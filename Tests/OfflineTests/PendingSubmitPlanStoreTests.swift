@@ -61,6 +61,24 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         }
     }
 
+    func testAddsSubmittedEndpointByRawTransaction() async throws {
+        let rawTransaction = Data([0x01, 0x02])
+        let transaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32), raw: rawTransaction)
+        let endpoint = LightWalletEndpoint(address: "submit.z.cash", port: 443, secure: true)
+        let store = PendingSubmitPlanStore(logger: NullLogger())
+
+        await store.markAwaitingSubmitPlan([transaction])
+        await store.addSubmitEndpoint(rawTransaction: rawTransaction, endpoint: endpoint)
+
+        switch await store.getSubmitPlan(for: transaction.rawID) {
+        case .ready(let plan):
+            XCTAssertEqual(plan.endpoints.count, 1)
+            assertEndpoint(plan.endpoints[0], equals: endpoint)
+        default:
+            XCTFail("Expected raw transaction submit path to register the endpoint.")
+        }
+    }
+
     func testPrunesPlansThatAreNoLongerResubmissionCandidates() async throws {
         let persistence = InMemorySubmitPlanPersistence()
         let retainedTransaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
@@ -150,7 +168,10 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         return context
     }
 
-    private func makeTransaction(rawID: Data) -> ZcashTransaction.Overview {
+    private func makeTransaction(
+        rawID: Data,
+        raw: Data = Data([0x01, 0x02])
+    ) -> ZcashTransaction.Overview {
         ZcashTransaction.Overview(
             accountUUID: TestsData.mockedAccountUUID,
             blockTime: nil,
@@ -161,7 +182,7 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
             hasChange: false,
             memoCount: 0,
             minedHeight: nil,
-            raw: Data([0x01, 0x02]),
+            raw: raw,
             rawID: rawID,
             receivedNoteCount: 0,
             sentNoteCount: 1,

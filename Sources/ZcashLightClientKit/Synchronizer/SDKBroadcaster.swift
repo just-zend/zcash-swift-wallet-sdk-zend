@@ -117,6 +117,7 @@ class SDKBroadcaster: Broadcaster {
         _ rawTransaction: Data,
         to endpoint: LightWalletEndpoint
     ) async throws {
+        // Record before submitting so transient endpoint failures keep the same retry plan.
         if let transaction = try? await rawTransactionLookup?.find(rawTransaction: rawTransaction) {
             await pendingSubmitPlanStore.addSubmitEndpoint(transaction: transaction, endpoint: endpoint)
             try await transactionSubmitter.submit(
