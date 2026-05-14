@@ -1,11 +1,10 @@
 use std::ffi::CString;
 
 use anyhow::anyhow;
-use orchard::note::ExtractedNoteCommitment;
 use serde::Serialize;
 use zcash_client_sqlite::util::SystemClock;
-use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
-use zcash_protocol::consensus::{self, Network};
+use zcash_keys::keys::UnifiedSpendingKey;
+use zcash_protocol::consensus::Network;
 use zcash_voting as voting;
 use zip32::{AccountId, Scope};
 
@@ -57,53 +56,6 @@ pub(super) fn json_to_boxed_slice<T: Serialize>(
 ) -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
     let json = serde_json::to_vec(value)?;
     Ok(crate::ffi::BoxedSlice::some(json))
-}
-
-/// Convert a librustzcash ReceivedNote (orchard) into zcash_voting's NoteInfo.
-///
-/// Requires the account's UFVK and network to compute the nullifier and
-/// encode the UFVK string.
-pub(super) fn received_note_to_note_info<P: consensus::Parameters>(
-    note: &zcash_client_backend::wallet::ReceivedNote<
-        zcash_client_sqlite::ReceivedNoteId,
-        orchard::note::Note,
-    >,
-    ufvk: &UnifiedFullViewingKey,
-    network: &P,
-) -> anyhow::Result<voting::NoteInfo> {
-    let orchard_note = note.note();
-    let fvk = ufvk
-        .orchard()
-        .ok_or_else(|| anyhow!("UFVK has no Orchard component"))?;
-
-    let nullifier = orchard_note.nullifier(fvk);
-    // `voting::NoteInfo::commitment` is the wire-form (extracted) cmx, not the affine
-    // note commitment, so the affine value is converted here before serialization.
-    let cmx: ExtractedNoteCommitment = orchard_note.commitment().into();
-
-    // Extract raw fields
-    let diversifier = orchard_note.recipient().diversifier().as_array().to_vec();
-    let value = orchard_note.value().inner();
-    let rho = orchard_note.rho().to_bytes().to_vec();
-    let rseed = orchard_note.rseed().as_bytes().to_vec();
-    let position = u64::from(note.note_commitment_tree_position());
-    let scope = match note.spending_key_scope() {
-        Scope::External => 0u32,
-        Scope::Internal => 1u32,
-    };
-    let ufvk_str = ufvk.encode(network);
-
-    Ok(voting::NoteInfo {
-        commitment: cmx.to_bytes().to_vec(),
-        nullifier: nullifier.to_bytes().to_vec(),
-        value,
-        position,
-        diversifier,
-        rho,
-        rseed,
-        scope,
-        ufvk_str,
-    })
 }
 
 /// Open the wallet database.

@@ -7,8 +7,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 # Unreleased
 
 ## Changed
-- Bumped `zcash_voting` to `0.7.0` for required voting input validation and paginated vote commitment tree sync
-  responses with per-block roots. Updated hotkey generation APIs to drop the unused round ID.
+- Bumped `zcash_voting` to `0.7.1` for required voting input validation,
+  paginated vote commitment tree sync responses with per-block roots, and
+  shared Orchard note conversion. Updated hotkey generation APIs to drop the
+  unused round ID.
 
 # 2.5.0 - 2026-05-11
 
