@@ -5,12 +5,9 @@ use ffi_helpers::panic::catch_panic;
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
+use super::constants::{KEYSTONE_SIGNATURE_LEN, PCZT_SIGHASH_LEN, RANDOMIZED_KEY_LEN};
 use super::db::VotingDatabaseHandle;
 use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
-
-const KEYSTONE_SIGNATURE_LEN: usize = 64;
-const PCZT_SIGHASH_LEN: usize = 32;
-const RANDOMIZED_KEY_LEN: usize = 32;
 
 #[derive(serde::Serialize)]
 struct JsonKeystoneSignatureRecord {
@@ -52,11 +49,6 @@ pub unsafe extern "C" fn zcashlc_voting_store_delegation_tx_hash(
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
         let tx_hash_str = unsafe { str_from_ptr(tx_hash, tx_hash_len) }?;
-        // Check if the bundle exists
-        handle
-            .db
-            .get_delegation_tx_hash(&round_id_str, bundle_index)
-            .map_err(|e| anyhow!("store_delegation_tx_hash failed: {}", e))?;
         handle
             .db
             .store_delegation_tx_hash(&round_id_str, bundle_index, &tx_hash_str)

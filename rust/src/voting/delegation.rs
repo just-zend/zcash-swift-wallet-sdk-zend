@@ -12,7 +12,10 @@ use zcash_voting::{self as voting, zkp1};
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
-use super::constants::SEED_FINGERPRINT_LEN;
+use super::constants::{
+    CANONICAL_FIELD_LEN, PIR_NULLIFIER_BOUNDS_LEN, PIR_NULLIFIER_LEN, PIR_PATH_ELEMENT_COUNT,
+    PIR_PATH_LEN, PIR_ROOT_LEN, SEED_FINGERPRINT_LEN,
+};
 use super::db::VotingDatabaseHandle;
 use super::ffi_types::{FfiBundleSetupResult, FfiVotingHotkey};
 use super::helpers::{
@@ -57,7 +60,7 @@ fn validate_cached_tree_state_for_round(
 // VotingDatabase methods — Delegation proof
 // =============================================================================
 
-/// Generate a voting hotkey for a round.
+/// Generate a voting hotkey.
 ///
 /// Returns a pointer to `FfiVotingHotkey` on success, or null on error.
 /// Call `zcashlc_voting_free_hotkey` to free the returned pointer.
@@ -68,8 +71,6 @@ fn validate_cached_tree_state_for_round(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_generate_hotkey(
     db: *mut VotingDatabaseHandle,
-    round_id: *const u8,
-    round_id_len: usize,
     seed: *const u8,
     seed_len: usize,
 ) -> *mut FfiVotingHotkey {
@@ -77,12 +78,11 @@ pub unsafe extern "C" fn zcashlc_voting_generate_hotkey(
     let res = catch_panic(|| {
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
         let seed_bytes = unsafe { bytes_from_ptr(seed, seed_len) }?;
 
         let hotkey = handle
             .db
-            .generate_hotkey(&round_id_str, seed_bytes)
+            .generate_hotkey(seed_bytes)
             .map_err(|e| anyhow!("generate_hotkey failed: {}", e))?;
 
         Ok(Box::into_raw(Box::new(voting_hotkey_to_ffi(hotkey)?)))
@@ -654,17 +654,6 @@ pub unsafe extern "C" fn zcashlc_voting_store_van_position(
     unwrap_exc_or(res, -1)
 }
 
-/// Depth of the IMT non-membership tree: number of authentication path
-/// siblings in a PIR-fetched proof. Matches `zcash_voting::ImtProofData::path`
-/// and `voting_circuits::delegation::imt::IMT_DEPTH` (29). Kept local because
-/// `voting-circuits` is not a direct dependency of this crate and
-/// `zcash_voting` does not currently re-export the constant.
-const NUM_PATH_ELEMENTS: usize = 29;
-
-/// Wire size of `ImtProofData::path` in bytes: one canonical 32-byte
-/// pallas::Base element per IMT depth level.
-const PATH_BYTES: usize = NUM_PATH_ELEMENTS * 32;
-
 /// Validate a PIR-fetched IMT non-membership proof bytewise.
 ///
 /// Inputs are the wire format of `zcash_voting::ImtProofData`: 32-byte LE
@@ -689,29 +678,41 @@ pub unsafe extern "C" fn zcashlc_voting_validate_pir_proof(
     expected_root: *const u8,
 ) -> i32 {
     let res = catch_panic(|| {
-        let root_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(root, 32) }
-            .try_into()
-            .map_err(|_| anyhow!("root must be exactly 32 bytes"))?;
-        let nf_bounds_bytes: [u8; 96] = unsafe { std::slice::from_raw_parts(nf_bounds, 96) }
-            .try_into()
-            .map_err(|_| anyhow!("nf_bounds must be exactly 96 bytes"))?;
-        let path_bytes: [u8; PATH_BYTES] = unsafe { std::slice::from_raw_parts(path, PATH_BYTES) }
-            .try_into()
-            .map_err(|_| anyhow!("path must be exactly {PATH_BYTES} bytes"))?;
-        let nullifier_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(nullifier, 32) }
-            .try_into()
-            .map_err(|_| anyhow!("nullifier must be exactly 32 bytes"))?;
-        let expected_root_bytes: [u8; 32] =
-            unsafe { std::slice::from_raw_parts(expected_root, 32) }
+        let root_bytes: [u8; PIR_ROOT_LEN] =
+            unsafe { std::slice::from_raw_parts(root, PIR_ROOT_LEN) }
                 .try_into()
-                .map_err(|_| anyhow!("expected_root must be exactly 32 bytes"))?;
+                .map_err(|_| anyhow!("root must be exactly {PIR_ROOT_LEN} bytes"))?;
+        let nf_bounds_bytes: [u8; PIR_NULLIFIER_BOUNDS_LEN] =
+            unsafe { std::slice::from_raw_parts(nf_bounds, PIR_NULLIFIER_BOUNDS_LEN) }
+                .try_into()
+                .map_err(|_| {
+                    anyhow!("nf_bounds must be exactly {PIR_NULLIFIER_BOUNDS_LEN} bytes")
+                })?;
+        let path_bytes: [u8; PIR_PATH_LEN] =
+            unsafe { std::slice::from_raw_parts(path, PIR_PATH_LEN) }
+                .try_into()
+                .map_err(|_| anyhow!("path must be exactly {PIR_PATH_LEN} bytes"))?;
+        let nullifier_bytes: [u8; PIR_NULLIFIER_LEN] =
+            unsafe { std::slice::from_raw_parts(nullifier, PIR_NULLIFIER_LEN) }
+                .try_into()
+                .map_err(|_| anyhow!("nullifier must be exactly {PIR_NULLIFIER_LEN} bytes"))?;
+        let expected_root_bytes: [u8; PIR_ROOT_LEN] =
+            unsafe { std::slice::from_raw_parts(expected_root, PIR_ROOT_LEN) }
+                .try_into()
+                .map_err(|_| anyhow!("expected_root must be exactly {PIR_ROOT_LEN} bytes"))?;
 
         let proof = zcash_voting::ImtProofData {
             root: parse_base(&root_bytes, "root")?,
             nf_bounds: [
-                parse_base(&nf_bounds_bytes[0..32], "nf_bounds[0]")?,
-                parse_base(&nf_bounds_bytes[32..64], "nf_bounds[1]")?,
-                parse_base(&nf_bounds_bytes[64..96], "nf_bounds[2]")?,
+                parse_base(&nf_bounds_bytes[0..CANONICAL_FIELD_LEN], "nf_bounds[0]")?,
+                parse_base(
+                    &nf_bounds_bytes[CANONICAL_FIELD_LEN..CANONICAL_FIELD_LEN * 2],
+                    "nf_bounds[1]",
+                )?,
+                parse_base(
+                    &nf_bounds_bytes[CANONICAL_FIELD_LEN * 2..PIR_NULLIFIER_BOUNDS_LEN],
+                    "nf_bounds[2]",
+                )?,
             ],
             leaf_pos,
             path: parse_path(&path_bytes)?,
@@ -729,16 +730,16 @@ pub unsafe extern "C" fn zcashlc_voting_validate_pir_proof(
 }
 
 fn parse_base(bytes: &[u8], label: &str) -> anyhow::Result<pallas::Base> {
-    let bytes: [u8; 32] = bytes
+    let bytes: [u8; CANONICAL_FIELD_LEN] = bytes
         .try_into()
-        .map_err(|_| anyhow!("{label} must be exactly 32 bytes"))?;
+        .map_err(|_| anyhow!("{label} must be exactly {CANONICAL_FIELD_LEN} bytes"))?;
     Option::from(pallas::Base::from_repr(bytes))
         .ok_or_else(|| anyhow!("{label} is not a canonical pallas::Base encoding"))
 }
 
-fn parse_path(bytes: &[u8]) -> anyhow::Result<[pallas::Base; NUM_PATH_ELEMENTS]> {
-    let mut path = [pallas::Base::from(0); NUM_PATH_ELEMENTS];
-    for (i, chunk) in bytes.chunks_exact(32).enumerate() {
+fn parse_path(bytes: &[u8]) -> anyhow::Result<[pallas::Base; PIR_PATH_ELEMENT_COUNT]> {
+    let mut path = [pallas::Base::from(0); PIR_PATH_ELEMENT_COUNT];
+    for (i, chunk) in bytes.chunks_exact(CANONICAL_FIELD_LEN).enumerate() {
         path[i] = parse_base(chunk, "path element")?;
     }
     Ok(path)
@@ -793,7 +794,7 @@ mod tests {
         proof_root: &[u8; 32],
         nf_bounds: &[u8; 96],
         leaf_pos: u32,
-        path: &[u8; PATH_BYTES],
+        path: &[u8; PIR_PATH_LEN],
         nullifier: &[u8; 32],
         expected_root: &[u8; 32],
     ) -> i32 {
@@ -1121,13 +1122,7 @@ mod tests {
 
         assert!(
             unsafe {
-                zcashlc_voting_generate_hotkey(
-                    std::ptr::null_mut(),
-                    round.as_ptr(),
-                    round.len(),
-                    bytes.as_ptr(),
-                    bytes.len(),
-                )
+                zcashlc_voting_generate_hotkey(std::ptr::null_mut(), bytes.as_ptr(), bytes.len())
             }
             .is_null()
         );
@@ -1254,17 +1249,8 @@ mod tests {
     fn generate_hotkey_returns_freeable_ffi_value() {
         let db = open_memory_voting_db();
         let seed = [7u8; 32];
-        let round = TEST_ROUND_ID.as_bytes();
 
-        let hotkey = unsafe {
-            zcashlc_voting_generate_hotkey(
-                db,
-                round.as_ptr(),
-                round.len(),
-                seed.as_ptr(),
-                seed.len(),
-            )
-        };
+        let hotkey = unsafe { zcashlc_voting_generate_hotkey(db, seed.as_ptr(), seed.len()) };
 
         assert!(!hotkey.is_null());
         let hotkey_ref = unsafe { hotkey.as_ref() }.expect("hotkey");
@@ -1284,17 +1270,8 @@ mod tests {
     fn generate_hotkey_rejects_short_seed() {
         let db = open_memory_voting_db();
         let seed = [7u8; 31];
-        let round = TEST_ROUND_ID.as_bytes();
 
-        let hotkey = unsafe {
-            zcashlc_voting_generate_hotkey(
-                db,
-                round.as_ptr(),
-                round.len(),
-                seed.as_ptr(),
-                seed.len(),
-            )
-        };
+        let hotkey = unsafe { zcashlc_voting_generate_hotkey(db, seed.as_ptr(), seed.len()) };
 
         assert!(hotkey.is_null());
         unsafe { zcashlc_voting_db_free(db) };
@@ -1444,7 +1421,7 @@ mod tests {
     fn validate_pir_proof_accepts_valid() {
         let root = decode_hex::<32>(ROOT);
         let nf_bounds = decode_hex::<96>(NF_BOUNDS);
-        let path = decode_hex::<PATH_BYTES>(PATH);
+        let path = decode_hex::<PIR_PATH_LEN>(PATH);
         let nullifier = decode_hex::<32>(NULLIFIER);
         let expected_root = decode_hex::<32>(EXPECTED_ROOT);
 
@@ -1465,7 +1442,7 @@ mod tests {
     fn validate_pir_proof_rejects_root_mismatch() {
         let root = decode_hex::<32>(ROOT);
         let nf_bounds = decode_hex::<96>(NF_BOUNDS);
-        let path = decode_hex::<PATH_BYTES>(PATH);
+        let path = decode_hex::<PIR_PATH_LEN>(PATH);
         let nullifier = decode_hex::<32>(NULLIFIER);
         let mut expected_root = decode_hex::<32>(EXPECTED_ROOT);
         expected_root[0] ^= 1;
@@ -1487,7 +1464,7 @@ mod tests {
     fn validate_pir_proof_rejects_corrupted_path() {
         let root = decode_hex::<32>(ROOT);
         let nf_bounds = decode_hex::<96>(NF_BOUNDS);
-        let mut path = decode_hex::<PATH_BYTES>(PATH);
+        let mut path = decode_hex::<PIR_PATH_LEN>(PATH);
         let nullifier = decode_hex::<32>(NULLIFIER);
         let expected_root = decode_hex::<32>(EXPECTED_ROOT);
         path[0] ^= 1;
@@ -1508,7 +1485,7 @@ mod tests {
     #[test]
     fn validate_pir_proof_rejects_non_canonical_field_encoding() {
         let nf_bounds = decode_hex::<96>(NF_BOUNDS);
-        let path = decode_hex::<PATH_BYTES>(PATH);
+        let path = decode_hex::<PIR_PATH_LEN>(PATH);
         let non_canonical_root = [0xff; 32];
         let nullifier = decode_hex::<32>(NULLIFIER);
         let expected_root = decode_hex::<32>(EXPECTED_ROOT);

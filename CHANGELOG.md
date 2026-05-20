@@ -9,6 +9,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Changed
 - `Broadcaster` transactions now remain eligible for SDK automatic retry after submission. The SDK records the submitted endpoints privately and retries with those endpoints instead of the synchronizer's default endpoint.
 
+# 2.5.1 - 2026-05-14
+
+## Fixed
+- Fixed a bug that could cause transactions shielding more than 150 transparent
+  P2PKH inputs to fail due to incorrect fee computation.
+
 # 2.5.0 - 2026-05-11
 
 ## Added
@@ -71,7 +77,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `addSentServers(roundId:bundleIndex:proposalId:shareIndex:newURLs:)` → `zcashlc_voting_add_sent_servers`
 
   Delegation workflow
-  - `generateHotkey(roundId:seed:)` → `zcashlc_voting_generate_hotkey` (frees `FfiVotingHotkey` via `zcashlc_voting_free_hotkey`)
+  - `generateHotkey(seed:)` → `zcashlc_voting_generate_hotkey` (frees `FfiVotingHotkey` via `zcashlc_voting_free_hotkey`)
   - `setupBundles(roundId:notes:)` → `zcashlc_voting_setup_bundles` (frees `FfiBundleSetupResult` via `zcashlc_voting_free_bundle_setup_result`)
   - `getBundleCount(roundId:)` → `zcashlc_voting_get_bundle_count`
   - `buildPczt(_:)` → `zcashlc_voting_build_pczt` (takes `VotingBuildPcztParams`)
