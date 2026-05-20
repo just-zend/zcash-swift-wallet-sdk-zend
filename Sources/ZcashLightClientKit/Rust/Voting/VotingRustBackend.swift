@@ -5,6 +5,7 @@
 
 import Foundation
 import libzcashlc
+import Security
 
 // MARK: - Error
 
@@ -1387,6 +1388,218 @@ extension VotingRustBackend {
     }
 }
 
+// MARK: - Share policy
+
+extension VotingRustBackend {
+    /// Return the random byte counts needed to plan independent share submissions.
+    public static func shareSubmissionRandomBytesRequired(
+        shareCount: Int,
+        serverCount: Int,
+        nowSeconds: UInt64,
+        voteEndTimeSeconds: UInt64,
+        lastMomentBufferSeconds: UInt64?,
+        singleShare: Bool
+    ) throws -> VotingShareSubmissionRandomBytesRequired {
+        let shareCount = try requireNonNegativeCount(shareCount, name: "shareCount")
+        let serverCount = try requireNonNegativeCount(serverCount, name: "serverCount")
+
+        return try staticJSONFFI(fallback: "`share_submission_random_bytes_required` failed") {
+            zcashlc_voting_share_submission_random_bytes_required(
+                shareCount,
+                serverCount,
+                nowSeconds,
+                voteEndTimeSeconds,
+                lastMomentBufferSeconds ?? 0,
+                singleShare ? 1 : 0
+            )
+        }
+    }
+
+    /// Plan independent share submission timing and initial helper targets.
+    ///
+    /// This method draws the exact entropy required by the Rust policy from
+    /// Apple's CSPRNG and leaves HTTP delivery/fallback to the caller.
+    // swiftlint:disable:next function_parameter_count
+    public static func planShareSubmissions(
+        shareCount: Int,
+        serverURLs: [String],
+        nowSeconds: UInt64,
+        voteEndTimeSeconds: UInt64,
+        lastMomentBufferSeconds: UInt64?,
+        singleShare: Bool
+    ) throws -> [VotingShareSubmissionPlan] {
+        let required = try shareSubmissionRandomBytesRequired(
+            shareCount: shareCount,
+            serverCount: serverURLs.count,
+            nowSeconds: nowSeconds,
+            voteEndTimeSeconds: voteEndTimeSeconds,
+            lastMomentBufferSeconds: lastMomentBufferSeconds,
+            singleShare: singleShare
+        )
+        return try planShareSubmissionsFromEntropy(
+            shareCount: shareCount,
+            serverURLs: serverURLs,
+            nowSeconds: nowSeconds,
+            voteEndTimeSeconds: voteEndTimeSeconds,
+            lastMomentBufferSeconds: lastMomentBufferSeconds,
+            singleShare: singleShare,
+            submitAtRandomBytes: secureRandomBytes(count: required.submitAtRandomBytes),
+            serverRandomBytes: secureRandomBytes(count: required.serverRandomBytes)
+        )
+    }
+
+    /// Plan independent share submissions from caller-provided entropy.
+    ///
+    /// Use this for tests or when entropy was already drawn by the caller. Most
+    /// production paths should use `planShareSubmissions(...)`.
+    // swiftlint:disable:next function_parameter_count
+    public static func planShareSubmissionsFromEntropy(
+        shareCount: Int,
+        serverURLs: [String],
+        nowSeconds: UInt64,
+        voteEndTimeSeconds: UInt64,
+        lastMomentBufferSeconds: UInt64?,
+        singleShare: Bool,
+        submitAtRandomBytes: [UInt8],
+        serverRandomBytes: [UInt8]
+    ) throws -> [VotingShareSubmissionPlan] {
+        let shareCount = try requireNonNegativeCount(shareCount, name: "shareCount")
+        let serverURLsBytes = [UInt8](try JSONEncoder().encode(serverURLs))
+
+        return try serverURLsBytes.withUnsafeBufferPointer { urlsBuf in
+            try submitAtRandomBytes.withUnsafeBufferPointer { submitAtBuf in
+                try serverRandomBytes.withUnsafeBufferPointer { serverBytesBuf in
+                    try staticJSONFFI(fallback: "`plan_share_submissions` failed") {
+                        zcashlc_voting_plan_share_submissions(
+                            shareCount,
+                            urlsBuf.baseAddress,
+                            UInt(urlsBuf.count),
+                            nowSeconds,
+                            voteEndTimeSeconds,
+                            lastMomentBufferSeconds ?? 0,
+                            singleShare ? 1 : 0,
+                            submitAtBuf.baseAddress,
+                            UInt(submitAtBuf.count),
+                            serverBytesBuf.baseAddress,
+                            UInt(serverBytesBuf.count)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the random byte count needed to order helpers for resubmission.
+    public static func resubmissionServerOrderRandomBytesRequired(
+        configuredServerURLs: [String],
+        sentToURLs: [String]
+    ) throws -> Int {
+        let configuredBytes = [UInt8](try JSONEncoder().encode(configuredServerURLs))
+        let sentBytes = [UInt8](try JSONEncoder().encode(sentToURLs))
+
+        let required: UInt64 = try configuredBytes.withUnsafeBufferPointer { configuredBuf in
+            try sentBytes.withUnsafeBufferPointer { sentBuf in
+                try staticJSONFFI(fallback: "`resubmission_server_order_random_bytes_required` failed") {
+                    zcashlc_voting_resubmission_server_order_random_bytes_required(
+                        configuredBuf.baseAddress,
+                        UInt(configuredBuf.count),
+                        sentBuf.baseAddress,
+                        UInt(sentBuf.count)
+                    )
+                }
+            }
+        }
+        guard required <= UInt64(Int.max) else {
+            throw VotingRustBackendError.invalidData("required random byte count is too large")
+        }
+        return Int(required)
+    }
+
+    /// Return a randomized resubmission order with untried helpers first.
+    ///
+    /// This method draws the exact entropy required by the Rust policy from
+    /// Apple's CSPRNG. The caller still owns the HTTP retry loop.
+    public static func resubmissionServerOrder(
+        configuredServerURLs: [String],
+        sentToURLs: [String]
+    ) throws -> [String] {
+        let required = try resubmissionServerOrderRandomBytesRequired(
+            configuredServerURLs: configuredServerURLs,
+            sentToURLs: sentToURLs
+        )
+        return try resubmissionServerOrderFromEntropy(
+            configuredServerURLs: configuredServerURLs,
+            sentToURLs: sentToURLs,
+            serverRandomBytes: secureRandomBytes(count: required)
+        )
+    }
+
+    /// Return a resubmission order from caller-provided entropy.
+    public static func resubmissionServerOrderFromEntropy(
+        configuredServerURLs: [String],
+        sentToURLs: [String],
+        serverRandomBytes: [UInt8]
+    ) throws -> [String] {
+        let configuredBytes = [UInt8](try JSONEncoder().encode(configuredServerURLs))
+        let sentBytes = [UInt8](try JSONEncoder().encode(sentToURLs))
+
+        return try configuredBytes.withUnsafeBufferPointer { configuredBuf in
+            try sentBytes.withUnsafeBufferPointer { sentBuf in
+                try serverRandomBytes.withUnsafeBufferPointer { randomBuf in
+                    try staticJSONFFI(fallback: "`resubmission_server_order` failed") {
+                        zcashlc_voting_resubmission_server_order(
+                            configuredBuf.baseAddress,
+                            UInt(configuredBuf.count),
+                            sentBuf.baseAddress,
+                            UInt(sentBuf.count),
+                            randomBuf.baseAddress,
+                            UInt(randomBuf.count)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the next polling delay for share recovery, or nil once all shares
+    /// are confirmed.
+    public static func nextShareTrackingDelaySeconds(
+        shares: [VotingShareDelegation],
+        nowSeconds: UInt64
+    ) throws -> UInt64? {
+        let sharesBytes = [UInt8](try JSONEncoder().encode(shares))
+        return try sharesBytes.withUnsafeBufferPointer { sharesBuf in
+            try staticJSONFFI(fallback: "`next_tracking_delay_seconds` failed") {
+                zcashlc_voting_next_tracking_delay_seconds(
+                    sharesBuf.baseAddress,
+                    UInt(sharesBuf.count),
+                    nowSeconds
+                )
+            }
+        }
+    }
+
+    /// Summarize share recovery state using the shared wallet policy.
+    public static func summarizeShareTracking(
+        shares: [VotingShareDelegation],
+        nowSeconds: UInt64,
+        voteEndTimeSeconds: UInt64?
+    ) throws -> VotingShareTrackingSummary {
+        let sharesBytes = [UInt8](try JSONEncoder().encode(shares))
+        return try sharesBytes.withUnsafeBufferPointer { sharesBuf in
+            try staticJSONFFI(fallback: "`summarize_share_tracking` failed") {
+                zcashlc_voting_summarize_share_tracking(
+                    sharesBuf.baseAddress,
+                    UInt(sharesBuf.count),
+                    nowSeconds,
+                    voteEndTimeSeconds ?? 0,
+                    voteEndTimeSeconds == nil ? 0 : 1
+                )
+            }
+        }
+    }
+}
+
 // MARK: - Delegation workflow
 
 extension VotingRustBackend {
@@ -1893,6 +2106,17 @@ private extension VotingRustBackend {
         return try JSONDecoder().decode(T.self, from: data)
     }
 
+    static func staticJSONFFI<T: Decodable>(
+        fallback: String,
+        _ call: () -> UnsafeMutablePointer<FfiBoxedSlice>?
+    ) throws -> T {
+        guard let ptr = call() else {
+            throw VotingRustBackendError.rustError(staticLastErrorMessage(fallback: fallback))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try staticDecodeJSON(from: ptr)
+    }
+
     /// Decode Rust's persisted round phase without silently aliasing unknown values.
     static func decodeRoundPhase(_ rawValue: UInt32) throws -> VotingRoundPhase {
         guard let phase = VotingRoundPhase(rawValue: rawValue) else {
@@ -1920,6 +2144,29 @@ private extension VotingRustBackend {
         }
 
         return String(cString: pointer)
+    }
+
+    static func requireNonNegativeCount(_ count: Int, name: String) throws -> UInt {
+        guard count >= 0 else {
+            throw VotingRustBackendError.invalidData("\(name) must be non-negative")
+        }
+        return UInt(count)
+    }
+
+    static func secureRandomBytes(count: Int) throws -> [UInt8] {
+        guard count >= 0 else {
+            throw VotingRustBackendError.invalidData("random byte count must be non-negative")
+        }
+        guard count > 0 else {
+            return []
+        }
+
+        var bytes = [UInt8](repeating: 0, count: count)
+        let status = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
+        guard status == errSecSuccess else {
+            throw VotingRustBackendError.invalidData("SecRandomCopyBytes failed with status \(status)")
+        }
+        return bytes
     }
 
     /// Calls a static FFI returning `*FfiBoxedSlice` and copies the resulting

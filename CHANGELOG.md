@@ -6,6 +6,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- `VotingRustBackend` share policy helpers for planning share submission timing
+  and helper targets, randomized resubmission order, and share tracking
+  summary/delay using `zcash_voting 0.9.1`.
+
 # 2.5.1 - 2026-05-14
 
 ## Fixed

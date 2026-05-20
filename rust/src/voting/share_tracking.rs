@@ -63,7 +63,7 @@ fn hex_nibble(byte: u8) -> anyhow::Result<u8> {
     }
 }
 
-fn decode_share_nullifier_hex(hex: &str) -> anyhow::Result<[u8; SHARE_NULLIFIER_LEN]> {
+pub(super) fn decode_share_nullifier_hex(hex: &str) -> anyhow::Result<[u8; SHARE_NULLIFIER_LEN]> {
     if hex.len() != SHARE_NULLIFIER_HEX_LEN {
         return Err(anyhow!(
             "nullifier must be {} hex chars, got {}",

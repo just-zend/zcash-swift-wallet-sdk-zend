@@ -13,6 +13,7 @@ pub mod notes;
 pub mod progress;
 pub mod recovery;
 pub mod rounds;
+pub mod share_policy;
 pub mod share_tracking;
 #[cfg(test)]
 pub(crate) mod test_helpers;

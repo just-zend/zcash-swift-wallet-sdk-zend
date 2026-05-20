@@ -203,6 +203,63 @@ public struct VotingShareDelegation: Codable, Equatable, Sendable {
     }
 }
 
+// MARK: - Share Policy (JSON)
+
+/// Random byte counts needed to plan one or more independent share submissions.
+public struct VotingShareSubmissionRandomBytesRequired: Codable, Equatable, Sendable {
+    public let submitAtRandomBytes: Int
+    public let serverRandomBytes: Int
+
+    enum CodingKeys: String, CodingKey {
+        case submitAtRandomBytes = "submit_at_random_bytes"
+        case serverRandomBytes = "server_random_bytes"
+    }
+
+    public init(submitAtRandomBytes: Int, serverRandomBytes: Int) {
+        self.submitAtRandomBytes = submitAtRandomBytes
+        self.serverRandomBytes = serverRandomBytes
+    }
+}
+
+/// Planned helper-share submission values that SDK callers can apply to payloads.
+public struct VotingShareSubmissionPlan: Codable, Equatable, Sendable {
+    /// Unix seconds when helpers should submit the share, or 0 for immediate.
+    public let submitAt: UInt64
+    /// Number of helpers each share should reach.
+    public let targetCount: UInt64
+    /// Helper targets selected for initial share submission.
+    public let targetServers: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case submitAt = "submit_at"
+        case targetCount = "target_count"
+        case targetServers = "target_servers"
+    }
+
+    public init(submitAt: UInt64, targetCount: UInt64, targetServers: [String]) {
+        self.submitAt = submitAt
+        self.targetCount = targetCount
+        self.targetServers = targetServers
+    }
+}
+
+/// Counts shares by their recovery status.
+public struct VotingShareTrackingSummary: Codable, Equatable, Sendable {
+    public let total: UInt64
+    public let confirmed: UInt64
+    public let waiting: UInt64
+    public let ready: UInt64
+    public let overdue: UInt64
+
+    public init(total: UInt64, confirmed: UInt64, waiting: UInt64, ready: UInt64, overdue: UInt64) {
+        self.total = total
+        self.confirmed = confirmed
+        self.waiting = waiting
+        self.ready = ready
+        self.overdue = overdue
+    }
+}
+
 // MARK: - Delegation Proof Result (JSON)
 
 /// Result of building and proving a delegation.

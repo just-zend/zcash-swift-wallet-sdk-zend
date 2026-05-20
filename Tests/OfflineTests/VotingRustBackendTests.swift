@@ -792,6 +792,117 @@ final class VotingRustBackendTests: XCTestCase {
         XCTAssertTrue(try backend.getUnconfirmedDelegations(roundId: "missing").isEmpty)
     }
 
+    // MARK: - Share policy
+
+    func test_shareSubmissionRandomBytesRequired_returnsExpectedCounts() throws {
+        let required = try VotingRustBackend.shareSubmissionRandomBytesRequired(
+            shareCount: 2,
+            serverCount: 3,
+            nowSeconds: 100,
+            voteEndTimeSeconds: 1_000,
+            lastMomentBufferSeconds: 100,
+            singleShare: false
+        )
+
+        XCTAssertEqual(required.submitAtRandomBytes, 16)
+        XCTAssertEqual(required.serverRandomBytes, 32)
+    }
+
+    func test_planShareSubmissionsFromEntropy_usesIndependentEntropy() throws {
+        let plans = try VotingRustBackend.planShareSubmissionsFromEntropy(
+            shareCount: 2,
+            serverURLs: [
+                "https://helper-a.example",
+                "https://helper-b.example",
+                "https://helper-c.example"
+            ],
+            nowSeconds: 100,
+            voteEndTimeSeconds: 1_000,
+            lastMomentBufferSeconds: 100,
+            singleShare: false,
+            submitAtRandomBytes: littleEndianRandomBytes([0, UInt64.max]),
+            serverRandomBytes: littleEndianRandomBytes([0, 0, 0, 0])
+        )
+
+        XCTAssertEqual(plans.count, 2)
+        XCTAssertEqual(plans[0].submitAt, 100)
+        XCTAssertEqual(plans[1].submitAt, 899)
+        XCTAssertEqual(plans[0].targetCount, 2)
+        XCTAssertEqual(
+            plans[0].targetServers,
+            [
+                "https://helper-b.example",
+                "https://helper-c.example"
+            ]
+        )
+    }
+
+    func test_planShareSubmissions_drawsRandomBytesForImmediateShare() throws {
+        let servers = [
+            "https://helper-a.example",
+            "https://helper-b.example"
+        ]
+
+        let plans = try VotingRustBackend.planShareSubmissions(
+            shareCount: 1,
+            serverURLs: servers,
+            nowSeconds: 100,
+            voteEndTimeSeconds: 1_000,
+            lastMomentBufferSeconds: 100,
+            singleShare: true
+        )
+
+        XCTAssertEqual(plans.count, 1)
+        XCTAssertEqual(plans[0].submitAt, 0)
+        XCTAssertEqual(plans[0].targetCount, 1)
+        XCTAssertEqual(plans[0].targetServers.count, 1)
+        XCTAssertTrue(servers.contains(plans[0].targetServers[0]))
+    }
+
+    func test_resubmissionServerOrderFromEntropy_prefersUntriedHelpers() throws {
+        let order = try VotingRustBackend.resubmissionServerOrderFromEntropy(
+            configuredServerURLs: [
+                "https://helper-a.example",
+                "https://helper-b.example",
+                "https://helper-c.example"
+            ],
+            sentToURLs: ["https://helper-b.example"],
+            serverRandomBytes: littleEndianRandomBytes([0])
+        )
+
+        XCTAssertEqual(
+            order,
+            [
+                "https://helper-c.example",
+                "https://helper-a.example",
+                "https://helper-b.example"
+            ]
+        )
+    }
+
+    func test_shareTrackingSummaryAndDelay_usesSharedPolicy() throws {
+        let shares = [
+            makeShareDelegation(submitAt: 0, createdAt: 100, confirmed: false)
+        ]
+
+        let delay = try VotingRustBackend.nextShareTrackingDelaySeconds(
+            shares: shares,
+            nowSeconds: 112
+        )
+        let summary = try VotingRustBackend.summarizeShareTracking(
+            shares: shares,
+            nowSeconds: 112,
+            voteEndTimeSeconds: 1_000
+        )
+
+        XCTAssertEqual(delay, 15)
+        XCTAssertEqual(summary.total, 1)
+        XCTAssertEqual(summary.confirmed, 0)
+        XCTAssertEqual(summary.waiting, 0)
+        XCTAssertEqual(summary.ready, 1)
+        XCTAssertEqual(summary.overdue, 0)
+    }
+
     // MARK: - Delegation workflow
 
     func test_setupBundles_returnsZero_forEmptyNotes() throws {
@@ -1552,6 +1663,30 @@ final class VotingRustBackendTests: XCTestCase {
             return
         }
         XCTAssertTrue(message.contains("no vote found"), "unexpected message: \(message)", file: file, line: line)
+    }
+
+    private func littleEndianRandomBytes(_ samples: [UInt64]) -> [UInt8] {
+        samples.flatMap { sample in
+            withUnsafeBytes(of: sample.littleEndian) { Array($0) }
+        }
+    }
+
+    private func makeShareDelegation(
+        submitAt: UInt64,
+        createdAt: UInt64,
+        confirmed: Bool
+    ) -> VotingShareDelegation {
+        VotingShareDelegation(
+            roundId: roundTripRoundId,
+            bundleIndex: roundTripBundleIndex,
+            proposalId: roundTripProposalId,
+            shareIndex: roundTripShareIndex0,
+            sentToURLs: [roundTripHelperAURL],
+            nullifier: roundTripShareNullifier,
+            confirmed: confirmed,
+            submitAt: submitAt,
+            createdAt: createdAt
+        )
     }
 
     private func makeVoteCommitmentBundle(
