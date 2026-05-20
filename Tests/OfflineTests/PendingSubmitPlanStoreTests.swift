@@ -119,6 +119,36 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         }
     }
 
+    func testRawEndpointRegistrationDuringCreationIsPreserved() async throws {
+        let rawTransaction = Data([0x01, 0x02])
+        let transaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32), raw: rawTransaction)
+        let endpoint = LightWalletEndpoint(address: "submit.z.cash", port: 443, secure: true)
+        let store = PendingSubmitPlanStore(logger: NullLogger())
+        let creationStarted = AsyncSignal()
+        let allowCreationToReturn = AsyncSignal()
+
+        let creationTask = Task {
+            await store.createAndMarkAwaitingSubmitPlan {
+                await creationStarted.signal()
+                await allowCreationToReturn.wait()
+                return [transaction]
+            }
+        }
+        await creationStarted.wait()
+
+        await store.addSubmitEndpoint(rawTransaction: rawTransaction, endpoint: endpoint)
+        await allowCreationToReturn.signal()
+        _ = await creationTask.value
+
+        switch await store.getSubmitPlan(for: transaction.rawID) {
+        case .ready(let plan):
+            XCTAssertEqual(plan.endpoints.count, 1)
+            assertEndpoint(plan.endpoints[0], equals: endpoint)
+        default:
+            XCTFail("Expected raw endpoint registration during creation to be preserved.")
+        }
+    }
+
     func testPrunesPlansThatAreNoLongerResubmissionCandidates() async throws {
         let persistence = InMemorySubmitPlanPersistence()
         let prunedRawTransaction = Data([0x03, 0x04])

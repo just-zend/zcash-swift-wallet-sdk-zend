@@ -51,6 +51,7 @@ actor PendingSubmitPlanStore {
     // In-memory cache only. After restart, raw transaction submissions recover
     // the transaction id through RawTransactionLookup before recording endpoints.
     private var transactionIdsByRawTransaction: [String: String] = [:]
+    private var pendingEndpointsByRawTransaction: [String: [StoredEndpoint]] = [:]
     private var loadedFromPersistence = false
     // Actor isolation prevents data races, but actor methods are reentrant
     // across await. Candidate lookup returns a repository snapshot, so pruning
@@ -90,7 +91,11 @@ actor PendingSubmitPlanStore {
     ) async {
         loadFromPersistenceIfNeeded()
 
-        guard let transactionId = transactionIdsByRawTransaction[rawTransaction.stablePlanKey] else {
+        let rawTransactionKey = rawTransaction.stablePlanKey
+        guard let transactionId = transactionIdsByRawTransaction[rawTransactionKey] else {
+            if activeSubmitPlanCreations > 0 {
+                addPendingSubmitEndpoint(rawTransactionKey: rawTransactionKey, endpoint: endpoint)
+            }
             return
         }
 
@@ -142,6 +147,7 @@ actor PendingSubmitPlanStore {
     func clear() async {
         plansByTransactionId.removeAll()
         transactionIdsByRawTransaction.removeAll()
+        pendingEndpointsByRawTransaction.removeAll()
         clearGeneration &+= 1
         bumpStoreRevision()
         do {
@@ -150,7 +156,9 @@ actor PendingSubmitPlanStore {
             logger.warn("Failed to clear pending submit plans: \(error)")
         }
     }
+}
 
+private extension PendingSubmitPlanStore {
     private func markAwaitingSubmitPlan(_ transactions: [ZcashTransaction.Overview]) {
         var shouldSave = false
         var didChange = false
@@ -161,6 +169,15 @@ actor PendingSubmitPlanStore {
                 if transactionIdsByRawTransaction[rawTransactionKey] != transactionId {
                     transactionIdsByRawTransaction[rawTransactionKey] = transactionId
                     didChange = true
+                }
+                if let pendingEndpoints = pendingEndpointsByRawTransaction.removeValue(forKey: rawTransactionKey) {
+                    didChange = true
+                    var endpoints = plansByTransactionId[transactionId] ?? []
+                    for pendingEndpoint in pendingEndpoints where !endpoints.contains(pendingEndpoint) {
+                        endpoints.append(pendingEndpoint)
+                        shouldSave = true
+                    }
+                    plansByTransactionId[transactionId] = endpoints
                 }
             }
             if plansByTransactionId[transactionId] == nil {
@@ -192,6 +209,19 @@ actor PendingSubmitPlanStore {
         saveToPersistence()
     }
 
+    private func addPendingSubmitEndpoint(
+        rawTransactionKey: String,
+        endpoint: LightWalletEndpoint
+    ) {
+        let storedEndpoint = StoredEndpoint(endpoint: endpoint)
+        var endpoints = pendingEndpointsByRawTransaction[rawTransactionKey] ?? []
+        guard !endpoints.contains(storedEndpoint) else { return }
+
+        endpoints.append(storedEndpoint)
+        pendingEndpointsByRawTransaction[rawTransactionKey] = endpoints
+        bumpStoreRevision()
+    }
+
     private func retainPlans(for transactionIds: [Data]) {
         let retainedTransactionIds = Set(transactionIds.map(\.stablePlanKey))
         let previousPlanCount = plansByTransactionId.count
@@ -218,6 +248,10 @@ actor PendingSubmitPlanStore {
     private func endSubmitPlanCreation() {
         precondition(activeSubmitPlanCreations > 0, "Attempted to end inactive submit-plan creation.")
         activeSubmitPlanCreations -= 1
+        if activeSubmitPlanCreations == 0 && !pendingEndpointsByRawTransaction.isEmpty {
+            pendingEndpointsByRawTransaction.removeAll()
+            bumpStoreRevision()
+        }
     }
 
     private func makeRetainToken() -> RetainToken {
