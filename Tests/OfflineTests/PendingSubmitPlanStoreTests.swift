@@ -145,6 +145,205 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         XCTAssertNil(prunedPlan)
     }
 
+    func testRetainSkipsPruneWhenCreationCompletesDuringCandidateLookup() async throws {
+        let transaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
+        let store = PendingSubmitPlanStore(logger: NullLogger())
+        let lookupStarted = AsyncSignal()
+        let allowLookupToReturn = AsyncSignal()
+
+        let retainTask = Task {
+            await store.loadTransactionsAndRetainSubmitPlans(
+                loadTransactions: {
+                    await lookupStarted.signal()
+                    await allowLookupToReturn.wait()
+                    return [ZcashTransaction.Overview]()
+                },
+                transactionId: { $0.rawID }
+            )
+        }
+        await lookupStarted.wait()
+
+        await markAwaiting([transaction], in: store)
+        await allowLookupToReturn.signal()
+        _ = await retainTask.value
+
+        switch await store.getSubmitPlan(for: transaction.rawID) {
+        case .awaitingPlan:
+            break
+        default:
+            XCTFail("Expected submit plan created during candidate lookup to survive stale pruning.")
+        }
+    }
+
+    func testRetainSkipsPruneWhenCreationWasAlreadyActiveDuringCandidateLookup() async throws {
+        let existingTransaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
+        let store = PendingSubmitPlanStore(logger: NullLogger())
+        let creationStarted = AsyncSignal()
+        let allowCreationToReturn = AsyncSignal()
+        let lookupStarted = AsyncSignal()
+        let allowLookupToReturn = AsyncSignal()
+
+        await markAwaiting([existingTransaction], in: store)
+
+        let creationTask = Task {
+            await store.createAndMarkAwaitingSubmitPlan {
+                await creationStarted.signal()
+                await allowCreationToReturn.wait()
+                return []
+            }
+        }
+        await creationStarted.wait()
+
+        let retainTask = Task {
+            await store.loadTransactionsAndRetainSubmitPlans(
+                loadTransactions: {
+                    await lookupStarted.signal()
+                    await allowLookupToReturn.wait()
+                    return [ZcashTransaction.Overview]()
+                },
+                transactionId: { $0.rawID }
+            )
+        }
+        await lookupStarted.wait()
+
+        await allowCreationToReturn.signal()
+        _ = await creationTask.value
+        await allowLookupToReturn.signal()
+        _ = await retainTask.value
+
+        switch await store.getSubmitPlan(for: existingTransaction.rawID) {
+        case .awaitingPlan:
+            break
+        default:
+            XCTFail("Expected stale pruning to be skipped when lookup started during transaction creation.")
+        }
+    }
+
+    func testEndpointRegistrationDuringCandidateLookupInvalidatesPrune() async throws {
+        let transaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
+        let endpoint = LightWalletEndpoint(address: "submit.z.cash", port: 443, secure: true)
+        let store = PendingSubmitPlanStore(logger: NullLogger())
+        let lookupStarted = AsyncSignal()
+        let allowLookupToReturn = AsyncSignal()
+
+        let retainTask = Task {
+            await store.loadTransactionsAndRetainSubmitPlans(
+                loadTransactions: {
+                    await lookupStarted.signal()
+                    await allowLookupToReturn.wait()
+                    return [ZcashTransaction.Overview]()
+                },
+                transactionId: { $0.rawID }
+            )
+        }
+        await lookupStarted.wait()
+
+        await store.addSubmitEndpoint(transaction: transaction, endpoint: endpoint)
+        await allowLookupToReturn.signal()
+        _ = await retainTask.value
+
+        switch await store.getSubmitPlan(for: transaction.rawID) {
+        case .ready(let plan):
+            XCTAssertEqual(plan.endpoints.count, 1)
+            assertEndpoint(plan.endpoints[0], equals: endpoint)
+        default:
+            XCTFail("Expected endpoint registration during candidate lookup to invalidate stale pruning.")
+        }
+
+        await loadAndRetain([], in: store)
+        let planAfterCleanRetain = await store.getSubmitPlan(for: transaction.rawID)
+        XCTAssertNil(planAfterCleanRetain)
+    }
+
+    func testOverlappingRetainsDoNotBothPruneFromStaleSnapshots() async throws {
+        let firstTransaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
+        let secondTransaction = makeTransaction(rawID: Data(repeating: 0xCD, count: 32))
+        let store = PendingSubmitPlanStore(logger: NullLogger())
+        let firstLookupStarted = AsyncSignal()
+        let secondLookupStarted = AsyncSignal()
+        let allowFirstLookupToReturn = AsyncSignal()
+        let allowSecondLookupToReturn = AsyncSignal()
+
+        await markAwaiting([firstTransaction, secondTransaction], in: store)
+
+        let firstRetainTask = Task {
+            await store.loadTransactionsAndRetainSubmitPlans(
+                loadTransactions: {
+                    await firstLookupStarted.signal()
+                    await allowFirstLookupToReturn.wait()
+                    return [firstTransaction]
+                },
+                transactionId: { $0.rawID }
+            )
+        }
+        let secondRetainTask = Task {
+            await store.loadTransactionsAndRetainSubmitPlans(
+                loadTransactions: {
+                    await secondLookupStarted.signal()
+                    await allowSecondLookupToReturn.wait()
+                    return [secondTransaction]
+                },
+                transactionId: { $0.rawID }
+            )
+        }
+        await firstLookupStarted.wait()
+        await secondLookupStarted.wait()
+
+        await allowFirstLookupToReturn.signal()
+        _ = await firstRetainTask.value
+        await allowSecondLookupToReturn.signal()
+        _ = await secondRetainTask.value
+
+        let firstPlan = await store.getSubmitPlan(for: firstTransaction.rawID)
+        let secondPlan = await store.getSubmitPlan(for: secondTransaction.rawID)
+        XCTAssertNotNil(firstPlan)
+        XCTAssertNil(secondPlan)
+    }
+
+    func testThrowingCreationDoesNotSuppressFuturePruning() async throws {
+        let staleTransaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
+        let store = PendingSubmitPlanStore(logger: NullLogger())
+
+        await markAwaiting([staleTransaction], in: store)
+
+        do {
+            _ = try await store.createAndMarkAwaitingSubmitPlan {
+                throw CancellationError()
+            }
+            XCTFail("Expected transaction creation to throw.")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        await loadAndRetain([], in: store)
+
+        let plan = await store.getSubmitPlan(for: staleTransaction.rawID)
+        XCTAssertNil(plan)
+    }
+
+    func testClearDuringCreationPreventsPlanFromBeingRecorded() async throws {
+        let transaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
+        let store = PendingSubmitPlanStore(logger: NullLogger())
+        let creationStarted = AsyncSignal()
+        let allowCreationToReturn = AsyncSignal()
+
+        let creationTask = Task {
+            await store.createAndMarkAwaitingSubmitPlan {
+                await creationStarted.signal()
+                await allowCreationToReturn.wait()
+                return [transaction]
+            }
+        }
+        await creationStarted.wait()
+
+        await store.clear()
+        await allowCreationToReturn.signal()
+        _ = await creationTask.value
+
+        let plan = await store.getSubmitPlan(for: transaction.rawID)
+        XCTAssertNil(plan)
+    }
+
     func testTxResubmissionSkipsTransactionsAwaitingSubmitPlan() async throws {
         let awaitingTransaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
         let legacyTransaction = makeTransaction(rawID: Data(repeating: 0xCD, count: 32))
@@ -212,18 +411,12 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         let transactionEncoder = RecordingTransactionEncoder()
         let store = PendingSubmitPlanStore(logger: NullLogger())
         let submitter = RecordingTransactionSubmitter()
-        let createCompleted = AsyncFlag()
-        var createTask: Task<Void, Never>?
+        let lookupStarted = AsyncSignal()
+        let allowLookupToReturn = AsyncSignal()
 
         transactionRepository.findForResubmissionUpToClosure = { _ in
-            createTask = Task {
-                await self.markAwaiting([createdTransaction], in: store)
-                await createCompleted.set()
-            }
-
-            try await Task.sleep(nanoseconds: 20_000_000)
-            let didCreateComplete = await createCompleted.get()
-            XCTAssertFalse(didCreateComplete)
+            await lookupStarted.signal()
+            await allowLookupToReturn.wait()
             return []
         }
 
@@ -237,13 +430,14 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
 
         let action = TxResubmissionAction(container: mockContainer)
         action.latestResolvedTime = 0
-        _ = try await action.run(with: resubmissionContext()) { _ in }
-
-        guard let createTask else {
-            XCTFail("Expected test to start concurrent transaction creation.")
-            return
+        let actionTask = Task {
+            try await action.run(with: resubmissionContext()) { _ in }
         }
-        await createTask.value
+        await lookupStarted.wait()
+
+        await markAwaiting([createdTransaction], in: store)
+        await allowLookupToReturn.signal()
+        _ = try await actionTask.value
 
         switch await store.getSubmitPlan(for: createdTransaction.rawID) {
         case .awaitingPlan:
@@ -355,6 +549,30 @@ private final class InMemorySubmitPlanPersistence: PendingSubmitPlanPersistence 
 
 private enum SubmitPlanPersistenceTestError: Error {
     case loadFailed
+}
+
+private actor AsyncSignal {
+    private var isSignaled = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        guard !isSignaled else { return }
+
+        isSignaled = true
+        let continuations = self.continuations
+        self.continuations = []
+        continuations.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        if isSignaled {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
 }
 
 private final class RecordingTransactionEncoder: TransactionEncoder {
