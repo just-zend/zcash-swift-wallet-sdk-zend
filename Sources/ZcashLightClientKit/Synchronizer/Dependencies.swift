@@ -168,7 +168,10 @@ enum Dependencies {
         }
 
         container.register(type: SubmitPlanExecutor.self, isSingleton: true) { di in
-            SubmitPlanExecutor(transactionSubmitter: di.resolve(TransactionSubmitter.self))
+            SubmitPlanExecutor(
+                transactionSubmitter: di.resolve(TransactionSubmitter.self),
+                logger: di.resolve(Logger.self)
+            )
         }
         
         container.register(type: TransactionEncoder.self, isSingleton: true) { di in

@@ -162,7 +162,7 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         mockContainer.mock(type: TransactionEncoder.self, isSingleton: true) { _ in transactionEncoder }
         mockContainer.mock(type: PendingSubmitPlanStore.self, isSingleton: true) { _ in store }
         mockContainer.mock(type: SubmitPlanExecutor.self, isSingleton: true) { _ in
-            SubmitPlanExecutor(transactionSubmitter: submitter)
+            SubmitPlanExecutor(transactionSubmitter: submitter, logger: NullLogger())
         }
         mockContainer.mock(type: Logger.self, isSingleton: true) { _ in NullLogger() }
 
@@ -190,7 +190,7 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         mockContainer.mock(type: TransactionEncoder.self, isSingleton: true) { _ in transactionEncoder }
         mockContainer.mock(type: PendingSubmitPlanStore.self, isSingleton: true) { _ in store }
         mockContainer.mock(type: SubmitPlanExecutor.self, isSingleton: true) { _ in
-            SubmitPlanExecutor(transactionSubmitter: submitter)
+            SubmitPlanExecutor(transactionSubmitter: submitter, logger: NullLogger())
         }
         mockContainer.mock(type: Logger.self, isSingleton: true) { _ in NullLogger() }
 
@@ -231,7 +231,7 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         mockContainer.mock(type: TransactionEncoder.self, isSingleton: true) { _ in transactionEncoder }
         mockContainer.mock(type: PendingSubmitPlanStore.self, isSingleton: true) { _ in store }
         mockContainer.mock(type: SubmitPlanExecutor.self, isSingleton: true) { _ in
-            SubmitPlanExecutor(transactionSubmitter: submitter)
+            SubmitPlanExecutor(transactionSubmitter: submitter, logger: NullLogger())
         }
         mockContainer.mock(type: Logger.self, isSingleton: true) { _ in NullLogger() }
 

@@ -87,9 +87,14 @@ final class EndpointTransactionSubmitter: TransactionSubmitter {
 
 final class SubmitPlanExecutor {
     private let transactionSubmitter: TransactionSubmitter
+    private let logger: Logger
 
-    init(transactionSubmitter: TransactionSubmitter) {
+    init(
+        transactionSubmitter: TransactionSubmitter,
+        logger: Logger
+    ) {
         self.transactionSubmitter = transactionSubmitter
+        self.logger = logger
     }
 
     func submit(
@@ -103,6 +108,9 @@ final class SubmitPlanExecutor {
                 try await transactionSubmitter.submit(transaction: transaction, to: endpoint)
                 return
             } catch {
+                logger.warn(
+                    "Submit plan endpoint \(endpoint.host):\(endpoint.port) failed: \(error)"
+                )
                 lastError = error
             }
         }
