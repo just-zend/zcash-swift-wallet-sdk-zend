@@ -67,6 +67,20 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         XCTAssertNil(plan)
     }
 
+    func testDoesNotOverwritePersistedSubmitPlansWhenLoadFails() async throws {
+        let persistence = InMemorySubmitPlanPersistence()
+        let originalData = Data("persisted submit plans".utf8)
+        let transaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
+        persistence.data = originalData
+        persistence.loadError = SubmitPlanPersistenceTestError.loadFailed
+        let store = PendingSubmitPlanStore(persistence: persistence, logger: NullLogger())
+
+        await markAwaiting([transaction], in: store)
+
+        XCTAssertEqual(persistence.saveCallCount, 0)
+        XCTAssertEqual(persistence.data, originalData)
+    }
+
     func testAddsSubmittedEndpointsToExistingPlan() async throws {
         let transaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
         let firstEndpoint = LightWalletEndpoint(address: "a.z.cash", port: 443, secure: true)
@@ -319,18 +333,28 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
 
 private final class InMemorySubmitPlanPersistence: PendingSubmitPlanPersistence {
     var data: Data?
+    var loadError: Error?
+    private(set) var saveCallCount = 0
 
     func load() throws -> Data? {
-        data
+        if let loadError {
+            throw loadError
+        }
+        return data
     }
 
     func save(_ data: Data) throws {
+        saveCallCount += 1
         self.data = data
     }
 
     func clear() throws {
         data = nil
     }
+}
+
+private enum SubmitPlanPersistenceTestError: Error {
+    case loadFailed
 }
 
 private final class RecordingTransactionEncoder: TransactionEncoder {

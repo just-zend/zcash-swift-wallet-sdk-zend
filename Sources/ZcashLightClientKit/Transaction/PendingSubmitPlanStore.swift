@@ -169,13 +169,13 @@ actor PendingSubmitPlanStore {
 
     private func loadFromPersistenceIfNeeded() {
         guard !loadedFromPersistence else { return }
-        defer { loadedFromPersistence = true }
 
         do {
             guard
                 let data = try persistence?.load(),
                 !data.isEmpty
             else {
+                loadedFromPersistence = true
                 return
             }
 
@@ -183,13 +183,38 @@ actor PendingSubmitPlanStore {
             guard storedPlans.version == StoredPlans.currentVersion else {
                 throw PendingSubmitPlanStoreError.unsupportedVersion(storedPlans.version)
             }
-            plansByTransactionId = storedPlans.plansByTransactionId
+            mergeLoadedPlans(storedPlans.plansByTransactionId)
+            loadedFromPersistence = true
         } catch {
             logger.warn("Failed to load pending submit plans: \(error)")
         }
     }
 
+    private func mergeLoadedPlans(_ loadedPlans: [String: [StoredEndpoint]]) {
+        guard !plansByTransactionId.isEmpty else {
+            plansByTransactionId = loadedPlans
+            return
+        }
+
+        var mergedPlans = loadedPlans
+        for (transactionId, currentEndpoints) in plansByTransactionId {
+            var endpoints = mergedPlans[transactionId] ?? []
+            currentEndpoints.forEach {
+                if !endpoints.contains($0) {
+                    endpoints.append($0)
+                }
+            }
+            mergedPlans[transactionId] = endpoints
+        }
+        plansByTransactionId = mergedPlans
+    }
+
     private func saveToPersistence() {
+        guard loadedFromPersistence else {
+            logger.warn("Skipping pending submit plan save because persisted plans have not loaded.")
+            return
+        }
+
         do {
             let storedPlans = StoredPlans(plansByTransactionId: plansByTransactionId)
             let data = try JSONEncoder().encode(storedPlans)
