@@ -23,6 +23,12 @@ struct TransactionSubmitPlan {
     }
 }
 
+/// Tracks submit plans for pending transactions created through `Broadcaster`.
+///
+/// Transactions start as waiting for submit endpoints, then the store records
+/// the endpoints used for submission so resubmission can retry through the same
+/// path. Plans are persisted across launches and pruned when their transactions
+/// are no longer resubmission candidates.
 actor PendingSubmitPlanStore {
     enum StoredSubmitPlan {
         case awaitingPlan
