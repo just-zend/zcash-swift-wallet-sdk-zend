@@ -6,6 +6,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+- New wallets now use the chain-tip tree state from the lightwalletd server as the wallet birthday, eliminating unnecessary block scanning on first launch. Falls back to the bundled checkpoint if the server is unreachable.
+
 # 2.5.1 - 2026-05-14
 
 ## Fixed
@@ -106,7 +109,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 - `Transport became inactive` connectivity issue.
-- `NIOHTTP2` connectivity issues. 
+- `NIOHTTP2` connectivity issues.
 
 ## Checkpoints
 
