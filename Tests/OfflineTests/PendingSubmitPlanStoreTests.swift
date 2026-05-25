@@ -81,6 +81,45 @@ final class PendingSubmitPlanStoreTests: ZcashTestCase {
         XCTAssertEqual(persistence.data, originalData)
     }
 
+    func testPersistsMergedInMemoryPlansAfterLoadRecovery() async throws {
+        let persistence = InMemorySubmitPlanPersistence()
+        let persistedTransaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
+        let recoveredTransaction = makeTransaction(rawID: Data(repeating: 0xCD, count: 32))
+        let persistedEndpoint = LightWalletEndpoint(address: "persisted.z.cash", port: 443, secure: true)
+        let recoveredEndpoint = LightWalletEndpoint(address: "recovered.z.cash", port: 443, secure: true)
+        let initialStore = PendingSubmitPlanStore(persistence: persistence, logger: NullLogger())
+
+        await markAwaiting([persistedTransaction], in: initialStore)
+        await initialStore.addSubmitEndpoint(transaction: persistedTransaction, endpoint: persistedEndpoint)
+        let saveCallCountAfterInitialStore = persistence.saveCallCount
+
+        persistence.loadError = SubmitPlanPersistenceTestError.loadFailed
+        let recoveryStore = PendingSubmitPlanStore(persistence: persistence, logger: NullLogger())
+        await markAwaiting([recoveredTransaction], in: recoveryStore)
+        await recoveryStore.addSubmitEndpoint(transaction: recoveredTransaction, endpoint: recoveredEndpoint)
+        XCTAssertEqual(persistence.saveCallCount, saveCallCountAfterInitialStore)
+
+        persistence.loadError = nil
+        _ = await recoveryStore.getSubmitPlan(for: persistedTransaction.rawID)
+
+        XCTAssertEqual(persistence.saveCallCount, saveCallCountAfterInitialStore + 1)
+        let reloadedStore = PendingSubmitPlanStore(persistence: persistence, logger: NullLogger())
+        switch await reloadedStore.getSubmitPlan(for: persistedTransaction.rawID) {
+        case .ready(let plan):
+            XCTAssertEqual(plan.endpoints.count, 1)
+            assertEndpoint(plan.endpoints[0], equals: persistedEndpoint)
+        default:
+            XCTFail("Expected persisted submit plan to survive load recovery.")
+        }
+        switch await reloadedStore.getSubmitPlan(for: recoveredTransaction.rawID) {
+        case .ready(let plan):
+            XCTAssertEqual(plan.endpoints.count, 1)
+            assertEndpoint(plan.endpoints[0], equals: recoveredEndpoint)
+        default:
+            XCTFail("Expected recovered in-memory submit plan to be persisted after load recovery.")
+        }
+    }
+
     func testAddsSubmittedEndpointsToExistingPlan() async throws {
         let transaction = makeTransaction(rawID: Data(repeating: 0xAB, count: 32))
         let firstEndpoint = LightWalletEndpoint(address: "a.z.cash", port: 443, secure: true)

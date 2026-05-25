@@ -279,33 +279,34 @@ private extension PendingSubmitPlanStore {
         guard !loadedFromPersistence else { return }
 
         do {
-            guard
-                let data = try persistence?.load(),
-                !data.isEmpty
-            else {
-                loadedFromPersistence = true
-                return
+            let shouldSaveAfterLoad: Bool
+            if let data = try persistence?.load(), !data.isEmpty {
+                let storedPlans = try JSONDecoder().decode(StoredPlans.self, from: data)
+                guard storedPlans.version == StoredPlans.currentVersion else {
+                    throw PendingSubmitPlanStoreError.unsupportedVersion(storedPlans.version)
+                }
+                shouldSaveAfterLoad = mergeLoadedPlans(storedPlans.plansByTransactionId)
+            } else {
+                shouldSaveAfterLoad = !plansByTransactionId.isEmpty
             }
 
-            let storedPlans = try JSONDecoder().decode(StoredPlans.self, from: data)
-            guard storedPlans.version == StoredPlans.currentVersion else {
-                throw PendingSubmitPlanStoreError.unsupportedVersion(storedPlans.version)
-            }
-            mergeLoadedPlans(storedPlans.plansByTransactionId)
             loadedFromPersistence = true
+            if shouldSaveAfterLoad {
+                saveToPersistence()
+            }
         } catch {
             logger.warn("Failed to load pending submit plans: \(error)")
         }
     }
 
-    private func mergeLoadedPlans(_ loadedPlans: [String: [StoredEndpoint]]) {
+    private func mergeLoadedPlans(_ loadedPlans: [String: [StoredEndpoint]]) -> Bool {
         let previousPlans = plansByTransactionId
         guard !plansByTransactionId.isEmpty else {
             plansByTransactionId = loadedPlans
             if previousPlans != plansByTransactionId {
                 bumpStoreRevision()
             }
-            return
+            return false
         }
 
         var mergedPlans = loadedPlans
@@ -322,6 +323,7 @@ private extension PendingSubmitPlanStore {
         if previousPlans != plansByTransactionId {
             bumpStoreRevision()
         }
+        return loadedPlans != plansByTransactionId
     }
 
     private func saveToPersistence() {
