@@ -119,16 +119,22 @@ class SDKBroadcaster: Broadcaster {
         to endpoint: LightWalletEndpoint
     ) async throws {
         // Record before submitting so transient endpoint failures keep the same retry plan.
-        if let transaction = try? await rawTransactionLookup?.find(rawTransaction: rawTransaction) {
-            await pendingSubmitPlanStore.addSubmitEndpoint(transaction: transaction, endpoint: endpoint)
-            try await transactionSubmitter.submit(
-                transaction: EncodedTransaction(transactionId: transaction.rawID, raw: rawTransaction),
-                to: endpoint
-            )
-        } else {
-            await pendingSubmitPlanStore.addSubmitEndpoint(rawTransaction: rawTransaction, endpoint: endpoint)
-            try await transactionSubmitter.submit(rawTransaction: rawTransaction, to: endpoint)
+        if let rawTransactionLookup = rawTransactionLookup {
+            do {
+                let transaction = try await rawTransactionLookup.find(rawTransaction: rawTransaction)
+                await pendingSubmitPlanStore.addSubmitEndpoint(transaction: transaction, endpoint: endpoint)
+                try await transactionSubmitter.submit(
+                    transaction: EncodedTransaction(transactionId: transaction.rawID, raw: rawTransaction),
+                    to: endpoint
+                )
+                return
+            } catch ZcashError.transactionRepositoryEntityNotFound {
+                // Fall back to raw submission for transactions that are not in the repository.
+            }
         }
+
+        await pendingSubmitPlanStore.addSubmitEndpoint(rawTransaction: rawTransaction, endpoint: endpoint)
+        try await transactionSubmitter.submit(rawTransaction: rawTransaction, to: endpoint)
     }
 
     private func createProposedTransactionsWithoutRegisteringSubmitPlan(

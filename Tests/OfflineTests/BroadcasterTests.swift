@@ -208,6 +208,47 @@ final class BroadcasterTests: ZcashTestCase {
         }
     }
 
+    func testSubmitFallsBackToRawSubmissionWhenRawTransactionIsNotFound() async throws {
+        let rawTransaction = Data([0x01, 0x02, 0x03, 0x04])
+        let transactionRepository = LookupTransactionRepository(result: .failure(ZcashError.transactionRepositoryEntityNotFound))
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [])
+        let service = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        defer { try? service.stop() }
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: transactionEncoder,
+            transactionRepository: transactionRepository
+        )
+
+        try await synchronizer.broadcaster.submit(rawTransaction, to: service.endpoint)
+
+        XCTAssertEqual(transactionRepository.receivedRawTransactions, [rawTransaction])
+        XCTAssertEqual(service.recordedTransactions(), [rawTransaction])
+    }
+
+    func testSubmitPropagatesRawTransactionLookupErrors() async throws {
+        let rawTransaction = Data([0x01, 0x02, 0x03, 0x04])
+        let transactionRepository = LookupTransactionRepository(result: .failure(BroadcasterTestError.rawLookupFailed))
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [])
+        let service = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        defer { try? service.stop() }
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: transactionEncoder,
+            transactionRepository: transactionRepository
+        )
+
+        do {
+            try await synchronizer.broadcaster.submit(rawTransaction, to: service.endpoint)
+            XCTFail("Expected raw transaction lookup failure to be propagated.")
+        } catch BroadcasterTestError.rawLookupFailed {
+            // Expected.
+        } catch {
+            XCTFail("Expected rawLookupFailed but got \(error).")
+        }
+
+        XCTAssertEqual(transactionRepository.receivedRawTransactions, [rawTransaction])
+        XCTAssertEqual(service.recordedTransactions(), [])
+    }
+
     func testBroadcasterThrowsWhenNotPrepared() async throws {
         let transactionEncoder = StubTransactionEncoder(createdTransactions: [])
         let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
@@ -465,6 +506,10 @@ final class BroadcasterTests: ZcashTestCase {
 
 // MARK: - Test Doubles
 
+private enum BroadcasterTestError: Error {
+    case rawLookupFailed
+}
+
 private final class StubTransactionEncoder: TransactionEncoder {
     private let createdTransactions: [ZcashTransaction.Overview]
     private let beforeReturningCreatedTransactions: () async -> Void
@@ -529,11 +574,15 @@ private final class StubTransactionEncoder: TransactionEncoder {
 }
 
 private final class LookupTransactionRepository: TransactionRepository, RawTransactionLookup {
-    private let transaction: ZcashTransaction.Overview
+    private let result: Result<ZcashTransaction.Overview, Error>
     private(set) var receivedRawTransactions: [Data] = []
 
     init(transaction: ZcashTransaction.Overview) {
-        self.transaction = transaction
+        result = .success(transaction)
+    }
+
+    init(result: Result<ZcashTransaction.Overview, Error>) {
+        self.result = result
     }
 
     func closeDBConnection() { }
@@ -602,7 +651,7 @@ private final class LookupTransactionRepository: TransactionRepository, RawTrans
 
     func find(rawTransaction: Data) async throws -> ZcashTransaction.Overview {
         receivedRawTransactions.append(rawTransaction)
-        return transaction
+        return try result.get()
     }
 }
 
