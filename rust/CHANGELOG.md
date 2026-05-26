@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 2.6.0-alpha.3 - 2026-05-26
+
 ### Changed
 - Pinned `zcash_voting` to `=0.10.1` for the pre-launch voting SQLite schema
   reset, crate-owned recovery store missing-row errors, required voting input
