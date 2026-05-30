@@ -6,15 +6,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-## 2.6.0-alpha.3 - 2026-05-26
+## 2.6.0-alpha.3 - 2026-05-27
 
-### Changed
-- Pinned `zcash_voting` to `=0.10.1` for the pre-launch voting SQLite schema
-  reset, crate-owned recovery store missing-row errors, required voting input
-  validation, paginated vote commitment tree sync responses with per-block
-  roots, and the shared Orchard note conversion used by
-  `zcashlc_voting_get_wallet_notes`. Dropped the unused round ID from
-  `zcashlc_voting_generate_hotkey`.
+### Added
+- Added dependency `zcash_voting 0.10` & supporting FFI methods.
 
 ## 2.5.0 - 2026-05-11
 
