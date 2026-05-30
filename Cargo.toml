@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "2.5.1"
+version = "2.6.0-alpha.3"
 authors = [
     "Jack Grigg <thestr4d@gmail.com>",
     "Lukas Korba <lukas@tangiblecodes.com>",
@@ -84,7 +84,7 @@ rust_decimal = { version = "1", default-features = false, features = ["c-repr"] 
 xz2 = { version = "0.1", features = ["static"] }
 
 # Voting
-zcash_voting = { version = "=0.10.1", default-features = false, features = [
+zcash_voting = { version = "0.10.1", default-features = false, features = [
     "client-pir",
     "client-tree-sync",
 ] }

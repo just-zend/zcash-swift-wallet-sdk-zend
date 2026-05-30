@@ -6,6 +6,27 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+- `Broadcaster` transactions now remain eligible for SDK automatic retry after submission. The SDK records the submitted endpoints privately and retries with those endpoints instead of the synchronizer's default endpoint.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3340000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3355000.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4010000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4030000.json
+````
+
 # 2.6.0-alpha.3 - 2026-05-26
 
 ## Changed
