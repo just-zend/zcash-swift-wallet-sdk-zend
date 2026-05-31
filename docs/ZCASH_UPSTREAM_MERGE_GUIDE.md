@@ -68,3 +68,23 @@ When conflicts occur:
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
+
+## Bleeding-edge snapshot (2026-05-31)
+
+Open upstream PRs assessed as not ready to carry right now:
+
+- `#1748` (`release/ffi-2.6.0-alpha.3`): non-draft but `BLOCKED` and tied to release sequencing.
+- `#1746` (`kris/1745-finish-release-workflow`): non-draft but `BLOCKED`, CI/release workflow heavy.
+- `#1737` (`adam/broadcaster-submit-plan`): non-draft but `DIRTY`; high-impact transaction-submit behavior.
+- `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview.
+- `#1700`, `#1638`, `#1637`, `#1592`, `#1579`, `#1443`: draft/WIP FFI and behavior changes with broad impact.
+- `#1692`, `#1672`, `#1570`, `#1505`: non-draft but currently `BLOCKED` or `DIRTY` in upstream.
+
+Unmerged upstream branches without open PRs (not carried):
+
+- `adam/update-zcash-voting-0.9.1-policy`: voting feature scope; no upstream PR/review thread yet.
+- `adam/voting-round-recovery-ffi`: voting recovery feature; no upstream PR/review thread yet.
+- `adam/voting-rust-lint-workflow`: workflow/lint only; limited direct Zend runtime value.
+- `ignore_worktrees`: housekeeping-only change; not urgent for Zend behavior.
+- `release-ci`: release branch integration artifact; not a clear standalone carry target.
+- `shielded-vote-2.4.10`: specialized voting branch with unclear Zend product priority.
