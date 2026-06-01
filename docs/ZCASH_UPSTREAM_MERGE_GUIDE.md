@@ -2,6 +2,8 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
+Last reviewed: 2026-06-01
+
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
@@ -44,7 +46,7 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-05-31)
+## Zend divergence notes (as of 2026-06-01)
 
 Current relationship from git graph:
 
@@ -69,7 +71,7 @@ When conflicts occur:
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
 
-## Bleeding-edge snapshot (2026-05-31)
+## Bleeding-edge snapshot (2026-06-01)
 
 Open upstream PRs assessed as not ready to carry right now:
 
@@ -79,6 +81,8 @@ Open upstream PRs assessed as not ready to carry right now:
 - `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview.
 - `#1700`, `#1638`, `#1637`, `#1592`, `#1579`, `#1443`: draft/WIP FFI and behavior changes with broad impact.
 - `#1692`, `#1672`, `#1570`, `#1505`: non-draft but currently `BLOCKED` or `DIRTY` in upstream.
+
+No candidate currently meets all carry criteria (ready + useful + low risk) for Zend ahead-of-upstream adoption.
 
 Unmerged upstream branches without open PRs (not carried):
 
