@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-01
+Last reviewed: 2026-06-02
 
 ## Remote and branch invariants
 
@@ -46,12 +46,12 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-01)
+## Zend divergence notes (as of 2026-06-02)
 
 Current relationship from git graph:
 
 - `upstream/main` commits missing in fork default branch: `0`
-- Fork default branch commits not present in `upstream/main`: `25`
+- Fork default branch commits not present in `upstream/main`: `29`
 
 Notable fork-ahead work currently on `origin/main` includes:
 
@@ -71,7 +71,7 @@ When conflicts occur:
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
 
-## Bleeding-edge snapshot (2026-06-01)
+## Bleeding-edge snapshot (2026-06-02)
 
 Open upstream PRs assessed as not ready to carry right now:
 
@@ -82,7 +82,7 @@ Open upstream PRs assessed as not ready to carry right now:
 - `#1700`, `#1638`, `#1637`, `#1592`, `#1579`, `#1443`: draft/WIP FFI and behavior changes with broad impact.
 - `#1692`, `#1672`, `#1570`, `#1505`: non-draft but currently `BLOCKED` or `DIRTY` in upstream.
 
-No candidate currently meets all carry criteria (ready + useful + low risk) for Zend ahead-of-upstream adoption.
+No candidate currently meets all carry criteria (ready + useful + low risk) for Zend ahead-of-upstream adoption. The 2026-06-02 upstream PR list and unmerged-branch scan did not surface any new ready-to-carry work.
 
 Unmerged upstream branches without open PRs (not carried):
 
