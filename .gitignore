@@ -89,3 +89,4 @@ BuildSupport/products/
 # Claude code
 .claude/settings.local.json
 .remember/
+.worktrees/
