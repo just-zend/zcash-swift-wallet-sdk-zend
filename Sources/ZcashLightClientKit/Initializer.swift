@@ -461,14 +461,19 @@ public class Initializer {
                 }
             case .newWallet:
                 if let latestBlockHeight = try? await lightWalletService.latestBlockHeight(mode: await sdkFlags.ifTor(.uniqueTor)) {
-                    // Fetch the tree state at the chain tip so the birthday equals chain_tip + 1,
-                    // producing zero scan ranges. This eliminates unnecessary block scanning for
-                    // wallets with no transaction history.
-                    var blockID = BlockID()
-                    blockID.height = UInt64(latestBlockHeight)
+                    // Fetch a recent tree state below the reorg horizon so funds intended for the
+                    // wallet can't be missed if the current chain tip is reorganized.
+                    let birthdayTreeStateHeight = max(
+                        latestBlockHeight - ZcashSDK.maxReorgSize,
+                        network.constants.saplingActivationHeight
+                    )
+                    let blockID = BlockID(height: UInt64(birthdayTreeStateHeight))
                     if let serverTreeState = try? await lightWalletService.getTreeState(blockID, mode: await sdkFlags.ifTor(.uniqueTor)) {
                         accountTreeState = serverTreeState
-                        self.walletBirthday = latestBlockHeight
+                        // Not using birthdayTreeStateHeight directly just in case that something is wrong and server returns different height for
+                        // tree state. At 99.9999999% of cases `birthdayTreeStateHeight` and `serverTreeState.height` will be the same. In those
+                        // other cases this makes sure that there is no inconsistency between rust and `self.walletBirthday`.
+                        self.walletBirthday = BlockHeight(serverTreeState.height)
                     }
                 }
             case .existingWallet:

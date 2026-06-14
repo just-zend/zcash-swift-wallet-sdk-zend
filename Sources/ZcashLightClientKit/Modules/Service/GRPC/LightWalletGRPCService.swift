@@ -218,7 +218,10 @@ class LightWalletGRPCService: LightWalletService {
             throw ZcashError.grpcServiceCalledWithTorMode
         }
 
-        let stream = compactTxStreamer.getBlockRange(range.blockRange())
+        let stream = compactTxStreamer.getBlockRange(
+            range.blockRange(),
+            callOptions: Self.callOptions(timeLimit: self.streamingCallTimeout)
+        )
         var iterator = stream.makeAsyncIterator()
         
         return AsyncThrowingStream() {
@@ -314,7 +317,10 @@ class LightWalletGRPCService: LightWalletService {
             utxoArgs.addresses = tAddresses
             utxoArgs.startHeight = UInt64(height)
         }
-        let stream = compactTxStreamer.getAddressUtxosStream(args)
+        let stream = compactTxStreamer.getAddressUtxosStream(
+            args,
+            callOptions: Self.callOptions(timeLimit: self.streamingCallTimeout)
+        )
         var iterator = stream.makeAsyncIterator()
 
         return AsyncThrowingStream() {
@@ -384,7 +390,10 @@ class LightWalletGRPCService: LightWalletService {
             throw ZcashError.grpcServiceCalledWithTorMode
         }
 
-        let stream = compactTxStreamer.getSubtreeRoots(request)
+        let stream = compactTxStreamer.getSubtreeRoots(
+            request,
+            callOptions: Self.callOptions(timeLimit: self.streamingCallTimeout)
+        )
         var iterator = stream.makeAsyncIterator()
         
         return AsyncThrowingStream() {
@@ -411,7 +420,10 @@ class LightWalletGRPCService: LightWalletService {
             throw ZcashError.grpcServiceCalledWithTorMode
         }
 
-        let stream = compactTxStreamer.getTaddressTxids(request)
+        let stream = compactTxStreamer.getTaddressTxids(
+            request,
+            callOptions: Self.callOptions(timeLimit: self.streamingCallTimeout)
+        )
         var iterator = stream.makeAsyncIterator()
         
         return AsyncThrowingStream() {
