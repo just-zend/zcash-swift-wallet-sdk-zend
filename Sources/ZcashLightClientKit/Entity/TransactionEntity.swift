@@ -141,8 +141,7 @@ extension ZcashTransaction.Output {
             
             if
                 let outputRecipient = try row.get(Column.toAddress),
-                let metadata = DerivationTool.getAddressMetadata(outputRecipient)
-            {
+                let metadata = DerivationTool.getAddressMetadata(outputRecipient) {
                 recipient = TransactionRecipient.address(try Recipient(outputRecipient, network: metadata.networkType))
             } else if let toAccount = try row.get(Column.toAccount) {
                 recipient = .internalAccount(AccountUUID(id: [UInt8](Data(blob: toAccount))))
