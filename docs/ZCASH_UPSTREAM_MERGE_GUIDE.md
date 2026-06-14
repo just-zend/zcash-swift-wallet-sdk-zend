@@ -60,7 +60,7 @@ Notable fork-ahead work currently on `origin/main` includes:
 - New-wallet birthday behavior from the `[#1673]` lineage, now reconciled with upstream's reorg-safe follow-up on the June 14 parity branch.
 - Voting-related Zend SDK additions that remain ahead of upstream.
 
-Implication: `origin/main` trails upstream by the post-`2.6.0-alpha.4` release and transaction-state fixes. The active branch `codex/zcash-upstream-sync-2026-06-14` contains `upstream/main` through `4dded75b` while preserving Zend's binary target URL/checksum in `Package.swift`.
+Implication: `origin/main` trails upstream by the post-`2.6.0-alpha.4` release and transaction-state fixes. The active branch `codex/zcash-upstream-sync-2026-06-14` contains `upstream/main` through `4dded75b` while preserving Zend's binary target URL/checksum in `Package.swift`. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: this branch prepares the next Zend SDK patch section (`2.6.2`) without remapping `libzcashlc` or the binary artifact URL to that SDK version.
 
 ## Conflict resolution heuristics
 
@@ -91,7 +91,7 @@ Merged upstream default-branch delta now pending in Zend fork default branch and
 Zend parity branch note:
 
 - `codex/zcash-upstream-sync-2026-06-14` merges `upstream/main` through `4dded75b`.
-- Conflict resolution was limited to `CHANGELOG.md`: kept Zend's broadcaster retry note under `Unreleased`, added upstream new-wallet and expired-transaction notes, and kept the upstream `2.6.0-alpha.5` release section.
+- Conflict resolution was limited to `CHANGELOG.md`: moved the already-tagged Zend broadcaster retry note into `2.6.1`, added upstream new-wallet, streaming-timeout, and expired-transaction notes under the Zend SDK `2.6.2` patch section, and did not remap the upstream `2.6.0-alpha.5` SDK release number onto this fork.
 - `Package.swift` has no diff from `origin/main`, so the SDK still downloads Zend's fork-specific `2.6.0-alpha.3` XCFramework release.
 
 Open upstream PRs assessed as not ready to carry right now:
