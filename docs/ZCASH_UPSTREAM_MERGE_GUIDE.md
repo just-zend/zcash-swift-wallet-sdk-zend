@@ -96,6 +96,7 @@ Zend parity branch note:
 
 Open upstream PRs assessed as not ready to carry right now:
 
+- `#1761` (`harry/enhance-failure-backoff`): non-draft and relevant to stuck transaction enhancement, but `BLOCKED` with review required; wait for upstream review/merge.
 - `#1760` (`harry/fix-resubmit-race-on-first-sync`): non-draft and relevant to resubmission behavior, but `BLOCKED` with review required; wait for upstream review/merge.
 - `#1759` (`harry/treat-already-in-mempool-as-success`): non-draft and related to submit handling, but `BLOCKED` with review required; wait for upstream review/merge.
 - `#1758` (`dependabot/swift/github.com/apple/swift-nio-2.101.0`): non-draft dependency bump, but `BLOCKED` with review required; not worth carrying independently before upstream acceptance.
