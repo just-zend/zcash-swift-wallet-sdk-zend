@@ -45,7 +45,7 @@ if [[ -z "$1" ]]; then
 fi
 
 VERSION="$1"
-REPO="zcash/zcash-swift-wallet-sdk"
+REPO="just-zend/zcash-swift-wallet-sdk-zend"
 PRODUCTS_DIR="BuildSupport/products"
 ZIP_FILE="libzcashlc.xcframework.zip"
 
@@ -135,7 +135,7 @@ echo "   git add Package.swift"
 echo "   git commit -m \"Prepare ffi release for sdk version ${VERSION}\""
 echo ""
 echo "3. Push:"
-echo "   git push -u upstream release/ffi-${VERSION}"
+echo "   git push -u origin release/ffi-${VERSION}"
 echo ""
 echo "4. Once release/ffi-${VERSION} has merged to the SDK release branch, create the signed tag:"
 echo "   git tag -s ${VERSION} -m \"Release ${VERSION}\""

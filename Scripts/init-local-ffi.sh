@@ -36,10 +36,10 @@ if [[ "$MACOS_ONLY" == "true" ]]; then
     ./Scripts/rebuild-local-ffi.sh macos
 elif [[ "$USE_CACHED" == "true" ]]; then
     echo "Downloading pre-built xcframework..."
-    REPO="zcash/zcash-swift-wallet-sdk"
+    REPO="just-zend/zcash-swift-wallet-sdk-zend"
 
     # Extract the version from the download URL in Package.swift
-    SDK_VERSION=$(grep -oE 'releases/download/[0-9]+\.[0-9]+\.[0-9]+' Package.swift | head -1 | sed 's|releases/download/||')
+    SDK_VERSION=$(grep -oE 'releases/download/[^/"]+' Package.swift | head -1 | sed 's|releases/download/||')
     if [[ -z "$SDK_VERSION" ]]; then
         echo "Error: Could not determine SDK version from Package.swift"
         exit 1
