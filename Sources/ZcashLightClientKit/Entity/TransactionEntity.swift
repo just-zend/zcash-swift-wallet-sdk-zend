@@ -24,7 +24,8 @@ public enum ZcashTransaction {
             init(
                 currentHeight: BlockHeight,
                 minedHeight: BlockHeight?,
-                expiredUnmined: Bool?
+                expiredUnmined: Bool?,
+                expiryHeight: BlockHeight? = nil
             ) {
                 guard let expiredUnmined, !expiredUnmined else {
                     self = .expired
@@ -36,7 +37,13 @@ public enum ZcashTransaction {
                 } else if let minedHeight, (currentHeight - minedHeight) < ZcashSDK.defaultStaleTolerance {
                     self = .pending
                 } else if minedHeight == nil {
-                    self = .pending
+                    // Fallback for when `expired_unmined` lags: a tx whose expiry has passed
+                    // is physically unminable regardless of column state.
+                    if let expiryHeight, expiryHeight > 0, currentHeight >= expiryHeight {
+                        self = .expired
+                    } else {
+                        self = .pending
+                    }
                 } else {
                     self = .expired
                 }
@@ -134,8 +141,7 @@ extension ZcashTransaction.Output {
             
             if
                 let outputRecipient = try row.get(Column.toAddress),
-                let metadata = DerivationTool.getAddressMetadata(outputRecipient)
-            {
+                let metadata = DerivationTool.getAddressMetadata(outputRecipient) {
                 recipient = TransactionRecipient.address(try Recipient(outputRecipient, network: metadata.networkType))
             } else if let toAccount = try row.get(Column.toAccount) {
                 recipient = .internalAccount(AccountUUID(id: [UInt8](Data(blob: toAccount))))
@@ -245,7 +251,8 @@ public extension ZcashTransaction.Overview {
         State(
             currentHeight: currentHeight,
             minedHeight: minedHeight,
-            expiredUnmined: self.isExpiredUmined
+            expiredUnmined: self.isExpiredUmined,
+            expiryHeight: self.expiryHeight
         )
     }
 
