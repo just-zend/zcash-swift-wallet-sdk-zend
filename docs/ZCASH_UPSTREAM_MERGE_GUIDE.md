@@ -48,10 +48,11 @@ If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked r
 
 ## Zend divergence notes (as of 2026-06-16)
 
-Current relationship from the `codex/zcash-upstream-release-2.6.3` release branch after merging upstream `main` through `04383463` (`#1757`, `#1759`):
+Current relationship after Zend PR `#12` merged `codex/zcash-upstream-release-2.6.3` into `origin/main`:
 
-- `upstream/main` commits missing in release branch: `0`
+- `origin/main...upstream/main`: `48 0` after fetching both remotes on 2026-06-16.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
+- `upstream/main` currently points at `04383463` (`#1757` multi-server submission); those upstream SDK fixes are already present in `origin/main`.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -61,7 +62,7 @@ Notable fork-ahead work currently preserved includes:
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: merge this release branch before cutting Zend SDK `2.6.3`; after merge, Zend will contain upstream `main` through `04383463` and will no longer reject reachable NU6.2 servers because of the stale `2.6.0-alpha.3` binary artifact. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while the bundled Rust crate version remains `2.6.0-alpha.4`.
+Implication: no default-branch parity PR is needed while the right-side count remains `0`. Zend now contains upstream `main` through `04383463` and should not reuse the stale `2.6.0-alpha.3` binary artifact for post-NU6.2 Zend iOS work. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while the bundled Rust crate version remains `2.6.0-alpha.4`.
 
 ## Conflict resolution heuristics
 
@@ -76,13 +77,14 @@ When conflicts occur:
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
-- `#1759`: verify submit failures against the server and treat already-known transactions as accepted.
-- `#1757`: multi-server transaction submission and persisted submit plans.
-- These are merged into the `codex/zcash-upstream-release-2.6.3` release branch. Before the branch lands on `main`, `git rev-list --left-right --count origin/main...upstream/main` returns `45 23`; from the release branch, the right-side count against `upstream/main` is `0`.
+- None. `git rev-list --left-right --count origin/main...upstream/main` returns `48 0`.
+- `#1759`: verify submit failures against the server and treat already-known transactions as accepted, already merged into Zend via PR `#12`.
+- `#1757`: multi-server transaction submission and persisted submit plans, already merged into Zend via PR `#12`.
 
 Zend parity branch note:
 
-- `codex/zcash-upstream-release-2.6.3` merges upstream `main` through `04383463`, removes stale Zend-only `PendingSubmitPlanStore` files that were superseded by upstream's `SubmitPlanStore`, and updates `Package.swift` to the Zend-hosted `2.6.3` XCFramework.
+- `codex/zcash-upstream-release-2.6.3` was merged by Zend PR `#12` and the remote branch has been removed.
+- PR `#12` merged upstream `main` through `04383463`, removed stale Zend-only `PendingSubmitPlanStore` files that were superseded by upstream's `SubmitPlanStore`, and updated `Package.swift` to the Zend-hosted `2.6.3` XCFramework.
 - The old `2.6.0-alpha.3` XCFramework returned local consensus branch `4dec4df0` at current mainnet/testnet heights while live lightwalletd servers report `5437f330`; do not reuse that binary for Zend iOS after NU6.2.
 
 Open upstream PRs assessed as not ready to carry right now:
@@ -90,7 +92,7 @@ Open upstream PRs assessed as not ready to carry right now:
 - `#1764` (`michal/MOB-1039-multiserver-changelog`): small changelog-only follow-up, approved but still `BLOCKED`; not required for Zend because the fork changelog documents the multi-server submission merge in `2.6.3`.
 - `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, `BLOCKED`, and touches Tor/exchange-rate concurrency with explicit remaining lifecycle-race scope; wait for upstream to finish review and device confirmation.
 - `#1761` (`harry/enhance-failure-backoff`): non-draft and relevant to stuck transaction enhancement, but `BLOCKED` with changes requested; wait for upstream review/merge.
-- `#1760` (`harry/fix-resubmit-race-on-first-sync`): non-draft and relevant to resubmission behavior, and CI is green after a force-push, but it is still `BLOCKED` with changes requested; wait for upstream review/merge.
+- `#1760` (`harry/fix-resubmit-race-on-first-sync`): non-draft and relevant to resubmission behavior, but it is `DIRTY` with changes requested; wait for upstream review/merge.
 - `#1758` (`dependabot/swift/github.com/apple/swift-nio-2.101.0`): non-draft dependency bump, but `BLOCKED` with review required; not worth carrying independently before upstream acceptance.
 - `#1746` (`kris/1745-finish-release-workflow`): non-draft but `DIRTY`, review required, and CI/release-workflow heavy.
 - `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview.
@@ -103,12 +105,13 @@ No candidate currently meets all carry criteria (ready + useful + low risk) for 
 
 Unmerged upstream branches without open PRs (not carried):
 
-- `adam/update-zcash-voting-0.9.1-policy`: 1 commit ahead and 30 behind `upstream/main`; voting feature scope with no upstream PR/review thread yet.
-- `adam/voting-round-recovery-ffi`: 1 commit ahead and 139 behind `upstream/main`; voting recovery FFI with no upstream PR/review thread yet.
-- `adam/voting-rust-lint-workflow`: 1 commit ahead and 140 behind `upstream/main`; workflow/lint only and limited direct Zend runtime value.
-- `ignore_worktrees`: 1 commit ahead and 34 behind `upstream/main`; housekeeping-only change.
-- `maint/v2.5.x`: 0 commits ahead and 120 behind `upstream/main`; maintenance line, no standalone carry.
-- `release-ci`: 4 commits ahead and 112 behind `upstream/main`; release branch integration artifact, not a clear standalone carry target.
-- `release/2.6.0`: 0 commits ahead and 123 behind `upstream/main`; upstream release stabilization branch, wait for upstream release sequencing.
-- `roman/voting-delegation-workflow-swift-wrappers`: 0 commits ahead and 99 behind `upstream/main`; voting wrapper branch without an upstream PR/review thread yet.
-- `shielded-vote-2.4.10`: 1 commit ahead and 57 behind `upstream/main`; specialized voting branch with unclear Zend product priority.
+- `adam/update-zcash-voting-0.9.1-policy`: 1 commit ahead and 53 behind `upstream/main`; voting feature scope with no upstream PR/review thread yet.
+- `adam/voting-round-recovery-ffi`: 1 commit ahead and 162 behind `upstream/main`; voting recovery FFI with no upstream PR/review thread yet.
+- `adam/voting-rust-lint-workflow`: 1 commit ahead and 163 behind `upstream/main`; workflow/lint only and limited direct Zend runtime value.
+- `adam/broadcaster-submit-plan`: 14 commits ahead and 57 behind `upstream/main`; no upstream PR, and the commits are already contained in `origin/main` from Zend PR `#2` before being superseded by upstream's `SubmitPlanStore` work in `#1757`.
+- `ignore_worktrees`: 1 commit ahead and 57 behind `upstream/main`; housekeeping-only change.
+- `maint/v2.5.x`: 0 commits ahead and 143 behind `upstream/main`; maintenance line, no standalone carry.
+- `release-ci`: 4 commits ahead and 135 behind `upstream/main`; release branch integration artifact, not a clear standalone carry target.
+- `release/2.6.0`: 0 commits ahead and 146 behind `upstream/main`; upstream release stabilization branch, wait for upstream release sequencing.
+- `roman/voting-delegation-workflow-swift-wrappers`: 0 commits ahead and 122 behind `upstream/main`; voting wrapper branch without an upstream PR/review thread yet.
+- `shielded-vote-2.4.10`: 1 commit ahead and 80 behind `upstream/main`; specialized voting branch with unclear Zend product priority.
