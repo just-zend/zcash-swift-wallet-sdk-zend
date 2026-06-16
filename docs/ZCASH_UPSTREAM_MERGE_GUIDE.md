@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-15
+Last reviewed: 2026-06-16
 
 ## Remote and branch invariants
 
@@ -46,22 +46,22 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-15)
+## Zend divergence notes (as of 2026-06-16)
 
-Current relationship from git graph after the June 14 parity and release-helper PRs landed:
+Current relationship from the `codex/zcash-upstream-release-2.6.3` release branch after merging upstream `main` through `04383463` (`#1757`, `#1759`):
 
-- `upstream/main` commits missing in fork default branch: `0`
-- Fork default branch commits not present in `upstream/main`: `43`
+- `upstream/main` commits missing in release branch: `0`
+- Fork-specific Zend commits remain ahead of `upstream/main`.
 
-Notable fork-ahead work currently on `origin/main` includes:
+Notable fork-ahead work currently preserved includes:
 
-- Zend-specific `2.6.0-alpha.3` XCFramework release wiring in `Package.swift`; keep this fork artifact until Zend publishes a newer forked XCFramework.
-- Broadcaster submit-plan recovery behavior carried from the prior Zend branch lineage.
+- Zend-specific XCFramework release wiring in `Package.swift`; the `2.6.3` package pin is a Zend-hosted artifact built from `libzcashlc` `2.6.0-alpha.4` sources so the local consensus branch ID matches NU6.2 lightwalletd servers.
+- Upstream's new multi-server broadcaster submission model from `#1757`, which supersedes Zend's earlier pending-submit-plan carry.
 - New-wallet birthday behavior from the `[#1673]` lineage, now reconciled with upstream's reorg-safe follow-up.
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: no parity branch is needed for upstream default-branch commits as of this review. `origin/main` contains `upstream/main` through `4dded75b` (`#1756`) and includes the merged June 14 Zend parity and release-helper work. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.2` does not imply that `libzcashlc` or the binary artifact URL should be remapped to `2.6.2`.
+Implication: merge this release branch before cutting Zend SDK `2.6.3`; after merge, Zend will contain upstream `main` through `04383463` and will no longer reject reachable NU6.2 servers because of the stale `2.6.0-alpha.3` binary artifact. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while the bundled Rust crate version remains `2.6.0-alpha.4`.
 
 ## Conflict resolution heuristics
 
@@ -72,27 +72,27 @@ When conflicts occur:
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
-## Bleeding-edge snapshot (2026-06-15)
+## Bleeding-edge snapshot (2026-06-16)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
-- None. `git rev-list --left-right --count origin/main...upstream/main` returned `43 0`.
+- `#1759`: verify submit failures against the server and treat already-known transactions as accepted.
+- `#1757`: multi-server transaction submission and persisted submit plans.
+- These are merged into the `codex/zcash-upstream-release-2.6.3` release branch. Before the branch lands on `main`, `git rev-list --left-right --count origin/main...upstream/main` returns `45 23`; from the release branch, the right-side count against `upstream/main` is `0`.
 
 Zend parity branch note:
 
-- `codex/zcash-upstream-sync-2026-06-14` and the stacked release-helper fix have landed on `origin/main` through PRs `#9` and `#10`.
-- `Package.swift` still downloads Zend's fork-specific `2.6.0-alpha.3` XCFramework release. Do not infer the binary artifact version from the Zend SDK tag.
+- `codex/zcash-upstream-release-2.6.3` merges upstream `main` through `04383463`, removes stale Zend-only `PendingSubmitPlanStore` files that were superseded by upstream's `SubmitPlanStore`, and updates `Package.swift` to the Zend-hosted `2.6.3` XCFramework.
+- The old `2.6.0-alpha.3` XCFramework returned local consensus branch `4dec4df0` at current mainnet/testnet heights while live lightwalletd servers report `5437f330`; do not reuse that binary for Zend iOS after NU6.2.
 
 Open upstream PRs assessed as not ready to carry right now:
 
+- `#1764` (`michal/MOB-1039-multiserver-changelog`): small changelog-only follow-up, approved but still `BLOCKED`; not required for Zend because the fork changelog documents the multi-server submission merge in `2.6.3`.
 - `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, `BLOCKED`, and touches Tor/exchange-rate concurrency with explicit remaining lifecycle-race scope; wait for upstream to finish review and device confirmation.
 - `#1761` (`harry/enhance-failure-backoff`): non-draft and relevant to stuck transaction enhancement, but `BLOCKED` with changes requested; wait for upstream review/merge.
 - `#1760` (`harry/fix-resubmit-race-on-first-sync`): non-draft and relevant to resubmission behavior, and CI is green after a force-push, but it is still `BLOCKED` with changes requested; wait for upstream review/merge.
-- `#1759` (`harry/treat-already-in-mempool-as-success`): non-draft and related to submit handling, but `BLOCKED` with changes requested; wait for upstream review/merge.
 - `#1758` (`dependabot/swift/github.com/apple/swift-nio-2.101.0`): non-draft dependency bump, but `BLOCKED` with review required; not worth carrying independently before upstream acceptance.
-- `#1757` (`michal/mob-1039-multiserver-submission`): draft, `DIRTY`, large breaking broadcaster/submit-plan redesign.
 - `#1746` (`kris/1745-finish-release-workflow`): non-draft but `DIRTY`, review required, and CI/release-workflow heavy.
-- `#1737` (`adam/broadcaster-submit-plan`): non-draft but `DIRTY`, review required, and high-impact transaction-submit behavior now superseded by `#1757`.
 - `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview.
 - `#1700`, `#1638`, `#1637`, `#1592`, `#1579`, `#1443`: draft/WIP FFI and behavior changes with broad impact; several are also `DIRTY` or have requested changes.
 - `#1692`: non-draft but `BLOCKED` and still review required.
