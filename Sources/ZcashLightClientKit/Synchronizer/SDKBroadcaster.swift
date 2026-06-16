@@ -2,186 +2,173 @@
 //  SDKBroadcaster.swift
 //  ZcashLightClientKit
 //
-//  Created by Adam Tucker on 2026-04-15.
-//
 
 import Combine
 import Foundation
 
-class SDKBroadcaster: Broadcaster {
+final class SDKBroadcaster: Broadcaster {
     private let transactionEncoder: TransactionEncoder
     private let initializer: Initializer
     private let logger: Logger
     private let eventSubject: PassthroughSubject<SynchronizerEvent, Never>
+    private let submitPlanStore: SubmitPlanStoring
+    private let multiEndpointSubmitter: MultiEndpointSubmitter
     private let statusCheck: () throws -> Void
-    private let pendingSubmitPlanStore: PendingSubmitPlanStore
-    private let transactionSubmitter: TransactionSubmitter
-    private let rawTransactionLookup: RawTransactionLookup?
 
     init(
         transactionEncoder: TransactionEncoder,
         initializer: Initializer,
         logger: Logger,
         eventSubject: PassthroughSubject<SynchronizerEvent, Never>,
-        pendingSubmitPlanStore: PendingSubmitPlanStore,
-        transactionSubmitter: TransactionSubmitter,
-        rawTransactionLookup: RawTransactionLookup?,
+        submitPlanStore: SubmitPlanStoring,
+        multiEndpointSubmitter: MultiEndpointSubmitter,
         statusCheck: @escaping () throws -> Void
     ) {
         self.transactionEncoder = transactionEncoder
         self.initializer = initializer
         self.logger = logger
         self.eventSubject = eventSubject
-        self.pendingSubmitPlanStore = pendingSubmitPlanStore
-        self.transactionSubmitter = transactionSubmitter
-        self.rawTransactionLookup = rawTransactionLookup
+        self.submitPlanStore = submitPlanStore
+        self.multiEndpointSubmitter = multiEndpointSubmitter
         self.statusCheck = statusCheck
     }
+
+    // MARK: - Broadcaster conformance
 
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey
-    ) async throws -> [ZcashTransaction.Overview] {
-        try statusCheck()
-
-        try await SaplingParameterDownloader.downloadParamsIfnotPresent(
-            spendURL: initializer.spendParamsURL,
-            spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
-            outputURL: initializer.outputParamsURL,
-            outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: logger
-        )
-
-        let transactions = try await pendingSubmitPlanStore.createAndMarkAwaitingSubmitPlan {
-            try await transactionEncoder.createProposedTransactions(
-                proposal: proposal,
-                spendingKey: spendingKey
-            )
-        }
-        sendFoundTransactionsEvent(transactions)
-
-        return transactions
-    }
-
-    func createProposedTransactionsForLegacySubmit(
-        proposal: Proposal,
-        spendingKey: UnifiedSpendingKey
-    ) async throws -> [ZcashTransaction.Overview] {
-        let transactions = try await createProposedTransactionsWithoutRegisteringSubmitPlan(
-            proposal: proposal,
-            spendingKey: spendingKey
-        )
-        sendFoundTransactionsEvent(transactions)
-        return transactions
+    ) async throws -> [CreatedTransaction] {
+        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, recordingPlans: true)
     }
 
     func createTransactionFromPCZT(
         pcztWithProofs: Pczt,
         pcztWithSigs: Pczt
-    ) async throws -> [ZcashTransaction.Overview] {
-        try statusCheck()
-
-        try await SaplingParameterDownloader.downloadParamsIfnotPresent(
-            spendURL: initializer.spendParamsURL,
-            spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
-            outputURL: initializer.outputParamsURL,
-            outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: logger
-        )
-
-        let transactions = try await pendingSubmitPlanStore.createAndMarkAwaitingSubmitPlan {
-            let txId = try await initializer.rustBackend.extractAndStoreTxFromPCZT(
-                pcztWithProofs: pcztWithProofs,
-                pcztWithSigs: pcztWithSigs
-            )
-
-            return try await transactionEncoder.fetchTransactionsForTxIds([txId])
-        }
-        sendFoundTransactionsEvent(transactions)
-
-        return transactions
-    }
-
-    func createTransactionFromPCZTForLegacySubmit(
-        pcztWithProofs: Pczt,
-        pcztWithSigs: Pczt
-    ) async throws -> [ZcashTransaction.Overview] {
-        let transactions = try await createTransactionFromPCZTWithoutRegisteringSubmitPlan(
-            pcztWithProofs: pcztWithProofs,
-            pcztWithSigs: pcztWithSigs
-        )
-        sendFoundTransactionsEvent(transactions)
-        return transactions
+    ) async throws -> [CreatedTransaction] {
+        try await createTransactionFromPCZT(pcztWithProofs: pcztWithProofs, pcztWithSigs: pcztWithSigs, recordingPlans: true)
     }
 
     func submit(
-        _ rawTransaction: Data,
-        to endpoint: LightWalletEndpoint
-    ) async throws {
-        // Record before submitting so transient endpoint failures keep the same retry plan.
-        if let rawTransactionLookup = rawTransactionLookup {
-            do {
-                let transaction = try await rawTransactionLookup.find(rawTransaction: rawTransaction)
-                await pendingSubmitPlanStore.addSubmitEndpoint(transaction: transaction, endpoint: endpoint)
-                try await transactionSubmitter.submit(
-                    transaction: EncodedTransaction(transactionId: transaction.rawID, raw: rawTransaction),
-                    to: endpoint
-                )
-                return
-            } catch ZcashError.transactionRepositoryEntityNotFound {
-                // Fall back to raw submission for transactions that are not in the repository.
-            }
+        transaction: CreatedTransaction,
+        to endpoints: [LightWalletEndpoint],
+        timing: SubmissionTiming
+    ) async -> TransactionSubmissionOutcome {
+        let txId = transaction.txId.toHexStringTxId()
+
+        guard !endpoints.isEmpty else {
+            logger.debug("Transaction \(txId) submit requested with no endpoints; nothing sent, transaction stays awaiting.")
+            return .unreachable
         }
 
-        await pendingSubmitPlanStore.addSubmitEndpoint(rawTransaction: rawTransaction, endpoint: endpoint)
-        try await transactionSubmitter.submit(rawTransaction: rawTransaction, to: endpoint)
+        let endpointList = endpoints.map { "\($0.host):\($0.port)" }.joined(separator: ", ")
+        logger.debug("Transaction \(txId) submitting to \(endpoints.count) endpoint(s): \(endpointList).")
+
+        // Record before any network attempt so a cancelled or timed-out race
+        // still leaves the intended retry plan behind.
+        await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
+
+        let outcome = await multiEndpointSubmitter.submit(transaction: transaction, to: endpoints, timing: timing)
+        logger.debug("Transaction \(txId) submission \(outcome.logDescription).")
+        return outcome
     }
 
-    private func createProposedTransactionsWithoutRegisteringSubmitPlan(
+    func submit(
+        transactions: [CreatedTransaction],
+        to endpoints: [LightWalletEndpoint],
+        timing: SubmissionTiming
+    ) async -> [TransactionSubmissionReport] {
+        logger.debug("Batch submitting \(transactions.count) transaction(s).")
+        var reports: [TransactionSubmissionReport] = []
+        var stopped = false
+
+        for transaction in transactions {
+            let txId = transaction.txId.toHexStringTxId()
+            if stopped {
+                logger.debug("Transaction \(txId) not attempted; an earlier transaction in the batch was not accepted.")
+                reports.append(TransactionSubmissionReport(txId: transaction.txId, outcome: .notAttempted))
+                continue
+            }
+
+            let outcome = await submit(transaction: transaction, to: endpoints, timing: timing)
+            reports.append(TransactionSubmissionReport(txId: transaction.txId, outcome: outcome))
+
+            if case .accepted = outcome {
+                continue
+            }
+            logger.debug("Batch stopping after \(txId) was \(outcome.logDescription); remaining marked not attempted.")
+            stopped = true
+        }
+
+        return reports
+    }
+
+    // MARK: - Internal create paths (legacy callers pass recordingPlans: false)
+
+    func createProposedTransactions(
         proposal: Proposal,
-        spendingKey: UnifiedSpendingKey
-    ) async throws -> [ZcashTransaction.Overview] {
+        spendingKey: UnifiedSpendingKey,
+        recordingPlans: Bool
+    ) async throws -> [CreatedTransaction] {
         try statusCheck()
+        try await downloadSaplingParamsIfNeeded()
 
-        try await SaplingParameterDownloader.downloadParamsIfnotPresent(
-            spendURL: initializer.spendParamsURL,
-            spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
-            outputURL: initializer.outputParamsURL,
-            outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: logger
-        )
-
-        return try await transactionEncoder.createProposedTransactions(
+        let overviews = try await transactionEncoder.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey
         )
+
+        return try await finishCreation(overviews: overviews, recordingPlans: recordingPlans)
     }
 
-    private func createTransactionFromPCZTWithoutRegisteringSubmitPlan(
+    func createTransactionFromPCZT(
         pcztWithProofs: Pczt,
-        pcztWithSigs: Pczt
-    ) async throws -> [ZcashTransaction.Overview] {
+        pcztWithSigs: Pczt,
+        recordingPlans: Bool
+    ) async throws -> [CreatedTransaction] {
         try statusCheck()
-
-        try await SaplingParameterDownloader.downloadParamsIfnotPresent(
-            spendURL: initializer.spendParamsURL,
-            spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
-            outputURL: initializer.outputParamsURL,
-            outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: logger
-        )
+        try await downloadSaplingParamsIfNeeded()
 
         let txId = try await initializer.rustBackend.extractAndStoreTxFromPCZT(
             pcztWithProofs: pcztWithProofs,
             pcztWithSigs: pcztWithSigs
         )
 
-        return try await transactionEncoder.fetchTransactionsForTxIds([txId])
+        let overviews = try await transactionEncoder.fetchTransactionsForTxIds([txId])
+
+        return try await finishCreation(overviews: overviews, recordingPlans: recordingPlans)
     }
 
-    private func sendFoundTransactionsEvent(_ transactions: [ZcashTransaction.Overview]) {
-        if !transactions.isEmpty {
-            eventSubject.send(.foundTransactions(transactions, nil))
+    // MARK: - Private
+
+    private func downloadSaplingParamsIfNeeded() async throws {
+        try await SaplingParameterDownloader.downloadParamsIfnotPresent(
+            spendURL: initializer.spendParamsURL,
+            spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
+            outputURL: initializer.outputParamsURL,
+            outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
+            logger: logger
+        )
+    }
+
+    private func finishCreation(
+        overviews: [ZcashTransaction.Overview],
+        recordingPlans: Bool
+    ) async throws -> [CreatedTransaction] {
+        let createdTransactions = try overviews.map { try CreatedTransaction(overview: $0) }
+
+        let txIdList = createdTransactions.map { $0.txId.toHexStringTxId() }.joined(separator: ", ")
+        if recordingPlans {
+            logger.debug("Created \(createdTransactions.count) transaction(s) awaiting submission by the app: \(txIdList).")
+            await submitPlanStore.markAwaitingSubmission(txIds: createdTransactions.map(\.txId))
+        } else {
+            logger.debug("Created \(createdTransactions.count) transaction(s) for immediate submission: \(txIdList).")
         }
+
+        if !overviews.isEmpty {
+            eventSubject.send(.foundTransactions(overviews, nil))
+        }
+
+        return createdTransactions
     }
 }
