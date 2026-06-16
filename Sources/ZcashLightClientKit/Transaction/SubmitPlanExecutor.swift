@@ -2,120 +2,40 @@
 //  SubmitPlanExecutor.swift
 //  ZcashLightClientKit
 //
-//  Created by Adam Tucker on 2026-05-12.
-//
 
 import Foundation
 
-protocol TransactionSubmitter {
-    func submit(
-        rawTransaction: Data,
-        to endpoint: LightWalletEndpoint
-    ) async throws
-
-    func submit(
-        transaction: EncodedTransaction,
-        to endpoint: LightWalletEndpoint
-    ) async throws
-}
-
-final class EndpointTransactionSubmitter: TransactionSubmitter {
-    private let torClient: TorClient
-    private let sdkFlags: SDKFlags
-
-    init(
-        torClient: TorClient,
-        sdkFlags: SDKFlags
-    ) {
-        self.torClient = torClient
-        self.sdkFlags = sdkFlags
-    }
-
-    func submit(
-        rawTransaction: Data,
-        to endpoint: LightWalletEndpoint
-    ) async throws {
-        try await submit(
-            rawTransaction: rawTransaction,
-            to: endpoint,
-            mode: await sdkFlags.torEnabled ? .uniqueTor : .direct
-        )
-    }
-
-    func submit(
-        transaction: EncodedTransaction,
-        to endpoint: LightWalletEndpoint
-    ) async throws {
-        let mode: ServiceMode
-        if await sdkFlags.torEnabled {
-            mode = ServiceMode.txIdGroup(prefix: "submit", txId: transaction.transactionId)
-        } else {
-            mode = .direct
-        }
-
-        try await submit(
-            rawTransaction: transaction.raw,
-            to: endpoint,
-            mode: mode
-        )
-    }
-
-    private func submit(
-        rawTransaction: Data,
-        to endpoint: LightWalletEndpoint,
-        mode: ServiceMode
-    ) async throws {
-        let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
-        let response: any LightWalletServiceResponse
-        do {
-            response = try await service.submit(spendTransaction: rawTransaction, mode: mode)
-        } catch {
-            await service.closeConnections()
-            throw error
-        }
-
-        await service.closeConnections()
-
-        guard response.errorCode >= 0 else {
-            throw TransactionEncoderError.submitError(
-                code: Int(response.errorCode),
-                message: response.errorMessage
-            )
-        }
-    }
-}
-
+/// Background-retry executor: tries the recorded plan endpoints sequentially
+/// until one accepts. Background retry stays gentle — no fan-out.
+/// An empty endpoint list returns without submitting.
 final class SubmitPlanExecutor {
-    private let transactionSubmitter: TransactionSubmitter
+    private let endpointSubmitter: EndpointSubmitter
     private let logger: Logger
 
-    init(
-        transactionSubmitter: TransactionSubmitter,
-        logger: Logger
-    ) {
-        self.transactionSubmitter = transactionSubmitter
+    init(endpointSubmitter: EndpointSubmitter, logger: Logger) {
+        self.endpointSubmitter = endpointSubmitter
         self.logger = logger
     }
 
-    func submit(
-        transaction: EncodedTransaction,
-        submitPlan: TransactionSubmitPlan
-    ) async throws {
+    func submit(transaction: CreatedTransaction, endpoints: [LightWalletEndpoint]) async throws {
+        let txId = transaction.txId.toHexStringTxId()
+        logger.debug("Transaction \(txId) background retry across \(endpoints.count) recorded endpoint(s).")
         var lastError: Error?
 
-        for endpoint in submitPlan.endpoints {
+        for endpoint in endpoints {
+            try Task.checkCancellation()
             do {
-                try await transactionSubmitter.submit(transaction: transaction, to: endpoint)
+                try await endpointSubmitter.submit(transaction: transaction, to: endpoint)
+                logger.debug("Transaction \(txId) background retry accepted by \(endpoint.host):\(endpoint.port).")
                 return
             } catch {
-                logger.warn(
-                    "Submit plan endpoint \(endpoint.host):\(endpoint.port) failed: \(error)"
-                )
+                logger.warn("Transaction \(txId) background retry to \(endpoint.host):\(endpoint.port) failed: \(error)")
                 lastError = error
             }
         }
 
         if let lastError {
+            logger.warn("Transaction \(txId) background retry exhausted all \(endpoints.count) recorded endpoint(s).")
             throw lastError
         }
     }
