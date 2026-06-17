@@ -63,9 +63,7 @@ final class SDKMetricsImpl: SDKMetrics {
     }
     
     func actionDetail(_ detail: String, `for` action: CBPState) {
-        guard var report = cbpOverview[action] else {
-            return
-        }
+        guard var report = cbpOverview[action] else { return }
         
         report.details.append(detail)
         
