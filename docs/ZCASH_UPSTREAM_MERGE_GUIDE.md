@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-17
+Last reviewed: 2026-06-18
 
 ## Remote and branch invariants
 
@@ -46,12 +46,12 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-17)
+## Zend divergence notes (as of 2026-06-18)
 
 Current relationship from `codex/zcash-upstream-sync-2026-06-17` after merging upstream `main` through `fe836893`:
 
-- Before the parity branch lands, `origin/main...upstream/main`: `50 11` after fetching both remotes on 2026-06-17.
-- From the parity branch after the merge, `git rev-list --left-right --count HEAD...upstream/main` returns `51 0`.
+- Before the parity branch lands, `origin/main...upstream/main`: `50 11` after fetching both remotes on 2026-06-18.
+- From the parity branch after the merge, `git rev-list --left-right --count origin/codex/zcash-upstream-sync-2026-06-17...upstream/main` returns `51 0`.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `fe836893` (`#1761` enhancement backoff); those upstream SDK fixes are present in the parity branch.
 
@@ -75,14 +75,14 @@ When conflicts occur:
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
-## Bleeding-edge snapshot (2026-06-17)
+## Bleeding-edge snapshot (2026-06-18)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
 - `#1764`: changelog follow-up for the multi-server submission work.
 - `#1760`: first-sync resubmit race fix and test adaptation.
 - `#1761`: enhancement retry/backoff hardening plus diagnostic logging.
-- These are merged into `codex/zcash-upstream-sync-2026-06-17`. Before the branch lands on `main`, `git rev-list --left-right --count origin/main...upstream/main` returns `50 11`; from the parity branch after the merge, `git rev-list --left-right --count HEAD...upstream/main` returns `51 0`.
+- These are merged into `codex/zcash-upstream-sync-2026-06-17`. Before the branch lands on `main`, `git rev-list --left-right --count origin/main...upstream/main` returns `50 11`; from the parity branch after the merge, `git rev-list --left-right --count origin/codex/zcash-upstream-sync-2026-06-17...upstream/main` returns `51 0`.
 
 Zend parity branch note:
 
@@ -91,9 +91,11 @@ Zend parity branch note:
 
 Open upstream PRs assessed as not ready to carry right now:
 
+- `#1766` (`dw/setup-dependabot`): non-draft but `BLOCKED` with review required; dependency automation configuration is not worth carrying before upstream accepts the exact policy.
+- `#1765` (`dw/delete-trailing-whitespaces`): non-draft, approved, and clean, but whitespace-only and low Zend product value; wait for upstream to merge rather than opening a standalone Zend carry PR.
 - `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, `BLOCKED`, and touches Tor/exchange-rate concurrency with explicit remaining lifecycle-race scope; wait for upstream to finish review and device confirmation.
 - `#1758` (`dependabot/swift/github.com/apple/swift-nio-2.101.0`): non-draft dependency bump, but `BLOCKED` with review required; not worth carrying independently before upstream acceptance.
-- `#1746` (`kris/1745-finish-release-workflow`): non-draft with green checks, but still review required and CI/release-workflow heavy.
+- `#1746` (`kris/1745-finish-release-workflow`): non-draft but `DIRTY`, review required, and CI/release-workflow heavy.
 - `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview; latest CodeQL run was still in progress during review.
 - `#1700`, `#1638`, `#1637`, `#1592`, `#1579`, `#1443`: draft/WIP FFI and behavior changes with broad impact; several are also `DIRTY` or have requested changes.
 - `#1692`: non-draft but `BLOCKED` and still review required.
