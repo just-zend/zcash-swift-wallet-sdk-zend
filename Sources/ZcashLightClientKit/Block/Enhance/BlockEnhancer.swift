@@ -69,7 +69,7 @@ extension BlockEnhancerImpl: BlockEnhancer {
     // swiftlint:disable:next cyclomatic_complexity
     func enhance(at range: CompactBlockRange, didEnhance: @escaping (EnhancementProgress) async -> Void) async throws -> [ZcashTransaction.Overview]? {
         try Task.checkCancellation()
-        
+
         logger.debug("Started Enhancing range: \(range)")
 
         // fetch transactions
