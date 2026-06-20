@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-19
+Last reviewed: 2026-06-20
 
 ## Remote and branch invariants
 
@@ -46,12 +46,12 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-19)
+## Zend divergence notes (as of 2026-06-20)
 
 Current relationship from `codex/zcash-upstream-sync-2026-06-17` after merging upstream `main` through `dd7329eb`:
 
-- Before the parity branch lands, `origin/main...upstream/main`: `50 13` after fetching both remotes on 2026-06-19.
-- From the parity branch after the June 19 upstream merge, `git rev-list --left-right --count HEAD...upstream/main` returns `53 0`.
+- Before the parity branch lands, `origin/main...upstream/main`: `50 13` after fetching both remotes on 2026-06-20.
+- From the parity branch after the June 20 guide refresh, `git rev-list --left-right --count HEAD...upstream/main` returns `55 0`.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `dd7329eb` (`#1765` trailing-whitespace cleanup); those upstream SDK fixes and cleanup commits are present in the parity branch.
 
@@ -76,7 +76,7 @@ When conflicts occur:
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
-## Bleeding-edge snapshot (2026-06-19)
+## Bleeding-edge snapshot (2026-06-20)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
@@ -84,13 +84,14 @@ Merged upstream default-branch delta pending in Zend fork default branch:
 - `#1760`: first-sync resubmit race fix and test adaptation.
 - `#1761`: enhancement retry/backoff hardening plus diagnostic logging.
 - `#1765`: repository-wide trailing-whitespace cleanup.
-- These are merged into `codex/zcash-upstream-sync-2026-06-17`. Before the branch lands on `main`, `git rev-list --left-right --count origin/main...upstream/main` returns `50 13`; from the parity branch after the June 19 upstream merge, `git rev-list --left-right --count HEAD...upstream/main` returns `53 0`.
+- These are merged into `codex/zcash-upstream-sync-2026-06-17`. Before the branch lands on `main`, `git rev-list --left-right --count origin/main...upstream/main` returns `50 13`; from the parity branch after the June 20 guide refresh, `git rev-list --left-right --count HEAD...upstream/main` returns `55 0`.
 
 Zend parity branch note:
 
 - `codex/zcash-upstream-sync-2026-06-17` merges upstream `main` through `dd7329eb`.
 - The original June 17 merge conflict was `CHANGELOG.md`; resolve by keeping Zend's `2.6.3` release section and placing the upstream `Unreleased` diagnostics/resubmission notes above it.
 - The June 19 refresh merged `#1765` without conflicts and required no Zend-specific code adaptation.
+- Zend PR `#14` is the active draft parity PR for this branch. As of the 2026-06-20 monitor, its GitHub build/offline-test, SwiftLint, and zizmor checks were all green.
 
 Open upstream PRs assessed as not ready to carry right now:
 
@@ -99,7 +100,7 @@ Open upstream PRs assessed as not ready to carry right now:
 - `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, `BLOCKED`, and touches Tor/exchange-rate concurrency with explicit remaining lifecycle-race scope; wait for upstream to finish review and device confirmation.
 - `#1758` (`dependabot/swift/github.com/apple/swift-nio-2.101.0`): non-draft dependency bump, but `BLOCKED` with review required; not worth carrying independently before upstream acceptance.
 - `#1746` (`kris/1745-finish-release-workflow`): non-draft but `DIRTY`, review required, and CI/release-workflow heavy.
-- `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview; latest CodeQL run was still in progress during review.
+- `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview, so wait for upstream release sequencing rather than carrying it independently.
 - `#1700`, `#1638`, `#1637`, `#1592`, `#1579`, `#1443`: draft/WIP FFI and behavior changes with broad impact; several are also `DIRTY` or have requested changes.
 - `#1692`: non-draft but `BLOCKED` and still review required.
 - `#1570`: non-draft and approved, but still `DIRTY` and old enough that carrying it ahead of upstream would be a higher-risk behavioral fork.
