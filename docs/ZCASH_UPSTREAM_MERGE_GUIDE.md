@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-06-21
 
 ## Remote and branch invariants
 
@@ -46,12 +46,12 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-20)
+## Zend divergence notes (as of 2026-06-21)
 
 Current relationship from `codex/zcash-upstream-sync-2026-06-17` after merging upstream `main` through `dd7329eb`:
 
-- Before the parity branch lands, `origin/main...upstream/main`: `50 13` after fetching both remotes on 2026-06-20.
-- From the parity branch after the June 20 guide refresh, `git rev-list --left-right --count HEAD...upstream/main` returns `55 0`.
+- Before the parity branch lands, `origin/main...upstream/main`: `50 13` after fetching both remotes on 2026-06-21.
+- From the parity branch after the June 21 guide refresh, `git rev-list --left-right --count HEAD...upstream/main` returns `56 0`.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `dd7329eb` (`#1765` trailing-whitespace cleanup); those upstream SDK fixes and cleanup commits are present in the parity branch.
 
@@ -76,7 +76,7 @@ When conflicts occur:
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
-## Bleeding-edge snapshot (2026-06-20)
+## Bleeding-edge snapshot (2026-06-21)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
@@ -84,14 +84,14 @@ Merged upstream default-branch delta pending in Zend fork default branch:
 - `#1760`: first-sync resubmit race fix and test adaptation.
 - `#1761`: enhancement retry/backoff hardening plus diagnostic logging.
 - `#1765`: repository-wide trailing-whitespace cleanup.
-- These are merged into `codex/zcash-upstream-sync-2026-06-17`. Before the branch lands on `main`, `git rev-list --left-right --count origin/main...upstream/main` returns `50 13`; from the parity branch after the June 20 guide refresh, `git rev-list --left-right --count HEAD...upstream/main` returns `55 0`.
+- These are merged into `codex/zcash-upstream-sync-2026-06-17`. Before the branch lands on `main`, `git rev-list --left-right --count origin/main...upstream/main` returns `50 13`; from the parity branch after the June 21 guide refresh, `git rev-list --left-right --count HEAD...upstream/main` returns `56 0`.
 
 Zend parity branch note:
 
 - `codex/zcash-upstream-sync-2026-06-17` merges upstream `main` through `dd7329eb`.
 - The original June 17 merge conflict was `CHANGELOG.md`; resolve by keeping Zend's `2.6.3` release section and placing the upstream `Unreleased` diagnostics/resubmission notes above it.
 - The June 19 refresh merged `#1765` without conflicts and required no Zend-specific code adaptation.
-- Zend PR `#14` is the active draft parity PR for this branch. As of the 2026-06-20 monitor, its GitHub build/offline-test, SwiftLint, and zizmor checks were all green.
+- Zend PR `#14` is the active draft parity PR for this branch. As of the 2026-06-21 monitor, its GitHub build/offline-test, SwiftLint, and zizmor checks were all green for the previous docs-only refresh commit `cfaa145a`.
 
 Open upstream PRs assessed as not ready to carry right now:
 
