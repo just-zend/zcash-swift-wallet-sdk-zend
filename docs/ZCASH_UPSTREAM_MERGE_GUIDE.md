@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-21
+Last reviewed: 2026-06-22
 
 ## Remote and branch invariants
 
@@ -46,14 +46,14 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-21)
+## Zend divergence notes (as of 2026-06-22)
 
-Current relationship from `codex/zcash-upstream-sync-2026-06-17` after merging upstream `main` through `dd7329eb`:
+Current relationship after Zend PR `#14` merged `codex/zcash-upstream-sync-2026-06-17` into `origin/main`:
 
-- Before the parity branch lands, `origin/main...upstream/main`: `50 13` after fetching both remotes on 2026-06-21.
-- From the parity branch after the June 21 guide refresh, `git rev-list --left-right --count HEAD...upstream/main` returns `56 0`.
+- `origin/main...upstream/main`: `57 0` after fetching both remotes on 2026-06-22.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
-- `upstream/main` currently points at `dd7329eb` (`#1765` trailing-whitespace cleanup); those upstream SDK fixes and cleanup commits are present in the parity branch.
+- `upstream/main` currently points at `dd7329eb` (`#1765` trailing-whitespace cleanup); those upstream SDK fixes and cleanup commits are present in `origin/main`.
+- `git merge-base --is-ancestor upstream/main origin/main` succeeds, so the fork default branch contains the upstream default branch.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -65,7 +65,7 @@ Notable fork-ahead work currently preserved includes:
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: a default-branch parity PR is needed while the right-side count remains non-zero on `origin/main`. After `codex/zcash-upstream-sync-2026-06-17` lands, Zend will contain upstream `main` through `dd7329eb`. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while the bundled Rust crate version remains `2.6.0-alpha.4`.
+Implication: no default-branch parity PR is needed while the right-side count remains `0` on `origin/main`. Zend contains upstream `main` through `dd7329eb`. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while the bundled Rust crate version remains `2.6.0-alpha.4`.
 
 ## Conflict resolution heuristics
 
@@ -76,22 +76,19 @@ When conflicts occur:
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
-## Bleeding-edge snapshot (2026-06-21)
+## Bleeding-edge snapshot (2026-06-22)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
-- `#1764`: changelog follow-up for the multi-server submission work.
-- `#1760`: first-sync resubmit race fix and test adaptation.
-- `#1761`: enhancement retry/backoff hardening plus diagnostic logging.
-- `#1765`: repository-wide trailing-whitespace cleanup.
-- These are merged into `codex/zcash-upstream-sync-2026-06-17`. Before the branch lands on `main`, `git rev-list --left-right --count origin/main...upstream/main` returns `50 13`; from the parity branch after the June 21 guide refresh, `git rev-list --left-right --count HEAD...upstream/main` returns `56 0`.
+- None. `git rev-list --left-right --count origin/main...upstream/main` returns `57 0`.
+- Zend PR `#14` merged the prior parity branch into `origin/main` on 2026-06-22.
 
 Zend parity branch note:
 
-- `codex/zcash-upstream-sync-2026-06-17` merges upstream `main` through `dd7329eb`.
+- `codex/zcash-upstream-sync-2026-06-17` merged upstream `main` through `dd7329eb`.
 - The original June 17 merge conflict was `CHANGELOG.md`; resolve by keeping Zend's `2.6.3` release section and placing the upstream `Unreleased` diagnostics/resubmission notes above it.
 - The June 19 refresh merged `#1765` without conflicts and required no Zend-specific code adaptation.
-- Zend PR `#14` is the active draft parity PR for this branch. As of the 2026-06-21 monitor, its GitHub build/offline-test, SwiftLint, and zizmor checks were all green for the previous docs-only refresh commit `cfaa145a`.
+- Zend PR `#14` is merged. Its final checks were green: GitHub build/offline-test, SwiftLint, and zizmor all succeeded for commit `48347a08`.
 
 Open upstream PRs assessed as not ready to carry right now:
 
@@ -108,16 +105,25 @@ Open upstream PRs assessed as not ready to carry right now:
 
 No candidate currently meets all carry criteria (ready + useful + low risk) for Zend ahead-of-upstream adoption.
 
-Unmerged upstream branches without open PRs (not carried):
+Unmerged upstream branches (not carried):
 
 - `adam/broadcaster-submit-plan`: 14 commits ahead and 70 behind `upstream/main`; no upstream PR, and the commits are already contained in `origin/main` from Zend PR `#2` before being superseded by upstream's `SubmitPlanStore` work in `#1757`.
 - `adam/update-zcash-voting-0.9.1-policy`: 1 commit ahead and 66 behind `upstream/main`; voting feature scope with no upstream PR/review thread yet.
 - `adam/voting-round-recovery-ffi`: 1 commit ahead and 175 behind `upstream/main`; voting recovery FFI with no upstream PR/review thread yet.
 - `adam/voting-rust-lint-workflow`: 1 commit ahead and 176 behind `upstream/main`; workflow/lint only and limited direct Zend runtime value.
+- `dependabot/swift/github.com/apple/swift-nio-2.101.0`: 1 commit ahead and 36 behind `upstream/main`; covered by open upstream PR `#1758`, so wait for upstream review.
 - `dw/remove-useless-deadcode-annotations`: 1 commit ahead and 2 behind `upstream/main`; covered by open upstream PR `#1767`, so wait for upstream review.
+- `dw/setup-dependabot`: 1 commit ahead and 2 behind `upstream/main`; covered by open upstream PR `#1766`, so wait for upstream review.
+- `feature/ffi_database_handle`: 10 commits ahead and 276 behind `upstream/main`; broad FFI database-handle work covered by draft upstream PR `#1637`, so do not carry early.
+- `feature/typesafe_db_handles`: 11 commits ahead and 276 behind `upstream/main`; broad type-safe handle work covered by draft upstream PR `#1638`, so do not carry early.
+- `ffi-0.18.0-part-2`: 5 commits ahead and 797 behind `upstream/main`; stale WIP transaction policy work covered by draft upstream PR `#1592`.
 - `ignore_worktrees`: 1 commit ahead and 70 behind `upstream/main`; housekeeping-only change.
+- `kris/1745-finish-release-workflow`: 9 commits ahead and 70 behind `upstream/main`; covered by open upstream PR `#1746`, which is still dirty and review-required.
+- `michal/MOB-1389-fetch-usd-rate-tor-crash`: 1 commit ahead and 36 behind `upstream/main`; covered by draft upstream PR `#1763`, so wait for upstream completion.
 - `maint/v2.5.x`: 0 commits ahead and 156 behind `upstream/main`; maintenance line, no standalone carry.
 - `release-ci`: 4 commits ahead and 148 behind `upstream/main`; release branch integration artifact, not a clear standalone carry target.
 - `release/2.6.0`: 0 commits ahead and 159 behind `upstream/main`; upstream release stabilization branch, wait for upstream release sequencing.
 - `roman/voting-delegation-workflow-swift-wrappers`: 0 commits ahead and 135 behind `upstream/main`; voting wrapper branch without an upstream PR/review thread yet.
+- `rust-build-plugin`: 2 commits ahead and 1097 behind `upstream/main`; stale draft build-plugin work covered by upstream PR `#1443`.
 - `shielded-vote-2.4.10`: 1 commit ahead and 93 behind `upstream/main`; specialized voting branch with unclear Zend product priority.
+- `testing/note_spendability_improvements`: 6 commits ahead and 206 behind `upstream/main`; draft test-only branch covered by upstream PR `#1700`.
