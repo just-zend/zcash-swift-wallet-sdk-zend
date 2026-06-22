@@ -1,6 +1,6 @@
 //
 //  CombineSynchronizer.swift
-//  
+//
 //
 //  Created by Michal Fousek on 16.03.2023.
 //
@@ -113,7 +113,7 @@ public protocol CombineSynchronizer {
         pcztWithProofs: Pczt,
         pcztWithSigs: Pczt
     ) -> SinglePublisher<AsyncThrowingStream<TransactionSubmitResult, Error>, Error>
-    
+
     func proposefulfillingPaymentURI(
         _ uri: String,
         accountUUID: AccountUUID
@@ -158,6 +158,6 @@ public protocol CombineSynchronizer {
 
     func rewind(_ policy: RewindPolicy) -> CompletablePublisher<Error>
     func wipe() -> CompletablePublisher<Error>
-    
+
     func rescanFrom(height: BlockHeight) -> CompletablePublisher<Error>
 }
