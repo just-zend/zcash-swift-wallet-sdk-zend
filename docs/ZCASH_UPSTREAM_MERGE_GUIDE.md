@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-22
+Last reviewed: 2026-06-23
 
 ## Remote and branch invariants
 
@@ -46,11 +46,11 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-22)
+## Zend divergence notes (as of 2026-06-23)
 
 Current relationship after Zend PR `#14` merged `codex/zcash-upstream-sync-2026-06-17` into `origin/main`:
 
-- `origin/main...upstream/main`: `57 0` after fetching both remotes on 2026-06-22.
+- `origin/main...upstream/main`: `57 0` after fetching both remotes on 2026-06-23.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `dd7329eb` (`#1765` trailing-whitespace cleanup); those upstream SDK fixes and cleanup commits are present in `origin/main`.
 - `git merge-base --is-ancestor upstream/main origin/main` succeeds, so the fork default branch contains the upstream default branch.
@@ -76,12 +76,13 @@ When conflicts occur:
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
-## Bleeding-edge snapshot (2026-06-22)
+## Bleeding-edge snapshot (2026-06-23)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
 - None. `git rev-list --left-right --count origin/main...upstream/main` returns `57 0`.
 - Zend PR `#14` merged the prior parity branch into `origin/main` on 2026-06-22.
+- Zend PR `#15` is the active draft docs refresh PR for the settled parity state.
 
 Zend parity branch note:
 
@@ -94,7 +95,7 @@ Open upstream PRs assessed as not ready to carry right now:
 
 - `#1766` (`dw/setup-dependabot`): non-draft but `BLOCKED` with review required; dependency automation configuration is not worth carrying before upstream accepts the exact policy.
 - `#1767` (`dw/remove-useless-deadcode-annotations`): non-draft but `BLOCKED` with review required; Rust annotation cleanup is low-risk but should wait for upstream review rather than being carried independently.
-- `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, `BLOCKED`, and touches Tor/exchange-rate concurrency with explicit remaining lifecycle-race scope; wait for upstream to finish review and device confirmation.
+- `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, `DIRTY`, and touches Tor/exchange-rate concurrency with explicit remaining lifecycle-race scope; wait for upstream to finish review and device confirmation.
 - `#1758` (`dependabot/swift/github.com/apple/swift-nio-2.101.0`): non-draft dependency bump, but `BLOCKED` with review required; not worth carrying independently before upstream acceptance.
 - `#1746` (`kris/1745-finish-release-workflow`): non-draft but `DIRTY`, review required, and CI/release-workflow heavy.
 - `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview, so wait for upstream release sequencing rather than carrying it independently.
