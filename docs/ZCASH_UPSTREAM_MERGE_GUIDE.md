@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-24
+Last reviewed: 2026-06-25
 
 ## Remote and branch invariants
 
@@ -46,15 +46,15 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-24)
+## Zend divergence notes (as of 2026-06-25)
 
 Current relationship after Zend PR `#14` merged `codex/zcash-upstream-sync-2026-06-17` into `origin/main`, before the current PR `#15` lands:
 
-- `origin/main...upstream/main`: `57 3` after fetching both remotes on 2026-06-24.
+- `origin/main...upstream/main`: `57 3` after fetching both remotes on 2026-06-25.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `e0bf7ca3` (`#1766` Dependabot setup); this adds `.github/dependabot.yml` with weekly Cargo, Swift, and GitHub Actions update schedules plus seven-day cooldowns.
 - `git merge-base --is-ancestor upstream/main origin/main` fails until PR `#15` lands.
-- From the active parity branch `codex/zcash-upstream-sync-2026-06-22`, `git rev-list --left-right --count HEAD...upstream/main` returns `61 0` and `git merge-base --is-ancestor upstream/main HEAD` succeeds.
+- From the active parity branch `codex/zcash-upstream-sync-2026-06-22`, `git rev-list --left-right --count HEAD...upstream/main` returns `61 0` and `git merge-base --is-ancestor upstream/main HEAD` succeeds, so the existing draft PR still covers upstream `main`.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -78,11 +78,11 @@ When conflicts occur:
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
-## Bleeding-edge snapshot (2026-06-24)
+## Bleeding-edge snapshot (2026-06-25)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
-- `#1766`: Dependabot setup merged upstream. `git rev-list --left-right --count origin/main...upstream/main` returns `57 3`.
+- `#1766`: Dependabot setup merged upstream. `git rev-list --left-right --count origin/main...upstream/main` returns `57 3`; draft PR `#15` already contains these upstream commits.
 - Upstream-only commits before PR `#15` lands:
   - `e0bf7ca3`: merge PR `#1766`.
   - `86870b40`: add cooldown to Dependabot updates.
@@ -99,16 +99,16 @@ Zend parity branch note:
 
 Open upstream PRs assessed as not ready to carry right now:
 
-- `#1770` through `#1785`: fresh Dependabot PRs for Cargo, Swift, and GitHub Actions dependencies. They are non-draft but `BLOCKED`/review-required or unknown merge-state update branches; wait for upstream review and CI policy before carrying individual dependency bumps.
+- `#1770` through `#1785`: fresh Dependabot PRs for Cargo, Swift, and GitHub Actions dependencies. They are non-draft but `BLOCKED` and review-required; wait for upstream review and CI policy before carrying individual dependency bumps.
 - `#1767` (`dw/remove-useless-deadcode-annotations`): non-draft but `BLOCKED` with review required; Rust annotation cleanup is low-risk but should wait for upstream review rather than being carried independently.
-- `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, merge state unknown, and touches Tor/exchange-rate concurrency with explicit remaining lifecycle-race scope; wait for upstream to finish review and device confirmation.
-- `#1758` (`dependabot/swift/github.com/apple/swift-nio-2.101.0`): non-draft dependency bump, but merge state unknown and review required; not worth carrying independently before upstream acceptance.
-- `#1746` (`kris/1745-finish-release-workflow`): non-draft but merge state unknown, review required, and CI/release-workflow heavy.
+- `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, `DIRTY`, and touches Tor/exchange-rate concurrency with explicit remaining lifecycle-race scope; wait for upstream to finish review and device confirmation.
+- `#1758` (`dependabot/swift/github.com/apple/swift-nio-2.101.0`): non-draft dependency bump, but `BLOCKED` and review required; not worth carrying independently before upstream acceptance.
+- `#1746` (`kris/1745-finish-release-workflow`): non-draft but `DIRTY`, review required, and CI/release-workflow heavy.
 - `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview, so wait for upstream release sequencing rather than carrying it independently.
 - `#1700`, `#1638`, `#1637`, `#1592`, `#1579`, `#1443`: draft/WIP FFI and behavior changes with broad impact; several also have requested changes or stale unknown merge state.
-- `#1692`: non-draft but merge state unknown and still review required.
-- `#1570`: non-draft and approved, but merge state unknown and old enough that carrying it ahead of upstream would be a higher-risk behavioral fork.
-- `#1505`: tiny spelling fix, but merge state unknown and review required, so not worth carrying independently.
+- `#1692`: non-draft but `BLOCKED` and still review required.
+- `#1570`: non-draft and approved, but still `DIRTY` and old enough that carrying it ahead of upstream would be a higher-risk behavioral fork.
+- `#1505`: tiny spelling fix, but still `DIRTY` and review required, so not worth carrying independently.
 
 No candidate currently meets all carry criteria (ready + useful + low risk) for Zend ahead-of-upstream adoption.
 
