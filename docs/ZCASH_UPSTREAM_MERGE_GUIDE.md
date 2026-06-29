@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-28
+Last reviewed: 2026-06-29
 
 ## Remote and branch invariants
 
@@ -46,15 +46,15 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-28)
+## Zend divergence notes (as of 2026-06-29)
 
 Current relationship after Zend PR `#14` merged `codex/zcash-upstream-sync-2026-06-17` into `origin/main`, before the current PR `#15` lands:
 
-- `origin/main...upstream/main`: `57 10` after fetching both remotes on 2026-06-28.
+- `origin/main...upstream/main`: `57 10` after fetching both remotes on 2026-06-29.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `4303068e` (`#1790` / tag `2.6.0-alpha.6`); it also includes `#1789` checkpoint refresh, `#1786` for the Keystone/cross-account `deleteAccount` fix, and `#1766` Dependabot setup.
 - `git merge-base --is-ancestor upstream/main origin/main` fails until PR `#15` lands.
-- From the active parity branch `codex/zcash-upstream-sync-2026-06-22`, `git rev-list --left-right --count HEAD...upstream/main` returns `67 0` after this guide refresh and `git merge-base --is-ancestor upstream/main HEAD` succeeds, so the existing PR covers upstream `main`.
+- From the active parity branch `codex/zcash-upstream-sync-2026-06-22`, `git rev-list --left-right --count HEAD...upstream/main` returns `68 0` after this guide refresh and `git merge-base --is-ancestor upstream/main HEAD` succeeds, so the existing PR covers upstream `main`.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -70,7 +70,7 @@ Notable fork-ahead work currently preserved includes:
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: PR `#15` is the active default-branch parity PR. As of the 2026-06-28 monitor it is open, no longer draft, mergeable with `mergeStateStatus: CLEAN`, and its GitHub `build`, `Run zizmor`, and `zizmor` checks are all passing on `e2bf0c7d`. After it lands, Zend will contain upstream `main` through `4303068e`. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
+Implication: PR `#15` is the active default-branch parity PR. As of the 2026-06-29 monitor it is open, no longer draft, mergeable with `mergeStateStatus: CLEAN`, and its GitHub `build`, `Run zizmor`, and `zizmor` checks are all passing on `c1669523`. After it lands, Zend will contain upstream `main` through `4303068e`. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
 
 ## Conflict resolution heuristics
 
@@ -91,7 +91,7 @@ Zend parity branch note:
 - The June 26 refresh merged upstream through `8bbc0b7f` with one conflict in `CHANGELOG.md`. Resolve by keeping upstream `2.6.0-alpha.6` checkpoint notes above Zend `2.6.3`, preserving Zend `2.6.3` and `2.6.2`, and retaining upstream `2.6.0-alpha.5` release notes separately.
 - The June 27 refresh merged upstream through `4303068e` with one conflict in `Package.swift`. Resolve by keeping Zend's `https://github.com/just-zend/zcash-swift-wallet-sdk-zend/releases/download/2.6.3/libzcashlc.xcframework.zip` URL and checksum, rather than replacing it with upstream's `2.6.0-alpha.6` artifact.
 
-## Bleeding-edge snapshot (2026-06-28)
+## Bleeding-edge snapshot (2026-06-29)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
@@ -110,7 +110,7 @@ Merged upstream default-branch delta pending in Zend fork default branch:
   - `e0bf7ca3`: merge PR `#1766`.
   - `86870b40`: add cooldown to Dependabot updates.
   - `8023c752`: add Dependabot configuration.
-- Zend PR `#15` remains the active parity PR and already merges upstream `main` through `4303068e`; no new upstream default-branch commits appeared after the 2026-06-27 refresh.
+- Zend PR `#15` remains the active parity PR and already merges upstream `main` through `4303068e`; no new upstream default-branch commits appeared after the 2026-06-27 refresh, and the 2026-06-29 monitor still reports `57 10` for `origin/main...upstream/main` and `68 0` for the PR branch against `upstream/main`.
 
 Open upstream PRs assessed as not ready to carry right now:
 
