@@ -17,6 +17,18 @@ public struct MigrationProgress: Equatable, Codable {
     public let remainingOrchard: UInt64
     public let nextTransferReadyAtHeight: UInt32?
 
+    public init(
+        completedTransfers: UInt32,
+        totalTransfers: UInt32,
+        remainingOrchardZatoshi: UInt64,
+        nextTransferReadyAtHeight: UInt32?
+    ) {
+        self.completedTransfers = completedTransfers
+        self.totalTransfers = totalTransfers
+        self.remainingOrchardZatoshi = remainingOrchardZatoshi
+        self.nextTransferReadyAtHeight = nextTransferReadyAtHeight
+    }
+
     enum CodingKeys: String, CodingKey {
         case completedTransfers = "completed_transfers"
         case totalTransfers = "total_transfers"
@@ -33,6 +45,12 @@ public struct PreparedTx: Equatable, Codable {
     public let txid: String
     public let rawPczt: [UInt8]
 
+    public init(id: String, txid: String, rawTx: [UInt8]) {
+        self.id = id
+        self.txid = txid
+        self.rawTx = rawTx
+    }
+
     enum CodingKeys: String, CodingKey {
         case id
         case txid
@@ -44,6 +62,11 @@ public struct PreparedTx: Equatable, Codable {
 public struct NoteSplitProposal: Equatable, Codable {
     public let outputNotes: [UInt64]
     public let fee: UInt64
+
+    public init(outputNotes: [UInt64], fee: UInt64) {
+        self.outputNotes = outputNotes
+        self.fee = fee
+    }
 
     enum CodingKeys: String, CodingKey {
         case outputNotes = "output_notes"
@@ -60,6 +83,20 @@ public struct TransferProposal: Equatable, Codable {
     public let nextExecutableAfterHeight: UInt32
     public let expiryHeight: UInt32
 
+    public init(
+        id: String,
+        amountZatoshi: UInt64,
+        anchorHeight: UInt32,
+        nextExecutableAfterHeight: UInt32,
+        expiryHeight: UInt32
+    ) {
+        self.id = id
+        self.amountZatoshi = amountZatoshi
+        self.anchorHeight = anchorHeight
+        self.nextExecutableAfterHeight = nextExecutableAfterHeight
+        self.expiryHeight = expiryHeight
+    }
+
     enum CodingKeys: String, CodingKey {
         case id
         case amount
@@ -74,6 +111,11 @@ public struct MigrationSchedule: Equatable, Codable {
     public let transfers: [TransferProposal]
     public let estimatedDurationHours: UInt32
 
+    public init(transfers: [TransferProposal], estimatedDurationHours: UInt32) {
+        self.transfers = transfers
+        self.estimatedDurationHours = estimatedDurationHours
+    }
+
     enum CodingKeys: String, CodingKey {
         case transfers
         case estimatedDurationHours = "estimated_duration_hours"
@@ -85,6 +127,11 @@ public struct MigrationSchedule: Equatable, Codable {
 public struct NetworkPrivacyOptions: Equatable, Codable {
     public let useTor: Bool
     public let submissionEndpoint: String?
+
+    public init(useTor: Bool, submissionEndpoint: String?) {
+        self.useTor = useTor
+        self.submissionEndpoint = submissionEndpoint
+    }
 
     enum CodingKeys: String, CodingKey {
         case useTor = "use_tor"
