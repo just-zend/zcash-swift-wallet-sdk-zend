@@ -29,6 +29,7 @@ enum ShieldedProtocol: SwiftProtobuf.Enum, Swift.CaseIterable {
   typealias RawValue = Int
   case sapling // = 0
   case orchard // = 1
+  case ironwood // = 2
   case UNRECOGNIZED(Int)
 
   init() {
@@ -39,6 +40,7 @@ enum ShieldedProtocol: SwiftProtobuf.Enum, Swift.CaseIterable {
     switch rawValue {
     case 0: self = .sapling
     case 1: self = .orchard
+    case 2: self = .ironwood
     default: self = .UNRECOGNIZED(rawValue)
     }
   }
@@ -47,6 +49,7 @@ enum ShieldedProtocol: SwiftProtobuf.Enum, Swift.CaseIterable {
     switch self {
     case .sapling: return 0
     case .orchard: return 1
+    case .ironwood: return 2
     case .UNRECOGNIZED(let i): return i
     }
   }
@@ -55,6 +58,7 @@ enum ShieldedProtocol: SwiftProtobuf.Enum, Swift.CaseIterable {
   static let allCases: [ShieldedProtocol] = [
     .sapling,
     .orchard,
+    .ironwood,
   ]
 
 }
@@ -376,6 +380,9 @@ struct TreeState: Sendable {
   /// orchard commitment tree state
   var orchardTree: String = String()
 
+  /// ironwood commitment tree state
+  var ironwoodTree: String = String()
+
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
   init() {}
@@ -477,7 +484,7 @@ struct GetAddressUtxosReplyList: Sendable {
 fileprivate let _protobuf_package = "cash.z.wallet.sdk.rpc"
 
 extension ShieldedProtocol: SwiftProtobuf._ProtoNameProviding {
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0sapling\0\u{1}orchard\0")
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0sapling\0\u{1}orchard\0\u{1}ironwood\0")
 }
 
 extension BlockID: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
@@ -1027,7 +1034,7 @@ extension Exclude: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
 
 extension TreeState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   static let protoMessageName: String = _protobuf_package + ".TreeState"
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}network\0\u{1}height\0\u{1}hash\0\u{1}time\0\u{1}saplingTree\0\u{1}orchardTree\0")
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}network\0\u{1}height\0\u{1}hash\0\u{1}time\0\u{1}saplingTree\0\u{1}orchardTree\0\u{1}ironwoodTree\0")
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1041,6 +1048,7 @@ extension TreeState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
       case 4: try { try decoder.decodeSingularUInt32Field(value: &self.time) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.saplingTree) }()
       case 6: try { try decoder.decodeSingularStringField(value: &self.orchardTree) }()
+      case 7: try { try decoder.decodeSingularStringField(value: &self.ironwoodTree) }()
       default: break
       }
     }
@@ -1065,6 +1073,9 @@ extension TreeState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     if !self.orchardTree.isEmpty {
       try visitor.visitSingularStringField(value: self.orchardTree, fieldNumber: 6)
     }
+    if !self.ironwoodTree.isEmpty {
+      try visitor.visitSingularStringField(value: self.ironwoodTree, fieldNumber: 7)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -1075,6 +1086,7 @@ extension TreeState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     if lhs.time != rhs.time {return false}
     if lhs.saplingTree != rhs.saplingTree {return false}
     if lhs.orchardTree != rhs.orchardTree {return false}
+    if lhs.ironwoodTree != rhs.ironwoodTree {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
