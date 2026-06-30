@@ -15,13 +15,19 @@ build = "rust/build.rs"
 [dependencies]
 
 # Zcash
-orchard = { version = "0.14", features = ["unstable-voting-circuits"] }
+# `unstable-voting-circuits` dropped while voting is gated off on this Ironwood branch (it is only
+# needed by the voting stack, which the valargroup orchard fork is incompatible with). See below.
+orchard = { version = "0.14" }
 pasta_curves = "0.5"
 ff = "0.13"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
-transparent = { package = "zcash_transparent", version = "0.8", default-features = false }
-zcash_address = { version = "0.12" }
-zcash_client_backend = { version = "0.23", features = [
+# librustzcash-family deps are pinned to EXACT fork versions (`=x.y.0`): the valargroup fork is the
+# `.0` patch of each minor, and `[patch.crates-io]` only *adds* the fork version as an option — a
+# looser `^` requirement would let the resolver pick a higher crates.io patch release (e.g.
+# zcash_client_sqlite 0.21.1) over the patched fork. The `=` pins force the fork version graph-wide.
+transparent = { package = "zcash_transparent", version = "=0.8.0", default-features = false }
+zcash_address = { version = "=0.12.0" }
+zcash_client_backend = { version = "=0.23.0", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "pczt",
@@ -29,14 +35,14 @@ zcash_client_backend = { version = "0.23", features = [
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "0.21", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "=0.21.0", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_note_encryption = "0.4.1"
-zcash_primitives = "0.28"
-zcash_proofs = "0.28"
-zcash_protocol = "0.9"
+zcash_primitives = "=0.28.0"
+zcash_proofs = "=0.28.0"
+zcash_protocol = "=0.9.0"
 zcash_script = "0.4"
 zip32 = "0.2"
-pczt = { version = "0.7", features = ["prover"] }
+pczt = { version = "=0.7.0", features = ["prover"] }
 
 # EIP-681
 eip681 = "0.1.0"
@@ -83,16 +89,25 @@ rust_decimal = { version = "1", default-features = false, features = ["c-repr"] 
 # - The "static" feature is required for the "compression" default feature of arti-client.
 xz2 = { version = "0.1", features = ["static"] }
 
-# Voting
+# Voting is gated behind the `voting` feature (off by default): the crates.io zcash_voting /
+# voting-circuits stack calls the pre-Ironwood orchard Note API and cannot build against the
+# valargroup orchard fork this branch requires for Ironwood. Re-enable once the voting stack is
+# migrated to valargroup zcash_voting 1.0.0 (MOB-1455).
 zcash_voting = { version = "0.11", default-features = false, features = [
     "client-pir",
     "client-tree-sync",
-] }
-zcash_keys = { version = "0.14", features = ["orchard"] }
+], optional = true }
+zcash_keys = { version = "=0.14.0", features = ["orchard"] }
 incrementalmerkletree = { version = "0.8", default-features = false }
 
-[dev-dependencies]
-zcash_voting = { version = "0.11", default-features = false, features = ["test-fixtures"] }
+# Ironwood migration engine (shared Orchard->Ironwood logic, also consumed by the Android SDK).
+# Local path for development; switch to a git pin for release.
+zodl_ironwood_migration = { path = "../ZODLIronwoodMigrationRust" }
+
+[features]
+# Off by default on this Ironwood branch — see the zcash_voting dependency note above. Enabling it
+# requires migrating the voting stack to valargroup zcash_voting 1.0.0.
+voting = ["dep:zcash_voting"]
 
 [build-dependencies]
 bindgen = "0.72"
@@ -106,3 +121,21 @@ crate-type = ["staticlib"]
 
 [profile.release]
 lto = true
+
+# Point the whole librustzcash graph at the valargroup fork so the SDK, the migration crate, the
+# voting stack, and all transitive deps unify on ONE librustzcash with Ironwood (NU6.3) support.
+# Pinned BY BRANCH (tip = 0c3ad735) to match the valargroup voting workspace, which references
+# librustzcash by this branch — a rev spec would not unify with it (same reason orchard is
+# branch-pinned). This is vizor's proven configuration.
+[patch.crates-io]
+zcash_client_backend = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+zcash_client_sqlite  = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+zcash_primitives     = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+zcash_keys           = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+zcash_protocol       = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+zcash_transparent    = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+zcash_proofs         = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+zcash_address        = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+zip321               = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+pczt                 = { git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+orchard = { git = "https://github.com/zcash/orchard", branch = "adam/qleak-dummy-ciphertexts-on-pr505" }

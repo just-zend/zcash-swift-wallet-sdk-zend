@@ -91,6 +91,10 @@ mod derivation;
 mod eip681;
 mod ffi;
 mod tor;
+// Voting is gated off on this Ironwood branch: the crates.io voting stack calls the pre-Ironwood
+// orchard Note API and is incompatible with the valargroup orchard fork. Re-enable with the
+// `voting` feature once the stack is migrated to valargroup zcash_voting 1.0.0 (MOB-1455).
+#[cfg(feature = "voting")]
 mod voting;
 
 #[cfg(target_vendor = "apple")]
@@ -1331,7 +1335,7 @@ pub unsafe extern "C" fn zcashlc_rewind_to_height(
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let height = BlockHeight::from(height);
-        let result_height = db_data.rewind_to_height(height);
+        let result_height = db_data.truncate_to_height(height);
 
         result_height.map_or_else(
             |err| match err {
@@ -1836,6 +1840,10 @@ pub unsafe extern "C" fn zcashlc_put_utxo(
                 script_pubkey,
             ),
             Some(BlockHeight::from(height as u32)),
+            // This FFI call doesn't carry account context (new fork fields) — left unset.
+            None,
+            None,
+            None,
         )
         .ok_or_else(|| {
             anyhow!(
@@ -2247,6 +2255,8 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             memo,
             mode,
             confirmation_policy,
+            // `proposed_version` (unstable): use the default tx version for a max-spend transfer.
+            None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2848,7 +2858,11 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
 
         if prover.requires_orchard_proof() {
             prover = prover
-                .create_orchard_proof(&orchard::circuit::ProvingKey::build())
+                .create_orchard_proof(&orchard::circuit::ProvingKey::build(
+                    // Regular Orchard-pool proving uses the current fixed circuit; PostNu6_3 is
+                    // reserved for the separate Ironwood proof path.
+                    orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2,
+                ))
                 .map_err(|e| anyhow!("Failed to create Orchard proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_orchard_proof());
