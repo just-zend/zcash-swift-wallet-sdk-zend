@@ -881,6 +881,9 @@ enum ZcashErrorDefinition {
     /// Put Orchard subtree roots to the DB failed.
     // sourcery: code="ZCBPEO0022"
     case compactBlockProcessorPutOrchardSubtreeRoots(_ error: Error)
+    /// Put Ironwood subtree roots to the DB failed.
+    // sourcery: code="ZCBPEO0023"
+    case compactBlockProcessorPutIronwoodSubtreeRoots(_ error: Error)
 
     // MARK: - SDKSynchronizer
 

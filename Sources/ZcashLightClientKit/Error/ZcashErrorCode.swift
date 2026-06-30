@@ -455,6 +455,8 @@ public enum ZcashErrorCode: String {
     case compactBlockProcessorSupportedSyncAlgorithm = "ZCBPEO0021"
     /// Put Orchard subtree roots to the DB failed.
     case compactBlockProcessorPutOrchardSubtreeRoots = "ZCBPEO0022"
+    /// Put Ironwood subtree roots to the DB failed.
+    case compactBlockProcessorPutIronwoodSubtreeRoots = "ZCBPEO0023"
     /// The synchronizer is unprepared.
     case synchronizerNotPrepared = "ZSYNCO0001"
     /// Memos can't be sent to transparent addresses.
