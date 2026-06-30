@@ -90,6 +90,7 @@ use zip32::fingerprint::SeedFingerprint;
 mod derivation;
 mod eip681;
 mod ffi;
+mod migration;
 mod tor;
 // Voting is gated off on this Ironwood branch: the crates.io voting stack calls the pre-Ironwood
 // orchard Note API and is incompatible with the valargroup orchard fork. Re-enable with the
