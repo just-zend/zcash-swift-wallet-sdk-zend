@@ -6,6 +6,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- Internal `ZcashRustBackendWelding` surface for the Orchard → Ironwood migration engine
+  (`zodl_ironwood_migration`): migration state/progress, note-split planning + signing, transfer
+  scheduling + signing, due-transfer execution bookkeeping, and lifecycle/recovery. Adds public
+  `Codable` models (`MigrationState`, `MigrationProgress`, `MigrationSchedule`, `TransferProposal`,
+  `NoteSplitProposal`, `PreparedTx`, `TransferResult`, `AttentionReason`, `NetworkPrivacyOptions`).
+  The public `Synchronizer` API and the network broadcast composition follow in a later change.
+
+## Changed
+- The Rust core now builds against the valargroup `librustzcash` fork under
+  `zcash_unstable="nu6.3"` to enable Ironwood (NU6.3) transaction building. Shielded voting is
+  temporarily gated behind an off-by-default `voting` cargo feature (and its Swift layer excluded
+  from the build): the crates.io voting stack calls the pre-Ironwood orchard `Note` API and is
+  incompatible with the orchard fork. To be restored against valargroup `zcash_voting` 1.0.0.
+
 # 2.6.0-alpha.6
 
 ## Added
