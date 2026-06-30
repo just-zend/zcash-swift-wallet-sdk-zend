@@ -346,6 +346,9 @@ pub struct AccountBalance {
     /// The value of unspent Orchard outputs belonging to the account.
     orchard_balance: Balance,
 
+    /// The value of unspent Ironwood (Orchard note-version V3) outputs belonging to the account.
+    ironwood_balance: Balance,
+
     /// The value of all unspent transparent outputs belonging to the account,
     /// irrespective of confirmation depth.
     ///
@@ -362,6 +365,7 @@ impl AccountBalance {
             account_uuid: account_uuid.expose_uuid().into_bytes(),
             sapling_balance: Balance::new(balance.sapling_balance()),
             orchard_balance: Balance::new(balance.orchard_balance()),
+            ironwood_balance: Balance::new(balance.ironwood_balance()),
             unshielded: ZatBalance::from(balance.unshielded_balance().total()).into(),
         }
     }
@@ -414,6 +418,7 @@ pub struct WalletSummary {
     recovery_progress: *mut ScanProgress,
     next_sapling_subtree_index: u64,
     next_orchard_subtree_index: u64,
+    next_ironwood_subtree_index: u64,
 }
 
 impl WalletSummary {
@@ -453,6 +458,7 @@ impl WalletSummary {
             recovery_progress,
             next_sapling_subtree_index: summary.next_sapling_subtree_index(),
             next_orchard_subtree_index: summary.next_orchard_subtree_index(),
+            next_ironwood_subtree_index: summary.next_ironwood_subtree_index(),
         })))
     }
 
@@ -466,6 +472,7 @@ impl WalletSummary {
             recovery_progress: ptr::null_mut(),
             next_sapling_subtree_index: 0,
             next_orchard_subtree_index: 0,
+            next_ironwood_subtree_index: 0,
         }))
     }
 }
