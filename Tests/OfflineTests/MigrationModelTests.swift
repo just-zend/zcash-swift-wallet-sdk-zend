@@ -28,13 +28,13 @@ final class MigrationModelTests: XCTestCase {
 
     func testMigrationStateInProgress() throws {
         let json = """
-        {"InProgress":{"completed_transfers":1,"total_transfers":3,"remaining_orchard_zatoshi":600000000,"next_transfer_ready_at_height":2880864}}
+        {"InProgress":{"completed_transfers":1,"total_transfers":3,"remaining_orchard":600000000,"next_transfer_ready_at_height":2880864}}
         """
         let expected = MigrationState.inProgress(
             MigrationProgress(
                 completedTransfers: 1,
                 totalTransfers: 3,
-                remainingOrchardZatoshi: 600_000_000,
+                remainingOrchard: 600_000_000,
                 nextTransferReadyAtHeight: 2_880_864
             )
         )
@@ -67,9 +67,9 @@ final class MigrationModelTests: XCTestCase {
         }
     }
 
-    func testPreparedTxDecodesRawTxArray() throws {
-        let tx = try decode(PreparedTx.self, "{\"id\":\"t1\",\"txid\":\"deadbeef\",\"raw_tx\":[5,0,255]}")
-        XCTAssertEqual(tx, PreparedTx(id: "t1", txid: "deadbeef", rawTx: [5, 0, 255]))
+    func testPreparedTxDecodesRawPcztArray() throws {
+        let tx = try decode(PreparedTx.self, "{\"id\":\"t1\",\"txid\":\"deadbeef\",\"raw_pczt\":[5,0,255]}")
+        XCTAssertEqual(tx, PreparedTx(id: "t1", txid: "deadbeef", rawPczt: [5, 0, 255]))
     }
 
     func testNoteSplitProposalSnakeCase() throws {
@@ -81,10 +81,10 @@ final class MigrationModelTests: XCTestCase {
 
     func testScheduleAndProposalDecodeAndRoundTrip() throws {
         let json = """
-        {"transfers":[{"id":"t1","amount_zatoshi":1000000000,"anchor_height":2880000,"next_executable_after_height":2880288,"expiry_height":2880576}],"estimated_duration_hours":6}
+        {"transfers":[{"id":"t1","amount":1000000000,"anchor_height":2880000,"next_executable_after_height":2880288,"expiry_height":2880576}],"estimated_duration_hours":6}
         """
         let decoded = try decode(MigrationSchedule.self, json)
-        XCTAssertEqual(decoded.transfers.first?.amountZatoshi, 1_000_000_000)
+        XCTAssertEqual(decoded.transfers.first?.amount, 1_000_000_000)
         XCTAssertEqual(decoded.transfers.first?.nextExecutableAfterHeight, 2_880_288)
         XCTAssertEqual(decoded.estimatedDurationHours, 6)
         XCTAssertEqual(try roundTrip(decoded), decoded)
@@ -93,7 +93,7 @@ final class MigrationModelTests: XCTestCase {
     func testMigrationProgressNullableHeight() throws {
         let decoded = try decode(
             MigrationProgress.self,
-            "{\"completed_transfers\":0,\"total_transfers\":0,\"remaining_orchard_zatoshi\":0,\"next_transfer_ready_at_height\":null}"
+            "{\"completed_transfers\":0,\"total_transfers\":0,\"remaining_orchard\":0,\"next_transfer_ready_at_height\":null}"
         )
         XCTAssertNil(decoded.nextTransferReadyAtHeight)
     }

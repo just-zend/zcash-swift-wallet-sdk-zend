@@ -4156,6 +4156,54 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
+    // MARK: - migrationExtractBroadcastTx
+
+    var migrationExtractBroadcastTxPcztForThrowableError: Error?
+    var migrationExtractBroadcastTxPcztForCallsCount = 0
+    var migrationExtractBroadcastTxPcztForCalled: Bool {
+        return migrationExtractBroadcastTxPcztForCallsCount > 0
+    }
+    var migrationExtractBroadcastTxPcztForReceivedArguments: (pczt: [UInt8], account: AccountUUID)?
+    var migrationExtractBroadcastTxPcztForReturnValue: [UInt8]!
+    var migrationExtractBroadcastTxPcztForClosure: (([UInt8], AccountUUID) async throws -> [UInt8])?
+
+    func migrationExtractBroadcastTx(pczt: [UInt8], for account: AccountUUID) async throws -> [UInt8] {
+        if let error = migrationExtractBroadcastTxPcztForThrowableError {
+            throw error
+        }
+        migrationExtractBroadcastTxPcztForCallsCount += 1
+        migrationExtractBroadcastTxPcztForReceivedArguments = (pczt: pczt, account: account)
+        if let closure = migrationExtractBroadcastTxPcztForClosure {
+            return try await closure(pczt, account)
+        } else {
+            return migrationExtractBroadcastTxPcztForReturnValue
+        }
+    }
+
+    // MARK: - migrationRefreshStaleTransfers
+
+    var migrationRefreshStaleTransfersUskForThrowableError: Error?
+    var migrationRefreshStaleTransfersUskForCallsCount = 0
+    var migrationRefreshStaleTransfersUskForCalled: Bool {
+        return migrationRefreshStaleTransfersUskForCallsCount > 0
+    }
+    var migrationRefreshStaleTransfersUskForReceivedArguments: (usk: UnifiedSpendingKey, account: AccountUUID)?
+    var migrationRefreshStaleTransfersUskForReturnValue: UInt32!
+    var migrationRefreshStaleTransfersUskForClosure: ((UnifiedSpendingKey, AccountUUID) async throws -> UInt32)?
+
+    func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32 {
+        if let error = migrationRefreshStaleTransfersUskForThrowableError {
+            throw error
+        }
+        migrationRefreshStaleTransfersUskForCallsCount += 1
+        migrationRefreshStaleTransfersUskForReceivedArguments = (usk: usk, account: account)
+        if let closure = migrationRefreshStaleTransfersUskForClosure {
+            return try await closure(usk, account)
+        } else {
+            return migrationRefreshStaleTransfersUskForReturnValue
+        }
+    }
+
     // MARK: - migrationRecordTransferResult
 
     var migrationRecordTransferResultTransferIdResultForThrowableError: Error?

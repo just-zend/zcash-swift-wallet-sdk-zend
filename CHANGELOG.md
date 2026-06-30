@@ -9,10 +9,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Added
 - Internal `ZcashRustBackendWelding` surface for the Orchard → Ironwood migration engine
   (`zodl_ironwood_migration`): migration state/progress, note-split planning + signing, transfer
-  scheduling + signing, due-transfer execution bookkeeping, and lifecycle/recovery. Adds public
-  `Codable` models (`MigrationState`, `MigrationProgress`, `MigrationSchedule`, `TransferProposal`,
-  `NoteSplitProposal`, `PreparedTx`, `TransferResult`, `AttentionReason`, `NetworkPrivacyOptions`).
-  The public `Synchronizer` API and the network broadcast composition follow in a later change.
+  scheduling + signing, due-transfer execution bookkeeping, extraction of the broadcast-ready
+  consensus transaction from a signed PCZT, stale-transfer refresh, and lifecycle/recovery. Adds
+  public `Codable` models (`MigrationState`, `MigrationProgress`, `MigrationSchedule`,
+  `TransferProposal`, `NoteSplitProposal`, `PreparedTx`, `TransferResult`, `AttentionReason`,
+  `NetworkPrivacyOptions`). `PreparedTx.rawPczt` is a serialized PCZT that the platform turns into a
+  consensus transaction via the welding's extract step (`migrationExtractBroadcastTx`) before
+  broadcasting. The public `Synchronizer` API and the network broadcast composition follow in a
+  later change.
 
 ## Changed
 - The Rust core now builds against the valargroup `librustzcash` fork under

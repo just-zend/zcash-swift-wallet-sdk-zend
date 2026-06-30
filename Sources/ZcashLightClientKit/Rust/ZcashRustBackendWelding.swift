@@ -395,6 +395,17 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationNextDueTransfer` if the rust layer returns an error.
     func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedTx?
 
+    /// Extract the broadcast-ready consensus transaction from a signed PCZT (the `PreparedTx.rawPczt`
+    /// returned by `migrationNextDueTransfer` or `migrationSignNoteSplit`); returns the raw
+    /// transaction bytes to hand to the lightwalletd submit path.
+    /// - Throws: `rustMigrationExtractBroadcastTx` if the rust layer returns an error.
+    func migrationExtractBroadcastTx(pczt: [UInt8], for account: AccountUUID) async throws -> [UInt8]
+
+    /// Re-anchor, re-prove and re-sign the active run's scheduled transfers; returns the number
+    /// refreshed.
+    /// - Throws: `rustMigrationRefreshStaleTransfers` if the rust layer returns an error.
+    func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32
+
     /// Record the platform's broadcast outcome, advancing engine state.
     /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error.
     func migrationRecordTransferResult(transferId: String, result: TransferResult, for account: AccountUUID) async throws

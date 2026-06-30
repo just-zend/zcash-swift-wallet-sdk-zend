@@ -58,4 +58,13 @@ final class MigrationFFITests: XCTestCase {
             // The crate returns MigrationError::InvalidState -> null ptr -> rustMigrationRecordTransferResult.
         }
     }
+
+    func testExtractBroadcastTxWithInvalidPcztThrows() async throws {
+        do {
+            _ = try await rustBackend.migrationExtractBroadcastTx(pczt: [0, 1, 2, 3], for: account)
+            XCTFail("expected extracting a tx from invalid PCZT bytes to throw")
+        } catch {
+            // Invalid PCZT bytes -> crate deserialization error -> null ptr -> rustMigrationExtractBroadcastTx.
+        }
+    }
 }

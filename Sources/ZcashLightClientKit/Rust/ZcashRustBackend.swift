@@ -1298,6 +1298,46 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
+    @DBActor func migrationExtractBroadcastTx(pczt: [UInt8], for account: AccountUUID) async throws -> [UInt8] {
+        let ptr = pczt.withUnsafeBufferPointer { pcztPtr in
+            zcashlc_migration_extract_broadcast_tx(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                pcztPtr.baseAddress,
+                UInt(pczt.count)
+            )
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationExtractBroadcastTx(lastErrorMessage(fallback: "`migrationExtractBroadcastTx` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return [UInt8](Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+    }
+
+    @DBActor func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32 {
+        let ptr = usk.bytes.withUnsafeBufferPointer { uskPtr in
+            zcashlc_migration_refresh_stale_transfers(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                uskPtr.baseAddress,
+                UInt(usk.bytes.count)
+            )
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationRefreshStaleTransfers(lastErrorMessage(fallback: "`migrationRefreshStaleTransfers` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(UInt32.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationRefreshStaleTransfers("Failed to decode UInt32: \(error)")
+        }
+    }
+
     @DBActor func migrationRecordTransferResult(transferId: String, result: TransferResult, for account: AccountUUID) async throws {
         let resultBytes = [UInt8](try JSONEncoder().encode(result))
         let ptr = resultBytes.withUnsafeBufferPointer { resultPtr in

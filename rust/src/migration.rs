@@ -4,8 +4,9 @@
 //! Every function marshals whole `serde` types as JSON through [`ffi::BoxedSlice`]: on success it
 //! returns a non-null `BoxedSlice` holding the JSON body; on failure it returns null and stores the
 //! message for `zcashlc_last_error_message`. Void crate methods encode `()` (`"null"`), which the
-//! Swift welding ignores. The crate never broadcasts — the Swift layer broadcasts the returned
-//! `PreparedTx.raw_tx` and reports the outcome back via `record_transfer_result`.
+//! Swift welding ignores. The crate never broadcasts — `PreparedTx.raw_pczt` is a serialized PCZT;
+//! the Swift layer extracts the consensus transaction via `zcashlc_migration_extract_broadcast_tx`,
+//! broadcasts that, and reports the outcome back via `record_transfer_result`.
 
 use std::ffi::{CStr, OsStr};
 use std::os::raw::c_char;
@@ -25,8 +26,8 @@ use crate::unwrap_exc_or_null;
 /// `parse_network`).
 fn migration_network(network_id: u32) -> anyhow::Result<Network> {
     match network_id {
-        0 => Ok(Network::Test),
-        1 => Ok(Network::Main),
+        0 => Ok(Network::TestNetwork),
+        1 => Ok(Network::MainNetwork),
         other => Err(anyhow!("Invalid network id: {other}")),
     }
 }
@@ -272,6 +273,58 @@ pub unsafe extern "C" fn zcashlc_migration_next_due_transfer(
         let value = ctx
             .next_due_transfer()
             .map_err(|e| anyhow!("next_due_transfer: {e}"))?;
+        Ok(ffi::BoxedSlice::some(serde_json::to_vec(&value)?))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Extract the broadcast-ready consensus transaction from a serialized signed PCZT
+/// (`PreparedTx.raw_pczt`). Returns the raw transaction bytes (NOT JSON).
+///
+/// # Safety
+/// See [`context`]; `pczt_ptr` must be valid for reads of `pczt_len` bytes. Free the returned
+/// pointer with `zcashlc_free_boxed_slice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_extract_broadcast_tx(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    pczt_ptr: *const u8,
+    pczt_len: usize,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let pczt = unsafe { slice::from_raw_parts(pczt_ptr, pczt_len) };
+        let tx = ctx
+            .extract_broadcast_tx(pczt)
+            .map_err(|e| anyhow!("extract_broadcast_tx: {e}"))?;
+        Ok(ffi::BoxedSlice::some(tx))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Re-anchor, re-prove and re-sign the active run's scheduled transfers, returning the number
+/// refreshed (JSON `u32`). `usk` is the raw `UnifiedSpendingKey` (Orchard era) bytes.
+///
+/// # Safety
+/// See [`context`]; `usk_ptr` must be valid for reads of `usk_len` bytes. Free the returned
+/// pointer with `zcashlc_free_boxed_slice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    usk_ptr: *const u8,
+    usk_len: usize,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let usk = unsafe { slice::from_raw_parts(usk_ptr, usk_len) };
+        let value = ctx
+            .refresh_stale_transfers(usk)
+            .map_err(|e| anyhow!("refresh_stale_transfers: {e}"))?;
         Ok(ffi::BoxedSlice::some(serde_json::to_vec(&value)?))
     });
     unwrap_exc_or_null(res)

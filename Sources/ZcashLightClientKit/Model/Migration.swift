@@ -14,28 +14,29 @@ import Foundation
 public struct MigrationProgress: Equatable, Codable {
     public let completedTransfers: UInt32
     public let totalTransfers: UInt32
-    public let remainingOrchardZatoshi: UInt64
+    public let remainingOrchard: UInt64
     public let nextTransferReadyAtHeight: UInt32?
 
     enum CodingKeys: String, CodingKey {
         case completedTransfers = "completed_transfers"
         case totalTransfers = "total_transfers"
-        case remainingOrchardZatoshi = "remaining_orchard_zatoshi"
+        case remainingOrchard = "remaining_orchard"
         case nextTransferReadyAtHeight = "next_transfer_ready_at_height"
     }
 }
 
-/// A pre-signed transaction for the platform to broadcast. `rawTx` is the consensus-encoded
-/// transaction (serde encodes `Vec<u8>` as a JSON array of bytes); `txid` is its pre-computed id.
+/// A pre-signed transaction for the platform to broadcast. `rawPczt` is a serialized PCZT (serde
+/// encodes `Vec<u8>` as a JSON array of bytes); the Swift layer turns it into a consensus
+/// transaction via `migrationExtractBroadcastTx` before broadcasting. `txid` is its pre-computed id.
 public struct PreparedTx: Equatable, Codable {
     public let id: String
     public let txid: String
-    public let rawTx: [UInt8]
+    public let rawPczt: [UInt8]
 
     enum CodingKeys: String, CodingKey {
         case id
         case txid
-        case rawTx = "raw_tx"
+        case rawPczt = "raw_pczt"
     }
 }
 
@@ -54,14 +55,14 @@ public struct NoteSplitProposal: Equatable, Codable {
 /// the transfer may broadcast after `nextExecutableAfterHeight` and is invalid after `expiryHeight`.
 public struct TransferProposal: Equatable, Codable {
     public let id: String
-    public let amountZatoshi: UInt64
+    public let amount: UInt64
     public let anchorHeight: UInt32
     public let nextExecutableAfterHeight: UInt32
     public let expiryHeight: UInt32
 
     enum CodingKeys: String, CodingKey {
         case id
-        case amountZatoshi = "amount_zatoshi"
+        case amount
         case anchorHeight = "anchor_height"
         case nextExecutableAfterHeight = "next_executable_after_height"
         case expiryHeight = "expiry_height"
