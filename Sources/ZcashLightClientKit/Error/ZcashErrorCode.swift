@@ -259,6 +259,34 @@ public enum ZcashErrorCode: String {
     case rustTruncateToChainState = "ZRUST0091"
     /// Error from rust layer when calling ZcashEip681Backend.parseTransactionRequest
     case rustEip681Parse = "ZRUST0092"
+    /// Error from rust layer when calling ZcashRustBackend.migrationState
+    case rustMigrationState = "ZRUST0093"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProgress
+    case rustMigrationProgress = "ZRUST0094"
+    /// Error from rust layer when calling ZcashRustBackend.migrationIsNoteSplitNeeded
+    case rustMigrationIsNoteSplitNeeded = "ZRUST0095"
+    /// Error from rust layer when calling ZcashRustBackend.migrationPrepareNoteSplit
+    case rustMigrationPrepareNoteSplit = "ZRUST0096"
+    /// Error from rust layer when calling ZcashRustBackend.migrationSignNoteSplit
+    case rustMigrationSignNoteSplit = "ZRUST0097"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProposeTransfers
+    case rustMigrationProposeTransfers = "ZRUST0098"
+    /// Error from rust layer when calling ZcashRustBackend.migrationSignAndStore
+    case rustMigrationSignAndStore = "ZRUST0099"
+    /// Error from rust layer when calling ZcashRustBackend.migrationIsSyncRequired
+    case rustMigrationIsSyncRequired = "ZRUST0100"
+    /// Error from rust layer when calling ZcashRustBackend.migrationNextDueTransfer
+    case rustMigrationNextDueTransfer = "ZRUST0101"
+    /// Error from rust layer when calling ZcashRustBackend.migrationRecordTransferResult
+    case rustMigrationRecordTransferResult = "ZRUST0102"
+    /// Error from rust layer when calling ZcashRustBackend.migrationHasOverdueTransfers
+    case rustMigrationHasOverdueTransfers = "ZRUST0103"
+    /// Error from rust layer when calling ZcashRustBackend.migrationHasInvalidTransfers
+    case rustMigrationHasInvalidTransfers = "ZRUST0104"
+    /// Error from rust layer when calling ZcashRustBackend.migrationRestartStep
+    case rustMigrationRestartStep = "ZRUST0105"
+    /// Error from rust layer when calling ZcashRustBackend.migrationInitializePostUpgrade
+    case rustMigrationInitializePostUpgrade = "ZRUST0106"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.
