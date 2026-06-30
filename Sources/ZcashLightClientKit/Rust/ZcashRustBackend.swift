@@ -1156,6 +1156,214 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return branchId
     }
 
+    // MARK: - Ironwood migration
+
+    @DBActor func migrationState(for account: AccountUUID) async throws -> MigrationState {
+        let ptr = zcashlc_migration_state(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationState(lastErrorMessage(fallback: "`migrationState` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(MigrationState.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationState("Failed to decode MigrationState: \(error)")
+        }
+    }
+
+    @DBActor func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress? {
+        let ptr = zcashlc_migration_progress(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationProgress(lastErrorMessage(fallback: "`migrationProgress` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(MigrationProgress?.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationProgress("Failed to decode MigrationProgress: \(error)")
+        }
+    }
+
+    @DBActor func migrationIsNoteSplitNeeded(for account: AccountUUID) async throws -> Bool {
+        let ptr = zcashlc_migration_is_note_split_needed(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationIsNoteSplitNeeded(lastErrorMessage(fallback: "`migrationIsNoteSplitNeeded` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(Bool.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationIsNoteSplitNeeded("Failed to decode Bool: \(error)")
+        }
+    }
+
+    @DBActor func migrationPrepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal {
+        let ptr = zcashlc_migration_prepare_note_split(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationPrepareNoteSplit(lastErrorMessage(fallback: "`migrationPrepareNoteSplit` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(NoteSplitProposal.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationPrepareNoteSplit("Failed to decode NoteSplitProposal: \(error)")
+        }
+    }
+
+    @DBActor func migrationSignNoteSplit(proposal: NoteSplitProposal, usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> PreparedTx {
+        let proposalBytes = [UInt8](try JSONEncoder().encode(proposal))
+        let ptr = proposalBytes.withUnsafeBufferPointer { proposalPtr in
+            usk.bytes.withUnsafeBufferPointer { uskPtr in
+                zcashlc_migration_sign_note_split(
+                    dbData.0,
+                    dbData.1,
+                    account.id,
+                    networkType.networkId,
+                    proposalPtr.baseAddress,
+                    UInt(proposalBytes.count),
+                    uskPtr.baseAddress,
+                    UInt(usk.bytes.count)
+                )
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationSignNoteSplit(lastErrorMessage(fallback: "`migrationSignNoteSplit` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(PreparedTx.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationSignNoteSplit("Failed to decode PreparedTx: \(error)")
+        }
+    }
+
+    @DBActor func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
+        let ptr = zcashlc_migration_propose_transfers(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationProposeTransfers(lastErrorMessage(fallback: "`migrationProposeTransfers` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(MigrationSchedule.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationProposeTransfers("Failed to decode MigrationSchedule: \(error)")
+        }
+    }
+
+    @DBActor func migrationSignAndStore(schedule: MigrationSchedule, usk: UnifiedSpendingKey, for account: AccountUUID) async throws {
+        let scheduleBytes = [UInt8](try JSONEncoder().encode(schedule))
+        let ptr = scheduleBytes.withUnsafeBufferPointer { schedulePtr in
+            usk.bytes.withUnsafeBufferPointer { uskPtr in
+                zcashlc_migration_sign_and_store(
+                    dbData.0,
+                    dbData.1,
+                    account.id,
+                    networkType.networkId,
+                    schedulePtr.baseAddress,
+                    UInt(scheduleBytes.count),
+                    uskPtr.baseAddress,
+                    UInt(usk.bytes.count)
+                )
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationSignAndStore(lastErrorMessage(fallback: "`migrationSignAndStore` failed with unknown error"))
+        }
+        zcashlc_free_boxed_slice(ptr)
+    }
+
+    @DBActor func migrationIsSyncRequired(for account: AccountUUID) async throws -> Bool {
+        let ptr = zcashlc_migration_is_sync_required(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationIsSyncRequired(lastErrorMessage(fallback: "`migrationIsSyncRequired` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(Bool.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationIsSyncRequired("Failed to decode Bool: \(error)")
+        }
+    }
+
+    @DBActor func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedTx? {
+        let ptr = zcashlc_migration_next_due_transfer(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationNextDueTransfer(lastErrorMessage(fallback: "`migrationNextDueTransfer` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(PreparedTx?.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationNextDueTransfer("Failed to decode PreparedTx: \(error)")
+        }
+    }
+
+    @DBActor func migrationRecordTransferResult(transferId: String, result: TransferResult, for account: AccountUUID) async throws {
+        let resultBytes = [UInt8](try JSONEncoder().encode(result))
+        let ptr = resultBytes.withUnsafeBufferPointer { resultPtr in
+            zcashlc_migration_record_transfer_result(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                [CChar](transferId.utf8CString),
+                resultPtr.baseAddress,
+                UInt(resultBytes.count)
+            )
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationRecordTransferResult(lastErrorMessage(fallback: "`migrationRecordTransferResult` failed with unknown error"))
+        }
+        zcashlc_free_boxed_slice(ptr)
+    }
+
+    @DBActor func migrationHasOverdueTransfers(for account: AccountUUID) async throws -> Bool {
+        let ptr = zcashlc_migration_has_overdue_transfers(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationHasOverdueTransfers(lastErrorMessage(fallback: "`migrationHasOverdueTransfers` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(Bool.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationHasOverdueTransfers("Failed to decode Bool: \(error)")
+        }
+    }
+
+    @DBActor func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool {
+        let ptr = zcashlc_migration_has_invalid_transfers(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationHasInvalidTransfers(lastErrorMessage(fallback: "`migrationHasInvalidTransfers` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(Bool.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationHasInvalidTransfers("Failed to decode Bool: \(error)")
+        }
+    }
+
+    @DBActor func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule {
+        let ptr = zcashlc_migration_restart_step(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationRestartStep(lastErrorMessage(fallback: "`migrationRestartStep` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(MigrationSchedule.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationRestartStep("Failed to decode MigrationSchedule: \(error)")
+        }
+    }
+
+    @DBActor func migrationInitializePostUpgrade(for account: AccountUUID) async throws {
+        let ptr = zcashlc_migration_initialize_post_upgrade(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationInitializePostUpgrade(lastErrorMessage(fallback: "`migrationInitializePostUpgrade` failed with unknown error"))
+        }
+        zcashlc_free_boxed_slice(ptr)
+    }
+
     // swiftlint:disable:next cyclomatic_complexity
     @DBActor func transactionDataRequests() async throws -> [TransactionDataRequest] {
         let tDataRequestsPtr = zcashlc_transaction_data_requests(
