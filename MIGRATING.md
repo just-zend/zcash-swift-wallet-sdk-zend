@@ -6,6 +6,10 @@ information stored.
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
 track failures on its own. Wallet developers would have to account for those.
 
+## Ironwood (NU6.3) balance on `AccountBalance`
+
+`AccountBalance` gains a public `ironwoodBalance: PoolBalance` field (Ironwood is Orchard note-version V3, received at the account's existing Orchard receiver — there is no separate Ironwood address). The field is **additive** and is `.zero` for every wallet until NU6.3 activates and a lightwalletd serves Ironwood compact blocks. No action is required now; an app that wants to surface Ironwood can read/total it alongside `orchardBalance`. (If you construct `AccountBalance` yourself, e.g. in tests, the new field defaults to `.zero` via the memberwise initializer, so existing call sites keep compiling.)
+
 ## `Broadcaster` redesign (multi-server submission)
 
 The `Broadcaster` API introduced in the 2.6.0-alpha tags has changed:

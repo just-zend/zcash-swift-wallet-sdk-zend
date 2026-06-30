@@ -7,6 +7,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 # Unreleased
 
 ## Added
+- Ironwood (NU6.3) receive/sync readiness. Ironwood is Orchard note-version V3 — received at the
+  account's existing **Orchard receiver** (no separate Ironwood address) — so the SDK now wires the
+  receive/scan/balance path against the librustzcash Ironwood support: the Ironwood proto fields
+  (`CompactTx.ironwoodActions`, `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
+  `ShieldedProtocol.ironwood`); a `putIronwoodSubtreeRoots` FFI/welding method; a **best-effort**
+  Ironwood subtree-root fetch in `UpdateSubtreeRootsAction` (a lightwalletd that does not serve
+  Ironwood is skipped, so it never breaks sync); a public `AccountBalance.ironwoodBalance: PoolBalance`
+  (plus `WalletSummary.nextIronwoodSubtreeIndex`); and an optional `Checkpoint.ironwoodTree`. This is
+  **dormant** — `ironwoodBalance` is `.zero` for every wallet — until a lightwalletd serves Ironwood
+  compact blocks and NU6.3 activates (its consensus branch id is still a placeholder upstream). Error
+  codes ZRUST0109/ZRUST0110 and ZCBPEO0023.
 - Internal `ZcashRustBackendWelding` surface for the Orchard → Ironwood migration engine
   (`zodl_ironwood_migration`): migration state/progress, note-split planning + signing, transfer
   scheduling + signing, due-transfer execution bookkeeping, extraction of the broadcast-ready
