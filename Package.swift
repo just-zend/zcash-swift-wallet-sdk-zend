@@ -80,8 +80,10 @@ targets.append(contentsOf: [
         name: "OfflineTests",
         dependencies: ["ZcashLightClientKit", "TestUtils"],
         exclude: [
-            // Voting is gated off on this Ironwood branch (see the ZcashLightClientKit target).
-            "VotingRustBackendTests.swift"
+            // Voting is gated off on this Ironwood branch (see the ZcashLightClientKit target):
+            // these test the excluded Rust/Voting layer (VotingRustBackend, PirSnapshotResolver).
+            "VotingRustBackendTests.swift",
+            "PirSnapshotResolverTests.swift"
         ]
     ),
     .testTarget(
