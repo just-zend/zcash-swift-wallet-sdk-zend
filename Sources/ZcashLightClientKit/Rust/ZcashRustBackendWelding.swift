@@ -174,6 +174,9 @@ protocol ZcashRustBackendWelding {
 
     func putOrchardSubtreeRoots(startIndex: UInt64, roots: [SubtreeRoot]) async throws
 
+    /// Adds a sequence of Ironwood (Orchard note-version V3 / NU6.3) subtree roots to the data store.
+    func putIronwoodSubtreeRoots(startIndex: UInt64, roots: [SubtreeRoot]) async throws
+
     /// Updates the wallet's view of the blockchain.
     ///
     /// This method is used to provide the wallet with information about the state of the blockchain,
