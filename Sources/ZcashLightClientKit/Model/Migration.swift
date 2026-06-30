@@ -20,12 +20,12 @@ public struct MigrationProgress: Equatable, Codable {
     public init(
         completedTransfers: UInt32,
         totalTransfers: UInt32,
-        remainingOrchardZatoshi: UInt64,
+        remainingOrchard: UInt64,
         nextTransferReadyAtHeight: UInt32?
     ) {
         self.completedTransfers = completedTransfers
         self.totalTransfers = totalTransfers
-        self.remainingOrchardZatoshi = remainingOrchardZatoshi
+        self.remainingOrchard = remainingOrchard
         self.nextTransferReadyAtHeight = nextTransferReadyAtHeight
     }
 
@@ -45,10 +45,10 @@ public struct PreparedTx: Equatable, Codable {
     public let txid: String
     public let rawPczt: [UInt8]
 
-    public init(id: String, txid: String, rawTx: [UInt8]) {
+    public init(id: String, txid: String, rawPczt: [UInt8]) {
         self.id = id
         self.txid = txid
-        self.rawTx = rawTx
+        self.rawPczt = rawPczt
     }
 
     enum CodingKeys: String, CodingKey {
@@ -85,13 +85,13 @@ public struct TransferProposal: Equatable, Codable {
 
     public init(
         id: String,
-        amountZatoshi: UInt64,
+        amount: UInt64,
         anchorHeight: UInt32,
         nextExecutableAfterHeight: UInt32,
         expiryHeight: UInt32
     ) {
         self.id = id
-        self.amountZatoshi = amountZatoshi
+        self.amount = amount
         self.anchorHeight = anchorHeight
         self.nextExecutableAfterHeight = nextExecutableAfterHeight
         self.expiryHeight = expiryHeight

@@ -618,6 +618,11 @@ public protocol Synchronizer: AnyObject {
     /// Whether the migration is in an invalid state (spendable Orchard remains but nothing covers it).
     func hasInvalidTransfers(for account: AccountUUID) async throws -> Bool
 
+    /// Re-anchors, re-proves and re-signs the active migration run's scheduled transfers when they have
+    /// gone stale (their anchor is too old to broadcast), returning the number of transfers refreshed.
+    /// Detect the need with ``hasOverdueTransfers(for:)``.
+    func refreshStaleTransfers(spendingKey: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32
+
     /// Recovers from a `.requiresAttention` state by re-proposing the current migration step, returning
     /// the fresh schedule.
     func restartCurrentMigrationStep(for account: AccountUUID) async throws -> MigrationSchedule

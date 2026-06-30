@@ -543,7 +543,7 @@ public class SDKSynchronizer: Synchronizer {
             usk: spendingKey,
             for: account
         )
-        return try await broadcastMigrationTx(prepared)
+        return try await broadcastMigrationTx(prepared, for: account)
     }
 
     public func proposeMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
@@ -574,7 +574,7 @@ public class SDKSynchronizer: Synchronizer {
         guard let prepared = try await initializer.rustBackend.migrationNextDueTransfer(for: account) else {
             return nil
         }
-        let result = try await broadcastMigrationTx(prepared)
+        let result = try await broadcastMigrationTx(prepared, for: account)
         try await initializer.rustBackend.migrationRecordTransferResult(
             transferId: prepared.id,
             result: result,
@@ -583,21 +583,27 @@ public class SDKSynchronizer: Synchronizer {
         return result
     }
 
-    /// Broadcasts a crate-prepared migration transaction through the SDK's old direct submit path
-    /// (`transactionEncoder.submit`, not the broadcaster) and maps the outcome to a `TransferResult`,
+    /// Extracts the broadcast-ready consensus transaction from the crate-prepared, signed PCZT
+    /// (`PreparedTx.rawPczt`), broadcasts it through the SDK's old direct submit path
+    /// (`transactionEncoder.submit`, not the broadcaster), and maps the outcome to a `TransferResult`,
     /// mirroring `submitTransactions`' error handling.
     ///
     /// `invalidNote` / `expired` are intentionally not inferred from submit errors here — the
     /// migration engine owns deep invalidity: after broadcast, `migrationHasInvalidTransfers` /
     /// re-querying `migrationState` surfaces `.requiresAttention`, and `restartCurrentMigrationStep`
     /// recovers. So the Swift side maps obvious network outcomes and lets the engine reconcile.
-    private func broadcastMigrationTx(_ prepared: PreparedTx) async throws -> TransferResult {
+    private func broadcastMigrationTx(_ prepared: PreparedTx, for account: AccountUUID) async throws -> TransferResult {
+        // `PreparedTx.rawPczt` is a serialized PCZT, not a broadcastable transaction: extract the
+        // consensus transaction bytes first. An extract failure propagates (it is a crate/local error,
+        // not a network outcome) rather than being mapped to a `TransferResult`.
+        let txBytes = try await initializer.rustBackend.migrationExtractBroadcastTx(pczt: prepared.rawPczt, for: account)
+
         // `PreparedTx.txid` is the crate's display-order hex txid; `EncodedTransaction.transactionId`
         // and `isTransactionKnownToServer` need internal-order bytes, so decode then reverse.
         // TODO: [MOB-1455] honor NetworkPrivacyOptions (Tor / secondary endpoint). v1 broadcasts over
         // the SDK's already-configured service.
         let txIdData = Data(hexEncoded: prepared.txid).map { Data($0.reversed()) } ?? Data()
-        let encoded = EncodedTransaction(transactionId: txIdData, raw: Data(prepared.rawTx))
+        let encoded = EncodedTransaction(transactionId: txIdData, raw: Data(txBytes))
 
         do {
             try await transactionEncoder.submit(transaction: encoded)
@@ -620,6 +626,10 @@ public class SDKSynchronizer: Synchronizer {
 
     public func hasInvalidTransfers(for account: AccountUUID) async throws -> Bool {
         try await initializer.rustBackend.migrationHasInvalidTransfers(for: account)
+    }
+
+    public func refreshStaleTransfers(spendingKey: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32 {
+        try await initializer.rustBackend.migrationRefreshStaleTransfers(usk: spendingKey, for: account)
     }
 
     public func restartCurrentMigrationStep(for account: AccountUUID) async throws -> MigrationSchedule {

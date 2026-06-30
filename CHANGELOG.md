@@ -21,13 +21,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `for account: AccountUUID`: `migrationState`, `migrationProgress`, `isNoteSplitNeeded`,
   `prepareNoteSplit`, `submitNoteSplit`, `proposeMigrationTransfers`, `signAndStoreMigrationSchedule`,
   `isSyncRequiredBeforeNextTransfer`, `executeNextPendingTransfer`, `hasOverdueTransfers`,
-  `hasInvalidTransfers`, `restartCurrentMigrationStep`, and `initializePostUpgrade`. The two
-  broadcasting methods (`submitNoteSplit`, `executeNextPendingTransfer`) sign (or load) the engine's
-  prepared transaction and broadcast it over the SDK's existing direct submission path, mapping the
-  outcome to `TransferResult`; `executeNextPendingTransfer` also records the result back with the
-  engine. `NetworkPrivacyOptions` is accepted but not yet honored (broadcast uses the configured
-  lightwalletd). Async-only for now — the `ClosureSynchronizer` / `CombineSynchronizer` adapters are
-  not yet updated.
+  `hasInvalidTransfers`, `refreshStaleTransfers`, `restartCurrentMigrationStep`, and
+  `initializePostUpgrade`. The two broadcasting methods (`submitNoteSplit`,
+  `executeNextPendingTransfer`) sign (or load) the engine's prepared transaction, extract the
+  broadcast-ready consensus transaction from the signed PCZT (`migrationExtractBroadcastTx`), and
+  broadcast it over the SDK's existing direct submission path, mapping the outcome to
+  `TransferResult`; `executeNextPendingTransfer` also records the result back with the engine.
+  `refreshStaleTransfers` re-anchors/re-proves/re-signs stale scheduled transfers (pair with
+  `hasOverdueTransfers`). `NetworkPrivacyOptions` is accepted but not yet honored (broadcast uses the
+  configured lightwalletd). Async-only for now — the `ClosureSynchronizer` / `CombineSynchronizer`
+  adapters are not yet updated.
 
 ## Changed
 - The Rust core now builds against the valargroup `librustzcash` fork under

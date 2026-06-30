@@ -2906,6 +2906,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - refreshStaleTransfers
+
+    var refreshStaleTransfersSpendingKeyForThrowableError: Error?
+    var refreshStaleTransfersSpendingKeyForCallsCount = 0
+    var refreshStaleTransfersSpendingKeyForCalled: Bool {
+        return refreshStaleTransfersSpendingKeyForCallsCount > 0
+    }
+    var refreshStaleTransfersSpendingKeyForReceivedArguments: (spendingKey: UnifiedSpendingKey, account: AccountUUID)?
+    var refreshStaleTransfersSpendingKeyForReturnValue: UInt32!
+    var refreshStaleTransfersSpendingKeyForClosure: ((UnifiedSpendingKey, AccountUUID) async throws -> UInt32)?
+
+    func refreshStaleTransfers(spendingKey: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32 {
+        if let error = refreshStaleTransfersSpendingKeyForThrowableError {
+            throw error
+        }
+        refreshStaleTransfersSpendingKeyForCallsCount += 1
+        refreshStaleTransfersSpendingKeyForReceivedArguments = (spendingKey: spendingKey, account: account)
+        if let closure = refreshStaleTransfersSpendingKeyForClosure {
+            return try await closure(spendingKey, account)
+        } else {
+            return refreshStaleTransfersSpendingKeyForReturnValue
+        }
+    }
+
     // MARK: - restartCurrentMigrationStep
 
     var restartCurrentMigrationStepForThrowableError: Error?
