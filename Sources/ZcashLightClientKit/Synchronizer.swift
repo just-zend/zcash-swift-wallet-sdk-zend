@@ -561,6 +561,69 @@ public protocol Synchronizer: AnyObject {
     /// Use this to implement custom broadcast strategies such as submitting
     /// to multiple lightwalletd servers in parallel.
     var broadcaster: Broadcaster { get }
+
+    // MARK: - Ironwood migration
+
+    /// The current Orchard -> Ironwood migration state for `account`.
+    func migrationState(for account: AccountUUID) async throws -> MigrationState
+
+    /// Live migration progress for the progress UI, or `nil` when no migration is in progress.
+    func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress?
+
+    /// Whether the account's Orchard notes must be split before migration can proceed.
+    func isNoteSplitNeeded(for account: AccountUUID) async throws -> Bool
+
+    /// The proposed note split (per-note output values and the prep-transaction fee).
+    func prepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
+
+    /// Signs the note-split transaction for `proposal` and broadcasts it. After this returns
+    /// `.success`, the migration state advances to `.splitPendingConfirmation`; the app should poll
+    /// ``migrationState(for:)`` for confirmation.
+    /// - Parameter options: network-privacy preferences. Accepted but ignored in v1.
+    func submitNoteSplit(
+        proposal: NoteSplitProposal,
+        spendingKey: UnifiedSpendingKey,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> TransferResult
+
+    /// The full migration schedule for the spendable Orchard balance, presented to the user for a
+    /// one-time confirmation.
+    func proposeMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// Pre-signs and persists every transfer in the confirmed `schedule`.
+    func signAndStoreMigrationSchedule(
+        _ schedule: MigrationSchedule,
+        spendingKey: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws
+
+    /// Whether the wallet must sync before the next transfer can be broadcast (a previous transfer
+    /// produced change back to Orchard that must be observed first).
+    func isSyncRequiredBeforeNextTransfer(for account: AccountUUID) async throws -> Bool
+
+    /// Broadcasts the next height-due pre-signed transfer, records the outcome with the engine, and
+    /// returns it — or `nil` when no transfer is currently due. The transfer is already signed, so no
+    /// spending key is required. Intended to be called from the app's background scheduler; the app
+    /// must not sync in the same background session as this call.
+    /// - Parameter options: network-privacy preferences. Accepted but ignored in v1.
+    func executeNextPendingTransfer(
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> TransferResult?
+
+    /// Whether any scheduled transfer is past the height at which it should have been broadcast.
+    func hasOverdueTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// Whether the migration is in an invalid state (spendable Orchard remains but nothing covers it).
+    func hasInvalidTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// Recovers from a `.requiresAttention` state by re-proposing the current migration step, returning
+    /// the fresh schedule.
+    func restartCurrentMigrationStep(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// One-time initialization to run after the wallet upgrades to an Ironwood-capable build.
+    func initializePostUpgrade(for account: AccountUUID) async throws
 }
 
 /// Error thrown by the default `Synchronizer.getTreeState(height:)` implementation

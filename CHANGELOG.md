@@ -17,6 +17,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consensus transaction via the welding's extract step (`migrationExtractBroadcastTx`) before
   broadcasting. The public `Synchronizer` API and the network broadcast composition follow in a
   later change.
+- Public Orchard → Ironwood migration API on the (async) `Synchronizer` protocol, all taking
+  `for account: AccountUUID`: `migrationState`, `migrationProgress`, `isNoteSplitNeeded`,
+  `prepareNoteSplit`, `submitNoteSplit`, `proposeMigrationTransfers`, `signAndStoreMigrationSchedule`,
+  `isSyncRequiredBeforeNextTransfer`, `executeNextPendingTransfer`, `hasOverdueTransfers`,
+  `hasInvalidTransfers`, `restartCurrentMigrationStep`, and `initializePostUpgrade`. The two
+  broadcasting methods (`submitNoteSplit`, `executeNextPendingTransfer`) sign (or load) the engine's
+  prepared transaction and broadcast it over the SDK's existing direct submission path, mapping the
+  outcome to `TransferResult`; `executeNextPendingTransfer` also records the result back with the
+  engine. `NetworkPrivacyOptions` is accepted but not yet honored (broadcast uses the configured
+  lightwalletd). Async-only for now — the `ClosureSynchronizer` / `CombineSynchronizer` adapters are
+  not yet updated.
 
 ## Changed
 - The Rust core now builds against the valargroup `librustzcash` fork under

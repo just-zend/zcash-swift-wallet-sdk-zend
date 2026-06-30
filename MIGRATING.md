@@ -26,6 +26,13 @@ let outcome = await synchronizer.broadcaster.submit(
 - The retry plan is recorded before any network attempt and stays recorded when `submit` returns `.cancelled` or `.timedOut`: background resubmission may still broadcast the transaction later. Treat those outcomes as "outcome unknown", not as "not sent".
 - `LightWalletEndpoint` now conforms to `Equatable`. If your app declared that conformance retroactively, remove your declaration.
 
+## Orchard → Ironwood migration API on `Synchronizer`
+
+The async `Synchronizer` protocol gains an Orchard → Ironwood migration surface (every method takes `for account: AccountUUID`): `migrationState`, `migrationProgress`, `isNoteSplitNeeded`, `prepareNoteSplit`, `submitNoteSplit`, `proposeMigrationTransfers`, `signAndStoreMigrationSchedule`, `isSyncRequiredBeforeNextTransfer`, `executeNextPendingTransfer`, `hasOverdueTransfers`, `hasInvalidTransfers`, `restartCurrentMigrationStep`, and `initializePostUpgrade`.
+
+- If you provide your own type conforming to `Synchronizer`, you must implement these new methods. `SDKSynchronizer` already does, and the `ClosureSynchronizer` / `CombineSynchronizer` protocols are unchanged, so their adapters are unaffected.
+- `submitNoteSplit(proposal:spendingKey:options:for:)` and `executeNextPendingTransfer(options:for:)` broadcast the migration engine's pre-signed transaction over the SDK's existing direct submission path and return a `TransferResult`. The `options: NetworkPrivacyOptions` argument is accepted but ignored in this version (broadcast uses the already-configured lightwalletd).
+
 # Migrating from previous versions to 0.20.0-beta
 The `SDKSynchronizer` no longer uses `NotificationCenter` to send notifications.
 Notifications are replaced with `Combine` publishers.
