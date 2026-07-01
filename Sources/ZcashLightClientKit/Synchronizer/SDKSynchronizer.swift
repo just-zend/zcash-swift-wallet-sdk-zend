@@ -1020,7 +1020,8 @@ public class SDKSynchronizer: Synchronizer {
 
                 // rule out if mismatch of networks
                 guard (info.chainName == "main" && network == .mainnet)
-                    || (info.chainName == "test" && network == .testnet) else {
+                    || (info.chainName == "test" && network == .testnet)
+                    || (info.chainName == "regtest" && network == .regtest) else {
                     continue
                 }
 

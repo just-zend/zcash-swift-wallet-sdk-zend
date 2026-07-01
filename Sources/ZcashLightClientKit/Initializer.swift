@@ -333,6 +333,12 @@ public class Initializer {
         // from constructor. So `parsingError` is just stored in initializer and `SDKSynchronizer.prepare()` throw this error if it exists.
         let (updatedURLs, parsingError) = Self.tryToUpdateURLs(with: alias, urls: urls)
 
+        // A regtest network carries custom NU activation heights; register them with the Rust core
+        // before any FFI call resolves the regtest network id. Process-global (see MIGRATING.md).
+        if let activationHeights = network.customActivationHeights {
+            ZcashRustBackend.setRegtestActivationHeights(activationHeights)
+        }
+
         Dependencies.setup(
             in: container,
             urls: updatedURLs,
@@ -341,7 +347,8 @@ public class Initializer {
             endpoint: endpoint,
             loggingPolicy: loggingPolicy,
             isTorEnabled: isTorEnabled,
-            isExchangeRateEnabled: isExchangeRateEnabled
+            isExchangeRateEnabled: isExchangeRateEnabled,
+            regtestActivationHeights: network.customActivationHeights
         )
 
         return (updatedURLs, parsingError)
