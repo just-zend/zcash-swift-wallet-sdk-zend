@@ -39,7 +39,8 @@ zcash_client_sqlite = { version = "=0.21.0", features = ["orchard", "transparent
 zcash_note_encryption = "0.4.1"
 zcash_primitives = "=0.28.0"
 zcash_proofs = "=0.28.0"
-zcash_protocol = "=0.9.0"
+# `local-consensus` exposes `LocalNetwork` (custom per-NU activation heights) for regtest support.
+zcash_protocol = { version = "=0.9.0", features = ["local-consensus"] }
 zcash_script = "0.4"
 zip32 = "0.2"
 pczt = { version = "=0.7.0", features = ["prover"] }

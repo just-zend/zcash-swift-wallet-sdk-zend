@@ -28,6 +28,12 @@ fn migration_network(network_id: u32) -> anyhow::Result<Network> {
     match network_id {
         0 => Ok(Network::TestNetwork),
         1 => Ok(Network::MainNetwork),
+        // The migration engine's `Network` has no regtest/LocalNetwork variant, so the Orchard→Ironwood
+        // migration cannot run against a custom-parameter network yet. Connecting + syncing regtest is
+        // supported; enabling migration there is a follow-up in the migration crate (MOB-1455).
+        2 => Err(anyhow!(
+            "regtest (network id 2) is not supported by the Ironwood migration engine yet (MOB-1455)"
+        )),
         other => Err(anyhow!("Invalid network id: {other}")),
     }
 }
