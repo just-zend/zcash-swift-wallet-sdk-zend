@@ -122,7 +122,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     /// A `nil` height means "not activated on this network".
     static func setRegtestActivationHeights(_ heights: NetworkActivationHeights) {
         func height(_ value: BlockHeight?) -> Int64 {
-            value.map(Int64.init) ?? -1
+            guard let value else { return -1 }
+            return Int64(value)
         }
 
         _ = zcashlc_set_regtest_activation_heights(

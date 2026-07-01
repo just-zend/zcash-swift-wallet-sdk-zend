@@ -152,6 +152,10 @@ identifier_name:
     - as
     - di
     - by
+    # Network-upgrade activation-height fields, named to mirror the Rust core's LocalNetwork (NU6.1/6.2/6.3).
+    - nu6_1
+    - nu6_2
+    - nu6_3
 
 indentation_width:
   indentation_width: 4
