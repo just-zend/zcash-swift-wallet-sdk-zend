@@ -386,6 +386,11 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
     func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule
 
+    /// The immediate (single-transaction) migration schedule: one transfer sweeping the whole
+    /// spendable Orchard balance into Ironwood, executable now (no denomination, no note split).
+    /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
+    func migrationProposeImmediate(for account: AccountUUID) async throws -> MigrationSchedule
+
     /// Pre-sign and persist every transfer in the schedule.
     /// - Throws: `rustMigrationSignAndStore` if the rust layer returns an error.
     func migrationSignAndStore(schedule: MigrationSchedule, usk: UnifiedSpendingKey, for account: AccountUUID) async throws

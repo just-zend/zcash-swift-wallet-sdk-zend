@@ -1340,6 +1340,19 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
+    @DBActor func migrationProposeImmediate(for account: AccountUUID) async throws -> MigrationSchedule {
+        let ptr = zcashlc_migration_propose_immediate(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationProposeTransfers(lastErrorMessage(fallback: "`migrationProposeImmediate` failed with unknown error"))
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(MigrationSchedule.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationProposeTransfers("Failed to decode MigrationSchedule (immediate): \(error)")
+        }
+    }
+
     @DBActor func migrationSignAndStore(schedule: MigrationSchedule, usk: UnifiedSpendingKey, for account: AccountUUID) async throws {
         let scheduleBytes = [UInt8](try JSONEncoder().encode(schedule))
         let ptr = scheduleBytes.withUnsafeBufferPointer { schedulePtr in

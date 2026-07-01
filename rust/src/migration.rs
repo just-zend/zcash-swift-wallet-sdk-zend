@@ -199,6 +199,28 @@ pub unsafe extern "C" fn zcashlc_migration_propose_transfers(
     unwrap_exc_or_null(res)
 }
 
+/// Generate the immediate (single-transaction) migration schedule (JSON `MigrationSchedule`): one
+/// transfer sweeping the whole spendable Orchard balance into Ironwood, executable now.
+///
+/// # Safety
+/// See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_propose_immediate(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let value = ctx
+            .propose_immediate_migration_transfers()
+            .map_err(|e| anyhow!("propose_immediate_migration_transfers: {e}"))?;
+        Ok(ffi::BoxedSlice::some(serde_json::to_vec(&value)?))
+    });
+    unwrap_exc_or_null(res)
+}
+
 /// Pre-sign and persist every transfer in the schedule (JSON `null` on success). `schedule` is JSON
 /// `MigrationSchedule`; `usk` is the raw `UnifiedSpendingKey` (Orchard era) bytes.
 ///

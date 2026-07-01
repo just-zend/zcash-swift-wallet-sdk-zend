@@ -591,6 +591,11 @@ public protocol Synchronizer: AnyObject {
     /// one-time confirmation.
     func proposeMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule
 
+    /// The immediate (single-transaction) migration schedule: one transfer sweeping the whole
+    /// spendable Orchard balance into Ironwood, executable now. Used by the "migrate immediately"
+    /// path — no denomination and no note split.
+    func proposeImmediateMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule
+
     /// Pre-signs and persists every transfer in the confirmed `schedule`.
     func signAndStoreMigrationSchedule(
         _ schedule: MigrationSchedule,

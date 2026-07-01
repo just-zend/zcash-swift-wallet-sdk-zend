@@ -550,6 +550,10 @@ public class SDKSynchronizer: Synchronizer {
         try await initializer.rustBackend.migrationProposeTransfers(for: account)
     }
 
+    public func proposeImmediateMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
+        try await initializer.rustBackend.migrationProposeImmediate(for: account)
+    }
+
     public func signAndStoreMigrationSchedule(
         _ schedule: MigrationSchedule,
         spendingKey: UnifiedSpendingKey,
