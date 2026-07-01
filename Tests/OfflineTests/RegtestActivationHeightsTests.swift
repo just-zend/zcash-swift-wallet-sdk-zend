@@ -65,7 +65,8 @@ final class RegtestActivationHeightsTests: XCTestCase {
 
     func testRegtestConsensusBranchIdReflectsCustomActivationHeights() throws {
         // Configure a regtest network with NU5 at 100 and NU6 at 200.
-        ZcashRustBackend.setRegtestActivationHeights(
+        ZcashRustBackend.setCustomNetwork(
+            base: .regtest,
             NetworkActivationHeights(
                 overwinter: 1,
                 sapling: 1,

@@ -116,17 +116,19 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    /// Registers the custom NU activation heights of a regtest network with the Rust core, so that FFI
-    /// calls made with the regtest network id (`NetworkType.regtest`) resolve to a `LocalNetwork`
-    /// instead of failing. Process-global and idempotent; call once before using a regtest network.
-    /// A `nil` height means "not activated on this network".
-    static func setRegtestActivationHeights(_ heights: NetworkActivationHeights) {
+    /// Registers the custom network used for the regtest network id (`NetworkType.regtest`) with the
+    /// Rust core: its `base` identity (address encoding / `chainName`) plus its per-NU activation
+    /// heights, so subsequent FFI calls made with that network id resolve to it instead of failing.
+    /// Process-global and idempotent; call once before using a custom network. A `nil` height means
+    /// "not activated on this network".
+    static func setCustomNetwork(base: NetworkType, _ heights: NetworkActivationHeights) {
         func height(_ value: BlockHeight?) -> Int64 {
             guard let value else { return -1 }
             return Int64(value)
         }
 
-        _ = zcashlc_set_regtest_activation_heights(
+        _ = zcashlc_set_custom_network(
+            base.networkId,
             height(heights.overwinter),
             height(heights.sapling),
             height(heights.blossom),

@@ -4212,48 +4212,68 @@ pub(crate) const NETWORK_ID_TESTNET: u32 = 0;
 /// `zcashlc_*` FFI that takes a `network_id` parameter.
 pub(crate) const NETWORK_ID_MAINNET: u32 = 1;
 
-/// `network_id` value for a custom-parameter (regtest) network. Its per-NU activation heights must be
-/// registered once via [`zcashlc_set_regtest_activation_heights`] before any `zcashlc_*` call uses it.
+/// `network_id` value for a custom-parameter network. Its base identity + per-NU activation heights must
+/// be registered once via [`zcashlc_set_custom_network`] before any `zcashlc_*` call uses it.
 pub(crate) const NETWORK_ID_REGTEST: u32 = 2;
 
 /// Consensus parameters passed across the FFI: either a standard [`Network`] (Mainnet/Testnet, with
-/// activation heights baked into librustzcash) or a custom [`LocalNetwork`] (regtest) whose per-NU
-/// heights are configured at runtime. Implements [`Parameters`] purely by delegation, so it is a
-/// drop-in replacement for the concrete `Network` everywhere the FFI threads network parameters.
+/// activation heights baked into librustzcash) or a **custom network** — a chosen base identity
+/// (`base`, which determines address encoding and `chainName`) combined with per-NU activation heights
+/// ([`LocalNetwork`]) configured at runtime. This is how the SDK connects to a custom-parameter node
+/// (e.g. a modified-mainnet Ironwood backend: `base = Main`, NU6.3 at a custom height). Implements
+/// [`Parameters`] purely by delegation, so it is a drop-in replacement for the concrete `Network`
+/// everywhere the FFI threads network parameters.
 #[derive(Clone, Copy)]
 pub(crate) enum NetworkParams {
     Standard(Network),
-    Regtest(LocalNetwork),
+    Custom { base: NetworkType, local: LocalNetwork },
 }
 
 impl Parameters for NetworkParams {
     fn network_type(&self) -> NetworkType {
         match self {
             NetworkParams::Standard(network) => network.network_type(),
-            NetworkParams::Regtest(local) => local.network_type(),
+            // Identity (address HRPs, chainName) comes from the chosen base network, not from
+            // `LocalNetwork` (whose `network_type()` is always Regtest).
+            NetworkParams::Custom { base, .. } => *base,
         }
     }
 
     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
         match self {
             NetworkParams::Standard(network) => network.activation_height(nu),
-            NetworkParams::Regtest(local) => local.activation_height(nu),
+            NetworkParams::Custom { local, .. } => local.activation_height(nu),
         }
     }
 }
 
-/// Regtest activation heights, configured once via [`zcashlc_set_regtest_activation_heights`] and read
-/// back by [`parse_network`] for `network_id` [`NETWORK_ID_REGTEST`]. `None` until set.
-static REGTEST_PARAMS: std::sync::RwLock<Option<LocalNetwork>> = std::sync::RwLock::new(None);
+/// The custom network's base identity + per-NU activation heights, configured once via
+/// [`zcashlc_set_custom_network`] and read back by [`parse_network`] for `network_id`
+/// [`NETWORK_ID_REGTEST`]. `None` until set.
+static CUSTOM_PARAMS: std::sync::RwLock<Option<(NetworkType, LocalNetwork)>> =
+    std::sync::RwLock::new(None);
 
-/// Registers the NU activation heights for the regtest network ([`NETWORK_ID_REGTEST`]), which every
-/// subsequent `zcashlc_*` call resolves through [`parse_network`]. Each argument is a block height, or
-/// a negative value meaning "not activated on this network". Set these to mirror the `nuparams` of the
-/// full node / `lightwalletd` being connected to. Idempotent; intended to be called once at init.
+/// Maps an FFI `network_id` to its [`NetworkType`], used to select the base identity of a custom network.
+fn network_type_for_id(network_id: u32) -> Option<NetworkType> {
+    match network_id {
+        NETWORK_ID_TESTNET => Some(NetworkType::Test),
+        NETWORK_ID_MAINNET => Some(NetworkType::Main),
+        NETWORK_ID_REGTEST => Some(NetworkType::Regtest),
+        _ => None,
+    }
+}
+
+/// Registers the **custom network** resolved for `network_id` [`NETWORK_ID_REGTEST`], which every
+/// subsequent `zcashlc_*` call resolves through [`parse_network`]. `base_network_id` selects the base
+/// identity — address encoding and `chainName` — as mainnet (1), testnet (0), or regtest (2); the
+/// activation heights are custom regardless. Each height argument is a block height, or a negative value
+/// meaning "not activated on this network"; set them to mirror the `nuparams` of the node /
+/// `lightwalletd` being connected to. Idempotent; intended to be called once at init.
 ///
-/// Returns `true` on success, `false` if the internal lock is poisoned.
+/// Returns `true` on success, `false` on an invalid `base_network_id` or a poisoned lock.
 #[unsafe(no_mangle)]
-pub extern "C" fn zcashlc_set_regtest_activation_heights(
+pub extern "C" fn zcashlc_set_custom_network(
+    base_network_id: u32,
     overwinter: i64,
     sapling: i64,
     blossom: i64,
@@ -4269,6 +4289,10 @@ pub extern "C" fn zcashlc_set_regtest_activation_heights(
         u32::try_from(value).ok().map(BlockHeight::from_u32)
     }
 
+    let Some(base) = network_type_for_id(base_network_id) else {
+        return false;
+    };
+
     let local = LocalNetwork {
         overwinter: height(overwinter),
         sapling: height(sapling),
@@ -4282,9 +4306,9 @@ pub extern "C" fn zcashlc_set_regtest_activation_heights(
         nu6_3: height(nu6_3),
     };
 
-    match REGTEST_PARAMS.write() {
+    match CUSTOM_PARAMS.write() {
         Ok(mut guard) => {
-            *guard = Some(local);
+            *guard = Some((base, local));
             true
         }
         Err(_) => false,
@@ -4296,21 +4320,21 @@ pub(crate) fn parse_network(value: u32) -> anyhow::Result<NetworkParams> {
         NETWORK_ID_TESTNET => Ok(NetworkParams::Standard(TestNetwork)),
         NETWORK_ID_MAINNET => Ok(NetworkParams::Standard(MainNetwork)),
         NETWORK_ID_REGTEST => {
-            let guard = REGTEST_PARAMS
+            let guard = CUSTOM_PARAMS
                 .read()
-                .map_err(|_| anyhow!("regtest network params lock is poisoned"))?;
-            // `Option<LocalNetwork>` is `Copy`, so deref-copy out of the read guard.
-            let local = (*guard).ok_or_else(|| {
+                .map_err(|_| anyhow!("custom network params lock is poisoned"))?;
+            // `Option<(NetworkType, LocalNetwork)>` is `Copy`, so deref-copy out of the read guard.
+            let (base, local) = (*guard).ok_or_else(|| {
                 anyhow!(
-                    "regtest network (id {}) used before its activation heights were set; call \
-                     zcashlc_set_regtest_activation_heights first",
+                    "custom network (id {}) used before it was configured; call \
+                     zcashlc_set_custom_network first",
                     NETWORK_ID_REGTEST,
                 )
             })?;
-            Ok(NetworkParams::Regtest(local))
+            Ok(NetworkParams::Custom { base, local })
         }
         _ => Err(anyhow!(
-            "Invalid network type: {}. Expected {}, {}, or {} for Testnet, Mainnet, or Regtest, respectively.",
+            "Invalid network type: {}. Expected {}, {}, or {} for Testnet, Mainnet, or a custom network, respectively.",
             value,
             NETWORK_ID_TESTNET,
             NETWORK_ID_MAINNET,

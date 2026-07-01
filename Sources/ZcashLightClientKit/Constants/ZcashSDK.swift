@@ -14,14 +14,20 @@ public protocol ZcashNetwork {
     /// `saplingActivationHeight`; a regtest network returns its configured height.
     var saplingActivationHeight: BlockHeight { get }
 
-    /// The full set of custom NU activation heights when this is a regtest network, otherwise `nil`.
-    /// Consumed by the Rust backend to switch the core onto `LocalNetwork` (custom-parameter) consensus.
+    /// The full set of custom NU activation heights when this is a custom (regtest-slot) network,
+    /// otherwise `nil`. Consumed by the Rust backend to switch the core onto a custom-parameter network.
     var customActivationHeights: NetworkActivationHeights? { get }
+
+    /// For a custom network (``customActivationHeights`` non-nil), the base identity registered with the
+    /// Rust core: address encoding and `chainName` follow this, while the activation heights are custom
+    /// (e.g. a modified-mainnet Ironwood backend uses base `.mainnet`). `nil` for standard networks.
+    var customNetworkBase: NetworkType? { get }
 }
 
 public extension ZcashNetwork {
     var saplingActivationHeight: BlockHeight { constants.saplingActivationHeight }
     var customActivationHeights: NetworkActivationHeights? { nil }
+    var customNetworkBase: NetworkType? { nil }
 }
 
 public enum NetworkType: Equatable, Codable, Hashable {
@@ -78,16 +84,25 @@ public enum ZcashNetworkBuilder {
         switch networkType {
         case .mainnet:  return ZcashMainnet()
         case .testnet:  return ZcashTestnet()
-        case .regtest:  return ZcashRegtest(activationHeights: NetworkActivationHeights.allActiveFromGenesis)
+        case .regtest:  return ZcashRegtest(base: .regtest, activationHeights: NetworkActivationHeights.allActiveFromGenesis)
         }
     }
 
     /// Builds a custom **regtest** network with the given NU activation heights, for connecting the SDK
-    /// to a custom-parameter `lightwalletd` (e.g. an Ironwood testing backend). Addresses and chain
-    /// identity are regtest-encoded, and the on-disk databases use a `regtest`-specific name prefix.
-    /// See `MIGRATING.md`.
+    /// to a custom-parameter `lightwalletd`. Addresses and chain identity are regtest-encoded, and the
+    /// on-disk databases use a `regtest`-specific name prefix. See `MIGRATING.md`.
     public static func regtest(activationHeights: NetworkActivationHeights) -> ZcashNetwork {
-        ZcashRegtest(activationHeights: activationHeights)
+        ZcashRegtest(base: .regtest, activationHeights: activationHeights)
+    }
+
+    /// Builds a **custom network**: a chosen `base` identity (which determines address encoding and the
+    /// expected `chainName`) combined with custom per-NU activation heights. For example a
+    /// modified-mainnet Ironwood testing backend uses `base: .mainnet` with NU6.3 at a custom height —
+    /// the Rust core then derives **mainnet-encoded** addresses and runs mainnet consensus at the custom
+    /// heights. On-disk the network still uses the `regtest`-slot name prefix, so it never collides with
+    /// a real mainnet wallet. See `MIGRATING.md`.
+    public static func custom(base: NetworkType, activationHeights: NetworkActivationHeights) -> ZcashNetwork {
+        ZcashRegtest(base: base, activationHeights: activationHeights)
     }
 }
 
@@ -104,14 +119,19 @@ class ZcashMainnet: ZcashNetwork {
 class ZcashRegtest: ZcashNetwork {
     let networkType: NetworkType = .regtest
     let constants: NetworkConstants.Type = ZcashSDKRegtestConstants.self
+    /// The base identity registered with the Rust core (address encoding / `chainName`). `.regtest` for
+    /// a plain regtest network; `.mainnet` for a modified-mainnet custom network (e.g. Ironwood).
+    let base: NetworkType
     let activationHeights: NetworkActivationHeights
 
-    init(activationHeights: NetworkActivationHeights) {
+    init(base: NetworkType, activationHeights: NetworkActivationHeights) {
+        self.base = base
         self.activationHeights = activationHeights
     }
 
     var saplingActivationHeight: BlockHeight { activationHeights.sapling ?? 1 }
     var customActivationHeights: NetworkActivationHeights? { activationHeights }
+    var customNetworkBase: NetworkType? { base }
 }
 
 /**

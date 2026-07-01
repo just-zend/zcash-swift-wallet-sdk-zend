@@ -16,27 +16,11 @@ use std::slice;
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zodl_ironwood_migration::{
-    MigrationContext, MigrationSchedule, Network, NoteSplitProposal, TransferResult,
+    MigrationContext, MigrationSchedule, NoteSplitProposal, TransferResult,
 };
 
 use crate::ffi;
 use crate::unwrap_exc_or_null;
-
-/// Map the FFI network id to the migration crate's [`Network`] (testnet = 0, mainnet = 1, mirroring
-/// `parse_network`).
-fn migration_network(network_id: u32) -> anyhow::Result<Network> {
-    match network_id {
-        0 => Ok(Network::TestNetwork),
-        1 => Ok(Network::MainNetwork),
-        // The migration engine's `Network` has no regtest/LocalNetwork variant, so the Orchard→Ironwood
-        // migration cannot run against a custom-parameter network yet. Connecting + syncing regtest is
-        // supported; enabling migration there is a follow-up in the migration crate (MOB-1455).
-        2 => Err(anyhow!(
-            "regtest (network id 2) is not supported by the Ironwood migration engine yet (MOB-1455)"
-        )),
-        other => Err(anyhow!("Invalid network id: {other}")),
-    }
-}
 
 /// Borrow the wallet db path (UTF-8) from the FFI byte buffer.
 ///
@@ -68,9 +52,12 @@ unsafe fn context(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-) -> anyhow::Result<MigrationContext> {
+) -> anyhow::Result<MigrationContext<crate::NetworkParams>> {
     let path = unsafe { migration_db_path(db_data, db_data_len)? };
-    let network = migration_network(network_id)?;
+    // Resolve the same consensus parameters (identity + custom activation heights) the rest of the SDK
+    // uses for this network id, so migration runs with matching consensus — including a custom network
+    // (network_id 2, configured via `zcashlc_set_custom_network`, e.g. base = Main + custom heights).
+    let network = crate::parse_network(network_id)?;
     let account = unsafe { account_16(account_uuid_bytes)? };
     MigrationContext::new(path, network, account)
         .map_err(|e| anyhow!("open migration context: {e}"))
