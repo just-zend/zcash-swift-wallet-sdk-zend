@@ -7,6 +7,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 # Unreleased
 
 ## Added
+- Configurable network-upgrade activation heights, for connecting the SDK to a **custom-parameter
+  (regtest) network** such as an Ironwood testing backend. `ZcashNetworkBuilder.regtest(activationHeights:)`
+  builds a `ZcashNetwork` from a new `NetworkActivationHeights` value (per-NU heights up to NU6.3), threaded
+  into the Rust core via librustzcash's `LocalNetwork`. Adds a `NetworkType.regtest` identity (`networkId`
+  2, `chainName` "regtest", regtest-encoded addresses, `ZcashSdk_regtest_` database prefix) and a
+  `zcashlc_set_regtest_activation_heights` FFI. Opt-in and fully additive — mainnet/testnet behavior is
+  unchanged. Running the Orchard→Ironwood **migration** against a regtest network is not yet supported (the
+  migration engine has no custom-network variant). See `MIGRATING.md` and
+  `docs/handoffs/ZODL-regtest-activation-heights.md`.
 - Ironwood (NU6.3) receive/sync readiness. Ironwood is Orchard note-version V3 — received at the
   account's existing **Orchard receiver** (no separate Ironwood address) — so the SDK now wires the
   receive/scan/balance path against the librustzcash Ironwood support: the Ironwood proto fields

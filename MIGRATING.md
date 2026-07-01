@@ -6,6 +6,25 @@ information stored.
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
 track failures on its own. Wallet developers would have to account for those.
 
+## Configurable activation heights (regtest / custom networks)
+
+New, **additive** capability for pointing the SDK at a custom-parameter (regtest) `lightwalletd` — e.g. an Ironwood testing backend — whose network upgrades activate at arbitrary heights instead of the hardcoded mainnet/testnet values. Existing code is unaffected; you opt in by building a regtest `ZcashNetwork`:
+
+```swift
+let network = ZcashNetworkBuilder.regtest(activationHeights: NetworkActivationHeights(
+    sapling: 1,
+    nu5: 100,
+    nu6: 200,
+    nu6_3: 5000   // Ironwood
+))
+let initializer = Initializer(/* … */, network: network)
+```
+
+- Set the heights to mirror the `nuparams` of the node / `lightwalletd` you connect to. `nil` means "not activated".
+- A regtest network reports its type as **Regtest**: addresses are regtest-encoded and its databases use a `ZcashSdk_regtest_` name prefix (no collision with mainnet/testnet data). The SDK expects the server to report `chainName == "regtest"`.
+- Regtest ships no bundled checkpoints; a fresh wallet scans from the Sapling activation height (empty tree). For a higher birthday, seed a tree state via `Synchronizer.getTreeState(height:)`.
+- Running the Orchard→Ironwood **migration** on regtest is not yet supported. See `docs/handoffs/ZODL-regtest-activation-heights.md`.
+
 ## Ironwood (NU6.3) balance on `AccountBalance`
 
 `AccountBalance` gains a public `ironwoodBalance: PoolBalance` field (Ironwood is Orchard note-version V3, received at the account's existing Orchard receiver — there is no separate Ironwood address). The field is **additive** and is `.zero` for every wallet until NU6.3 activates and a lightwalletd serves Ironwood compact blocks. No action is required now; an app that wants to surface Ironwood can read/total it alongside `orchardBalance`. (If you construct `AccountBalance` yourself, e.g. in tests, the new field defaults to `.zero` via the memberwise initializer, so existing call sites keep compiling.)
