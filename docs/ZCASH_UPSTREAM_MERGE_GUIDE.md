@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-06-30
+Last reviewed: 2026-07-01
 
 ## Remote and branch invariants
 
@@ -46,15 +46,15 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-06-30)
+## Zend divergence notes (as of 2026-07-01)
 
 Current relationship after Zend PR `#14` merged `codex/zcash-upstream-sync-2026-06-17` into `origin/main`, before the current PR `#15` lands:
 
-- `origin/main...upstream/main`: `57 10` after fetching both remotes on 2026-06-30.
+- `origin/main...upstream/main`: `57 10` after fetching both remotes on 2026-07-01.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `4303068e` (`#1790` / tag `2.6.0-alpha.6`); it also includes `#1789` checkpoint refresh, `#1786` for the Keystone/cross-account `deleteAccount` fix, and `#1766` Dependabot setup.
 - `git merge-base --is-ancestor upstream/main origin/main` fails until PR `#15` lands.
-- From the active parity branch `codex/zcash-upstream-sync-2026-06-22`, `git rev-list --left-right --count HEAD...upstream/main` returns `69 0` after this guide refresh and `git merge-base --is-ancestor upstream/main HEAD` succeeds, so the existing PR covers upstream `main`.
+- From the active parity branch `codex/zcash-upstream-sync-2026-06-22`, `git rev-list --left-right --count HEAD...upstream/main` returns `70 0` after this guide refresh and `git merge-base --is-ancestor upstream/main HEAD` succeeds, so the existing PR covers upstream `main`.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -70,7 +70,7 @@ Notable fork-ahead work currently preserved includes:
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: PR `#15` is the active default-branch parity PR. As of the 2026-06-30 monitor it is open, no longer draft, mergeable with `mergeStateStatus: CLEAN`, and its GitHub `build`, `Run zizmor`, and `zizmor` checks are all passing on `c739966f`. After it lands, Zend will contain upstream `main` through `4303068e`. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
+Implication: PR `#15` is the active default-branch parity PR. As of the 2026-07-01 monitor it is open, no longer draft, mergeable with `mergeStateStatus: CLEAN`, and its GitHub `build`, `Run zizmor`, and `zizmor` checks were all passing on `5fe283ca` before this docs-only guide refresh. After it lands, Zend will contain upstream `main` through `4303068e`. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
 
 ## Conflict resolution heuristics
 
@@ -91,7 +91,7 @@ Zend parity branch note:
 - The June 26 refresh merged upstream through `8bbc0b7f` with one conflict in `CHANGELOG.md`. Resolve by keeping upstream `2.6.0-alpha.6` checkpoint notes above Zend `2.6.3`, preserving Zend `2.6.3` and `2.6.2`, and retaining upstream `2.6.0-alpha.5` release notes separately.
 - The June 27 refresh merged upstream through `4303068e` with one conflict in `Package.swift`. Resolve by keeping Zend's `https://github.com/just-zend/zcash-swift-wallet-sdk-zend/releases/download/2.6.3/libzcashlc.xcframework.zip` URL and checksum, rather than replacing it with upstream's `2.6.0-alpha.6` artifact.
 
-## Bleeding-edge snapshot (2026-06-30)
+## Bleeding-edge snapshot (2026-07-01)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
@@ -110,12 +110,13 @@ Merged upstream default-branch delta pending in Zend fork default branch:
   - `e0bf7ca3`: merge PR `#1766`.
   - `86870b40`: add cooldown to Dependabot updates.
   - `8023c752`: add Dependabot configuration.
-- Zend PR `#15` remains the active parity PR and already merges upstream `main` through `4303068e`; no new upstream default-branch commits appeared after the 2026-06-27 refresh, and the 2026-06-30 monitor still reports `57 10` for `origin/main...upstream/main` and `69 0` for the PR branch against `upstream/main` after this guide refresh.
+- Zend PR `#15` remains the active parity PR and already merges upstream `main` through `4303068e`; no new upstream default-branch commits appeared after the 2026-06-27 refresh, and the 2026-07-01 monitor still reports `57 10` for `origin/main...upstream/main` and `70 0` for the PR branch against `upstream/main` after this guide refresh.
 
 Open upstream PRs assessed as not ready to carry right now:
 
-- `#1792` (`harry/ironwood-nu6.3-deps` -> `harry/ironwood-migration-sdk-interface`): draft, `UNSTABLE`, and its build check is failing. It depends on an in-flight Ironwood migration feature branch rather than upstream `main`, so it is not ready for a Zend carry.
-- `#1791` (`harry/ironwood-migration-sdk-interface`): draft, `BLOCKED`, and review-required. It exposes Ironwood migration planning and Synchronizer API surface; despite passing checks, this is protocol-facing feature work and should wait for upstream review and completion.
+- `#1794` (`michal/MOB-1455-2-ironwood-migration-sdk-impl` -> `michal/MOB-1455-ironwood-migration-prototype-ffi`): draft, `UNSTABLE`, and its build check is failing. It layers migration orchestration and public SDK API work on top of the in-flight FFI branch, so it is not ready for a Zend carry.
+- `#1793` (`michal/MOB-1455-ironwood-migration-prototype-ffi`): draft, `BLOCKED`, review-required, and its build check is failing. It updates the FFI/welding layer for Ironwood migration; this is protocol-facing work and should wait for upstream review, green CI, and API stabilization.
+- Closed unmerged on 2026-07-01: `#1792` (`harry/ironwood-nu6.3-deps` -> `harry/ironwood-migration-sdk-interface`) and `#1791` (`harry/ironwood-migration-sdk-interface`). Their branches still exist, but the closed draft PRs do not provide a readiness signal for Zend.
 - `#1787` and `#1788`: Swift NIO / NIO Extras Dependabot PRs; non-draft with passing checks, but still `BLOCKED` and review-required, so wait for upstream dependency review.
 - `#1770` through `#1785`: Dependabot PRs for Cargo, Swift, and GitHub Actions dependencies. They remain review-required and `BLOCKED`; several still have failed build or zizmor checks, so wait for upstream review and CI policy before carrying individual dependency bumps.
 - `#1767` (`dw/remove-useless-deadcode-annotations`): non-draft but `BLOCKED` and review-required; Rust annotation cleanup should wait for upstream review rather than being carried independently.
@@ -145,8 +146,8 @@ Unmerged upstream branches (not carried):
 - `ignore_worktrees`: 1 commit ahead and 80 behind `upstream/main`; housekeeping-only change.
 - `kris/1745-finish-release-workflow`: 9 commits ahead and 80 behind `upstream/main`; covered by open upstream PR `#1746`, which is release-workflow heavy and review-required.
 - `michal/MOB-1389-fetch-usd-rate-tor-crash`: 1 commit ahead and 46 behind `upstream/main`; covered by draft upstream PR `#1763`, so wait for upstream completion.
-- `michal/MOB-1455-2-ironwood-migration-sdk-impl`: 12 commits ahead and 0 behind `upstream/main`; new Ironwood migration implementation work with no open upstream PR, so there is not enough review or readiness signal to carry it into Zend.
-- `michal/MOB-1455-ironwood-migration-prototype-ffi`: 10 commits ahead and 0 behind `upstream/main`; new prototype Ironwood migration FFI work with no open upstream PR, so wait for upstream review and API stabilization.
+- `michal/MOB-1455-2-ironwood-migration-sdk-impl`: 15 commits ahead and 0 behind `upstream/main`; covered by draft upstream PR `#1794`, build-failing, and layered on the prototype FFI branch, so wait for upstream review and API stabilization.
+- `michal/MOB-1455-ironwood-migration-prototype-ffi`: 11 commits ahead and 0 behind `upstream/main`; covered by draft upstream PR `#1793`, build-failing, and still protocol-facing FFI work, so wait for upstream review and green CI.
 - `maint/v2.5.x`: 0 commits ahead and 166 behind `upstream/main`; maintenance line, no standalone carry.
 - `release-ci`: 4 commits ahead and 158 behind `upstream/main`; release branch integration artifact, not a clear standalone carry target.
 - `release/2.6.0`: 0 commits ahead and 169 behind `upstream/main`; upstream release stabilization branch, wait for upstream release sequencing.
