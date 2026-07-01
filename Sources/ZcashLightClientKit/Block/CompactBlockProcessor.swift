@@ -136,7 +136,7 @@ actor CompactBlockProcessor {
             self.outputParamsURL = outputParamsURL
             self.saplingParamsSourceURL = saplingParamsSourceURL
             self.walletBirthdayProvider = walletBirthdayProvider
-            self.saplingActivation = network.constants.saplingActivationHeight
+            self.saplingActivation = network.saplingActivationHeight
             self.network = network
             self.cacheDbURL = nil
             self.enhanceBatchSize = enhanceBatchSize

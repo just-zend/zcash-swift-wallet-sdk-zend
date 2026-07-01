@@ -467,7 +467,7 @@ public class Initializer {
                     // wallet can't be missed if the current chain tip is reorganized.
                     let birthdayTreeStateHeight = max(
                         latestBlockHeight - ZcashSDK.maxReorgSize,
-                        network.constants.saplingActivationHeight
+                        network.saplingActivationHeight
                     )
                     let blockID = BlockID(height: UInt64(birthdayTreeStateHeight))
                     if let serverTreeState = try? await lightWalletService.getTreeState(blockID, mode: await sdkFlags.ifTor(.uniqueTor)) {
