@@ -543,7 +543,16 @@ public class SDKSynchronizer: Synchronizer {
             usk: spendingKey,
             for: account
         )
-        return try await broadcastMigrationTx(prepared, for: account)
+        let result = try await broadcastMigrationTx(prepared, for: account)
+        // Record the broadcast so the engine advances the split phase (mirrors
+        // `executeNextPendingTransfer`). `prepared.id` is `prep:<run_id>`, which the crate maps to
+        // the denomination-split flow; without this the state is stuck at `preparing_denominations`.
+        try await initializer.rustBackend.migrationRecordTransferResult(
+            transferId: prepared.id,
+            result: result,
+            for: account
+        )
+        return result
     }
 
     public func proposeMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
