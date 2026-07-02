@@ -621,9 +621,13 @@ public class SDKSynchronizer: Synchronizer {
         do {
             try await transactionEncoder.submit(transaction: encoded)
             return .success(txid: prepared.txid)
-        } catch ZcashError.serviceSubmitFailed {
+        } catch let ZcashError.serviceSubmitFailed(serviceError) {
+            logger.error("Migration broadcast serviceSubmitFailed: \(String(describing: serviceError))")
             return .networkError(retryable: true)
-        } catch TransactionEncoderError.submitError {
+        } catch let TransactionEncoderError.submitError(code, message) {
+            // Surface the server's rejection reason (lightwalletd/Zebra SendResponse) — otherwise the
+            // migration engine only sees an opaque `.networkError`.
+            logger.error("Migration broadcast rejected by server: code=\(code) message=\(message)")
             // Trust the network over the submit-side error: if the server already has this tx, the
             // broadcast already landed. Mirror `submitTransactions`' isTransactionKnownToServer check.
             if await transactionEncoder.isTransactionKnownToServer(txId: txIdData) {
