@@ -99,4 +99,19 @@ final class MigrationFFITests: XCTestCase {
             // Empty set -> MigrationError::InvalidState -> null ptr -> rustMigrationStoreSignedSchedulePCZTs.
         }
     }
+
+    func testCreateUnsignedTransferPCZTsWithEmptyScheduleThrows() async throws {
+        // Round-trips the caller-provided schedule through the FFI's JSON marshalling into the
+        // crate, which rejects an empty schedule before any PCZT work.
+        do {
+            _ = try await rustBackend.migrationCreateUnsignedTransferPCZTs(
+                schedule: MigrationSchedule(transfers: [], estimatedDurationHours: 0),
+                for: account
+            )
+            XCTFail("expected building PCZTs for an empty schedule to throw")
+        } catch {
+            // Empty schedule -> MigrationError::InvalidState -> null ptr ->
+            // rustMigrationCreateUnsignedTransferPCZTs.
+        }
+    }
 }

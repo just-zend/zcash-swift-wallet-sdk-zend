@@ -619,21 +619,27 @@ public protocol Synchronizer: AnyObject {
         for account: AccountUUID
     ) async throws
 
-    /// One unsigned PCZT per proposed migration transfer for an external signer (hardware wallet) —
-    /// the counterpart of ``signAndStoreMigrationSchedule(_:spendingKey:for:)`` for accounts whose
-    /// spending key lives on a device. Proposes the schedule and builds each transfer's PCZT,
-    /// keeping the proven originals staged internally keyed by transfer id. The app signs each PCZT
-    /// on the device sequentially (via ``redactPCZTForSigner(pczt:)`` and the QR channel) and hands
-    /// the full signed set to ``storeSignedMigrationTransferPCZTs(_:for:)`` — the id in each
-    /// ``MigrationTransferPCZT`` pairs the signed PCZT with its transfer and must be preserved.
-    func proposeMigrationTransferPCZTs(for account: AccountUUID) async throws -> [MigrationTransferPCZT]
+    /// One unsigned PCZT per transfer of the confirmed `schedule` for an external signer (hardware
+    /// wallet) — the counterpart of ``signAndStoreMigrationSchedule(_:spendingKey:for:)`` for
+    /// accounts whose spending key lives on a device. Takes the schedule the user confirmed (from
+    /// ``proposeMigrationTransfers(for:)`` / ``proposeImmediateMigrationTransfers(for:)``) rather
+    /// than re-proposing internally: schedules carry randomized denominations, so a fresh proposal
+    /// here would silently sign a different plan than the one displayed. Builds each transfer's
+    /// PCZT, keeping the proven originals staged internally keyed by transfer id. The app signs
+    /// each PCZT on the device sequentially (via ``redactPCZTForSigner(pczt:)`` and the QR channel)
+    /// and hands the full signed set to ``storeSignedMigrationTransferPCZTs(_:for:)`` — the id in
+    /// each ``MigrationTransferPCZT`` pairs the signed PCZT with its transfer and must be preserved.
+    func proposeMigrationTransferPCZTs(
+        _ schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> [MigrationTransferPCZT]
 
     /// Stores the full set of externally signed migration-transfer PCZTs — all-or-nothing. Every
-    /// transfer returned by ``proposeMigrationTransferPCZTs(for:)`` must be present (by id) with its
-    /// device-signed PCZT; each is verified and finalized, and the committed schedule is persisted
-    /// exactly like ``signAndStoreMigrationSchedule(_:spendingKey:for:)``. A partial, mismatched, or
-    /// invalid set stores nothing, so the flow can be retried. Broadcasting then flows through
-    /// ``executeNextPendingTransfer(options:for:)`` as usual.
+    /// transfer returned by ``proposeMigrationTransferPCZTs(_:for:)`` must be present (by id) with
+    /// its device-signed PCZT; each is verified and finalized, and the committed schedule is
+    /// persisted exactly like ``signAndStoreMigrationSchedule(_:spendingKey:for:)``. A partial,
+    /// mismatched, or invalid set stores nothing, so the flow can be retried. Broadcasting then
+    /// flows through ``executeNextPendingTransfer(options:for:)`` as usual.
     func storeSignedMigrationTransferPCZTs(_ pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws
 
     /// Whether the wallet must sync before the next transfer can be broadcast (a previous transfer

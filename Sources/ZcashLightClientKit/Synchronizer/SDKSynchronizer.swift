@@ -562,7 +562,21 @@ public class SDKSynchronizer: Synchronizer {
     public func submitSignedNoteSplitPCZT(_ pczt: Pczt, for account: AccountUUID) async throws -> TransferResult {
         // Mirrors `submitNoteSplit`: the store step replaces the internal signing, then the
         // broadcast + record composition is identical (`prepared.id` is `prep:<run_id>`).
-        let prepared = try await initializer.rustBackend.migrationStoreSignedNoteSplitPCZT(pczt: pczt, for: account)
+        let prepared: PreparedTx
+        do {
+            prepared = try await initializer.rustBackend.migrationStoreSignedNoteSplitPCZT(pczt: pczt, for: account)
+        } catch {
+            // Retry safety: the crate consumes the staged original atomically with creating the
+            // run, so retrying after a failed broadcast finds nothing staged and the store throws.
+            // In exactly that state the crate's next-due transfer is the run's still-pending
+            // (`prep:<run_id>`) prep transaction — re-broadcast it instead of double-storing.
+            // Any other store failure leaves no pending prep tx, so the original error propagates.
+            guard
+                let pending = try? await initializer.rustBackend.migrationNextDueTransfer(for: account),
+                pending.id.hasPrefix("prep:")
+            else { throw error }
+            prepared = pending
+        }
         let result = try await broadcastMigrationTx(prepared, for: account)
         try await initializer.rustBackend.migrationRecordTransferResult(
             transferId: prepared.id,
@@ -572,12 +586,14 @@ public class SDKSynchronizer: Synchronizer {
         return result
     }
 
-    public func proposeMigrationTransferPCZTs(for account: AccountUUID) async throws -> [MigrationTransferPCZT] {
-        // Propose the schedule, then build + stage one unsigned PCZT per transfer. The schedule
-        // used here is authoritative for the PCZTs; the display schedule the app may have shown
-        // earlier via `proposeMigrationTransfers` is recomputed from the same balance.
-        let schedule = try await initializer.rustBackend.migrationProposeTransfers(for: account)
-        return try await initializer.rustBackend.migrationCreateUnsignedTransferPCZTs(schedule: schedule, for: account)
+    public func proposeMigrationTransferPCZTs(
+        _ schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> [MigrationTransferPCZT] {
+        // The caller's confirmed schedule is authoritative: schedules carry randomized
+        // denominations, so re-proposing here would build (and later sign) a different plan than
+        // the one the user approved on screen.
+        try await initializer.rustBackend.migrationCreateUnsignedTransferPCZTs(schedule: schedule, for: account)
     }
 
     public func storeSignedMigrationTransferPCZTs(_ pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws {

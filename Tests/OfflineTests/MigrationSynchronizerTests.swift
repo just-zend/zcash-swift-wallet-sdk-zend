@@ -205,6 +205,7 @@ final class MigrationSynchronizerTests: ZcashTestCase {
     func testSubmitSignedNoteSplitPCZTPropagatesStoreErrorWithoutSubmitting() async throws {
         let rustBackend = ZcashRustBackendWeldingMock()
         rustBackend.migrationStoreSignedNoteSplitPCZTPcztForThrowableError = TestError.boom
+        rustBackend.migrationNextDueTransferForReturnValue = nil
         let encoder = StubTransactionEncoder(createdTransactions: [])
         let synchronizer = try makeSynchronizer(transactionEncoder: encoder, rustBackend: rustBackend)
 
@@ -219,7 +220,54 @@ final class MigrationSynchronizerTests: ZcashTestCase {
         XCTAssertFalse(rustBackend.migrationRecordTransferResultTransferIdResultForCalled)
     }
 
-    func testProposeMigrationTransferPCZTsProposesThenBuildsFromThatSchedule() async throws {
+    func testSubmitSignedNoteSplitPCZTRebroadcastsPendingPrepTxWhenStagingAlreadyConsumed() async throws {
+        // Retry contract (MOB-1468): after a store-succeeded-broadcast-failed first attempt, the
+        // failure sheet's Retry re-calls submitSignedNoteSplitPCZT with the SAME signed PCZT. The
+        // staged original was consumed by that first store, so the store step now throws — the
+        // still-pending `prep:<run_id>` transaction surfaced by `migrationNextDueTransfer` is what
+        // must be re-broadcast (no device round-trip, no second run stored).
+        let prepared = makePreparedTx(id: "prep:run-1")
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.migrationStoreSignedNoteSplitPCZTPcztForThrowableError =
+            ZcashError.rustMigrationStoreSignedNoteSplitPCZT("no staged note-split PCZT to store")
+        rustBackend.migrationNextDueTransferForReturnValue = prepared
+        rustBackend.migrationExtractBroadcastTxPcztForReturnValue = extractedTxBytes
+        rustBackend.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let encoder = StubTransactionEncoder(createdTransactions: [])
+        let synchronizer = try makeSynchronizer(transactionEncoder: encoder, rustBackend: rustBackend)
+
+        let result = try await synchronizer.submitSignedNoteSplitPCZT(Pczt([0x0A, 0x0B]), for: account)
+
+        XCTAssertEqual(result, .success(txid: prepared.txid))
+        // The persisted prep tx (not the incoming device PCZT) is what gets extracted + broadcast.
+        XCTAssertEqual(rustBackend.migrationExtractBroadcastTxPcztForReceivedArguments?.pczt, prepared.rawPczt)
+        XCTAssertEqual(encoder.submittedTransactions.map(\.raw), [Data(extractedTxBytes)])
+        let recorded = rustBackend.migrationRecordTransferResultTransferIdResultForReceivedArguments
+        XCTAssertEqual(recorded?.transferId, prepared.id)
+        XCTAssertEqual(recorded?.result, .success(txid: prepared.txid))
+    }
+
+    func testSubmitSignedNoteSplitPCZTRethrowsStoreErrorWhenNextDueIsARegularTransfer() async throws {
+        // A pending non-prep transfer must not be hijacked by the note-split retry path: only a
+        // `prep:`-prefixed next-due transaction identifies the consumed-staging retry state.
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.migrationStoreSignedNoteSplitPCZTPcztForThrowableError = TestError.boom
+        rustBackend.migrationNextDueTransferForReturnValue = makePreparedTx(id: "transfer-3")
+        let encoder = StubTransactionEncoder(createdTransactions: [])
+        let synchronizer = try makeSynchronizer(transactionEncoder: encoder, rustBackend: rustBackend)
+
+        do {
+            _ = try await synchronizer.submitSignedNoteSplitPCZT(Pczt([0x0A]), for: account)
+            XCTFail("Expected submitSignedNoteSplitPCZT to rethrow the store error")
+        } catch {
+            // expected
+        }
+
+        XCTAssertTrue(encoder.submittedTransactions.isEmpty)
+        XCTAssertFalse(rustBackend.migrationRecordTransferResultTransferIdResultForCalled)
+    }
+
+    func testProposeMigrationTransferPCZTsBuildsFromTheGivenSchedule() async throws {
         let schedule = MigrationSchedule(
             transfers: [
                 TransferProposal(
@@ -234,33 +282,35 @@ final class MigrationSynchronizerTests: ZcashTestCase {
         )
         let pairs = [MigrationTransferPCZT(id: "run-0", pczt: Pczt([0x01]))]
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.migrationProposeTransfersForReturnValue = schedule
         rustBackend.migrationCreateUnsignedTransferPCZTsScheduleForReturnValue = pairs
         let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
 
-        let result = try await synchronizer.proposeMigrationTransferPCZTs(for: account)
+        let result = try await synchronizer.proposeMigrationTransferPCZTs(schedule, for: account)
 
         XCTAssertEqual(result, pairs)
-        XCTAssertEqual(rustBackend.migrationProposeTransfersForReceivedAccount, account)
-        // The freshly proposed schedule is the one the PCZTs are built from.
+        // The caller's confirmed schedule is what the PCZTs are built from — no internal
+        // re-propose (denominations are randomized, so a fresh proposal would differ from the
+        // schedule the user approved).
+        XCTAssertFalse(rustBackend.migrationProposeTransfersForCalled)
         let args = rustBackend.migrationCreateUnsignedTransferPCZTsScheduleForReceivedArguments
         XCTAssertEqual(args?.schedule, schedule)
         XCTAssertEqual(args?.account, account)
     }
 
-    func testProposeMigrationTransferPCZTsPropagatesProposeErrorWithoutBuilding() async throws {
+    func testProposeMigrationTransferPCZTsPropagatesBuildError() async throws {
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.migrationProposeTransfersForThrowableError = TestError.boom
+        rustBackend.migrationCreateUnsignedTransferPCZTsScheduleForThrowableError = TestError.boom
         let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
 
         do {
-            _ = try await synchronizer.proposeMigrationTransferPCZTs(for: account)
-            XCTFail("Expected proposeMigrationTransferPCZTs to propagate the propose error")
+            _ = try await synchronizer.proposeMigrationTransferPCZTs(
+                MigrationSchedule(transfers: [], estimatedDurationHours: 0),
+                for: account
+            )
+            XCTFail("Expected proposeMigrationTransferPCZTs to propagate the build error")
         } catch {
             // expected
         }
-
-        XCTAssertFalse(rustBackend.migrationCreateUnsignedTransferPCZTsScheduleForCalled)
     }
 
     func testStoreSignedMigrationTransferPCZTsDelegatesToRustBackend() async throws {

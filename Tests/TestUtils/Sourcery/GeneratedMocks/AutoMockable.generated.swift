@@ -2889,18 +2889,18 @@ class SynchronizerMock: Synchronizer {
     var proposeMigrationTransferPCZTsForCalled: Bool {
         return proposeMigrationTransferPCZTsForCallsCount > 0
     }
-    var proposeMigrationTransferPCZTsForReceivedAccount: AccountUUID?
+    var proposeMigrationTransferPCZTsForReceivedArguments: (schedule: MigrationSchedule, account: AccountUUID)?
     var proposeMigrationTransferPCZTsForReturnValue: [MigrationTransferPCZT]!
-    var proposeMigrationTransferPCZTsForClosure: ((AccountUUID) async throws -> [MigrationTransferPCZT])?
+    var proposeMigrationTransferPCZTsForClosure: ((MigrationSchedule, AccountUUID) async throws -> [MigrationTransferPCZT])?
 
-    func proposeMigrationTransferPCZTs(for account: AccountUUID) async throws -> [MigrationTransferPCZT] {
+    func proposeMigrationTransferPCZTs(_ schedule: MigrationSchedule, for account: AccountUUID) async throws -> [MigrationTransferPCZT] {
         if let error = proposeMigrationTransferPCZTsForThrowableError {
             throw error
         }
         proposeMigrationTransferPCZTsForCallsCount += 1
-        proposeMigrationTransferPCZTsForReceivedAccount = account
+        proposeMigrationTransferPCZTsForReceivedArguments = (schedule: schedule, account: account)
         if let closure = proposeMigrationTransferPCZTsForClosure {
-            return try await closure(account)
+            return try await closure(schedule, account)
         } else {
             return proposeMigrationTransferPCZTsForReturnValue
         }
