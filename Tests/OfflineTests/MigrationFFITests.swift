@@ -67,4 +67,36 @@ final class MigrationFFITests: XCTestCase {
             // Invalid PCZT bytes -> crate deserialization error -> null ptr -> rustMigrationExtractBroadcastTx.
         }
     }
+
+    func testStoreSignedNoteSplitPCZTWithNothingStagedThrows() async throws {
+        do {
+            _ = try await rustBackend.migrationStoreSignedNoteSplitPCZT(pczt: Pczt([0, 1, 2]), for: account)
+            XCTFail("expected storing a signed split with nothing staged to throw")
+        } catch {
+            // No staged note-split PCZT -> MigrationError::InvalidState -> null ptr ->
+            // rustMigrationStoreSignedNoteSplitPCZT.
+        }
+    }
+
+    func testStoreSignedSchedulePCZTsWithNothingStagedThrows() async throws {
+        do {
+            try await rustBackend.migrationStoreSignedSchedulePCZTs(
+                pczts: [MigrationTransferPCZT(id: "run-0", pczt: Pczt([1, 2, 3]))],
+                for: account
+            )
+            XCTFail("expected storing signed transfers with nothing staged to throw")
+        } catch {
+            // No staged transfer PCZTs -> MigrationError::InvalidState -> null ptr ->
+            // rustMigrationStoreSignedSchedulePCZTs.
+        }
+    }
+
+    func testStoreSignedSchedulePCZTsWithEmptySetThrows() async throws {
+        do {
+            try await rustBackend.migrationStoreSignedSchedulePCZTs(pczts: [], for: account)
+            XCTFail("expected storing an empty signed-transfer set to throw")
+        } catch {
+            // Empty set -> MigrationError::InvalidState -> null ptr -> rustMigrationStoreSignedSchedulePCZTs.
+        }
+    }
 }

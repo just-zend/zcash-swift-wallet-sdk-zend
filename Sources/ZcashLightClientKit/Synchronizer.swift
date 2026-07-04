@@ -587,6 +587,22 @@ public protocol Synchronizer: AnyObject {
         for account: AccountUUID
     ) async throws -> TransferResult
 
+    /// The note-split transaction as an unsigned PCZT for an external signer (hardware wallet) —
+    /// the counterpart of ``submitNoteSplit(proposal:spendingKey:options:for:)`` for accounts whose
+    /// spending key lives on a device. Plans the split for the current spendable Orchard balance and
+    /// keeps the proven original staged internally; the app routes the returned PCZT to the device
+    /// (via ``redactPCZTForSigner(pczt:)`` and the QR channel, exactly like a regular
+    /// hardware-wallet send) and hands the signed PCZT to
+    /// ``submitSignedNoteSplitPCZT(_:for:)``.
+    func proposeNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt
+
+    /// Stores the externally signed note-split PCZT (merging it into the staged original, verifying
+    /// and finalizing it) and broadcasts the result — the external-signer completion of
+    /// ``proposeNoteSplitPCZT(for:)``. After this returns `.success`, the migration state advances
+    /// to `.splitPendingConfirmation`, mirroring
+    /// ``submitNoteSplit(proposal:spendingKey:options:for:)``.
+    func submitSignedNoteSplitPCZT(_ pczt: Pczt, for account: AccountUUID) async throws -> TransferResult
+
     /// The full migration schedule for the spendable Orchard balance, presented to the user for a
     /// one-time confirmation.
     func proposeMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule
@@ -602,6 +618,23 @@ public protocol Synchronizer: AnyObject {
         spendingKey: UnifiedSpendingKey,
         for account: AccountUUID
     ) async throws
+
+    /// One unsigned PCZT per proposed migration transfer for an external signer (hardware wallet) —
+    /// the counterpart of ``signAndStoreMigrationSchedule(_:spendingKey:for:)`` for accounts whose
+    /// spending key lives on a device. Proposes the schedule and builds each transfer's PCZT,
+    /// keeping the proven originals staged internally keyed by transfer id. The app signs each PCZT
+    /// on the device sequentially (via ``redactPCZTForSigner(pczt:)`` and the QR channel) and hands
+    /// the full signed set to ``storeSignedMigrationTransferPCZTs(_:for:)`` — the id in each
+    /// ``MigrationTransferPCZT`` pairs the signed PCZT with its transfer and must be preserved.
+    func proposeMigrationTransferPCZTs(for account: AccountUUID) async throws -> [MigrationTransferPCZT]
+
+    /// Stores the full set of externally signed migration-transfer PCZTs — all-or-nothing. Every
+    /// transfer returned by ``proposeMigrationTransferPCZTs(for:)`` must be present (by id) with its
+    /// device-signed PCZT; each is verified and finalized, and the committed schedule is persisted
+    /// exactly like ``signAndStoreMigrationSchedule(_:spendingKey:for:)``. A partial, mismatched, or
+    /// invalid set stores nothing, so the flow can be retried. Broadcasting then flows through
+    /// ``executeNextPendingTransfer(options:for:)`` as usual.
+    func storeSignedMigrationTransferPCZTs(_ pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws
 
     /// Whether the wallet must sync before the next transfer can be broadcast (a previous transfer
     /// produced change back to Orchard that must be observed first).

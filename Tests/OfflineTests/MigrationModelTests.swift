@@ -72,6 +72,15 @@ final class MigrationModelTests: XCTestCase {
         XCTAssertEqual(tx, PreparedTx(id: "t1", txid: "deadbeef", rawPczt: [5, 0, 255]))
     }
 
+    func testMigrationTransferPCZTDecodesRawPcztArrayIntoData() throws {
+        let pair = try decode(MigrationTransferPCZT.self, "{\"id\":\"run-3\",\"raw_pczt\":[80,67,90,84]}")
+        XCTAssertEqual(pair, MigrationTransferPCZT(id: "run-3", pczt: Pczt([80, 67, 90, 84])))
+        XCTAssertEqual(try roundTrip(pair), pair)
+        // The crate expects the byte-array wire format back (`raw_pczt` key, numeric array).
+        let encoded = String(decoding: try JSONEncoder().encode(pair), as: UTF8.self)
+        XCTAssertTrue(encoded.contains("\"raw_pczt\":[80,67,90,84]"))
+    }
+
     func testNoteSplitProposalSnakeCase() throws {
         XCTAssertEqual(
             try decode(NoteSplitProposal.self, "{\"output_notes\":[100000000,34500000],\"fee\":10000}"),

@@ -555,6 +555,35 @@ public class SDKSynchronizer: Synchronizer {
         return result
     }
 
+    public func proposeNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt {
+        try await initializer.rustBackend.migrationCreateUnsignedNoteSplitPCZT(for: account)
+    }
+
+    public func submitSignedNoteSplitPCZT(_ pczt: Pczt, for account: AccountUUID) async throws -> TransferResult {
+        // Mirrors `submitNoteSplit`: the store step replaces the internal signing, then the
+        // broadcast + record composition is identical (`prepared.id` is `prep:<run_id>`).
+        let prepared = try await initializer.rustBackend.migrationStoreSignedNoteSplitPCZT(pczt: pczt, for: account)
+        let result = try await broadcastMigrationTx(prepared, for: account)
+        try await initializer.rustBackend.migrationRecordTransferResult(
+            transferId: prepared.id,
+            result: result,
+            for: account
+        )
+        return result
+    }
+
+    public func proposeMigrationTransferPCZTs(for account: AccountUUID) async throws -> [MigrationTransferPCZT] {
+        // Propose the schedule, then build + stage one unsigned PCZT per transfer. The schedule
+        // used here is authoritative for the PCZTs; the display schedule the app may have shown
+        // earlier via `proposeMigrationTransfers` is recomputed from the same balance.
+        let schedule = try await initializer.rustBackend.migrationProposeTransfers(for: account)
+        return try await initializer.rustBackend.migrationCreateUnsignedTransferPCZTs(schedule: schedule, for: account)
+    }
+
+    public func storeSignedMigrationTransferPCZTs(_ pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws {
+        try await initializer.rustBackend.migrationStoreSignedSchedulePCZTs(pczts: pczts, for: account)
+    }
+
     public func proposeMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
         try await initializer.rustBackend.migrationProposeTransfers(for: account)
     }

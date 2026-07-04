@@ -382,6 +382,25 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationSignNoteSplit` if the rust layer returns an error.
     func migrationSignNoteSplit(proposal: NoteSplitProposal, usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> PreparedTx
 
+    /// Build the note-split transaction as an unsigned PCZT for an external signer; the proven
+    /// original stays staged inside the crate until `migrationStoreSignedNoteSplitPCZT`.
+    /// - Throws: `rustMigrationCreateUnsignedNoteSplitPCZT` if the rust layer returns an error.
+    func migrationCreateUnsignedNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt
+
+    /// Store the externally signed note-split PCZT (merged into the staged original, verified and
+    /// finalized); returns the broadcastable `PreparedTx`.
+    /// - Throws: `rustMigrationStoreSignedNoteSplitPCZT` if the rust layer returns an error.
+    func migrationStoreSignedNoteSplitPCZT(pczt: Pczt, for account: AccountUUID) async throws -> PreparedTx
+
+    /// Build one unsigned PCZT per transfer of the schedule for an external signer, each staged
+    /// inside the crate keyed by transfer id.
+    /// - Throws: `rustMigrationCreateUnsignedTransferPCZTs` if the rust layer returns an error.
+    func migrationCreateUnsignedTransferPCZTs(schedule: MigrationSchedule, for account: AccountUUID) async throws -> [MigrationTransferPCZT]
+
+    /// Store the full set of externally signed transfer PCZTs, all-or-nothing.
+    /// - Throws: `rustMigrationStoreSignedSchedulePCZTs` if the rust layer returns an error.
+    func migrationStoreSignedSchedulePCZTs(pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws
+
     /// The full migration schedule for the spendable Orchard balance.
     /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
     func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule

@@ -51,6 +51,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hasOverdueTransfers`). `NetworkPrivacyOptions` is accepted but not yet honored (broadcast uses the
   configured lightwalletd). Async-only for now — the `ClosureSynchronizer` / `CombineSynchronizer`
   adapters are not yet updated.
+- External-signer (hardware wallet / Keystone) surface for the Orchard → Ironwood migration, so
+  accounts whose spending key lives on a device can migrate: `Synchronizer.proposeNoteSplitPCZT` /
+  `submitSignedNoteSplitPCZT` mirror the `submitNoteSplit` flow with the signature produced by the
+  device, and `proposeMigrationTransferPCZTs` / `storeSignedMigrationTransferPCZTs` mirror
+  `signAndStoreMigrationSchedule` — one unsigned PCZT per scheduled transfer (new
+  `MigrationTransferPCZT` model pairing a transfer id with its `Pczt`), signed on the device via the
+  app's existing redact → animated-QR flow, then stored **all-or-nothing** (a partial or mismatched
+  signed set stores nothing, so the flow can be retried). The unsigned PCZTs are proved up front and
+  the originals stay staged inside the migration engine, which pairs, verifies, and finalizes the
+  returned signatures — the app never has to juggle proof/signature PCZT pairs. Error codes
+  ZRUST0111–ZRUST0114.
 
 ## Changed
 - The Rust core now builds against the valargroup `librustzcash` fork under

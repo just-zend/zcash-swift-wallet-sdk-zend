@@ -58,6 +58,39 @@ public struct PreparedTx: Equatable, Codable {
     }
 }
 
+/// A migration-transfer PCZT paired with the transfer id it belongs to, for the external-signer
+/// (hardware wallet) flow. `proposeMigrationTransferPCZTs` returns one per scheduled transfer with
+/// `pczt` holding the unsigned PCZT for the signing device; the app hands the same pairs back to
+/// `storeSignedMigrationTransferPCZTs` with `pczt` replaced by the device-signed PCZT — the crate
+/// matches them to its staged originals by `id`. The JSON wire format mirrors the crate's
+/// `TransferPczt` (`raw_pczt` as a byte array), converted to `Pczt` (`Data`) here.
+public struct MigrationTransferPCZT: Equatable, Codable {
+    public let id: String
+    public let pczt: Pczt
+
+    public init(id: String, pczt: Pczt) {
+        self.id = id
+        self.pczt = pczt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case pczt = "raw_pczt"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        pczt = Pczt(try container.decode([UInt8].self, forKey: .pczt))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode([UInt8](pczt), forKey: .pczt)
+    }
+}
+
 /// A proposed note split: the per-note output values (zatoshi) and the prep-transaction fee.
 public struct NoteSplitProposal: Equatable, Codable {
     public let outputNotes: [UInt64]

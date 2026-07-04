@@ -295,6 +295,14 @@ public enum ZcashErrorCode: String {
     case rustMigrationExtractBroadcastTx = "ZRUST0107"
     /// Error from rust layer when calling ZcashRustBackend.migrationRefreshStaleTransfers
     case rustMigrationRefreshStaleTransfers = "ZRUST0108"
+    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedNoteSplitPCZT
+    case rustMigrationCreateUnsignedNoteSplitPCZT = "ZRUST0111"
+    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedTransferPCZTs
+    case rustMigrationCreateUnsignedTransferPCZTs = "ZRUST0112"
+    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedNoteSplitPCZT
+    case rustMigrationStoreSignedNoteSplitPCZT = "ZRUST0113"
+    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePCZTs
+    case rustMigrationStoreSignedSchedulePCZTs = "ZRUST0114"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.

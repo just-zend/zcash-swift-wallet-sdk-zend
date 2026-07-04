@@ -1327,6 +1327,90 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
+    @DBActor func migrationCreateUnsignedNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt {
+        let ptr = zcashlc_migration_create_unsigned_note_split_pczt(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationCreateUnsignedNoteSplitPCZT(
+                lastErrorMessage(fallback: "`migrationCreateUnsignedNoteSplitPCZT` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return Pczt(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+    }
+
+    @DBActor func migrationStoreSignedNoteSplitPCZT(pczt: Pczt, for account: AccountUUID) async throws -> PreparedTx {
+        let pcztBytes = [UInt8](pczt)
+        let ptr = pcztBytes.withUnsafeBufferPointer { pcztPtr in
+            zcashlc_migration_store_signed_note_split_pczt(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                pcztPtr.baseAddress,
+                UInt(pcztBytes.count)
+            )
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationStoreSignedNoteSplitPCZT(
+                lastErrorMessage(fallback: "`migrationStoreSignedNoteSplitPCZT` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(PreparedTx.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationStoreSignedNoteSplitPCZT("Failed to decode PreparedTx: \(error)")
+        }
+    }
+
+    @DBActor func migrationCreateUnsignedTransferPCZTs(
+        schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> [MigrationTransferPCZT] {
+        let scheduleBytes = [UInt8](try JSONEncoder().encode(schedule))
+        let ptr = scheduleBytes.withUnsafeBufferPointer { schedulePtr in
+            zcashlc_migration_create_unsigned_transfer_pczts(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                schedulePtr.baseAddress,
+                UInt(scheduleBytes.count)
+            )
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationCreateUnsignedTransferPCZTs(
+                lastErrorMessage(fallback: "`migrationCreateUnsignedTransferPCZTs` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode([MigrationTransferPCZT].self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        } catch {
+            throw ZcashError.rustMigrationCreateUnsignedTransferPCZTs("Failed to decode [MigrationTransferPCZT]: \(error)")
+        }
+    }
+
+    @DBActor func migrationStoreSignedSchedulePCZTs(pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws {
+        let signedBytes = [UInt8](try JSONEncoder().encode(pczts))
+        let ptr = signedBytes.withUnsafeBufferPointer { signedPtr in
+            zcashlc_migration_store_signed_schedule_pczts(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                signedPtr.baseAddress,
+                UInt(signedBytes.count)
+            )
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationStoreSignedSchedulePCZTs(
+                lastErrorMessage(fallback: "`migrationStoreSignedSchedulePCZTs` failed with unknown error")
+            )
+        }
+        zcashlc_free_boxed_slice(ptr)
+    }
+
     @DBActor func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
         let ptr = zcashlc_migration_propose_transfers(dbData.0, dbData.1, account.id, networkType.networkId)
         guard let ptr else {

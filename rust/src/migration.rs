@@ -16,7 +16,7 @@ use std::slice;
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zodl_ironwood_migration::{
-    MigrationContext, MigrationSchedule, NoteSplitProposal, TransferResult,
+    MigrationContext, MigrationSchedule, NoteSplitProposal, TransferPczt, TransferResult,
 };
 
 use crate::ffi;
@@ -174,6 +174,117 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
             .sign_note_split(&proposal, usk)
             .map_err(|e| anyhow!("sign_note_split: {e}"))?;
         Ok(ffi::BoxedSlice::some(serde_json::to_vec(&value)?))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Build the note-split transaction as an unsigned PCZT for an external signer (hardware
+/// wallet). Plans the split for the current spendable Orchard balance, proves and stages the
+/// original inside the crate, and returns the unsigned PCZT bytes (NOT JSON) for the device;
+/// the platform redacts them for the QR channel exactly like its regular hardware-wallet send.
+///
+/// # Safety
+/// See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczt(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let pczt = ctx
+            .create_unsigned_note_split_pczt()
+            .map_err(|e| anyhow!("create_unsigned_note_split_pczt: {e}"))?;
+        Ok(ffi::BoxedSlice::some(pczt))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Accept the externally signed note-split PCZT: merge the device's signatures into the staged
+/// original, verify + finalize, and persist the run (JSON `PreparedTx`). Broadcasting the
+/// returned `PreparedTx` then flows through the existing extract + submit + record path.
+/// `pczt_ptr` is the raw device-signed PCZT bytes.
+///
+/// # Safety
+/// See [`context`]; `pczt_ptr` must be valid for reads of `pczt_len` bytes. Free the returned
+/// pointer with `zcashlc_free_boxed_slice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczt(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    pczt_ptr: *const u8,
+    pczt_len: usize,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let pczt = unsafe { slice::from_raw_parts(pczt_ptr, pczt_len) };
+        let value = ctx
+            .store_signed_note_split_pczt(pczt)
+            .map_err(|e| anyhow!("store_signed_note_split_pczt: {e}"))?;
+        Ok(ffi::BoxedSlice::some(serde_json::to_vec(&value)?))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Build one unsigned PCZT per transfer of the schedule for an external signer (JSON
+/// `Vec<TransferPczt>`, each `{ id, raw_pczt }`). The proven originals are staged inside the
+/// crate keyed by transfer id; the platform routes the unsigned PCZTs to the device and hands
+/// the signed set back to `zcashlc_migration_store_signed_schedule_pczts`. `schedule` is JSON
+/// `MigrationSchedule`.
+///
+/// # Safety
+/// See [`context`]; `schedule_ptr` must be valid for reads of `schedule_len` bytes. Free the
+/// returned pointer with `zcashlc_free_boxed_slice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_create_unsigned_transfer_pczts(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    schedule_ptr: *const u8,
+    schedule_len: usize,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let schedule: MigrationSchedule =
+            serde_json::from_slice(unsafe { slice::from_raw_parts(schedule_ptr, schedule_len) })
+                .map_err(|e| anyhow!("decode MigrationSchedule: {e}"))?;
+        let value = ctx
+            .create_unsigned_transfer_pczts(&schedule)
+            .map_err(|e| anyhow!("create_unsigned_transfer_pczts: {e}"))?;
+        Ok(ffi::BoxedSlice::some(serde_json::to_vec(&value)?))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Accept the full set of externally signed transfer PCZTs — all-or-nothing (JSON `null` on
+/// success). Every staged transfer must be matched by id; a partial, mismatched, or invalid set
+/// stores nothing. `signed` is JSON `Vec<TransferPczt>` (`{ id, raw_pczt }` pairs).
+///
+/// # Safety
+/// See [`context`]; `signed_ptr` must be valid for reads of `signed_len` bytes. Free the
+/// returned pointer with `zcashlc_free_boxed_slice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    signed_ptr: *const u8,
+    signed_len: usize,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let signed: Vec<TransferPczt> =
+            serde_json::from_slice(unsafe { slice::from_raw_parts(signed_ptr, signed_len) })
+                .map_err(|e| anyhow!("decode signed transfer PCZTs: {e}"))?;
+        ctx.store_signed_schedule_pczts(&signed)
+            .map_err(|e| anyhow!("store_signed_schedule_pczts: {e}"))?;
+        Ok(ffi::BoxedSlice::some(serde_json::to_vec(&())?))
     });
     unwrap_exc_or_null(res)
 }
@@ -476,6 +587,29 @@ mod tests {
         let body = unsafe { (*ptr).as_slice() };
         assert_eq!(body, b"\"NotStarted\"");
         unsafe { crate::ffi::zcashlc_free_boxed_slice(ptr) }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn store_signed_schedule_pczts_with_nothing_staged_is_an_error() {
+        let path =
+            std::env::temp_dir().join(format!("zcashlc_mig_ext_{}.sqlite", std::process::id()));
+        let path_str = path.to_str().unwrap();
+        let db = path_str.as_bytes();
+        let account = [7u8; 16];
+        let signed = br#"[{"id":"run-0","raw_pczt":[1,2,3]}]"#;
+        let ptr = unsafe {
+            zcashlc_migration_store_signed_schedule_pczts(
+                db.as_ptr(),
+                db.len(),
+                account.as_ptr(),
+                1,
+                signed.as_ptr(),
+                signed.len(),
+            )
+        };
+        // No staged transfer PCZTs exist -> the crate rejects the set -> null + last-error set.
+        assert!(ptr.is_null());
         let _ = std::fs::remove_file(&path);
     }
 }

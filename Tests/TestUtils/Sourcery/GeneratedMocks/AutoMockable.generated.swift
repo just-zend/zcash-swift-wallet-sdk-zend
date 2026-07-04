@@ -2767,6 +2767,54 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - proposeNoteSplitPCZT
+
+    var proposeNoteSplitPCZTForThrowableError: Error?
+    var proposeNoteSplitPCZTForCallsCount = 0
+    var proposeNoteSplitPCZTForCalled: Bool {
+        return proposeNoteSplitPCZTForCallsCount > 0
+    }
+    var proposeNoteSplitPCZTForReceivedAccount: AccountUUID?
+    var proposeNoteSplitPCZTForReturnValue: Pczt!
+    var proposeNoteSplitPCZTForClosure: ((AccountUUID) async throws -> Pczt)?
+
+    func proposeNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt {
+        if let error = proposeNoteSplitPCZTForThrowableError {
+            throw error
+        }
+        proposeNoteSplitPCZTForCallsCount += 1
+        proposeNoteSplitPCZTForReceivedAccount = account
+        if let closure = proposeNoteSplitPCZTForClosure {
+            return try await closure(account)
+        } else {
+            return proposeNoteSplitPCZTForReturnValue
+        }
+    }
+
+    // MARK: - submitSignedNoteSplitPCZT
+
+    var submitSignedNoteSplitPCZTForThrowableError: Error?
+    var submitSignedNoteSplitPCZTForCallsCount = 0
+    var submitSignedNoteSplitPCZTForCalled: Bool {
+        return submitSignedNoteSplitPCZTForCallsCount > 0
+    }
+    var submitSignedNoteSplitPCZTForReceivedArguments: (pczt: Pczt, account: AccountUUID)?
+    var submitSignedNoteSplitPCZTForReturnValue: TransferResult!
+    var submitSignedNoteSplitPCZTForClosure: ((Pczt, AccountUUID) async throws -> TransferResult)?
+
+    func submitSignedNoteSplitPCZT(_ pczt: Pczt, for account: AccountUUID) async throws -> TransferResult {
+        if let error = submitSignedNoteSplitPCZTForThrowableError {
+            throw error
+        }
+        submitSignedNoteSplitPCZTForCallsCount += 1
+        submitSignedNoteSplitPCZTForReceivedArguments = (pczt: pczt, account: account)
+        if let closure = submitSignedNoteSplitPCZTForClosure {
+            return try await closure(pczt, account)
+        } else {
+            return submitSignedNoteSplitPCZTForReturnValue
+        }
+    }
+
     // MARK: - proposeMigrationTransfers
 
     var proposeMigrationTransfersForThrowableError: Error?
@@ -2791,6 +2839,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - proposeImmediateMigrationTransfers
+
+    var proposeImmediateMigrationTransfersForThrowableError: Error?
+    var proposeImmediateMigrationTransfersForCallsCount = 0
+    var proposeImmediateMigrationTransfersForCalled: Bool {
+        return proposeImmediateMigrationTransfersForCallsCount > 0
+    }
+    var proposeImmediateMigrationTransfersForReceivedAccount: AccountUUID?
+    var proposeImmediateMigrationTransfersForReturnValue: MigrationSchedule!
+    var proposeImmediateMigrationTransfersForClosure: ((AccountUUID) async throws -> MigrationSchedule)?
+
+    func proposeImmediateMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
+        if let error = proposeImmediateMigrationTransfersForThrowableError {
+            throw error
+        }
+        proposeImmediateMigrationTransfersForCallsCount += 1
+        proposeImmediateMigrationTransfersForReceivedAccount = account
+        if let closure = proposeImmediateMigrationTransfersForClosure {
+            return try await closure(account)
+        } else {
+            return proposeImmediateMigrationTransfersForReturnValue
+        }
+    }
+
     // MARK: - signAndStoreMigrationSchedule
 
     var signAndStoreMigrationScheduleSpendingKeyForThrowableError: Error?
@@ -2808,6 +2880,49 @@ class SynchronizerMock: Synchronizer {
         signAndStoreMigrationScheduleSpendingKeyForCallsCount += 1
         signAndStoreMigrationScheduleSpendingKeyForReceivedArguments = (schedule: schedule, spendingKey: spendingKey, account: account)
         try await signAndStoreMigrationScheduleSpendingKeyForClosure!(schedule, spendingKey, account)
+    }
+
+    // MARK: - proposeMigrationTransferPCZTs
+
+    var proposeMigrationTransferPCZTsForThrowableError: Error?
+    var proposeMigrationTransferPCZTsForCallsCount = 0
+    var proposeMigrationTransferPCZTsForCalled: Bool {
+        return proposeMigrationTransferPCZTsForCallsCount > 0
+    }
+    var proposeMigrationTransferPCZTsForReceivedAccount: AccountUUID?
+    var proposeMigrationTransferPCZTsForReturnValue: [MigrationTransferPCZT]!
+    var proposeMigrationTransferPCZTsForClosure: ((AccountUUID) async throws -> [MigrationTransferPCZT])?
+
+    func proposeMigrationTransferPCZTs(for account: AccountUUID) async throws -> [MigrationTransferPCZT] {
+        if let error = proposeMigrationTransferPCZTsForThrowableError {
+            throw error
+        }
+        proposeMigrationTransferPCZTsForCallsCount += 1
+        proposeMigrationTransferPCZTsForReceivedAccount = account
+        if let closure = proposeMigrationTransferPCZTsForClosure {
+            return try await closure(account)
+        } else {
+            return proposeMigrationTransferPCZTsForReturnValue
+        }
+    }
+
+    // MARK: - storeSignedMigrationTransferPCZTs
+
+    var storeSignedMigrationTransferPCZTsForThrowableError: Error?
+    var storeSignedMigrationTransferPCZTsForCallsCount = 0
+    var storeSignedMigrationTransferPCZTsForCalled: Bool {
+        return storeSignedMigrationTransferPCZTsForCallsCount > 0
+    }
+    var storeSignedMigrationTransferPCZTsForReceivedArguments: (pczts: [MigrationTransferPCZT], account: AccountUUID)?
+    var storeSignedMigrationTransferPCZTsForClosure: (([MigrationTransferPCZT], AccountUUID) async throws -> Void)?
+
+    func storeSignedMigrationTransferPCZTs(_ pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws {
+        if let error = storeSignedMigrationTransferPCZTsForThrowableError {
+            throw error
+        }
+        storeSignedMigrationTransferPCZTsForCallsCount += 1
+        storeSignedMigrationTransferPCZTsForReceivedArguments = (pczts: pczts, account: account)
+        try await storeSignedMigrationTransferPCZTsForClosure!(pczts, account)
     }
 
     // MARK: - isSyncRequiredBeforeNextTransfer
@@ -4410,6 +4525,97 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
+    // MARK: - migrationCreateUnsignedNoteSplitPCZT
+
+    var migrationCreateUnsignedNoteSplitPCZTForThrowableError: Error?
+    var migrationCreateUnsignedNoteSplitPCZTForCallsCount = 0
+    var migrationCreateUnsignedNoteSplitPCZTForCalled: Bool {
+        return migrationCreateUnsignedNoteSplitPCZTForCallsCount > 0
+    }
+    var migrationCreateUnsignedNoteSplitPCZTForReceivedAccount: AccountUUID?
+    var migrationCreateUnsignedNoteSplitPCZTForReturnValue: Pczt!
+    var migrationCreateUnsignedNoteSplitPCZTForClosure: ((AccountUUID) async throws -> Pczt)?
+
+    func migrationCreateUnsignedNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt {
+        if let error = migrationCreateUnsignedNoteSplitPCZTForThrowableError {
+            throw error
+        }
+        migrationCreateUnsignedNoteSplitPCZTForCallsCount += 1
+        migrationCreateUnsignedNoteSplitPCZTForReceivedAccount = account
+        if let closure = migrationCreateUnsignedNoteSplitPCZTForClosure {
+            return try await closure(account)
+        } else {
+            return migrationCreateUnsignedNoteSplitPCZTForReturnValue
+        }
+    }
+
+    // MARK: - migrationStoreSignedNoteSplitPCZT
+
+    var migrationStoreSignedNoteSplitPCZTPcztForThrowableError: Error?
+    var migrationStoreSignedNoteSplitPCZTPcztForCallsCount = 0
+    var migrationStoreSignedNoteSplitPCZTPcztForCalled: Bool {
+        return migrationStoreSignedNoteSplitPCZTPcztForCallsCount > 0
+    }
+    var migrationStoreSignedNoteSplitPCZTPcztForReceivedArguments: (pczt: Pczt, account: AccountUUID)?
+    var migrationStoreSignedNoteSplitPCZTPcztForReturnValue: PreparedTx!
+    var migrationStoreSignedNoteSplitPCZTPcztForClosure: ((Pczt, AccountUUID) async throws -> PreparedTx)?
+
+    func migrationStoreSignedNoteSplitPCZT(pczt: Pczt, for account: AccountUUID) async throws -> PreparedTx {
+        if let error = migrationStoreSignedNoteSplitPCZTPcztForThrowableError {
+            throw error
+        }
+        migrationStoreSignedNoteSplitPCZTPcztForCallsCount += 1
+        migrationStoreSignedNoteSplitPCZTPcztForReceivedArguments = (pczt: pczt, account: account)
+        if let closure = migrationStoreSignedNoteSplitPCZTPcztForClosure {
+            return try await closure(pczt, account)
+        } else {
+            return migrationStoreSignedNoteSplitPCZTPcztForReturnValue
+        }
+    }
+
+    // MARK: - migrationCreateUnsignedTransferPCZTs
+
+    var migrationCreateUnsignedTransferPCZTsScheduleForThrowableError: Error?
+    var migrationCreateUnsignedTransferPCZTsScheduleForCallsCount = 0
+    var migrationCreateUnsignedTransferPCZTsScheduleForCalled: Bool {
+        return migrationCreateUnsignedTransferPCZTsScheduleForCallsCount > 0
+    }
+    var migrationCreateUnsignedTransferPCZTsScheduleForReceivedArguments: (schedule: MigrationSchedule, account: AccountUUID)?
+    var migrationCreateUnsignedTransferPCZTsScheduleForReturnValue: [MigrationTransferPCZT]!
+    var migrationCreateUnsignedTransferPCZTsScheduleForClosure: ((MigrationSchedule, AccountUUID) async throws -> [MigrationTransferPCZT])?
+
+    func migrationCreateUnsignedTransferPCZTs(schedule: MigrationSchedule, for account: AccountUUID) async throws -> [MigrationTransferPCZT] {
+        if let error = migrationCreateUnsignedTransferPCZTsScheduleForThrowableError {
+            throw error
+        }
+        migrationCreateUnsignedTransferPCZTsScheduleForCallsCount += 1
+        migrationCreateUnsignedTransferPCZTsScheduleForReceivedArguments = (schedule: schedule, account: account)
+        if let closure = migrationCreateUnsignedTransferPCZTsScheduleForClosure {
+            return try await closure(schedule, account)
+        } else {
+            return migrationCreateUnsignedTransferPCZTsScheduleForReturnValue
+        }
+    }
+
+    // MARK: - migrationStoreSignedSchedulePCZTs
+
+    var migrationStoreSignedSchedulePCZTsPcztsForThrowableError: Error?
+    var migrationStoreSignedSchedulePCZTsPcztsForCallsCount = 0
+    var migrationStoreSignedSchedulePCZTsPcztsForCalled: Bool {
+        return migrationStoreSignedSchedulePCZTsPcztsForCallsCount > 0
+    }
+    var migrationStoreSignedSchedulePCZTsPcztsForReceivedArguments: (pczts: [MigrationTransferPCZT], account: AccountUUID)?
+    var migrationStoreSignedSchedulePCZTsPcztsForClosure: (([MigrationTransferPCZT], AccountUUID) async throws -> Void)?
+
+    func migrationStoreSignedSchedulePCZTs(pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws {
+        if let error = migrationStoreSignedSchedulePCZTsPcztsForThrowableError {
+            throw error
+        }
+        migrationStoreSignedSchedulePCZTsPcztsForCallsCount += 1
+        migrationStoreSignedSchedulePCZTsPcztsForReceivedArguments = (pczts: pczts, account: account)
+        try await migrationStoreSignedSchedulePCZTsPcztsForClosure!(pczts, account)
+    }
+
     // MARK: - migrationProposeTransfers
 
     var migrationProposeTransfersForThrowableError: Error?
@@ -4431,6 +4637,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(account)
         } else {
             return migrationProposeTransfersForReturnValue
+        }
+    }
+
+    // MARK: - migrationProposeImmediate
+
+    var migrationProposeImmediateForThrowableError: Error?
+    var migrationProposeImmediateForCallsCount = 0
+    var migrationProposeImmediateForCalled: Bool {
+        return migrationProposeImmediateForCallsCount > 0
+    }
+    var migrationProposeImmediateForReceivedAccount: AccountUUID?
+    var migrationProposeImmediateForReturnValue: MigrationSchedule!
+    var migrationProposeImmediateForClosure: ((AccountUUID) async throws -> MigrationSchedule)?
+
+    func migrationProposeImmediate(for account: AccountUUID) async throws -> MigrationSchedule {
+        if let error = migrationProposeImmediateForThrowableError {
+            throw error
+        }
+        migrationProposeImmediateForCallsCount += 1
+        migrationProposeImmediateForReceivedAccount = account
+        if let closure = migrationProposeImmediateForClosure {
+            return try await closure(account)
+        } else {
+            return migrationProposeImmediateForReturnValue
         }
     }
 
