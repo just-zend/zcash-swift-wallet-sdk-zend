@@ -45,7 +45,10 @@ targets.append(contentsOf: [
             "Modules/Service/GRPC/ProtoBuf/proto/compact_formats.proto",
             "Modules/Service/GRPC/ProtoBuf/proto/proposal.proto",
             "Modules/Service/GRPC/ProtoBuf/proto/service.proto",
-            "Error/Sourcery/"
+            "Error/Sourcery/",
+            // Voting is gated off on this Ironwood branch: the underlying zcashlc_voting_* FFI
+            // symbols are not built (valargroup orchard fork incompatibility). See Cargo.toml.
+            "Rust/Voting"
         ],
         resources: [
             .copy("Resources/checkpoints")
@@ -75,7 +78,13 @@ targets.append(contentsOf: [
     ),
     .testTarget(
         name: "OfflineTests",
-        dependencies: ["ZcashLightClientKit", "TestUtils"]
+        dependencies: ["ZcashLightClientKit", "TestUtils"],
+        exclude: [
+            // Voting is gated off on this Ironwood branch (see the ZcashLightClientKit target):
+            // these test the excluded Rust/Voting layer (VotingRustBackend, PirSnapshotResolver).
+            "VotingRustBackendTests.swift",
+            "PirSnapshotResolverTests.swift"
+        ]
     ),
     .testTarget(
         name: "NetworkTests",

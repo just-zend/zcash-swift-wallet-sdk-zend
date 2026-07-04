@@ -233,12 +233,12 @@ extension ZcashTransaction.Overview {
     func anchor(network: ZcashNetwork) -> BlockHeight? {
         guard let minedHeight = self.minedHeight else { return nil }
         if minedHeight != -1 {
-            return max(minedHeight - ZcashSDK.defaultStaleTolerance, network.constants.saplingActivationHeight)
+            return max(minedHeight - ZcashSDK.defaultStaleTolerance, network.saplingActivationHeight)
         }
 
         guard let expiryHeight = self.expiryHeight else { return nil }
         if expiryHeight != -1 {
-            return max(expiryHeight - ZcashSDK.expiryOffset - ZcashSDK.defaultStaleTolerance, network.constants.saplingActivationHeight)
+            return max(expiryHeight - ZcashSDK.expiryOffset - ZcashSDK.defaultStaleTolerance, network.saplingActivationHeight)
         }
 
         return nil

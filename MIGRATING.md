@@ -6,6 +6,29 @@ information stored.
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
 track failures on its own. Wallet developers would have to account for those.
 
+## Configurable activation heights (regtest / custom networks)
+
+New, **additive** capability for pointing the SDK at a custom-parameter (regtest) `lightwalletd` — e.g. an Ironwood testing backend — whose network upgrades activate at arbitrary heights instead of the hardcoded mainnet/testnet values. Existing code is unaffected; you opt in by building a regtest `ZcashNetwork`:
+
+```swift
+let network = ZcashNetworkBuilder.regtest(activationHeights: NetworkActivationHeights(
+    sapling: 1,
+    nu5: 100,
+    nu6: 200,
+    nu6_3: 5000   // Ironwood
+))
+let initializer = Initializer(/* … */, network: network)
+```
+
+- Set the heights to mirror the `nuparams` of the node / `lightwalletd` you connect to. `nil` means "not activated".
+- A regtest network reports its type as **Regtest**: addresses are regtest-encoded and its databases use a `ZcashSdk_regtest_` name prefix (no collision with mainnet/testnet data). The SDK expects the server to report `chainName == "regtest"`.
+- Regtest ships no bundled checkpoints; a fresh wallet scans from the Sapling activation height (empty tree). For a higher birthday, seed a tree state via `Synchronizer.getTreeState(height:)`.
+- Running the Orchard→Ironwood **migration** on regtest is not yet supported. See `docs/handoffs/ZODL-regtest-activation-heights.md`.
+
+## Ironwood (NU6.3) balance on `AccountBalance`
+
+`AccountBalance` gains a public `ironwoodBalance: PoolBalance` field (Ironwood is Orchard note-version V3, received at the account's existing Orchard receiver — there is no separate Ironwood address). The field is **additive** and is `.zero` for every wallet until NU6.3 activates and a lightwalletd serves Ironwood compact blocks. No action is required now; an app that wants to surface Ironwood can read/total it alongside `orchardBalance`. (If you construct `AccountBalance` yourself, e.g. in tests, the new field defaults to `.zero` via the memberwise initializer, so existing call sites keep compiling.)
+
 ## `Broadcaster` redesign (multi-server submission)
 
 The `Broadcaster` API introduced in the 2.6.0-alpha tags has changed:
@@ -25,6 +48,14 @@ let outcome = await synchronizer.broadcaster.submit(
 - Retry semantics: the endpoint list passed to `submit` is persisted as the transaction's retry plan. The SDK's background resubmission retries pending transactions through those endpoints (sequentially) instead of the synchronizer's default endpoint, and never auto-submits transactions created through `Broadcaster` that the app hasn't submitted yet. If the plan store cannot be read, background resubmission skips the affected transactions rather than falling back to the default endpoint. Plans are kept until the transaction expires (so a chain reorg cannot detach a transaction from its recorded endpoints), and `Synchronizer.wipe()` deletes the plan database file.
 - The retry plan is recorded before any network attempt and stays recorded when `submit` returns `.cancelled` or `.timedOut`: background resubmission may still broadcast the transaction later. Treat those outcomes as "outcome unknown", not as "not sent".
 - `LightWalletEndpoint` now conforms to `Equatable`. If your app declared that conformance retroactively, remove your declaration.
+
+## Orchard → Ironwood migration API on `Synchronizer`
+
+The async `Synchronizer` protocol gains an Orchard → Ironwood migration surface (every method takes `for account: AccountUUID`): `migrationState`, `migrationProgress`, `isNoteSplitNeeded`, `prepareNoteSplit`, `submitNoteSplit`, `proposeMigrationTransfers`, `signAndStoreMigrationSchedule`, `isSyncRequiredBeforeNextTransfer`, `executeNextPendingTransfer`, `hasOverdueTransfers`, `hasInvalidTransfers`, `refreshStaleTransfers`, `restartCurrentMigrationStep`, and `initializePostUpgrade`.
+
+- If you provide your own type conforming to `Synchronizer`, you must implement these new methods. `SDKSynchronizer` already does, and the `ClosureSynchronizer` / `CombineSynchronizer` protocols are unchanged, so their adapters are unaffected.
+- `submitNoteSplit(proposal:spendingKey:options:for:)` and `executeNextPendingTransfer(options:for:)` broadcast the migration engine's pre-signed transaction over the SDK's existing direct submission path and return a `TransferResult`. Each first extracts the broadcast-ready consensus transaction from the engine's signed PCZT before submitting. The `options: NetworkPrivacyOptions` argument is accepted but ignored in this version (broadcast uses the already-configured lightwalletd).
+- `refreshStaleTransfers(spendingKey:for:)` re-anchors, re-proves and re-signs the active migration run's scheduled transfers when they have gone stale (anchor too old to broadcast), returning the number refreshed. Detect the need with `hasOverdueTransfers(for:)`.
 
 # Migrating from previous versions to 0.20.0-beta
 The `SDKSynchronizer` no longer uses `NotificationCenter` to send notifications.

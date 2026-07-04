@@ -6,6 +6,70 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- Configurable network-upgrade activation heights, for connecting the SDK to a **custom-parameter
+  (regtest) network** such as an Ironwood testing backend. `ZcashNetworkBuilder.regtest(activationHeights:)`
+  builds a `ZcashNetwork` from a new `NetworkActivationHeights` value (per-NU heights up to NU6.3), threaded
+  into the Rust core via librustzcash's `LocalNetwork`. Adds a `NetworkType.regtest` identity (`networkId`
+  2, `chainName` "regtest", regtest-encoded addresses, `ZcashSdk_regtest_` database prefix) and a
+  `zcashlc_set_regtest_activation_heights` FFI. Opt-in and fully additive — mainnet/testnet behavior is
+  unchanged. Running the Orchard→Ironwood **migration** against a regtest network is not yet supported (the
+  migration engine has no custom-network variant). See `MIGRATING.md` and
+  `docs/handoffs/ZODL-regtest-activation-heights.md`.
+- Ironwood (NU6.3) receive/sync readiness. Ironwood is Orchard note-version V3 — received at the
+  account's existing **Orchard receiver** (no separate Ironwood address) — so the SDK now wires the
+  receive/scan/balance path against the librustzcash Ironwood support: the Ironwood proto fields
+  (`CompactTx.ironwoodActions`, `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
+  `ShieldedProtocol.ironwood`); a `putIronwoodSubtreeRoots` FFI/welding method; a **best-effort**
+  Ironwood subtree-root fetch in `UpdateSubtreeRootsAction` (a lightwalletd that does not serve
+  Ironwood is skipped, so it never breaks sync); a public `AccountBalance.ironwoodBalance: PoolBalance`
+  (plus `WalletSummary.nextIronwoodSubtreeIndex`); and an optional `Checkpoint.ironwoodTree`. This is
+  **dormant** — `ironwoodBalance` is `.zero` for every wallet — until a lightwalletd serves Ironwood
+  compact blocks and NU6.3 activates (its consensus branch id is still a placeholder upstream). Error
+  codes ZRUST0109/ZRUST0110 and ZCBPEO0023.
+- Internal `ZcashRustBackendWelding` surface for the Orchard → Ironwood migration engine
+  (`zodl_ironwood_migration`): migration state/progress, note-split planning + signing, transfer
+  scheduling + signing, due-transfer execution bookkeeping, extraction of the broadcast-ready
+  consensus transaction from a signed PCZT, stale-transfer refresh, and lifecycle/recovery. Adds
+  public `Codable` models (`MigrationState`, `MigrationProgress`, `MigrationSchedule`,
+  `TransferProposal`, `NoteSplitProposal`, `PreparedTx`, `TransferResult`, `AttentionReason`,
+  `NetworkPrivacyOptions`). `PreparedTx.rawPczt` is a serialized PCZT that the platform turns into a
+  consensus transaction via the welding's extract step (`migrationExtractBroadcastTx`) before
+  broadcasting. The public `Synchronizer` API and the network broadcast composition follow in a
+  later change.
+- Public Orchard → Ironwood migration API on the (async) `Synchronizer` protocol, all taking
+  `for account: AccountUUID`: `migrationState`, `migrationProgress`, `isNoteSplitNeeded`,
+  `prepareNoteSplit`, `submitNoteSplit`, `proposeMigrationTransfers`, `signAndStoreMigrationSchedule`,
+  `isSyncRequiredBeforeNextTransfer`, `executeNextPendingTransfer`, `hasOverdueTransfers`,
+  `hasInvalidTransfers`, `refreshStaleTransfers`, `restartCurrentMigrationStep`, and
+  `initializePostUpgrade`. The two broadcasting methods (`submitNoteSplit`,
+  `executeNextPendingTransfer`) sign (or load) the engine's prepared transaction, extract the
+  broadcast-ready consensus transaction from the signed PCZT (`migrationExtractBroadcastTx`), and
+  broadcast it over the SDK's existing direct submission path, mapping the outcome to
+  `TransferResult`; `executeNextPendingTransfer` also records the result back with the engine.
+  `refreshStaleTransfers` re-anchors/re-proves/re-signs stale scheduled transfers (pair with
+  `hasOverdueTransfers`). `NetworkPrivacyOptions` is accepted but not yet honored (broadcast uses the
+  configured lightwalletd). Async-only for now — the `ClosureSynchronizer` / `CombineSynchronizer`
+  adapters are not yet updated.
+- External-signer (hardware wallet / Keystone) surface for the Orchard → Ironwood migration, so
+  accounts whose spending key lives on a device can migrate: `Synchronizer.proposeNoteSplitPCZT` /
+  `submitSignedNoteSplitPCZT` mirror the `submitNoteSplit` flow with the signature produced by the
+  device, and `proposeMigrationTransferPCZTs` / `storeSignedMigrationTransferPCZTs` mirror
+  `signAndStoreMigrationSchedule` — one unsigned PCZT per scheduled transfer (new
+  `MigrationTransferPCZT` model pairing a transfer id with its `Pczt`), signed on the device via the
+  app's existing redact → animated-QR flow, then stored **all-or-nothing** (a partial or mismatched
+  signed set stores nothing, so the flow can be retried). The unsigned PCZTs are proved up front and
+  the originals stay staged inside the migration engine, which pairs, verifies, and finalizes the
+  returned signatures — the app never has to juggle proof/signature PCZT pairs. Error codes
+  ZRUST0111–ZRUST0114.
+
+## Changed
+- The Rust core now builds against the valargroup `librustzcash` fork under
+  `zcash_unstable="nu6.3"` to enable Ironwood (NU6.3) transaction building. Shielded voting is
+  temporarily gated behind an off-by-default `voting` cargo feature (and its Swift layer excluded
+  from the build): the crates.io voting stack calls the pre-Ironwood orchard `Note` API and is
+  incompatible with the orchard fork. To be restored against valargroup `zcash_voting` 1.0.0.
+
 # 2.6.0-alpha.6
 
 ## Added

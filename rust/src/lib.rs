@@ -78,9 +78,10 @@ use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
     ShieldedProtocol,
     consensus::{
-        BlockHeight, BranchId, Network,
+        BlockHeight, BranchId, Network, NetworkType, NetworkUpgrade, Parameters,
         Network::{MainNetwork, TestNetwork},
     },
+    local_consensus::LocalNetwork,
     memo::MemoBytes,
     value::{ZatBalance, Zatoshis},
 };
@@ -90,7 +91,12 @@ use zip32::fingerprint::SeedFingerprint;
 mod derivation;
 mod eip681;
 mod ffi;
+mod migration;
 mod tor;
+// Voting is gated off on this Ironwood branch: the crates.io voting stack calls the pre-Ironwood
+// orchard Note API and is incompatible with the valargroup orchard fork. Re-enable with the
+// `voting` feature once the stack is migrated to valargroup zcash_voting 1.0.0 (MOB-1455).
+#[cfg(feature = "voting")]
 mod voting;
 
 #[cfg(target_vendor = "apple")]
@@ -128,8 +134,8 @@ where
 unsafe fn wallet_db(
     db_data: *const u8,
     db_data_len: usize,
-    network: Network,
-) -> anyhow::Result<WalletDb<rusqlite::Connection, Network, SystemClock, OsRng>> {
+    network: NetworkParams,
+) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, OsRng>> {
     let db_data = Path::new(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
@@ -1331,7 +1337,7 @@ pub unsafe extern "C" fn zcashlc_rewind_to_height(
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let height = BlockHeight::from(height);
-        let result_height = db_data.rewind_to_height(height);
+        let result_height = db_data.truncate_to_height(height);
 
         result_height.map_or_else(
             |err| match err {
@@ -1507,6 +1513,62 @@ pub unsafe extern "C" fn zcashlc_put_orchard_subtree_roots(
             .put_orchard_subtree_roots(start_index, &roots)
             .map(|()| true)
             .map_err(|e| anyhow!("Error while storing Orchard subtree roots: {}", e))
+    });
+    unwrap_exc_or(res, false)
+}
+
+/// Adds a sequence of Ironwood subtree roots to the data store.
+///
+/// Ironwood is Orchard note-version V3 and shares Orchard's commitment-tree machinery, so the roots
+/// are Orchard-shaped; they are tracked in a dedicated Ironwood commitment tree.
+///
+/// Returns true if the subtrees could be stored, false otherwise. When false is returned,
+/// caller should check for errors.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of `pointer::offset`.
+/// - `roots` must be non-null and initialized.
+/// - The memory referenced by `roots` must not be mutated for the duration of the function call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_put_ironwood_subtree_roots(
+    db_data: *const u8,
+    db_data_len: usize,
+    start_index: u64,
+    roots: *const ffi::SubtreeRoots,
+    network_id: u32,
+) -> bool {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+
+        let roots = unsafe { roots.as_ref().unwrap() };
+        let roots_slice: &[ffi::SubtreeRoot] =
+            unsafe { slice::from_raw_parts(roots.ptr, roots.len) };
+
+        let roots = roots_slice
+            .iter()
+            .map(|r| {
+                let root_hash_bytes =
+                    unsafe { slice::from_raw_parts(r.root_hash_ptr, r.root_hash_ptr_len) };
+                let root_hash = HashSer::read(root_hash_bytes)?;
+
+                Ok(CommitmentTreeRoot::from_parts(
+                    BlockHeight::from_u32(r.completing_block_height),
+                    root_hash,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        db_data
+            .put_ironwood_subtree_roots(start_index, &roots)
+            .map(|()| true)
+            .map_err(|e| anyhow!("Error while storing Ironwood subtree roots: {}", e))
     });
     unwrap_exc_or(res, false)
 }
@@ -1836,6 +1898,10 @@ pub unsafe extern "C" fn zcashlc_put_utxo(
                 script_pubkey,
             ),
             Some(BlockHeight::from(height as u32)),
+            // This FFI call doesn't carry account context (new fork fields) — left unset.
+            None,
+            None,
+            None,
         )
         .ok_or_else(|| {
             anyhow!(
@@ -2247,6 +2313,8 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             memo,
             mode,
             confirmation_policy,
+            // `proposed_version` (unstable): use the default tx version for a max-spend transfer.
+            None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2848,7 +2916,11 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
 
         if prover.requires_orchard_proof() {
             prover = prover
-                .create_orchard_proof(&orchard::circuit::ProvingKey::build())
+                .create_orchard_proof(&orchard::circuit::ProvingKey::build(
+                    // Regular Orchard-pool proving uses the current fixed circuit; PostNu6_3 is
+                    // reserved for the separate Ironwood proof path.
+                    orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2,
+                ))
                 .map_err(|e| anyhow!("Failed to create Orchard proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_orchard_proof());
@@ -4140,15 +4212,133 @@ pub(crate) const NETWORK_ID_TESTNET: u32 = 0;
 /// `zcashlc_*` FFI that takes a `network_id` parameter.
 pub(crate) const NETWORK_ID_MAINNET: u32 = 1;
 
-pub(crate) fn parse_network(value: u32) -> anyhow::Result<Network> {
+/// `network_id` value for a custom-parameter network. Its base identity + per-NU activation heights must
+/// be registered once via [`zcashlc_set_custom_network`] before any `zcashlc_*` call uses it.
+pub(crate) const NETWORK_ID_REGTEST: u32 = 2;
+
+/// Consensus parameters passed across the FFI: either a standard [`Network`] (Mainnet/Testnet, with
+/// activation heights baked into librustzcash) or a **custom network** — a chosen base identity
+/// (`base`, which determines address encoding and `chainName`) combined with per-NU activation heights
+/// ([`LocalNetwork`]) configured at runtime. This is how the SDK connects to a custom-parameter node
+/// (e.g. a modified-mainnet Ironwood backend: `base = Main`, NU6.3 at a custom height). Implements
+/// [`Parameters`] purely by delegation, so it is a drop-in replacement for the concrete `Network`
+/// everywhere the FFI threads network parameters.
+#[derive(Clone, Copy)]
+pub(crate) enum NetworkParams {
+    Standard(Network),
+    Custom { base: NetworkType, local: LocalNetwork },
+}
+
+impl Parameters for NetworkParams {
+    fn network_type(&self) -> NetworkType {
+        match self {
+            NetworkParams::Standard(network) => network.network_type(),
+            // Identity (address HRPs, chainName) comes from the chosen base network, not from
+            // `LocalNetwork` (whose `network_type()` is always Regtest).
+            NetworkParams::Custom { base, .. } => *base,
+        }
+    }
+
+    fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+        match self {
+            NetworkParams::Standard(network) => network.activation_height(nu),
+            NetworkParams::Custom { local, .. } => local.activation_height(nu),
+        }
+    }
+}
+
+/// The custom network's base identity + per-NU activation heights, configured once via
+/// [`zcashlc_set_custom_network`] and read back by [`parse_network`] for `network_id`
+/// [`NETWORK_ID_REGTEST`]. `None` until set.
+static CUSTOM_PARAMS: std::sync::RwLock<Option<(NetworkType, LocalNetwork)>> =
+    std::sync::RwLock::new(None);
+
+/// Maps an FFI `network_id` to its [`NetworkType`], used to select the base identity of a custom network.
+fn network_type_for_id(network_id: u32) -> Option<NetworkType> {
+    match network_id {
+        NETWORK_ID_TESTNET => Some(NetworkType::Test),
+        NETWORK_ID_MAINNET => Some(NetworkType::Main),
+        NETWORK_ID_REGTEST => Some(NetworkType::Regtest),
+        _ => None,
+    }
+}
+
+/// Registers the **custom network** resolved for `network_id` [`NETWORK_ID_REGTEST`], which every
+/// subsequent `zcashlc_*` call resolves through [`parse_network`]. `base_network_id` selects the base
+/// identity — address encoding and `chainName` — as mainnet (1), testnet (0), or regtest (2); the
+/// activation heights are custom regardless. Each height argument is a block height, or a negative value
+/// meaning "not activated on this network"; set them to mirror the `nuparams` of the node /
+/// `lightwalletd` being connected to. Idempotent; intended to be called once at init.
+///
+/// Returns `true` on success, `false` on an invalid `base_network_id` or a poisoned lock.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_set_custom_network(
+    base_network_id: u32,
+    overwinter: i64,
+    sapling: i64,
+    blossom: i64,
+    heartwood: i64,
+    canopy: i64,
+    nu5: i64,
+    nu6: i64,
+    nu6_1: i64,
+    nu6_2: i64,
+    nu6_3: i64,
+) -> bool {
+    fn height(value: i64) -> Option<BlockHeight> {
+        u32::try_from(value).ok().map(BlockHeight::from_u32)
+    }
+
+    let Some(base) = network_type_for_id(base_network_id) else {
+        return false;
+    };
+
+    let local = LocalNetwork {
+        overwinter: height(overwinter),
+        sapling: height(sapling),
+        blossom: height(blossom),
+        heartwood: height(heartwood),
+        canopy: height(canopy),
+        nu5: height(nu5),
+        nu6: height(nu6),
+        nu6_1: height(nu6_1),
+        nu6_2: height(nu6_2),
+        nu6_3: height(nu6_3),
+    };
+
+    match CUSTOM_PARAMS.write() {
+        Ok(mut guard) => {
+            *guard = Some((base, local));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn parse_network(value: u32) -> anyhow::Result<NetworkParams> {
     match value {
-        NETWORK_ID_TESTNET => Ok(TestNetwork),
-        NETWORK_ID_MAINNET => Ok(MainNetwork),
+        NETWORK_ID_TESTNET => Ok(NetworkParams::Standard(TestNetwork)),
+        NETWORK_ID_MAINNET => Ok(NetworkParams::Standard(MainNetwork)),
+        NETWORK_ID_REGTEST => {
+            let guard = CUSTOM_PARAMS
+                .read()
+                .map_err(|_| anyhow!("custom network params lock is poisoned"))?;
+            // `Option<(NetworkType, LocalNetwork)>` is `Copy`, so deref-copy out of the read guard.
+            let (base, local) = (*guard).ok_or_else(|| {
+                anyhow!(
+                    "custom network (id {}) used before it was configured; call \
+                     zcashlc_set_custom_network first",
+                    NETWORK_ID_REGTEST,
+                )
+            })?;
+            Ok(NetworkParams::Custom { base, local })
+        }
         _ => Err(anyhow!(
-            "Invalid network type: {}. Expected either {} or {} for Testnet or Mainnet, respectively.",
+            "Invalid network type: {}. Expected {}, {}, or {} for Testnet, Mainnet, or a custom network, respectively.",
             value,
             NETWORK_ID_TESTNET,
             NETWORK_ID_MAINNET,
+            NETWORK_ID_REGTEST,
         )),
     }
 }

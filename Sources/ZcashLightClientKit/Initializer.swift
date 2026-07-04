@@ -333,6 +333,13 @@ public class Initializer {
         // from constructor. So `parsingError` is just stored in initializer and `SDKSynchronizer.prepare()` throw this error if it exists.
         let (updatedURLs, parsingError) = Self.tryToUpdateURLs(with: alias, urls: urls)
 
+        // A custom network carries a base identity + custom NU activation heights; register them with
+        // the Rust core before any FFI call resolves the custom (regtest-slot) network id.
+        // Process-global (see MIGRATING.md).
+        if let activationHeights = network.customActivationHeights {
+            ZcashRustBackend.setCustomNetwork(base: network.customNetworkBase ?? network.networkType, activationHeights)
+        }
+
         Dependencies.setup(
             in: container,
             urls: updatedURLs,
@@ -341,7 +348,8 @@ public class Initializer {
             endpoint: endpoint,
             loggingPolicy: loggingPolicy,
             isTorEnabled: isTorEnabled,
-            isExchangeRateEnabled: isExchangeRateEnabled
+            isExchangeRateEnabled: isExchangeRateEnabled,
+            regtestActivationHeights: network.customActivationHeights
         )
 
         return (updatedURLs, parsingError)
@@ -467,7 +475,7 @@ public class Initializer {
                     // wallet can't be missed if the current chain tip is reorganized.
                     let birthdayTreeStateHeight = max(
                         latestBlockHeight - ZcashSDK.maxReorgSize,
-                        network.constants.saplingActivationHeight
+                        network.saplingActivationHeight
                     )
                     let blockID = BlockID(height: UInt64(birthdayTreeStateHeight))
                     if let serverTreeState = try? await lightWalletService.getTreeState(blockID, mode: await sdkFlags.ifTor(.uniqueTor)) {

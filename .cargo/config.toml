@@ -1,0 +1,6 @@
+# Ironwood (NU6.3) transaction-building is gated behind this unstable cfg in the valargroup
+# librustzcash fork (see Cargo.toml [patch.crates-io]). It must be "nu6.3" (NOT "nu7"): the proven
+# qleak-pr44 valargroup branch gates the entire Ironwood wallet layer on nu6.3. Without it every
+# Ironwood API compiles out. Remove once Ironwood stabilizes.
+[build]
+rustflags = ["--cfg", "zcash_unstable=\"nu6.3\""]

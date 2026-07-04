@@ -561,6 +561,118 @@ public protocol Synchronizer: AnyObject {
     /// Use this to implement custom broadcast strategies such as submitting
     /// to multiple lightwalletd servers in parallel.
     var broadcaster: Broadcaster { get }
+
+    // MARK: - Ironwood migration
+
+    /// The current Orchard -> Ironwood migration state for `account`.
+    func migrationState(for account: AccountUUID) async throws -> MigrationState
+
+    /// Live migration progress for the progress UI, or `nil` when no migration is in progress.
+    func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress?
+
+    /// Whether the account's Orchard notes must be split before migration can proceed.
+    func isNoteSplitNeeded(for account: AccountUUID) async throws -> Bool
+
+    /// The proposed note split (per-note output values and the prep-transaction fee).
+    func prepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
+
+    /// Signs the note-split transaction for `proposal` and broadcasts it. After this returns
+    /// `.success`, the migration state advances to `.splitPendingConfirmation`; the app should poll
+    /// ``migrationState(for:)`` for confirmation.
+    /// - Parameter options: network-privacy preferences. Accepted but ignored in v1.
+    func submitNoteSplit(
+        proposal: NoteSplitProposal,
+        spendingKey: UnifiedSpendingKey,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> TransferResult
+
+    /// The note-split transaction as an unsigned PCZT for an external signer (hardware wallet) —
+    /// the counterpart of ``submitNoteSplit(proposal:spendingKey:options:for:)`` for accounts whose
+    /// spending key lives on a device. Plans the split for the current spendable Orchard balance and
+    /// keeps the proven original staged internally; the app routes the returned PCZT to the device
+    /// (via ``redactPCZTForSigner(pczt:)`` and the QR channel, exactly like a regular
+    /// hardware-wallet send) and hands the signed PCZT to
+    /// ``submitSignedNoteSplitPCZT(_:for:)``.
+    func proposeNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt
+
+    /// Stores the externally signed note-split PCZT (merging it into the staged original, verifying
+    /// and finalizing it) and broadcasts the result — the external-signer completion of
+    /// ``proposeNoteSplitPCZT(for:)``. After this returns `.success`, the migration state advances
+    /// to `.splitPendingConfirmation`, mirroring
+    /// ``submitNoteSplit(proposal:spendingKey:options:for:)``.
+    func submitSignedNoteSplitPCZT(_ pczt: Pczt, for account: AccountUUID) async throws -> TransferResult
+
+    /// The full migration schedule for the spendable Orchard balance, presented to the user for a
+    /// one-time confirmation.
+    func proposeMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// The immediate (single-transaction) migration schedule: one transfer sweeping the whole
+    /// spendable Orchard balance into Ironwood, executable now. Used by the "migrate immediately"
+    /// path — no denomination and no note split.
+    func proposeImmediateMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// Pre-signs and persists every transfer in the confirmed `schedule`.
+    func signAndStoreMigrationSchedule(
+        _ schedule: MigrationSchedule,
+        spendingKey: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws
+
+    /// One unsigned PCZT per transfer of the confirmed `schedule` for an external signer (hardware
+    /// wallet) — the counterpart of ``signAndStoreMigrationSchedule(_:spendingKey:for:)`` for
+    /// accounts whose spending key lives on a device. Takes the schedule the user confirmed (from
+    /// ``proposeMigrationTransfers(for:)`` / ``proposeImmediateMigrationTransfers(for:)``) rather
+    /// than re-proposing internally: schedules carry randomized denominations, so a fresh proposal
+    /// here would silently sign a different plan than the one displayed. Builds each transfer's
+    /// PCZT, keeping the proven originals staged internally keyed by transfer id. The app signs
+    /// each PCZT on the device sequentially (via ``redactPCZTForSigner(pczt:)`` and the QR channel)
+    /// and hands the full signed set to ``storeSignedMigrationTransferPCZTs(_:for:)`` — the id in
+    /// each ``MigrationTransferPCZT`` pairs the signed PCZT with its transfer and must be preserved.
+    func proposeMigrationTransferPCZTs(
+        _ schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> [MigrationTransferPCZT]
+
+    /// Stores the full set of externally signed migration-transfer PCZTs — all-or-nothing. Every
+    /// transfer returned by ``proposeMigrationTransferPCZTs(_:for:)`` must be present (by id) with
+    /// its device-signed PCZT; each is verified and finalized, and the committed schedule is
+    /// persisted exactly like ``signAndStoreMigrationSchedule(_:spendingKey:for:)``. A partial,
+    /// mismatched, or invalid set stores nothing, so the flow can be retried. Broadcasting then
+    /// flows through ``executeNextPendingTransfer(options:for:)`` as usual.
+    func storeSignedMigrationTransferPCZTs(_ pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws
+
+    /// Whether the wallet must sync before the next transfer can be broadcast (a previous transfer
+    /// produced change back to Orchard that must be observed first).
+    func isSyncRequiredBeforeNextTransfer(for account: AccountUUID) async throws -> Bool
+
+    /// Broadcasts the next height-due pre-signed transfer, records the outcome with the engine, and
+    /// returns it — or `nil` when no transfer is currently due. The transfer is already signed, so no
+    /// spending key is required. Intended to be called from the app's background scheduler; the app
+    /// must not sync in the same background session as this call.
+    /// - Parameter options: network-privacy preferences. Accepted but ignored in v1.
+    func executeNextPendingTransfer(
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> TransferResult?
+
+    /// Whether any scheduled transfer is past the height at which it should have been broadcast.
+    func hasOverdueTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// Whether the migration is in an invalid state (spendable Orchard remains but nothing covers it).
+    func hasInvalidTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// Re-anchors, re-proves and re-signs the active migration run's scheduled transfers when they have
+    /// gone stale (their anchor is too old to broadcast), returning the number of transfers refreshed.
+    /// Detect the need with ``hasOverdueTransfers(for:)``.
+    func refreshStaleTransfers(spendingKey: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32
+
+    /// Recovers from a `.requiresAttention` state by re-proposing the current migration step, returning
+    /// the fresh schedule.
+    func restartCurrentMigrationStep(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// One-time initialization to run after the wallet upgrades to an Ironwood-capable build.
+    func initializePostUpgrade(for account: AccountUUID) async throws
 }
 
 /// Error thrown by the default `Synchronizer.getTreeState(height:)` implementation

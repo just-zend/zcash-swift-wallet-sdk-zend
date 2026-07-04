@@ -174,6 +174,9 @@ protocol ZcashRustBackendWelding {
 
     func putOrchardSubtreeRoots(startIndex: UInt64, roots: [SubtreeRoot]) async throws
 
+    /// Adds a sequence of Ironwood (Orchard note-version V3 / NU6.3) subtree roots to the data store.
+    func putIronwoodSubtreeRoots(startIndex: UInt64, roots: [SubtreeRoot]) async throws
+
     /// Updates the wallet's view of the blockchain.
     ///
     /// This method is used to provide the wallet with information about the state of the blockchain,
@@ -355,6 +358,100 @@ protocol ZcashRustBackendWelding {
     /// - Parameter height: the height you what to know the branch id for
     /// - Throws: `rustNoConsensusBranchId` if rust layer returns error.
     func consensusBranchIdFor(height: Int32) throws -> Int32
+
+    // MARK: - Ironwood migration
+
+    /// Current Orchard -> Ironwood migration state for `account`.
+    /// - Throws: `rustMigrationState` if the rust layer returns an error.
+    func migrationState(for account: AccountUUID) async throws -> MigrationState
+
+    /// Live migration progress, or `nil` when no migration is in progress.
+    /// - Throws: `rustMigrationProgress` if the rust layer returns an error.
+    func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress?
+
+    /// Whether the Orchard notes must be split before migration.
+    /// - Throws: `rustMigrationIsNoteSplitNeeded` if the rust layer returns an error.
+    func migrationIsNoteSplitNeeded(for account: AccountUUID) async throws -> Bool
+
+    /// The optimal note split for the spendable Orchard balance.
+    /// - Throws: `rustMigrationPrepareNoteSplit` if the rust layer returns an error.
+    func migrationPrepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
+
+    /// Build, sign and persist the note-split transaction; returns the bytes for the platform to
+    /// broadcast.
+    /// - Throws: `rustMigrationSignNoteSplit` if the rust layer returns an error.
+    func migrationSignNoteSplit(proposal: NoteSplitProposal, usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> PreparedTx
+
+    /// Build the note-split transaction as an unsigned PCZT for an external signer; the proven
+    /// original stays staged inside the crate until `migrationStoreSignedNoteSplitPCZT`.
+    /// - Throws: `rustMigrationCreateUnsignedNoteSplitPCZT` if the rust layer returns an error.
+    func migrationCreateUnsignedNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt
+
+    /// Store the externally signed note-split PCZT (merged into the staged original, verified and
+    /// finalized); returns the broadcastable `PreparedTx`.
+    /// - Throws: `rustMigrationStoreSignedNoteSplitPCZT` if the rust layer returns an error.
+    func migrationStoreSignedNoteSplitPCZT(pczt: Pczt, for account: AccountUUID) async throws -> PreparedTx
+
+    /// Build one unsigned PCZT per transfer of the schedule for an external signer, each staged
+    /// inside the crate keyed by transfer id.
+    /// - Throws: `rustMigrationCreateUnsignedTransferPCZTs` if the rust layer returns an error.
+    func migrationCreateUnsignedTransferPCZTs(schedule: MigrationSchedule, for account: AccountUUID) async throws -> [MigrationTransferPCZT]
+
+    /// Store the full set of externally signed transfer PCZTs, all-or-nothing.
+    /// - Throws: `rustMigrationStoreSignedSchedulePCZTs` if the rust layer returns an error.
+    func migrationStoreSignedSchedulePCZTs(pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws
+
+    /// The full migration schedule for the spendable Orchard balance.
+    /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
+    func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// The immediate (single-transaction) migration schedule: one transfer sweeping the whole
+    /// spendable Orchard balance into Ironwood, executable now (no denomination, no note split).
+    /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
+    func migrationProposeImmediate(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// Pre-sign and persist every transfer in the schedule.
+    /// - Throws: `rustMigrationSignAndStore` if the rust layer returns an error.
+    func migrationSignAndStore(schedule: MigrationSchedule, usk: UnifiedSpendingKey, for account: AccountUUID) async throws
+
+    /// Whether a sync is required before the next transfer.
+    /// - Throws: `rustMigrationIsSyncRequired` if the rust layer returns an error.
+    func migrationIsSyncRequired(for account: AccountUUID) async throws -> Bool
+
+    /// The next height-due pre-signed transfer, or `nil`.
+    /// - Throws: `rustMigrationNextDueTransfer` if the rust layer returns an error.
+    func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedTx?
+
+    /// Extract the broadcast-ready consensus transaction from a signed PCZT (the `PreparedTx.rawPczt`
+    /// returned by `migrationNextDueTransfer` or `migrationSignNoteSplit`); returns the raw
+    /// transaction bytes to hand to the lightwalletd submit path.
+    /// - Throws: `rustMigrationExtractBroadcastTx` if the rust layer returns an error.
+    func migrationExtractBroadcastTx(pczt: [UInt8], for account: AccountUUID) async throws -> [UInt8]
+
+    /// Re-anchor, re-prove and re-sign the active run's scheduled transfers; returns the number
+    /// refreshed.
+    /// - Throws: `rustMigrationRefreshStaleTransfers` if the rust layer returns an error.
+    func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32
+
+    /// Record the platform's broadcast outcome, advancing engine state.
+    /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error.
+    func migrationRecordTransferResult(transferId: String, result: TransferResult, for account: AccountUUID) async throws
+
+    /// Whether any scheduled transfer is past its send height but not yet broadcast.
+    /// - Throws: `rustMigrationHasOverdueTransfers` if the rust layer returns an error.
+    func migrationHasOverdueTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// Whether the migration is in an invalid state (spendable Orchard remains but nothing covers it).
+    /// - Throws: `rustMigrationHasInvalidTransfers` if the rust layer returns an error.
+    func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// Re-evaluate the remaining balance and return a fresh schedule.
+    /// - Throws: `rustMigrationRestartStep` if the rust layer returns an error.
+    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// First-launch post-upgrade initialization.
+    /// - Throws: `rustMigrationInitializePostUpgrade` if the rust layer returns an error.
+    func migrationInitializePostUpgrade(for account: AccountUUID) async throws
 
     /// Initializes Filesystem based block cache
     /// - Throws: `rustInitBlockMetadataDb` if rust layer returns error.
