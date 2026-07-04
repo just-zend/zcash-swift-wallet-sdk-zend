@@ -1517,7 +1517,7 @@ dependencies = [
 [[package]]
 name = "equihash"
 version = "0.3.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "blake2b_simd",
  "corez",
@@ -1553,7 +1553,7 @@ dependencies = [
 [[package]]
 name = "f4jumble"
 version = "0.1.1"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "blake2b_simd",
 ]
@@ -2537,7 +2537,7 @@ dependencies = [
  "log-panics",
  "nonempty",
  "once_cell",
- "orchard",
+ "orchard 0.15.0-pre.1",
  "pasta_curves",
  "pczt",
  "prost",
@@ -2947,7 +2947,44 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "orchard"
 version = "0.14.0"
-source = "git+https://github.com/zcash/orchard?branch=adam%2Fqleak-dummy-ciphertexts-on-pr505#204d8ce99f2f35c01654694dd294e3a20ef882d5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a54f8d29bfb1e76a9d4e868a1a08cce2e57dd2bdc66232982822ad3114b91ab3"
+dependencies = [
+ "aes",
+ "bitvec",
+ "blake2b_simd",
+ "corez",
+ "ff",
+ "fpe",
+ "getset",
+ "group",
+ "halo2_gadgets",
+ "halo2_poseidon",
+ "halo2_proofs",
+ "hex",
+ "incrementalmerkletree",
+ "lazy_static",
+ "memuse",
+ "nonempty",
+ "pasta_curves",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "reddsa",
+ "serde",
+ "sinsemilla",
+ "subtle",
+ "tracing",
+ "visibility",
+ "zcash_note_encryption",
+ "zcash_spec",
+ "zip32",
+]
+
+[[package]]
+name = "orchard"
+version = "0.15.0-pre.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8e277dd4b46f5d06deae3ffb8af1a951e8622368f028c2a4d6fe59339566403"
 dependencies = [
  "aes",
  "bitvec",
@@ -3097,7 +3134,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 [[package]]
 name = "pczt"
 version = "0.7.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "blake2b_simd",
  "bls12_381",
@@ -3106,7 +3143,7 @@ dependencies = [
  "getset",
  "jubjub",
  "nonempty",
- "orchard",
+ "orchard 0.15.0-pre.1",
  "pasta_curves",
  "postcard",
  "rand_core 0.6.4",
@@ -6194,7 +6231,7 @@ dependencies = [
  "incrementalmerkletree",
  "itertools 0.14.0",
  "lazy_static",
- "orchard",
+ "orchard 0.14.0",
  "pasta_curves",
  "rand 0.8.6",
  "sinsemilla",
@@ -6852,7 +6889,7 @@ dependencies = [
 [[package]]
 name = "zcash_address"
 version = "0.12.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "bech32",
  "bs58",
@@ -6865,7 +6902,7 @@ dependencies = [
 [[package]]
 name = "zcash_client_backend"
 version = "0.23.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "arti-client",
  "base64",
@@ -6888,7 +6925,7 @@ dependencies = [
  "incrementalmerkletree",
  "memuse",
  "nonempty",
- "orchard",
+ "orchard 0.15.0-pre.1",
  "pasta_curves",
  "pczt",
  "percent-encoding",
@@ -6933,7 +6970,7 @@ dependencies = [
 [[package]]
 name = "zcash_client_sqlite"
 version = "0.21.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "bip32",
  "bitflags",
@@ -6946,7 +6983,7 @@ dependencies = [
  "jubjub",
  "maybe-rayon",
  "nonempty",
- "orchard",
+ "orchard 0.15.0-pre.1",
  "prost",
  "rand 0.8.6",
  "rand_core 0.6.4",
@@ -6979,7 +7016,7 @@ dependencies = [
 [[package]]
 name = "zcash_encoding"
 version = "0.4.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "corez",
  "hex",
@@ -6989,7 +7026,7 @@ dependencies = [
 [[package]]
 name = "zcash_keys"
 version = "0.14.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "bech32",
  "bip32",
@@ -7002,7 +7039,7 @@ dependencies = [
  "group",
  "memuse",
  "nonempty",
- "orchard",
+ "orchard 0.15.0-pre.1",
  "rand_core 0.6.4",
  "sapling-crypto",
  "secrecy",
@@ -7031,7 +7068,7 @@ dependencies = [
 [[package]]
 name = "zcash_primitives"
 version = "0.28.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "blake2b_simd",
  "block-buffer 0.11.0-rc.3",
@@ -7045,7 +7082,7 @@ dependencies = [
  "jubjub",
  "memuse",
  "nonempty",
- "orchard",
+ "orchard 0.15.0-pre.1",
  "rand_core 0.6.4",
  "redjubjub",
  "sapling-crypto",
@@ -7061,7 +7098,7 @@ dependencies = [
 [[package]]
 name = "zcash_proofs"
 version = "0.28.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -7082,7 +7119,7 @@ dependencies = [
 [[package]]
 name = "zcash_protocol"
 version = "0.9.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "corez",
  "document-features",
@@ -7120,7 +7157,7 @@ dependencies = [
 [[package]]
 name = "zcash_transparent"
 version = "0.8.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "bip32",
  "bs58",
@@ -7163,7 +7200,7 @@ dependencies = [
  "imt-tree",
  "incrementalmerkletree",
  "nonempty",
- "orchard",
+ "orchard 0.14.0",
  "pasta_curves",
  "pczt",
  "pir-client",
@@ -7259,7 +7296,7 @@ dependencies = [
 [[package]]
 name = "zip321"
 version = "0.8.0"
-source = "git+https://github.com/valargroup/librustzcash?branch=adam%2Fqleak-pr44-orchard-dummy-ciphertexts#0c3ad735f8402295fccb9acf2fe897779500bbf5"
+source = "git+https://github.com/valargroup/librustzcash?branch=ironwood-integration#79d18386461e6df08a1e132bb79f8d03aebe2438"
 dependencies = [
  "base64",
  "nom",
@@ -7279,7 +7316,7 @@ name = "zodl_ironwood_migration"
 version = "0.1.0"
 dependencies = [
  "hex",
- "orchard",
+ "orchard 0.15.0-pre.1",
  "pczt",
  "rand 0.8.6",
  "rusqlite",
