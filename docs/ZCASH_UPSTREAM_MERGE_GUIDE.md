@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-02
+Last reviewed: 2026-07-04
 
 ## Remote and branch invariants
 
@@ -94,6 +94,14 @@ Zend parity branch note:
 - The July 2 refresh merged upstream through `89f994b5` with no conflicts. The upstream `#1795` changes touch `CLAUDE.md`, `Scripts/init-local-ffi.sh`, and `docs/LOCAL_DEVELOPMENT.md`; no Zend-specific artifact URL, checksum, branding, or release behavior changed.
 
 ## Bleeding-edge snapshot (2026-07-02)
+
+Zend draft Ironwood carry:
+
+- Branch `codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04` intentionally carries the latest stacked upstream Ironwood branch `upstream/michal/MOB-1455-6-integration-with-final-zodl` on top of `origin/main`.
+- The carried upstream stack includes `#1793`, `#1794`, and `#1796` through `#1798`, plus the unreviewed `michal/MOB-1455-6-integration-with-final-zodl` tip. It also subsumes the closed draft `#1791`/`#1792` Ironwood interface and NU6.3 dependency direction through the newer MOB-1455 stack.
+- The merge was clean and preserved Zend's `Package.swift` binary target URL/checksum for the existing `2.6.3` fork artifact. This is a draft carry only, not default-branch parity.
+- Known blocker: `Cargo.toml` still depends on `zodl_ironwood_migration = { path = "../ZODLIronwoodMigrationRust" }`, so local and CI builds require that sibling checkout or a release-ready git/tag pin.
+- Known upstream risk: upstream Ironwood PRs remain draft, build-failing, dirty or review-required, so this branch is for Zend review and integration planning rather than merge readiness.
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
