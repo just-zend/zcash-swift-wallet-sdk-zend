@@ -106,8 +106,12 @@ zcash_keys = { version = "=0.14.0", features = ["orchard"] }
 incrementalmerkletree = { version = "0.8", default-features = false }
 
 # Ironwood migration engine (shared Orchard->Ironwood logic, also consumed by the Android SDK).
-# Local path for development; switch to a git pin for release.
-zodl_ironwood_migration = { path = "../ZODLIronwoodMigrationRust" }
+# Pinned by exact rev at the just-zend fork so every environment builds identical fund-moving
+# code (fetched over ssh via the git CLI — see [net] in .cargo/config.toml). For local crate
+# development, temporarily override with:
+#   [patch."ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git"]
+#   zodl_ironwood_migration = { path = "../ZODLIronwoodMigrationRust" }
+zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "3bd5a27548968c749eee5883234acf42acbfa7c1" }
 
 [features]
 # Off by default on this Ironwood branch — see the zcash_voting dependency note above. Enabling it
