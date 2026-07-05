@@ -2,12 +2,14 @@
 import PackageDescription
 import Foundation
 
-// Automatically detect local FFI development mode.
-// When LocalPackages/Package.swift exists (created by Scripts/init-local-ffi.sh),
-// the SDK builds against the locally-built FFI instead of the pre-built binary
-// from GitHub Releases. Run `rm -rf LocalPackages` to switch back.
+// Automatically detect the in-repo FFI.
+// When LocalPackages/libzcashlc.xcframework exists (committed on this branch, and also what
+// Scripts/init-local-ffi.sh produces), the SDK builds against it as a path-based binary target —
+// this works both for local checkouts and when the SDK is consumed as a remote git package
+// (a sub-package under LocalPackages would not resolve remotely). Run `rm -rf LocalPackages`
+// to fall back to the released binary.
 let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
-let useLocalFFI = FileManager.default.fileExists(atPath: packageDir + "/LocalPackages/Package.swift")
+let useLocalFFI = FileManager.default.fileExists(atPath: packageDir + "/LocalPackages/libzcashlc.xcframework/Info.plist")
 
 var dependencies: [Package.Dependency] = [
     .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.24.2"),
@@ -22,8 +24,13 @@ var sdkDependencies: [Target.Dependency] = [
 var targets: [Target] = []
 
 if useLocalFFI {
-    dependencies.append(.package(name: "libzcashlc", path: "LocalPackages"))
-    sdkDependencies.append(.product(name: "libzcashlc", package: "libzcashlc"))
+    targets.append(
+        .binaryTarget(
+            name: "libzcashlc",
+            path: "LocalPackages/libzcashlc.xcframework"
+        )
+    )
+    sdkDependencies.append("libzcashlc")
 } else {
     // Binary target for the Rust FFI library
     // Updated by Scripts/release.sh during the release process

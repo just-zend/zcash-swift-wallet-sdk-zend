@@ -91,3 +91,4 @@ BuildSupport/products/
 .worktrees/
 
 **/*.pyc
+LocalPackages/Package.swift
