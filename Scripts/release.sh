@@ -17,6 +17,9 @@
 #              (usually 'origin')
 #   <version>  The version to release (e.g., '2.5.0')
 #
+# Versions with a SemVer pre-release suffix (e.g. 2.6.0-alpha.1, 2.7.0-rc.2)
+# are detected automatically and the GitHub release is marked as a pre-release.
+#
 # Prerequisites:
 #   - gh CLI installed and authenticated
 #   - Rust toolchain with all Apple targets
@@ -58,7 +61,16 @@ fi
 REPO="just-zend/zcash-swift-wallet-sdk-zend"
 PRODUCTS_DIR="BuildSupport/products"
 
+# SemVer: a hyphen in the version (e.g. 2.6.0-alpha.1) marks a pre-release
+PRERELEASE_FLAG=()
+if [[ "$VERSION" == *-* ]]; then
+    PRERELEASE_FLAG=(--prerelease)
+fi
+
 echo "=== SDK Release ${VERSION} ==="
+if [[ ${#PRERELEASE_FLAG[@]} -gt 0 ]]; then
+    echo "Pre-release suffix detected. The GitHub release will be marked as a pre-release."
+fi
 echo ""
 
 # Verify clean working directory
@@ -148,7 +160,7 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     echo "Release paused. To resume manually:"
     echo "  git tag -s ${VERSION} -m \"Release ${VERSION}\""
     echo "  git push ${UPSTREAM_REMOTE} ${CURRENT_BRANCH} ${VERSION}"
-    echo "  gh release edit ${VERSION} --repo ${REPO} --draft=false"
+    echo "  gh release edit ${VERSION} --repo ${REPO} --draft=false${PRERELEASE_FLAG:+ ${PRERELEASE_FLAG[*]}}"
     exit 0
 fi
 
@@ -162,11 +174,15 @@ git push "$UPSTREAM_REMOTE" "$CURRENT_BRANCH" "$VERSION"
 
 echo ""
 echo "=== Step 6/6: Publishing release ==="
-gh release edit "$VERSION" --repo "$REPO" --draft=false
+gh release edit "$VERSION" --repo "$REPO" --draft=false "${PRERELEASE_FLAG[@]}"
 
 echo ""
 echo "=========================================="
-echo "  Release ${VERSION} complete!"
+if [[ ${#PRERELEASE_FLAG[@]} -gt 0 ]]; then
+    echo "  Pre-release ${VERSION} complete!"
+else
+    echo "  Release ${VERSION} complete!"
+fi
 echo "=========================================="
 echo ""
 echo "  GitHub Release: https://github.com/${REPO}/releases/tag/${VERSION}"
