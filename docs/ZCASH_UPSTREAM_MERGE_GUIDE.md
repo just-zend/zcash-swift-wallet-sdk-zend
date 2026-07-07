@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-06
+Last reviewed: 2026-07-07
 
 ## Remote and branch invariants
 
@@ -46,15 +46,15 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-07-06)
+## Zend divergence notes (as of 2026-07-07)
 
 Current relationship after Zend PR `#16` merged `codex/zcash-upstream-sync-2026-07-03` into `origin/main`:
 
-- `origin/main...upstream/main`: `77 0` after fetching both remotes on 2026-07-06.
+- `origin/main...upstream/main`: `77 3` after fetching both remotes on 2026-07-07.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
-- `upstream/main` currently points at `018253d8` (`#1799`); it also includes `#1795` for local FFI build flags, `#1790` / tag `2.6.0-alpha.6`, `#1789` checkpoint refresh, `#1786` for the Keystone/cross-account `deleteAccount` fix, and `#1766` Dependabot setup.
-- `git merge-base --is-ancestor upstream/main origin/main` succeeds, so the fork default branch currently contains every upstream default-branch commit.
-- No new upstream-default parity branch is needed as of this review. Future runs should open or reuse a parity PR only if `origin/main..upstream/main` becomes non-empty.
+- `upstream/main` currently points at `d92a7940` (`#1802`); it also includes `#1799` for Tor retry classification, `#1795` for local FFI build flags, `#1790` / tag `2.6.0-alpha.6`, `#1789` checkpoint refresh, `#1786` for the Keystone/cross-account `deleteAccount` fix, and `#1766` Dependabot setup.
+- `git merge-base --is-ancestor upstream/main origin/main` fails until the current parity PR lands.
+- The active parity branch `codex/zcash-upstream-sync-2026-07-06` now merges upstream `main` through `d92a7940`; `git rev-list --left-right --count HEAD...upstream/main` returns `80 0` after this guide refresh and `git merge-base --is-ancestor upstream/main HEAD` succeeds.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -68,11 +68,12 @@ Notable fork-ahead work currently preserved includes:
 - Upstream's `2.6.0-alpha.6` release tag from `#1790`, adopted as Git history parity while preserving Zend's `Package.swift` binary target URL and checksum for the existing Zend-hosted `2.6.3` artifact.
 - Upstream's local FFI build flag update from `#1795`, adopted without conflicts. This adds arm64-only helper modes for Apple Silicon local FFI iteration and keeps Zend's fork-local release artifact workflow intact.
 - Upstream's Tor retry classification fix from `#1799`, adopted without conflicts. It treats Rust-layer Tor failures as retryable service errors in `CompactBlockProcessor`, so transient Tor circuit and stream errors use the existing reset-and-retry path instead of immediately becoming fatal sync failures.
+- Upstream's release-script pre-release detection from `#1802`, adopted without conflicts. It marks SemVer pre-release tags as GitHub pre-releases in `Scripts/prepare-release.sh` and `Scripts/release.sh`, and documents the behavior in `docs/ci.md`.
 - New-wallet birthday behavior from the `[#1673]` lineage, now reconciled with upstream's reorg-safe follow-up.
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: default-branch parity is complete through `018253d8` / upstream PR `#1799`. Open Zend PR `#17` is separate bleeding-edge Ironwood / NU6.3 carry work and remains blocked by merge conflicts plus missing Ironwood/migration FFI symbols in the current Zend `2.6.3` binary target. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
+Implication: default-branch parity is pending in Zend PR `#18`, which now carries upstream `main` through `d92a7940` / PR `#1802`. Open Zend PR `#17` is separate bleeding-edge Ironwood / NU6.3 carry work and remains blocked by merge conflicts plus missing Ironwood/migration FFI symbols in the current Zend `2.6.3` binary target. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
 
 ## Conflict resolution heuristics
 
@@ -94,13 +95,14 @@ Zend parity branch note:
 - The June 27 refresh merged upstream through `4303068e` with one conflict in `Package.swift`. Resolve by keeping Zend's `https://github.com/just-zend/zcash-swift-wallet-sdk-zend/releases/download/2.6.3/libzcashlc.xcframework.zip` URL and checksum, rather than replacing it with upstream's `2.6.0-alpha.6` artifact.
 - The July 2 refresh merged upstream through `89f994b5` with no conflicts. The upstream `#1795` changes touch `CLAUDE.md`, `Scripts/init-local-ffi.sh`, and `docs/LOCAL_DEVELOPMENT.md`; no Zend-specific artifact URL, checksum, branding, or release behavior changed.
 - The July 3 refresh merged upstream through `018253d8` with no conflicts. The upstream `#1799` changes touch `CHANGELOG.md` and `Sources/ZcashLightClientKit/Block/CompactBlockProcessor.swift`; no Zend-specific artifact URL, checksum, branding, or release behavior changed.
+- The July 7 refresh merged upstream through `d92a7940` with no conflicts. The upstream `#1802` changes touch `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `docs/ci.md`; no Zend-specific artifact URL, checksum, branding, or support surface changed.
 
-## Bleeding-edge snapshot (2026-07-06)
+## Bleeding-edge snapshot (2026-07-07)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
-- None. `origin/main` contains `upstream/main` through `018253d8`; `git rev-list --left-right --count origin/main...upstream/main` returns `77 0`.
-- Zend PR `#16` is merged. The next upstream-default parity PR should wait until upstream `main` advances beyond `018253d8`.
+- `#1802`: marks GitHub releases as pre-releases automatically when the SemVer version contains a pre-release suffix. Upstream-only commits before the current parity PR lands are `05968e49`, `1ef37b53`, and merge commit `d92a7940`; `git rev-list --left-right --count origin/main...upstream/main` returns `77 3`.
+- Zend PR `#18` (`codex/zcash-upstream-sync-2026-07-06`) now owns this upstream-default parity refresh. It cleanly merges upstream `main` through `d92a7940`.
 - Zend PR `#17` (`codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04`) already owns the early Ironwood / NU6.3 carry surface. It is open and not draft, but it is not merge-ready: `mergeStateStatus=DIRTY`, `mergeable=CONFLICTING`, `build` fails, and `Run zizmor`, `SwiftLint`, and standalone `zizmor` pass.
 
 Open upstream PRs assessed as not ready to carry right now:
@@ -113,42 +115,42 @@ Open upstream PRs assessed as not ready to carry right now:
 - `#1794` (`michal/MOB-1455-2-ironwood-migration-sdk-impl` -> `michal/MOB-1455-ironwood-migration-prototype-ffi`): draft, `UNSTABLE`, and its build check is failing. It layers migration orchestration and public SDK API work on top of the in-flight FFI branch, so it is not ready for a Zend carry.
 - `#1793` (`michal/MOB-1455-ironwood-migration-prototype-ffi`): draft, `DIRTY`, review-required, and its build check is failing. It updates the FFI/welding layer for Ironwood migration; this is protocol-facing work and should wait for upstream review, green CI, and API stabilization.
 - Closed unmerged on 2026-07-01: `#1792` (`harry/ironwood-nu6.3-deps` -> `harry/ironwood-migration-sdk-interface`) and `#1791` (`harry/ironwood-migration-sdk-interface`). Their branches still exist, but the closed draft PRs do not provide a readiness signal for Zend.
-- `#1787` and `#1788`: Swift NIO / NIO Extras Dependabot PRs; non-draft with passing checks, but still `BLOCKED` and review-required, so wait for upstream dependency review.
-- `#1770` through `#1785`: Dependabot PRs for Cargo, Swift, and GitHub Actions dependencies. They remain `BLOCKED` and review-required; several still have failed build or zizmor checks, so wait for upstream review and CI policy before carrying individual dependency bumps.
-- `#1767` (`dw/remove-useless-deadcode-annotations`): non-draft but `BLOCKED` and review-required; Rust annotation cleanup should wait for upstream review rather than being carried independently.
-- `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, `DIRTY`, and review-required; touches Tor/exchange-rate concurrency, so wait for upstream completion despite current checks passing.
-- `#1746` (`kris/1745-finish-release-workflow`): non-draft but `DIRTY`, review-required, and release-workflow heavy.
-- `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview, so wait for upstream release sequencing rather than carrying it independently.
+- `#1787` and `#1788`: Swift NIO / NIO Extras Dependabot PRs; non-draft with passing checks, but review-required and `mergeStateStatus=UNKNOWN`, so wait for upstream dependency review.
+- `#1770` through `#1785`: Dependabot PRs for Cargo, Swift, and GitHub Actions dependencies. They remain review-required with unknown merge state; several still have failed build or zizmor checks, so wait for upstream review and CI policy before carrying individual dependency bumps.
+- `#1767` (`dw/remove-useless-deadcode-annotations`): non-draft, review-required, and `mergeStateStatus=UNKNOWN`; Rust annotation cleanup should wait for upstream review rather than being carried independently.
+- `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, review-required, and `mergeStateStatus=UNKNOWN`; touches Tor/exchange-rate concurrency, so wait for upstream completion despite current checks passing.
+- `#1746` (`kris/1745-finish-release-workflow`): non-draft, review-required, and release-workflow heavy. Upstream `#1802` has already landed the focused pre-release flag subset, so the broader release-workflow PR should still wait for upstream completion.
+- `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview with green checks, so wait for upstream release sequencing rather than carrying it independently.
 - `#1700`, `#1638`, `#1637`, `#1592`, `#1579`, and `#1443`: draft/WIP FFI, testing, send-max, or build-plugin changes with broad impact; several also have requested changes or stale unknown merge state.
-- `#1692`: non-draft but `BLOCKED`, review-required, and has no current check signal.
-- `#1570`: non-draft and approved, but still `DIRTY` and an old broad behavioral fork; carrying it ahead of upstream remains higher risk.
-- `#1505`: tiny spelling fix, but still `DIRTY` and review-required, so not worth carrying independently.
+- `#1692`: non-draft, review-required, `mergeStateStatus=UNKNOWN`, and has no current check signal.
+- `#1570`: non-draft and approved, but still has unknown merge state and represents an old broad behavioral fork; carrying it ahead of upstream remains higher risk.
+- `#1505`: tiny spelling fix, but still review-required with unknown merge state, so not worth carrying independently.
 
 No candidate currently meets all carry criteria (ready + useful + low risk) for Zend ahead-of-upstream adoption.
 
 Unmerged upstream branches (not carried):
 
-- `adam/broadcaster-submit-plan`: 14 commits ahead and 84 behind `upstream/main`; no upstream PR, and the commits are already contained in `origin/main` from Zend PR `#2` before being superseded by upstream's `SubmitPlanStore` work in `#1757`.
-- `adam/update-zcash-voting-0.9.1-policy`: 1 commit ahead and 80 behind `upstream/main`; voting feature scope with no upstream PR/review thread yet.
-- `adam/voting-round-recovery-ffi`: 1 commit ahead and 189 behind `upstream/main`; voting recovery FFI with no upstream PR/review thread yet.
-- `adam/voting-rust-lint-workflow`: 1 commit ahead and 190 behind `upstream/main`; workflow/lint only and limited direct Zend runtime value.
-- Dependabot branches for Cargo, Swift, and GitHub Actions updates are each 1 commit ahead and 9-11 behind `upstream/main`; all are covered by open upstream PRs `#1770` through `#1788`, so wait for upstream review and CI completion.
-- `dw/remove-useless-deadcode-annotations`: 1 commit ahead and 16 behind `upstream/main`; covered by open upstream PR `#1767`, so wait for upstream review.
-- `feature/ffi_database_handle`: 10 commits ahead and 290 behind `upstream/main`; broad FFI database-handle work covered by draft upstream PR `#1637`, so do not carry early.
-- `feature/typesafe_db_handles`: 11 commits ahead and 290 behind `upstream/main`; broad type-safe handle work covered by draft upstream PR `#1638`, so do not carry early.
-- `ffi-0.18.0-part-2`: 5 commits ahead and 811 behind `upstream/main`; stale WIP transaction policy work covered by draft upstream PR `#1592`.
-- `harry/ironwood-migration-sdk-interface`: 4 commits ahead and 4 behind `upstream/main`; formerly covered by draft upstream PR `#1791`, protocol-facing Ironwood migration API work, so wait for upstream review.
-- `harry/ironwood-nu6.3-deps`: 5 commits ahead and 4 behind `upstream/main`; formerly covered by draft upstream PR `#1792`, depends on `harry/ironwood-migration-sdk-interface`, and had a failing build check.
-- `ignore_worktrees`: 1 commit ahead and 84 behind `upstream/main`; housekeeping-only change.
-- `kris/1745-finish-release-workflow`: 9 commits ahead and 84 behind `upstream/main`; covered by open upstream PR `#1746`, which is release-workflow heavy and review-required.
-- `michal/MOB-1389-fetch-usd-rate-tor-crash`: 1 commit ahead and 50 behind `upstream/main`; covered by draft upstream PR `#1763`, so wait for upstream completion.
-- `michal/MOB-1455-2-ironwood-migration-sdk-impl`: 15 commits ahead and 4 behind `upstream/main`; covered by draft upstream PR `#1794`, build-failing, and layered on the prototype FFI branch, so wait for upstream review and API stabilization.
-- `michal/MOB-1455-3-ironwood-sdk-support`: 22 commits ahead and 4 behind `upstream/main`; covered by draft upstream PR `#1796`, build-failing, and part of the Ironwood stack.
-- `michal/MOB-1455-4-set-activation-height`: 29 commits ahead and 4 behind `upstream/main`; covered by draft upstream PR `#1797`, build-failing, and part of the Ironwood stack.
-- `michal/MOB-1455-5-final-fixes`: 35 commits ahead and 4 behind `upstream/main`; covered by draft upstream PR `#1798`, build-failing, and part of the Ironwood stack.
-- `michal/MOB-1455-6-integration-with-final-zodl`: 38 commits ahead and 4 behind `upstream/main`; no upstream PR exists yet, and the branch layers Keystone PCZT and final Zodl integration work on top of the draft build-failing Ironwood stack, so do not carry it until upstream opens/reviews it and the stack turns green.
-- `michal/MOB-1455-ironwood-migration-prototype-ffi`: 11 commits ahead and 4 behind `upstream/main`; covered by draft upstream PR `#1793`, build-failing, and still protocol-facing FFI work, so wait for upstream review and green CI.
-- `release-ci`: 4 commits ahead and 162 behind `upstream/main`; release branch integration artifact, not a clear standalone carry target.
-- `rust-build-plugin`: 2 commits ahead and 1111 behind `upstream/main`; stale draft build-plugin work covered by upstream PR `#1443`.
-- `shielded-vote-2.4.10`: 1 commit ahead and 107 behind `upstream/main`; specialized voting branch with unclear Zend product priority.
-- `testing/note_spendability_improvements`: 6 commits ahead and 220 behind `upstream/main`; draft test-only branch covered by upstream PR `#1700`.
+- `adam/broadcaster-submit-plan`: 14 commits ahead and 87 behind `upstream/main`; no upstream PR, and the commits are already contained in `origin/main` from Zend PR `#2` before being superseded by upstream's `SubmitPlanStore` work in `#1757`.
+- `adam/update-zcash-voting-0.9.1-policy`: 1 commit ahead and 83 behind `upstream/main`; voting feature scope with no upstream PR/review thread yet.
+- `adam/voting-round-recovery-ffi`: 1 commit ahead and 192 behind `upstream/main`; voting recovery FFI with no upstream PR/review thread yet.
+- `adam/voting-rust-lint-workflow`: 1 commit ahead and 193 behind `upstream/main`; workflow/lint only and limited direct Zend runtime value.
+- Dependabot branches for Cargo, Swift, and GitHub Actions updates are each 1 commit ahead and 12-14 behind `upstream/main`; all are covered by open upstream PRs `#1770` through `#1788`, so wait for upstream review and CI completion.
+- `dw/remove-useless-deadcode-annotations`: 1 commit ahead and 19 behind `upstream/main`; covered by open upstream PR `#1767`, so wait for upstream review.
+- `feature/ffi_database_handle`: 10 commits ahead and 293 behind `upstream/main`; broad FFI database-handle work covered by draft upstream PR `#1637`, so do not carry early.
+- `feature/typesafe_db_handles`: 11 commits ahead and 293 behind `upstream/main`; broad type-safe handle work covered by draft upstream PR `#1638`, so do not carry early.
+- `ffi-0.18.0-part-2`: 5 commits ahead and 814 behind `upstream/main`; stale WIP transaction policy work covered by draft upstream PR `#1592`.
+- `harry/ironwood-migration-sdk-interface`: 4 commits ahead and 7 behind `upstream/main`; formerly covered by draft upstream PR `#1791`, protocol-facing Ironwood migration API work, so wait for upstream review.
+- `harry/ironwood-nu6.3-deps`: 5 commits ahead and 7 behind `upstream/main`; formerly covered by draft upstream PR `#1792`, depends on `harry/ironwood-migration-sdk-interface`, and had a failing build check.
+- `ignore_worktrees`: 1 commit ahead and 87 behind `upstream/main`; housekeeping-only change.
+- `kris/1745-finish-release-workflow`: 9 commits ahead and 87 behind `upstream/main`; covered by open upstream PR `#1746`, which is release-workflow heavy and review-required.
+- `michal/MOB-1389-fetch-usd-rate-tor-crash`: 1 commit ahead and 53 behind `upstream/main`; covered by draft upstream PR `#1763`, so wait for upstream completion.
+- `michal/MOB-1455-2-ironwood-migration-sdk-impl`: 15 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1794`, build-failing, and layered on the prototype FFI branch, so wait for upstream review and API stabilization.
+- `michal/MOB-1455-3-ironwood-sdk-support`: 22 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1796`, build-failing, and part of the Ironwood stack.
+- `michal/MOB-1455-4-set-activation-height`: 29 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1797`, build-failing, and part of the Ironwood stack.
+- `michal/MOB-1455-5-final-fixes`: 35 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1798`, build-failing, and part of the Ironwood stack.
+- `michal/MOB-1455-6-integration-with-final-zodl`: 38 commits ahead and 7 behind `upstream/main`; no upstream PR exists yet, and the branch layers Keystone PCZT and final Zodl integration work on top of the draft build-failing Ironwood stack, so do not carry it until upstream opens/reviews it and the stack turns green.
+- `michal/MOB-1455-ironwood-migration-prototype-ffi`: 11 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1793`, build-failing, and still protocol-facing FFI work, so wait for upstream review and green CI.
+- `release-ci`: 4 commits ahead and 165 behind `upstream/main`; release branch integration artifact, not a clear standalone carry target.
+- `rust-build-plugin`: 2 commits ahead and 1114 behind `upstream/main`; stale draft build-plugin work covered by upstream PR `#1443`.
+- `shielded-vote-2.4.10`: 1 commit ahead and 110 behind `upstream/main`; specialized voting branch with unclear Zend product priority.
+- `testing/note_spendability_improvements`: 6 commits ahead and 223 behind `upstream/main`; draft test-only branch covered by upstream PR `#1700`.
