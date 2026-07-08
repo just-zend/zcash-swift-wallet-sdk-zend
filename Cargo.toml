@@ -111,7 +111,10 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 # development, temporarily override with:
 #   [patch."ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git"]
 #   zodl_ironwood_migration = { path = "../ZODLIronwoodMigrationRust" }
-zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "3bd5a27548968c749eee5883234acf42acbfa7c1" }
+# Rev = branch fix/quantization-divergence: the quantization-divergence fix (change owns the
+# residual, transfers pin to prepared notes) plus split-expiry/V3-filtering/reorg-audit
+# hardening — supersedes 3bd5a27, which it contains. Re-pin when the branch merges to main.
+zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "11565617cbb641e27134389917e475af24015bc1" }
 
 [features]
 # Off by default on this Ironwood branch — see the zcash_voting dependency note above. Enabling it
