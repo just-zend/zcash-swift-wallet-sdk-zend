@@ -113,8 +113,9 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 #   zodl_ironwood_migration = { path = "../ZODLIronwoodMigrationRust" }
 # Rev = branch fix/quantization-divergence: the quantization-divergence fix (change owns the
 # residual, transfers pin to prepared notes) plus split-expiry/V3-filtering/reorg-audit
-# hardening — supersedes 3bd5a27, which it contains. Re-pin when the branch merges to main.
-zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "11565617cbb641e27134389917e475af24015bc1" }
+# hardening and a compressed 16-block transfer cadence on test networks (mainnet stays 288) —
+# supersedes 1156561, which it contains. Re-pin when the branch merges to main.
+zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "f44aae4a9d70088c7098b999eb6771f906be3296" }
 
 [features]
 # Off by default on this Ironwood branch — see the zcash_voting dependency note above. Enabling it
