@@ -37,7 +37,10 @@ else
     IS_APPLE_SILICON=false
 fi
 
-# Map target to Rust triple and xcframework slice
+# Map target to Rust triple and xcframework slice. Slice identifiers name
+# exactly the single architecture that was built (never the full build's fat
+# ios-arm64_x86_64-simulator / macos-arm64_x86_64 names) — see the invariant
+# note in init-local-ffi.sh; the two tools must stay interchangeable.
 case "$TARGET" in
     ios-sim)
         if [[ "$IS_APPLE_SILICON" == "true" ]]; then
@@ -47,7 +50,7 @@ case "$TARGET" in
             RUST_TARGET="x86_64-apple-ios"
             ARCH="x86_64"
         fi
-        XCFRAMEWORK_SLICE="ios-arm64_x86_64-simulator"
+        XCFRAMEWORK_SLICE="ios-${ARCH}-simulator"
         PLATFORM="ios"
         PLATFORM_VARIANT="simulator"
         ;;
@@ -66,7 +69,7 @@ case "$TARGET" in
             RUST_TARGET="x86_64-apple-darwin"
             ARCH="x86_64"
         fi
-        XCFRAMEWORK_SLICE="macos-arm64_x86_64"
+        XCFRAMEWORK_SLICE="macos-${ARCH}"
         PLATFORM="macos"
         PLATFORM_VARIANT=""
         ;;

@@ -152,20 +152,32 @@ Removes `LocalPackages/` and switches back to the release binary.
 
 ### XCFramework Structure
 
-The XCFramework contains three platform slices:
-- `ios-arm64` — iOS devices
-- `ios-arm64_x86_64-simulator` — iOS Simulator (universal)
-- `macos-arm64_x86_64` — macOS (universal)
+The XCFramework contains three platform slices, and each slice's
+LibraryIdentifier names exactly the architectures its binary contains:
+
+- Full 5-arch release build (`make xcframework`): `ios-arm64`,
+  `ios-arm64_x86_64-simulator` (universal), `macos-arm64_x86_64` (universal).
+- Single-arch builds (`init-local-ffi.sh --arm-*`, `rebuild-local-ffi.sh`, and
+  the xcframework committed under `LocalPackages/` on the fork line):
+  `ios-arm64`, `ios-arm64-simulator`, `macos-arm64` — or the `x86_64`
+  spellings when built on an Intel host.
+
+An identifier must never advertise an architecture the binary lacks: a
+multi-arch consumer build (e.g. `-destination 'generic/platform=iOS
+Simulator'`) then dies late at link time with missing `_zcashlc_*` symbols for
+the absent architecture instead of an explicit unsupported-architecture error.
+The committed fork-line xcframework stays arm64-only by design — one
+architecture is ~52MB, so a fat slice would cross GitHub's 100MB file limit.
 
 ### Build Targets
 
 | Development Target | Rust Target | XCFramework Slice |
 |-------------------|-------------|-------------------|
-| iOS Simulator (Apple Silicon) | `aarch64-apple-ios-sim` | `ios-arm64_x86_64-simulator` |
-| iOS Simulator (Intel) | `x86_64-apple-ios` | `ios-arm64_x86_64-simulator` |
+| iOS Simulator (Apple Silicon) | `aarch64-apple-ios-sim` | `ios-arm64-simulator` |
+| iOS Simulator (Intel) | `x86_64-apple-ios` | `ios-x86_64-simulator` |
 | iOS Device | `aarch64-apple-ios` | `ios-arm64` |
-| macOS (Apple Silicon) | `aarch64-apple-darwin` | `macos-arm64_x86_64` |
-| macOS (Intel) | `x86_64-apple-darwin` | `macos-arm64_x86_64` |
+| macOS (Apple Silicon) | `aarch64-apple-darwin` | `macos-arm64` |
+| macOS (Intel) | `x86_64-apple-darwin` | `macos-x86_64` |
 
 ### Local Package Override
 
