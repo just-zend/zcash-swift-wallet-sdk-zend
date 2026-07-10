@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-09
+Last reviewed: 2026-07-10
 
 ## Remote and branch invariants
 
@@ -46,15 +46,15 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-07-09)
+## Zend divergence notes (as of 2026-07-10)
 
 Current relationship after Zend PR `#16` merged `codex/zcash-upstream-sync-2026-07-03` into `origin/main`:
 
-- `origin/main...upstream/main`: `77 3` after fetching both remotes on 2026-07-09.
+- `origin/main...upstream/main`: `77 3` after fetching both remotes on 2026-07-10.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `d92a7940` (`#1802`); it also includes `#1799` for Tor retry classification, `#1795` for local FFI build flags, `#1790` / tag `2.6.0-alpha.6`, `#1789` checkpoint refresh, `#1786` for the Keystone/cross-account `deleteAccount` fix, and `#1766` Dependabot setup.
 - `git merge-base --is-ancestor upstream/main origin/main` fails until the current parity PR lands.
-- The active parity branch `codex/zcash-upstream-sync-2026-07-06` now merges upstream `main` through `d92a7940`; `git rev-list --left-right --count HEAD...upstream/main` returns `81 0` after this guide refresh and `git merge-base --is-ancestor upstream/main HEAD` succeeds.
+- The active parity branch `codex/zcash-upstream-sync-2026-07-06` now merges upstream `main` through `d92a7940`; `git rev-list --left-right --count HEAD...upstream/main` returns `83 0` after this guide refresh and `git merge-base --is-ancestor upstream/main HEAD` succeeds.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -73,7 +73,7 @@ Notable fork-ahead work currently preserved includes:
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: default-branch parity is pending in Zend PR `#18`, which now carries upstream `main` through `d92a7940` / PR `#1802` and was green on GitHub at head `b105b557` before the 2026-07-09 docs refresh. Open Zend PR `#17` is separate bleeding-edge Ironwood / NU6.3 carry work and remains blocked by merge conflicts plus missing Ironwood/migration FFI symbols in the current Zend `2.6.3` binary target. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
+Implication: default-branch parity is pending in Zend PR `#18`, which now carries upstream `main` through `d92a7940` / PR `#1802` and was green on GitHub at head `d2b06bb1` before the 2026-07-10 docs refresh. Open Zend PR `#17` is separate bleeding-edge Ironwood / NU6.3 carry work and remains blocked by merge conflicts plus missing Ironwood/migration FFI symbols in the current Zend `2.6.3` binary target. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
 
 ## Conflict resolution heuristics
 
@@ -97,12 +97,12 @@ Zend parity branch note:
 - The July 3 refresh merged upstream through `018253d8` with no conflicts. The upstream `#1799` changes touch `CHANGELOG.md` and `Sources/ZcashLightClientKit/Block/CompactBlockProcessor.swift`; no Zend-specific artifact URL, checksum, branding, or release behavior changed.
 - The July 7 refresh merged upstream through `d92a7940` with no conflicts. The upstream `#1802` changes touch `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `docs/ci.md`; no Zend-specific artifact URL, checksum, branding, or support surface changed.
 
-## Bleeding-edge snapshot (2026-07-09)
+## Bleeding-edge snapshot (2026-07-10)
 
 Merged upstream default-branch delta pending in Zend fork default branch:
 
-- `#1802`: marks GitHub releases as pre-releases automatically when the SemVer version contains a pre-release suffix. Upstream-only commits before the current parity PR lands are `05968e49`, `1ef37b53`, and merge commit `d92a7940`; `git rev-list --left-right --count origin/main...upstream/main` returns `77 3`.
-- Zend PR `#18` (`codex/zcash-upstream-sync-2026-07-06`) now owns this upstream-default parity refresh. It cleanly merges upstream `main` through `d92a7940`; before the 2026-07-09 docs refresh it was draft, `mergeStateStatus=CLEAN`, `mergeable=MERGEABLE`, and `build`, `Run zizmor`, and standalone `zizmor` all passed at head `b105b557`.
+- `#1802`: marks GitHub releases as pre-releases automatically when the SemVer version contains a pre-release suffix. Upstream-only commits before the current parity PR lands are still `05968e49`, `1ef37b53`, and merge commit `d92a7940`; `git rev-list --left-right --count origin/main...upstream/main` returns `77 3`.
+- Zend PR `#18` (`codex/zcash-upstream-sync-2026-07-06`) now owns this upstream-default parity refresh. It cleanly merges upstream `main` through `d92a7940`; before the 2026-07-10 docs refresh it was draft, `mergeStateStatus=CLEAN`, `mergeable=MERGEABLE`, and `build`, `Run zizmor`, and standalone `zizmor` all passed at head `d2b06bb1`.
 - Zend PR `#17` (`codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04`) already owns the early Ironwood / NU6.3 carry surface. It is open and not draft, but it is not merge-ready: `mergeStateStatus=DIRTY`, `mergeable=CONFLICTING`, `build` fails, and `Run zizmor`, `SwiftLint`, and standalone `zizmor` pass.
 
 Open upstream PRs assessed as not ready to carry right now:
