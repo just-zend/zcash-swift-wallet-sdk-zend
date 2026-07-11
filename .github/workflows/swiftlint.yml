@@ -22,4 +22,3 @@ jobs:
           persist-credentials: false
       - name: SwiftLint
         run: swiftlint lint
-        
