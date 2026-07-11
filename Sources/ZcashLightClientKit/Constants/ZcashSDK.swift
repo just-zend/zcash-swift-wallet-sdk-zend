@@ -19,15 +19,20 @@ public protocol ZcashNetwork {
     var customActivationHeights: NetworkActivationHeights? { get }
 
     /// For a custom network (``customActivationHeights`` non-nil), the base identity registered with the
-    /// Rust core: address encoding and `chainName` follow this, while the activation heights are custom
-    /// (e.g. a modified-mainnet Ironwood backend uses base `.mainnet`). `nil` for standard networks.
+    /// Rust core: address encoding follows this while activation heights are custom (e.g. a
+    /// modified-mainnet Ironwood backend uses base `.mainnet`). `nil` for standard networks.
     var customNetworkBase: NetworkType? { get }
+
+    /// The exact canonical chain name expected from lightwalletd `getInfo`. This is included in the
+    /// Rust consensus-configuration fingerprint and must not be selected dynamically per request.
+    var chainName: String { get }
 }
 
 public extension ZcashNetwork {
     var saplingActivationHeight: BlockHeight { constants.saplingActivationHeight }
     var customActivationHeights: NetworkActivationHeights? { nil }
     var customNetworkBase: NetworkType? { nil }
+    var chainName: String { networkType.chainName }
 }
 
 public enum NetworkType: Equatable, Codable, Hashable {
@@ -84,7 +89,12 @@ public enum ZcashNetworkBuilder {
         switch networkType {
         case .mainnet:  return ZcashMainnet()
         case .testnet:  return ZcashTestnet()
-        case .regtest:  return ZcashRegtest(base: .regtest, activationHeights: NetworkActivationHeights.allActiveFromGenesis)
+        case .regtest:
+            return ZcashRegtest(
+                base: .regtest,
+                chainName: NetworkType.regtest.chainName,
+                activationHeights: NetworkActivationHeights.allActiveFromGenesis
+            )
         }
     }
 
@@ -92,7 +102,7 @@ public enum ZcashNetworkBuilder {
     /// to a custom-parameter `lightwalletd`. Addresses and chain identity are regtest-encoded, and the
     /// on-disk databases use a `regtest`-specific name prefix. See `MIGRATING.md`.
     public static func regtest(activationHeights: NetworkActivationHeights) -> ZcashNetwork {
-        ZcashRegtest(base: .regtest, activationHeights: activationHeights)
+        ZcashRegtest(base: .regtest, chainName: NetworkType.regtest.chainName, activationHeights: activationHeights)
     }
 
     /// Builds a **custom network**: a chosen `base` identity (which determines address encoding and the
@@ -101,8 +111,12 @@ public enum ZcashNetworkBuilder {
     /// the Rust core then derives **mainnet-encoded** addresses and runs mainnet consensus at the custom
     /// heights. On-disk the network still uses the `regtest`-slot name prefix, so it never collides with
     /// a real mainnet wallet. See `MIGRATING.md`.
-    public static func custom(base: NetworkType, activationHeights: NetworkActivationHeights) -> ZcashNetwork {
-        ZcashRegtest(base: base, activationHeights: activationHeights)
+    public static func custom(
+        base: NetworkType,
+        chainName: String? = nil,
+        activationHeights: NetworkActivationHeights
+    ) -> ZcashNetwork {
+        ZcashRegtest(base: base, chainName: chainName ?? base.chainName, activationHeights: activationHeights)
     }
 }
 
@@ -122,10 +136,12 @@ class ZcashRegtest: ZcashNetwork {
     /// The base identity registered with the Rust core (address encoding / `chainName`). `.regtest` for
     /// a plain regtest network; `.mainnet` for a modified-mainnet custom network (e.g. Ironwood).
     let base: NetworkType
+    let chainName: String
     let activationHeights: NetworkActivationHeights
 
-    init(base: NetworkType, activationHeights: NetworkActivationHeights) {
+    init(base: NetworkType, chainName: String, activationHeights: NetworkActivationHeights) {
         self.base = base
+        self.chainName = ConsensusChainName.canonicalize(chainName) ?? chainName
         self.activationHeights = activationHeights
     }
 

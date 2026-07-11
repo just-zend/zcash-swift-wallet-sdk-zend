@@ -27,49 +27,39 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **dormant** — `ironwoodBalance` is `.zero` for every wallet — until a lightwalletd serves Ironwood
   compact blocks and NU6.3 activates (its consensus branch id is still a placeholder upstream). Error
   codes ZRUST0109/ZRUST0110 and ZCBPEO0023.
-- Internal `ZcashRustBackendWelding` surface for the Orchard → Ironwood migration engine
-  (`zodl_ironwood_migration`): migration state/progress, note-split planning + signing, transfer
-  scheduling + signing, due-transfer execution bookkeeping, extraction of the broadcast-ready
-  consensus transaction from a signed PCZT, stale-transfer refresh, and lifecycle/recovery. Adds
-  public `Codable` models (`MigrationState`, `MigrationProgress`, `MigrationSchedule`,
-  `TransferProposal`, `NoteSplitProposal`, `PreparedTx`, `TransferResult`, `AttentionReason`,
-  `NetworkPrivacyOptions`). `PreparedTx.rawPczt` is a serialized PCZT that the platform turns into a
-  consensus transaction via the welding's extract step (`migrationExtractBroadcastTx`) before
-  broadcasting. The public `Synchronizer` API and the network broadcast composition follow in a
-  later change.
-- Public Orchard → Ironwood migration API on the (async) `Synchronizer` protocol, all taking
-  `for account: AccountUUID`: `migrationState`, `migrationProgress`, `isNoteSplitNeeded`,
-  `prepareNoteSplit`, `submitNoteSplit`, `proposeMigrationTransfers`, `signAndStoreMigrationSchedule`,
-  `isSyncRequiredBeforeNextTransfer`, `executeNextPendingTransfer`, `hasOverdueTransfers`,
-  `hasInvalidTransfers`, `refreshStaleTransfers`, `restartCurrentMigrationStep`, and
-  `initializePostUpgrade`. The two broadcasting methods (`submitNoteSplit`,
-  `executeNextPendingTransfer`) sign (or load) the engine's prepared transaction, extract the
-  broadcast-ready consensus transaction from the signed PCZT (`migrationExtractBroadcastTx`), and
-  broadcast it over the SDK's existing direct submission path, mapping the outcome to
-  `TransferResult`; `executeNextPendingTransfer` also records the result back with the engine.
-  `refreshStaleTransfers` re-anchors/re-proves/re-signs stale scheduled transfers (pair with
-  `hasOverdueTransfers`). `NetworkPrivacyOptions` is accepted but not yet honored (broadcast uses the
-  configured lightwalletd). Async-only for now — the `ClosureSynchronizer` / `CombineSynchronizer`
-  adapters are not yet updated.
-- External-signer (hardware wallet / Keystone) surface for the Orchard → Ironwood migration, so
-  accounts whose spending key lives on a device can migrate: `Synchronizer.proposeNoteSplitPCZT` /
-  `submitSignedNoteSplitPCZT` mirror the `submitNoteSplit` flow with the signature produced by the
-  device, and `proposeMigrationTransferPCZTs` / `storeSignedMigrationTransferPCZTs` mirror
-  `signAndStoreMigrationSchedule` — one unsigned PCZT per scheduled transfer (new
-  `MigrationTransferPCZT` model pairing a transfer id with its `Pczt`), signed on the device via the
-  app's existing redact → animated-QR flow, then stored **all-or-nothing** (a partial or mismatched
-  signed set stores nothing, so the flow can be retried). The unsigned PCZTs are proved up front and
-  the originals stay staged inside the migration engine, which pairs, verifies, and finalizes the
-  returned signatures — the app never has to juggle proof/signature PCZT pairs. Error codes
-  ZRUST0111–ZRUST0114.
+- Authoritative schema-v4 Orchard → Ironwood `MigrationSnapshot` models: exact run/revision,
+  mode/phase, typed failure and recovery, next safe action, exact intent/count projections,
+  immutable submission policy, signer leases, and account-scoped ordinary-spend reservation.
+  Defensive Swift validation rejects contradictory/corrupt wire state and projects read failures as
+  non-operational `.walletSchemaUnavailable` state instead of reusing a stale runnable snapshot.
+- Public intent/JIT migration APIs on async `Synchronizer`. Private begin and Immediate commit
+  validate and atomically persist their immutable endpoint/consensus policy; approved transfers stay
+  anchorless until one becomes due. Every existing-run mutation takes caller `expectedRunId` and
+  `expectedRevision`, preventing a foreground or background task from acting on a replacement run.
+- Crash-resumable software and external-signer paths for the note split and each due intent. The SDK
+  resumes the exact staged PCZT/claim token after relaunch, extracts the Rust-computed transaction,
+  validates endpoint chain/branch/expiry state, submits it over the selected direct or Tor transport,
+  and records an exact known-unsent, success, failure, or outcome-unknown lifecycle result.
 
 ## Changed
-- The Rust core now builds against the valargroup `librustzcash` fork under
-  `zcash_unstable="nu6.3"` to enable Ironwood (NU6.3) transaction building. Shielded voting is
-  temporarily gated behind an off-by-default `voting` cargo feature (and its Swift layer excluded
-  from the build): the crates.io voting stack calls the pre-Ironwood orchard `Note` API and is
-  incompatible with the orchard fork. To be restored against valargroup `zcash_voting` 1.0.0.
+- Breaking: removed the legacy anchored pre-sign-all migration methods from the public
+  `Synchronizer` contract (`proposeMigrationTransfers`, `signAndStoreMigrationSchedule`, full-schedule
+  PCZT propose/store, `executeNextPendingTransfer`, `refreshStaleTransfers`, and
+  `restartCurrentMigrationStep`). Migrate callers to `propose*MigrationIntent`,
+  `commitMigrationIntents`, and the expected-run/revision `execute`/`stage`/`resume` APIs described in
+  `MIGRATING.md`.
+- The Rust core now builds against exact upstream `zcash/librustzcash` revision
+  `292e758462e3bc7dfb4d7272d9f88ab671bf1cab`, where NU6.3/Ironwood is stable; no synthetic
+  `zcash_unstable="nu6.3"` cfg or fork is used. Shielded voting remains gated behind an
+  off-by-default Cargo feature (and its Swift layer is excluded): the current crates.io
+  `zcash_voting 1.0.0` still pins Orchard 0.14 + unstable voting circuits, while this audited
+  Ironwood graph uses Orchard 0.15.0. Re-enable only after the voting stack moves to Orchard 0.15.
 ## Fixed
+- Ironwood migration now self-heals interrupted leases, missed private windows, expired JIT
+  transactions, process-death external signing, and ambiguous submissions without silently creating
+  replacement bytes. Legacy policyless artifacts are either revision-bound before exposure or kept
+  quarantined until chain evidence resolves them. Ordinary send, send-max, ZIP-321, PCZT creation,
+  shielding, and finalization fail closed only for the migrating account.
 - Tor-layer errors (`rustTorConnectToLightwalletd`, `rustTorLwdGetInfo`, `rustTorLwdSubmit`, `rustTorLwdFetchTransaction`, `rustTorLwdLatestBlockHeight`, `rustTorLwdGetTreeState`) are now classified as retryable service errors in `CompactBlockProcessor`. Previously these errors bypassed the service-error retry path and went straight to a fatal sync failure, so a transient Tor circuit/stream issue (e.g. "remote hostname lookup failure", "Failed to obtain exit circuit for ports", "Tor network protocol violation") required a full app restart to recover. They now trigger the same reset-and-retry behavior (including tearing down cached Tor connections via `service.closeConnections()`) as other transport errors, up to `ZcashSDK.serviceFailureRetries` times.
 
 # 2.6.0-alpha.6

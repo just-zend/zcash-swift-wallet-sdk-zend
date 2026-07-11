@@ -80,6 +80,40 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     let sdkFlags: SDKFlags
 
     static var rustInitialized = false
+    private static let ordinarySpendsBlockedErrorCode: UInt32 = 1
+    private static let immutableSubmissionPolicyConflictErrorCode: UInt32 = 2
+
+    private func accountUUIDString(_ account: AccountUUID) -> String {
+        let bytes = account.id
+        return UUID(
+            uuid: (
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[8], bytes[9], bytes[10], bytes[11],
+                bytes[12], bytes[13], bytes[14], bytes[15]
+            )
+        ).uuidString.lowercased()
+    }
+
+    private func migrationEngineSchemaMetadata() -> MigrationEngineSchemaMetadata? {
+        let ptr = zcashlc_migration_engine_schema_metadata(dbData.0, dbData.1)
+        guard let ptr else { return nil }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try? JSONDecoder().decode(
+            MigrationEngineSchemaMetadata.self,
+            from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+        )
+    }
+
+    private func migrationAwareRustError(
+        fallback: String,
+        otherwise: (String) -> ZcashError
+    ) -> ZcashError {
+        let message = lastErrorMessage(fallback: fallback)
+        return zcashlc_last_migration_error_code() == Self.ordinarySpendsBlockedErrorCode
+            ? .migrationOrdinarySpendsBlocked
+            : otherwise(message)
+    }
 
     /// Creates instance of `ZcashRustBackend`.
     /// - Parameters:
@@ -117,29 +151,38 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     /// Registers the custom network used for the regtest network id (`NetworkType.regtest`) with the
-    /// Rust core: its `base` identity (address encoding / `chainName`) plus its per-NU activation
+    /// Rust core: its base identity, exact expected lightwalletd chain name, and per-NU activation
     /// heights, so subsequent FFI calls made with that network id resolve to it instead of failing.
-    /// Process-global and idempotent; call once before using a custom network. A `nil` height means
-    /// "not activated on this network".
-    static func setCustomNetwork(base: NetworkType, _ heights: NetworkActivationHeights) {
+    /// Process-global and idempotent for one exact configuration; a conflicting second registration
+    /// fails closed. A `nil` height means "not activated on this network".
+    static func setCustomNetwork(
+        base: NetworkType,
+        chainName: String,
+        _ heights: NetworkActivationHeights
+    ) -> Bool {
         func height(_ value: BlockHeight?) -> Int64 {
             guard let value else { return -1 }
             return Int64(value)
         }
 
-        _ = zcashlc_set_custom_network(
-            base.networkId,
-            height(heights.overwinter),
-            height(heights.sapling),
-            height(heights.blossom),
-            height(heights.heartwood),
-            height(heights.canopy),
-            height(heights.nu5),
-            height(heights.nu6),
-            height(heights.nu6_1),
-            height(heights.nu6_2),
-            height(heights.nu6_3)
-        )
+        return Array(chainName.utf8).withUnsafeBufferPointer { chainNameBuffer in
+            zcashlc_set_custom_network(
+                base.networkId,
+                chainNameBuffer.baseAddress,
+                UInt(chainNameBuffer.count),
+                height(heights.overwinter),
+                height(heights.sapling),
+                height(heights.blossom),
+                height(heights.heartwood),
+                height(heights.canopy),
+                height(heights.nu5),
+                height(heights.nu6),
+                height(heights.nu6_1),
+                height(heights.nu6_2),
+                height(heights.nu6_3),
+                height(heights.nu7)
+            )
+        }
     }
 
     @DBActor
@@ -329,7 +372,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
 
         guard let proposal else {
-            throw ZcashError.rustCreateToAddress(lastErrorMessage(fallback: "`proposeTransfer` failed with unknown error"))
+            throw migrationAwareRustError(
+                fallback: "`proposeTransfer` failed with unknown error",
+                otherwise: ZcashError.rustCreateToAddress
+            )
         }
 
         defer { zcashlc_free_boxed_slice(proposal) }
@@ -355,7 +401,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
 
         guard let proposal else {
-            throw ZcashError.rustCreateToAddress(lastErrorMessage(fallback: "`proposeTransfer` failed with unknown error"))
+            throw migrationAwareRustError(
+                fallback: "`proposeTransferFromURI` failed with unknown error",
+                otherwise: ZcashError.rustCreateToAddress
+            )
         }
 
         defer { zcashlc_free_boxed_slice(proposal) }
@@ -385,7 +434,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
 
         guard let pcztPtr else {
-            throw ZcashError.rustCreatePCZTFromProposal(lastErrorMessage(fallback: "`createPCZTFromProposal` failed with unknown error"))
+            throw migrationAwareRustError(
+                fallback: "`createPCZTFromProposal` failed with unknown error",
+                otherwise: ZcashError.rustCreatePCZTFromProposal
+            )
         }
 
         defer { zcashlc_free_boxed_slice(pcztPtr) }
@@ -497,7 +549,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
 
         guard let txidPtr else {
-            throw ZcashError.rustExtractAndStoreTxFromPCZT(lastErrorMessage(fallback: "`extractAndStoreTxFromPCZT` failed with unknown error"))
+            throw migrationAwareRustError(
+                fallback: "`extractAndStoreTxFromPCZT` failed with unknown error",
+                otherwise: ZcashError.rustExtractAndStoreTxFromPCZT
+            )
         }
 
         guard txidPtr.pointee.len == 32 else {
@@ -1221,7 +1276,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
 
         guard let txIdsPtr else {
-            throw ZcashError.rustCreateToAddress(lastErrorMessage(fallback: "`createToAddress` failed with unknown error"))
+            throw migrationAwareRustError(
+                fallback: "`createProposedTransactions` failed with unknown error",
+                otherwise: ZcashError.rustCreateToAddress
+            )
         }
 
         defer { zcashlc_free_txids(txIdsPtr) }
@@ -1246,6 +1304,50 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return branchId
     }
 
+    nonisolated func networkUpgradeActivationHeight(_ upgrade: NetworkUpgrade) throws -> BlockHeight? {
+        let result = zcashlc_network_upgrade_activation_height(networkType.networkId, upgrade.rawValue)
+        switch result {
+        case -1:
+            return nil
+        case 0...Int64(UInt32.max):
+            return BlockHeight(result)
+        default:
+            throw ConsensusParametersError.unavailable(
+                lastErrorMessage(fallback: "`networkUpgradeActivationHeight` failed with unknown error")
+            )
+        }
+    }
+
+    nonisolated func nu6_3ActivationHeight() throws -> BlockHeight? {
+        try networkUpgradeActivationHeight(.nu6_3)
+    }
+
+    nonisolated func consensusChainName() throws -> String {
+        guard let pointer = zcashlc_consensus_chain_id(networkType.networkId) else {
+            throw ConsensusParametersError.unavailable(
+                lastErrorMessage(fallback: "`consensusChainName` failed with unknown error")
+            )
+        }
+        defer { zcashlc_string_free(pointer) }
+        guard let value = String(validatingUTF8: pointer) else {
+            throw ConsensusParametersError.unavailable("Rust returned a non-UTF-8 consensus chain name")
+        }
+        return value
+    }
+
+    nonisolated func consensusParametersFingerprint() throws -> String {
+        guard let pointer = zcashlc_consensus_parameters_fingerprint(networkType.networkId) else {
+            throw ConsensusParametersError.unavailable(
+                lastErrorMessage(fallback: "`consensusParametersFingerprint` failed with unknown error")
+            )
+        }
+        defer { zcashlc_string_free(pointer) }
+        guard let value = String(validatingUTF8: pointer) else {
+            throw ConsensusParametersError.unavailable("Rust returned a non-UTF-8 consensus fingerprint")
+        }
+        return value
+    }
+
     // MARK: - Ironwood migration
 
     @DBActor func migrationState(for account: AccountUUID) async throws -> MigrationState {
@@ -1258,6 +1360,234 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             return try JSONDecoder().decode(MigrationState.self, from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
         } catch {
             throw ZcashError.rustMigrationState("Failed to decode MigrationState: \(error)")
+        }
+    }
+
+    @DBActor func migrationSnapshot(for account: AccountUUID) async throws -> MigrationSnapshot {
+        let unavailableSnapshot = {
+            MigrationSnapshot.unavailable(
+                accountUuid: self.accountUUIDString(account),
+                network: (try? self.consensusChainName()) ?? self.networkType.chainName,
+                consensusFingerprint: (try? self.consensusParametersFingerprint()) ?? ""
+            )
+        }
+        let ptr = zcashlc_migration_snapshot(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            if
+                let metadata = migrationEngineSchemaMetadata(),
+                metadata.isNewer,
+                let foundVersion = metadata.foundVersion,
+                foundVersion > metadata.supportedVersion
+            {
+                return .appUpdateRequired(
+                    foundSchemaVersion: foundVersion,
+                    accountUuid: accountUUIDString(account),
+                    network: (try? consensusChainName()) ?? networkType.chainName
+                )
+            }
+            return unavailableSnapshot()
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            let snapshot = try JSONDecoder().decode(
+                MigrationSnapshot.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+            do {
+                return try snapshot.validated(
+                    accountUuid: accountUUIDString(account),
+                    network: try consensusChainName(),
+                    consensusFingerprint: try consensusParametersFingerprint()
+                )
+            }
+        } catch let error as MigrationSnapshotValidationError {
+            _ = error
+            return unavailableSnapshot()
+        } catch let error as ZcashError {
+            _ = error
+            return unavailableSnapshot()
+        } catch {
+            return unavailableSnapshot()
+        }
+    }
+
+    @DBActor func migrationBeginPrivate(
+        externalSigner: Bool,
+        policy: SubmissionPolicy,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let policyBytes = [UInt8](try JSONEncoder().encode(policy))
+        return try decodeMigrationSnapshot(
+            policyBytes.withUnsafeBufferPointer { policyPtr in
+                zcashlc_migration_begin_private(
+                    dbData.0,
+                    dbData.1,
+                    account.id,
+                    networkType.networkId,
+                    externalSigner,
+                    policyPtr.baseAddress,
+                    UInt(policyBytes.count)
+                )
+            },
+            operation: "beginPrivateMigration",
+            account: account
+        )
+    }
+
+    @DBActor func migrationBindSubmissionPolicy(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        policy: SubmissionPolicy,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let policyBytes = [UInt8](try JSONEncoder().encode(policy))
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            policyBytes.withUnsafeBufferPointer { policyPtr in
+                zcashlc_migration_bind_submission_policy(
+                    dbData.0,
+                    dbData.1,
+                    account.id,
+                    networkType.networkId,
+                    runIdPtr.baseAddress,
+                    expectedRevision,
+                    policyPtr.baseAddress,
+                    UInt(policyBytes.count)
+                )
+            }
+        }
+        guard let ptr else {
+            let message = lastErrorMessage(fallback: "`bindSubmissionPolicy` failed with unknown error")
+            if zcashlc_last_migration_error_code() == Self.immutableSubmissionPolicyConflictErrorCode {
+                throw MigrationSubmissionPolicyBindingError.immutablePolicyConflict
+            }
+            throw ZcashError.rustMigrationSnapshot(message)
+        }
+        return try decodeMigrationSnapshot(ptr, operation: "bindSubmissionPolicy", account: account)
+    }
+
+    @DBActor func migrationRecordSubmissionPolicyValidationFailure(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        failure: SubmissionPolicyValidationFailure,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            zcashlc_migration_record_submission_policy_validation_failure(
+                dbData.0, dbData.1, account.id, networkType.networkId, runIdPtr.baseAddress,
+                expectedRevision, failure.rawValue
+            )
+        }
+        return try decodeMigrationSnapshot(
+            ptr,
+            operation: "recordSubmissionPolicyValidationFailure",
+            account: account
+        )
+    }
+
+    @DBActor func migrationPause(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            zcashlc_migration_pause(
+                dbData.0, dbData.1, account.id, networkType.networkId, runIdPtr.baseAddress, expectedRevision
+            )
+        }
+        return try decodeMigrationSnapshot(
+            ptr,
+            operation: "pauseMigration",
+            account: account
+        )
+    }
+
+    @DBActor func migrationRetryAutomaticRecovery(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            zcashlc_migration_retry_automatic_recovery(
+                dbData.0, dbData.1, account.id, networkType.networkId, runIdPtr.baseAddress, expectedRevision
+            )
+        }
+        return try decodeMigrationSnapshot(
+            ptr,
+            operation: "retryAutomaticMigrationRecovery",
+            account: account
+        )
+    }
+
+    @DBActor func migrationResume(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            zcashlc_migration_resume(
+                dbData.0, dbData.1, account.id, networkType.networkId, runIdPtr.baseAddress, expectedRevision
+            )
+        }
+        return try decodeMigrationSnapshot(
+            ptr,
+            operation: "resumeMigration",
+            account: account
+        )
+    }
+
+    @DBActor func migrationRequestAbandonment(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            zcashlc_migration_request_abandonment(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                runIdPtr.baseAddress,
+                expectedRevision
+            )
+        }
+        return try decodeMigrationSnapshot(
+            ptr,
+            operation: "requestMigrationAbandonment",
+            account: account
+        )
+    }
+
+    @DBActor private func decodeMigrationSnapshot(
+        _ ptr: UnsafeMutablePointer<FfiBoxedSlice>?,
+        operation: String,
+        account: AccountUUID
+    ) throws -> MigrationSnapshot {
+        guard let ptr else {
+            throw ZcashError.rustMigrationSnapshot(
+                lastErrorMessage(fallback: "`\(operation)` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            let snapshot = try JSONDecoder().decode(
+                MigrationSnapshot.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+            return try snapshot.validated(
+                accountUuid: accountUUIDString(account),
+                network: try consensusChainName(),
+                consensusFingerprint: try consensusParametersFingerprint()
+            )
+        } catch let error as MigrationSnapshotValidationError {
+            throw error
+        } catch {
+            throw ZcashError.rustMigrationSnapshot("Invalid `\(operation)` snapshot: \(error)")
         }
     }
 
@@ -1300,20 +1630,29 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor func migrationSignNoteSplit(proposal: NoteSplitProposal, usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> PreparedTx {
+    @DBActor func migrationSignNoteSplit(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        proposal: NoteSplitProposal,
+        usk: UnifiedSpendingKey,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> PreparedTx {
         let proposalBytes = [UInt8](try JSONEncoder().encode(proposal))
-        let ptr = proposalBytes.withUnsafeBufferPointer { proposalPtr in
-            usk.bytes.withUnsafeBufferPointer { uskPtr in
-                zcashlc_migration_sign_note_split(
-                    dbData.0,
-                    dbData.1,
-                    account.id,
-                    networkType.networkId,
-                    proposalPtr.baseAddress,
-                    UInt(proposalBytes.count),
-                    uskPtr.baseAddress,
-                    UInt(usk.bytes.count)
-                )
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+                proposalBytes.withUnsafeBufferPointer { proposalPtr in
+                    usk.bytes.withUnsafeBufferPointer { uskPtr in
+                        zcashlc_migration_sign_note_split(
+                            dbData.0, dbData.1, account.id, networkType.networkId,
+                            runIdPtr.baseAddress, expectedRevision,
+                            proposalPtr.baseAddress, UInt(proposalBytes.count),
+                            uskPtr.baseAddress, UInt(usk.bytes.count), fingerprintPtr.baseAddress
+                        )
+                    }
+                }
             }
         }
         guard let ptr else {
@@ -1327,28 +1666,73 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor func migrationCreateUnsignedNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt {
-        let ptr = zcashlc_migration_create_unsigned_note_split_pczt(dbData.0, dbData.1, account.id, networkType.networkId)
+    @DBActor func migrationCreateUnsignedNoteSplitPCZT(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        proposal: NoteSplitProposal,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedNoteSplitPCZT {
+        let proposalBytes = [UInt8](try JSONEncoder().encode(proposal))
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+                proposalBytes.withUnsafeBufferPointer { proposalPtr in
+                    zcashlc_migration_create_unsigned_note_split_pczt(
+                        dbData.0, dbData.1, account.id, networkType.networkId,
+                        runIdPtr.baseAddress, expectedRevision,
+                        proposalPtr.baseAddress, UInt(proposalBytes.count), fingerprintPtr.baseAddress
+                    )
+                }
+            }
+        }
         guard let ptr else {
             throw ZcashError.rustMigrationCreateUnsignedNoteSplitPCZT(
                 lastErrorMessage(fallback: "`migrationCreateUnsignedNoteSplitPCZT` failed with unknown error")
             )
         }
         defer { zcashlc_free_boxed_slice(ptr) }
-        return Pczt(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+        do {
+            return try JSONDecoder().decode(
+                ClaimedNoteSplitPCZT.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationCreateUnsignedNoteSplitPCZT(
+                "Failed to decode ClaimedNoteSplitPCZT: \(error)"
+            )
+        }
     }
 
-    @DBActor func migrationStoreSignedNoteSplitPCZT(pczt: Pczt, for account: AccountUUID) async throws -> PreparedTx {
+    @DBActor func migrationStoreSignedNoteSplitPCZT(
+        claim: ClaimedNoteSplitPCZT,
+        pczt: Pczt,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> PreparedTx {
         let pcztBytes = [UInt8](pczt)
-        let ptr = pcztBytes.withUnsafeBufferPointer { pcztPtr in
-            zcashlc_migration_store_signed_note_split_pczt(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                pcztPtr.baseAddress,
-                UInt(pcztBytes.count)
-            )
+        let runId = [CChar](claim.runId.utf8CString)
+        let signerToken = [CChar](claim.signerToken.utf8CString)
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let ptr = fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+            runId.withUnsafeBufferPointer { runIdPtr in
+                signerToken.withUnsafeBufferPointer { signerTokenPtr in
+                    pcztBytes.withUnsafeBufferPointer { pcztPtr in
+                        zcashlc_migration_store_signed_note_split_pczt(
+                            dbData.0,
+                            dbData.1,
+                            account.id,
+                            networkType.networkId,
+                            runIdPtr.baseAddress,
+                            signerTokenPtr.baseAddress,
+                            pcztPtr.baseAddress,
+                            UInt(pcztBytes.count),
+                            fingerprintPtr.baseAddress
+                        )
+                    }
+                }
+            }
         }
         guard let ptr else {
             throw ZcashError.rustMigrationStoreSignedNoteSplitPCZT(
@@ -1365,18 +1749,23 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor func migrationCreateUnsignedTransferPCZTs(
         schedule: MigrationSchedule,
+        expectedPolicyFingerprint: String,
         for account: AccountUUID
     ) async throws -> [MigrationTransferPCZT] {
         let scheduleBytes = [UInt8](try JSONEncoder().encode(schedule))
-        let ptr = scheduleBytes.withUnsafeBufferPointer { schedulePtr in
-            zcashlc_migration_create_unsigned_transfer_pczts(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                schedulePtr.baseAddress,
-                UInt(scheduleBytes.count)
-            )
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let ptr = fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+            scheduleBytes.withUnsafeBufferPointer { schedulePtr in
+                zcashlc_migration_create_unsigned_transfer_pczts(
+                    dbData.0,
+                    dbData.1,
+                    account.id,
+                    networkType.networkId,
+                    schedulePtr.baseAddress,
+                    UInt(scheduleBytes.count),
+                    fingerprintPtr.baseAddress
+                )
+            }
         }
         guard let ptr else {
             throw ZcashError.rustMigrationCreateUnsignedTransferPCZTs(
@@ -1391,17 +1780,25 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor func migrationStoreSignedSchedulePCZTs(pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws {
+    @DBActor func migrationStoreSignedSchedulePCZTs(
+        pczts: [MigrationTransferPCZT],
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws {
         let signedBytes = [UInt8](try JSONEncoder().encode(pczts))
-        let ptr = signedBytes.withUnsafeBufferPointer { signedPtr in
-            zcashlc_migration_store_signed_schedule_pczts(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                signedPtr.baseAddress,
-                UInt(signedBytes.count)
-            )
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let ptr = fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+            signedBytes.withUnsafeBufferPointer { signedPtr in
+                zcashlc_migration_store_signed_schedule_pczts(
+                    dbData.0,
+                    dbData.1,
+                    account.id,
+                    networkType.networkId,
+                    signedPtr.baseAddress,
+                    UInt(signedBytes.count),
+                    fingerprintPtr.baseAddress
+                )
+            }
         }
         guard let ptr else {
             throw ZcashError.rustMigrationStoreSignedSchedulePCZTs(
@@ -1437,20 +1834,95 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor func migrationSignAndStore(schedule: MigrationSchedule, usk: UnifiedSpendingKey, for account: AccountUUID) async throws {
+    @DBActor func migrationProposePrivateIntents(for account: AccountUUID) async throws -> MigrationIntentSchedule {
+        let ptr = zcashlc_migration_propose_private_intents(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationProposePrivateIntents(
+                lastErrorMessage(fallback: "`migrationProposePrivateIntents` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                MigrationIntentSchedule.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationProposePrivateIntents(
+                "Failed to decode MigrationIntentSchedule: \(error)"
+            )
+        }
+    }
+
+    @DBActor func migrationProposeImmediateIntent(for account: AccountUUID) async throws -> MigrationIntentSchedule {
+        let ptr = zcashlc_migration_propose_immediate_intent(dbData.0, dbData.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationProposeImmediateIntent(
+                lastErrorMessage(fallback: "`migrationProposeImmediateIntent` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                MigrationIntentSchedule.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationProposeImmediateIntent(
+                "Failed to decode MigrationIntentSchedule: \(error)"
+            )
+        }
+    }
+
+    @DBActor func migrationCommitIntents(
+        schedule: MigrationIntentSchedule,
+        externalSigner: Bool,
+        policy: SubmissionPolicy,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
         let scheduleBytes = [UInt8](try JSONEncoder().encode(schedule))
+        let policyBytes = [UInt8](try JSONEncoder().encode(policy))
         let ptr = scheduleBytes.withUnsafeBufferPointer { schedulePtr in
-            usk.bytes.withUnsafeBufferPointer { uskPtr in
-                zcashlc_migration_sign_and_store(
+            policyBytes.withUnsafeBufferPointer { policyPtr in
+                zcashlc_migration_commit_intents(
                     dbData.0,
                     dbData.1,
                     account.id,
                     networkType.networkId,
                     schedulePtr.baseAddress,
                     UInt(scheduleBytes.count),
-                    uskPtr.baseAddress,
-                    UInt(usk.bytes.count)
+                    externalSigner,
+                    policyPtr.baseAddress,
+                    UInt(policyBytes.count)
                 )
+            }
+        }
+        return try decodeMigrationSnapshot(ptr, operation: "commitMigrationIntents", account: account)
+    }
+
+    @DBActor func migrationSignAndStore(
+        schedule: MigrationSchedule,
+        usk: UnifiedSpendingKey,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws {
+        let scheduleBytes = [UInt8](try JSONEncoder().encode(schedule))
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let ptr = fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+            scheduleBytes.withUnsafeBufferPointer { schedulePtr in
+                usk.bytes.withUnsafeBufferPointer { uskPtr in
+                    zcashlc_migration_sign_and_store(
+                        dbData.0,
+                        dbData.1,
+                        account.id,
+                        networkType.networkId,
+                        schedulePtr.baseAddress,
+                        UInt(scheduleBytes.count),
+                        uskPtr.baseAddress,
+                        UInt(usk.bytes.count),
+                        fingerprintPtr.baseAddress
+                    )
+                }
             }
         }
         guard let ptr else {
@@ -1485,7 +1957,283 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor func migrationExtractBroadcastTx(pczt: [UInt8], for account: AccountUUID) async throws -> [UInt8] {
+    @DBActor func migrationClaimNextDueTransfer(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        leaseDurationMs: UInt64,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTx? {
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+                zcashlc_migration_claim_next_due_transfer(
+                    dbData.0, dbData.1, account.id, networkType.networkId,
+                    runIdPtr.baseAddress, expectedRevision, leaseDurationMs, fingerprintPtr.baseAddress
+                )
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationClaimNextDueTransfer(
+                lastErrorMessage(fallback: "`migrationClaimNextDueTransfer` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                ClaimedTx?.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationClaimNextDueTransfer("Failed to decode ClaimedTx: \(error)")
+        }
+    }
+
+    @DBActor func migrationClaimNoteSplitSubmission(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        leaseDurationMs: UInt64,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTx? {
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+                zcashlc_migration_claim_note_split_submission(
+                    dbData.0, dbData.1, account.id, networkType.networkId,
+                    runIdPtr.baseAddress, expectedRevision, leaseDurationMs, fingerprintPtr.baseAddress
+                )
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationClaimNoteSplitSubmission(
+                lastErrorMessage(fallback: "`migrationClaimNoteSplitSubmission` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                ClaimedTx?.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationClaimNoteSplitSubmission("Failed to decode ClaimedTx: \(error)")
+        }
+    }
+
+    @DBActor func migrationMaterializeAndClaimNextDue(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        leaseDurationMs: UInt64,
+        usk: UnifiedSpendingKey,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTx? {
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+                usk.bytes.withUnsafeBufferPointer { uskPtr in
+                    zcashlc_migration_materialize_and_claim_next_due(
+                        dbData.0, dbData.1, account.id, networkType.networkId,
+                        runIdPtr.baseAddress, expectedRevision, leaseDurationMs,
+                        uskPtr.baseAddress, UInt(usk.bytes.count), fingerprintPtr.baseAddress
+                    )
+                }
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationMaterializeAndClaimNextDue(
+                lastErrorMessage(fallback: "`migrationMaterializeAndClaimNextDue` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                ClaimedTx?.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationMaterializeAndClaimNextDue("Failed to decode ClaimedTx: \(error)")
+        }
+    }
+
+    @DBActor func migrationStageNextDueExternalPCZT(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        leaseDurationMs: UInt64,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTransferPCZT? {
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+                zcashlc_migration_stage_next_due_external_pczt(
+                    dbData.0, dbData.1, account.id, networkType.networkId,
+                    runIdPtr.baseAddress, expectedRevision, leaseDurationMs, fingerprintPtr.baseAddress
+                )
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationStageNextDueExternalPCZT(
+                lastErrorMessage(fallback: "`migrationStageNextDueExternalPCZT` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                ClaimedTransferPCZT?.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationStageNextDueExternalPCZT(
+                "Failed to decode ClaimedTransferPCZT: \(error)"
+            )
+        }
+    }
+
+    @DBActor func migrationResumeNoteSplitExternalPCZT(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedNoteSplitPCZT? {
+        let runId = [CChar](expectedRunId.utf8CString)
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+                zcashlc_migration_resume_note_split_external_pczt(
+                    dbData.0, dbData.1, account.id, networkType.networkId,
+                    runIdPtr.baseAddress, expectedRevision, fingerprintPtr.baseAddress
+                )
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationCreateUnsignedNoteSplitPCZT(
+                lastErrorMessage(fallback: "`migrationResumeNoteSplitExternalPCZT` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try JSONDecoder().decode(
+            ClaimedNoteSplitPCZT?.self,
+            from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+        )
+    }
+
+    @DBActor func migrationResumeDueExternalPCZT(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        leaseDurationMs: UInt64,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTransferPCZT? {
+        let runId = [CChar](expectedRunId.utf8CString)
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+                zcashlc_migration_resume_due_external_pczt(
+                    dbData.0, dbData.1, account.id, networkType.networkId,
+                    runIdPtr.baseAddress, expectedRevision, leaseDurationMs, fingerprintPtr.baseAddress
+                )
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationStageNextDueExternalPCZT(
+                lastErrorMessage(fallback: "`migrationResumeDueExternalPCZT` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try JSONDecoder().decode(
+            ClaimedTransferPCZT?.self,
+            from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+        )
+    }
+
+    @DBActor func migrationResumeStagedSubmission(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        leaseDurationMs: UInt64,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTx? {
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let runId = [CChar](expectedRunId.utf8CString)
+        let ptr = runId.withUnsafeBufferPointer { runIdPtr in
+            fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+                zcashlc_migration_resume_staged_submission(
+                    dbData.0, dbData.1, account.id, networkType.networkId,
+                    runIdPtr.baseAddress, expectedRevision, leaseDurationMs, fingerprintPtr.baseAddress
+                )
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationResumeStagedSubmission(
+                lastErrorMessage(fallback: "`migrationResumeStagedSubmission` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                ClaimedTx?.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationResumeStagedSubmission("Failed to decode ClaimedTx: \(error)")
+        }
+    }
+
+    @DBActor func migrationStoreSignedDueIntent(
+        intentId: String,
+        signerToken: String,
+        pczt: Pczt,
+        leaseDurationMs: UInt64,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTx? {
+        let pcztBytes = [UInt8](pczt)
+        let intentIdCString = [CChar](intentId.utf8CString)
+        let signerTokenCString = [CChar](signerToken.utf8CString)
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let ptr = fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+            intentIdCString.withUnsafeBufferPointer { intentIdPtr in
+                signerTokenCString.withUnsafeBufferPointer { signerTokenPtr in
+                    pcztBytes.withUnsafeBufferPointer { pcztPtr in
+                        zcashlc_migration_store_signed_due_intent(
+                            dbData.0,
+                            dbData.1,
+                            account.id,
+                            networkType.networkId,
+                            intentIdPtr.baseAddress,
+                            signerTokenPtr.baseAddress,
+                            pcztPtr.baseAddress,
+                            UInt(pcztBytes.count),
+                            leaseDurationMs,
+                            fingerprintPtr.baseAddress
+                        )
+                    }
+                }
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationStoreSignedDueIntent(
+                lastErrorMessage(fallback: "`migrationStoreSignedDueIntent` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                ClaimedTx?.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationStoreSignedDueIntent("Failed to decode ClaimedTx: \(error)")
+        }
+    }
+
+    @DBActor func migrationExtractBroadcastTx(pczt: [UInt8], for account: AccountUUID) async throws -> ExtractedTx {
         let ptr = pczt.withUnsafeBufferPointer { pcztPtr in
             zcashlc_migration_extract_broadcast_tx(
                 dbData.0,
@@ -1500,19 +2248,34 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             throw ZcashError.rustMigrationExtractBroadcastTx(lastErrorMessage(fallback: "`migrationExtractBroadcastTx` failed with unknown error"))
         }
         defer { zcashlc_free_boxed_slice(ptr) }
-        return [UInt8](Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        do {
+            return try JSONDecoder().decode(
+                ExtractedTx.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationExtractBroadcastTx("Failed to decode ExtractedTx: \(error)")
+        }
     }
 
-    @DBActor func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32 {
-        let ptr = usk.bytes.withUnsafeBufferPointer { uskPtr in
-            zcashlc_migration_refresh_stale_transfers(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                uskPtr.baseAddress,
-                UInt(usk.bytes.count)
-            )
+    @DBActor func migrationRefreshStaleTransfers(
+        usk: UnifiedSpendingKey,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> UInt32 {
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let ptr = fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+            usk.bytes.withUnsafeBufferPointer { uskPtr in
+                zcashlc_migration_refresh_stale_transfers(
+                    dbData.0,
+                    dbData.1,
+                    account.id,
+                    networkType.networkId,
+                    uskPtr.baseAddress,
+                    UInt(usk.bytes.count),
+                    fingerprintPtr.baseAddress
+                )
+            }
         }
         guard let ptr else {
             throw ZcashError.rustMigrationRefreshStaleTransfers(lastErrorMessage(fallback: "`migrationRefreshStaleTransfers` failed with unknown error"))
@@ -1540,6 +2303,149 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
         guard let ptr else {
             throw ZcashError.rustMigrationRecordTransferResult(lastErrorMessage(fallback: "`migrationRecordTransferResult` failed with unknown error"))
+        }
+        zcashlc_free_boxed_slice(ptr)
+    }
+
+    @DBActor func migrationRecordClaimedTransferResult(
+        transferId: String,
+        attemptToken: String,
+        result: TransferResult,
+        for account: AccountUUID
+    ) async throws {
+        let resultBytes = [UInt8](try JSONEncoder().encode(result))
+        let transferIdCString = [CChar](transferId.utf8CString)
+        let attemptTokenCString = [CChar](attemptToken.utf8CString)
+        let ptr = transferIdCString.withUnsafeBufferPointer { transferIdPtr in
+            attemptTokenCString.withUnsafeBufferPointer { attemptTokenPtr in
+                resultBytes.withUnsafeBufferPointer { resultPtr in
+                    zcashlc_migration_record_claimed_transfer_result(
+                        dbData.0,
+                        dbData.1,
+                        account.id,
+                        networkType.networkId,
+                        transferIdPtr.baseAddress,
+                        attemptTokenPtr.baseAddress,
+                        resultPtr.baseAddress,
+                        UInt(resultBytes.count)
+                    )
+                }
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationRecordClaimedTransferResult(
+                lastErrorMessage(fallback: "`migrationRecordClaimedTransferResult` failed with unknown error")
+            )
+        }
+        zcashlc_free_boxed_slice(ptr)
+    }
+
+    @DBActor func migrationRenewClaimedTransferLease(
+        transferId: String,
+        attemptToken: String,
+        leaseDurationMs: UInt64,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTx? {
+        let transferIdCString = [CChar](transferId.utf8CString)
+        let attemptTokenCString = [CChar](attemptToken.utf8CString)
+        let fingerprint = [CChar](expectedPolicyFingerprint.utf8CString)
+        let ptr = fingerprint.withUnsafeBufferPointer { fingerprintPtr in
+            transferIdCString.withUnsafeBufferPointer { transferIdPtr in
+                attemptTokenCString.withUnsafeBufferPointer { attemptTokenPtr in
+                    zcashlc_migration_renew_claimed_transfer_lease(
+                        dbData.0,
+                        dbData.1,
+                        account.id,
+                        networkType.networkId,
+                        transferIdPtr.baseAddress,
+                        attemptTokenPtr.baseAddress,
+                        leaseDurationMs,
+                        fingerprintPtr.baseAddress
+                    )
+                }
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationRecordClaimedTransferResult(
+                lastErrorMessage(fallback: "`migrationRenewClaimedTransferLease` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                ClaimedTx?.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationRecordClaimedTransferResult(
+                "Failed to decode renewed ClaimedTx: \(error)"
+            )
+        }
+    }
+
+    @DBActor func migrationReleaseClaimedTransferKnownUnsent(
+        transferId: String,
+        attemptToken: String,
+        reason: KnownUnsentReason,
+        for account: AccountUUID
+    ) async throws {
+        let reasonBytes = [UInt8](try JSONEncoder().encode(reason))
+        let transferIdCString = [CChar](transferId.utf8CString)
+        let attemptTokenCString = [CChar](attemptToken.utf8CString)
+        let ptr = transferIdCString.withUnsafeBufferPointer { transferIdPtr in
+            attemptTokenCString.withUnsafeBufferPointer { attemptTokenPtr in
+                reasonBytes.withUnsafeBufferPointer { reasonPtr in
+                    zcashlc_migration_release_claimed_transfer_known_unsent(
+                        dbData.0,
+                        dbData.1,
+                        account.id,
+                        networkType.networkId,
+                        transferIdPtr.baseAddress,
+                        attemptTokenPtr.baseAddress,
+                        reasonPtr.baseAddress,
+                        UInt(reasonBytes.count)
+                    )
+                }
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationRecordClaimedTransferResult(
+                lastErrorMessage(fallback: "`migrationReleaseClaimedTransferKnownUnsent` failed with unknown error")
+            )
+        }
+        zcashlc_free_boxed_slice(ptr)
+    }
+
+    @DBActor func migrationRecordClaimedTransferLocalFailure(
+        transferId: String,
+        attemptToken: String,
+        failure: LocalSubmissionFailure,
+        for account: AccountUUID
+    ) async throws {
+        let failureBytes = [UInt8](try JSONEncoder().encode(failure))
+        let transferIdCString = [CChar](transferId.utf8CString)
+        let attemptTokenCString = [CChar](attemptToken.utf8CString)
+        let ptr = transferIdCString.withUnsafeBufferPointer { transferIdPtr in
+            attemptTokenCString.withUnsafeBufferPointer { attemptTokenPtr in
+                failureBytes.withUnsafeBufferPointer { failurePtr in
+                    zcashlc_migration_record_claimed_transfer_local_failure(
+                        dbData.0,
+                        dbData.1,
+                        account.id,
+                        networkType.networkId,
+                        transferIdPtr.baseAddress,
+                        attemptTokenPtr.baseAddress,
+                        failurePtr.baseAddress,
+                        UInt(failureBytes.count)
+                    )
+                }
+            }
+        }
+        guard let ptr else {
+            throw ZcashError.rustMigrationRecordClaimedTransferResult(
+                lastErrorMessage(fallback: "`migrationRecordClaimedTransferLocalFailure` failed with unknown error")
+            )
         }
         zcashlc_free_boxed_slice(ptr)
     }

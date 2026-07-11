@@ -14,6 +14,13 @@ import Combine
 public class SDKSynchronizer: Synchronizer {
     private enum Constants {
         static let fixWitnessesLastVersionCall = "ud_fixWitnessesLastVersionCall"
+        /// Long enough for a normal submit round-trip, short enough that a killed worker repairs
+        /// itself promptly on the next foreground/background opportunity.
+        static let migrationLeaseDurationMs: UInt64 = 15 * 60 * 1_000
+    }
+
+    private enum MigrationClaimLifecycleError: Error {
+        case insufficientLeaseBudget
     }
 
     public var alias: ZcashSynchronizerAlias { initializer.alias }
@@ -55,6 +62,7 @@ public class SDKSynchronizer: Synchronizer {
     private let syncSessionTicker: SessionTicker
     var latestBlocksDataProvider: LatestBlocksDataProvider
     private let submitPlanStore: SubmitPlanStoring
+    private let migrationTransactionSubmitter: MigrationTransactionSubmitting
 
     private var broadcasterStorage: SDKBroadcaster?
     public var broadcaster: Broadcaster { sdkBroadcaster }
@@ -87,7 +95,8 @@ public class SDKSynchronizer: Synchronizer {
         transactionEncoder: TransactionEncoder,
         transactionRepository: TransactionRepository,
         blockProcessor: CompactBlockProcessor,
-        syncSessionTicker: SessionTicker
+        syncSessionTicker: SessionTicker,
+        migrationTransactionSubmitter: MigrationTransactionSubmitting? = nil
     ) {
         self.connectionState = .idle
         self.underlyingStatus = GenericActor(status)
@@ -104,6 +113,10 @@ public class SDKSynchronizer: Synchronizer {
         self.latestBlocksDataProvider = initializer.container.resolve(LatestBlocksDataProvider.self)
         self.sdkFlags = initializer.container.resolve(SDKFlags.self)
         self.submitPlanStore = initializer.container.resolve(SubmitPlanStoring.self)
+        self.migrationTransactionSubmitter = migrationTransactionSubmitter ?? LiveMigrationTransactionSubmitter(
+            torClient: initializer.container.resolve(TorClient.self),
+            logger: initializer.logger
+        )
 
         self.broadcasterStorage = SDKBroadcaster(
             transactionEncoder: transactionEncoder,
@@ -519,6 +532,93 @@ public class SDKSynchronizer: Synchronizer {
         try await initializer.rustBackend.migrationState(for: account)
     }
 
+    public func migrationSnapshot(for account: AccountUUID) async throws -> MigrationSnapshot {
+        try await initializer.rustBackend.migrationSnapshot(for: account)
+    }
+
+    public func beginPrivateMigration(
+        externalSigner: Bool,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let policy = try await validatedSubmissionPolicy(options: options).policy
+        let started = try await initializer.rustBackend.migrationBeginPrivate(
+            externalSigner: externalSigner,
+            policy: policy,
+            for: account
+        )
+        guard started.submissionPolicy?.policy == policy else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        return started
+    }
+
+    public func bindMigrationSubmissionPolicy(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let snapshot = try await migrationSnapshot(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+        return try await validatedAndBindSubmissionPolicy(
+            options: options,
+            snapshot: snapshot,
+            for: account
+        ).snapshot
+    }
+
+    public func pauseMigration(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        try await initializer.rustBackend.migrationPause(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+    }
+
+    public func retryAutomaticMigrationRecovery(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        try await initializer.rustBackend.migrationRetryAutomaticRecovery(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+    }
+
+    public func resumeMigration(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        try await initializer.rustBackend.migrationResume(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+    }
+
+    public func requestMigrationAbandonment(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        try await initializer.rustBackend.migrationRequestAbandonment(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+    }
+
     public func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress? {
         try await initializer.rustBackend.migrationProgress(for: account)
     }
@@ -532,90 +632,407 @@ public class SDKSynchronizer: Synchronizer {
     }
 
     public func submitNoteSplit(
+        expectedRunId: String,
+        expectedRevision: UInt64,
         proposal: NoteSplitProposal,
         spendingKey: UnifiedSpendingKey,
         options: NetworkPrivacyOptions,
         for account: AccountUUID
     ) async throws -> TransferResult {
-        // `options` is accepted but ignored in v1 (see `broadcastMigrationTx`).
-        let prepared = try await initializer.rustBackend.migrationSignNoteSplit(
-            proposal: proposal,
-            usk: spendingKey,
-            for: account
-        )
-        let result = try await broadcastMigrationTx(prepared, for: account)
-        // Record the broadcast so the engine advances the split phase (mirrors
-        // `executeNextPendingTransfer`). `prepared.id` is `prep:<run_id>`, which the crate maps to
-        // the denomination-split flow; without this the state is stuck at `preparing_denominations`.
-        try await initializer.rustBackend.migrationRecordTransferResult(
-            transferId: prepared.id,
-            result: result,
-            for: account
-        )
-        return result
-    }
-
-    public func proposeNoteSplitPCZT(for account: AccountUUID) async throws -> Pczt {
-        try await initializer.rustBackend.migrationCreateUnsignedNoteSplitPCZT(for: account)
-    }
-
-    public func submitSignedNoteSplitPCZT(_ pczt: Pczt, for account: AccountUUID) async throws -> TransferResult {
-        // Mirrors `submitNoteSplit`: the store step replaces the internal signing, then the
-        // broadcast + record composition is identical (`prepared.id` is `prep:<run_id>`).
-        let prepared: PreparedTx
-        do {
-            prepared = try await initializer.rustBackend.migrationStoreSignedNoteSplitPCZT(pczt: pczt, for: account)
-        } catch {
-            // Retry safety: the crate consumes the staged original atomically with creating the
-            // run, so retrying after a failed broadcast finds nothing staged and the store throws.
-            // In exactly that state the crate's next-due transfer is the run's still-pending
-            // (`prep:<run_id>`) prep transaction — re-broadcast it instead of double-storing.
-            // Any other store failure leaves no pending prep tx, so the original error propagates.
-            guard
-                let pending = try? await initializer.rustBackend.migrationNextDueTransfer(for: account),
-                pending.id.hasPrefix("prep:")
-            else { throw error }
-            prepared = pending
+        let current = try await initializer.rustBackend.migrationSnapshot(for: account)
+        guard current.runId == expectedRunId,
+              current.revision == expectedRevision,
+              !current.externalSigner else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
         }
-        let result = try await broadcastMigrationTx(prepared, for: account)
-        try await initializer.rustBackend.migrationRecordTransferResult(
-            transferId: prepared.id,
-            result: result,
+        let binding = try await validatedAndBindSubmissionPolicy(
+            options: options,
+            snapshot: current,
             for: account
         )
-        return result
+        guard binding.snapshot.runId == expectedRunId else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        let boundPolicy = binding.policy
+        let claim: ClaimedTx?
+        do {
+            _ = try await initializer.rustBackend.migrationSignNoteSplit(
+                expectedRunId: expectedRunId,
+                expectedRevision: binding.snapshot.revision,
+                proposal: proposal,
+                usk: spendingKey,
+                expectedPolicyFingerprint: boundPolicy.policyFingerprint,
+                for: account
+            )
+            claim = try await claimNoteSplitSubmission(
+                expectedRunId: expectedRunId,
+                expectedPolicyFingerprint: boundPolicy.policyFingerprint,
+                for: account
+            )
+        } catch {
+            // If persistence completed before a crash/retry, signing correctly rejects creating a
+            // second split. Resume the engine-owned bytes; otherwise preserve the original error.
+            guard let recovered = try await claimNoteSplitSubmission(
+                expectedRunId: expectedRunId,
+                expectedPolicyFingerprint: boundPolicy.policyFingerprint,
+                for: account
+            ) else { throw error }
+            claim = recovered
+        }
+        guard let claim else {
+            throw ZcashError.rustMigrationClaimNoteSplitSubmission("persisted note split was not claimable")
+        }
+        let execution = try await submitMigrationClaim(claim, options: options, for: account)
+        return execution.submissionResult ?? .outcomeUnknown
     }
 
-    public func proposeMigrationTransferPCZTs(
+    public func proposeNoteSplitPCZT(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        proposal: NoteSplitProposal,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> ClaimedNoteSplitPCZT {
+        let current = try await initializer.rustBackend.migrationSnapshot(for: account)
+        guard current.runId == expectedRunId,
+              current.revision == expectedRevision,
+              current.externalSigner else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        let binding = try await validatedAndBindSubmissionPolicy(
+            options: options,
+            snapshot: current,
+            for: account
+        )
+        guard binding.snapshot.runId == expectedRunId else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        return try await initializer.rustBackend.migrationCreateUnsignedNoteSplitPCZT(
+            expectedRunId: expectedRunId,
+            expectedRevision: binding.snapshot.revision,
+            proposal: proposal,
+            expectedPolicyFingerprint: binding.policy.policyFingerprint,
+            for: account
+        )
+    }
+
+    public func submitSignedNoteSplitPCZT(
+        _ pczt: Pczt,
+        for signerClaim: ClaimedNoteSplitPCZT,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        account: AccountUUID
+    ) async throws -> TransferResult {
+        let current = try await migrationSnapshot(
+            expectedRunId: signerClaim.runId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+        let binding = try await validatedAndBindSubmissionPolicy(
+            options: options,
+            snapshot: current,
+            for: account
+        )
+        guard binding.policy == signerClaim.submissionPolicy else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        let claim: ClaimedTx?
+        do {
+            _ = try await initializer.rustBackend.migrationStoreSignedNoteSplitPCZT(
+                claim: signerClaim,
+                pczt: pczt,
+                expectedPolicyFingerprint: binding.policy.policyFingerprint,
+                for: account
+            )
+            claim = try await claimNoteSplitSubmission(
+                expectedRunId: signerClaim.runId,
+                expectedPolicyFingerprint: binding.policy.policyFingerprint,
+                for: account
+            )
+        } catch {
+            guard let recovered = try await claimNoteSplitSubmission(
+                expectedRunId: signerClaim.runId,
+                expectedPolicyFingerprint: binding.policy.policyFingerprint,
+                for: account
+            ) else { throw error }
+            claim = recovered
+        }
+        guard let claim else {
+            throw ZcashError.rustMigrationClaimNoteSplitSubmission("persisted note split was not claimable")
+        }
+        let execution = try await submitMigrationClaim(claim, options: options, for: account)
+        return execution.submissionResult ?? .outcomeUnknown
+    }
+
+    public func proposePrivateMigrationIntents(for account: AccountUUID) async throws -> MigrationIntentSchedule {
+        try await initializer.rustBackend.migrationProposePrivateIntents(for: account)
+    }
+
+    public func proposeImmediateMigrationIntent(for account: AccountUUID) async throws -> MigrationIntentSchedule {
+        try await initializer.rustBackend.migrationProposeImmediateIntent(for: account)
+    }
+
+    public func commitMigrationIntents(
+        _ schedule: MigrationIntentSchedule,
+        externalSigner: Bool,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let policy = try await validatedSubmissionPolicy(options: options).policy
+        let committed = try await initializer.rustBackend.migrationCommitIntents(
+            schedule: schedule,
+            externalSigner: externalSigner,
+            policy: policy,
+            for: account
+        )
+        guard committed.runId == schedule.runId,
+              committed.submissionPolicy?.policy == policy else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        return committed
+    }
+
+    public func executeNextMigrationAction(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        spendingKey: UnifiedSpendingKey?,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> MigrationExecutionResult {
+        let snapshot = try await migrationSnapshot(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+        guard [
+            NextAction.claimDueTransaction,
+            .materializeDueTransaction,
+            .resumeStagedSubmission
+        ].contains(snapshot.nextAction) else {
+            return MigrationExecutionResult(disposition: .noAction, submissionResult: nil, snapshot: snapshot)
+        }
+        let binding = try await validatedAndBindSubmissionPolicy(
+            options: options,
+            snapshot: snapshot,
+            for: account
+        )
+        guard binding.snapshot.runId == expectedRunId else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        let claim: ClaimedTx?
+        switch binding.snapshot.nextAction {
+        case .claimDueTransaction:
+            claim = try await claimPersistedSubmission(
+                snapshot: binding.snapshot,
+                expectedPolicyFingerprint: binding.policy.policyFingerprint,
+                for: account
+            )
+        case .materializeDueTransaction:
+            guard let spendingKey else {
+                return MigrationExecutionResult(disposition: .noAction, submissionResult: nil, snapshot: binding.snapshot)
+            }
+            claim = try await initializer.rustBackend.migrationMaterializeAndClaimNextDue(
+                expectedRunId: expectedRunId,
+                expectedRevision: binding.snapshot.revision,
+                leaseDurationMs: Constants.migrationLeaseDurationMs,
+                usk: spendingKey,
+                expectedPolicyFingerprint: binding.policy.policyFingerprint,
+                for: account
+            )
+        case .resumeStagedSubmission:
+            claim = try await initializer.rustBackend.migrationResumeStagedSubmission(
+                expectedRunId: expectedRunId,
+                expectedRevision: binding.snapshot.revision,
+                leaseDurationMs: Constants.migrationLeaseDurationMs,
+                expectedPolicyFingerprint: binding.policy.policyFingerprint,
+                for: account
+            )
+        case .initialize, .awaitUserChoice, .waitForSync, .preparePrivateSplit,
+             .waitForSplitConfirmation, .proposePrivateSchedule, .stageNoteSplitExternalSignature,
+             .stageDueExternalSignature, .waitForWorkerLease, .awaitExternalSignature,
+             .waitForDueHeight, .waitForConfirmation, .waitForSubmissionResolution,
+             .reviewUpdatedIntentFee, .reviewUpdatedMigrationPlan, .resumeMigration,
+             .waitForCancellationSafety, .recover, .none:
+            return MigrationExecutionResult(disposition: .noAction, submissionResult: nil, snapshot: binding.snapshot)
+        }
+        guard let claim else {
+            let refreshed = try await initializer.rustBackend.migrationSnapshot(for: account)
+            return MigrationExecutionResult(disposition: .noAction, submissionResult: nil, snapshot: refreshed)
+        }
+        return try await submitMigrationClaim(claim, options: options, for: account)
+    }
+
+    public func stageNextDueMigrationPCZT(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> ClaimedTransferPCZT? {
+        let snapshot = try await migrationSnapshot(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+        let isNewRound = snapshot.nextAction == .stageDueExternalSignature
+        let isResumableRound = snapshot.nextAction == .awaitExternalSignature
+            && snapshot.phase.map { [.broadcastScheduled, .broadcasting].contains($0) } == true
+        guard isNewRound || isResumableRound else { return nil }
+        let binding = try await validatedAndBindSubmissionPolicy(
+            options: options,
+            snapshot: snapshot,
+            for: account
+        )
+        guard binding.snapshot.runId == expectedRunId else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        if binding.snapshot.nextAction == .awaitExternalSignature {
+            return try await initializer.rustBackend.migrationResumeDueExternalPCZT(
+                expectedRunId: expectedRunId,
+                expectedRevision: binding.snapshot.revision,
+                leaseDurationMs: Constants.migrationLeaseDurationMs,
+                expectedPolicyFingerprint: binding.policy.policyFingerprint,
+                for: account
+            )
+        }
+        return try await initializer.rustBackend.migrationStageNextDueExternalPCZT(
+            expectedRunId: expectedRunId,
+            expectedRevision: binding.snapshot.revision,
+            leaseDurationMs: Constants.migrationLeaseDurationMs,
+            expectedPolicyFingerprint: binding.policy.policyFingerprint,
+            for: account
+        )
+    }
+
+    public func resumeNoteSplitExternalSigning(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> ClaimedNoteSplitPCZT? {
+        let snapshot = try await migrationSnapshot(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+        guard snapshot.nextAction == .awaitExternalSignature,
+              snapshot.phase == .preparingDenominations else { return nil }
+        let binding = try await validatedAndBindSubmissionPolicy(options: options, snapshot: snapshot, for: account)
+        guard binding.snapshot.runId == expectedRunId else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        return try await initializer.rustBackend.migrationResumeNoteSplitExternalPCZT(
+            expectedRunId: expectedRunId,
+            expectedRevision: binding.snapshot.revision,
+            expectedPolicyFingerprint: binding.policy.policyFingerprint,
+            for: account
+        )
+    }
+
+    public func resumeDueMigrationExternalSigning(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> ClaimedTransferPCZT? {
+        let snapshot = try await migrationSnapshot(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+        guard snapshot.nextAction == .awaitExternalSignature,
+              snapshot.phase.map({ [.broadcastScheduled, .broadcasting].contains($0) }) == true else { return nil }
+        let binding = try await validatedAndBindSubmissionPolicy(options: options, snapshot: snapshot, for: account)
+        guard binding.snapshot.runId == expectedRunId else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        return try await initializer.rustBackend.migrationResumeDueExternalPCZT(
+            expectedRunId: expectedRunId,
+            expectedRevision: binding.snapshot.revision,
+            leaseDurationMs: Constants.migrationLeaseDurationMs,
+            expectedPolicyFingerprint: binding.policy.policyFingerprint,
+            for: account
+        )
+    }
+
+    public func submitSignedDueMigrationPCZT(
+        _ signedPCZT: Pczt,
+        for claim: ClaimedTransferPCZT,
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        account: AccountUUID
+    ) async throws -> MigrationExecutionResult {
+        let current = try await migrationSnapshot(
+            expectedRunId: expectedRunId,
+            expectedRevision: expectedRevision,
+            for: account
+        )
+        let binding = try await validatedAndBindSubmissionPolicy(
+            options: options,
+            snapshot: current,
+            for: account
+        )
+        guard binding.policy == claim.submissionPolicy else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        guard let submission = try await initializer.rustBackend.migrationStoreSignedDueIntent(
+            intentId: claim.intentId,
+            signerToken: claim.signerToken,
+            pczt: signedPCZT,
+            leaseDurationMs: Constants.migrationLeaseDurationMs,
+            expectedPolicyFingerprint: binding.policy.policyFingerprint,
+            for: account
+        ) else {
+            let snapshot = try await initializer.rustBackend.migrationSnapshot(for: account)
+            return MigrationExecutionResult(disposition: .noAction, submissionResult: nil, snapshot: snapshot)
+        }
+        return try await submitMigrationClaim(submission, options: options, for: account)
+    }
+
+    /// Internal legacy-fixture compatibility only. The production Synchronizer contract exposes
+    /// only anchorless intent commit plus one-due-intent JIT materialization.
+    func proposeMigrationTransferPCZTs(
         _ schedule: MigrationSchedule,
         for account: AccountUUID
     ) async throws -> [MigrationTransferPCZT] {
         // The caller's confirmed schedule is authoritative: schedules carry randomized
         // denominations, so re-proposing here would build (and later sign) a different plan than
         // the one the user approved on screen.
-        try await initializer.rustBackend.migrationCreateUnsignedTransferPCZTs(schedule: schedule, for: account)
+        let policy = try await requiredBoundMigrationPolicy(for: account)
+        return try await initializer.rustBackend.migrationCreateUnsignedTransferPCZTs(
+            schedule: schedule,
+            expectedPolicyFingerprint: policy.policyFingerprint,
+            for: account
+        )
     }
 
-    public func storeSignedMigrationTransferPCZTs(_ pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws {
-        try await initializer.rustBackend.migrationStoreSignedSchedulePCZTs(pczts: pczts, for: account)
+    func storeSignedMigrationTransferPCZTs(_ pczts: [MigrationTransferPCZT], for account: AccountUUID) async throws {
+        let policy = try await requiredBoundMigrationPolicy(for: account)
+        try await initializer.rustBackend.migrationStoreSignedSchedulePCZTs(
+            pczts: pczts,
+            expectedPolicyFingerprint: policy.policyFingerprint,
+            for: account
+        )
     }
 
-    public func proposeMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
+    func proposeMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
         try await initializer.rustBackend.migrationProposeTransfers(for: account)
     }
 
-    public func proposeImmediateMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
+    func proposeImmediateMigrationTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
         try await initializer.rustBackend.migrationProposeImmediate(for: account)
     }
 
-    public func signAndStoreMigrationSchedule(
+    func signAndStoreMigrationSchedule(
         _ schedule: MigrationSchedule,
         spendingKey: UnifiedSpendingKey,
         for account: AccountUUID
     ) async throws {
+        let policy = try await requiredBoundMigrationPolicy(for: account)
         try await initializer.rustBackend.migrationSignAndStore(
             schedule: schedule,
             usk: spendingKey,
+            expectedPolicyFingerprint: policy.policyFingerprint,
             for: account
         )
     }
@@ -624,62 +1041,401 @@ public class SDKSynchronizer: Synchronizer {
         try await initializer.rustBackend.migrationIsSyncRequired(for: account)
     }
 
-    public func executeNextPendingTransfer(
+    func executeNextPendingTransfer(
         options: NetworkPrivacyOptions,
         for account: AccountUUID
     ) async throws -> TransferResult? {
-        // `options` is accepted but ignored in v1 (see `broadcastMigrationTx`).
-        guard let prepared = try await initializer.rustBackend.migrationNextDueTransfer(for: account) else {
-            return nil
-        }
-        let result = try await broadcastMigrationTx(prepared, for: account)
-        try await initializer.rustBackend.migrationRecordTransferResult(
-            transferId: prepared.id,
-            result: result,
+        let snapshot = try await initializer.rustBackend.migrationSnapshot(for: account)
+        let binding = try await validatedAndBindSubmissionPolicy(
+            options: options,
+            snapshot: snapshot,
             for: account
         )
-        return result
+        guard let claim = try await claimPersistedSubmission(
+            snapshot: binding.snapshot,
+            expectedPolicyFingerprint: binding.policy.policyFingerprint,
+            for: account
+        ) else { return nil }
+        let execution = try await submitMigrationClaim(claim, options: options, for: account)
+        return execution.submissionResult ?? .outcomeUnknown
     }
 
-    /// Extracts the broadcast-ready consensus transaction from the crate-prepared, signed PCZT
-    /// (`PreparedTx.rawPczt`), broadcasts it through the SDK's old direct submit path
-    /// (`transactionEncoder.submit`, not the broadcaster), and maps the outcome to a `TransferResult`,
-    /// mirroring `submitTransactions`' error handling.
-    ///
-    /// `invalidNote` / `expired` are intentionally not inferred from submit errors here — the
-    /// migration engine owns deep invalidity: after broadcast, `migrationHasInvalidTransfers` /
-    /// re-querying `migrationState` surfaces `.requiresAttention`, and `restartCurrentMigrationStep`
-    /// recovers. So the Swift side maps obvious network outcomes and lets the engine reconcile.
-    private func broadcastMigrationTx(_ prepared: PreparedTx, for account: AccountUUID) async throws -> TransferResult {
-        // `PreparedTx.rawPczt` is a serialized PCZT, not a broadcastable transaction: extract the
-        // consensus transaction bytes first. An extract failure propagates (it is a crate/local error,
-        // not a network outcome) rather than being mapped to a `TransferResult`.
-        let txBytes = try await initializer.rustBackend.migrationExtractBroadcastTx(pczt: prepared.rawPczt, for: account)
+    private func validatedAndBindSubmissionPolicy(
+        options: NetworkPrivacyOptions,
+        snapshot: MigrationSnapshot,
+        for account: AccountUUID
+    ) async throws -> (snapshot: MigrationSnapshot, policy: BoundSubmissionPolicy) {
+        guard let expectedRunId = snapshot.runId else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        let consensusFingerprint = try initializer.rustBackend.consensusParametersFingerprint()
+        guard snapshot.consensusFingerprint == consensusFingerprint else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        let policy: SubmissionPolicy
+        do {
+            policy = try await validatedSubmissionPolicy(options: options).policy
+        } catch let error as MigrationBroadcastError {
+            if let failure = Self.policyValidationFailure(for: error) {
+                _ = try await initializer.rustBackend.migrationRecordSubmissionPolicyValidationFailure(
+                    expectedRunId: expectedRunId,
+                    expectedRevision: snapshot.revision,
+                    failure: failure,
+                    for: account
+                )
+            }
+            throw error
+        }
 
-        // `PreparedTx.txid` is the crate's display-order hex txid; `EncodedTransaction.transactionId`
-        // and `isTransactionKnownToServer` need internal-order bytes, so decode then reverse.
-        // TODO: [MOB-1455] honor NetworkPrivacyOptions (Tor / secondary endpoint). v1 broadcasts over
-        // the SDK's already-configured service.
-        let txIdData = Data(hexEncoded: prepared.txid).map { Data($0.reversed()) } ?? Data()
-        let encoded = EncodedTransaction(transactionId: txIdData, raw: Data(txBytes))
+        let boundSnapshot: MigrationSnapshot
+        do {
+            boundSnapshot = try await initializer.rustBackend.migrationBindSubmissionPolicy(
+                expectedRunId: expectedRunId,
+                expectedRevision: snapshot.revision,
+                policy: policy,
+                for: account
+            )
+        } catch MigrationSubmissionPolicyBindingError.immutablePolicyConflict {
+            // A changed immutable policy is an actionable, stable run state. Persist it before
+            // surfacing the typed SDK error so a background driver does not hot-loop on the same
+            // endpoint preference. CAS races intentionally propagate from the record call and are
+            // retried from a fresh snapshot by the caller.
+            _ = try await initializer.rustBackend.migrationRecordSubmissionPolicyValidationFailure(
+                expectedRunId: expectedRunId,
+                expectedRevision: snapshot.revision,
+                failure: .submissionPolicyMismatch,
+                for: account
+            )
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        guard let boundPolicy = boundSnapshot.submissionPolicy,
+              boundPolicy.policy == policy,
+              boundPolicy.policy.consensusFingerprint == consensusFingerprint else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        return (boundSnapshot, boundPolicy)
+    }
+
+    /// Performs all network/RPC validation before a fresh run is inserted. Keeping this helper
+    /// independent of mutation is what lets private begin and immediate commit persist their run,
+    /// immutable policy, and first durable work in one Rust transaction with no policyless crash
+    /// window and no ordinary-spend lock while an endpoint is being sampled.
+    private func validatedSubmissionPolicy(
+        options: NetworkPrivacyOptions
+    ) async throws -> (policy: SubmissionPolicy, consensusFingerprint: String) {
+        let expectedChainName = try initializer.rustBackend.consensusChainName()
+        let consensusFingerprint = try initializer.rustBackend.consensusParametersFingerprint()
+        let policy = try await migrationTransactionSubmitter.validateSubmissionPolicy(
+            options: options,
+            defaultEndpoint: initializer.endpoint,
+            networkType: network.networkType,
+            expectedChainName: expectedChainName,
+            consensusFingerprint: consensusFingerprint,
+            branchIdForHeight: { [rustBackend = initializer.rustBackend] height in
+                try rustBackend.consensusBranchIdFor(height: height)
+            }
+        )
+        return (policy, consensusFingerprint)
+    }
+
+    /// Rejects a caller's stale UI/background envelope before endpoint validation, policy binding,
+    /// or any Rust mutation. A same-run revision that advances during subsequent RPC validation is
+    /// safe: Rust returns that run's current bound snapshot and every acquisition uses its fresh
+    /// revision CAS token.
+    private func migrationSnapshot(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot {
+        let snapshot = try await initializer.rustBackend.migrationSnapshot(for: account)
+        guard snapshot.runId == expectedRunId,
+              snapshot.revision == expectedRevision else {
+            throw MigrationBroadcastError.migrationSnapshotChanged
+        }
+        return snapshot
+    }
+
+    private static func policyValidationFailure(
+        for error: MigrationBroadcastError
+    ) -> SubmissionPolicyValidationFailure? {
+        switch error {
+        case .migrationSnapshotChanged:
+            return nil
+        case .invalidSubmissionEndpoint, .submissionPolicyMismatch:
+            return .submissionPolicyMismatch
+        case .selectedEndpointChainMismatch, .selectedEndpointConsensusBranchMismatch,
+             .selectedEndpointInfoBehindSampledTip:
+            return .endpointConsensusMismatch
+        case .invalidTransactionID, .transactionIDMismatch, .transactionConsensusBranchMismatch,
+             .missingExpiryHeight, .selectedTransportTipWithinExpirySafetyMargin:
+            return nil
+        }
+    }
+
+    private func requiredBoundMigrationPolicy(for account: AccountUUID) async throws -> BoundSubmissionPolicy {
+        let snapshot = try await initializer.rustBackend.migrationSnapshot(for: account)
+        let consensusFingerprint = try initializer.rustBackend.consensusParametersFingerprint()
+        guard let policy = snapshot.submissionPolicy,
+              snapshot.consensusFingerprint == consensusFingerprint,
+              policy.policy.consensusFingerprint == consensusFingerprint else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        return policy
+    }
+
+    private func claimNoteSplitSubmission(
+        expectedRunId: String?,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTx? {
+        let snapshot = try await initializer.rustBackend.migrationSnapshot(for: account)
+        guard let expectedRunId,
+              snapshot.runId == expectedRunId,
+              snapshot.submissionPolicy?.policyFingerprint == expectedPolicyFingerprint else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        return try await initializer.rustBackend.migrationClaimNoteSplitSubmission(
+            expectedRunId: expectedRunId,
+            expectedRevision: snapshot.revision,
+            leaseDurationMs: Constants.migrationLeaseDurationMs,
+            expectedPolicyFingerprint: expectedPolicyFingerprint,
+            for: account
+        )
+    }
+
+    private func claimPersistedSubmission(
+        snapshot: MigrationSnapshot,
+        expectedPolicyFingerprint: String,
+        for account: AccountUUID
+    ) async throws -> ClaimedTx? {
+        guard let expectedRunId = snapshot.runId,
+              snapshot.submissionPolicy?.policyFingerprint == expectedPolicyFingerprint else {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        if let prep = try await initializer.rustBackend.migrationClaimNoteSplitSubmission(
+            expectedRunId: expectedRunId,
+            expectedRevision: snapshot.revision,
+            leaseDurationMs: Constants.migrationLeaseDurationMs,
+            expectedPolicyFingerprint: expectedPolicyFingerprint,
+            for: account
+        ) {
+            return prep
+        }
+        return try await initializer.rustBackend.migrationClaimNextDueTransfer(
+            expectedRunId: expectedRunId,
+            expectedRevision: snapshot.revision,
+            leaseDurationMs: Constants.migrationLeaseDurationMs,
+            expectedPolicyFingerprint: expectedPolicyFingerprint,
+            for: account
+        )
+    }
+
+    private func submitMigrationClaim(
+        _ claim: ClaimedTx,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> MigrationExecutionResult {
+        let currentFingerprint = try initializer.rustBackend.consensusParametersFingerprint()
+        guard claim.submissionPolicy.policy.consensusFingerprint == currentFingerprint else {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .submissionPolicyMismatch, for: account)
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        }
+        guard claim.txid.utf8.count == 64,
+              let displayOrderTxID = Data(hexEncoded: claim.txid),
+              displayOrderTxID.count == 32 else {
+            try await recordMigrationLocalFailure(.txidMismatch, claim: claim, for: account)
+            throw MigrationBroadcastError.invalidTransactionID
+        }
+
+        let renewLease = { [initializer] in
+            try Task.checkCancellation()
+            guard let renewed = try await initializer.rustBackend.migrationRenewClaimedTransferLease(
+                transferId: claim.id,
+                attemptToken: claim.attemptToken,
+                leaseDurationMs: Constants.migrationLeaseDurationMs,
+                expectedPolicyFingerprint: claim.submissionPolicy.policyFingerprint,
+                for: account
+            ), renewed.id == claim.id,
+               renewed.txid == claim.txid,
+               renewed.rawPczt == claim.rawPczt,
+               renewed.attemptToken == claim.attemptToken,
+               renewed.expiryHeight == claim.expiryHeight,
+               renewed.submissionPolicy == claim.submissionPolicy,
+               renewed.leaseExpiresAtMs >= Self.minimumRequiredMigrationLeaseExpiryMs(
+                   endpoint: initializer.endpoint
+               ) else {
+                throw MigrationClaimLifecycleError.insufficientLeaseBudget
+            }
+        }
 
         do {
-            try await transactionEncoder.submit(transaction: encoded)
-            return .success(txid: prepared.txid)
-        } catch let ZcashError.serviceSubmitFailed(serviceError) {
-            logger.error("Migration broadcast serviceSubmitFailed: \(String(describing: serviceError))")
-            return .networkError(retryable: true)
-        } catch let TransactionEncoderError.submitError(code, message) {
-            // Surface the server's rejection reason (lightwalletd/Zebra SendResponse) — otherwise the
-            // migration engine only sees an opaque `.networkError`.
-            logger.error("Migration broadcast rejected by server: code=\(code) message=\(message)")
-            // Trust the network over the submit-side error: if the server already has this tx, the
-            // broadcast already landed. Mirror `submitTransactions`' isTransactionKnownToServer check.
-            if await transactionEncoder.isTransactionKnownToServer(txId: txIdData) {
-                return .success(txid: prepared.txid)
-            }
-            return .networkError(retryable: false)
+            try await renewLease()
+        } catch {
+            await releaseMigrationClaimKnownUnsent(
+                claim,
+                reason: error is CancellationError ? .cancelledBeforeTransport : .insufficientLeaseBudget,
+                for: account
+            )
+            throw error
         }
+
+        do {
+            let snapshot = try await initializer.rustBackend.migrationSnapshot(for: account)
+            try await renewLease()
+            guard snapshot.submissionPolicy == claim.submissionPolicy else {
+                await releaseMigrationClaimKnownUnsent(claim, reason: .submissionPolicyMismatch, for: account)
+                throw MigrationBroadcastError.submissionPolicyMismatch
+            }
+        } catch is CancellationError {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .cancelledBeforeTransport, for: account)
+            throw CancellationError()
+        } catch MigrationBroadcastError.submissionPolicyMismatch {
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        } catch {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .insufficientLeaseBudget, for: account)
+            throw error
+        }
+
+        let extracted: ExtractedTx
+        do {
+            extracted = try await initializer.rustBackend.migrationExtractBroadcastTx(
+                pczt: claim.rawPczt,
+                for: account
+            )
+            try await renewLease()
+        } catch is CancellationError {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .cancelledBeforeTransport, for: account)
+            throw CancellationError()
+        } catch let error as MigrationClaimLifecycleError {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .insufficientLeaseBudget, for: account)
+            throw error
+        } catch {
+            try await recordMigrationLocalFailure(.malformedPczt, claim: claim, for: account)
+            throw error
+        }
+
+        guard
+            extracted.txid == claim.txid,
+            extracted.txid.utf8.count == 64,
+            let computedDisplayOrderTxID = Data(hexEncoded: extracted.txid),
+            computedDisplayOrderTxID.count == 32,
+            computedDisplayOrderTxID == displayOrderTxID,
+            extracted.expiryHeight == claim.expiryHeight
+        else {
+            try await recordMigrationLocalFailure(.txidMismatch, claim: claim, for: account)
+            throw MigrationBroadcastError.transactionIDMismatch
+        }
+
+        let submittedResult: TransferResult
+        do {
+            submittedResult = try await migrationTransactionSubmitter.submit(
+                transaction: EncodedTransaction(
+                    transactionId: Data(computedDisplayOrderTxID.reversed()),
+                    raw: Data(extracted.rawTx)
+                ),
+                displayTransactionID: claim.txid,
+                expiryHeight: BlockHeight(claim.expiryHeight),
+                options: options,
+                defaultEndpoint: initializer.endpoint,
+                networkType: network.networkType,
+                expectedChainName: try initializer.rustBackend.consensusChainName(),
+                boundPolicy: claim.submissionPolicy,
+                transactionConsensusBranchId: extracted.consensusBranchId,
+                branchIdForHeight: { [rustBackend = initializer.rustBackend] height in
+                    try rustBackend.consensusBranchIdFor(height: height)
+                },
+                renewLease: renewLease
+            )
+        } catch is CancellationError {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .cancelledBeforeTransport, for: account)
+            throw CancellationError()
+        } catch MigrationClaimLifecycleError.insufficientLeaseBudget {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .insufficientLeaseBudget, for: account)
+            throw MigrationClaimLifecycleError.insufficientLeaseBudget
+        } catch MigrationBroadcastError.submissionPolicyMismatch {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .submissionPolicyMismatch, for: account)
+            throw MigrationBroadcastError.submissionPolicyMismatch
+        } catch MigrationBroadcastError.invalidSubmissionEndpoint {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .submissionPolicyMismatch, for: account)
+            throw MigrationBroadcastError.invalidSubmissionEndpoint
+        } catch MigrationBroadcastError.selectedEndpointChainMismatch {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .endpointConsensusMismatch, for: account)
+            throw MigrationBroadcastError.selectedEndpointChainMismatch
+        } catch MigrationBroadcastError.selectedEndpointConsensusBranchMismatch {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .endpointConsensusMismatch, for: account)
+            throw MigrationBroadcastError.selectedEndpointConsensusBranchMismatch
+        } catch let error as MigrationBroadcastError {
+            switch error {
+            case .selectedEndpointInfoBehindSampledTip:
+                await releaseMigrationClaimKnownUnsent(claim, reason: .endpointConsensusMismatch, for: account)
+            case .transactionConsensusBranchMismatch:
+                await releaseMigrationClaimKnownUnsent(claim, reason: .transactionBranchNotCurrent, for: account)
+            case .selectedTransportTipWithinExpirySafetyMargin:
+                await releaseMigrationClaimKnownUnsent(claim, reason: .transactionExpiryWindowClosed, for: account)
+            default:
+                await releaseMigrationClaimKnownUnsent(claim, reason: .transportSetupFailed, for: account)
+            }
+            throw error
+        } catch {
+            await releaseMigrationClaimKnownUnsent(claim, reason: .transportSetupFailed, for: account)
+            throw error
+        }
+        // Cancellation after networking begins cannot safely mean "unsent". Preserve the exact
+        // engine claim and record an ambiguous outcome even if a transport double raced back with
+        // a nominal result while cancellation was being delivered.
+        let result: TransferResult = Task.isCancelled ? .outcomeUnknown : submittedResult
+        do {
+            try await initializer.rustBackend.migrationRecordClaimedTransferResult(
+                transferId: claim.id,
+                attemptToken: claim.attemptToken,
+                result: result,
+                for: account
+            )
+        } catch {
+            // A lease can expire after the server responds but before CAS. Never surface that stale
+            // response as durable truth. If the engine is readable, its fresh snapshot is the only
+            // safe result and recovery will resume the same staged bytes/token path.
+            let snapshot = try await initializer.rustBackend.migrationSnapshot(for: account)
+            return MigrationExecutionResult(disposition: .verifying, submissionResult: nil, snapshot: snapshot)
+        }
+        let snapshot = try await initializer.rustBackend.migrationSnapshot(for: account)
+        return MigrationExecutionResult(
+            disposition: result == .outcomeUnknown ? .verifying : .resultRecorded,
+            submissionResult: result,
+            snapshot: snapshot
+        )
+    }
+
+    private static func minimumRequiredMigrationLeaseExpiryMs(endpoint: LightWalletEndpoint) -> UInt64 {
+        let nowMs = UInt64(max(0, Date().timeIntervalSince1970 * 1_000))
+        let timeoutMs = UInt64(max(0, endpoint.singleCallTimeoutInMillis))
+        return nowMs.addingReportingOverflow(timeoutMs + 30_000).partialValue
+    }
+
+    private func releaseMigrationClaimKnownUnsent(
+        _ claim: ClaimedTx,
+        reason: KnownUnsentReason,
+        for account: AccountUUID
+    ) async {
+        try? await initializer.rustBackend.migrationReleaseClaimedTransferKnownUnsent(
+            transferId: claim.id,
+            attemptToken: claim.attemptToken,
+            reason: reason,
+            for: account
+        )
+    }
+
+    private func recordMigrationLocalFailure(
+        _ failure: LocalSubmissionFailure,
+        claim: ClaimedTx,
+        for account: AccountUUID
+    ) async throws {
+        try await initializer.rustBackend.migrationRecordClaimedTransferLocalFailure(
+            transferId: claim.id,
+            attemptToken: claim.attemptToken,
+            failure: failure,
+            for: account
+        )
     }
 
     public func hasOverdueTransfers(for account: AccountUUID) async throws -> Bool {
@@ -690,11 +1446,16 @@ public class SDKSynchronizer: Synchronizer {
         try await initializer.rustBackend.migrationHasInvalidTransfers(for: account)
     }
 
-    public func refreshStaleTransfers(spendingKey: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32 {
-        try await initializer.rustBackend.migrationRefreshStaleTransfers(usk: spendingKey, for: account)
+    func refreshStaleTransfers(spendingKey: UnifiedSpendingKey, for account: AccountUUID) async throws -> UInt32 {
+        let policy = try await requiredBoundMigrationPolicy(for: account)
+        return try await initializer.rustBackend.migrationRefreshStaleTransfers(
+            usk: spendingKey,
+            expectedPolicyFingerprint: policy.policyFingerprint,
+            for: account
+        )
     }
 
-    public func restartCurrentMigrationStep(for account: AccountUUID) async throws -> MigrationSchedule {
+    func restartCurrentMigrationStep(for account: AccountUUID) async throws -> MigrationSchedule {
         try await initializer.rustBackend.migrationRestartStep(for: account)
     }
 
@@ -814,6 +1575,22 @@ public class SDKSynchronizer: Synchronizer {
 
     public func latestHeight() async throws -> BlockHeight {
         try await blockProcessor.latestHeight(mode: await sdkFlags.ifTor(.torInGroup("SDKSynchronizer.latestHeight")))
+    }
+
+    public func networkUpgradeActivationHeight(_ upgrade: NetworkUpgrade) throws -> BlockHeight? {
+        try initializer.rustBackend.networkUpgradeActivationHeight(upgrade)
+    }
+
+    public func nu6_3ActivationHeight() throws -> BlockHeight? {
+        try initializer.rustBackend.nu6_3ActivationHeight()
+    }
+
+    public func consensusChainName() throws -> String {
+        try initializer.rustBackend.consensusChainName()
+    }
+
+    public func consensusParametersFingerprint() throws -> String {
+        try initializer.rustBackend.consensusParametersFingerprint()
     }
 
     public func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs {

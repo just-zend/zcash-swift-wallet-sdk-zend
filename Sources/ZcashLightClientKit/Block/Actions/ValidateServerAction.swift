@@ -31,39 +31,31 @@ extension ValidateServerAction: Action {
         let localNetwork = config.network
         let saplingActivation = config.saplingActivation
 
-        // A custom-parameter network (customActivationHeights != nil, e.g. a regtest wallet pointed at a
-        // modified-mainnet Ironwood backend) may reach a server that identifies with a different base
-        // chain (chainName "main") and reports a nonstandard consensus branch id. For such networks the
-        // strict network-type and branch-id matches are skipped; the Sapling-activation check below still
-        // guards against pointing a custom-heights wallet at a real main/test server.
-        let isCustomNetwork = localNetwork.customActivationHeights != nil
-
-        // check network types
-        guard let remoteNetworkType = NetworkType.forChainName(info.chainName) else {
+        guard let remoteChainName = ConsensusChainName.canonicalize(info.chainName) else {
             throw ZcashError.compactBlockProcessorChainName(info.chainName)
         }
-
-        if !isCustomNetwork {
-            guard remoteNetworkType == localNetwork.networkType else {
+        guard remoteChainName == localNetwork.chainName else {
+            if localNetwork.customActivationHeights == nil,
+               let remoteNetworkType = NetworkType.forChainName(remoteChainName) {
                 throw ZcashError.compactBlockProcessorNetworkMismatch(localNetwork.networkType, remoteNetworkType)
             }
+            throw ZcashError.compactBlockProcessorChainName(info.chainName)
         }
 
         guard saplingActivation == info.saplingActivationHeight else {
             throw ZcashError.compactBlockProcessorSaplingActivationMismatch(saplingActivation, BlockHeight(info.saplingActivationHeight))
         }
 
-        // check branch id
-        if !isCustomNetwork {
-            let localBranch = try rustBackend.consensusBranchIdFor(height: Int32(info.blockHeight))
-
-            guard let remoteBranchID = ConsensusBranchID.fromString(info.consensusBranchID) else {
-                throw ZcashError.compactBlockProcessorConsensusBranchID
-            }
-
-            guard remoteBranchID == localBranch else {
-                throw ZcashError.compactBlockProcessorWrongConsensusBranchId(localBranch, remoteBranchID)
-            }
+        guard info.blockHeight < UInt64(Int32.max),
+              let nextBlockHeight = Int32(exactly: info.blockHeight + 1) else {
+            throw ZcashError.compactBlockProcessorConsensusBranchID
+        }
+        let localBranch = try rustBackend.consensusBranchIdFor(height: nextBlockHeight)
+        guard let remoteBranchID = ConsensusBranchID.fromString(info.consensusBranchID) else {
+            throw ZcashError.compactBlockProcessorConsensusBranchID
+        }
+        guard remoteBranchID == localBranch else {
+            throw ZcashError.compactBlockProcessorWrongConsensusBranchId(localBranch, remoteBranchID)
         }
 
         await context.update(state: .fetchUTXO)

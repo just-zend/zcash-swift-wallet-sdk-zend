@@ -303,6 +303,30 @@ public enum ZcashErrorCode: String {
     case rustMigrationStoreSignedNoteSplitPCZT = "ZRUST0113"
     /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePCZTs
     case rustMigrationStoreSignedSchedulePCZTs = "ZRUST0114"
+    /// Ordinary wallet spending is blocked by the active Ironwood migration.
+    case migrationOrdinarySpendsBlocked = "ZRUST0115"
+    /// Error from rust layer when reading the authoritative migration snapshot.
+    case rustMigrationSnapshot = "ZRUST0116"
+    /// Error from rust layer when proposing a private anchorless intent schedule.
+    case rustMigrationProposePrivateIntents = "ZRUST0117"
+    /// Error from rust layer when proposing an immediate anchorless intent.
+    case rustMigrationProposeImmediateIntent = "ZRUST0118"
+    /// Error from rust layer when committing an approved intent schedule.
+    case rustMigrationCommitIntents = "ZRUST0119"
+    /// Error from rust layer when claiming a persisted due migration transaction.
+    case rustMigrationClaimNextDueTransfer = "ZRUST0120"
+    /// Error from rust layer when materializing and claiming a software-signed intent.
+    case rustMigrationMaterializeAndClaimNextDue = "ZRUST0121"
+    /// Error from rust layer when staging a due intent for an external signer.
+    case rustMigrationStageNextDueExternalPCZT = "ZRUST0122"
+    /// Error from rust layer when resuming an engine-owned signed submission.
+    case rustMigrationResumeStagedSubmission = "ZRUST0123"
+    /// Error from rust layer when storing a device-signed due intent.
+    case rustMigrationStoreSignedDueIntent = "ZRUST0124"
+    /// Error from rust layer when recording a tokenized migration submission result.
+    case rustMigrationRecordClaimedTransferResult = "ZRUST0125"
+    /// Error from rust layer when ingesting and claiming a persisted denomination-split transaction.
+    case rustMigrationClaimNoteSplitSubmission = "ZRUST0126"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.
@@ -465,6 +489,8 @@ public enum ZcashErrorCode: String {
     case compactBlockProcessorPutOrchardSubtreeRoots = "ZCBPEO0022"
     /// Put Ironwood subtree roots to the DB failed.
     case compactBlockProcessorPutIronwoodSubtreeRoots = "ZCBPEO0023"
+    /// Every sampled server tip was below durable local wallet state. Retrying may select a healthy load-balanced replica.
+    case compactBlockProcessorServerTipBehind = "ZCBPEO0024"
     /// The synchronizer is unprepared.
     case synchronizerNotPrepared = "ZSYNCO0001"
     /// Memos can't be sent to transparent addresses.

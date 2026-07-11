@@ -1272,7 +1272,10 @@ pub enum AddressCheckResult {
 }
 
 impl AddressCheckResult {
-    pub(crate) fn from_rust(network: &impl Parameters, found: Option<TransparentAddress>) -> *mut Self {
+    pub(crate) fn from_rust(
+        network: &impl Parameters,
+        found: Option<TransparentAddress>,
+    ) -> *mut Self {
         let res = match found {
             None => AddressCheckResult::NotFound,
             Some(addr) => {

@@ -51,11 +51,50 @@ let outcome = await synchronizer.broadcaster.submit(
 
 ## Orchard → Ironwood migration API on `Synchronizer`
 
-The async `Synchronizer` protocol gains an Orchard → Ironwood migration surface (every method takes `for account: AccountUUID`): `migrationState`, `migrationProgress`, `isNoteSplitNeeded`, `prepareNoteSplit`, `submitNoteSplit`, `proposeMigrationTransfers`, `signAndStoreMigrationSchedule`, `isSyncRequiredBeforeNextTransfer`, `executeNextPendingTransfer`, `hasOverdueTransfers`, `hasInvalidTransfers`, `refreshStaleTransfers`, `restartCurrentMigrationStep`, and `initializePostUpgrade`.
+The early anchored, pre-sign-all migration API has been replaced. Remove calls to
+`proposeMigrationTransfers`, `proposeImmediateMigrationTransfers`,
+`signAndStoreMigrationSchedule`, `proposeMigrationTransferPCZTs`,
+`storeSignedMigrationTransferPCZTs`, `executeNextPendingTransfer`,
+`refreshStaleTransfers`, and `restartCurrentMigrationStep`; they are no longer in the public
+`Synchronizer` contract. The supported flow commits anchorless intents once and materializes at
+most one due transaction with a fresh anchor and expiry window.
 
-- If you provide your own type conforming to `Synchronizer`, you must implement these new methods. `SDKSynchronizer` already does, and the `ClosureSynchronizer` / `CombineSynchronizer` protocols are unchanged, so their adapters are unaffected.
-- `submitNoteSplit(proposal:spendingKey:options:for:)` and `executeNextPendingTransfer(options:for:)` broadcast the migration engine's pre-signed transaction over the SDK's existing direct submission path and return a `TransferResult`. Each first extracts the broadcast-ready consensus transaction from the engine's signed PCZT before submitting. The `options: NetworkPrivacyOptions` argument is accepted but ignored in this version (broadcast uses the already-configured lightwalletd).
-- `refreshStaleTransfers(spendingKey:for:)` re-anchors, re-proves and re-signs the active migration run's scheduled transfers when they have gone stale (anchor too old to broadcast), returning the number refreshed. Detect the need with `hasOverdueTransfers(for:)`.
+Migration UI and background workers must read one authoritative `migrationSnapshot(for:)` and
+render its `phase`, `state`, `failureCode`, `recoveryAction`, and `nextAction`. Every mutation of an
+existing run takes the caller's `expectedRunId` and `expectedRevision`. If either changed, discard
+the result, refresh the snapshot, and re-drive from its new `nextAction`; never apply an action to a
+replacement run merely because its revision number happens to match.
+
+The principal APIs are:
+
+- `beginPrivateMigration(externalSigner:options:for:)` validates the selected endpoint first, then
+  atomically creates the private run and immutable submission policy. Endpoint validation cannot
+  leave a policyless run or block ordinary spends while RPC is in flight.
+- `proposePrivateMigrationIntents(for:)` and `proposeImmediateMigrationIntent(for:)` return the
+  exact anchorless plan for confirmation. `commitMigrationIntents(_:externalSigner:options:for:)`
+  validates the endpoint and atomically commits an Immediate run, its policy, and its intents; an
+  existing Private run must already carry the same policy.
+- `executeNextMigrationAction(expectedRunId:expectedRevision:spendingKey:options:for:)` performs at
+  most one engine-authorized software/background step. Offline missed windows are rebased by the
+  engine; signed or possibly submitted bytes are reconciled instead of blindly rebuilt.
+- `stageNextDueMigrationPCZT`, `resumeNoteSplitExternalSigning`, and
+  `resumeDueMigrationExternalSigning` also require the expected run/revision. They return the exact
+  persisted signer envelope after process death. Signed-PCZT submission APIs require the caller's
+  current revision and preserve the engine claim token through finalization and broadcast.
+- `bindMigrationSubmissionPolicy(expectedRunId:expectedRevision:options:for:)` is only the explicit
+  repair path for upgraded legacy runs. Chain-exposed policyless bytes remain quarantined until
+  mining or positive consensus expiry resolves them.
+
+`NetworkPrivacyOptions` is authoritative. Direct and Tor transports never silently fall back to
+one another; the endpoint's TLS identity, chain name, sampled tip, consensus branch, transaction
+branch, and expiry safety window are validated before submission. A nonzero lightwalletd submit
+code is not success unless exact-txid reconciliation proves the transaction is known.
+
+Snapshot read/decode/corruption failures surface as a non-operational
+`.walletSchemaUnavailable` projection (`nextAction == .none`, ordinary spends blocked). Do not
+render or execute a cached runnable snapshot in that state. Ordinary-spend reservations are scoped
+to the migrating account, so another account in the same wallet remains usable when its own
+authoritative guard succeeds.
 
 # Migrating from previous versions to 0.20.0-beta
 The `SDKSynchronizer` no longer uses `NotificationCenter` to send notifications.

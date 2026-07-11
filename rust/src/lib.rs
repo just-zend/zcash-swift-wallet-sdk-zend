@@ -20,11 +20,14 @@ use http_body_util::BodyExt;
 use nonempty::NonEmpty;
 use pczt::{
     Pczt,
-    roles::{combiner::Combiner, prover::Prover, redactor::Redactor},
+    roles::{
+        combiner::Combiner, prover::Prover, redactor::Redactor, tx_extractor::TransactionExtractor,
+    },
 };
 use prost::Message;
 use rand::rngs::OsRng;
 use secrecy::Secret;
+use sha2::{Digest, Sha256};
 use tor_rtcompat::ToplevelBlockOn as _;
 use tracing::{debug, metadata::LevelFilter};
 use tracing_subscriber::prelude::*;
@@ -39,16 +42,17 @@ use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     address::Address,
     data_api::{
-        Account, AccountBirthday, AccountPurpose, InputSource, MaxSpendMode, SeedRelevance,
-        TransactionDataRequest, TransactionStatus, TransparentKeyOrigin, TransparentOutputFilter,
+        Account, AccountBirthday, AccountPurpose, CoinbaseFilter, InputSource, MaxSpendMode,
+        SeedRelevance, TransactionDataRequest, TransactionStatus, TransparentKeyOrigin,
         WalletCommitmentTrees, WalletRead, WalletWrite, Zip32Derivation,
         chain::{CommitmentTreeRoot, scan_cached_blocks},
+        ll::LowLevelWalletRead,
         scanning::ScanPriority,
         wallet::{
             self, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
             decrypt_and_store_transaction, extract_and_store_transaction_from_pczt,
-            input_selection::GreedyInputSelector, propose_send_max_transfer, propose_shielding,
-            propose_transfer,
+            input_selection::{GreedyInputSelector, SpendPolicy},
+            propose_send_max_transfer, propose_shielding, propose_transfer,
         },
     },
     encoding::AddressCodec,
@@ -76,10 +80,11 @@ use zcash_primitives::{
 };
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
-    ShieldedProtocol,
+    ShieldedPool,
     consensus::{
-        BlockHeight, BranchId, Network, NetworkType, NetworkUpgrade, Parameters,
+        BlockHeight, BranchId, Network,
         Network::{MainNetwork, TestNetwork},
+        NetworkType, NetworkUpgrade, Parameters,
     },
     local_consensus::LocalNetwork,
     memo::MemoBytes,
@@ -93,9 +98,9 @@ mod eip681;
 mod ffi;
 mod migration;
 mod tor;
-// Voting is gated off on this Ironwood branch: the crates.io voting stack calls the pre-Ironwood
-// orchard Note API and is incompatible with the valargroup orchard fork. Re-enable with the
-// `voting` feature once the stack is migrated to valargroup zcash_voting 1.0.0 (MOB-1455).
+// Voting is gated off on this Ironwood branch: latest zcash_voting 1.0.0 still pins Orchard 0.14
+// and its unstable voting circuits, so its Note API is incompatible with this audited Orchard
+// 0.15 graph. Re-enable only after that upstream stack migrates (MOB-1455).
 #[cfg(feature = "voting")]
 mod voting;
 
@@ -714,7 +719,10 @@ pub unsafe extern "C" fn zcashlc_delete_account(
 /// - The memory referenced by `usk_ptr` must not be mutated for the duration of the function call.
 /// - The total size `usk_len` must be no larger than `isize::MAX`. See the safety documentation
 ///   of pointer::offset.
-unsafe fn decode_usk(usk_ptr: *const u8, usk_len: usize) -> anyhow::Result<UnifiedSpendingKey> {
+pub(crate) unsafe fn decode_usk(
+    usk_ptr: *const u8,
+    usk_len: usize,
+) -> anyhow::Result<UnifiedSpendingKey> {
     let usk_bytes = unsafe { slice::from_raw_parts(usk_ptr, usk_len) };
 
     // The remainder of the function is safe.
@@ -1027,7 +1035,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance(
                 &taddr,
                 target,
                 confirmations_policy,
-                TransparentOutputFilter::All,
+                CoinbaseFilter::AllTransparentOutputs,
             )
             .map_err(|e| anyhow!("Error while fetching verified transparent balance: {}", e))?;
         let amount = utxos
@@ -1091,7 +1099,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
                         taddr,
                         target,
                         confirmations_policy,
-                        TransparentOutputFilter::All,
+                        CoinbaseFilter::AllTransparentOutputs,
                     )
                     .map_err(|e| {
                         anyhow!("Error while fetching verified transparent balance: {}", e)
@@ -1142,7 +1150,7 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance(
                 &taddr,
                 target,
                 wallet::ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
-                TransparentOutputFilter::All,
+                CoinbaseFilter::AllTransparentOutputs,
             )
             .map_err(|e| anyhow!("Error while fetching total transparent balance: {}", e))?
             .iter()
@@ -1207,10 +1215,10 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance_for_account(
     unwrap_exc_or(res, -1)
 }
 
-fn parse_protocol(code: u32) -> Option<ShieldedProtocol> {
+fn parse_protocol(code: u32) -> Option<ShieldedPool> {
     match code {
-        2 => Some(ShieldedProtocol::Sapling),
-        3 => Some(ShieldedProtocol::Orchard),
+        2 => Some(ShieldedPool::Sapling),
+        3 => Some(ShieldedPool::Orchard),
         _ => None,
     }
 }
@@ -1898,7 +1906,7 @@ pub unsafe extern "C" fn zcashlc_put_utxo(
                 script_pubkey,
             ),
             Some(BlockHeight::from(height as u32)),
-            // This FFI call doesn't carry account context (new fork fields) — left unset.
+            // This FFI call doesn't carry account context — leave ownership metadata unset.
             None,
             None,
             None,
@@ -2154,7 +2162,7 @@ fn zip317_helper<DbT>(
         MultiOutputChangeStrategy::new(
             StandardFeeRule::Zip317,
             change_memo,
-            ShieldedProtocol::Orchard,
+            ShieldedPool::Orchard,
             DustOutputPolicy::default(),
             SplitPolicy::with_min_output_value(
                 NonZeroUsize::new(4).unwrap(),
@@ -2199,9 +2207,16 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
-
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        unsafe {
+            migration::ensure_account_ordinary_spends_allowed(
+                db_data,
+                db_data_len,
+                *account_uuid.expose_uuid().as_bytes(),
+                network,
+            )?
+        };
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
         let to = unsafe { CStr::from_ptr(to) }.to_str()?;
         let value = Zatoshis::from_nonnegative_i64(value)
             .map_err(|_| anyhow!("Invalid amount, out of range"))?;
@@ -2234,6 +2249,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             &change_strategy,
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
+            &SpendPolicy::default(),
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2279,9 +2295,16 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
-
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        unsafe {
+            migration::ensure_account_ordinary_spends_allowed(
+                db_data,
+                db_data_len,
+                *account_uuid.expose_uuid().as_bytes(),
+                network,
+            )?
+        };
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
         let to = unsafe { CStr::from_ptr(to) }.to_str()?;
 
         let to: ZcashAddress = to
@@ -2307,14 +2330,12 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             &mut db_data,
             &network,
             account_uuid,
-            &[ShieldedProtocol::Sapling, ShieldedProtocol::Orchard],
+            &[ShieldedPool::Sapling, ShieldedPool::Orchard],
             &StandardFeeRule::Zip317,
             to,
             memo,
             mode,
             confirmation_policy,
-            // `proposed_version` (unstable): use the default tx version for a max-spend transfer.
-            None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2358,9 +2379,16 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
-
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        unsafe {
+            migration::ensure_account_ordinary_spends_allowed(
+                db_data,
+                db_data_len,
+                *account_uuid.expose_uuid().as_bytes(),
+                network,
+            )?
+        };
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
         let payment_uri_str = unsafe { CStr::from_ptr(payment_uri) }.to_str()?;
 
         let (change_strategy, input_selector) = zip317_helper(None);
@@ -2376,6 +2404,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             &change_strategy,
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
+            &SpendPolicy::default(),
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2396,6 +2425,81 @@ pub extern "C" fn zcashlc_branch_id_for_height(height: i32, network_id: u32) -> 
         Ok(branch_id as i32)
     });
     unwrap_exc_or(res, -1)
+}
+
+/// Returns the activation height of a consensus network upgrade for the requested network.
+///
+/// `network_upgrade` uses a stable FFI mapping that is intentionally independent of Rust enum
+/// discriminants: Overwinter through NU7 are numbered 0 through 10 in activation order. NU7 is
+/// reported as not configured when this crate is built without upstream's `zcash_unstable="nu7"`
+/// cfg (the production configuration of this SDK).
+///
+/// Returns the non-negative activation height, `-1` when that upgrade is not configured to
+/// activate, or `-2` when the network or upgrade id is invalid (with details in the last-error
+/// channel). Standard mainnet/testnet values come directly from this linked librustzcash revision;
+/// custom-network values come from the exact `LocalNetwork` registered for network id 2.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_network_upgrade_activation_height(
+    network_id: u32,
+    network_upgrade: u32,
+) -> i64 {
+    let res = catch_panic(|| {
+        let upgrade = match network_upgrade {
+            0 => NetworkUpgrade::Overwinter,
+            1 => NetworkUpgrade::Sapling,
+            2 => NetworkUpgrade::Blossom,
+            3 => NetworkUpgrade::Heartwood,
+            4 => NetworkUpgrade::Canopy,
+            5 => NetworkUpgrade::Nu5,
+            6 => NetworkUpgrade::Nu6,
+            7 => NetworkUpgrade::Nu6_1,
+            8 => NetworkUpgrade::Nu6_2,
+            9 => NetworkUpgrade::Nu6_3,
+            10 => {
+                #[cfg(zcash_unstable = "nu7")]
+                {
+                    NetworkUpgrade::Nu7
+                }
+                #[cfg(not(zcash_unstable = "nu7"))]
+                {
+                    return Ok(-1);
+                }
+            }
+            _ => return Err(anyhow!("Invalid network upgrade id: {network_upgrade}")),
+        };
+        let network = parse_network(network_id)?;
+        Ok(network
+            .activation_height(upgrade)
+            .map_or(-1, |height| i64::from(u32::from(height))))
+    });
+    unwrap_exc_or(res, -2)
+}
+
+/// Returns the canonical chain id bound into the requested network's consensus configuration.
+/// The returned string must be freed with [`zcashlc_string_free`].
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_consensus_chain_id(network_id: u32) -> *mut c_char {
+    let res = catch_panic(|| {
+        CString::new(parse_network(network_id)?.canonical_chain_id())
+            .map(CString::into_raw)
+            .map_err(|error| anyhow!("canonical chain id contains a null byte: {error}"))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Returns the lowercase SHA-256 consensus-configuration fingerprint for the requested network.
+/// It commits to the canonical chain id, actual consensus base identity, and every stable
+/// activation height through NU7 (including an explicit absent marker when NU7 is gated off). The
+/// returned string must be freed with
+/// [`zcashlc_string_free`].
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_consensus_parameters_fingerprint(network_id: u32) -> *mut c_char {
+    let res = catch_panic(|| {
+        CString::new(parse_network(network_id)?.consensus_fingerprint())
+            .map(CString::into_raw)
+            .map_err(|error| anyhow!("consensus fingerprint contains a null byte: {error}"))
+    });
+    unwrap_exc_or_null(res)
 }
 
 /// Frees strings returned by other zcashlc functions.
@@ -2466,9 +2570,16 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
-
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        unsafe {
+            migration::ensure_account_ordinary_spends_allowed(
+                db_data,
+                db_data_len,
+                *account_uuid.expose_uuid().as_bytes(),
+                network,
+            )?
+        };
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let memo_bytes = if memo.is_null() {
             MemoBytes::empty()
@@ -2583,7 +2694,7 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
             &from_addrs,
             account_uuid,
             confirmations_policy,
-            TransparentOutputFilter::All,
+            CoinbaseFilter::AllTransparentOutputs,
         )
         .map_err(|e| anyhow!("Error while shielding transaction: {}", e))?;
 
@@ -2661,13 +2772,26 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
 ) -> *mut ffi::TxIds {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let db_data_ptr = db_data;
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+
+        let usk = unsafe { decode_usk(usk_ptr, usk_len) }?;
+        let account = db_data
+            .get_account_for_ufvk(&usk.to_unified_full_viewing_key())?
+            .ok_or_else(|| anyhow!("Spending key does not belong to an account in this wallet"))?;
+        unsafe {
+            migration::ensure_account_ordinary_spends_allowed(
+                db_data_ptr,
+                db_data_len,
+                *account.id().expose_uuid().as_bytes(),
+                network,
+            )?
+        };
 
         let proposal =
             Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
                 .map_err(|e| anyhow!("Invalid proposal: {}", e))?
-                .try_into_standard_proposal(&db_data)?;
-        let usk = unsafe { decode_usk(usk_ptr, usk_len) }?;
+                .try_into_standard_proposal(&network, &db_data)?;
         let spend_params = Path::new(OsStr::from_bytes(unsafe {
             slice::from_raw_parts(spend_params, spend_params_len)
         }));
@@ -2685,7 +2809,6 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             &SpendingKeys::from_unified_spending_key(usk),
             OvkPolicy::Sender,
             &proposal,
-            None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2742,14 +2865,21 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        unsafe {
+            migration::ensure_account_ordinary_spends_allowed(
+                db_data,
+                db_data_len,
+                *account_uuid.expose_uuid().as_bytes(),
+                network,
+            )?
+        };
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let proposal =
             Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
                 .map_err(|e| anyhow!("Invalid proposal: {}", e))?
-                .try_into_standard_proposal(&db_data)?;
-
-        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+                .try_into_standard_proposal(&network, &db_data)?;
 
         if proposal.steps().len() == 1 {
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
@@ -2758,10 +2888,15 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
                 account_uuid,
                 OvkPolicy::Sender,
                 &proposal,
+                None,
+                orchard::builder::BundleType::DEFAULT,
             )
             .map_err(|e| anyhow!("Error creating PCZT from single-step proposal: {}", e))?;
 
-            Ok(ffi::BoxedSlice::some(pczt.serialize()))
+            let encoded = pczt
+                .serialize()
+                .map_err(|e| anyhow!("Error serializing PCZT: {:?}", e))?;
+            Ok(ffi::BoxedSlice::some(encoded))
         } else {
             Err(anyhow!(
                 "Multi-step proposals are not yet supported for PCZT generation."
@@ -2820,7 +2955,10 @@ pub unsafe extern "C" fn zcashlc_redact_pczt_for_signer(
             })
             .finish();
 
-        Ok(ffi::BoxedSlice::some(redacted_pczt.serialize()))
+        let encoded = redacted_pczt
+            .serialize()
+            .map_err(|e| anyhow!("Error serializing redacted PCZT: {:?}", e))?;
+        Ok(ffi::BoxedSlice::some(encoded))
     });
     unwrap_exc_or_null(res)
 }
@@ -2949,7 +3087,10 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
 
         let pczt_with_proofs = prover.finish();
 
-        Ok(ffi::BoxedSlice::some(pczt_with_proofs.serialize()))
+        let encoded = pczt_with_proofs
+            .serialize()
+            .map_err(|e| anyhow!("Error serializing proven PCZT: {:?}", e))?;
+        Ok(ffi::BoxedSlice::some(encoded))
     });
     unwrap_exc_or_null(res)
 }
@@ -3025,7 +3166,6 @@ pub unsafe extern "C" fn zcashlc_extract_and_store_from_pczt(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let pczt_with_proofs_bytes =
             unsafe { slice::from_raw_parts(pczt_with_proofs_ptr, pczt_with_proofs_len) };
@@ -3052,6 +3192,34 @@ pub unsafe extern "C" fn zcashlc_extract_and_store_from_pczt(
         let pczt = Combiner::new(vec![pczt_with_proofs, pczt_with_sigs])
             .combine()
             .map_err(|e| anyhow!("Failed to combine PCZTs: {:?}", e))?;
+
+        // Derive the actual funding account(s) from the fully authorized consensus transaction.
+        // This avoids both the former wallet-wide block (which prevented unrelated account B from
+        // finalizing while A migrated) and trusting caller-editable PCZT proprietary metadata.
+        let mut extractor = TransactionExtractor::new(pczt.clone());
+        if let Some((spend_vk, output_vk)) = sapling_vk.as_ref() {
+            extractor = extractor.with_sapling(spend_vk, output_vk);
+        }
+        let transaction = extractor
+            .extract()
+            .map_err(|e| anyhow!("Failed to inspect finalized PCZT funding accounts: {e:?}"))?;
+        let mut wallet = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let funding_accounts = wallet
+            .transactionally(|wallet_tx| wallet_tx.get_funding_accounts(&transaction))
+            .map_err(|e| anyhow!("Failed to identify finalized PCZT funding accounts: {e}"))?;
+        drop(wallet);
+        for account in funding_accounts {
+            unsafe {
+                migration::ensure_account_ordinary_spends_allowed(
+                    db_data,
+                    db_data_len,
+                    *account.expose_uuid().as_bytes(),
+                    network,
+                )?
+            };
+        }
+
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let txid = extract_and_store_transaction_from_pczt::<_, ()>(
             &mut db_data,
@@ -4226,7 +4394,11 @@ pub(crate) const NETWORK_ID_REGTEST: u32 = 2;
 #[derive(Clone, Copy)]
 pub(crate) enum NetworkParams {
     Standard(Network),
-    Custom { base: NetworkType, local: LocalNetwork },
+    Custom {
+        base: NetworkType,
+        local: LocalNetwork,
+        chain_id: CanonicalChainId,
+    },
 }
 
 impl Parameters for NetworkParams {
@@ -4247,11 +4419,125 @@ impl Parameters for NetworkParams {
     }
 }
 
+impl NetworkParams {
+    pub(crate) fn canonical_chain_id(&self) -> &str {
+        match self {
+            NetworkParams::Standard(MainNetwork) => "main",
+            NetworkParams::Standard(TestNetwork) => "test",
+            NetworkParams::Custom { chain_id, .. } => chain_id.as_str(),
+        }
+    }
+
+    fn consensus_fingerprint(&self) -> String {
+        // v2 adds stable upgrade id 10 (NU7), encoded as explicitly absent in production while
+        // upstream keeps the variant gated. A domain bump prevents the expanded schedule from
+        // silently changing the meaning of persisted v1 fingerprints.
+        const DOMAIN: &[u8] = b"zend-consensus-config-v2\0";
+        const UPGRADES: [NetworkUpgrade; 10] = [
+            NetworkUpgrade::Overwinter,
+            NetworkUpgrade::Sapling,
+            NetworkUpgrade::Blossom,
+            NetworkUpgrade::Heartwood,
+            NetworkUpgrade::Canopy,
+            NetworkUpgrade::Nu5,
+            NetworkUpgrade::Nu6,
+            NetworkUpgrade::Nu6_1,
+            NetworkUpgrade::Nu6_2,
+            NetworkUpgrade::Nu6_3,
+        ];
+
+        let mut digest = Sha256::new();
+        digest.update(DOMAIN);
+        digest.update([match self.network_type() {
+            NetworkType::Main => 0,
+            NetworkType::Test => 1,
+            NetworkType::Regtest => 2,
+        }]);
+        let chain_id = self.canonical_chain_id().as_bytes();
+        digest.update(
+            u16::try_from(chain_id.len())
+                .expect("validated chain id length")
+                .to_be_bytes(),
+        );
+        digest.update(chain_id);
+        for (id, upgrade) in UPGRADES.into_iter().enumerate() {
+            digest.update([u8::try_from(id).expect("ten upgrade ids")]);
+            match self.activation_height(upgrade) {
+                Some(height) => {
+                    digest.update([1]);
+                    digest.update(u32::from(height).to_be_bytes());
+                }
+                None => {
+                    digest.update([0]);
+                    digest.update(0u32.to_be_bytes());
+                }
+            }
+        }
+        // Raw id 10 is part of the stable SDK/FFI consensus identity even though the exact pinned
+        // upstream revision keeps the Nu7 enum variant and LocalNetwork field behind
+        // `zcash_unstable="nu7"`. This ensures adding an activation later changes the durable
+        // policy fingerprint instead of aliasing the current explicitly-absent schedule.
+        digest.update([10]);
+        #[cfg(zcash_unstable = "nu7")]
+        let nu7_height = self.activation_height(NetworkUpgrade::Nu7);
+        #[cfg(not(zcash_unstable = "nu7"))]
+        let nu7_height: Option<BlockHeight> = None;
+        match nu7_height {
+            Some(height) => {
+                digest.update([1]);
+                digest.update(u32::from(height).to_be_bytes());
+            }
+            None => {
+                digest.update([0]);
+                digest.update(0u32.to_be_bytes());
+            }
+        }
+        hex::encode(digest.finalize())
+    }
+}
+
 /// The custom network's base identity + per-NU activation heights, configured once via
 /// [`zcashlc_set_custom_network`] and read back by [`parse_network`] for `network_id`
 /// [`NETWORK_ID_REGTEST`]. `None` until set.
-static CUSTOM_PARAMS: std::sync::RwLock<Option<(NetworkType, LocalNetwork)>> =
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CanonicalChainId {
+    bytes: [u8; 255],
+    len: u8,
+}
+
+impl CanonicalChainId {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("canonical chain ids contain validated ASCII")
+    }
+}
+
+static CUSTOM_PARAMS: std::sync::RwLock<Option<(NetworkType, LocalNetwork, CanonicalChainId)>> =
     std::sync::RwLock::new(None);
+
+fn canonicalize_chain_id(value: &[u8]) -> anyhow::Result<CanonicalChainId> {
+    let value = std::str::from_utf8(value)
+        .map_err(|_| anyhow!("custom chain id is not valid UTF-8"))?
+        .trim()
+        .to_ascii_lowercase();
+    if value.is_empty() || value.len() > 255 {
+        return Err(anyhow!("custom chain id must contain 1 through 255 bytes"));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte))
+    {
+        return Err(anyhow!(
+            "custom chain id may contain only ASCII lowercase letters, digits, '.', '_', and '-'"
+        ));
+    }
+    let mut bytes = [0u8; 255];
+    bytes[..value.len()].copy_from_slice(value.as_bytes());
+    Ok(CanonicalChainId {
+        bytes,
+        len: u8::try_from(value.len()).expect("validated chain id length"),
+    })
+}
 
 /// Maps an FFI `network_id` to its [`NetworkType`], used to select the base identity of a custom network.
 fn network_type_for_id(network_id: u32) -> Option<NetworkType> {
@@ -4266,14 +4552,18 @@ fn network_type_for_id(network_id: u32) -> Option<NetworkType> {
 /// Registers the **custom network** resolved for `network_id` [`NETWORK_ID_REGTEST`], which every
 /// subsequent `zcashlc_*` call resolves through [`parse_network`]. `base_network_id` selects the base
 /// identity — address encoding and `chainName` — as mainnet (1), testnet (0), or regtest (2); the
-/// activation heights are custom regardless. Each height argument is a block height, or a negative value
-/// meaning "not activated on this network"; set them to mirror the `nuparams` of the node /
-/// `lightwalletd` being connected to. Idempotent; intended to be called once at init.
+/// activation heights are custom regardless. `chain_id` is the canonical chain name expected from
+/// lightwalletd `getInfo` and committed into the consensus fingerprint. Each height argument is a
+/// block height, or a negative value meaning "not activated on this network"; set them to mirror
+/// the `nuparams` of the node / `lightwalletd` being connected to. Idempotent for one exact
+/// configuration; a later conflicting registration fails closed and preserves the first value.
 ///
 /// Returns `true` on success, `false` on an invalid `base_network_id` or a poisoned lock.
 #[unsafe(no_mangle)]
-pub extern "C" fn zcashlc_set_custom_network(
+pub unsafe extern "C" fn zcashlc_set_custom_network(
     base_network_id: u32,
+    chain_id: *const u8,
+    chain_id_len: usize,
     overwinter: i64,
     sapling: i64,
     blossom: i64,
@@ -4284,6 +4574,7 @@ pub extern "C" fn zcashlc_set_custom_network(
     nu6_1: i64,
     nu6_2: i64,
     nu6_3: i64,
+    nu7: i64,
 ) -> bool {
     fn height(value: i64) -> Option<BlockHeight> {
         u32::try_from(value).ok().map(BlockHeight::from_u32)
@@ -4292,6 +4583,20 @@ pub extern "C" fn zcashlc_set_custom_network(
     let Some(base) = network_type_for_id(base_network_id) else {
         return false;
     };
+    // The stable production build deliberately does not enable proposed NU7 consensus behavior.
+    // Reject an explicit custom activation instead of silently omitting it from LocalNetwork.
+    #[cfg(not(zcash_unstable = "nu7"))]
+    if nu7 >= 0 {
+        return false;
+    }
+    if chain_id.is_null() {
+        return false;
+    }
+    let chain_id =
+        match canonicalize_chain_id(unsafe { slice::from_raw_parts(chain_id, chain_id_len) }) {
+            Ok(chain_id) => chain_id,
+            Err(_) => return false,
+        };
 
     let local = LocalNetwork {
         overwinter: height(overwinter),
@@ -4304,12 +4609,19 @@ pub extern "C" fn zcashlc_set_custom_network(
         nu6_1: height(nu6_1),
         nu6_2: height(nu6_2),
         nu6_3: height(nu6_3),
+        #[cfg(zcash_unstable = "nu7")]
+        nu7: height(nu7),
     };
 
     match CUSTOM_PARAMS.write() {
         Ok(mut guard) => {
-            *guard = Some((base, local));
-            true
+            let configured = (base, local, chain_id);
+            if guard.as_ref().is_some_and(|current| current != &configured) {
+                false
+            } else {
+                *guard = Some(configured);
+                true
+            }
         }
         Err(_) => false,
     }
@@ -4323,15 +4635,18 @@ pub(crate) fn parse_network(value: u32) -> anyhow::Result<NetworkParams> {
             let guard = CUSTOM_PARAMS
                 .read()
                 .map_err(|_| anyhow!("custom network params lock is poisoned"))?;
-            // `Option<(NetworkType, LocalNetwork)>` is `Copy`, so deref-copy out of the read guard.
-            let (base, local) = (*guard).ok_or_else(|| {
+            let (base, local, chain_id) = (*guard).ok_or_else(|| {
                 anyhow!(
                     "custom network (id {}) used before it was configured; call \
                      zcashlc_set_custom_network first",
                     NETWORK_ID_REGTEST,
                 )
             })?;
-            Ok(NetworkParams::Custom { base, local })
+            Ok(NetworkParams::Custom {
+                base,
+                local,
+                chain_id,
+            })
         }
         _ => Err(anyhow!(
             "Invalid network type: {}. Expected {}, {}, or {} for Testnet, Mainnet, or a custom network, respectively.",
