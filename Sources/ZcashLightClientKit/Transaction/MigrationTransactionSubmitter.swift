@@ -69,6 +69,8 @@ protocol MigrationTransactionSubmitting {
         branchIdForHeight: @escaping (Int32) throws -> Int32
     ) async throws -> SubmissionPolicy
 
+    // Engine claim, immutable policy, and lease renewal are one atomic submission contract.
+    // swiftlint:disable:next function_parameter_count
     func submit(
         transaction: EncodedTransaction,
         displayTransactionID: String,
@@ -179,6 +181,8 @@ final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
         )
     }
 
+    // Mirrors the atomic protocol contract above; grouping these values would obscure ownership.
+    // swiftlint:disable:next function_parameter_count
     func submit(
         transaction: EncodedTransaction,
         displayTransactionID: String,

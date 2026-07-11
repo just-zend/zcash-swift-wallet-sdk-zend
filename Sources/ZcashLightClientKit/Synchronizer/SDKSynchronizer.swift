@@ -1230,6 +1230,8 @@ public class SDKSynchronizer: Synchronizer {
         )
     }
 
+    // All transport outcomes converge here so every claim token is finalized exactly once.
+    // swiftlint:disable:next cyclomatic_complexity
     private func submitMigrationClaim(
         _ claim: ClaimedTx,
         options: NetworkPrivacyOptions,

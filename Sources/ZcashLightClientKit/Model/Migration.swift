@@ -779,6 +779,8 @@ extension MigrationSnapshot {
     /// Defensively validates the complete v4 wire snapshot before any UI/background consumer sees
     /// it. A newer schema is converted to the single fail-closed app-update projection; every
     /// compatible schema violation is rejected as typed corruption.
+    // Validation deliberately enumerates the complete untrusted wire-state matrix in one choke point.
+    // swiftlint:disable:next cyclomatic_complexity
     func validated(
         accountUuid expectedAccountUuid: String,
         network expectedNetwork: String,
@@ -1149,6 +1151,8 @@ extension MigrationSnapshot {
         }
     }
 
+    // This is the exhaustive phase/action authorization matrix; splitting it risks inconsistent gates.
+    // swiftlint:disable:next cyclomatic_complexity
     private static func action(
         _ action: NextAction,
         isAllowedFor phase: MigrationPhase,
