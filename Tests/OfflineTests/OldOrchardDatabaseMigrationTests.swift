@@ -18,17 +18,57 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
     ])
     private static let fixtureSeed = [UInt8](repeating: 0, count: 32)
     private static let orchardValue = Zatoshi(123_456_789)
-    private static let ironwoodActivation = 4_134_000
+    private static let immediateFee: UInt64 = 20_000
 
-    func testPrepareUpgradesCanonicalOldOrchardWalletWithoutLosingState() async throws {
+    func testRestoreUpgradesCanonicalOldOrchardTestnetWalletWithoutLosingState() async throws {
         let fixtureURL = try XCTUnwrap(TestDbBuilder.zend260Alpha6OrchardDataDbURL())
-        let dataDbURL = testTempDirectory.appendingPathComponent("old-orchard-wallet.sqlite")
+        try await assertCanonicalUpgrade(
+            fixtureURL: fixtureURL,
+            compactBlocks: try TestDbBuilder.zend260Alpha6OrchardCompactBlocks(),
+            identifier: "testnet-restore",
+            networkType: .testnet,
+            saplingActivation: 280_000,
+            ironwoodActivation: 4_134_000,
+            walletMode: .restoreWallet
+        )
+    }
+
+    func testExistingWalletUpgradesCanonicalOldOrchardMainnetWalletWithoutLosingState() async throws {
+        let fixtureURL = try XCTUnwrap(TestDbBuilder.zend260Alpha6OrchardMainnetDataDbURL())
+        try await assertCanonicalUpgrade(
+            fixtureURL: fixtureURL,
+            compactBlocks: try TestDbBuilder.zend260Alpha6OrchardMainnetCompactBlocks(),
+            identifier: "mainnet-existing",
+            networkType: .mainnet,
+            saplingActivation: 419_200,
+            ironwoodActivation: 3_428_143,
+            walletMode: .existingWallet
+        )
+    }
+
+    private func assertCanonicalUpgrade(
+        fixtureURL: URL,
+        compactBlocks: [ZcashCompactBlock],
+        identifier: String,
+        networkType: NetworkType,
+        saplingActivation: BlockHeight,
+        ironwoodActivation: BlockHeight,
+        walletMode: WalletInitMode
+    ) async throws {
+        let fixtureStart = ironwoodActivation - 10
+        let fixtureEndExclusive = ironwoodActivation + 11
+        let dataDbURL = testTempDirectory.appendingPathComponent("old-orchard-wallet-\(identifier).sqlite")
         try FileManager.default.copyItem(at: fixtureURL, to: dataDbURL)
 
         let before = try Self.captureDurableState(at: dataDbURL)
         XCTAssertEqual(before.accountCount, 1)
+        XCTAssertGreaterThan(before.addressCount, 0)
         XCTAssertEqual(before.orchardNoteCount, 1)
-        XCTAssertEqual(before.scanQueue, "100000:4133990:0,4133990:4134011:10")
+        XCTAssertEqual(
+            before.scanQueue,
+            "\(saplingActivation):\(fixtureStart):0,\(fixtureStart):\(fixtureEndExclusive):10"
+        )
+        try Self.assertCanonicalAddressNetwork(before.addressPayload, networkType: networkType)
         XCTAssertEqual(try Self.schemaObjectCount(containing: "ironwood", at: dataDbURL), 0)
         XCTAssertEqual(try Self.schemaObjectCount(prefix: "ext_ironwood_migration_", at: dataDbURL), 0)
         XCTAssertEqual(try Self.rawTransactionCount(at: dataDbURL), 0)
@@ -36,12 +76,12 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
         let initializer = Initializer(
             container: mockContainer,
             cacheDbURL: nil,
-            fsBlockDbRoot: testTempDirectory.appendingPathComponent("blocks"),
+            fsBlockDbRoot: testTempDirectory.appendingPathComponent("blocks-\(identifier)"),
             generalStorageURL: testGeneralStorageDirectory,
             dataDbURL: dataDbURL,
-            torDirURL: testTempDirectory.appendingPathComponent("tor"),
+            torDirURL: testTempDirectory.appendingPathComponent("tor-\(identifier)"),
             endpoint: LightWalletEndpointBuilder.default,
-            network: ZcashNetworkBuilder.network(for: .testnet),
+            network: ZcashNetworkBuilder.network(for: networkType),
             spendParamsURL: try __spendParamsURL(),
             outputParamsURL: try __outputParamsURL(),
             saplingParamsSourceURL: .tests,
@@ -53,8 +93,8 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
 
         let prepareResult = try await synchronizer.prepare(
             with: Self.fixtureSeed,
-            walletBirthday: Self.ironwoodActivation - 10,
-            for: .restoreWallet,
+            walletBirthday: fixtureStart,
+            for: walletMode,
             name: "",
             keySource: nil
         )
@@ -68,12 +108,25 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
         let afterPrepare = try Self.captureDurableState(at: dataDbURL)
         XCTAssertEqual(afterPrepare.accountCount, 1)
         XCTAssertEqual(afterPrepare.accountPayload, before.accountPayload)
+        XCTAssertEqual(afterPrepare.addressCount, before.addressCount)
+        XCTAssertEqual(afterPrepare.addressPayload, before.addressPayload)
         XCTAssertEqual(afterPrepare.orchardNoteCount, 1)
         XCTAssertEqual(afterPrepare.orchardNotePayload, before.orchardNotePayload)
+        let expectedScanQueue = [
+            "\(saplingActivation):\(fixtureStart):0",
+            "\(fixtureStart):\(ironwoodActivation):10",
+            "\(ironwoodActivation):\(fixtureEndExclusive):20"
+        ].joined(separator: ",")
         XCTAssertEqual(
             afterPrepare.scanQueue,
-            "100000:4133990:0,4133990:4134000:10,4134000:4134011:20"
+            expectedScanQueue
         )
+        try Self.assertCanonicalAddressNetwork(afterPrepare.addressPayload, networkType: networkType)
+
+        let currentAddress = try await synchronizer.getUnifiedAddress(accountUUID: Self.expectedAccount)
+        XCTAssertNoThrow(try UnifiedAddress(encoding: currentAddress.stringEncoded, network: networkType))
+        let otherNetwork: NetworkType = networkType == .mainnet ? .testnet : .mainnet
+        XCTAssertThrowsError(try UnifiedAddress(encoding: currentAddress.stringEncoded, network: otherNetwork))
 
         XCTAssertEqual(try Self.schemaObjectCount(named: "ironwood_received_notes", at: dataDbURL), 1)
         XCTAssertEqual(try Self.schemaObjectCount(named: "ironwood_tree_shards", at: dataDbURL), 1)
@@ -83,17 +136,25 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
 
         let suggested = try await initializer.rustBackend.suggestScanRanges()
         XCTAssertEqual(suggested.count, 1)
-        XCTAssertEqual(suggested.first?.range, Self.ironwoodActivation ..< 4_134_011)
+        XCTAssertEqual(suggested.first?.range, ironwoodActivation ..< fixtureEndExclusive)
         XCTAssertEqual(suggested.first?.priority, .historic)
         let fullyScannedHeight = try await initializer.rustBackend.fullyScannedHeight()
         let maxScannedHeight = try await initializer.rustBackend.maxScannedHeight()
-        XCTAssertEqual(fullyScannedHeight, Self.ironwoodActivation - 1)
-        XCTAssertEqual(maxScannedHeight, 4_134_010)
+        XCTAssertEqual(fullyScannedHeight, ironwoodActivation - 1)
+        XCTAssertEqual(maxScannedHeight, fixtureEndExclusive - 1)
 
+        // Isolate librustzcash's witness eligibility from the SDK's separate startup guard,
+        // which deliberately masks every spendable balance until a live chain tip is observed.
+        await initializer.container.resolve(SDKFlags.self).markChainTipAsUpdated()
         let walletSummary = try await initializer.rustBackend.getWalletSummary()
         let summary = try XCTUnwrap(walletSummary)
         let accountBalance = try XCTUnwrap(summary.accountBalances[Self.expectedAccount])
         XCTAssertEqual(accountBalance.orchardBalance.total(), Self.orchardValue)
+        // The schema migration introduces a historic Ironwood activation range. Until the next
+        // synchronization scans that range, the open Orchard shard is not witness-complete under
+        // current librustzcash rules. Total value must survive, but presenting it as immediately
+        // spendable would race the required rescan.
+        XCTAssertEqual(accountBalance.orchardBalance.spendableValue, .zero)
         XCTAssertEqual(accountBalance.ironwoodBalance.total(), .zero)
 
         try await synchronizer.initializePostUpgrade(for: Self.expectedAccount)
@@ -105,38 +166,72 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
         XCTAssertEqual(try Self.schemaObjectCount(prefix: "ext_ironwood_migration_", at: dataDbURL), 10)
         XCTAssertEqual(try Self.engineSchemaVersion(at: dataDbURL), MigrationSnapshot.supportedSchemaVersion)
 
-        let orchardSpendable = try XCTUnwrap(UInt64(exactly: accountBalance.orchardBalance.spendableValue.amount))
         let engineRowsBeforePreview = try Self.engineRowCount(at: dataDbURL)
         let preview = try await synchronizer.previewImmediateMigration(for: Self.expectedAccount)
-        switch preview {
-        case let .actionable(spendableBalance, migrationAmount, fee):
-            XCTAssertEqual(spendableBalance, orchardSpendable)
-            XCTAssertEqual(migrationAmount + fee, spendableBalance)
-            XCTAssertGreaterThan(migrationAmount, 0)
-        case let .positiveBalanceAtOrBelowFee(spendableBalance, fee):
-            XCTAssertEqual(spendableBalance, orchardSpendable)
-            XCTAssertGreaterThan(spendableBalance, 0)
-            XCTAssertLessThanOrEqual(spendableBalance, fee)
-        case .noSpendableFunds:
-            XCTAssertEqual(orchardSpendable, 0)
-        }
+        XCTAssertEqual(preview, .noSpendableFunds)
         XCTAssertEqual(try Self.captureDurableState(at: dataDbURL), afterPrepare)
         XCTAssertEqual(try Self.engineRowCount(at: dataDbURL), engineRowsBeforePreview)
         let snapshotAfterPreview = try await synchronizer.migrationSnapshot(for: Self.expectedAccount)
         XCTAssertEqual(snapshotAfterPreview, snapshot)
+
+        // A production synchronizer self-heals this expected waiting state by downloading and
+        // scanning the Historic range. Replay the exact compact blocks that created the old
+        // database through the real filesystem cache and current Rust scanner, without a server.
+        XCTAssertEqual(compactBlocks.map(\.height), Array(fixtureStart ..< fixtureEndExclusive))
+        try await initializer.storage.create()
+        try await initializer.storage.write(blocks: compactBlocks)
+
+        var priorTreeState = TreeState()
+        priorTreeState.network = networkType == .mainnet ? "main" : "test"
+        priorTreeState.height = UInt64(fixtureStart - 1)
+        priorTreeState.hash = String(repeating: "0", count: 64)
+        let scanSummary = try await initializer.rustBackend.scanBlocks(
+            fromHeight: Int32(fixtureStart),
+            fromState: priorTreeState,
+            limit: UInt32(compactBlocks.count)
+        )
+        XCTAssertEqual(scanSummary.scannedRange, fixtureStart ..< fixtureEndExclusive)
+        let healedSuggestedRanges = try await initializer.rustBackend.suggestScanRanges()
+        let healedFullyScannedHeight = try await initializer.rustBackend.fullyScannedHeight()
+        let healedMaxScannedHeight = try await initializer.rustBackend.maxScannedHeight()
+        XCTAssertTrue(healedSuggestedRanges.isEmpty)
+        XCTAssertEqual(healedFullyScannedHeight, fixtureEndExclusive - 1)
+        XCTAssertEqual(healedMaxScannedHeight, fixtureEndExclusive - 1)
+        XCTAssertEqual(try Self.captureDurableState(at: dataDbURL), before)
+
+        let healedWalletSummary = try await initializer.rustBackend.getWalletSummary()
+        let healedSummary = try XCTUnwrap(healedWalletSummary)
+        let healedBalance = try XCTUnwrap(healedSummary.accountBalances[Self.expectedAccount])
+        XCTAssertEqual(healedBalance.orchardBalance.total(), Self.orchardValue)
+        XCTAssertEqual(healedBalance.orchardBalance.spendableValue, Self.orchardValue)
+        XCTAssertEqual(healedBalance.orchardBalance.valuePendingSpendability, .zero)
+
+        let healedPreview = try await synchronizer.previewImmediateMigration(for: Self.expectedAccount)
+        guard case let .actionable(spendableBalance, migrationAmount, fee) = healedPreview else {
+            return XCTFail("the canonical Orchard note must become actionable after its queued rescan")
+        }
+        let orchardSpendable = try XCTUnwrap(UInt64(exactly: Self.orchardValue.amount))
+        XCTAssertEqual(spendableBalance, orchardSpendable)
+        XCTAssertEqual(fee, Self.immediateFee)
+        XCTAssertEqual(migrationAmount, orchardSpendable - Self.immediateFee)
+        XCTAssertEqual(try Self.engineRowCount(at: dataDbURL), engineRowsBeforePreview)
+        let healedSnapshot = try await synchronizer.migrationSnapshot(for: Self.expectedAccount)
+        XCTAssertEqual(healedSnapshot, snapshot)
 
         // Both migration layers are restart-safe. A launch interrupted after either step can
         // repeat them without duplicating an account, note, scan range, or engine marker.
         let repeatedInit = try await initializer.rustBackend.initDataDb(seed: Self.fixtureSeed)
         XCTAssertEqual(repeatedInit, .success)
         try await synchronizer.initializePostUpgrade(for: Self.expectedAccount)
-        XCTAssertEqual(try Self.captureDurableState(at: dataDbURL), afterPrepare)
+        XCTAssertEqual(try Self.captureDurableState(at: dataDbURL), before)
         XCTAssertEqual(try Self.engineMetaRowCount(at: dataDbURL), 1)
     }
 
     private struct DurableState: Equatable {
         let accountCount: Int64
         let accountPayload: String
+        let addressCount: Int64
+        let addressPayload: String
         let orchardNoteCount: Int64
         let orchardNotePayload: String
         let scanQueue: String
@@ -152,6 +247,20 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
                     '%s|%d|%d|%s|%s|%d',
                     hex(uuid), account_kind, hd_account_index, ufvk, uivk, birthday_height
                 ) FROM accounts
+                """,
+                in: db
+            ),
+            addressCount: try scalarInt("SELECT COUNT(*) FROM addresses", in: db),
+            addressPayload: try scalarString(
+                """
+                SELECT group_concat(entry, ';') FROM (
+                    SELECT printf(
+                        '%d|%d|%s|%s|%s|%d',
+                        id, key_scope, coalesce(hex(diversifier_index_be), ''), address,
+                        coalesce(cached_transparent_receiver_address, ''), receiver_flags
+                    ) AS entry
+                    FROM addresses ORDER BY id
+                )
                 """,
                 in: db
             ),
@@ -176,6 +285,39 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
                 in: db
             )
         )
+    }
+
+    private static func assertCanonicalAddressNetwork(
+        _ payload: String,
+        networkType: NetworkType
+    ) throws {
+        let otherNetwork: NetworkType = networkType == .mainnet ? .testnet : .mainnet
+        for entry in payload.split(separator: ";") {
+            let fields = entry.split(separator: "|", omittingEmptySubsequences: false)
+            guard fields.count == 6 else {
+                XCTFail("unexpected persisted address payload shape")
+                continue
+            }
+
+            let address = String(fields[3])
+            if address.hasPrefix("u") {
+                XCTAssertNoThrow(try UnifiedAddress(encoding: address, network: networkType))
+                XCTAssertThrowsError(try UnifiedAddress(encoding: address, network: otherNetwork))
+            } else {
+                XCTAssertNoThrow(try TransparentAddress(encoding: address, network: networkType))
+                XCTAssertThrowsError(try TransparentAddress(encoding: address, network: otherNetwork))
+            }
+
+            let cachedTransparent = String(fields[4])
+            if !cachedTransparent.isEmpty {
+                XCTAssertNoThrow(
+                    try TransparentAddress(encoding: cachedTransparent, network: networkType)
+                )
+                XCTAssertThrowsError(
+                    try TransparentAddress(encoding: cachedTransparent, network: otherNetwork)
+                )
+            }
+        }
     }
 
     private static func schemaObjectCount(named name: String, at url: URL) throws -> Int64 {

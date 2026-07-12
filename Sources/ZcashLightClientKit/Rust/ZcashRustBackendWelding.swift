@@ -132,7 +132,8 @@ protocol ZcashRustBackendWelding {
     /// - Returns: `DbInitResult.success` if the dataDb was initialized successfully
     /// or `DbInitResult.seedRequired` if the operation requires the seed to be passed
     /// in order to be completed successfully.
-    /// Throws `rustInitDataDb` if rust layer returns error.
+    /// Throws `WalletDatabaseInitializationError` for classified storage/schema/data failures,
+    /// or `rustInitDataDb` for an unclassified backend error.
     func initDataDb(seed: [UInt8]?) async throws -> DbInitResult
 
     /// Returns a list of the transparent receivers for the diversified unified addresses that have

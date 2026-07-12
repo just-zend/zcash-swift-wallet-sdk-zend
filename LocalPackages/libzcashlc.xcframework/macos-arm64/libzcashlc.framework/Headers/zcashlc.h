@@ -515,7 +515,11 @@ typedef struct FfiSymmetricKeys FfiTxIds;
 /**
  * Metadata about the status of a transaction obtained by inspecting the chain state.
  */
-enum FfiTransactionStatus_Tag {
+enum FfiTransactionStatus_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
   /**
    * The requested transaction ID was not recognized by the node.
    */
@@ -532,7 +536,11 @@ enum FfiTransactionStatus_Tag {
    */
   Mined,
 };
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiTransactionStatus_Tag FfiTransactionStatus_Tag;
+#else
 typedef uint8_t FfiTransactionStatus_Tag;
+#endif // __STDC_VERSION__ >= 202311L
 
 typedef struct FfiTransactionStatus {
   FfiTransactionStatus_Tag tag;
@@ -547,7 +555,11 @@ typedef struct FfiTransactionStatus {
  * A request for transaction data enhancement, spentness check, or discovery
  * of spends from a given transparent address within a specific block range.
  */
-enum FfiTransactionDataRequest_Tag {
+enum FfiTransactionDataRequest_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
   /**
    * Information about the chain's view of a transaction is requested.
    *
@@ -595,7 +607,11 @@ enum FfiTransactionDataRequest_Tag {
    */
   TransactionsInvolvingAddress,
 };
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiTransactionDataRequest_Tag FfiTransactionDataRequest_Tag;
+#else
 typedef uint8_t FfiTransactionDataRequest_Tag;
+#endif // __STDC_VERSION__ >= 202311L
 
 typedef struct TransactionsInvolvingAddress_Body {
   /**
@@ -749,7 +765,11 @@ typedef struct Decimal {
  * The result of checking for UTXOs received by an ephemeral address.
  *
  */
-enum FfiAddressCheckResult_Tag {
+enum FfiAddressCheckResult_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
   /**
    * No UTXOs were found as a result of the check.
    */
@@ -759,7 +779,11 @@ enum FfiAddressCheckResult_Tag {
    */
   FfiAddressCheckResult_Found,
 };
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiAddressCheckResult_Tag FfiAddressCheckResult_Tag;
+#else
 typedef uint8_t FfiAddressCheckResult_Tag;
+#endif // __STDC_VERSION__ >= 202311L
 
 typedef struct FfiAddressCheckResult_Found_Body {
   char *address;
@@ -948,6 +972,12 @@ typedef struct FfiVoteRecords {
   struct FfiVoteRecord *ptr;
   uintptr_t len;
 } FfiVoteRecords;
+
+/**
+ * Takes the stable database-initialization failure code for the immediately preceding call on
+ * this thread. Swift uses this typed channel for recovery policy and never parses Rust prose.
+ */
+uint32_t zcashlc_last_database_init_error_code(void);
 
 /**
  * Initializes global Rust state, such as the logging infrastructure and threadpools.

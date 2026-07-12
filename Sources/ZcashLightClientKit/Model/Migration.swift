@@ -216,6 +216,62 @@ public enum ImmediateMigrationPreview: Equatable, Sendable, Codable {
     }
 }
 
+/// Sanitized, stable cause for the canonical wallet database initialization/migration. Recovery
+/// policy must use this typed value rather than parsing Rust, SQLite, migration, or path prose.
+public enum WalletDatabaseInitializationFailureCause: String, Equatable, Sendable, Codable {
+    case databaseBusy = "database_busy"
+    case databaseLocked = "database_locked"
+    case databaseFull = "database_full"
+    case databaseReadOnly = "database_read_only"
+    case databaseCorrupt = "database_corrupt"
+    case databaseUnavailable = "database_unavailable"
+    case schemaIncompatible = "schema_incompatible"
+    case backend = "backend"
+
+    init?(ffiCode: UInt32) {
+        switch ffiCode {
+        case 1: self = .databaseBusy
+        case 2: self = .databaseLocked
+        case 3: self = .databaseFull
+        case 4: self = .databaseReadOnly
+        case 5: self = .databaseCorrupt
+        case 6: self = .databaseUnavailable
+        case 7: self = .schemaIncompatible
+        case 8: self = .backend
+        default: return nil
+        }
+    }
+}
+
+/// Public typed error thrown when the upstream wallet database migration fails. It carries no
+/// source error text and is safe to use in UI state and telemetry.
+public struct WalletDatabaseInitializationError: Error, Equatable, Sendable, LocalizedError {
+    public let cause: WalletDatabaseInitializationFailureCause
+
+    public init(cause: WalletDatabaseInitializationFailureCause) {
+        self.cause = cause
+    }
+
+    public var errorDescription: String? {
+        switch cause {
+        case .databaseBusy, .databaseLocked:
+            "The wallet database is temporarily busy."
+        case .databaseFull:
+            "The device does not have enough storage to update the wallet."
+        case .databaseReadOnly:
+            "The wallet database cannot be updated."
+        case .databaseCorrupt:
+            "The wallet database appears to be damaged."
+        case .databaseUnavailable:
+            "The wallet database is unavailable."
+        case .schemaIncompatible:
+            "This wallet database was created by an incompatible SDK version."
+        case .backend:
+            "The wallet database could not be initialized."
+        }
+    }
+}
+
 /// Sanitized, stable cause for a migration-engine initialization failure. These cases are safe for
 /// UI state and telemetry; no Rust, SQLite, path, schema-object, or SQL text is retained.
 public enum MigrationEngineInitializationFailureCause: String, Equatable, Sendable, Codable {

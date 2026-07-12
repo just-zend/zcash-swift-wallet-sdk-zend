@@ -1,5 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::convert::{Infallible, TryFrom, TryInto};
 use std::error::Error;
@@ -103,6 +104,87 @@ mod tor;
 // 0.15 graph. Re-enable only after that upstream stack migrates (MOB-1455).
 #[cfg(feature = "voting")]
 mod voting;
+
+const DATABASE_INIT_ERROR_NONE: u32 = 0;
+const DATABASE_INIT_ERROR_BUSY: u32 = 1;
+const DATABASE_INIT_ERROR_LOCKED: u32 = 2;
+const DATABASE_INIT_ERROR_FULL: u32 = 3;
+const DATABASE_INIT_ERROR_READ_ONLY: u32 = 4;
+const DATABASE_INIT_ERROR_CORRUPT: u32 = 5;
+const DATABASE_INIT_ERROR_UNAVAILABLE: u32 = 6;
+const DATABASE_INIT_ERROR_INCOMPATIBLE: u32 = 7;
+const DATABASE_INIT_ERROR_BACKEND: u32 = 8;
+
+thread_local! {
+    static LAST_DATABASE_INIT_ERROR_CODE: Cell<u32> = const { Cell::new(DATABASE_INIT_ERROR_NONE) };
+}
+
+fn set_database_init_error_code(code: u32) {
+    LAST_DATABASE_INIT_ERROR_CODE.with(|value| value.set(code));
+}
+
+/// Takes the stable database-initialization failure code for the immediately preceding call on
+/// this thread. Swift uses this typed channel for recovery policy and never parses Rust prose.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_last_database_init_error_code() -> u32 {
+    LAST_DATABASE_INIT_ERROR_CODE.with(|value| value.replace(DATABASE_INIT_ERROR_NONE))
+}
+
+fn sqlite_database_init_error_code(error: &rusqlite::Error) -> u32 {
+    use rusqlite::ffi::ErrorCode;
+
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
+            ErrorCode::DatabaseBusy => DATABASE_INIT_ERROR_BUSY,
+            ErrorCode::DatabaseLocked => DATABASE_INIT_ERROR_LOCKED,
+            ErrorCode::DiskFull => DATABASE_INIT_ERROR_FULL,
+            ErrorCode::ReadOnly
+            | ErrorCode::PermissionDenied
+            | ErrorCode::AuthorizationForStatementDenied => DATABASE_INIT_ERROR_READ_ONLY,
+            ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => DATABASE_INIT_ERROR_CORRUPT,
+            ErrorCode::CannotOpen
+            | ErrorCode::SystemIoFailure
+            | ErrorCode::FileLockingProtocolFailed => DATABASE_INIT_ERROR_UNAVAILABLE,
+            _ => DATABASE_INIT_ERROR_BACKEND,
+        },
+        _ => DATABASE_INIT_ERROR_BACKEND,
+    }
+}
+
+fn wallet_database_init_error_code(error: &WalletMigrationError) -> u32 {
+    match error {
+        WalletMigrationError::DatabaseNotSupported(_) | WalletMigrationError::CannotRevert(_) => {
+            DATABASE_INIT_ERROR_INCOMPATIBLE
+        }
+        WalletMigrationError::DbError(error) => sqlite_database_init_error_code(error),
+        WalletMigrationError::CorruptedData(_)
+        | WalletMigrationError::BalanceError(_)
+        | WalletMigrationError::CommitmentTree(_)
+        | WalletMigrationError::AddressGeneration(_) => DATABASE_INIT_ERROR_CORRUPT,
+        WalletMigrationError::Other(error) => match error.as_ref() {
+            SqliteClientError::DbError(error) => sqlite_database_init_error_code(error),
+            SqliteClientError::Io(_) => DATABASE_INIT_ERROR_UNAVAILABLE,
+            _ => DATABASE_INIT_ERROR_CORRUPT,
+        },
+        WalletMigrationError::SeedRequired | WalletMigrationError::SeedNotRelevant => {
+            DATABASE_INIT_ERROR_BACKEND
+        }
+    }
+}
+
+fn migrator_database_init_error_code(
+    error: &schemerz::MigratorError<Uuid, WalletMigrationError>,
+) -> u32 {
+    match error {
+        // Applied migration IDs that this binary does not know are a forward/incompatible schema,
+        // not permission to recreate or overwrite the wallet.
+        schemerz::MigratorError::Dependency(_) => DATABASE_INIT_ERROR_INCOMPATIBLE,
+        schemerz::MigratorError::Adapter(error)
+        | schemerz::MigratorError::Migration { error, .. } => {
+            wallet_database_init_error_code(error)
+        }
+    }
+}
 
 #[cfg(target_vendor = "apple")]
 mod os_log;
@@ -304,9 +386,20 @@ pub unsafe extern "C" fn zcashlc_init_data_database(
     seed_len: usize,
     network_id: u32,
 ) -> i32 {
+    set_database_init_error_code(DATABASE_INIT_ERROR_NONE);
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network) }.map_err(|error| {
+            let code = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+                .map_or(
+                    DATABASE_INIT_ERROR_UNAVAILABLE,
+                    sqlite_database_init_error_code,
+                );
+            set_database_init_error_code(code);
+            error
+        })?;
 
         let seed = if seed.is_null() {
             None
@@ -334,7 +427,10 @@ pub unsafe extern "C" fn zcashlc_init_data_database(
             {
                 Ok(2)
             }
-            Err(e) => Err(anyhow!("Error while initializing data DB: {}", e)),
+            Err(e) => {
+                set_database_init_error_code(migrator_database_init_error_code(&e));
+                Err(anyhow!("Error while initializing data DB: {}", e))
+            }
         }
     });
     unwrap_exc_or(res, -1)

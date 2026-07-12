@@ -34,6 +34,9 @@ jobs:
     - name: Verify committed XCFramework
       run: ./Scripts/verify-ironwood-ffi-artifact.sh
 
+    - name: Verify canonical pre-Ironwood fixtures
+      run: ./Scripts/verify-old-orchard-fixtures.sh
+
     # Build the Swift package
     - name: Build ZcashLightClientKit Swift Package
       timeout-minutes: 15

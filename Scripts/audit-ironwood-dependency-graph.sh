@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-expected_librustzcash_rev="d4f4095de03e1aab3bd72b4c3f83459072ed584e"
+expected_librustzcash_rev="54ff673169ec8be5a4b023a7ae69bcf5caead2a3"
 tree_file=$(mktemp)
 duplicates_file=$(mktemp)
 trap 'rm -f "$tree_file" "$duplicates_file"' EXIT
@@ -44,16 +44,16 @@ assert_one() {
 
 assert_one orchard 0.15.0
 for crate_and_version in \
-    "pczt 0.7.0" \
+    "pczt 0.8.0-rc.1" \
     "zcash_address 0.13.0" \
-    "zcash_client_backend 0.23.0" \
-    "zcash_client_sqlite 0.21.1" \
+    "zcash_client_backend 0.24.0-rc.1" \
+    "zcash_client_sqlite 0.22.0-rc.1" \
     "zcash_keys 0.15.0" \
     "zcash_primitives 0.29.0" \
     "zcash_proofs 0.29.0" \
     "zcash_protocol 0.10.0" \
     "zcash_transparent 0.9.0" \
-    "zip321 0.8.0"
+    "zip321 0.9.0-rc.1"
 do
     read -r crate version <<< "$crate_and_version"
     assert_one "$crate" "$version" "github.com/zcash/librustzcash?rev=$expected_librustzcash_rev"

@@ -706,6 +706,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         case 2:
             return DbInitResult.seedNotRelevant
         default:
+            if let cause = WalletDatabaseInitializationFailureCause(
+                ffiCode: zcashlc_last_database_init_error_code()
+            ) {
+                // The typed channel is the behavior boundary. Discard detailed Rust/SQLite prose
+                // so callers cannot accidentally persist or export paths and schema details.
+                zcashlc_clear_last_error()
+                throw WalletDatabaseInitializationError(cause: cause)
+            }
             throw ZcashError.rustInitDataDb(lastErrorMessage(fallback: "`initDataDb` failed with unknown error"))
         }
     }

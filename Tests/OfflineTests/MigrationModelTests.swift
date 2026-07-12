@@ -192,6 +192,27 @@ final class MigrationModelTests: XCTestCase {
         XCTAssertNil(MigrationEngineInitializationFailureCause(ffiCode: UInt32.max))
     }
 
+    func testWalletDatabaseInitializationFailureCodeMappingIsCompleteAndSanitized() {
+        let expected: [(UInt32, WalletDatabaseInitializationFailureCause)] = [
+            (1, .databaseBusy),
+            (2, .databaseLocked),
+            (3, .databaseFull),
+            (4, .databaseReadOnly),
+            (5, .databaseCorrupt),
+            (6, .databaseUnavailable),
+            (7, .schemaIncompatible),
+            (8, .backend)
+        ]
+        for (code, cause) in expected {
+            XCTAssertEqual(WalletDatabaseInitializationFailureCause(ffiCode: code), cause)
+            let error = WalletDatabaseInitializationError(cause: cause)
+            XCTAssertEqual(error.cause.rawValue, cause.rawValue)
+            XCTAssertFalse(error.localizedDescription.contains("raw-device-secret"))
+        }
+        XCTAssertNil(WalletDatabaseInitializationFailureCause(ffiCode: 0))
+        XCTAssertNil(WalletDatabaseInitializationFailureCause(ffiCode: UInt32.max))
+    }
+
     func testIntentScheduleIsAnchorlessAndCarriesRevisionToken() throws {
         let json = """
         {

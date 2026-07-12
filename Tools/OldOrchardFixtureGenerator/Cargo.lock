@@ -1123,6 +1123,7 @@ dependencies = [
 name = "old-orchard-fixture-generator"
 version = "0.1.0"
 dependencies = [
+ "prost",
  "rand",
  "rand_chacha",
  "rusqlite",

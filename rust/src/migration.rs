@@ -879,9 +879,13 @@ pub unsafe extern "C" fn zcashlc_migration_preview_immediate(
                 "migration preview requires initialize_post_upgrade at the current schema"
             ));
         }
-        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let value: ImmediateMigrationPreview = ctx
-            .preview_immediate_migration()
+        let network = crate::parse_network(network_id)?;
+        let chain_id = network.canonical_chain_id().to_string();
+        let account = unsafe { account_16(account_uuid_bytes)? };
+        let value: ImmediateMigrationPreview =
+            MigrationContext::preview_immediate_migration_read_only(
+                path, network, &chain_id, account,
+            )
             .map_err(|error| anyhow!("preview_immediate_migration: {error}"))?;
         Ok(ffi::BoxedSlice::some(serde_json::to_vec(&value)?))
     });
@@ -1747,6 +1751,29 @@ mod tests {
         assert_eq!(body, b"\"NotStarted\"");
         unsafe { crate::ffi::zcashlc_free_boxed_slice(ptr) }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn data_database_init_exposes_typed_corruption_code_once() {
+        let path = unique_test_path("corrupt_wallet");
+        std::fs::write(&path, b"not a sqlite wallet or a private path").unwrap();
+        let db = path.to_str().unwrap().as_bytes();
+
+        assert_eq!(
+            unsafe {
+                crate::zcashlc_init_data_database(db.as_ptr(), db.len(), std::ptr::null(), 0, 0)
+            },
+            -1
+        );
+        assert_eq!(
+            crate::zcashlc_last_database_init_error_code(),
+            crate::DATABASE_INIT_ERROR_CORRUPT
+        );
+        assert_eq!(
+            crate::zcashlc_last_database_init_error_code(),
+            crate::DATABASE_INIT_ERROR_NONE
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
