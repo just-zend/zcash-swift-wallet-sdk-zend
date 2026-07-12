@@ -294,7 +294,7 @@ final class MigrationModelTests: XCTestCase {
           "recovery_action":"wipe_and_rescan_testnet",
           "next_action":"recover",
           "external_signer":false,
-          "ordinary_spends_blocked":false,
+          "ordinary_spends_blocked":true,
           "schema_provenance":"fork_incompatible_shared_migration_id",
           "submission_policy":null
         }
@@ -306,6 +306,22 @@ final class MigrationModelTests: XCTestCase {
         XCTAssertEqual(snapshot.recoveryAction, .wipeAndRescanTestnet)
         XCTAssertEqual(snapshot.nextAction, .recover)
         XCTAssertEqual(snapshot.schemaProvenance, .forkIncompatibleSharedMigrationId)
+        XCTAssertTrue(snapshot.ordinarySpendsBlocked)
+        XCTAssertEqual(try validate(snapshot), snapshot)
+
+        let failOpenProjection = try decode(
+            MigrationSnapshot.self,
+            json.replacingOccurrences(
+                of: "\"ordinary_spends_blocked\":true",
+                with: "\"ordinary_spends_blocked\":false"
+            )
+        )
+        XCTAssertThrowsError(try validate(failOpenProjection)) { error in
+            XCTAssertEqual(
+                error as? MigrationSnapshotValidationError,
+                .invariantViolation("incompatible_schema_projection")
+            )
+        }
     }
 
     func testFeeDriftSnapshotExposesApprovedAndReplacementExactFeesForReapproval() throws {

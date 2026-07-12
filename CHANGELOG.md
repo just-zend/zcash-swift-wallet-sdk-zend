@@ -7,6 +7,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 # Unreleased
 
 ## Added
+- `AccountUUID.init(id:)` is now public so recovery tooling can reconstruct an account's exact
+  16-byte database identity without lossy conversion.
 - Configurable network-upgrade activation heights, for connecting the SDK to a **custom-parameter
   (regtest) network** such as an Ironwood testing backend. `ZcashNetworkBuilder.regtest(activationHeights:)`
   builds a `ZcashNetwork` from a new `NetworkActivationHeights` value (per-NU heights up to NU6.3), threaded
