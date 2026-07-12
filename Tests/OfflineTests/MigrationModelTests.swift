@@ -130,6 +130,68 @@ final class MigrationModelTests: XCTestCase {
         XCTAssertEqual(try roundTrip(decoded), decoded)
     }
 
+    func testImmediateMigrationPreviewStableTaggedStates() throws {
+        let actionable = ImmediateMigrationPreview.actionable(
+            spendableBalance: 40_000,
+            migrationAmount: 20_000,
+            fee: 20_000
+        )
+        XCTAssertEqual(
+            try decode(
+                ImmediateMigrationPreview.self,
+                "{\"status\":\"actionable\",\"spendable_balance\":40000,\"migration_amount\":20000,\"fee\":20000}"
+            ),
+            actionable
+        )
+        XCTAssertEqual(try roundTrip(actionable), actionable)
+
+        let belowFee = ImmediateMigrationPreview.positiveBalanceAtOrBelowFee(
+            spendableBalance: 19_999,
+            fee: 20_000
+        )
+        XCTAssertEqual(
+            try decode(
+                ImmediateMigrationPreview.self,
+                "{\"status\":\"positive_balance_at_or_below_fee\",\"spendable_balance\":19999,\"fee\":20000}"
+            ),
+            belowFee
+        )
+        XCTAssertEqual(try roundTrip(belowFee), belowFee)
+        XCTAssertEqual(
+            try decode(ImmediateMigrationPreview.self, "{\"status\":\"no_spendable_funds\"}"),
+            .noSpendableFunds
+        )
+        XCTAssertEqual(try roundTrip(ImmediateMigrationPreview.noSpendableFunds), .noSpendableFunds)
+    }
+
+    func testInitializationFailureCodeMappingIsCompleteAndSanitized() throws {
+        let expected: [(UInt32, MigrationEngineInitializationFailureCause)] = [
+            (10, .notSynced),
+            (11, .notInitialized),
+            (12, .schemaIncompatible),
+            (13, .engineSchemaNewer),
+            (14, .engineSchemaCorrupt),
+            (15, .consensusMismatch),
+            (20, .databaseBusy),
+            (21, .databaseLocked),
+            (22, .databaseFull),
+            (23, .databaseReadOnly),
+            (24, .databaseCorrupt),
+            (25, .databaseUnavailable),
+            (30, .backend),
+            (31, .pipeline),
+            (32, .otherInvalid)
+        ]
+        for (code, cause) in expected {
+            XCTAssertEqual(MigrationEngineInitializationFailureCause(ffiCode: code), cause)
+            let error = MigrationEngineInitializationError(cause: cause)
+            XCTAssertEqual(error.cause.rawValue, cause.rawValue)
+            XCTAssertFalse(error.localizedDescription.contains("raw-device-secret"))
+        }
+        XCTAssertNil(MigrationEngineInitializationFailureCause(ffiCode: 0))
+        XCTAssertNil(MigrationEngineInitializationFailureCause(ffiCode: UInt32.max))
+    }
+
     func testIntentScheduleIsAnchorlessAndCarriesRevisionToken() throws {
         let json = """
         {

@@ -18,10 +18,10 @@ use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zcash_client_backend::data_api::{Account, WalletRead};
 use zodl_ironwood_migration::{
-    InvalidStateError, KnownUnsentReason, LocalSubmissionFailure, MigrationContext, MigrationError,
-    MigrationIntentSchedule, MigrationSchedule, NoteSplitProposal, SubmissionPolicy,
-    SubmissionPolicyValidationFailure, TransferPczt, TransferResult,
-    migration_engine_schema_metadata,
+    ImmediateMigrationPreview, InvalidStateError, KnownUnsentReason, LocalSubmissionFailure,
+    MigrationContext, MigrationError, MigrationIntentSchedule, MigrationSchedule,
+    NoteSplitProposal, SubmissionPolicy, SubmissionPolicyValidationFailure, TransferPczt,
+    TransferResult, migration_engine_schema_metadata,
 };
 
 use crate::ffi;
@@ -41,6 +41,21 @@ const MIGRATION_FFI_ERROR_ORDINARY_SPENDS_BLOCKED: u32 = 1;
 /// `bind_submission_policy` rejected a changed immutable policy because transaction artifacts
 /// already exist. This is deliberately distinct from stale revision, schema, I/O, and corruption.
 const MIGRATION_FFI_ERROR_IMMUTABLE_SUBMISSION_POLICY_CONFLICT: u32 = 2;
+const MIGRATION_FFI_ERROR_INITIALIZE_NOT_SYNCED: u32 = 10;
+const MIGRATION_FFI_ERROR_INITIALIZE_NOT_INITIALIZED: u32 = 11;
+const MIGRATION_FFI_ERROR_INITIALIZE_SCHEMA_INCOMPATIBLE: u32 = 12;
+const MIGRATION_FFI_ERROR_INITIALIZE_ENGINE_SCHEMA_NEWER: u32 = 13;
+const MIGRATION_FFI_ERROR_INITIALIZE_ENGINE_SCHEMA_CORRUPT: u32 = 14;
+const MIGRATION_FFI_ERROR_INITIALIZE_CONSENSUS_MISMATCH: u32 = 15;
+const MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_BUSY: u32 = 20;
+const MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_LOCKED: u32 = 21;
+const MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_FULL: u32 = 22;
+const MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_READ_ONLY: u32 = 23;
+const MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_CORRUPT: u32 = 24;
+const MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_UNAVAILABLE: u32 = 25;
+const MIGRATION_FFI_ERROR_INITIALIZE_BACKEND: u32 = 30;
+const MIGRATION_FFI_ERROR_INITIALIZE_PIPELINE: u32 = 31;
+const MIGRATION_FFI_ERROR_INITIALIZE_OTHER_INVALID: u32 = 32;
 
 thread_local! {
     static LAST_MIGRATION_FFI_ERROR_CODE: Cell<u32> = const { Cell::new(MIGRATION_FFI_ERROR_NONE) };
@@ -51,11 +66,76 @@ fn set_migration_ffi_error_code(code: u32) {
 }
 
 /// Takes the stable migration-specific error code for the immediately preceding protected FFI
-/// operation on this thread, resetting it to zero. `0` means no migration-specific classification
-/// and `1` means an ordinary spend was denied because migration safety could not be proven.
+/// operation on this thread, resetting it to zero. `0` means no migration-specific classification.
+/// Codes are a behavior boundary, not log text: Swift maps them to public typed failures and never
+/// parses or exports the underlying Rust/SQLite message.
 #[unsafe(no_mangle)]
 pub extern "C" fn zcashlc_last_migration_error_code() -> u32 {
     LAST_MIGRATION_FFI_ERROR_CODE.with(|value| value.replace(MIGRATION_FFI_ERROR_NONE))
+}
+
+fn sqlite_initialization_error_code(error: &rusqlite::Error) -> u32 {
+    use rusqlite::ffi::ErrorCode;
+
+    match error {
+        rusqlite::Error::SqliteFailure(error, _) => match error.code {
+            ErrorCode::DatabaseBusy => MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_BUSY,
+            ErrorCode::DatabaseLocked | ErrorCode::FileLockingProtocolFailed => {
+                MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_LOCKED
+            }
+            ErrorCode::DiskFull => MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_FULL,
+            ErrorCode::ReadOnly => MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_READ_ONLY,
+            ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
+                MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_CORRUPT
+            }
+            ErrorCode::CannotOpen
+            | ErrorCode::PermissionDenied
+            | ErrorCode::SystemIoFailure
+            | ErrorCode::NoLargeFileSupport => MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_UNAVAILABLE,
+            _ => MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_UNAVAILABLE,
+        },
+        _ => MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_UNAVAILABLE,
+    }
+}
+
+fn initialization_error_code(error: &MigrationError) -> u32 {
+    match error {
+        MigrationError::NotSynced => MIGRATION_FFI_ERROR_INITIALIZE_NOT_SYNCED,
+        MigrationError::NotInitialized => MIGRATION_FFI_ERROR_INITIALIZE_NOT_INITIALIZED,
+        MigrationError::InvalidState(InvalidStateError::SchemaIncompatible) => {
+            MIGRATION_FFI_ERROR_INITIALIZE_SCHEMA_INCOMPATIBLE
+        }
+        MigrationError::InvalidState(InvalidStateError::EngineSchemaNewer { .. }) => {
+            MIGRATION_FFI_ERROR_INITIALIZE_ENGINE_SCHEMA_NEWER
+        }
+        MigrationError::InvalidState(InvalidStateError::EngineSchemaCorrupt { .. }) => {
+            MIGRATION_FFI_ERROR_INITIALIZE_ENGINE_SCHEMA_CORRUPT
+        }
+        MigrationError::InvalidState(InvalidStateError::ConsensusConfigurationMismatch) => {
+            MIGRATION_FFI_ERROR_INITIALIZE_CONSENSUS_MISMATCH
+        }
+        MigrationError::InvalidState(_) => MIGRATION_FFI_ERROR_INITIALIZE_OTHER_INVALID,
+        MigrationError::Db(error) => sqlite_initialization_error_code(error),
+        MigrationError::Backend(zcash_client_sqlite::error::SqliteClientError::DbError(error)) => {
+            sqlite_initialization_error_code(error)
+        }
+        MigrationError::Backend(zcash_client_sqlite::error::SqliteClientError::CorruptedData(
+            _,
+        )) => MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_CORRUPT,
+        MigrationError::Backend(zcash_client_sqlite::error::SqliteClientError::Io(_)) => {
+            MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_UNAVAILABLE
+        }
+        MigrationError::Backend(_) => MIGRATION_FFI_ERROR_INITIALIZE_BACKEND,
+        MigrationError::Pipeline(_) => MIGRATION_FFI_ERROR_INITIALIZE_PIPELINE,
+    }
+}
+
+/// Preserve only the stable category across FFI. The source error may contain a database path,
+/// schema object, SQL, or other device-local content and must never become typed app telemetry.
+fn sanitized_initialization_error(error: MigrationError) -> anyhow::Error {
+    let code = initialization_error_code(&error);
+    set_migration_ffi_error_code(code);
+    anyhow!("IRONWOOD_MIGRATION_INITIALIZATION_FAILED:{code}")
 }
 
 /// Borrow the wallet db path (UTF-8) from the FFI byte buffer.
@@ -769,6 +849,40 @@ pub unsafe extern "C" fn zcashlc_migration_propose_immediate(
         let value = ctx
             .propose_immediate_migration_transfers()
             .map_err(|e| anyhow!("propose_immediate_migration_transfers: {e}"))?;
+        Ok(ffi::BoxedSlice::some(serde_json::to_vec(&value)?))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Preview exact immediate-migration economics (JSON `ImmediateMigrationPreview`) without
+/// creating a draft, run, reservation, signature, or transaction. The engine pins the wallet
+/// reads and upstream ZIP-317 proposal probe to one SQLite snapshot.
+///
+/// # Safety
+/// See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_preview_immediate(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let path = unsafe { migration_db_path(db_data, db_data_len)? };
+        let metadata = migration_engine_schema_metadata(path)
+            .map_err(|error| anyhow!("read migration schema before preview: {error}"))?;
+        if metadata.found_version != Some(metadata.supported_version) {
+            // Context construction initializes/upgrades the engine schema. Refuse that implicit
+            // write here so the preview FFI remains read-only even when called out of lifecycle
+            // order; `initialize_post_upgrade` owns all schema creation and upgrades.
+            return Err(anyhow!(
+                "migration preview requires initialize_post_upgrade at the current schema"
+            ));
+        }
+        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let value: ImmediateMigrationPreview = ctx
+            .preview_immediate_migration()
+            .map_err(|error| anyhow!("preview_immediate_migration: {error}"))?;
         Ok(ffi::BoxedSlice::some(serde_json::to_vec(&value)?))
     });
     unwrap_exc_or_null(res)
@@ -1577,10 +1691,19 @@ pub unsafe extern "C" fn zcashlc_migration_initialize_post_upgrade(
     account_uuid_bytes: *const u8,
     network_id: u32,
 ) -> *mut ffi::BoxedSlice {
+    set_migration_ffi_error_code(MIGRATION_FFI_ERROR_NONE);
     let res = catch_panic(|| {
-        let ctx = unsafe { context(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let path = unsafe { migration_db_path(db_data, db_data_len)? };
+        let network = crate::parse_network(network_id)?;
+        let account = unsafe { account_16(account_uuid_bytes)? };
+        let chain_id = network.canonical_chain_id().to_string();
+        // Keep the engine error structured until it has been converted to the stable sanitized
+        // code. The generic `context` helper intentionally erases errors into `anyhow` prose and
+        // therefore is not suitable for this recovery-critical boundary.
+        let ctx = MigrationContext::new_with_chain_id(path, network, &chain_id, account)
+            .map_err(sanitized_initialization_error)?;
         ctx.initialize_post_upgrade()
-            .map_err(|e| anyhow!("initialize_post_upgrade: {e}"))?;
+            .map_err(sanitized_initialization_error)?;
         Ok(ffi::BoxedSlice::some(serde_json::to_vec(&())?))
     });
     unwrap_exc_or_null(res)
@@ -1719,6 +1842,112 @@ mod tests {
     }
 
     #[test]
+    fn initialization_error_codes_are_stable_and_sanitized() {
+        use rusqlite::ffi::{Error, ErrorCode};
+
+        assert_eq!(
+            initialization_error_code(&MigrationError::NotSynced),
+            MIGRATION_FFI_ERROR_INITIALIZE_NOT_SYNCED
+        );
+        assert_eq!(
+            initialization_error_code(&MigrationError::NotInitialized),
+            MIGRATION_FFI_ERROR_INITIALIZE_NOT_INITIALIZED
+        );
+        assert_eq!(
+            initialization_error_code(&MigrationError::InvalidState(
+                InvalidStateError::SchemaIncompatible,
+            )),
+            MIGRATION_FFI_ERROR_INITIALIZE_SCHEMA_INCOMPATIBLE
+        );
+        assert_eq!(
+            initialization_error_code(&MigrationError::InvalidState(
+                InvalidStateError::EngineSchemaNewer {
+                    found: 9,
+                    supported: 4,
+                },
+            )),
+            MIGRATION_FFI_ERROR_INITIALIZE_ENGINE_SCHEMA_NEWER
+        );
+        assert_eq!(
+            initialization_error_code(&MigrationError::InvalidState(
+                InvalidStateError::EngineSchemaCorrupt {
+                    object: "secret-table-name".to_string(),
+                },
+            )),
+            MIGRATION_FFI_ERROR_INITIALIZE_ENGINE_SCHEMA_CORRUPT
+        );
+        assert_eq!(
+            initialization_error_code(&MigrationError::InvalidState(
+                InvalidStateError::ConsensusConfigurationMismatch,
+            )),
+            MIGRATION_FFI_ERROR_INITIALIZE_CONSENSUS_MISMATCH
+        );
+        assert_eq!(
+            initialization_error_code(&MigrationError::InvalidState(
+                InvalidStateError::NoActiveRun,
+            )),
+            MIGRATION_FFI_ERROR_INITIALIZE_OTHER_INVALID
+        );
+
+        let cases = [
+            (
+                ErrorCode::DatabaseBusy,
+                MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_BUSY,
+            ),
+            (
+                ErrorCode::DatabaseLocked,
+                MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_LOCKED,
+            ),
+            (
+                ErrorCode::DiskFull,
+                MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_FULL,
+            ),
+            (
+                ErrorCode::ReadOnly,
+                MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_READ_ONLY,
+            ),
+            (
+                ErrorCode::DatabaseCorrupt,
+                MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_CORRUPT,
+            ),
+            (
+                ErrorCode::CannotOpen,
+                MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_UNAVAILABLE,
+            ),
+        ];
+        for (sqlite_code, expected) in cases {
+            let error = MigrationError::Db(rusqlite::Error::SqliteFailure(
+                Error {
+                    code: sqlite_code,
+                    extended_code: 0,
+                },
+                Some("raw-device-secret".to_string()),
+            ));
+            assert_eq!(initialization_error_code(&error), expected);
+            let sanitized = sanitized_initialization_error(error).to_string();
+            assert!(!sanitized.contains("raw-device-secret"));
+            assert_eq!(
+                sanitized,
+                format!("IRONWOOD_MIGRATION_INITIALIZATION_FAILED:{expected}")
+            );
+            assert_eq!(zcashlc_last_migration_error_code(), expected);
+        }
+
+        assert_eq!(
+            initialization_error_code(&MigrationError::Backend(
+                zcash_client_sqlite::error::SqliteClientError::CorruptedData(
+                    "raw-device-secret".to_string(),
+                ),
+            )),
+            MIGRATION_FFI_ERROR_INITIALIZE_DATABASE_CORRUPT
+        );
+        assert_eq!(
+            initialization_error_code(&MigrationError::Pipeline("raw-device-secret".to_string(),)),
+            MIGRATION_FFI_ERROR_INITIALIZE_PIPELINE
+        );
+    }
+
+    #[test]
     fn newer_engine_schema_has_structured_metadata_and_is_not_downgraded() {
         let path = unique_test_path("mig_newer_schema");
         let path_str = path.to_str().unwrap();
@@ -1737,6 +1966,15 @@ mod tests {
         let account = [4_u8; 16];
         let ptr = unsafe { zcashlc_migration_snapshot(db.as_ptr(), db.len(), account.as_ptr(), 1) };
         assert!(ptr.is_null());
+
+        let initialization_ptr = unsafe {
+            zcashlc_migration_initialize_post_upgrade(db.as_ptr(), db.len(), account.as_ptr(), 1)
+        };
+        assert!(initialization_ptr.is_null());
+        assert_eq!(
+            zcashlc_last_migration_error_code(),
+            MIGRATION_FFI_ERROR_INITIALIZE_ENGINE_SCHEMA_NEWER
+        );
 
         let metadata_ptr =
             unsafe { zcashlc_migration_engine_schema_metadata(db.as_ptr(), db.len()) };

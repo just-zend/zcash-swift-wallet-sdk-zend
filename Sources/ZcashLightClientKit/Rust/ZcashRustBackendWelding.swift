@@ -502,6 +502,11 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
     func migrationProposeImmediate(for account: AccountUUID) async throws -> MigrationSchedule
 
+    /// Exact immediate-migration economics from one read-only wallet snapshot. This does not
+    /// create migration state or transaction artifacts. `migrationInitializePostUpgrade` must
+    /// have completed first; the preview never creates or upgrades the engine schema implicitly.
+    func migrationPreviewImmediate(for account: AccountUUID) async throws -> ImmediateMigrationPreview
+
     /// Propose a private anchorless intent schedule for one-time user confirmation.
     func migrationProposePrivateIntents(for account: AccountUUID) async throws -> MigrationIntentSchedule
 
@@ -672,7 +677,8 @@ protocol ZcashRustBackendWelding {
     func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule
 
     /// First-launch post-upgrade initialization.
-    /// - Throws: `rustMigrationInitializePostUpgrade` if the rust layer returns an error.
+    /// - Throws: `MigrationEngineInitializationError` for every classified engine failure, or
+    ///   `rustMigrationInitializePostUpgrade` only when the FFI cannot classify the failure.
     func migrationInitializePostUpgrade(for account: AccountUUID) async throws
 
     /// Initializes Filesystem based block cache

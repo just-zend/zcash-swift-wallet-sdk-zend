@@ -42,6 +42,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resumes the exact staged PCZT/claim token after relaunch, extracts the Rust-computed transaction,
   validates endpoint chain/branch/expiry state, submits it over the selected direct or Tor transport,
   and records an exact known-unsent, success, failure, or outcome-unknown lifecycle result.
+- A zero-write `previewImmediateMigration(for:)` API exposes exact upstream ZIP-317 economics as
+  `.actionable`, `.positiveBalanceAtOrBelowFee`, or `.noSpendableFunds` without creating migration
+  drafts, runs, reservations, signatures, or transaction artifacts. Migration-engine startup failures now throw a public sanitized
+  `MigrationEngineInitializationError` with stable typed causes for schema, consensus, SQLite,
+  backend, and pipeline failures; device-local Rust/SQLite text is not retained in the typed model.
 
 ## Changed
 - Breaking: removed the legacy anchored pre-sign-all migration methods from the public
@@ -51,7 +56,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `commitMigrationIntents`, and the expected-run/revision `execute`/`stage`/`resume` APIs described in
   `MIGRATING.md`.
 - The Rust core now builds against exact upstream `zcash/librustzcash` revision
-  `292e758462e3bc7dfb4d7272d9f88ab671bf1cab`, where NU6.3/Ironwood is stable; no synthetic
+  `d4f4095de03e1aab3bd72b4c3f83459072ed584e`, where NU6.3/Ironwood is stable; no synthetic
   `zcash_unstable="nu6.3"` cfg or fork is used. Shielded voting remains gated behind an
   off-by-default Cargo feature (and its Swift layer is excluded): the current crates.io
   `zcash_voting 1.0.0` still pins Orchard 0.14 + unstable voting circuits, while this audited

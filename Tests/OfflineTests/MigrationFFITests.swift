@@ -8,6 +8,7 @@
 //
 
 import XCTest
+import SQLite
 @testable import TestUtils
 @testable import ZcashLightClientKit
 
@@ -45,6 +46,48 @@ final class MigrationFFITests: XCTestCase {
 
     func testInitializePostUpgradeSucceeds() async throws {
         try await rustBackend.migrationInitializePostUpgrade(for: account)
+    }
+
+    func testPreviewBeforeEngineInitializationDoesNotCreateSchemaOrRun() async throws {
+        XCTAssertEqual(try engineSchemaObjectCount(), 0)
+        do {
+            _ = try await rustBackend.migrationPreviewImmediate(for: account)
+            XCTFail("expected preview before engine initialization to fail")
+        } catch {
+            // Initialization owns schema creation; a read-only preview never performs it.
+        }
+        XCTAssertEqual(try engineSchemaObjectCount(), 0)
+    }
+
+    func testNewerEngineSchemaThrowsSanitizedTypedInitializationError() async throws {
+        do {
+            let connection = try Connection(dbData.path)
+            try connection.run(
+                """
+                CREATE TABLE ext_ironwood_migration_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    schema_version INTEGER NOT NULL
+                )
+                """
+            )
+            try connection.run(
+                "INSERT INTO ext_ironwood_migration_meta (singleton, schema_version) VALUES (1, 5)"
+            )
+        }
+
+        do {
+            try await rustBackend.migrationInitializePostUpgrade(for: account)
+            XCTFail("expected a newer engine schema to fail closed")
+        } catch let error as MigrationEngineInitializationError {
+            XCTAssertEqual(error.cause, .engineSchemaNewer)
+            XCTAssertEqual(
+                error.localizedDescription,
+                "This wallet was opened by a newer migration engine."
+            )
+            XCTAssertFalse(error.localizedDescription.contains(dbData.path))
+        } catch {
+            XCTFail("expected typed initialization error, got \(type(of: error))")
+        }
     }
 
     func testRecordTransferResultWithNoActiveRunThrows() async throws {
@@ -243,6 +286,15 @@ final class MigrationFFITests: XCTestCase {
             cursor = source.index(after: cursor)
         }
         throw SourceAuditError.unterminatedFunction(name)
+    }
+
+    private func engineSchemaObjectCount() throws -> Int64 {
+        let connection = try Connection(dbData.path)
+        return try XCTUnwrap(
+            connection.scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'ext_ironwood_migration_%'"
+            ) as? Int64
+        )
     }
 
     private enum SourceAuditError: Error {

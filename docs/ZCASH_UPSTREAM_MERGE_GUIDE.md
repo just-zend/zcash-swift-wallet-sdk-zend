@@ -102,7 +102,7 @@ Zend parity branch note:
 Zend Ironwood hardening line:
 
 - PR `#17` and branch `codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04` remain useful provenance for the original upstream MOB-1455 stack, but must not be merged as the final migration implementation.
-- The hardened integration is based on exact upstream librustzcash revision `292e758462e3bc7dfb4d7272d9f88ab671bf1cab` and a separately frozen private migration-engine commit. Cargo must use its exact git revision for the final tree; a path dependency is development-only and fails the artifact gate.
+- The hardened integration is based on exact upstream librustzcash revision `d4f4095de03e1aab3bd72b4c3f83459072ed584e` and a separately frozen private migration-engine commit. Cargo must use its exact git revision for the final tree; a path dependency is development-only and fails the artifact gate.
 - The public migration contract is schema-v4 snapshot-driven, revision-CAS-bound, and JIT: it atomically binds submission policy, materializes only one due intent, resumes exact staged external-signer bytes after process death, and fail-closes ordinary spending only for the affected account.
 - Public CI never receives private Rust credentials. Authenticated local tooling builds the exact arm64 iOS device/simulator and macOS artifact, while public CI verifies its source/provenance/slice hashes and complete production migration symbol set before packaging it.
 - Do not mark the hardened line merge-ready until the private commit/tree, Cargo lock, build recipe, XCFramework, source hash, offline tests, and app integration CI all agree. Recheck live PR/check state rather than copying the historical `#17` status below.

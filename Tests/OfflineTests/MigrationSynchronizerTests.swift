@@ -1381,6 +1381,21 @@ final class MigrationSynchronizerTests: ZcashTestCase {
         XCTAssertEqual(rustBackend.migrationProposeTransfersForReceivedAccount, account)
     }
 
+    func testPreviewImmediateMigrationDelegatesToReadOnlyRustBackend() async throws {
+        let preview = ImmediateMigrationPreview.positiveBalanceAtOrBelowFee(
+            spendableBalance: 19_999,
+            fee: 20_000
+        )
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.migrationPreviewImmediateForReturnValue = preview
+        let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
+
+        let result = try await synchronizer.previewImmediateMigration(for: account)
+
+        XCTAssertEqual(result, preview)
+        XCTAssertEqual(rustBackend.migrationPreviewImmediateForReceivedAccount, account)
+    }
+
     func testSignAndStoreMigrationScheduleDelegatesToRustBackend() async throws {
         let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 7)
         let rustBackend = ZcashRustBackendWeldingMock()

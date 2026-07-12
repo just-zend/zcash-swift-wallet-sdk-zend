@@ -35,7 +35,7 @@ No manual `Package.swift` edits are needed.
 
 Ironwood builds use the exact stable Rust release in `rust-toolchain.toml` (currently `1.96.1`) and
 the exact upstream librustzcash revision
-`292e758462e3bc7dfb4d7272d9f88ab671bf1cab`. The optional voting implementation stays disabled:
+`d4f4095de03e1aab3bd72b4c3f83459072ed584e`. The optional voting implementation stays disabled:
 `zcash_voting 1.0.0` still resolves Orchard 0.14 voting circuits while the audited Ironwood graph
 uses Orchard 0.15.
 

@@ -772,6 +772,10 @@ public class SDKSynchronizer: Synchronizer {
         try await initializer.rustBackend.migrationProposeImmediateIntent(for: account)
     }
 
+    public func previewImmediateMigration(for account: AccountUUID) async throws -> ImmediateMigrationPreview {
+        try await initializer.rustBackend.migrationPreviewImmediate(for: account)
+    }
+
     public func commitMigrationIntents(
         _ schedule: MigrationIntentSchedule,
         externalSigner: Bool,

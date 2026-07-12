@@ -71,6 +71,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     let shieldingConfirmationsPolicy: ConfirmationsPolicy = ConfirmationsPolicy.defaultShieldingPolicy()
 
     let dbData: (String, UInt)
+    let dbDataPath: (String, UInt)
     let fsBlockDbRoot: (String, UInt)
     let spendParamsPath: (String, UInt)
     let outputParamsPath: (String, UInt)
@@ -96,7 +97,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     private func migrationEngineSchemaMetadata() -> MigrationEngineSchemaMetadata? {
-        let ptr = zcashlc_migration_engine_schema_metadata(dbData.0, dbData.1)
+        let ptr = zcashlc_migration_engine_schema_metadata(dbDataPath.0, dbDataPath.1)
         guard let ptr else { return nil }
         defer { zcashlc_free_boxed_slice(ptr) }
         return try? JSONDecoder().decode(
@@ -137,6 +138,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         sdkFlags: SDKFlags
     ) {
         self.dbData = dbData.osStr()
+        self.dbDataPath = dbData.osPathStr()
         self.fsBlockDbRoot = fsBlockDbRoot.osPathStr()
         self.spendParamsPath = spendParamsPath.osPathStr()
         self.outputParamsPath = outputParamsPath.osPathStr()
@@ -1834,6 +1836,26 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
+    @DBActor func migrationPreviewImmediate(for account: AccountUUID) async throws -> ImmediateMigrationPreview {
+        let ptr = zcashlc_migration_preview_immediate(dbDataPath.0, dbDataPath.1, account.id, networkType.networkId)
+        guard let ptr else {
+            throw ZcashError.rustMigrationProposeTransfers(
+                lastErrorMessage(fallback: "`migrationPreviewImmediate` failed with unknown error")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        do {
+            return try JSONDecoder().decode(
+                ImmediateMigrationPreview.self,
+                from: Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+            )
+        } catch {
+            throw ZcashError.rustMigrationProposeTransfers(
+                "Failed to decode ImmediateMigrationPreview: \(error)"
+            )
+        }
+    }
+
     @DBActor func migrationProposePrivateIntents(for account: AccountUUID) async throws -> MigrationIntentSchedule {
         let ptr = zcashlc_migration_propose_private_intents(dbData.0, dbData.1, account.id, networkType.networkId)
         guard let ptr else {
@@ -2492,6 +2514,13 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     @DBActor func migrationInitializePostUpgrade(for account: AccountUUID) async throws {
         let ptr = zcashlc_migration_initialize_post_upgrade(dbData.0, dbData.1, account.id, networkType.networkId)
         guard let ptr else {
+            let ffiCode = zcashlc_last_migration_error_code()
+            if let cause = MigrationEngineInitializationFailureCause(ffiCode: ffiCode) {
+                // The Rust adapter has already replaced its source error with a sanitized marker.
+                // Clear that generic channel so no later caller can accidentally export it.
+                zcashlc_clear_last_error()
+                throw MigrationEngineInitializationError(cause: cause)
+            }
             throw ZcashError.rustMigrationInitializePostUpgrade(lastErrorMessage(fallback: "`migrationInitializePostUpgrade` failed with unknown error"))
         }
         zcashlc_free_boxed_slice(ptr)

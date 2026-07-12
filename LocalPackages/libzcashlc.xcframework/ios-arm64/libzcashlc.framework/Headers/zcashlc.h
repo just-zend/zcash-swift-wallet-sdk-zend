@@ -3473,8 +3473,9 @@ void zcashlc_free_address_check_result(struct FfiAddressCheckResult *ptr);
 
 /**
  * Takes the stable migration-specific error code for the immediately preceding protected FFI
- * operation on this thread, resetting it to zero. `0` means no migration-specific classification
- * and `1` means an ordinary spend was denied because migration safety could not be proven.
+ * operation on this thread, resetting it to zero. `0` means no migration-specific classification.
+ * Codes are a behavior boundary, not log text: Swift maps them to public typed failures and never
+ * parses or exports the underlying Rust/SQLite message.
  */
 uint32_t zcashlc_last_migration_error_code(void);
 
@@ -3766,6 +3767,19 @@ struct FfiBoxedSlice *zcashlc_migration_propose_transfers(const uint8_t *db_data
  * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
  */
 struct FfiBoxedSlice *zcashlc_migration_propose_immediate(const uint8_t *db_data,
+                                                          uintptr_t db_data_len,
+                                                          const uint8_t *account_uuid_bytes,
+                                                          uint32_t network_id);
+
+/**
+ * Preview exact immediate-migration economics (JSON `ImmediateMigrationPreview`) without
+ * creating a draft, run, reservation, signature, or transaction. The engine pins the wallet
+ * reads and upstream ZIP-317 proposal probe to one SQLite snapshot.
+ *
+ * # Safety
+ * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ */
+struct FfiBoxedSlice *zcashlc_migration_preview_immediate(const uint8_t *db_data,
                                                           uintptr_t db_data_len,
                                                           const uint8_t *account_uuid_bytes,
                                                           uint32_t network_id);

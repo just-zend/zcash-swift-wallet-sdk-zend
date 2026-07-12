@@ -54,6 +54,10 @@ enum TestDbBuilder {
         Bundle.module.url(forResource: "darkside_caches", withExtension: "db")
     }
 
+    static func zend260Alpha6OrchardDataDbURL() -> URL? {
+        Bundle.module.url(forResource: "zend_2_6_0_alpha_6_orchard", withExtension: "sqlite")
+    }
+
     static func prepopulatedDataDbProvider(rustBackend: ZcashRustBackend) async throws -> ConnectionProvider? {
         let provider = SimpleConnectionProvider(path: (rustBackend.dbData).0, readonly: true)
 

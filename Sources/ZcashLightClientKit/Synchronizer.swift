@@ -700,6 +700,10 @@ public protocol Synchronizer: AnyObject {
     /// Proposes a single immediate, anchorless migration intent.
     func proposeImmediateMigrationIntent(for account: AccountUUID) async throws -> MigrationIntentSchedule
 
+    /// Returns exact immediate-migration economics without creating a draft, run, reservation,
+    /// signature, or transaction. ``initializePostUpgrade(for:)`` must have completed first.
+    func previewImmediateMigration(for account: AccountUUID) async throws -> ImmediateMigrationPreview
+
     /// Commits the exact approved intent schedule using its run id and revision compare-and-set
     /// token. `externalSigner` permanently selects the run's signer path.
     func commitMigrationIntents(

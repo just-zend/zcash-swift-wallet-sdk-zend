@@ -76,6 +76,8 @@ targets.append(contentsOf: [
             .copy("Resources/cache.db"),
             .copy("Resources/darkside_caches.db"),
             .copy("Resources/darkside_data.db"),
+            .copy("Resources/zend_2_6_0_alpha_6_orchard.sqlite"),
+            .copy("Resources/zend_2_6_0_alpha_6_orchard.provenance.md"),
             .copy("Resources/sandblasted_mainnet_block.json"),
             .copy("Resources/txBase64String.txt"),
             .copy("Resources/txFromAndroidSDK.txt"),

@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-expected_librustzcash_rev="292e758462e3bc7dfb4d7272d9f88ab671bf1cab"
+expected_librustzcash_rev="d4f4095de03e1aab3bd72b4c3f83459072ed584e"
 tree_file=$(mktemp)
 duplicates_file=$(mktemp)
 trap 'rm -f "$tree_file" "$duplicates_file"' EXIT

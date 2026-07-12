@@ -156,6 +156,149 @@ public struct MigrationSchedule: Equatable, Codable {
     }
 }
 
+/// Exact, read-only economics for an immediate Orchard-to-Ironwood migration. Computing this
+/// value does not create a draft, run, reservation, signature, or transaction.
+public enum ImmediateMigrationPreview: Equatable, Sendable, Codable {
+    /// The spendable Orchard balance can pay the exact ZIP-317 fee and leave value to migrate.
+    case actionable(spendableBalance: UInt64, migrationAmount: UInt64, fee: UInt64)
+    /// Positive Orchard value exists, but none remains after the exact ZIP-317 fee.
+    case positiveBalanceAtOrBelowFee(spendableBalance: UInt64, fee: UInt64)
+    /// No Orchard value is currently spendable, including value committed by a pending spend.
+    case noSpendableFunds
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case spendableBalance = "spendable_balance"
+        case migrationAmount = "migration_amount"
+        case fee
+    }
+
+    private enum Status: String, Codable {
+        case actionable
+        case positiveBalanceAtOrBelowFee = "positive_balance_at_or_below_fee"
+        case noSpendableFunds = "no_spendable_funds"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Status.self, forKey: .status) {
+        case .actionable:
+            self = try .actionable(
+                spendableBalance: container.decode(UInt64.self, forKey: .spendableBalance),
+                migrationAmount: container.decode(UInt64.self, forKey: .migrationAmount),
+                fee: container.decode(UInt64.self, forKey: .fee)
+            )
+        case .positiveBalanceAtOrBelowFee:
+            self = try .positiveBalanceAtOrBelowFee(
+                spendableBalance: container.decode(UInt64.self, forKey: .spendableBalance),
+                fee: container.decode(UInt64.self, forKey: .fee)
+            )
+        case .noSpendableFunds:
+            self = .noSpendableFunds
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .actionable(let spendableBalance, let migrationAmount, let fee):
+            try container.encode(Status.actionable, forKey: .status)
+            try container.encode(spendableBalance, forKey: .spendableBalance)
+            try container.encode(migrationAmount, forKey: .migrationAmount)
+            try container.encode(fee, forKey: .fee)
+        case .positiveBalanceAtOrBelowFee(let spendableBalance, let fee):
+            try container.encode(Status.positiveBalanceAtOrBelowFee, forKey: .status)
+            try container.encode(spendableBalance, forKey: .spendableBalance)
+            try container.encode(fee, forKey: .fee)
+        case .noSpendableFunds:
+            try container.encode(Status.noSpendableFunds, forKey: .status)
+        }
+    }
+}
+
+/// Sanitized, stable cause for a migration-engine initialization failure. These cases are safe for
+/// UI state and telemetry; no Rust, SQLite, path, schema-object, or SQL text is retained.
+public enum MigrationEngineInitializationFailureCause: String, Equatable, Sendable, Codable {
+    case notSynced = "not_synced"
+    case notInitialized = "not_initialized"
+    case schemaIncompatible = "schema_incompatible"
+    case engineSchemaNewer = "engine_schema_newer"
+    case engineSchemaCorrupt = "engine_schema_corrupt"
+    case consensusMismatch = "consensus_mismatch"
+    case databaseBusy = "database_busy"
+    case databaseLocked = "database_locked"
+    case databaseFull = "database_full"
+    case databaseReadOnly = "database_read_only"
+    case databaseCorrupt = "database_corrupt"
+    case databaseUnavailable = "database_unavailable"
+    case backend = "backend"
+    case pipeline = "pipeline"
+    case otherInvalid = "other_invalid"
+
+    init?(ffiCode: UInt32) {
+        switch ffiCode {
+        case 10: self = .notSynced
+        case 11: self = .notInitialized
+        case 12: self = .schemaIncompatible
+        case 13: self = .engineSchemaNewer
+        case 14: self = .engineSchemaCorrupt
+        case 15: self = .consensusMismatch
+        case 20: self = .databaseBusy
+        case 21: self = .databaseLocked
+        case 22: self = .databaseFull
+        case 23: self = .databaseReadOnly
+        case 24: self = .databaseCorrupt
+        case 25: self = .databaseUnavailable
+        case 30: self = .backend
+        case 31: self = .pipeline
+        case 32: self = .otherInvalid
+        default: return nil
+        }
+    }
+}
+
+/// Public typed error thrown when the Rust FFI can safely classify migration-engine startup.
+public struct MigrationEngineInitializationError: Error, Equatable, Sendable, LocalizedError {
+    public let cause: MigrationEngineInitializationFailureCause
+
+    public init(cause: MigrationEngineInitializationFailureCause) {
+        self.cause = cause
+    }
+
+    public var errorDescription: String? {
+        switch cause {
+        case .notSynced:
+            "Wallet synchronization must finish before migration can start."
+        case .notInitialized:
+            "Migration initialization has not completed."
+        case .schemaIncompatible:
+            "This wallet database uses an incompatible migration schema."
+        case .engineSchemaNewer:
+            "This wallet was opened by a newer migration engine."
+        case .engineSchemaCorrupt:
+            "The migration database state is incomplete or damaged."
+        case .consensusMismatch:
+            "The migration state belongs to a different network configuration."
+        case .databaseBusy, .databaseLocked:
+            "The wallet database is temporarily busy."
+        case .databaseFull:
+            "The device does not have enough storage for migration."
+        case .databaseReadOnly:
+            "The wallet database cannot be updated."
+        case .databaseCorrupt:
+            "The wallet database appears to be damaged."
+        case .databaseUnavailable:
+            "The wallet database is unavailable."
+        case .backend:
+            "The wallet backend could not initialize migration."
+        case .pipeline:
+            "The migration transaction pipeline could not initialize."
+        case .otherInvalid:
+            "The migration state is not valid for initialization."
+        }
+    }
+}
+
 /// One user-approved, anchorless migration transfer intent. A transaction anchor and consensus
 /// expiry do not exist until the engine materializes this intent at its due height.
 public struct MigrationIntent: Equatable, Codable {

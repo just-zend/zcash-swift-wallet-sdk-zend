@@ -3087,6 +3087,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - previewImmediateMigration
+
+    var previewImmediateMigrationForThrowableError: Error?
+    var previewImmediateMigrationForCallsCount = 0
+    var previewImmediateMigrationForCalled: Bool {
+        return previewImmediateMigrationForCallsCount > 0
+    }
+    var previewImmediateMigrationForReceivedAccount: AccountUUID?
+    var previewImmediateMigrationForReturnValue: ImmediateMigrationPreview!
+    var previewImmediateMigrationForClosure: ((AccountUUID) async throws -> ImmediateMigrationPreview)?
+
+    func previewImmediateMigration(for account: AccountUUID) async throws -> ImmediateMigrationPreview {
+        if let error = previewImmediateMigrationForThrowableError {
+            throw error
+        }
+        previewImmediateMigrationForCallsCount += 1
+        previewImmediateMigrationForReceivedAccount = account
+        if let closure = previewImmediateMigrationForClosure {
+            return try await closure(account)
+        } else {
+            return previewImmediateMigrationForReturnValue
+        }
+    }
+
     // MARK: - commitMigrationIntents
 
     var commitMigrationIntentsExternalSignerForThrowableError: Error?
@@ -5327,6 +5351,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(account)
         } else {
             return migrationProposeImmediateForReturnValue
+        }
+    }
+
+    // MARK: - migrationPreviewImmediate
+
+    var migrationPreviewImmediateForThrowableError: Error?
+    var migrationPreviewImmediateForCallsCount = 0
+    var migrationPreviewImmediateForCalled: Bool {
+        return migrationPreviewImmediateForCallsCount > 0
+    }
+    var migrationPreviewImmediateForReceivedAccount: AccountUUID?
+    var migrationPreviewImmediateForReturnValue: ImmediateMigrationPreview!
+    var migrationPreviewImmediateForClosure: ((AccountUUID) async throws -> ImmediateMigrationPreview)?
+
+    func migrationPreviewImmediate(for account: AccountUUID) async throws -> ImmediateMigrationPreview {
+        if let error = migrationPreviewImmediateForThrowableError {
+            throw error
+        }
+        migrationPreviewImmediateForCallsCount += 1
+        migrationPreviewImmediateForReceivedAccount = account
+        if let closure = migrationPreviewImmediateForClosure {
+            return try await closure(account)
+        } else {
+            return migrationPreviewImmediateForReturnValue
         }
     }
 
