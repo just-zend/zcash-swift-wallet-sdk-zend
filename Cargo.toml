@@ -115,7 +115,7 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 # Frozen Ironwood migration engine (shared Orchard->Ironwood logic, also consumed by Android).
 # The private repository and exact commit are part of the reviewed FFI provenance; never use a
 # branch, tag, or developer path for a release artifact.
-zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "e81df12cf921594bac3003811104bf1ede5612ab" }
+zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "2a558b12d9ddf5745bacfe3999f7c097b7c2da2d" }
 
 [features]
 # Off by default on this Ironwood branch — see the zcash_voting dependency note above. Enabling it
@@ -139,13 +139,13 @@ lto = true
 # same source and exact revision so direct SDK dependencies and the local migration engine unify.
 # Keep this rev immutable; changing it requires rebuilding and recommitting every FFI slice.
 [patch.crates-io]
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
-zcash_client_sqlite  = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
-zcash_primitives     = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
-zcash_keys           = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
-zcash_protocol       = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
-zcash_transparent    = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
-zcash_proofs         = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
-zcash_address        = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
-zip321               = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
-pczt                 = { git = "https://github.com/zcash/librustzcash", rev = "54ff673169ec8be5a4b023a7ae69bcf5caead2a3" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_client_sqlite  = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_primitives     = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_keys           = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_protocol       = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_transparent    = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_proofs         = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_address        = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zip321               = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+pczt                 = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }

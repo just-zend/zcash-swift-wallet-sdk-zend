@@ -1740,6 +1740,62 @@ mod tests {
     }
 
     #[test]
+    fn note_split_proposal_v5_json_preserves_quantized_and_residual_authority() {
+        let wire = br#"{
+            "output_notes":[1000020000,100020000,100020000],
+            "crossing_values":[1000000000,100000000,100000000],
+            "residual_output":82097000,
+            "residual_migration_amount":82077000,
+            "fee":25000
+        }"#;
+        let proposal: NoteSplitProposal = serde_json::from_slice(wire).unwrap();
+
+        assert_eq!(
+            proposal.output_notes,
+            vec![1_000_020_000, 100_020_000, 100_020_000]
+        );
+        assert_eq!(
+            proposal.crossing_values,
+            vec![1_000_000_000, 100_000_000, 100_000_000]
+        );
+        assert_eq!(proposal.residual_output, Some(82_097_000));
+        assert_eq!(proposal.residual_migration_amount, Some(82_077_000));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(wire).unwrap(),
+            serde_json::to_value(proposal).unwrap()
+        );
+    }
+
+    #[test]
+    fn private_intent_schedule_json_keeps_quantized_crossings_then_residual() {
+        let wire = br#"{
+            "run_id":"run-residual",
+            "expected_revision":5,
+            "intents":[
+                {"id":"run-residual-0","amount":1000000000,"fee":20000,"not_before_height":0,"target_window_end_height":288},
+                {"id":"run-residual-1","amount":100000000,"fee":20000,"not_before_height":288,"target_window_end_height":576},
+                {"id":"run-residual-2","amount":100000000,"fee":20000,"not_before_height":576,"target_window_end_height":864},
+                {"id":"run-residual-3","amount":82077000,"fee":20000,"not_before_height":864,"target_window_end_height":1152}
+            ],
+            "estimated_duration_hours":18
+        }"#;
+        let schedule: MigrationIntentSchedule = serde_json::from_slice(wire).unwrap();
+
+        assert_eq!(
+            schedule
+                .intents
+                .iter()
+                .map(|intent| intent.amount.into_u64())
+                .collect::<Vec<_>>(),
+            vec![1_000_000_000, 100_000_000, 100_000_000, 82_077_000]
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(wire).unwrap(),
+            serde_json::to_value(schedule).unwrap()
+        );
+    }
+
+    #[test]
     fn migration_state_on_fresh_db_is_not_started() {
         let path = unique_test_path("mig");
         let path_str = path.to_str().unwrap();
@@ -1984,7 +2040,7 @@ mod tests {
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  schema_version INTEGER NOT NULL
              );
-             INSERT INTO ext_ironwood_migration_meta (singleton, schema_version) VALUES (1, 5);",
+             INSERT INTO ext_ironwood_migration_meta (singleton, schema_version) VALUES (1, 6);",
         )
         .unwrap();
         drop(conn);
@@ -2008,8 +2064,8 @@ mod tests {
         assert!(!metadata_ptr.is_null());
         let metadata: zodl_ironwood_migration::MigrationEngineSchemaMetadata =
             serde_json::from_slice(unsafe { (*metadata_ptr).as_slice() }).unwrap();
-        assert_eq!(metadata.found_version, Some(5));
-        assert_eq!(metadata.supported_version, 4);
+        assert_eq!(metadata.found_version, Some(6));
+        assert_eq!(metadata.supported_version, 5);
         assert!(metadata.is_newer);
         unsafe { crate::ffi::zcashlc_free_boxed_slice(metadata_ptr) }
 
@@ -2021,7 +2077,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let _ = std::fs::remove_file(&path);
     }

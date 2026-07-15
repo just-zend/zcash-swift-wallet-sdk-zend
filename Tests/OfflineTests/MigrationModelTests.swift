@@ -119,6 +119,26 @@ final class MigrationModelTests: XCTestCase {
         )
     }
 
+    func testNoteSplitProposalCarriesExactQuantizedAndResidualValues() throws {
+        let json = """
+        {
+          "output_notes":[1000020000,100020000,100020000],
+          "crossing_values":[1000000000,100000000,100000000],
+          "residual_output":82097000,
+          "residual_migration_amount":82077000,
+          "fee":25000
+        }
+        """
+        let proposal = try decode(NoteSplitProposal.self, json)
+
+        XCTAssertEqual(proposal.outputNotes, [1_000_020_000, 100_020_000, 100_020_000])
+        XCTAssertEqual(proposal.crossingValues, [1_000_000_000, 100_000_000, 100_000_000])
+        XCTAssertEqual(proposal.residualOutput, 82_097_000)
+        XCTAssertEqual(proposal.residualMigrationAmount, 82_077_000)
+        XCTAssertEqual(proposal.fee, 25_000)
+        XCTAssertEqual(try roundTrip(proposal), proposal)
+    }
+
     func testScheduleAndProposalDecodeAndRoundTrip() throws {
         let json = """
         {"transfers":[{"id":"t1","amount":1000000000,"anchor_height":2880000,"next_executable_after_height":2880288,"expiry_height":2880576}],"estimated_duration_hours":6}
@@ -250,10 +270,31 @@ final class MigrationModelTests: XCTestCase {
         XCTAssertFalse(encoded.contains("expiry"))
     }
 
+    func testPrivateIntentScheduleKeepsQuantizedCrossingsThenResidual() throws {
+        let json = """
+        {
+          "run_id":"run-residual",
+          "expected_revision":5,
+          "intents":[
+            {"id":"run-residual-0","amount":1000000000,"fee":20000,"not_before_height":0,"target_window_end_height":288},
+            {"id":"run-residual-1","amount":100000000,"fee":20000,"not_before_height":288,"target_window_end_height":576},
+            {"id":"run-residual-2","amount":100000000,"fee":20000,"not_before_height":576,"target_window_end_height":864},
+            {"id":"run-residual-3","amount":82077000,"fee":20000,"not_before_height":864,"target_window_end_height":1152}
+          ],
+          "estimated_duration_hours":18
+        }
+        """
+        let schedule = try decode(MigrationIntentSchedule.self, json)
+
+        XCTAssertEqual(schedule.intents.map(\.amount), [1_000_000_000, 100_000_000, 100_000_000, 82_077_000])
+        XCTAssertEqual(schedule.intents.map(\.fee), Array(repeating: 20_000, count: 4))
+        XCTAssertEqual(try roundTrip(schedule), schedule)
+    }
+
     func testAuthoritativeSnapshotDecodesEveryExecutionField() throws {
         let json = """
         {
-          "schema_version":4,
+          "schema_version":5,
           "revision":47,
           "run_id":"run-7",
           "account_uuid":"00000000-0000-0000-0000-000000000007",
@@ -351,7 +392,7 @@ final class MigrationModelTests: XCTestCase {
     func testSnapshotSchemaFailureStatesRemainMachineActionable() throws {
         let json = """
         {
-          "schema_version":4,
+          "schema_version":5,
           "revision":0,
           "run_id":null,
           "account_uuid":"00000000-0000-0000-0000-000000000000",
@@ -410,7 +451,7 @@ final class MigrationModelTests: XCTestCase {
     func testFeeDriftSnapshotExposesApprovedAndReplacementExactFeesForReapproval() throws {
         let json = """
         {
-          "schema_version":4,"revision":8,"run_id":"run-fee","account_uuid":"account","network":"test",
+          "schema_version":5,"revision":8,"run_id":"run-fee","account_uuid":"account","network":"test",
           "consensus_fingerprint":"\(consensusFingerprint)",
           "mode":"immediate","phase":"failed_recoverable","state":{"RequiresAttention":"TransferExpired"},
           "counts":{
@@ -450,7 +491,7 @@ final class MigrationModelTests: XCTestCase {
     func testAbandoningSnapshotKeepsOrdinarySpendsBlockedUntilCancellationIsSafe() throws {
         let json = """
         {
-          "schema_version":4,"revision":9,"run_id":"run-cancel","account_uuid":"account","network":"test",
+          "schema_version":5,"revision":9,"run_id":"run-cancel","account_uuid":"account","network":"test",
           "consensus_fingerprint":"\(consensusFingerprint)",
           "mode":"private_scheduled","phase":"abandoning","state":{"InProgress":{
             "completed_transfers":0,"total_transfers":1,"remaining_orchard":100000000,
@@ -484,7 +525,7 @@ final class MigrationModelTests: XCTestCase {
     func testPlanSemanticsDriftRequiresWholePlanReapprovalWithoutMasqueradingAsFeeDrift() throws {
         let json = """
         {
-          "schema_version":4,"revision":10,"run_id":"run-plan","account_uuid":"account","network":"test",
+          "schema_version":5,"revision":10,"run_id":"run-plan","account_uuid":"account","network":"test",
           "consensus_fingerprint":"\(consensusFingerprint)",
           "mode":"private_scheduled","phase":"failed_recoverable",
           "state":{"RequiresAttention":"TransferExpired"},
@@ -526,7 +567,7 @@ final class MigrationModelTests: XCTestCase {
     func testSnapshotFailsClosedForUnknownIntentStatus() throws {
         let json = """
         {
-          "schema_version":4,"revision":1,"run_id":"run","account_uuid":"account","network":"test",
+          "schema_version":5,"revision":1,"run_id":"run","account_uuid":"account","network":"test",
           "consensus_fingerprint":"\(consensusFingerprint)",
           "mode":"private_scheduled","phase":"broadcast_scheduled","state":{"InProgress":{
             "completed_transfers":0,"total_transfers":1,"remaining_orchard":1,"next_transfer_ready_at_height":1
@@ -557,15 +598,15 @@ final class MigrationModelTests: XCTestCase {
     }
 
     func testNewerSnapshotSchemaBecomesExplicitFailClosedUpdateState() throws {
-        // Deliberately contains future enum values and omits the v4 body. The stable envelope is
+        // Deliberately contains future enum values and omits the v5 body. The stable envelope is
         // enough to replace cached UI with an explicit non-actionable update-required state.
         let snapshot = try decode(
             MigrationSnapshot.self,
-            "{\"schema_version\":5,\"account_uuid\":\"account-5\",\"network\":\"test\",\"next_action\":\"future_action\"}"
+            "{\"schema_version\":6,\"account_uuid\":\"account-6\",\"network\":\"test\",\"next_action\":\"future_action\"}"
         )
 
-        XCTAssertEqual(snapshot.schemaVersion, 5)
-        XCTAssertEqual(snapshot.accountUuid, "account-5")
+        XCTAssertEqual(snapshot.schemaVersion, 6)
+        XCTAssertEqual(snapshot.accountUuid, "account-6")
         XCTAssertEqual(snapshot.network, "test")
         XCTAssertEqual(snapshot.state, .requiresAttention(.appUpdateRequired))
         XCTAssertEqual(snapshot.failureCode, .appUpdateRequired)
@@ -578,7 +619,7 @@ final class MigrationModelTests: XCTestCase {
 
     func testSnapshotIdentityValidationFailsClosedAcrossAccountOrNetwork() throws {
         let snapshot = MigrationSnapshot.appUpdateRequired(
-            foundSchemaVersion: 5,
+            foundSchemaVersion: 6,
             accountUuid: "account-a",
             network: "test"
         )

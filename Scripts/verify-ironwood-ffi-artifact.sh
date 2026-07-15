@@ -239,7 +239,7 @@ if [[ ! "$recorded_source_date_epoch" =~ ^[0-9]+$ || "$recorded_source_date_epoc
     exit 1
 fi
 
-expected_librustzcash_rev="54ff673169ec8be5a4b023a7ae69bcf5caead2a3"
+expected_librustzcash_rev="266a75ae3af076bbe9437088947fddb1add8bd99"
 recorded_librustzcash_rev=$(read_field LIBRUSTZCASH_REVISION)
 if [[ "$recorded_librustzcash_rev" != "$expected_librustzcash_rev" ]]; then
     echo "Error: provenance does not record the audited librustzcash revision" >&2

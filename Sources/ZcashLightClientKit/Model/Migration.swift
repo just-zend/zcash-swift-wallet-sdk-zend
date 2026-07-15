@@ -92,19 +92,59 @@ public struct MigrationTransferPCZT: Equatable, Codable {
     }
 }
 
-/// A proposed note split: the per-note output values (zatoshi) and the prep-transaction fee.
+/// A proposed note split and the exact migration values it creates.
+///
+/// `outputNotes` are the self-funding quantized Orchard notes. `crossingValues` are their
+/// corresponding power-of-ten Ironwood transfer amounts. A positive split remainder is exposed
+/// separately as `residualOutput`; when it is large enough to migrate, `residualMigrationAmount`
+/// is the final crossing amount after its ordinary transfer fee. New fields decode with safe empty
+/// defaults so proposals emitted by schema-v4 engines remain readable but cannot gain residual
+/// authority by inference.
 public struct NoteSplitProposal: Equatable, Codable {
     public let outputNotes: [UInt64]
+    public let crossingValues: [UInt64]
+    public let residualOutput: UInt64?
+    public let residualMigrationAmount: UInt64?
     public let fee: UInt64
 
-    public init(outputNotes: [UInt64], fee: UInt64) {
+    public init(
+        outputNotes: [UInt64],
+        fee: UInt64,
+        crossingValues: [UInt64] = [],
+        residualOutput: UInt64? = nil,
+        residualMigrationAmount: UInt64? = nil
+    ) {
         self.outputNotes = outputNotes
+        self.crossingValues = crossingValues
+        self.residualOutput = residualOutput
+        self.residualMigrationAmount = residualMigrationAmount
         self.fee = fee
     }
 
     enum CodingKeys: String, CodingKey {
         case outputNotes = "output_notes"
+        case crossingValues = "crossing_values"
+        case residualOutput = "residual_output"
+        case residualMigrationAmount = "residual_migration_amount"
         case fee
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        outputNotes = try container.decode([UInt64].self, forKey: .outputNotes)
+        crossingValues = try container.decodeIfPresent([UInt64].self, forKey: .crossingValues) ?? []
+        residualOutput = try container.decodeIfPresent(UInt64.self, forKey: .residualOutput)
+        residualMigrationAmount = try container.decodeIfPresent(UInt64.self, forKey: .residualMigrationAmount)
+        fee = try container.decode(UInt64.self, forKey: .fee)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(outputNotes, forKey: .outputNotes)
+        try container.encode(crossingValues, forKey: .crossingValues)
+        try container.encodeIfPresent(residualOutput, forKey: .residualOutput)
+        try container.encodeIfPresent(residualMigrationAmount, forKey: .residualMigrationAmount)
+        try container.encode(fee, forKey: .fee)
     }
 }
 
@@ -388,8 +428,10 @@ public struct MigrationIntent: Equatable, Codable {
     }
 }
 
-/// The authoritative anchorless intent schedule presented for confirmation. `expectedRevision`
-/// is a compare-and-set token: committing a stale or changed schedule is rejected by the engine.
+/// The authoritative anchorless intent schedule presented for confirmation. For a private split,
+/// quantized crossings remain largest-first (for example `10`, `1`, `1`) and an eligible residual
+/// is appended last. `expectedRevision` is a compare-and-set token: committing a stale or changed
+/// schedule is rejected by the engine.
 public struct MigrationIntentSchedule: Equatable, Codable {
     public let runId: String
     public let expectedRevision: UInt64
@@ -735,7 +777,7 @@ public struct MigrationIntentSummary: Equatable, Codable {
 /// One authoritative, revisioned read of migration state and its next safe operation.
 public struct MigrationSnapshot: Equatable, Codable {
     /// Current Rust/Swift snapshot schema understood by this SDK build.
-    public static let supportedSchemaVersion: UInt32 = 4
+    public static let supportedSchemaVersion: UInt32 = 5
 
     public let schemaVersion: UInt32
     public let revision: UInt64
@@ -975,7 +1017,7 @@ public enum MigrationSnapshotValidationError: Error, Equatable {
 }
 
 extension MigrationSnapshot {
-    /// Defensively validates the complete v4 wire snapshot before any UI/background consumer sees
+    /// Defensively validates the complete v5 wire snapshot before any UI/background consumer sees
     /// it. A newer schema is converted to the single fail-closed app-update projection; every
     /// compatible schema violation is rejected as typed corruption.
     // Validation deliberately enumerates the complete untrusted wire-state matrix in one choke point.
@@ -1392,7 +1434,7 @@ extension MigrationSnapshot {
                 && (
                     snapshot.counts.intentsAwaitingSignature > 0
                         || snapshot.counts.intentsStaged > 0
-                        // A staged note-split PCZT lives in the dedicated prep table, so schema v4
+                        // A staged note-split PCZT lives in the dedicated prep table, so schema v5
                         // has no intent count that can expose it. This narrow phase/mode projection
                         // is what the engine emits after a process dies before external signing;
                         // the revisioned resume API still proves the exact durable row/token.
@@ -1410,7 +1452,7 @@ extension MigrationSnapshot {
                 || snapshot.counts.intentsSubmitting > 0
                 || snapshot.counts.transfersSubmitting > 0
                 // The denomination-split claim is stored outside intent/pending-transfer counts.
-                // A live prep submission therefore has no count bit in schema v4; the exact phase
+                // A live prep submission therefore has no count bit in schema v5; the exact phase
                 // is the narrow projection emitted until its lease/result resolves.
                 || (snapshot.mode == .privateScheduled && phase == .preparingDenominations)
         case .reviewUpdatedIntentFee:

@@ -71,7 +71,7 @@ final class MigrationFFITests: XCTestCase {
                 """
             )
             try connection.run(
-                "INSERT INTO ext_ironwood_migration_meta (singleton, schema_version) VALUES (1, 5)"
+                "INSERT INTO ext_ironwood_migration_meta (singleton, schema_version) VALUES (1, 6)"
             )
         }
 

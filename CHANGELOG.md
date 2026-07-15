@@ -29,7 +29,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **dormant** — `ironwoodBalance` is `.zero` for every wallet — until a lightwalletd serves Ironwood
   compact blocks and NU6.3 activates (its consensus branch id is still a placeholder upstream). Error
   codes ZRUST0109/ZRUST0110 and ZCBPEO0023.
-- Authoritative schema-v4 Orchard → Ironwood `MigrationSnapshot` models: exact run/revision,
+- Authoritative schema-v5 Orchard → Ironwood `MigrationSnapshot` models: exact run/revision,
   mode/phase, typed failure and recovery, next safe action, exact intent/count projections,
   immutable submission policy, signer leases, and account-scoped ordinary-spend reservation.
   Defensive Swift validation rejects contradictory/corrupt wire state and projects read failures as
@@ -62,8 +62,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `commitMigrationIntents`, and the expected-run/revision `execute`/`stage`/`resume` APIs described in
   `MIGRATING.md`.
 - The Rust core now builds against exact upstream `zcash/librustzcash` revision
-  `54ff673169ec8be5a4b023a7ae69bcf5caead2a3`, the current upstream main reviewed for this change,
-  including `zcash_client_backend 0.24.0-rc.1`, `zcash_client_sqlite 0.22.0-rc.1`,
+  `266a75ae3af076bbe9437088947fddb1add8bd99`, the current upstream main reviewed for this change,
+  including independent Orchard/Ironwood bundle-type selection and the send-max overflow,
+  action-count, recipient, and nonzero-delivery fixes merged through upstream PR `#2610`, with
+  `zcash_client_backend 0.24.0-rc.1`, `zcash_client_sqlite 0.22.0-rc.1`,
   `pczt 0.8.0-rc.1`, and `zip321 0.9.0-rc.1`. NU6.3/Ironwood uses stable APIs; no synthetic
   `zcash_unstable="nu6.3"` cfg or fork is used. Shielded voting remains gated behind an
   off-by-default Cargo feature (and its Swift layer is excluded): the current crates.io
