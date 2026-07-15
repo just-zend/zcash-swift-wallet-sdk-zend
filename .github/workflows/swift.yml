@@ -13,12 +13,16 @@ on:
       - 'SWIFTLINT.md'
       - 'docs/**'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   build:
     permissions:
       contents: read
 
-    runs-on: macos-15
+    runs-on: warp-macos-15-arm64-12x
 
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

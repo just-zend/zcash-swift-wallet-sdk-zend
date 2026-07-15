@@ -16,7 +16,7 @@ name: "CodeQL Advanced"
 # Rationale:
 # - The Swift matrix entry requires `build-mode: manual` (CodeQL's Swift extractor
 #   hooks the compiler), so it has to run a full Rust FFI + Swift build on a
-#   macos-15 runner. On Cargo.lock-changing PRs this is a 30-50 min cold build,
+#   WarpBuild macOS 15 runner. On Cargo.lock-changing PRs this is a 30-50 min cold build,
 #   per push, with no concurrency cancellation.
 # - The build-integration signal that matters at PR time (does Rust still link
 #   with Swift? do offline tests pass?) is already covered by `swift.yml` on
@@ -58,16 +58,16 @@ jobs:
         include:
         - language: actions
           build-mode: none
-          runner: ubuntu-latest
+          runner: warp-ubuntu-latest-x64-16x
         - language: c-cpp
           build-mode: none
-          runner: ubuntu-latest
+          runner: warp-ubuntu-latest-x64-16x
         - language: rust
           build-mode: none
-          runner: ubuntu-latest
+          runner: warp-ubuntu-latest-x64-16x
         - language: swift
           build-mode: manual
-          runner: macos-15
+          runner: warp-macos-15-arm64-12x
         # CodeQL supports the following values keywords for 'language': 'actions', 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'rust', 'swift'
         # Use `c-cpp` to analyze code written in C, C++ or both
         # Use 'java-kotlin' to analyze code written in Java, Kotlin or both

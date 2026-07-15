@@ -13,7 +13,7 @@ permissions: {}
 
 jobs:
   build-xcframework:
-    runs-on: macos-15
+    runs-on: warp-macos-15-arm64-12x
     permissions:
       contents: write # Required for creating draft releases
     steps:
