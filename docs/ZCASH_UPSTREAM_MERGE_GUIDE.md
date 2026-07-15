@@ -58,6 +58,16 @@ Zend CI intentionally diverges from upstream's native GitHub-hosted runners:
 - Swift, SwiftLint, and zizmor PR workflows cancel superseded work for the same pull request.
 - Manual FFI release runs do not cancel. CodeQL retains no workflow-level concurrency, so its push, scheduled, and manual runs do not cancel.
 
+Moving the `contents: write` draft-release publisher to WarpBuild expands the trusted computing base for SDK releases. The following controls are required:
+
+- The live `sdk-release` GitHub environment must exist before this change merges or the workflow is used. It must require an independent reviewer, prevent self-approval and administrator bypass where GitHub makes those controls available, and restrict deployment branches and tags to protected, reviewed release refs.
+- WarpBuild GitHub App access must be limited to this repository and the minimum permissions required for these jobs.
+- The environment reviewer must verify and approve the exact commit SHA shown by the workflow run.
+- The workflow output must remain a draft release.
+- A second maintainer must download the draft XCFramework zip, independently run `shasum -a 256`, compare the result with both the workflow output and the checksum proposed for `Package.swift`, confirm that the draft asset came from the approved workflow SHA, and only then publish the release.
+
+This PR is not merge-ready until the live `sdk-release` environment protections and WarpBuild GitHub App controls have been verified.
+
 ### Upstream parity snapshot (as of 2026-07-04)
 
 Current relationship after Zend PR `#15` merged `codex/zcash-upstream-sync-2026-06-22` into `origin/main`, before the current July 3 parity branch lands:
