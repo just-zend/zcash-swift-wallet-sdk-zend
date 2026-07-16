@@ -104,7 +104,7 @@ jobs:
 
     - name: Select Xcode version
       if: matrix.language == 'swift'
-      run: sudo xcode-select -s '/Applications/Xcode_26.6.app/Contents/Developer'
+      run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
     - name: Verify committed XCFramework
       if: matrix.language == 'swift'

@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
 
       - name: Select Xcode version
-        run: sudo xcode-select -s '/Applications/Xcode_26.6.app/Contents/Developer'
+        run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
       - name: Verify frozen committed artifact
         run: |
