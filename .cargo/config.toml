@@ -1,0 +1,4 @@
+# Fetch git dependencies through the system git CLI so private just-zend repos resolve with the
+# environment's normal ssh credentials (cargo's built-in fetcher has no access to them).
+[net]
+git-fetch-with-cli = true

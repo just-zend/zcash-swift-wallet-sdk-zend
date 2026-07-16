@@ -6,7 +6,77 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- `AccountUUID.init(id:)` is now public so recovery tooling can reconstruct an account's exact
+  16-byte database identity without lossy conversion.
+- Configurable network-upgrade activation heights, for connecting the SDK to a **custom-parameter
+  (regtest) network** such as an Ironwood testing backend. `ZcashNetworkBuilder.regtest(activationHeights:)`
+  builds a `ZcashNetwork` from a new `NetworkActivationHeights` value (per-NU heights up to NU6.3), threaded
+  into the Rust core via librustzcash's `LocalNetwork`. Adds a `NetworkType.regtest` identity (`networkId`
+  2, `chainName` "regtest", regtest-encoded addresses, `ZcashSdk_regtest_` database prefix) and a
+  `zcashlc_set_regtest_activation_heights` FFI. Opt-in and fully additive — mainnet/testnet behavior is
+  unchanged. Running the Orchard→Ironwood **migration** against a regtest network is not yet supported (the
+  migration engine has no custom-network variant). See `MIGRATING.md` and
+  `docs/handoffs/ZODL-regtest-activation-heights.md`.
+- Ironwood (NU6.3) receive/sync readiness. Ironwood is Orchard note-version V3 — received at the
+  account's existing **Orchard receiver** (no separate Ironwood address) — so the SDK now wires the
+  receive/scan/balance path against the librustzcash Ironwood support: the Ironwood proto fields
+  (`CompactTx.ironwoodActions`, `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
+  `ShieldedProtocol.ironwood`); a `putIronwoodSubtreeRoots` FFI/welding method; a **best-effort**
+  Ironwood subtree-root fetch in `UpdateSubtreeRootsAction` (a lightwalletd that does not serve
+  Ironwood is skipped, so it never breaks sync); a public `AccountBalance.ironwoodBalance: PoolBalance`
+  (plus `WalletSummary.nextIronwoodSubtreeIndex`); and an optional `Checkpoint.ironwoodTree`. This is
+  **dormant** — `ironwoodBalance` is `.zero` for every wallet — until a lightwalletd serves Ironwood
+  compact blocks and NU6.3 activates (its consensus branch id is still a placeholder upstream). Error
+  codes ZRUST0109/ZRUST0110 and ZCBPEO0023.
+- Authoritative schema-v5 Orchard → Ironwood `MigrationSnapshot` models: exact run/revision,
+  mode/phase, typed failure and recovery, next safe action, exact intent/count projections,
+  immutable submission policy, signer leases, and account-scoped ordinary-spend reservation.
+  Defensive Swift validation rejects contradictory/corrupt wire state and projects read failures as
+  non-operational `.walletSchemaUnavailable` state instead of reusing a stale runnable snapshot.
+- Public intent/JIT migration APIs on async `Synchronizer`. Private begin and Immediate commit
+  validate and atomically persist their immutable endpoint/consensus policy; approved transfers stay
+  anchorless until one becomes due. Every existing-run mutation takes caller `expectedRunId` and
+  `expectedRevision`, preventing a foreground or background task from acting on a replacement run.
+- Crash-resumable software and external-signer paths for the note split and each due intent. The SDK
+  resumes the exact staged PCZT/claim token after relaunch, extracts the Rust-computed transaction,
+  validates endpoint chain/branch/expiry state, submits it over the selected direct or Tor transport,
+  and records an exact known-unsent, success, failure, or outcome-unknown lifecycle result.
+- A zero-write `previewImmediateMigration(for:)` API exposes exact upstream ZIP-317 economics as
+  `.actionable`, `.positiveBalanceAtOrBelowFee`, or `.noSpendableFunds` without creating migration
+  drafts, runs, reservations, signatures, or transaction artifacts. The FFI now opens SQLite in
+  read-only mode for this call, so even legacy consensus-identity adoption cannot mutate a run.
+  Migration-engine startup failures now throw a public sanitized
+  `MigrationEngineInitializationError` with stable typed causes for schema, consensus, SQLite,
+  backend, and pipeline failures; device-local Rust/SQLite text is not retained in the typed model.
+- Canonical wallet database initialization/migration failures now throw the public sanitized
+  `WalletDatabaseInitializationError`. Busy/locked, storage-full/read-only/unavailable,
+  corruption, forward/incompatible schema, and backend failures are stable typed causes, allowing
+  apps to choose truthful retry-versus-preservation UI without parsing Rust or SQLite prose.
+
+## Changed
+- Breaking: removed the legacy anchored pre-sign-all migration methods from the public
+  `Synchronizer` contract (`proposeMigrationTransfers`, `signAndStoreMigrationSchedule`, full-schedule
+  PCZT propose/store, `executeNextPendingTransfer`, `refreshStaleTransfers`, and
+  `restartCurrentMigrationStep`). Migrate callers to `propose*MigrationIntent`,
+  `commitMigrationIntents`, and the expected-run/revision `execute`/`stage`/`resume` APIs described in
+  `MIGRATING.md`.
+- The Rust core now builds against exact upstream `zcash/librustzcash` revision
+  `266a75ae3af076bbe9437088947fddb1add8bd99`, the current upstream main reviewed for this change,
+  including independent Orchard/Ironwood bundle-type selection and the send-max overflow,
+  action-count, recipient, and nonzero-delivery fixes merged through upstream PR `#2610`, with
+  `zcash_client_backend 0.24.0-rc.1`, `zcash_client_sqlite 0.22.0-rc.1`,
+  `pczt 0.8.0-rc.1`, and `zip321 0.9.0-rc.1`. NU6.3/Ironwood uses stable APIs; no synthetic
+  `zcash_unstable="nu6.3"` cfg or fork is used. Shielded voting remains gated behind an
+  off-by-default Cargo feature (and its Swift layer is excluded): the current crates.io
+  `zcash_voting 1.0.0` still pins Orchard 0.14 + unstable voting circuits, while this audited
+  Ironwood graph uses Orchard 0.15.0. Re-enable only after the voting stack moves to Orchard 0.15.
 ## Fixed
+- Ironwood migration now self-heals interrupted leases, missed private windows, expired JIT
+  transactions, process-death external signing, and ambiguous submissions without silently creating
+  replacement bytes. Legacy policyless artifacts are either revision-bound before exposure or kept
+  quarantined until chain evidence resolves them. Ordinary send, send-max, ZIP-321, PCZT creation,
+  shielding, and finalization fail closed only for the migrating account.
 - Tor-layer errors (`rustTorConnectToLightwalletd`, `rustTorLwdGetInfo`, `rustTorLwdSubmit`, `rustTorLwdFetchTransaction`, `rustTorLwdLatestBlockHeight`, `rustTorLwdGetTreeState`) are now classified as retryable service errors in `CompactBlockProcessor`. Previously these errors bypassed the service-error retry path and went straight to a fatal sync failure, so a transient Tor circuit/stream issue (e.g. "remote hostname lookup failure", "Failed to obtain exit circuit for ports", "Tor network protocol violation") required a full app restart to recover. They now trigger the same reset-and-retry behavior (including tearing down cached Tor connections via `service.closeConnections()`) as other transport errors, up to `ZcashSDK.serviceFailureRetries` times.
 
 # 2.6.0-alpha.6

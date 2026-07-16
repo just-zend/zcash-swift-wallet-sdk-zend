@@ -15,9 +15,9 @@ name: "CodeQL Advanced"
 #
 # Rationale:
 # - The Swift matrix entry requires `build-mode: manual` (CodeQL's Swift extractor
-#   hooks the compiler), so it has to run a Rust FFI + Swift build on a WarpBuild
-#   macOS 15 runner. The workflow builds only the arm64 FFI slice used by that
-#   runner and cancels an older scan when a newer push to the same ref arrives.
+#   hooks the compiler), so it has to run a full Swift build against the verified,
+#   committed FFI on a WarpBuild macOS 15 runner. On dependency-changing pushes
+#   this is a substantial cold build, so superseded scans are cancelled.
 # - The build-integration signal that matters at PR time (does Rust still link
 #   with Swift? do offline tests pass?) is already covered by `swift.yml` on
 #   every PR. CodeQL Swift adds static-analysis findings, not build verification.
@@ -90,64 +90,17 @@ jobs:
 
     # --- Swift manual build steps (mirrors swift.yml) ---
     #
-    # Swift does not support build-mode: none, and autobuild fails because
-    # Package.swift falls back to a pre-built xcframework that may lack new
-    # FFI symbols. We build the Rust FFI from source and configure LocalPackages
-    # so swift build resolves against the freshly-built xcframework.
+    # Swift does not support build-mode: none. The private migration engine is built and tested in
+    # its own repository; public SDK CodeQL consumes the reviewed, committed FFI artifact without
+    # requiring private-repository credentials.
 
     - name: Select Xcode version
       if: matrix.language == 'swift'
       run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
-    - name: Cache FFI XCFramework
+    - name: Verify committed XCFramework
       if: matrix.language == 'swift'
-      id: cache-ffi
-      uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-      with:
-        path: LocalPackages/libzcashlc.xcframework
-        key: ffi-xcframework-${{ runner.os }}-${{ runner.arch }}-xcode-16.0-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust/**/*.rs', 'rust/**/*.c', 'rust/**/*.h', 'BuildSupport/module.modulemap', 'BuildSupport/platform-Info.plist', 'Scripts/init-local-ffi.sh') }}
-
-    - name: Setup Rust
-      if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
-      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-      with:
-        toolchain: stable
-        targets: aarch64-apple-darwin
-
-    - name: Cache Cargo
-      if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
-      uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-
-    - name: Build arm64 FFI for macOS
-      if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
-      timeout-minutes: 30
-      run: ./Scripts/init-local-ffi.sh --arm-macos
-
-    - name: Configure local FFI
-      if: matrix.language == 'swift'
-      run: |
-        mkdir -p LocalPackages
-        cp BuildSupport/LocalPackages-Package.swift LocalPackages/Package.swift
-
-    - name: Verify XCFramework
-      if: matrix.language == 'swift'
-      env:
-        FFI_CACHE_HIT: ${{ steps.cache-ffi.outputs.cache-hit }}
-        RUNNER_ARCH: ${{ runner.arch }}
-        RUNNER_NAME: ${{ runner.name }}
-        RUNNER_OS: ${{ runner.os }}
-      run: |
-        XCFRAMEWORK="LocalPackages/libzcashlc.xcframework"
-        BINARY="$XCFRAMEWORK/macos-arm64_x86_64/libzcashlc.framework/libzcashlc"
-        test -d "$XCFRAMEWORK"
-        plutil -lint "$XCFRAMEWORK/Info.plist"
-        test "$(lipo -archs "$BINARY")" = "arm64"
-        {
-          echo "### Swift CodeQL runner"
-          echo "- Runner: $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH)"
-          echo "- FFI cache hit: $FFI_CACHE_HIT"
-          echo "- FFI architecture: arm64"
-        } >> "$GITHUB_STEP_SUMMARY"
+      run: ./Scripts/verify-ironwood-ffi-artifact.sh
 
     - name: Resolve Swift dependencies
       if: matrix.language == 'swift'
@@ -166,7 +119,7 @@ jobs:
     - name: Build Swift package
       if: matrix.language == 'swift'
       timeout-minutes: 30
-      run: swift build --arch arm64
+      run: swift build
 
     # --- End Swift manual build steps ---
 

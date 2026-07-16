@@ -1,8 +1,9 @@
-name: Build FFI XCFramework
+name: Package Verified FFI XCFramework
 
 on:
-  # Manual trigger for preparing releases.
-  # The branch selected in the GitHub UI determines which commit is checked out and built.
+  # The private migration engine is intentionally unavailable to public GitHub Actions. This
+  # workflow verifies and packages the frozen three-slice artifact already committed on the
+  # selected branch; authenticated source rebuilds use Scripts/build-ironwood-ffi-artifact.sh.
   workflow_dispatch:
     inputs:
       version:
@@ -12,9 +13,9 @@ on:
 permissions: {}
 
 jobs:
-  build-xcframework:
+  package-xcframework:
     runs-on: warp-macos-15-arm64-12x
-    # The live sdk-release environment must be protected before this workflow is used.
+    # The live sdk-release environment must be protected before this workflow is dispatched.
     environment: sdk-release
     permissions:
       contents: write # Required for creating draft releases
@@ -23,23 +24,43 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+      - name: Select Xcode version
+        run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-          targets: aarch64-apple-ios, x86_64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-darwin, aarch64-apple-darwin
+      - name: Verify frozen committed artifact
+        run: |
+          ./Scripts/verify-ironwood-ffi-artifact.sh
+          expected=(ios-arm64 ios-arm64-simulator macos-arm64)
+          for slice in "${expected[@]}"; do
+            test -f "LocalPackages/libzcashlc.xcframework/${slice}/libzcashlc.framework/libzcashlc"
+          done
+          count=$(find LocalPackages/libzcashlc.xcframework -type f -path '*/libzcashlc.framework/libzcashlc' | wc -l | tr -d ' ')
+          test "$count" = "3"
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-
-      - name: Build and upload draft release
+      - name: Package and upload draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ github.event.inputs.version }}
-        run: ./Scripts/prepare-release.sh "$VERSION"
+        run: |
+          set -euo pipefail
+          products=BuildSupport/products
+          archive=libzcashlc.xcframework.zip
+          mkdir -p "$products"
+          rm -f "$products/$archive"
+          (cd LocalPackages && /usr/bin/zip -qry "../$products/$archive" libzcashlc.xcframework)
+          checksum=$(shasum -a 256 "$products/$archive" | awk '{print $1}')
+          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/${archive}"
+          printf 'CHECKSUM=%s\nDOWNLOAD_URL=%s\nVERSION=%s\n' \
+            "$checksum" "$download_url" "$VERSION" > "$products/release.env"
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; refusing to overwrite a frozen artifact." >&2
+            exit 1
+          fi
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$VERSION" "$products/$archive" \
+            --repo "$GITHUB_REPOSITORY" --title "$VERSION" \
+            --notes "Zcash Light Client SDK $VERSION verified frozen FFI" --draft "${prerelease[@]}"
 
       - name: Output Package.swift Update
         run: |
