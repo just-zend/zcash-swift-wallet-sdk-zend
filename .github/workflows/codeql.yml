@@ -106,32 +106,14 @@ jobs:
       if: matrix.language == 'swift'
       run: ./Scripts/verify-ironwood-ffi-artifact.sh
 
-    # CodeQL 2.26 drops the module path for a pure `macos-arm64` XCFramework
-    # identifier. After provenance verification, give the unchanged framework
-    # bytes the conventional identifier used by the last green CodeQL build.
-    # This workspace-only metadata workaround never changes the committed artifact.
-    - name: Prepare CodeQL FFI layout
-      if: matrix.language == 'swift'
-      run: |
-        XCFRAMEWORK=LocalPackages/libzcashlc.xcframework
-        mv "$XCFRAMEWORK/macos-arm64" "$XCFRAMEWORK/macos-arm64_x86_64"
-        plutil -replace AvailableLibraries.2.LibraryIdentifier \
-          -string macos-arm64_x86_64 "$XCFRAMEWORK/Info.plist"
-
-    # Present the already-verified XCFramework through the package-product path
-    # used by the last successful Swift CodeQL build.
-    - name: Configure CodeQL FFI package
-      if: matrix.language == 'swift'
-      run: cp BuildSupport/LocalPackages-Package.swift LocalPackages/Package.swift
-
     - name: Resolve Swift dependencies
       if: matrix.language == 'swift'
       timeout-minutes: 10
       run: swift package resolve
 
-    # Dependency resolution is intentionally outside the extractor. Prebuilding
-    # dependencies is not: CodeQL changes the compiler environment and SwiftPM
-    # rebuilds them anyway, making a separate prebuild slower overall.
+    # Dependency resolution is intentionally outside the extractor. The explicit
+    # arm64 build below keeps CodeQL on the architecture provided by the committed
+    # XCFramework instead of allowing a traced compiler process to use x86_64.
     - name: Initialize CodeQL
       uses: github/codeql-action/init@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
       with:
