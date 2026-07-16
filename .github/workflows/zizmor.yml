@@ -6,12 +6,16 @@ on:
   pull_request:
     branches: ["**"]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions: {}
 
 jobs:
   zizmor:
     name: Run zizmor 🌈
-    runs-on: ubuntu-latest
+    runs-on: warp-ubuntu-latest-x64-8x
     permissions:
       security-events: write # Required for upload-sarif (used by zizmor-action) to upload SARIF files.
     steps:
