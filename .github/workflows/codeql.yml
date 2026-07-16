@@ -140,12 +140,12 @@ jobs:
         # If you wish to specify custom queries, you can do so here or in a config file.
         # queries: security-extended,security-and-quality
 
-    - name: Build repository Swift targets
+    - name: Build Swift package
       if: matrix.language == 'swift'
       timeout-minutes: 30
-      # TestUtils depends on ZcashLightClientKit, so this single planning pass
-      # traces both repository-owned targets without scanning external packages.
-      run: swift build --target TestUtils
+      # Keep the explicit architecture used by the last successful Swift CodeQL
+      # build; it also matches this arm64-only runner and FFI slice.
+      run: swift build --arch arm64
 
     # --- End Swift manual build steps ---
 
