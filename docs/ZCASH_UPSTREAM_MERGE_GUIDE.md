@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-14
+Last reviewed: 2026-07-15
 
 ## Remote and branch invariants
 
@@ -48,15 +48,18 @@ If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked r
 
 ## Zend divergence notes
 
-### CI runner divergence (as of 2026-07-14)
+### CI runner divergence (as of 2026-07-15)
 
 Zend CI intentionally diverges from upstream's native GitHub-hosted runners:
 
 - `warp-macos-15-arm64-12x` runs the manual FFI XCFramework release job, the Swift PR build and offline tests, and the Swift CodeQL matrix row.
 - `warp-ubuntu-latest-x64-16x` runs the CodeQL `actions`, `c-cpp`, and `rust` matrix rows.
 - `warp-ubuntu-latest-x64-8x` runs SwiftLint and zizmor.
+- Swift PR tests and Swift CodeQL build an arm64-only local FFI XCFramework because their WarpBuild runner is arm64. The manual release workflow still builds and publishes the complete five-target XCFramework.
 - Swift, SwiftLint, and zizmor PR workflows cancel superseded work for the same pull request.
-- Manual FFI release runs do not cancel. CodeQL retains no workflow-level concurrency, so its push, scheduled, and manual runs do not cancel.
+- A newer CodeQL push to the same ref cancels the older push scan. Scheduled and manually dispatched CodeQL scans remain independent, and manual FFI release runs do not cancel.
+
+The first warm Swift control after WarpBuild access was enabled completed in 3m05s ([run `29397180803`](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/actions/runs/29397180803)): checkout 4s, FFI cache restore 3s, Swift build 1m25s, and offline tests 1m24s. The prior GitHub-hosted warm median was 5m54s, so use roughly 3 minutes as the new warm regression baseline. Cold runs should be evaluated separately because rebuilding the Rust FFI dominates them.
 
 Moving the `contents: write` draft-release publisher to WarpBuild expands the trusted computing base for SDK releases. The following controls are required:
 
@@ -66,7 +69,7 @@ Moving the `contents: write` draft-release publisher to WarpBuild expands the tr
 - The workflow output must remain a draft release.
 - A second maintainer must download the draft XCFramework zip, independently run `shasum -a 256`, compare the result with both the workflow output and the checksum proposed for `Package.swift`, confirm that the draft asset came from the approved workflow SHA, and only then publish the release.
 
-This PR is not merge-ready until the live `sdk-release` environment protections and WarpBuild GitHub App controls have been verified.
+The live `sdk-release` environment is still absent as of 2026-07-15. Do not manually dispatch the FFI release workflow until its environment protections and the WarpBuild GitHub App controls have been verified.
 
 ### Upstream parity snapshot (as of 2026-07-04)
 

@@ -33,22 +33,14 @@ jobs:
     - name: Select Xcode version
       run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
-    # Generate a hash of all Rust source files for cache key
-    - name: Generate FFI source hash
-      id: ffi-hash
-      run: |
-        # Hash all Rust source files, Cargo files, and build support files
-        FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
-        echo "hash=$FFI_HASH" >> $GITHUB_OUTPUT
-        echo "FFI source hash: $FFI_HASH"
-
-    # Cache the built xcframework (macOS-only for CI tests)
+    # Cache the arm64-only XCFramework used by this arm64 runner. hashFiles avoids
+    # spawning one process per source file, which is especially expensive under CodeQL.
     - name: Cache FFI XCFramework
       id: cache-ffi
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
-        path: BuildSupport/products/libzcashlc.xcframework
-        key: ffi-xcframework-macos-only-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
+        path: LocalPackages/libzcashlc.xcframework
+        key: ffi-xcframework-${{ runner.os }}-${{ runner.arch }}-xcode-16.0-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust/**/*.rs', 'rust/**/*.c', 'rust/**/*.h', 'BuildSupport/module.modulemap', 'BuildSupport/platform-Info.plist', 'Scripts/init-local-ffi.sh') }}
 
     # Only set up Rust if we need to build FFI
     - name: Setup Rust
@@ -56,40 +48,44 @@ jobs:
       uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
       with:
         toolchain: stable
-        targets: aarch64-apple-darwin, x86_64-apple-darwin
+        targets: aarch64-apple-darwin
 
     # Cache Cargo dependencies (only if building FFI)
     - name: Cache Cargo
       if: steps.cache-ffi.outputs.cache-hit != 'true'
       uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
-    # Build FFI for macOS only (sufficient for running tests)
-    - name: Build FFI for macOS
+    # The WarpBuild runner is arm64, so compiling the x86_64 slice would double
+    # the cold FFI work without exercising any additional code in this job.
+    - name: Build arm64 FFI for macOS
       if: steps.cache-ffi.outputs.cache-hit != 'true'
       timeout-minutes: 30
-      working-directory: ./BuildSupport
-      run: |
-        echo "Building FFI for macOS..."
-        make macos
-        mkdir -p products/libzcashlc.xcframework
-        cp -R products/macos/frameworks products/libzcashlc.xcframework/macos-arm64_x86_64
-        cp Info.plist products/libzcashlc.xcframework
+      run: ./Scripts/init-local-ffi.sh --arm-macos
 
-    # Verify xcframework exists (whether from cache or fresh build)
+    # Verify the cache/build produced an arm64-only binary and a valid XCFramework.
     - name: Verify XCFramework
+      env:
+        FFI_CACHE_HIT: ${{ steps.cache-ffi.outputs.cache-hit }}
+        RUNNER_ARCH: ${{ runner.arch }}
+        RUNNER_NAME: ${{ runner.name }}
+        RUNNER_OS: ${{ runner.os }}
       run: |
-        if [ ! -d "BuildSupport/products/libzcashlc.xcframework" ]; then
-          echo "Error: BuildSupport/products/libzcashlc.xcframework not found"
-          exit 1
-        fi
-        echo "XCFramework contents:"
-        ls -la BuildSupport/products/libzcashlc.xcframework/
+        XCFRAMEWORK="LocalPackages/libzcashlc.xcframework"
+        BINARY="$XCFRAMEWORK/macos-arm64_x86_64/libzcashlc.framework/libzcashlc"
+        test -d "$XCFRAMEWORK"
+        plutil -lint "$XCFRAMEWORK/Info.plist"
+        test "$(lipo -archs "$BINARY")" = "arm64"
+        {
+          echo "### Swift CI runner"
+          echo "- Runner: $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH)"
+          echo "- FFI cache hit: $FFI_CACHE_HIT"
+          echo "- FFI architecture: arm64"
+        } >> "$GITHUB_STEP_SUMMARY"
 
     # Set up LocalPackages so Package.swift auto-detects the local build
     - name: Configure local FFI for CI
       run: |
         mkdir -p LocalPackages
-        cp -R BuildSupport/products/libzcashlc.xcframework LocalPackages/
         cp BuildSupport/LocalPackages-Package.swift LocalPackages/Package.swift
         echo "LocalPackages created — Package.swift will use local FFI"
 

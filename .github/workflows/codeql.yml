@@ -15,9 +15,9 @@ name: "CodeQL Advanced"
 #
 # Rationale:
 # - The Swift matrix entry requires `build-mode: manual` (CodeQL's Swift extractor
-#   hooks the compiler), so it has to run a full Rust FFI + Swift build on a
-#   WarpBuild macOS 15 runner. On Cargo.lock-changing PRs this is a 30-50 min cold build,
-#   per push, with no concurrency cancellation.
+#   hooks the compiler), so it has to run a Rust FFI + Swift build on a WarpBuild
+#   macOS 15 runner. The workflow builds only the arm64 FFI slice used by that
+#   runner and cancels an older scan when a newer push to the same ref arrives.
 # - The build-integration signal that matters at PR time (does Rust still link
 #   with Swift? do offline tests pass?) is already covered by `swift.yml` on
 #   every PR. CodeQL Swift adds static-analysis findings, not build verification.
@@ -36,6 +36,12 @@ on:
 
 permissions:
   contents: read
+
+# A newer main push supersedes an older main scan. Scheduled and manually
+# dispatched scans remain independent and are never cancelled here.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   analyze:
@@ -82,19 +88,6 @@ jobs:
       with:
         persist-credentials: false
 
-    # Initializes the CodeQL tools for scanning.
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
-      with:
-        languages: ${{ matrix.language }}
-        build-mode: ${{ matrix.build-mode }}
-        # If you wish to specify custom queries, you can do so here or in a config file.
-        # By default, queries listed here will override any specified in a config file.
-        # Prefix the list here with "+" to use these queries and those in the config file.
-
-        # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
-        # queries: security-extended,security-and-quality
-
     # --- Swift manual build steps (mirrors swift.yml) ---
     #
     # Swift does not support build-mode: none, and autobuild fails because
@@ -106,59 +99,74 @@ jobs:
       if: matrix.language == 'swift'
       run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
-    - name: Generate FFI source hash
-      if: matrix.language == 'swift'
-      id: ffi-hash
-      run: |
-        FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
-        echo "hash=$FFI_HASH" >> $GITHUB_OUTPUT
-        echo "FFI source hash: $FFI_HASH"
-
     - name: Cache FFI XCFramework
       if: matrix.language == 'swift'
       id: cache-ffi
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
-        path: BuildSupport/products/libzcashlc.xcframework
-        key: ffi-xcframework-macos-only-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
+        path: LocalPackages/libzcashlc.xcframework
+        key: ffi-xcframework-${{ runner.os }}-${{ runner.arch }}-xcode-16.0-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust/**/*.rs', 'rust/**/*.c', 'rust/**/*.h', 'BuildSupport/module.modulemap', 'BuildSupport/platform-Info.plist', 'Scripts/init-local-ffi.sh') }}
 
     - name: Setup Rust
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
       uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
       with:
         toolchain: stable
-        targets: aarch64-apple-darwin, x86_64-apple-darwin
+        targets: aarch64-apple-darwin
 
     - name: Cache Cargo
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
       uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
-    - name: Build FFI for macOS
+    - name: Build arm64 FFI for macOS
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
       timeout-minutes: 30
-      working-directory: ./BuildSupport
-      run: |
-        echo "Building FFI for macOS..."
-        make macos
-        mkdir -p products/libzcashlc.xcframework
-        cp -R products/macos/frameworks products/libzcashlc.xcframework/macos-arm64_x86_64
-        cp Info.plist products/libzcashlc.xcframework
+      run: ./Scripts/init-local-ffi.sh --arm-macos
 
     - name: Configure local FFI
       if: matrix.language == 'swift'
       run: |
         mkdir -p LocalPackages
-        cp -R BuildSupport/products/libzcashlc.xcframework LocalPackages/
         cp BuildSupport/LocalPackages-Package.swift LocalPackages/Package.swift
+
+    - name: Verify XCFramework
+      if: matrix.language == 'swift'
+      env:
+        FFI_CACHE_HIT: ${{ steps.cache-ffi.outputs.cache-hit }}
+        RUNNER_ARCH: ${{ runner.arch }}
+        RUNNER_NAME: ${{ runner.name }}
+        RUNNER_OS: ${{ runner.os }}
+      run: |
+        XCFRAMEWORK="LocalPackages/libzcashlc.xcframework"
+        BINARY="$XCFRAMEWORK/macos-arm64_x86_64/libzcashlc.framework/libzcashlc"
+        test -d "$XCFRAMEWORK"
+        plutil -lint "$XCFRAMEWORK/Info.plist"
+        test "$(lipo -archs "$BINARY")" = "arm64"
+        {
+          echo "### Swift CodeQL runner"
+          echo "- Runner: $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH)"
+          echo "- FFI cache hit: $FFI_CACHE_HIT"
+          echo "- FFI architecture: arm64"
+        } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Resolve Swift dependencies
       if: matrix.language == 'swift'
       run: swift package resolve
 
+    # Swift dependency resolution is intentionally outside the extractor. The only
+    # compiler invocation CodeQL needs to observe is the target build below.
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+        # If you wish to specify custom queries, you can do so here or in a config file.
+        # queries: security-extended,security-and-quality
+
     - name: Build Swift package
       if: matrix.language == 'swift'
       timeout-minutes: 30
-      run: swift build
+      run: swift build --arch arm64
 
     # --- End Swift manual build steps ---
 
