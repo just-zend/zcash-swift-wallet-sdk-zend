@@ -2,13 +2,11 @@
 import PackageDescription
 import Foundation
 
-// Automatically detect the in-repo FFI.
-// When LocalPackages/libzcashlc.xcframework exists (committed on this branch, and also what
-// Scripts/init-local-ffi.sh produces), the SDK builds against it as a path-based binary target —
-// this works both for local checkouts and when the SDK is consumed as a remote git package
-// (a sub-package under LocalPackages would not resolve remotely). Run `rm -rf LocalPackages`
-// to fall back to the released binary.
+// Automatically detect the in-repo FFI. Local development and CodeQL create the wrapper package
+// so SwiftPM treats the XCFramework as a package product. Remote git-package consumers do not have
+// that ignored wrapper and use the committed path-based binary target directly.
 let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
+let useLocalFFIPackage = FileManager.default.fileExists(atPath: packageDir + "/LocalPackages/Package.swift")
 let useLocalFFI = FileManager.default.fileExists(atPath: packageDir + "/LocalPackages/libzcashlc.xcframework/Info.plist")
 
 var dependencies: [Package.Dependency] = [
@@ -23,7 +21,10 @@ var sdkDependencies: [Target.Dependency] = [
 
 var targets: [Target] = []
 
-if useLocalFFI {
+if useLocalFFIPackage {
+    dependencies.append(.package(name: "libzcashlc", path: "LocalPackages"))
+    sdkDependencies.append(.product(name: "libzcashlc", package: "libzcashlc"))
+} else if useLocalFFI {
     targets.append(
         .binaryTarget(
             name: "libzcashlc",
