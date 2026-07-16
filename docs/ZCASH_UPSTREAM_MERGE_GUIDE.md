@@ -66,17 +66,20 @@ Moving the `contents: write` draft-release publisher to WarpBuild expands the tr
 - The workflow output must remain a draft release.
 - A second maintainer must download the draft XCFramework zip, independently run `shasum -a 256`, compare the result with both the workflow output and the checksum proposed for `Package.swift`, confirm that the draft asset came from the approved workflow SHA, and only then publish the release.
 
-Zend PR `#19` merged the runner changes into `origin/main`. The manual FFI release workflow must not be used until the live `sdk-release` environment protections and WarpBuild GitHub App controls have been verified.
+Zend PR `#19` merged the runner changes into `origin/main`, but the live `sdk-release`
+environment is still not configured. Do not dispatch the manual FFI release workflow until the
+environment protections and WarpBuild GitHub App controls above are verified.
 
-### Upstream parity snapshot (as of 2026-07-15)
+### Ironwood integration and upstream parity snapshot (as of 2026-07-15)
 
-Current relationship after Zend PR `#19` merged `codex/warpbuild-runners` into `origin/main`:
+Current relationship after Zend PR `#18` merged the parity branch into `origin/main`:
 
-- `origin/main...upstream/main`: `80 3` after fetching both remotes on 2026-07-15.
+- `origin/main...upstream/main`: `93 0` after fetching both remotes on 2026-07-15.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `d92a7940` (`#1802`); it also includes `#1799` for Tor retry classification, `#1795` for local FFI build flags, `#1790` / tag `2.6.0-alpha.6`, `#1789` checkpoint refresh, `#1786` for the Keystone/cross-account `deleteAccount` fix, and `#1766` Dependabot setup.
-- `git merge-base --is-ancestor upstream/main origin/main` fails until the current parity PR lands.
-- The active parity branch `codex/zcash-upstream-sync-2026-07-06` now merges current Zend `main` and upstream `main` through `d92a7940`; after this merge commit, `git rev-list --left-right --count HEAD...upstream/main` returns `92 0` and `git merge-base --is-ancestor upstream/main HEAD` succeeds.
+- `git merge-base --is-ancestor upstream/main origin/main` succeeds.
+- PR `#17` now contains both current `origin/main` and upstream `main`; its final head count is
+  recorded in the PR verification after the merge-resolution commit.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -95,7 +98,12 @@ Notable fork-ahead work currently preserved includes:
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: default-branch parity is pending in Zend PR `#18`, which now carries current Zend `main` plus upstream `main` through `d92a7940` / PR `#1802`. Open Zend PR `#17` is the separate Zend-original Ironwood SDK hardening surface; its previous head `1d8ce919` was green, but it must be refreshed against `main` after PR `#18` lands. It remains labeled `zend-improvement`. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
+Implication: Zend PR `#18` has landed, so `origin/main` now contains upstream `main` through
+`d92a7940` / PR `#1802`. Zend PR `#17` is the active Zend-original Ironwood SDK hardening surface;
+it replaces the sibling-path/private-CI blocker with an exact private-engine revision plus a
+committed, three-slice, provenance-verified XCFramework. Its merge-ready graph must freeze the
+private revision, artifact hashes, Swift/offline tests, and GitHub checks together. Zend SDK release
+numbering remains separate from upstream and FFI artifact numbering.
 
 ## Conflict resolution heuristics
 
@@ -121,11 +129,26 @@ Zend parity branch note:
 
 ## Bleeding-edge snapshot (2026-07-15)
 
-Merged upstream default-branch delta pending in Zend fork default branch:
+Zend Ironwood hardening line:
 
-- `#1802`: marks GitHub releases as pre-releases automatically when the SemVer version contains a pre-release suffix. Upstream-only commits before the current parity PR lands are still `05968e49`, `1ef37b53`, and merge commit `d92a7940`; `git rev-list --left-right --count origin/main...upstream/main` returns `80 3`.
-- Zend PR `#18` (`codex/zcash-upstream-sync-2026-07-06`) owns this upstream-default parity refresh. Its combined branch merges current Zend `main` plus upstream `main` through `d92a7940`; the pre-merge head `59662f03` passed GitHub `Build and Run Offline Tests`, standalone `zizmor`, and `Run zizmor`, and the combined head must rerun those checks before merge.
-- Zend PR `#17` (`codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04`) owns the separate Ironwood SDK hardening surface. It is open and not draft; its previous head `1d8ce919` passed GitHub `Build and Run Offline Tests`, `SwiftLint`, and `GitHub Actions Security Analysis with zizmor`, but it must be refreshed against `main` after PR `#18` lands. Because the work is Zend-original hardening rather than a Vizor-derived or upstream-Zodl artifact, it carries the `zend-improvement` label.
+- PR `#17` (`codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04`) is the active Zend-original
+  Ironwood SDK hardening surface and carries `zend-improvement`.
+- The graph pins private engine commit `2a558b12d9ddf5745bacfe3999f7c097b7c2da2d`, which is now
+  reachable from the engine repository's merged `main`, and exact upstream
+  `zcash/librustzcash@266a75ae3af076bbe9437088947fddb1add8bd99`.
+- The public migration contract is snapshot-driven, revision-CAS-bound, and JIT: it atomically
+  binds submission policy, materializes only one due intent, resumes exact staged external-signer
+  bytes after process death, and fail-closes ordinary spending only for the affected account.
+- Public CI never receives private Rust credentials. Authenticated local tooling builds the exact
+  arm64 iOS device/simulator and macOS artifact, while public CI verifies its
+  source/provenance/slice hashes and production migration symbol set.
+
+Default-branch parity:
+
+- Zend PR `#18` merged as `b3569196`, so `origin/main` contains upstream `main` through
+  `d92a7940` / upstream PR `#1802`.
+- `git rev-list --left-right --count origin/main...upstream/main` returns `93 0`, and
+  `git merge-base --is-ancestor upstream/main origin/main` succeeds.
 
 Open upstream PRs assessed as not ready to carry right now:
 

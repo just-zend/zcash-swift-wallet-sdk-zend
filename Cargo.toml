@@ -12,31 +12,47 @@ edition = "2024"
 rust-version = "1.90"
 build = "rust/build.rs"
 
+[lints.rust]
+# Match the exact upstream cfg contract. Production does not set this cfg; recognizing it here
+# allows the stable FFI identity to compile both sides of the upstream-gated NU7 mapping without
+# globally enabling proposed NU7 consensus behavior.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu7"))'] }
+
 [dependencies]
 
 # Zcash
-orchard = { version = "0.14", features = ["unstable-voting-circuits"] }
+# `unstable-voting-circuits` dropped while voting is gated off on this Ironwood branch (it is only
+# needed by the voting stack; see the zcash_voting dependency note below for the orchard-version
+# constraint that keeps it off).
+# Pinned exactly to the final Orchard release used by the audited upstream librustzcash revision.
+orchard = { version = "=0.15.0" }
 pasta_curves = "0.5"
 ff = "0.13"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
-transparent = { package = "zcash_transparent", version = "0.8", default-features = false }
-zcash_address = { version = "0.12" }
-zcash_client_backend = { version = "0.23", features = [
+# librustzcash-family deps are pinned to the exact package versions published by the audited
+# upstream revision. `[patch.crates-io]` below then replaces every member with that exact git tree.
+# NU6.3/Ironwood is stable in this revision: no synthetic cfg or backend-wide `unstable` feature
+# is needed to compile the migration surface. The SQLite crate's broad `unstable` feature remains
+# required by the SDK's pre-existing filesystem compact-block cache: upstream exposes FsBlockDb,
+# BlockMeta, and init_blockmeta_db behind that feature with no narrower feature at this revision.
+transparent = { package = "zcash_transparent", version = "=0.9.0", default-features = false }
+zcash_address = { version = "=0.13.0" }
+zcash_client_backend = { version = "=0.24.0-rc.1", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "pczt",
     "tor",
     "transparent-inputs",
-    "unstable",
 ] }
-zcash_client_sqlite = { version = "0.21", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "=0.22.0-rc.1", features = ["orchard", "transparent-inputs", "serde", "unstable"] }
 zcash_note_encryption = "0.4.1"
-zcash_primitives = "0.28"
-zcash_proofs = "0.28"
-zcash_protocol = "0.9"
+zcash_primitives = "=0.29.0"
+zcash_proofs = "=0.29.0"
+# `local-consensus` exposes `LocalNetwork` (custom per-NU activation heights) for regtest support.
+zcash_protocol = { version = "=0.10.0", features = ["local-consensus"] }
 zcash_script = "0.4"
 zip32 = "0.2"
-pczt = { version = "0.7", features = ["prover"] }
+pczt = { version = "=0.8.0-rc.1", features = ["prover"] }
 
 # EIP-681
 eip681 = "0.1.0"
@@ -44,7 +60,10 @@ eip681 = "0.1.0"
 # Infrastructure
 prost = "0.14"
 rusqlite = "0.37"
+schemerz = "0.2"
 secrecy = "0.8"
+sha2 = "0.10"
+hex = "0.4"
 rand = "0.8"
 nonempty = "0.11"
 
@@ -83,16 +102,25 @@ rust_decimal = { version = "1", default-features = false, features = ["c-repr"] 
 # - The "static" feature is required for the "compression" default feature of arti-client.
 xz2 = { version = "0.1", features = ["static"] }
 
-# Voting
-zcash_voting = { version = "0.11", default-features = false, features = [
-    "client-pir",
-    "client-tree-sync",
-] }
-zcash_keys = { version = "0.14", features = ["orchard"] }
+# Voting is gated behind the `voting` feature (off by default): the latest crates.io
+# zcash_voting 1.0.0 still pins Orchard 0.14 + voting-circuits 0.8.0 with
+# `unstable-voting-circuits`, while this audited Ironwood graph is on Orchard 0.15.0. Enabling it
+# therefore drags a second Orchard into the build and its pre-Ironwood Note API types do not
+# interoperate with the patched librustzcash crates. Re-audit once the upstream voting stack moves
+# to the Orchard 0.15 line (MOB-1455).
+zcash_voting = { version = "1.0.0", default-features = false, optional = true }
+zcash_keys = { version = "=0.15.0", features = ["orchard"] }
 incrementalmerkletree = { version = "0.8", default-features = false }
 
-[dev-dependencies]
-zcash_voting = { version = "0.11", default-features = false, features = ["test-fixtures"] }
+# Frozen Ironwood migration engine (shared Orchard->Ironwood logic, also consumed by Android).
+# The private repository and exact commit are part of the reviewed FFI provenance; never use a
+# branch, tag, or developer path for a release artifact.
+zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "2a558b12d9ddf5745bacfe3999f7c097b7c2da2d" }
+
+[features]
+# Off by default on this Ironwood branch — see the zcash_voting dependency note above. Enabling it
+# requires migrating the voting stack to the upstream Orchard 0.15 graph.
+voting = ["dep:zcash_voting"]
 
 [build-dependencies]
 bindgen = "0.72"
@@ -106,3 +134,18 @@ crate-type = ["staticlib"]
 
 [profile.release]
 lto = true
+
+# Point the complete graph at the latest audited upstream Ironwood revision. Every member uses the
+# same source and exact revision so direct SDK dependencies and the local migration engine unify.
+# Keep this rev immutable; changing it requires rebuilding and recommitting every FFI slice.
+[patch.crates-io]
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_client_sqlite  = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_primitives     = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_keys           = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_protocol       = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_transparent    = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_proofs         = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zcash_address        = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+zip321               = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }
+pczt                 = { git = "https://github.com/zcash/librustzcash", rev = "266a75ae3af076bbe9437088947fddb1add8bd99" }

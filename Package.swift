@@ -2,12 +2,14 @@
 import PackageDescription
 import Foundation
 
-// Automatically detect local FFI development mode.
-// When LocalPackages/Package.swift exists (created by Scripts/init-local-ffi.sh),
-// the SDK builds against the locally-built FFI instead of the pre-built binary
-// from GitHub Releases. Run `rm -rf LocalPackages` to switch back.
+// Automatically detect the in-repo FFI.
+// When LocalPackages/libzcashlc.xcframework exists (committed on this branch, and also what
+// Scripts/init-local-ffi.sh produces), the SDK builds against it as a path-based binary target —
+// this works both for local checkouts and when the SDK is consumed as a remote git package
+// (a sub-package under LocalPackages would not resolve remotely). Run `rm -rf LocalPackages`
+// to fall back to the released binary.
 let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
-let useLocalFFI = FileManager.default.fileExists(atPath: packageDir + "/LocalPackages/Package.swift")
+let useLocalFFI = FileManager.default.fileExists(atPath: packageDir + "/LocalPackages/libzcashlc.xcframework/Info.plist")
 
 var dependencies: [Package.Dependency] = [
     .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.24.2"),
@@ -22,8 +24,13 @@ var sdkDependencies: [Target.Dependency] = [
 var targets: [Target] = []
 
 if useLocalFFI {
-    dependencies.append(.package(name: "libzcashlc", path: "LocalPackages"))
-    sdkDependencies.append(.product(name: "libzcashlc", package: "libzcashlc"))
+    targets.append(
+        .binaryTarget(
+            name: "libzcashlc",
+            path: "LocalPackages/libzcashlc.xcframework"
+        )
+    )
+    sdkDependencies.append("libzcashlc")
 } else {
     // Binary target for the Rust FFI library
     // Updated by Scripts/release.sh during the release process
@@ -45,7 +52,11 @@ targets.append(contentsOf: [
             "Modules/Service/GRPC/ProtoBuf/proto/compact_formats.proto",
             "Modules/Service/GRPC/ProtoBuf/proto/proposal.proto",
             "Modules/Service/GRPC/ProtoBuf/proto/service.proto",
-            "Error/Sourcery/"
+            "Error/Sourcery/",
+            // Voting is gated off on this Ironwood branch: the underlying zcashlc_voting_* FFI
+            // symbols are not built because latest zcash_voting 1.0.0 still targets Orchard 0.14,
+            // while the exact audited upstream Ironwood graph uses Orchard 0.15. See Cargo.toml.
+            "Rust/Voting"
         ],
         resources: [
             .copy("Resources/checkpoints")
@@ -65,6 +76,12 @@ targets.append(contentsOf: [
             .copy("Resources/cache.db"),
             .copy("Resources/darkside_caches.db"),
             .copy("Resources/darkside_data.db"),
+            .copy("Resources/zend_2_6_0_alpha_6_orchard.sqlite"),
+            .copy("Resources/zend_2_6_0_alpha_6_orchard.compactblocks"),
+            .copy("Resources/zend_2_6_0_alpha_6_orchard.provenance.md"),
+            .copy("Resources/zend_2_6_0_alpha_6_orchard_mainnet.sqlite"),
+            .copy("Resources/zend_2_6_0_alpha_6_orchard_mainnet.compactblocks"),
+            .copy("Resources/zend_2_6_0_alpha_6_orchard_mainnet.provenance.md"),
             .copy("Resources/sandblasted_mainnet_block.json"),
             .copy("Resources/txBase64String.txt"),
             .copy("Resources/txFromAndroidSDK.txt"),
@@ -75,7 +92,13 @@ targets.append(contentsOf: [
     ),
     .testTarget(
         name: "OfflineTests",
-        dependencies: ["ZcashLightClientKit", "TestUtils"]
+        dependencies: ["ZcashLightClientKit", "TestUtils"],
+        exclude: [
+            // Voting is gated off on this Ironwood branch (see the ZcashLightClientKit target):
+            // these test the excluded Rust/Voting layer (VotingRustBackend, PirSnapshotResolver).
+            "VotingRustBackendTests.swift",
+            "PirSnapshotResolverTests.swift"
+        ]
     ),
     .testTarget(
         name: "NetworkTests",

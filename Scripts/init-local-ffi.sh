@@ -28,6 +28,14 @@ if [[ -f "$HOME/.cargo/env" ]]; then
     source "$HOME/.cargo/env"
 fi
 
+# shellcheck source=rust-build-env.sh
+source Scripts/rust-build-env.sh
+RUST_TOOLCHAIN=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+if [[ -z "$RUST_TOOLCHAIN" ]]; then
+    echo "Error: rust-toolchain.toml must pin an exact toolchain" >&2
+    exit 1
+fi
+
 XCFRAMEWORK_DIR="LocalPackages/libzcashlc.xcframework"
 
 usage() {
@@ -54,9 +62,17 @@ USAGEEOF
 # Build an arm64-only xcframework containing exactly the requested slices, then
 # atomically swap it into place. Each argument is one of: ios-sim, ios-device, macos.
 #
-# The slices reuse the same LibraryIdentifiers as the full build (e.g.
-# macos-arm64_x86_64) but declare only arm64 in SupportedArchitectures, matching
-# what rebuild-local-ffi.sh produces, so the two tools stay interchangeable.
+# Slice LibraryIdentifiers name exactly the architectures the slice contains
+# (e.g. ios-arm64-simulator) — only the full 5-arch build may use the fat
+# identifiers (ios-arm64_x86_64-simulator, macos-arm64_x86_64), because its
+# slices really are universal. This build is what gets committed in-tree on the
+# fork line, and an identifier advertising an x86_64 that isn't in the binary
+# turns every multi-arch build (generic simulator destinations, Intel Macs)
+# into a late "symbol(s) not found for architecture x86_64" link failure
+# instead of an up-front unsupported-architecture error. A fat committed slice
+# is not an option: one arch is ~52MB, two would cross GitHub's 100MB file
+# limit. rebuild-local-ffi.sh names its single-arch slices the same way, so
+# the two tools stay interchangeable.
 build_arm_xcframework() {
     local targets=("$@")
 
@@ -74,7 +90,7 @@ build_arm_xcframework() {
         case "$target" in
             ios-sim)
                 rust_target="aarch64-apple-ios-sim"
-                slice="ios-arm64_x86_64-simulator"
+                slice="ios-arm64-simulator"
                 platform="ios"
                 variant="simulator"
                 ;;
@@ -86,7 +102,7 @@ build_arm_xcframework() {
                 ;;
             macos)
                 rust_target="aarch64-apple-darwin"
-                slice="macos-arm64_x86_64"
+                slice="macos-arm64"
                 platform="macos"
                 variant=""
                 ;;
@@ -100,8 +116,8 @@ build_arm_xcframework() {
 
         # Ensure the Rust target is available (idempotent), then build it.
         # cargo is incremental, so repeat builds after small edits are fast.
-        rustup target add "$rust_target"
-        cargo build --target "$rust_target" --release
+        rustup target add --toolchain "$RUST_TOOLCHAIN" "$rust_target"
+        cargo "+$RUST_TOOLCHAIN" build --locked --target "$rust_target" --release
 
         # Populate the framework for this slice.
         local framework="$temp_xcfw/$slice/libzcashlc.framework"

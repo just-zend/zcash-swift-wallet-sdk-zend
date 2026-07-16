@@ -14,7 +14,15 @@ concurrency:
 jobs:
   SwiftLint:
     runs-on: warp-ubuntu-latest-x64-8x
+    permissions:
+      contents: read
+    container:
+      # SwiftLint 0.65.0, linux/amd64. The old action bundled an older parser that reports
+      # current Swift syntax as hundreds of strict warnings despite the pinned local lint passing.
+      image: ghcr.io/realm/swiftlint@sha256:d6dd2aefa68155198c07884b42a59fd2ca5ee70ac9a2683a6e83445235c326d6
     steps:
-      - uses: actions/checkout@v1
-      - name: GitHub Action for SwiftLint
-        uses: norio-nomura/action-swiftlint@3.2.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: SwiftLint
+        run: swiftlint lint

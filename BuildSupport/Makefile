@@ -5,6 +5,8 @@ SHELL := bash
 MAKEFLAGS += --warn-undefined-variables
 MAKEFLAGS += --no-builtin-rules
 
+RUST_TOOLCHAIN = 1.96.1
+
 PLATFORMS = ios-device macos ios-simulator
 IOS_DEVICE_ARCHS = aarch64-apple-ios
 IOS_SIM_ARCHS_STABLE = x86_64-apple-ios  aarch64-apple-ios-sim
@@ -15,8 +17,8 @@ RUST_SRCS = $(shell find ../rust -name "*.rs") ../Cargo.toml
 STATIC_LIBS = $(shell find ../target -name "libzcashlc.a")
 
 install:
-	rustup toolchain add stable
-	rustup +stable target add aarch64-apple-ios x86_64-apple-ios x86_64-apple-darwin aarch64-apple-darwin aarch64-apple-ios-sim
+	rustup toolchain add $(RUST_TOOLCHAIN) --profile minimal
+	rustup +$(RUST_TOOLCHAIN) target add aarch64-apple-ios x86_64-apple-ios x86_64-apple-darwin aarch64-apple-darwin aarch64-apple-ios-sim
 	
 .PHONY: install
 
@@ -84,4 +86,5 @@ $(IOS_SIM_ARCHS_STABLE): %: stable-%
 .PHONY: $(IOS_SIM_ARCHS_STABLE)
 
 stable-%: # target/%/release/libzcashlc.a:
-	sh -c "RUSTUP_TOOLCHAIN=stable cargo build --manifest-path ../Cargo.toml --target $* --release"
+	source ../Scripts/rust-build-env.sh && \
+	RUSTUP_TOOLCHAIN=$(RUST_TOOLCHAIN) cargo build --locked --manifest-path ../Cargo.toml --target $* --release

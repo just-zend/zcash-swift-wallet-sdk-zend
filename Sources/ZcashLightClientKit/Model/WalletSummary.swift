@@ -22,6 +22,10 @@ public struct PoolBalance: Equatable {
 public struct AccountBalance: Equatable {
     public let saplingBalance: PoolBalance
     public let orchardBalance: PoolBalance
+    /// The Ironwood (Orchard note-version V3 / NU6.3) balance. Ironwood is received at the account's
+    /// Orchard receiver. This is `.zero` for every wallet until NU6.3 activates and a lightwalletd
+    /// serves Ironwood compact blocks.
+    public let ironwoodBalance: PoolBalance
     public let unshielded: Zatoshi
 
     /// This field is reserved for special operations.
@@ -30,11 +34,24 @@ public struct AccountBalance: Equatable {
     /// The goal is to report the total amount along with the expected value.
     public let awaitingResolution: Zatoshi
 
-    static let zero = AccountBalance(saplingBalance: .zero, orchardBalance: .zero, unshielded: .zero, awaitingResolution: .zero)
+    static let zero = AccountBalance(
+        saplingBalance: .zero,
+        orchardBalance: .zero,
+        ironwoodBalance: .zero,
+        unshielded: .zero,
+        awaitingResolution: .zero
+    )
 
-    init(saplingBalance: PoolBalance, orchardBalance: PoolBalance, unshielded: Zatoshi, awaitingResolution: Zatoshi = .zero) {
+    init(
+        saplingBalance: PoolBalance,
+        orchardBalance: PoolBalance,
+        ironwoodBalance: PoolBalance = .zero,
+        unshielded: Zatoshi,
+        awaitingResolution: Zatoshi = .zero
+    ) {
         self.saplingBalance = saplingBalance
         self.orchardBalance = orchardBalance
+        self.ironwoodBalance = ironwoodBalance
         self.unshielded = unshielded
         self.awaitingResolution = awaitingResolution
     }
@@ -72,4 +89,5 @@ struct WalletSummary: Equatable {
     let scanProgress: ScanProgress?
     let nextSaplingSubtreeIndex: UInt32
     let nextOrchardSubtreeIndex: UInt32
+    let nextIronwoodSubtreeIndex: UInt32
 }

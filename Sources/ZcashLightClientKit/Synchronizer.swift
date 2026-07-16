@@ -339,6 +339,19 @@ public protocol Synchronizer: AnyObject {
     /// Returns the latest block height from the provided Lightwallet endpoint
     func latestHeight() async throws -> BlockHeight
 
+    /// Returns an upgrade's activation height from the exact librustzcash consensus parameters
+    /// linked into this SDK, or `nil` when it is explicitly not configured for this network.
+    func networkUpgradeActivationHeight(_ upgrade: NetworkUpgrade) throws -> BlockHeight?
+
+    /// Convenience query for the Ironwood / NU6.3 activation height.
+    func nu6_3ActivationHeight() throws -> BlockHeight?
+
+    /// Canonical chain name bound into the Rust consensus configuration.
+    func consensusChainName() throws -> String
+
+    /// Stable fingerprint of the Rust consensus base, chain name, and activation schedule.
+    func consensusParametersFingerprint() throws -> String
+
     /// Returns the latests UTXOs for the given address from the specified height on
     ///
     /// If `prepare()` hasn't already been called since creation of the synchronizer instance or since the last wipe then this method throws
@@ -561,6 +574,200 @@ public protocol Synchronizer: AnyObject {
     /// Use this to implement custom broadcast strategies such as submitting
     /// to multiple lightwalletd servers in parallel.
     var broadcaster: Broadcaster { get }
+
+    // MARK: - Ironwood migration
+
+    /// The current Orchard -> Ironwood migration state for `account`.
+    func migrationState(for account: AccountUUID) async throws -> MigrationState
+
+    /// One authoritative, revisioned read of the migration state machine. UI and background
+    /// workers should use this instead of combining the legacy state/progress getters.
+    func migrationSnapshot(for account: AccountUUID) async throws -> MigrationSnapshot
+
+    /// Starts (or idempotently resumes) a private run, validates its exact network submission
+    /// policy, and binds that policy before any transaction is proved, signed, or staged.
+    func beginPrivateMigration(
+        externalSigner: Bool,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot
+
+    /// Revalidates and binds the selected testnet transport policy for an existing run. This is
+    /// the explicit repair path after a durable endpoint/policy validation failure; it never
+    /// creates a run or transaction artifact.
+    func bindMigrationSubmissionPolicy(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot
+
+    /// Pauses future migration actions without discarding signed or staged bytes.
+    func pauseMigration(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot
+
+    /// Retries only an engine-owned `.retryAutomatically` failure at the supplied CAS revision.
+    /// Reapproval, proof rebuild, paused, abandoning, and terminal states are deliberately not
+    /// reset by this API.
+    func retryAutomaticMigrationRecovery(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot
+
+    /// Resumes a paused migration and returns the reconciled authoritative snapshot.
+    func resumeMigration(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot
+
+    /// Requests safe abandonment. Signed/possibly submitted work remains guarded until consensus
+    /// confirms it mined or expired; planned unsigned work is cancelled immediately.
+    func requestMigrationAbandonment(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot
+
+    /// Live migration progress for the progress UI, or `nil` when no migration is in progress.
+    func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress?
+
+    /// Whether the account's Orchard notes must be split before migration can proceed.
+    func isNoteSplitNeeded(for account: AccountUUID) async throws -> Bool
+
+    /// The proposed note split (per-note output values and the prep-transaction fee).
+    func prepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
+
+    /// Signs the note-split transaction for `proposal` and broadcasts it. After this returns
+    /// `.success`, the migration state advances to `.splitPendingConfirmation`; the app should poll
+    /// ``migrationState(for:)`` for confirmation.
+    /// - Parameter options: authoritative per-call network-privacy preferences.
+    func submitNoteSplit(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        proposal: NoteSplitProposal,
+        spendingKey: UnifiedSpendingKey,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> TransferResult
+
+    /// The note-split transaction as an unsigned PCZT for an external signer (hardware wallet) —
+    /// the counterpart of ``submitNoteSplit(proposal:spendingKey:options:for:)`` for accounts whose
+    /// spending key lives on a device. Plans the split for the current spendable Orchard balance and
+    /// keeps the proven original staged internally; the app routes the returned PCZT to the device
+    /// (via ``redactPCZTForSigner(pczt:)`` and the QR channel, exactly like a regular
+    /// hardware-wallet send) and hands the claim intact with the signed PCZT to
+    /// ``submitSignedNoteSplitPCZT(_:for:options:account:)``.
+    func proposeNoteSplitPCZT(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        proposal: NoteSplitProposal,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> ClaimedNoteSplitPCZT
+
+    /// Stores the externally signed note-split PCZT (merging it into the staged original, verifying
+    /// and finalizing it) and broadcasts the result — the external-signer completion of
+    /// ``proposeNoteSplitPCZT(for:)``. After this returns `.success`, the migration state advances
+    /// to `.splitPendingConfirmation`, mirroring
+    /// ``submitNoteSplit(proposal:spendingKey:options:for:)``.
+    /// - Parameter options: authoritative per-call network-privacy preferences.
+    func submitSignedNoteSplitPCZT(
+        _ pczt: Pczt,
+        for claim: ClaimedNoteSplitPCZT,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        account: AccountUUID
+    ) async throws -> TransferResult
+
+    /// Retrieves the exact already-staged note-split signer envelope after process death or UI
+    /// route loss. This never proves replacement bytes; positive consensus expiry returns `nil`
+    /// and lets the engine require a fresh round.
+    func resumeNoteSplitExternalSigning(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> ClaimedNoteSplitPCZT?
+
+    /// Proposes the private, anchorless migration intents shown for one-time confirmation.
+    func proposePrivateMigrationIntents(for account: AccountUUID) async throws -> MigrationIntentSchedule
+
+    /// Proposes a single immediate, anchorless migration intent.
+    func proposeImmediateMigrationIntent(for account: AccountUUID) async throws -> MigrationIntentSchedule
+
+    /// Returns exact immediate-migration economics without creating a draft, run, reservation,
+    /// signature, or transaction. ``initializePostUpgrade(for:)`` must have completed first.
+    func previewImmediateMigration(for account: AccountUUID) async throws -> ImmediateMigrationPreview
+
+    /// Commits the exact approved intent schedule using its run id and revision compare-and-set
+    /// token. `externalSigner` permanently selects the run's signer path.
+    func commitMigrationIntents(
+        _ schedule: MigrationIntentSchedule,
+        externalSigner: Bool,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> MigrationSnapshot
+
+    /// Executes at most one engine-authorized software/background action from a fresh snapshot.
+    /// A spending key is required only when a due anchorless intent must be materialized; signed
+    /// crash-recovery claims can be resumed without one. Returns `nil` for every wait, user-choice,
+    /// external-signing, or otherwise non-executable state.
+    func executeNextMigrationAction(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        spendingKey: UnifiedSpendingKey?,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> MigrationExecutionResult
+
+    /// Stages exactly one due proven-but-unsigned intent for an external signer. The returned
+    /// object carries the engine claim token and must be passed intact to
+    /// ``submitSignedDueMigrationPCZT(_:for:options:)``.
+    func stageNextDueMigrationPCZT(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> ClaimedTransferPCZT?
+
+    /// Retrieves the exact already-staged due signer envelope and renews its wall-clock lease
+    /// without materializing a new intent.
+    func resumeDueMigrationExternalSigning(
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        for account: AccountUUID
+    ) async throws -> ClaimedTransferPCZT?
+
+    /// Stores one externally signed due intent, submits the exact Rust-extracted bytes, and records
+    /// the result with the same engine claim token. Returns `nil` if reconciliation finds the
+    /// transaction already mined or safely expired before submission.
+    func submitSignedDueMigrationPCZT(
+        _ signedPCZT: Pczt,
+        for claim: ClaimedTransferPCZT,
+        expectedRunId: String,
+        expectedRevision: UInt64,
+        options: NetworkPrivacyOptions,
+        account: AccountUUID
+    ) async throws -> MigrationExecutionResult
+
+    /// Whether the wallet must sync before the next transfer can be broadcast (a previous transfer
+    /// produced change back to Orchard that must be observed first).
+    func isSyncRequiredBeforeNextTransfer(for account: AccountUUID) async throws -> Bool
+
+    /// Whether any scheduled transfer is past the height at which it should have been broadcast.
+    func hasOverdueTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// Whether the migration is in an invalid state (spendable Orchard remains but nothing covers it).
+    func hasInvalidTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// One-time initialization to run after the wallet upgrades to an Ironwood-capable build.
+    func initializePostUpgrade(for account: AccountUUID) async throws
 }
 
 /// Error thrown by the default `Synchronizer.getTreeState(height:)` implementation
