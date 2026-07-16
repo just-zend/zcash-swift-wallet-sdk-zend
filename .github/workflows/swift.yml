@@ -41,12 +41,7 @@ jobs:
     - name: Verify canonical pre-Ironwood fixtures
       run: ./Scripts/verify-old-orchard-fixtures.sh
 
-    # Build the Swift package
-    - name: Build ZcashLightClientKit Swift Package
+    # `swift test` builds the library and test targets in one package-planning pass.
+    - name: Build package and run OfflineTests suite
       timeout-minutes: 15
-      run: swift build -v
-
-    # Run tests
-    - name: Run OfflineTests suite
-      timeout-minutes: 10
       run: swift test --filter OfflineTests

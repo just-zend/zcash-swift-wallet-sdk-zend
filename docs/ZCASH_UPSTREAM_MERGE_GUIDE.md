@@ -52,11 +52,14 @@ If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked r
 
 Zend CI intentionally diverges from upstream's native GitHub-hosted runners:
 
-- `warp-macos-15-arm64-12x` runs the manual FFI XCFramework release job, the Swift PR build and offline tests, and the Swift CodeQL matrix row.
+- `warp-macos-15-arm64-12x` runs the manual committed-XCFramework packaging job, the Swift PR build and offline tests, and the Swift CodeQL matrix row.
 - `warp-ubuntu-latest-x64-16x` runs the CodeQL `actions`, `c-cpp`, and `rust` matrix rows.
 - `warp-ubuntu-latest-x64-8x` runs SwiftLint and zizmor.
+- Public Swift and CodeQL jobs verify the reviewed, committed three-slice FFI artifact; they do not build Rust or require credentials for the private migration engine. Authenticated source rebuilds use `Scripts/build-ironwood-ffi-artifact.sh` outside public CI.
 - Swift, SwiftLint, and zizmor PR workflows cancel superseded work for the same pull request.
-- Manual FFI release runs do not cancel. CodeQL retains no workflow-level concurrency, so its push, scheduled, and manual runs do not cancel.
+- A newer CodeQL push to the same ref cancels the older push scan. Scheduled and manually dispatched CodeQL scans remain independent, and manual FFI release runs do not cancel.
+
+The first committed-artifact Swift control completed in 3m10s ([run `29467560549`](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/actions/runs/29467560549)): checkout 16s, artifact verification 10s, fixture verification 1s, Swift build 1m23s, and offline tests 1m14s. The prior GitHub-hosted warm median was 5m54s, so use roughly 3m10s as the PR regression baseline. There is no longer a separate cold Rust-FFI build path in public SDK CI.
 
 Moving the `contents: write` draft-release publisher to WarpBuild expands the trusted computing base for SDK releases. The following controls are required:
 
@@ -72,14 +75,14 @@ environment protections and WarpBuild GitHub App controls above are verified.
 
 ### Ironwood integration and upstream parity snapshot (as of 2026-07-15)
 
-Current relationship after Zend PR `#18` merged the parity branch into `origin/main`:
+Current relationship after Zend PRs `#18` and `#17` merged into `origin/main`:
 
-- `origin/main...upstream/main`: `93 0` after fetching both remotes on 2026-07-15.
+- `origin/main...upstream/main`: `148 0` after fetching both remotes on 2026-07-15.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `d92a7940` (`#1802`); it also includes `#1799` for Tor retry classification, `#1795` for local FFI build flags, `#1790` / tag `2.6.0-alpha.6`, `#1789` checkpoint refresh, `#1786` for the Keystone/cross-account `deleteAccount` fix, and `#1766` Dependabot setup.
 - `git merge-base --is-ancestor upstream/main origin/main` succeeds.
-- PR `#17` now contains both current `origin/main` and upstream `main`; its final head count is
-  recorded in the PR verification after the merge-resolution commit.
+- PR `#17` merged as `1bbc35a6`; current `origin/main` contains both the upstream parity line and
+  the reviewed Ironwood migration SDK stack.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -98,12 +101,12 @@ Notable fork-ahead work currently preserved includes:
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: Zend PR `#18` has landed, so `origin/main` now contains upstream `main` through
-`d92a7940` / PR `#1802`. Zend PR `#17` is the active Zend-original Ironwood SDK hardening surface;
-it replaces the sibling-path/private-CI blocker with an exact private-engine revision plus a
-committed, three-slice, provenance-verified XCFramework. Its merge-ready graph must freeze the
-private revision, artifact hashes, Swift/offline tests, and GitHub checks together. Zend SDK release
-numbering remains separate from upstream and FFI artifact numbering.
+Implication: Zend PRs `#18` and `#17` have landed. `origin/main` contains upstream `main` through
+`d92a7940` / PR `#1802` plus the Zend-original Ironwood SDK hardening stack. PR `#17` replaced the
+sibling-path/private-CI blocker with an exact private-engine revision plus a committed, three-slice,
+provenance-verified XCFramework; future updates must continue to freeze the private revision,
+artifact hashes, Swift/offline tests, and GitHub checks together. Zend SDK release numbering remains
+separate from upstream and FFI artifact numbering.
 
 ## Conflict resolution heuristics
 
@@ -131,8 +134,8 @@ Zend parity branch note:
 
 Zend Ironwood hardening line:
 
-- PR `#17` (`codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04`) is the active Zend-original
-  Ironwood SDK hardening surface and carries `zend-improvement`.
+- PR `#17` (`codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04`) merged as `1bbc35a6` and is the
+  current Zend-original Ironwood SDK hardening baseline.
 - The graph pins private engine commit `2a558b12d9ddf5745bacfe3999f7c097b7c2da2d`, which is now
   reachable from the engine repository's merged `main`, and exact upstream
   `zcash/librustzcash@266a75ae3af076bbe9437088947fddb1add8bd99`.
@@ -145,9 +148,9 @@ Zend Ironwood hardening line:
 
 Default-branch parity:
 
-- Zend PR `#18` merged as `b3569196`, so `origin/main` contains upstream `main` through
-  `d92a7940` / upstream PR `#1802`.
-- `git rev-list --left-right --count origin/main...upstream/main` returns `93 0`, and
+- Zend PR `#18` merged as `b3569196`, and PR `#17` then merged as `1bbc35a6`, so `origin/main`
+  contains upstream `main` through `d92a7940` / upstream PR `#1802` plus the Ironwood SDK baseline.
+- `git rev-list --left-right --count origin/main...upstream/main` returns `148 0`, and
   `git merge-base --is-ancestor upstream/main origin/main` succeeds.
 
 Open upstream PRs assessed as not ready to carry right now:
