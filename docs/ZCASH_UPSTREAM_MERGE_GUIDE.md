@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-10
+Last reviewed: 2026-07-15
 
 ## Remote and branch invariants
 
@@ -46,15 +46,37 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-07-10)
+## Zend divergence notes
 
-Current relationship after Zend PR `#16` merged `codex/zcash-upstream-sync-2026-07-03` into `origin/main`:
+### CI runner divergence (as of 2026-07-15)
 
-- `origin/main...upstream/main`: `77 3` after fetching both remotes on 2026-07-10.
+Zend CI intentionally diverges from upstream's native GitHub-hosted runners:
+
+- `warp-macos-15-arm64-12x` runs the manual FFI XCFramework release job, the Swift PR build and offline tests, and the Swift CodeQL matrix row.
+- `warp-ubuntu-latest-x64-16x` runs the CodeQL `actions`, `c-cpp`, and `rust` matrix rows.
+- `warp-ubuntu-latest-x64-8x` runs SwiftLint and zizmor.
+- Swift, SwiftLint, and zizmor PR workflows cancel superseded work for the same pull request.
+- Manual FFI release runs do not cancel. CodeQL retains no workflow-level concurrency, so its push, scheduled, and manual runs do not cancel.
+
+Moving the `contents: write` draft-release publisher to WarpBuild expands the trusted computing base for SDK releases. The following controls are required:
+
+- The live `sdk-release` GitHub environment must exist before the manual FFI release workflow is used. It must require an independent reviewer, prevent self-approval and administrator bypass where GitHub makes those controls available, and restrict deployment branches and tags to protected, reviewed release refs.
+- WarpBuild GitHub App access must be limited to this repository and the minimum permissions required for these jobs.
+- The environment reviewer must verify and approve the exact commit SHA shown by the workflow run.
+- The workflow output must remain a draft release.
+- A second maintainer must download the draft XCFramework zip, independently run `shasum -a 256`, compare the result with both the workflow output and the checksum proposed for `Package.swift`, confirm that the draft asset came from the approved workflow SHA, and only then publish the release.
+
+Zend PR `#19` merged the runner changes into `origin/main`. The manual FFI release workflow must not be used until the live `sdk-release` environment protections and WarpBuild GitHub App controls have been verified.
+
+### Upstream parity snapshot (as of 2026-07-15)
+
+Current relationship after Zend PR `#18` merged `codex/zcash-upstream-sync-2026-07-06` into `origin/main`:
+
+- `origin/main...upstream/main`: `93 0` after fetching both remotes on 2026-07-15.
 - Fork-specific Zend commits remain ahead of `upstream/main`.
 - `upstream/main` currently points at `d92a7940` (`#1802`); it also includes `#1799` for Tor retry classification, `#1795` for local FFI build flags, `#1790` / tag `2.6.0-alpha.6`, `#1789` checkpoint refresh, `#1786` for the Keystone/cross-account `deleteAccount` fix, and `#1766` Dependabot setup.
-- `git merge-base --is-ancestor upstream/main origin/main` fails until the current parity PR lands.
-- The active parity branch `codex/zcash-upstream-sync-2026-07-06` now merges upstream `main` through `d92a7940`; `git rev-list --left-right --count HEAD...upstream/main` returns `83 0` after this guide refresh and `git merge-base --is-ancestor upstream/main HEAD` succeeds.
+- `git merge-base --is-ancestor upstream/main origin/main` succeeds.
+- Zend PR `#18` completed default-branch parity through upstream `d92a7940`; its merge commit is `b3569196`.
 
 Notable fork-ahead work currently preserved includes:
 
@@ -73,7 +95,7 @@ Notable fork-ahead work currently preserved includes:
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: default-branch parity is pending in Zend PR `#18`, which carries upstream `main` through `d92a7940` / PR `#1802`. Zend PR `#17` is the historical prototype carry, not the merge-readiness source of truth for the hardened Ironwood implementation. The hardened line replaces its sibling-path/private-CI blocker with an exact private-engine revision plus a committed, three-slice, provenance-verified XCFramework workflow. It is merge-ready only after that final private revision, artifact hashes, Swift/offline tests, and GitHub checks are frozen together; a locally compiling path dependency is not sufficient. Zend SDK release numbering remains separate from upstream and FFI artifact numbering.
+Implication: default-branch parity through upstream `d92a7940` / PR `#1802` is complete in Zend PR `#18`. Zend PR `#17` is the Zend-original, hardened Ironwood completion vehicle. It replaces the early sibling-path/private-CI prototype with an exact private-engine revision plus a committed, three-slice, provenance-verified XCFramework workflow. The final private revision and tree, Cargo lock, build recipe, XCFramework, source and slice hashes, Swift/offline tests, and GitHub checks must be frozen together; a locally compiling path dependency is not sufficient. The PR remains labeled `zend-improvement`. Zend SDK release numbering remains separate from upstream and FFI artifact numbering: the fork tag `2.6.3` points at the Zend SDK release while upstream `2.6.0-alpha.6` points at the upstream SDK release artifact.
 
 ## Conflict resolution heuristics
 
@@ -97,26 +119,19 @@ Zend parity branch note:
 - The July 3 refresh merged upstream through `018253d8` with no conflicts. The upstream `#1799` changes touch `CHANGELOG.md` and `Sources/ZcashLightClientKit/Block/CompactBlockProcessor.swift`; no Zend-specific artifact URL, checksum, branding, or release behavior changed.
 - The July 7 refresh merged upstream through `d92a7940` with no conflicts. The upstream `#1802` changes touch `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `docs/ci.md`; no Zend-specific artifact URL, checksum, branding, or support surface changed.
 
-## Bleeding-edge snapshot (2026-07-11)
+## Ironwood completion snapshot (2026-07-15)
 
-Zend Ironwood hardening line:
-
-- PR `#17` and branch `codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04` remain useful provenance for the original upstream MOB-1455 stack, but must not be merged as the final migration implementation.
-- The hardened integration is based on exact upstream librustzcash revision `266a75ae3af076bbe9437088947fddb1add8bd99` and a separately frozen private migration-engine commit. Cargo must use its exact git revision for the final tree; a path dependency is development-only and fails the artifact gate.
+- Zend PR `#18` merged the upstream default-branch delta through `d92a7940` / PR `#1802`; `git rev-list --left-right --count origin/main...upstream/main` returns `93 0` and upstream is an ancestor of Zend `main`.
+- Zend PR `#17` and branch `codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04` are the hardened Ironwood SDK merge vehicle. Because the work is Zend-original hardening rather than a Vizor-derived or upstream-Zodl artifact, it carries the `zend-improvement` label.
+- The hardened integration pins private migration-engine commit `2a558b12d9ddf5745bacfe3999f7c097b7c2da2d`, engine tree `e8294d34d72335bdddc8fe5bca5c3117e05e2168`, and upstream librustzcash revision `266a75ae3af076bbe9437088947fddb1add8bd99`. Cargo must use the exact git revision for the final tree; a path dependency is development-only and fails the artifact gate.
 - The public migration contract is schema-v5 snapshot-driven, revision-CAS-bound, and JIT: it atomically binds submission policy, materializes only one due intent, resumes exact staged external-signer bytes after process death, and fail-closes ordinary spending only for the affected account.
-- Public CI never receives private Rust credentials. Authenticated local tooling builds the exact arm64 iOS device/simulator and macOS artifact, while public CI verifies its source/provenance/slice hashes and complete production migration symbol set before packaging it.
-- Do not mark the hardened line merge-ready until the private commit/tree, Cargo lock, build recipe, XCFramework, source hash, offline tests, and app integration CI all agree. Recheck live PR/check state rather than copying the historical `#17` status below.
-
-Merged upstream default-branch delta pending in Zend fork default branch:
-
-- `#1802`: marks GitHub releases as pre-releases automatically when the SemVer version contains a pre-release suffix. Upstream-only commits before the current parity PR lands are still `05968e49`, `1ef37b53`, and merge commit `d92a7940`; `git rev-list --left-right --count origin/main...upstream/main` returns `77 3`.
-- Zend PR `#18` (`codex/zcash-upstream-sync-2026-07-06`) now owns this upstream-default parity refresh. It cleanly merges upstream `main` through `d92a7940`; before the 2026-07-10 docs refresh it was draft, `mergeStateStatus=CLEAN`, `mergeable=MERGEABLE`, and `build`, `Run zizmor`, and standalone `zizmor` all passed at head `d2b06bb1`.
-- Zend PR `#17` owns only the early Ironwood / NU6.3 prototype carry. Its historical merge/check state is not a readiness signal for the hardened line; use the frozen artifact gates and the live replacement PR checks described above.
+- Public CI never receives private Rust credentials. Authenticated local tooling builds the exact arm64 iOS device/simulator and macOS artifact, while public CI verifies its source, provenance, slice hashes, canonical pre-Ironwood fixtures, and complete production migration symbol set.
+- Merge only when the private commit and tree, Cargo lock, build recipe, three-slice XCFramework, source and slice hashes, Swift build, 546 offline tests, and exact-head GitHub checks all agree.
 
 Open upstream PRs assessed as not ready to carry right now:
 
-- `#1804` (`feat/dandelion-p2p-submit` from `zodl-inc/zcash-swift-wallet-sdk`): non-draft and potentially useful for future privacy work, but `BLOCKED`, review-required, and failing both `build` and `SwiftLint`. It adds an opt-in Dandelion++ direct P2P transaction submission path, new submitter/configuration types, fallback submission behavior, and protocol-level peer interaction, so Zend should wait for upstream review, green CI, and clear product adoption direction before carrying it. If carried later, it originates from a Zodl repo and should use the `zodl` label.
-- `#1803` (`slipstream-sdk-private`): non-draft with green checks and `mergeable=MERGEABLE`, but still `BLOCKED` and review-required. It supersedes `#1801` with the same broad opt-in high-performance sync engine plus optional private binary packaging, FULL/STUB FFI modes, private release scripts, `SlipstreamSynchronizer`, source-compatibility shims, and a new `allTransactions()` protocol requirement. Zend should wait for upstream review, public tag-consumer artifact guidance, and adoption direction before carrying it.
+- `#1804` (`feat/dandelion-p2p-submit` from `zodl-inc/zcash-swift-wallet-sdk`): non-draft, `mergeable=MERGEABLE`, and potentially useful for future privacy work, but `mergeable_state=unstable` with failing `Build and Run Offline Tests` and `SwiftLint`. It adds an opt-in Dandelion++ direct P2P transaction submission path, new submitter/configuration types, fallback submission behavior, and protocol-level peer interaction, so Zend should wait for upstream review, green CI, and clear product adoption direction before carrying it. If carried later, it originates from a Zodl repo and should use the `zodl` label.
+- `#1803` (`slipstream-sdk-private`): non-draft, `mergeable=MERGEABLE`, `mergeable_state=clean`, and green on `Build and Run Offline Tests`, `SwiftLint`, and `GitHub Actions Security Analysis with zizmor`, but still too broad/high-risk for an early Zend carry. It supersedes `#1801` with the same broad opt-in high-performance sync engine plus optional private binary packaging, FULL/STUB FFI modes, private release scripts, `SlipstreamSynchronizer`, source-compatibility shims, and a new `allTransactions()` protocol requirement. Zend should wait for upstream review, public tag-consumer artifact guidance, and adoption direction before carrying it.
 - `#1801` (`slipstream-sdk`): closed unmerged on 2026-07-08 and superseded by `#1803`, so it is not a carry target.
 - `#1800` (`slipstream`): closed unmerged on 2026-07-06 and superseded by later Slipstream PRs, so it is not a carry target.
 - `#1798` (`michal/MOB-1455-5-final-fixes` -> `michal/MOB-1455-4-set-activation-height`): draft, `UNSTABLE`, and its build check is failing. It is the latest layer in the Ironwood migration stack, so it should wait for upstream review and green CI.
@@ -127,7 +142,7 @@ Open upstream PRs assessed as not ready to carry right now:
 - Closed unmerged on 2026-07-01: `#1792` (`harry/ironwood-nu6.3-deps` -> `harry/ironwood-migration-sdk-interface`) and `#1791` (`harry/ironwood-migration-sdk-interface`). Their branches still exist, but the closed draft PRs do not provide a readiness signal for Zend.
 - `#1787` and `#1788`: Swift NIO / NIO Extras Dependabot PRs; non-draft with passing checks, but still `BLOCKED` and review-required, so wait for upstream dependency review.
 - `#1770` through `#1785`: Dependabot PRs for Cargo, Swift, and GitHub Actions dependencies. They remain `BLOCKED` and review-required; several still have failed build or zizmor checks, so wait for upstream review and CI policy before carrying individual dependency bumps.
-- `#1767` (`dw/remove-useless-deadcode-annotations`): non-draft, `BLOCKED`, and review-required; Rust annotation cleanup should wait for upstream review rather than being carried independently.
+- `#1767` (`dw/remove-useless-deadcode-annotations`): non-draft and clean/mergeable, but still an unmerged Rust annotation cleanup with limited direct Zend value; wait for upstream to land it rather than carrying it independently.
 - `#1763` (`michal/MOB-1389-fetch-usd-rate-tor-crash`): draft, `DIRTY`, and review-required; touches Tor/exchange-rate concurrency, so wait for upstream completion despite current checks passing.
 - `#1746` (`kris/1745-finish-release-workflow`): non-draft, `DIRTY`, review-required, and release-workflow heavy. Upstream `#1802` has already landed the focused pre-release flag subset, so the broader release-workflow PR should still wait for upstream completion.
 - `#1733` (`main` -> `release/2.6.0`): explicit `[DO NOT MERGE]` draft stabilization preview with green checks, so wait for upstream release sequencing rather than carrying it independently.
