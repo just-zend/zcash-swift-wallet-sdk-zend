@@ -15,7 +15,7 @@ permissions: {}
 jobs:
   package-xcframework:
     runs-on: warp-macos-15-arm64-12x
-    # The live sdk-release environment must be protected before this workflow is used.
+    # The live sdk-release environment must be protected before this workflow is dispatched.
     environment: sdk-release
     permissions:
       contents: write # Required for creating draft releases
@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
 
       - name: Select Xcode version
-        run: sudo xcode-select -s '/Applications/Xcode_26.6.app/Contents/Developer'
+        run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
       - name: Verify frozen committed artifact
         run: |
