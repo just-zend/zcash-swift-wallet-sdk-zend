@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-04
+Last reviewed: 2026-07-14
 
 ## Remote and branch invariants
 
@@ -46,7 +46,29 @@ If carried early:
 
 If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
-## Zend divergence notes (as of 2026-07-04)
+## Zend divergence notes
+
+### CI runner divergence (as of 2026-07-14)
+
+Zend CI intentionally diverges from upstream's native GitHub-hosted runners:
+
+- `warp-macos-15-arm64-12x` runs the manual FFI XCFramework release job, the Swift PR build and offline tests, and the Swift CodeQL matrix row.
+- `warp-ubuntu-latest-x64-16x` runs the CodeQL `actions`, `c-cpp`, and `rust` matrix rows.
+- `warp-ubuntu-latest-x64-8x` runs SwiftLint and zizmor.
+- Swift, SwiftLint, and zizmor PR workflows cancel superseded work for the same pull request.
+- Manual FFI release runs do not cancel. CodeQL retains no workflow-level concurrency, so its push, scheduled, and manual runs do not cancel.
+
+Moving the `contents: write` draft-release publisher to WarpBuild expands the trusted computing base for SDK releases. The following controls are required:
+
+- The live `sdk-release` GitHub environment must exist before this change merges or the workflow is used. It must require an independent reviewer, prevent self-approval and administrator bypass where GitHub makes those controls available, and restrict deployment branches and tags to protected, reviewed release refs.
+- WarpBuild GitHub App access must be limited to this repository and the minimum permissions required for these jobs.
+- The environment reviewer must verify and approve the exact commit SHA shown by the workflow run.
+- The workflow output must remain a draft release.
+- A second maintainer must download the draft XCFramework zip, independently run `shasum -a 256`, compare the result with both the workflow output and the checksum proposed for `Package.swift`, confirm that the draft asset came from the approved workflow SHA, and only then publish the release.
+
+This PR is not merge-ready until the live `sdk-release` environment protections and WarpBuild GitHub App controls have been verified.
+
+### Upstream parity snapshot (as of 2026-07-04)
 
 Current relationship after Zend PR `#15` merged `codex/zcash-upstream-sync-2026-06-22` into `origin/main`, before the current July 3 parity branch lands:
 

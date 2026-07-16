@@ -13,7 +13,9 @@ permissions: {}
 
 jobs:
   build-xcframework:
-    runs-on: macos-15
+    runs-on: warp-macos-15-arm64-12x
+    # The live sdk-release environment must be protected before this workflow is used.
+    environment: sdk-release
     permissions:
       contents: write # Required for creating draft releases
     steps:
