@@ -72,10 +72,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcash_voting 1.0.0` still pins Orchard 0.14 + unstable voting circuits, while this audited
   Ironwood graph uses Orchard 0.15.0. Re-enable only after the voting stack moves to Orchard 0.15.
 ## Fixed
-- Migration terminal reconciliation now requires a positive **spendable** Ironwood balance rather
-  than the pending-inclusive Ironwood total, in addition to the existing ten-block transfer burial
-  gate. This prevents the engine from reporting completion while the received Ironwood notes still
-  lack enough confirmations or witness state to be spent.
+- Migration terminal reconciliation now requires every confirmed migration transaction's exact
+  Ironwood value to be **spendable** through upstream note selection, in addition to the existing
+  ten-block transfer burial gate. Unrelated pre-existing Ironwood can no longer satisfy completion,
+  and a run remains provisional while any of its own received notes lacks confirmations or usable
+  witness state.
 - Ironwood migration now self-heals interrupted leases, missed private windows, expired JIT
   transactions, process-death external signing, and ambiguous submissions without silently creating
   replacement bytes. Legacy policyless artifacts are either revision-bound before exposure or kept

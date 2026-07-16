@@ -7566,7 +7566,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 [[package]]
 name = "zodl_ironwood_migration"
 version = "0.1.0"
-source = "git+ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git?rev=eda992fdd53d271faa150b0e1d81ebd02f38a519#eda992fdd53d271faa150b0e1d81ebd02f38a519"
+source = "git+ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git?rev=58f9c9936bcae603afe2c728a5b17184b9d5d861#58f9c9936bcae603afe2c728a5b17184b9d5d861"
 dependencies = [
  "hex",
  "orchard 0.15.0",

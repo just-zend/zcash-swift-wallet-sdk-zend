@@ -136,10 +136,12 @@ Zend Ironwood hardening line:
 
 - PR `#17` (`codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04`) merged as `1bbc35a6` and is the
   current Zend-original Ironwood SDK hardening baseline.
-- Follow-up branch `codex/ironwood-spendability` pins private engine PR `#2` commit
-  `eda992fdd53d271faa150b0e1d81ebd02f38a519`, which requires a spendable Ironwood balance before
-  terminal completion. It rebuilds all committed arm64 FFI slices and provenance together before
-  the exact SDK revision is consumed by draft app PR `just-zend/zend-ios#132`.
+- Follow-up branch `codex/ironwood-spendability` pins merged private-engine `main` commit
+  `58f9c9936bcae603afe2c728a5b17184b9d5d861` (PR `#3`, atop merged PR `#2`). Terminal completion
+  requires the exact Ironwood value received from every confirmed migration transaction to be
+  upstream-spendable; unrelated account funds cannot satisfy the gate. All committed arm64 FFI
+  slices and provenance are rebuilt together before the exact SDK revision is consumed by app PR
+  `just-zend/zend-ios#132`.
 - The graph continues to pin exact upstream
   `zcash/librustzcash@266a75ae3af076bbe9437088947fddb1add8bd99`.
 - The public migration contract is snapshot-driven, revision-CAS-bound, and JIT: it atomically
