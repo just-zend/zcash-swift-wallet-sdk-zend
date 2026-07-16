@@ -118,8 +118,9 @@ jobs:
       timeout-minutes: 10
       run: swift package resolve
 
-    # CodeQL only needs to trace this repository's SDK target. Building external
-    # dependencies first avoids instrumenting their much larger compile graph.
+    # CodeQL only needs to trace this repository's SDK and test-support targets.
+    # Building external dependencies first avoids instrumenting their much larger
+    # compile graph.
     - name: Prebuild external Swift dependencies
       if: matrix.language == 'swift'
       timeout-minutes: 10
@@ -128,7 +129,7 @@ jobs:
         swift build --target SQLite
 
     # Dependency setup is intentionally outside the extractor. The only compiler
-    # invocation CodeQL needs to observe is the repository target build below.
+    # invocations CodeQL needs to observe are the repository target builds below.
     - name: Initialize CodeQL
       uses: github/codeql-action/init@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
       with:
@@ -137,10 +138,12 @@ jobs:
         # If you wish to specify custom queries, you can do so here or in a config file.
         # queries: security-extended,security-and-quality
 
-    - name: Build Swift package
+    - name: Build repository Swift targets
       if: matrix.language == 'swift'
       timeout-minutes: 30
-      run: swift build --target ZcashLightClientKit
+      run: |
+        swift build --target ZcashLightClientKit
+        swift build --target TestUtils
 
     # --- End Swift manual build steps ---
 
