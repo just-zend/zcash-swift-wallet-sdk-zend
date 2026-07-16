@@ -115,7 +115,7 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 # Frozen Ironwood migration engine (shared Orchard->Ironwood logic, also consumed by Android).
 # The private repository and exact commit are part of the reviewed FFI provenance; never use a
 # branch, tag, or developer path for a release artifact.
-zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "2a558b12d9ddf5745bacfe3999f7c097b7c2da2d" }
+zodl_ironwood_migration = { git = "ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git", rev = "58f9c9936bcae603afe2c728a5b17184b9d5d861" }
 
 [features]
 # Off by default on this Ironwood branch — see the zcash_voting dependency note above. Enabling it
