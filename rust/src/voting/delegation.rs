@@ -75,7 +75,7 @@ pub unsafe extern "C" fn zcashlc_voting_generate_hotkey(
         // Honest error until the voting-FFI port (census: voting row).
         let _ = (&db, seed, seed_len);
         Err(anyhow!(
-            "voting: generate_hotkey is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: generate_hotkey is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
@@ -106,7 +106,7 @@ pub unsafe extern "C" fn zcashlc_voting_setup_bundles(
         // Honest error until the voting-FFI port (census: voting row).
         let _ = (&db, round_id, round_id_len, notes_json, notes_json_len);
         Err(anyhow!(
-            "voting: setup_bundles is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: setup_bundles is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
@@ -197,7 +197,7 @@ pub unsafe extern "C" fn zcashlc_voting_build_pczt(
             address_index,
         );
         Err(anyhow!(
-            "voting: build_pczt is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: build_pczt is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
@@ -426,7 +426,7 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
             network_id,
         );
         Err(anyhow!(
-            "voting: precompute_delegation_pir is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: precompute_delegation_pir is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
@@ -487,7 +487,7 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
             progress_callback,
         );
         Err(anyhow!(
-            "voting: build_and_prove_delegation is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: build_and_prove_delegation is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
@@ -527,7 +527,7 @@ pub unsafe extern "C" fn zcashlc_voting_get_delegation_submission(
             account_index,
         );
         Err(anyhow!(
-            "voting: get_delegation_submission is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: get_delegation_submission is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
@@ -567,7 +567,7 @@ pub unsafe extern "C" fn zcashlc_voting_get_delegation_submission_with_keystone_
             sighash_len,
         );
         Err(anyhow!(
-            "voting: get_delegation_submission_with_keystone_sig is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: get_delegation_submission_with_keystone_sig is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)

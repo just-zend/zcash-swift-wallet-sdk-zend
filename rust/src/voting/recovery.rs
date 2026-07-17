@@ -118,7 +118,7 @@ pub unsafe extern "C" fn zcashlc_voting_store_vote_tx_hash(
             tx_hash_len,
         );
         Err(anyhow!(
-            "voting: store_vote_tx_hash is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: store_vote_tx_hash is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or(res, -1)
@@ -187,7 +187,7 @@ pub unsafe extern "C" fn zcashlc_voting_store_commitment_bundle(
             vc_tree_position,
         );
         Err(anyhow!(
-            "voting: store_commitment_bundle is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: store_commitment_bundle is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or(res, -1)
