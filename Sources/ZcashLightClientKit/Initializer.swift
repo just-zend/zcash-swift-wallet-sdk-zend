@@ -477,7 +477,7 @@ public class Initializer {
                     // wallet can't be missed if the current chain tip is reorganized.
                     let birthdayTreeStateHeight = max(
                         latestBlockHeight - ZcashSDK.maxReorgSize,
-                        network.constants.saplingActivationHeight
+                        network.saplingActivationHeight
                     )
                     let blockID = BlockID(height: UInt64(birthdayTreeStateHeight))
                     if let serverTreeState = try? await lightWalletService.getTreeState(blockID, mode: await sdkFlags.ifTor(.uniqueTor)) {
@@ -507,14 +507,16 @@ public class Initializer {
     /// restoring a DIFFERENT seed over existing accounts previously no-op'd silently — the
     /// keychain held seed B while data.db kept seed A's account, the app showed A's balance AND
     /// receive address (funds receivable but unspendable), and sends failed ZRUST0002. Validate
-    /// the caller's seed against the stored derived account(s) before opening. Imported-only
-    /// wallets (no derived account) are exempt: relevance cannot be evaluated for them
-    /// (`SeedRelevance::NoDerivedAccounts` also reads as false, and throwing would break the
-    /// hardware-wallet-only + new-seed flow).
+    /// the caller's seed against the stored derived account(s) before opening.
+    ///
+    /// The relevance check is delegated to the Rust core, which reports the seed relevant when it
+    /// derives an existing account, when there are no accounts, or when there is no seed-derived
+    /// account to validate against — so imported-only wallets (hardware-wallet UFVKs) are exempt.
+    /// Only a genuine mismatch against existing seed-derived accounts throws. This must not use a
+    /// Swift-side heuristic on `seedFingerprint`/`hdAccountIndex`, since those are also populated
+    /// for imported-spending accounts and would falsely brick hardware-wallet-only wallets.
     private func validateSeedAgainstExistingAccounts(_ seed: [UInt8]?, existingAccounts: [Account]) async throws {
         guard let seed, !existingAccounts.isEmpty else { return }
-        let hasDerivedAccount = existingAccounts.contains { $0.seedFingerprint != nil && $0.hdAccountIndex != nil }
-        guard hasDerivedAccount else { return }
         let seedIsRelevant = try await rustBackend.isSeedRelevantToAnyDerivedAccount(seed: seed)
         guard seedIsRelevant else { throw ZcashError.initializerSeedMismatch }
     }

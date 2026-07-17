@@ -642,10 +642,17 @@ pub unsafe extern "C" fn zcashlc_is_seed_relevant_to_any_derived_account(
         let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
         let seed = Secret::new((unsafe { slice::from_raw_parts(seed, seed_len) }).to_vec());
 
-        // Replicate the logic from `initWalletDb`.
+        // Replicate the logic from `initWalletDb`. `NoDerivedAccounts` (the
+        // wallet has accounts but all are imported, e.g. hardware-wallet UFVKs)
+        // is treated as relevant like `NoAccounts`: there is no seed-derived
+        // account for the seed to conflict with, so opening must not be blocked.
+        // Only `NotRelevant` — the seed derives none of the existing *derived*
+        // accounts — is a genuine mismatch.
         Ok(match db_data.seed_relevance_to_derived_accounts(&seed)? {
-            SeedRelevance::Relevant { .. } | SeedRelevance::NoAccounts => 1,
-            SeedRelevance::NotRelevant | SeedRelevance::NoDerivedAccounts => 0,
+            SeedRelevance::Relevant { .. }
+            | SeedRelevance::NoAccounts
+            | SeedRelevance::NoDerivedAccounts => 1,
+            SeedRelevance::NotRelevant => 0,
         })
     });
     unwrap_exc_or(res, -1)

@@ -853,11 +853,21 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
                 throw ZcashError.rustPutSaplingSubtreeRootsAllocationProblem
             }
 
+            guard let completingBlockHeight = UInt32(exactly: root.completingBlockHeight) else {
+                defer {
+                    hashPtr.deallocate()
+                    ffiSubtreeRootsVec.deallocateElements()
+                }
+                throw ZcashError.rustPutSaplingSubtreeRoots(
+                    "server-supplied completing block height \(root.completingBlockHeight) does not fit in UInt32"
+                )
+            }
+
             ffiSubtreeRootsVec.append(
                 FfiSubtreeRoot(
                     root_hash_ptr: hashPtr,
                     root_hash_ptr_len: UInt(contiguousHashBytes.count),
-                    completing_block_height: UInt32(root.completingBlockHeight)
+                    completing_block_height: completingBlockHeight
                 )
             )
         }
@@ -910,11 +920,21 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
                 throw ZcashError.rustPutOrchardSubtreeRootsAllocationProblem
             }
 
+            guard let completingBlockHeight = UInt32(exactly: root.completingBlockHeight) else {
+                defer {
+                    hashPtr.deallocate()
+                    ffiSubtreeRootsVec.deallocateElements()
+                }
+                throw ZcashError.rustPutOrchardSubtreeRoots(
+                    "server-supplied completing block height \(root.completingBlockHeight) does not fit in UInt32"
+                )
+            }
+
             ffiSubtreeRootsVec.append(
                 FfiSubtreeRoot(
                     root_hash_ptr: hashPtr,
                     root_hash_ptr_len: UInt(contiguousHashBytes.count),
-                    completing_block_height: UInt32(root.completingBlockHeight)
+                    completing_block_height: completingBlockHeight
                 )
             )
         }
@@ -967,11 +987,21 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
                 throw ZcashError.rustPutIronwoodSubtreeRootsAllocationProblem
             }
 
+            guard let completingBlockHeight = UInt32(exactly: root.completingBlockHeight) else {
+                defer {
+                    hashPtr.deallocate()
+                    ffiSubtreeRootsVec.deallocateElements()
+                }
+                throw ZcashError.rustPutIronwoodSubtreeRoots(
+                    "server-supplied completing block height \(root.completingBlockHeight) does not fit in UInt32"
+                )
+            }
+
             ffiSubtreeRootsVec.append(
                 FfiSubtreeRoot(
                     root_hash_ptr: hashPtr,
                     root_hash_ptr_len: UInt(contiguousHashBytes.count),
-                    completing_block_height: UInt32(root.completingBlockHeight)
+                    completing_block_height: completingBlockHeight
                 )
             )
         }

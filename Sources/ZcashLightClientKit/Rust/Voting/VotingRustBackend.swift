@@ -387,7 +387,12 @@ extension VotingRustBackend {
         return try decodeJSON(from: ptr)
     }
 
-    /// Mark a vote as submitted for a specific proposal and bundle.
+    /// Re-mark a vote as submitted, using the transaction hash already stored
+    /// for it. In `zcash_voting` 1.0 submission is derived from the stored tx
+    /// hash, so `storeVoteTxHash` is what actually records submission and must
+    /// have been called first; this re-applies that state idempotently and
+    /// rejects a conflicting hash. Throws if no tx hash has been stored (or if
+    /// the lookup itself fails).
     public func markVoteSubmitted(
         roundId: String,
         bundleIndex: UInt32,
@@ -951,7 +956,11 @@ extension VotingRustBackend {
         return try decodeJSON(from: ptr)
     }
 
-    /// Persist the on-chain transaction hash for a submitted vote.
+    /// Persist the on-chain transaction hash for a vote. In `zcash_voting` 1.0
+    /// this is the call that marks the vote submitted — submission state is
+    /// derived from the stored tx hash and recorded atomically here;
+    /// `markVoteSubmitted` only re-applies it. Call this once the vote
+    /// transaction has been broadcast.
     public func storeVoteTxHash(
         roundId: String,
         bundleIndex: UInt32,

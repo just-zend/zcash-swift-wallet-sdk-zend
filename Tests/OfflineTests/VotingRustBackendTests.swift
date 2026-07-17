@@ -913,7 +913,7 @@ final class VotingRustBackendTests: XCTestCase {
         let params = VotingBuildPcztParams(
             roundId: "unknown-round",
             bundleIndex: 0,
-            walletDbPath: NSTemporaryDirectory() + "missing-wallet.db",
+            walletDbPath: "\(NSTemporaryDirectory())missing-wallet.db",
             accountUuid: "00000000-0000-0000-0000-000000000000",
             hotkeySecret: [UInt8](repeating: 7, count: 64),
             roundName: "Round"
@@ -1519,7 +1519,9 @@ final class VotingRustBackendTests: XCTestCase {
             return
         }
         XCTAssertTrue(
-            message.contains("no vote found") || message.contains("requires a stored vote tx hash"),
+            message.contains("no vote found")
+                || message.contains("requires a stored vote tx hash")
+                || message.contains("failed to look up stored vote tx hash"),
             "unexpected message: \(message)",
             file: file,
             line: line

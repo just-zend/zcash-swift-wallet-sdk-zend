@@ -6,7 +6,6 @@ use zcash_voting as voting;
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
-use super::constants::{CANONICAL_FIELD_LEN, MIN_SEED_LEN};
 use super::db::VotingDatabaseHandle;
 use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
 use super::json::{JsonSharePayload, JsonVoteCommitmentBundle, JsonWireEncryptedShare};
@@ -230,11 +229,14 @@ pub unsafe extern "C" fn zcashlc_voting_mark_vote_submitted(
 
         // zcash_voting 1.0 records submission and tx hash atomically; re-mark
         // with the stored hash (idempotent, conflicting hashes rejected).
+        // Propagate lookup failures (missing vote row, locked/corrupt DB) with
+        // their real cause instead of collapsing every non-`Some` outcome into
+        // the "call store_vote_tx_hash first" message; that guidance only holds
+        // when the vote exists but has no stored hash yet (`Ok(None)`).
         let tx_hash = handle
             .db
             .get_vote_tx_hash(&round_id_str, bundle_index, proposal_id)
-            .ok()
-            .flatten()
+            .map_err(|e| anyhow!("failed to look up stored vote tx hash: {}", e))?
             .ok_or_else(|| {
                 anyhow!("mark_vote_submitted requires a stored vote tx hash — call store_vote_tx_hash first")
             })?;
@@ -310,42 +312,6 @@ pub unsafe extern "C" fn zcashlc_voting_sign_cast_vote(
         ))
     });
     unwrap_exc_or_null(res)
-}
-
-fn require_32_bytes(bytes: &[u8], name: &str) -> anyhow::Result<()> {
-    if bytes.len() != CANONICAL_FIELD_LEN {
-        return Err(anyhow!(
-            "{} must be {} bytes, got {}",
-            name,
-            CANONICAL_FIELD_LEN,
-            bytes.len()
-        ));
-    }
-    Ok(())
-}
-
-fn require_min_seed_len(bytes: &[u8], name: &str) -> anyhow::Result<()> {
-    if bytes.len() < MIN_SEED_LEN {
-        return Err(anyhow!(
-            "{} must be at least {} bytes, got {}",
-            name,
-            MIN_SEED_LEN,
-            bytes.len()
-        ));
-    }
-    Ok(())
-}
-
-fn require_ascii_hex(value: &str, name: &str) -> anyhow::Result<()> {
-    if value.len() % 2 != 0 {
-        return Err(anyhow!(
-            "{name} must contain an even number of hex characters"
-        ));
-    }
-    if !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(anyhow!("{name} must contain only ASCII hex characters"));
-    }
-    Ok(())
 }
 
 /// Bridges the C progress callback onto the crate's vote-commit stage reporter.
