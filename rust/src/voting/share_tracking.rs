@@ -30,7 +30,7 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
             .try_into()
             .map_err(|_| anyhow!("primary_blind must be exactly 32 bytes"))?;
 
-        let nullifier = voting::share_tracking::compute_share_nullifier(&vc, share_index, &blind)
+        let nullifier = voting::share::compute_nullifier(&vc, share_index, &blind)
             .map_err(|e| anyhow!("compute_share_nullifier failed: {}", e))?;
 
         // Fixed-width hex: one 64-char allocation instead of per-byte `format!` temporaries.

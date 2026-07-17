@@ -50,7 +50,7 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
     let res = catch_panic(|| {
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        crate::parse_network(network_id)?;
+        let network = super::helpers::voting_network(network_id)?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
         let notes_bytes = unsafe { bytes_from_ptr(notes_json, notes_json_len) }?;
         let json_notes: Vec<JsonNoteInfo> = if notes_bytes.is_empty() {
@@ -69,7 +69,7 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
                 bundle_index,
                 &core_notes,
                 &pir_client,
-                network_id,
+                network,
             )
             .map_err(|e| anyhow!("precompute_delegation_pir failed: {}", e))?;
 

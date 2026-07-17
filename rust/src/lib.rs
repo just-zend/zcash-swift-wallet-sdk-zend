@@ -39,16 +39,16 @@ use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     address::Address,
     data_api::{
-        Account, AccountBirthday, AccountPurpose, InputSource, MaxSpendMode, SeedRelevance,
-        TransactionDataRequest, TransactionStatus, TransparentKeyOrigin, TransparentOutputFilter,
+        Account, AccountBirthday, AccountPurpose, CoinbaseFilter, InputSource, MaxSpendMode,
+        SeedRelevance, TransactionDataRequest, TransactionStatus, TransparentKeyOrigin,
         WalletCommitmentTrees, WalletRead, WalletWrite, Zip32Derivation,
         chain::{CommitmentTreeRoot, scan_cached_blocks},
         scanning::ScanPriority,
         wallet::{
             self, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
             decrypt_and_store_transaction, extract_and_store_transaction_from_pczt,
-            input_selection::GreedyInputSelector, propose_send_max_transfer, propose_shielding,
-            propose_transfer,
+            input_selection::{GreedyInputSelector, SpendPolicy}, propose_send_max_transfer,
+            propose_shielding, propose_transfer,
         },
     },
     encoding::AddressCodec,
@@ -76,7 +76,7 @@ use zcash_primitives::{
 };
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
-    ShieldedProtocol,
+    ShieldedPool,
     consensus::{
         BlockHeight, BranchId, Network,
         Network::{MainNetwork, TestNetwork},
@@ -1021,7 +1021,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance(
                 &taddr,
                 target,
                 confirmations_policy,
-                TransparentOutputFilter::All,
+                CoinbaseFilter::AllTransparentOutputs,
             )
             .map_err(|e| anyhow!("Error while fetching verified transparent balance: {}", e))?;
         let amount = utxos
@@ -1085,7 +1085,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
                         taddr,
                         target,
                         confirmations_policy,
-                        TransparentOutputFilter::All,
+                        CoinbaseFilter::AllTransparentOutputs,
                     )
                     .map_err(|e| {
                         anyhow!("Error while fetching verified transparent balance: {}", e)
@@ -1136,7 +1136,7 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance(
                 &taddr,
                 target,
                 wallet::ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
-                TransparentOutputFilter::All,
+                CoinbaseFilter::AllTransparentOutputs,
             )
             .map_err(|e| anyhow!("Error while fetching total transparent balance: {}", e))?
             .iter()
@@ -1201,10 +1201,10 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance_for_account(
     unwrap_exc_or(res, -1)
 }
 
-fn parse_protocol(code: u32) -> Option<ShieldedProtocol> {
+fn parse_protocol(code: u32) -> Option<ShieldedPool> {
     match code {
-        2 => Some(ShieldedProtocol::Sapling),
-        3 => Some(ShieldedProtocol::Orchard),
+        2 => Some(ShieldedPool::Sapling),
+        3 => Some(ShieldedPool::Orchard),
         _ => None,
     }
 }
@@ -1331,7 +1331,7 @@ pub unsafe extern "C" fn zcashlc_rewind_to_height(
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let height = BlockHeight::from(height);
-        let result_height = db_data.rewind_to_height(height);
+        let result_height = db_data.truncate_to_height(height);
 
         result_height.map_or_else(
             |err| match err {
@@ -1836,6 +1836,10 @@ pub unsafe extern "C" fn zcashlc_put_utxo(
                 script_pubkey,
             ),
             Some(BlockHeight::from(height as u32)),
+            // This UTXO is supplied by the caller with no account association or key scope.
+            None,
+            None,
+            None,
         )
         .ok_or_else(|| {
             anyhow!(
@@ -2088,7 +2092,7 @@ fn zip317_helper<DbT>(
         MultiOutputChangeStrategy::new(
             StandardFeeRule::Zip317,
             change_memo,
-            ShieldedProtocol::Orchard,
+            ShieldedPool::Orchard,
             DustOutputPolicy::default(),
             SplitPolicy::with_min_output_value(
                 NonZeroUsize::new(4).unwrap(),
@@ -2168,6 +2172,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             &change_strategy,
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
+            &SpendPolicy::default(),
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2241,7 +2246,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             &mut db_data,
             &network,
             account_uuid,
-            &[ShieldedProtocol::Sapling, ShieldedProtocol::Orchard],
+            &[ShieldedPool::Sapling, ShieldedPool::Orchard],
             &StandardFeeRule::Zip317,
             to,
             memo,
@@ -2308,6 +2313,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             &change_strategy,
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
+            &SpendPolicy::default(),
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2515,7 +2521,7 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
             &from_addrs,
             account_uuid,
             confirmations_policy,
-            TransparentOutputFilter::All,
+            CoinbaseFilter::AllTransparentOutputs,
         )
         .map_err(|e| anyhow!("Error while shielding transaction: {}", e))?;
 
@@ -2598,7 +2604,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
         let proposal =
             Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
                 .map_err(|e| anyhow!("Invalid proposal: {}", e))?
-                .try_into_standard_proposal(&db_data)?;
+                .try_into_standard_proposal(&network, &db_data)?;
         let usk = unsafe { decode_usk(usk_ptr, usk_len) }?;
         let spend_params = Path::new(OsStr::from_bytes(unsafe {
             slice::from_raw_parts(spend_params, spend_params_len)
@@ -2617,7 +2623,6 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             &SpendingKeys::from_unified_spending_key(usk),
             OvkPolicy::Sender,
             &proposal,
-            None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2679,7 +2684,7 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
         let proposal =
             Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
                 .map_err(|e| anyhow!("Invalid proposal: {}", e))?
-                .try_into_standard_proposal(&db_data)?;
+                .try_into_standard_proposal(&network, &db_data)?;
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
@@ -2690,10 +2695,16 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
                 account_uuid,
                 OvkPolicy::Sender,
                 &proposal,
+                // Use the transaction's default expiry height and the default Orchard
+                // bundle type; the SDK does not expose overrides for these.
+                None,
+                orchard::builder::BundleType::DEFAULT,
             )
             .map_err(|e| anyhow!("Error creating PCZT from single-step proposal: {}", e))?;
 
-            Ok(ffi::BoxedSlice::some(pczt.serialize()))
+            Ok(ffi::BoxedSlice::some(pczt.serialize().map_err(|e| {
+                anyhow!("Failed to serialize PCZT: {:?}", e)
+            })?))
         } else {
             Err(anyhow!(
                 "Multi-step proposals are not yet supported for PCZT generation."
@@ -2752,7 +2763,9 @@ pub unsafe extern "C" fn zcashlc_redact_pczt_for_signer(
             })
             .finish();
 
-        Ok(ffi::BoxedSlice::some(redacted_pczt.serialize()))
+        Ok(ffi::BoxedSlice::some(redacted_pczt.serialize().map_err(
+            |e| anyhow!("Failed to serialize redacted PCZT: {:?}", e),
+        )?))
     });
     unwrap_exc_or_null(res)
 }
@@ -2844,11 +2857,26 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
         let pczt_bytes = unsafe { slice::from_raw_parts(pczt_ptr, pczt_len) };
         let pczt = Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Invalid PCZT: {:?}", e))?;
 
+        // The Orchard proving key must be built for the circuit governing the Orchard pool
+        // under the consensus branch this PCZT was created for; derive it from the PCZT's
+        // consensus branch id before the PCZT is consumed by the prover.
+        let pczt_branch_id = BranchId::try_from(*pczt.global().consensus_branch_id())
+            .map_err(|_| anyhow!("PCZT has an invalid consensus branch id"))?;
+
         let mut prover = Prover::new(pczt);
 
         if prover.requires_orchard_proof() {
+            let orchard_circuit_version =
+                zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
+                    pczt_branch_id,
+                    orchard::ValuePool::Orchard,
+                )
+                .ok_or_else(|| {
+                    anyhow!("PCZT's consensus branch does not support the Orchard pool")
+                })?
+                .circuit_version();
             prover = prover
-                .create_orchard_proof(&orchard::circuit::ProvingKey::build())
+                .create_orchard_proof(&orchard::circuit::ProvingKey::build(orchard_circuit_version))
                 .map_err(|e| anyhow!("Failed to create Orchard proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_orchard_proof());
@@ -2877,7 +2905,9 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
 
         let pczt_with_proofs = prover.finish();
 
-        Ok(ffi::BoxedSlice::some(pczt_with_proofs.serialize()))
+        Ok(ffi::BoxedSlice::some(pczt_with_proofs.serialize().map_err(
+            |e| anyhow!("Failed to serialize proven PCZT: {:?}", e),
+        )?))
     });
     unwrap_exc_or_null(res)
 }
