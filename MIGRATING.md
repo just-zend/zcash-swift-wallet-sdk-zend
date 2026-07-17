@@ -15,6 +15,29 @@ information stored.
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
 track failures on its own. Wallet developers would have to account for those.
 
+## Voting: submission contract and pre-1.0 database reset
+
+The voting stack now rides upstream `zcash_voting` 1.0 (see the CHANGELOG for the full surface).
+Two changes affect callers of the voting API directly:
+
+- **`storeVoteTxHash` is what records submission.** Persisting the on-chain transaction hash now
+  marks the vote submitted (submission state is derived from the stored hash and written atomically).
+  Call `storeVoteTxHash` once the vote transaction is broadcast. `markVoteSubmitted` no longer stands
+  alone — it re-applies that state idempotently (rejecting a conflicting hash) and throws if no hash
+  has been stored yet. Any flow that previously called `markVoteSubmitted` as the submission mark must
+  call `storeVoteTxHash` first.
+- **Alpha-era voting databases are reset on open.** The voting database schema was rebuilt for 1.0;
+  opening a voting database created by a 2.6.0-alpha build drops and recreates every voting table
+  (rounds, votes, bundles, proofs, witnesses, share delegations, …). In-progress votes from an alpha
+  build do not survive the upgrade and must be re-cast. This is the separate voting database only —
+  wallet balances and the main wallet database are unaffected.
+
+The voting hotkey contract also changed: `generateHotkey` takes `storedSecret:` (an app-owned
+opaque secret) instead of `seed:`. Passing an empty array mints a fresh random hotkey; passing a
+previously stored 64-byte secret deterministically reconstructs the same hotkey. Persisting that
+secret is the only way to recover the same hotkey — the pre-1.0 seed-derived derivation is not
+reproducible under 1.0.
+
 ## `Broadcaster` redesign (multi-server submission)
 
 The `Broadcaster` API introduced in the 2.6.0-alpha tags has changed:
