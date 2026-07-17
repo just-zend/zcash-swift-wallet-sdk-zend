@@ -65,6 +65,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Helper-share submissions use crate-owned scheduling and nullifier material: shares can only be
     recorded for committed votes, and vote tx hashes are recorded atomically
     (`storeVoteTxHash`/`markVoteSubmitted`).
+  - The Rust core is built with `--cfg zcash_unstable="nu6.3"` (via a repo `.cargo/config.toml`),
+    which `zcash_voting` requires to compile its Ironwood arms — without it every delegation call
+    fails at runtime with "zcash voting only supports Ironwood / NU6.3 shielded voting notes".
+    Voting note witnesses, snapshot note selection, and `nc_root` extraction now read the **Ironwood**
+    note-commitment tree (voting notes live in the Ironwood pool, not Orchard), and a custom-network
+    voting database derives its network from the registered base (a modified-mainnet chain votes with
+    mainnet hotkeys/HRPs) instead of assuming regtest.
 - Generated protobuf Swift stubs are regenerated with a pinned `swift-protobuf` 1.35.1.
 
 ## Fixed

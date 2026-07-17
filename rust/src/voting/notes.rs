@@ -81,13 +81,15 @@ pub unsafe extern "C" fn zcashlc_voting_get_wallet_notes(
             )
         })?;
 
-        // Get the unspent Orchard notes at the historical height.
+        // Get the unspent Ironwood notes at the historical height. zcash_voting
+        // 1.0 votes with Ironwood-pool notes, so voting weight is read from the
+        // Ironwood pool, not Orchard.
         let height = zcash_protocol::consensus::BlockHeight::from_u32(snapshot_height_u32);
         let received_notes = wallet_db
-            .get_unspent_orchard_notes_at_historical_height(resolved_uuid, height)
+            .get_unspent_ironwood_notes_at_historical_height(resolved_uuid, height)
             .map_err(|e| {
                 anyhow!(
-                    "get_unspent_orchard_notes_at_historical_height failed: {}",
+                    "get_unspent_ironwood_notes_at_historical_height failed: {}",
                     e
                 )
             })?;
