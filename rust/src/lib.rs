@@ -2931,20 +2931,33 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
         let mut prover = Prover::new(pczt);
 
         if prover.requires_orchard_proof() {
-            // [IW-1 SPIKE] orchard 0.15-pre keys are built per circuit version.
-            // `FixedPostNu6_2` covers every tx Zodl constructs today (mainnet is
-            // NU6.2-era; NU6.3/ironwood-era proving — incl. the PostNu6_3 circuit
-            // with the disableCrossAddress constraint — is send-path work that
-            // selects the version from the PCZT's target era; MOB-1458 lane).
+            // Regular Orchard-pool proving uses the current fixed (NU6.2-era)
+            // circuit; the Ironwood pool uses the separate PostNu6_3 circuit
+            // proven below.
             prover = prover
                 .create_orchard_proof(&orchard::circuit::ProvingKey::build(
-                    // Regular Orchard-pool proving uses the current fixed circuit; PostNu6_3 is
-                    // reserved for the separate Ironwood proof path.
                     orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2,
                 ))
                 .map_err(|e| anyhow!("Failed to create Orchard proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_orchard_proof());
+
+        if prover.requires_ironwood_proof() {
+            // Post-NU6.3 proposals route orchard-receiver outputs and change
+            // into Ironwood bundles (the Orchard turnstile forbids adding value
+            // to Orchard once NU6.3 is active), so any PCZT built after
+            // activation can carry an Ironwood bundle that must be proven before
+            // extraction — otherwise a hardware-signed transaction fails at
+            // extract with MissingProof. The Ironwood bundle uses the PostNu6_3
+            // circuit (the fixed circuit plus the `disableCrossAddress`
+            // constraint), a distinct proving key from the Orchard pool's.
+            prover = prover
+                .create_ironwood_proof(&orchard::circuit::ProvingKey::build(
+                    orchard::circuit::OrchardCircuitVersion::PostNu6_3,
+                ))
+                .map_err(|e| anyhow!("Failed to create Ironwood proof for PCZT: {:?}", e))?;
+        }
+        assert!(!prover.requires_ironwood_proof());
 
         if prover.requires_sapling_proofs() {
             if spend_params.is_null() {
