@@ -141,12 +141,13 @@ fn validate_cached_tree_state_for_round(
 // VotingDatabase methods — Delegation proof
 // =============================================================================
 
-/// Generate a new app-owned random voting hotkey.
+/// Generate or reconstruct an app-owned voting hotkey.
 ///
-/// zcash_voting 1.0 uses app-owned random hotkeys; the legacy seed parameter
-/// is accepted for ABI compatibility but no longer used for derivation. The
-/// caller must persist `secret_key` (the stored secret) — it is the only way
-/// to reconstruct the hotkey.
+/// zcash_voting 1.0 uses app-owned hotkeys. Pass an empty `stored_secret` to
+/// generate a fresh random hotkey, or a previously stored 64-byte secret to
+/// deterministically reconstruct the same hotkey; any other length is an
+/// error. The caller must persist `secret_key` (the stored secret) — it is
+/// the only way to reconstruct the hotkey.
 ///
 /// Returns a pointer to `FfiVotingHotkey` on success, or null on error.
 /// Call `zcashlc_voting_free_hotkey` to free the returned pointer.
@@ -157,17 +158,22 @@ fn validate_cached_tree_state_for_round(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_generate_hotkey(
     db: *mut VotingDatabaseHandle,
-    seed: *const u8,
-    seed_len: usize,
+    stored_secret: *const u8,
+    stored_secret_len: usize,
 ) -> *mut FfiVotingHotkey {
     let db = AssertUnwindSafe(db);
     let res = catch_panic(|| {
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let _ = (seed, seed_len);
+        let stored_secret = unsafe { bytes_from_ptr(stored_secret, stored_secret_len) }?;
 
-        let hotkey = voting::hotkey::generate_random_voting_hotkey(handle.network)
-            .map_err(|e| anyhow!("generate_hotkey failed: {}", e))?;
+        let hotkey = if stored_secret.is_empty() {
+            voting::hotkey::generate_random_voting_hotkey(handle.network)
+                .map_err(|e| anyhow!("generate_hotkey failed: {}", e))?
+        } else {
+            voting::types::VotingHotkey::from_stored_secret(stored_secret, handle.network)
+                .map_err(|e| anyhow!("invalid voting hotkey material: {}", e))?
+        };
 
         let orchard_addr = orchard::Address::from_raw_address_bytes(hotkey.raw_orchard_address());
         let orchard_addr = Option::from(orchard_addr)

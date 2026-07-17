@@ -49,8 +49,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`buildPczt`, `buildAndProveDelegation`, and the seed-signing `getDelegationSubmission` take
     the wallet DB path, account UUID, and the app-owned hotkey stored secret); the wallet seed
     never enters the crate (the SpendAuth signature is produced in the FFI from the crate's
-    signing request). Voting hotkeys are app-owned random secrets (`generateHotkey` returns the
-    stored secret to persist; the legacy seed parameter is ignored).
+    signing request). Voting hotkeys are app-owned secrets: `generateHotkey(storedSecret:)`
+    generates a fresh random hotkey when passed an empty array and deterministically
+    reconstructs the same hotkey when passed a previously stored 64-byte secret — persisting
+    `secretKey` is the only way to get the same hotkey back.
   - Helper-share submissions use crate-owned scheduling and nullifier material: shares can only be
     recorded for committed votes, and vote tx hashes are recorded atomically
     (`storeVoteTxHash`/`markVoteSubmitted`).

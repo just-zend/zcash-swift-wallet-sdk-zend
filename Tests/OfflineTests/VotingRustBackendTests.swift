@@ -316,6 +316,41 @@ final class VotingRustBackendTests: XCTestCase {
         }
     }
 
+    // MARK: - generateHotkey
+
+    func test_generateHotkey_reconstructsHotkeyFromStoredSecret() throws {
+        let backend = VotingRustBackend()
+        try backend.open(path: makeTempDbPath(), networkId: 1)
+        defer { backend.close() }
+
+        let generated = try backend.generateHotkey(storedSecret: [])
+        XCTAssertEqual(generated.secretKey.count, votingHotkeyStoredSecretByteCount)
+
+        let reconstructed = try backend.generateHotkey(storedSecret: generated.secretKey)
+        XCTAssertEqual(reconstructed.secretKey, generated.secretKey)
+        XCTAssertEqual(reconstructed.publicKey, generated.publicKey)
+        XCTAssertEqual(reconstructed.address, generated.address)
+
+        let fresh = try backend.generateHotkey(storedSecret: [])
+        XCTAssertNotEqual(fresh.address, generated.address)
+    }
+
+    func test_generateHotkey_rejectsWrongLengthSecret() throws {
+        let backend = VotingRustBackend()
+        try backend.open(path: makeTempDbPath(), networkId: 1)
+        defer { backend.close() }
+
+        XCTAssertThrowsError(
+            try backend.generateHotkey(storedSecret: [UInt8](repeating: 1, count: votingMinSeedByteCount))
+        ) { error in
+            guard case VotingRustBackendError.rustError(let message) = error else {
+                XCTFail("Expected .rustError, got \(error)")
+                return
+            }
+            XCTAssertTrue(message.contains("64"), "unexpected message: \(message)")
+        }
+    }
+
     func test_extractOrchardFvk_invalidUfvk_throwsRustError() {
         XCTAssertThrowsError(
             try VotingRustBackend.extractOrchardFvk(ufvk: "not-a-ufvk", networkId: 1)
@@ -1081,7 +1116,7 @@ final class VotingRustBackendTests: XCTestCase {
             _ = try await backend.buildVoteCommitment(
                 roundId: "0000000000000000000000000000000000000000000000000000000000000001",
                 bundleIndex: 0,
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
+                hotkeySecret: [UInt8](repeating: 1, count: votingMinSeedByteCount),
                 networkId: 1,
                 proposalId: 0,
                 choice: 0,
@@ -1115,7 +1150,7 @@ final class VotingRustBackendTests: XCTestCase {
             _ = try await backend.buildVoteCommitment(
                 roundId: "0000000000000000000000000000000000000000000000000000000000000001",
                 bundleIndex: 0,
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount - 1),
+                hotkeySecret: [UInt8](repeating: 1, count: votingMinSeedByteCount - 1),
                 networkId: 1,
                 proposalId: 0,
                 choice: 0,
