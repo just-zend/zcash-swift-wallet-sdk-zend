@@ -353,7 +353,7 @@ extension VotingRustBackend {
     public func buildVoteCommitment(
         roundId: String,
         bundleIndex: UInt32,
-        hotkeySeed: [UInt8],
+        hotkeySecret: [UInt8],
         networkId: UInt32,
         proposalId: UInt32,
         choice: UInt32,
@@ -368,7 +368,7 @@ extension VotingRustBackend {
             try syncBuildVoteCommitment(
                 roundId: roundId,
                 bundleIndex: bundleIndex,
-                hotkeySeed: hotkeySeed,
+                hotkeySecret: hotkeySecret,
                 networkId: networkId,
                 proposalId: proposalId,
                 choice: choice,
@@ -1390,14 +1390,19 @@ extension VotingRustBackend {
 // MARK: - Delegation workflow
 
 extension VotingRustBackend {
-    /// Generate a voting hotkey.
+    /// Generate or reconstruct an app-owned voting hotkey.
+    ///
+    /// Pass an empty `storedSecret` to generate a fresh random hotkey, or the
+    /// previously stored 64-byte secret (`VotingHotkey.secretKey`) to
+    /// deterministically reconstruct the same hotkey. Any other length throws.
     ///
     /// The returned secret key is owned by Swift after this call. The Rust
-    /// allocation is freed before this method returns; callers should treat
-    /// the secret bytes with the same care as any other key material.
-    public func generateHotkey(seed: [UInt8]) throws -> VotingHotkey {
+    /// allocation is freed before this method returns; callers must persist
+    /// `secretKey` — it is the only way to reconstruct the hotkey — and treat
+    /// it with the same care as any other key material.
+    public func generateHotkey(storedSecret: [UInt8]) throws -> VotingHotkey {
         let ptr: UnsafeMutablePointer<FfiVotingHotkey> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiVotingHotkey>? = seed.withUnsafeBufferPointer { seedBuf in
+            let ptr: UnsafeMutablePointer<FfiVotingHotkey>? = storedSecret.withUnsafeBufferPointer { seedBuf in
                 zcashlc_voting_generate_hotkey(
                     dbh,
                     seedBuf.baseAddress,
@@ -1825,7 +1830,7 @@ private extension VotingRustBackend {
     func syncBuildVoteCommitment(
         roundId: String,
         bundleIndex: UInt32,
-        hotkeySeed: [UInt8],
+        hotkeySecret: [UInt8],
         networkId: UInt32,
         proposalId: UInt32,
         choice: UInt32,
@@ -1849,7 +1854,7 @@ private extension VotingRustBackend {
 
         let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
             let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                hotkeySeed.withUnsafeBufferPointer { seedBuf in
+                hotkeySecret.withUnsafeBufferPointer { seedBuf in
                     authPathBytes.withUnsafeBufferPointer { pathBuf in
                         zcashlc_voting_build_vote_commitment(
                             dbh,

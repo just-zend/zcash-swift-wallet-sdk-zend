@@ -7,6 +7,9 @@ let votingFieldElementByteCount = 32
 let votingAccountUuidByteCount = 16
 let votingOrchardFvkByteCount = 96
 let votingMinSeedByteCount = 32
+/// Length of the opaque app-owned hotkey stored secret
+/// (`zcash_voting::hotkey::VOTING_HOTKEY_STORED_SECRET_LEN`).
+let votingHotkeyStoredSecretByteCount = 64
 let votingSeedFingerprintByteCount = 32
 let votingShareNullifierByteCount = 32
 let votingShareNullifierHexCharacterCount = votingShareNullifierByteCount * 2
