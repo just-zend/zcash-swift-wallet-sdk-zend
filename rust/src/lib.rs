@@ -2269,6 +2269,151 @@ fn zip317_helper<DbT>(
     )
 }
 
+/// Returns the shielded pools that ordinary wallet sends may spend at the proposal target height.
+///
+/// Orchard remains an ordinary spend source until the first block in which NU6.3 is active. From
+/// that target height onward, Orchard is reserved for migration and Ironwood replaces it as the
+/// Orchard-family spend source. Transparent inputs are never part of this shielded-only policy.
+fn ordinary_spend_pools_at_target<ParamsT: Parameters>(
+    params: &ParamsT,
+    target_height: wallet::TargetHeight,
+) -> [ShieldedPool; 2] {
+    let orchard_family_pool = if params.is_nu_active(NetworkUpgrade::Nu6_3, target_height.into()) {
+        ShieldedPool::Ironwood
+    } else {
+        ShieldedPool::Orchard
+    };
+
+    [ShieldedPool::Sapling, orchard_family_pool]
+}
+
+/// Ensures that librustzcash built the proposal for the same side of the NU6.3 boundary used to
+/// choose its spend pools. The wallet database is queried once by this FFI and again internally by
+/// librustzcash, so a target-height change between those reads must fail closed.
+fn ensure_ordinary_spend_pools_match_target<ParamsT: Parameters>(
+    params: &ParamsT,
+    spend_pools: [ShieldedPool; 2],
+    proposal_target_height: wallet::TargetHeight,
+) -> anyhow::Result<()> {
+    if ordinary_spend_pools_at_target(params, proposal_target_height) != spend_pools {
+        Err(anyhow!(
+            "Wallet target height crossed the NU6.3 activation boundary while constructing the \
+             proposal; sync and retry."
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolves the proposal target height with the same confirmation policy that will be passed to
+/// librustzcash, then returns the ordinary-send pool set for that height.
+fn ordinary_spend_pools<DbT, ParamsT>(
+    wallet_db: &DbT,
+    params: &ParamsT,
+    confirmations_policy: wallet::ConfirmationsPolicy,
+) -> anyhow::Result<[ShieldedPool; 2]>
+where
+    DbT: WalletRead,
+    ParamsT: Parameters,
+    <DbT as WalletRead>::Error: std::fmt::Display,
+{
+    let target_height = wallet_db
+        .get_target_and_anchor_heights(confirmations_policy.trusted())
+        .map_err(|e| anyhow!("Error while fetching target height: {}", e))?
+        .map(|(target_height, _)| target_height)
+        .context("Target height not available; scan required.")?;
+
+    Ok(ordinary_spend_pools_at_target(params, target_height))
+}
+
+#[cfg(test)]
+mod ordinary_spend_pool_tests {
+    use super::*;
+
+    fn testnet_nu6_3_activation_height() -> BlockHeight {
+        TestNetwork
+            .activation_height(NetworkUpgrade::Nu6_3)
+            .expect("NU6.3 must have a testnet activation height")
+    }
+
+    #[test]
+    fn ordinary_spends_use_orchard_immediately_before_nu6_3() {
+        let target_height =
+            BlockHeight::from_u32(u32::from(testnet_nu6_3_activation_height()) - 1).into();
+
+        assert_eq!(
+            ordinary_spend_pools_at_target(&TestNetwork, target_height),
+            [ShieldedPool::Sapling, ShieldedPool::Orchard]
+        );
+    }
+
+    #[test]
+    fn ordinary_spends_use_ironwood_starting_at_nu6_3() {
+        let target_height = testnet_nu6_3_activation_height().into();
+
+        assert_eq!(
+            ordinary_spend_pools_at_target(&TestNetwork, target_height),
+            [ShieldedPool::Sapling, ShieldedPool::Ironwood]
+        );
+        assert!(
+            ensure_ordinary_spend_pools_match_target(
+                &TestNetwork,
+                [ShieldedPool::Sapling, ShieldedPool::Orchard],
+                target_height,
+            )
+            .is_err()
+        );
+    }
+
+    fn assert_ordinary_entrypoint_wiring(function_name: &str, pool_application: &str) {
+        // Full FFI tests require a populated wallet database. Keep this source-level guard so a
+        // future entrypoint edit cannot silently bypass either half of the shared policy seam.
+        let source = include_str!("lib.rs");
+        let signature = format!("pub unsafe extern \"C\" fn {function_name}(");
+        let entrypoint_source = source
+            .split_once(&signature)
+            .unwrap_or_else(|| panic!("missing FFI entrypoint {function_name}"))
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("could not isolate FFI entrypoint {function_name}"));
+
+        assert!(
+            entrypoint_source.contains("let spend_pools = ordinary_spend_pools("),
+            "{function_name} must resolve the shared ordinary-spend policy"
+        );
+        assert!(
+            entrypoint_source.contains(pool_application),
+            "{function_name} must pass the selected pools into proposal construction"
+        );
+        assert!(
+            entrypoint_source.contains("ensure_ordinary_spend_pools_match_target("),
+            "{function_name} must fail closed if its proposal crosses NU6.3"
+        );
+    }
+
+    #[test]
+    fn transfer_entrypoint_is_wired_through_the_shared_policy() {
+        assert_ordinary_entrypoint_wiring(
+            "zcashlc_propose_transfer",
+            "SpendPolicy::shielded_pools(spend_pools)",
+        );
+    }
+
+    #[test]
+    fn send_max_entrypoint_is_wired_through_the_shared_policy() {
+        assert_ordinary_entrypoint_wiring("zcashlc_propose_send_max_transfer", "&spend_pools,");
+    }
+
+    #[test]
+    fn zip_321_entrypoint_is_wired_through_the_shared_policy() {
+        assert_ordinary_entrypoint_wiring(
+            "zcashlc_propose_transfer_from_uri",
+            "SpendPolicy::shielded_pools(spend_pools)",
+        );
+    }
+}
+
 /// Select transaction inputs, compute fees, and construct a proposal for a transaction
 /// that can then be authorized and made ready for submission to the network with
 /// `zcashlc_create_proposed_transaction`.
@@ -2337,6 +2482,10 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
         ])
         .map_err(|e| anyhow!("Error creating transaction request: {:?}", e))?;
 
+        let confirmations_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
+        let spend_pools = ordinary_spend_pools(&db_data, &network, confirmations_policy)?;
+        let spend_policy = SpendPolicy::shielded_pools(spend_pools);
+
         let proposal = propose_transfer::<_, _, _, _, Infallible>(
             &mut db_data,
             &network,
@@ -2344,11 +2493,17 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             &input_selector,
             &change_strategy,
             req,
-            wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
-            &SpendPolicy::default(),
+            confirmations_policy,
+            &spend_policy,
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
+
+        ensure_ordinary_spend_pools_match_target(
+            &network,
+            spend_pools,
+            proposal.min_target_height(),
+        )?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -2420,20 +2575,27 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             ffi::MaxSpendMode::Everything => MaxSpendMode::Everything,
         };
 
-        let confirmation_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
+        let confirmations_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
+        let spend_pools = ordinary_spend_pools(&db_data, &network, confirmations_policy)?;
 
         let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
             &mut db_data,
             &network,
             account_uuid,
-            &[ShieldedPool::Sapling, ShieldedPool::Orchard],
+            &spend_pools,
             &StandardFeeRule::Zip317,
             to,
             memo,
             mode,
-            confirmation_policy,
+            confirmations_policy,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
+
+        ensure_ordinary_spend_pools_match_target(
+            &network,
+            spend_pools,
+            proposal.min_target_height(),
+        )?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -2492,6 +2654,10 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
         let req = TransactionRequest::from_uri(payment_uri_str)
             .map_err(|e| anyhow!("Error creating transaction request: {:?}", e))?;
 
+        let confirmations_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
+        let spend_pools = ordinary_spend_pools(&db_data, &network, confirmations_policy)?;
+        let spend_policy = SpendPolicy::shielded_pools(spend_pools);
+
         let proposal = propose_transfer::<_, _, _, _, Infallible>(
             &mut db_data,
             &network,
@@ -2499,11 +2665,17 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             &input_selector,
             &change_strategy,
             req,
-            wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
-            &SpendPolicy::default(),
+            confirmations_policy,
+            &spend_policy,
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
+
+        ensure_ordinary_spend_pools_match_target(
+            &network,
+            spend_pools,
+            proposal.min_target_height(),
+        )?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 

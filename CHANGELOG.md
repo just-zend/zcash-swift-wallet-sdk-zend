@@ -72,6 +72,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcash_voting 1.0.0` still pins Orchard 0.14 + unstable voting circuits, while this audited
   Ironwood graph uses Orchard 0.15.0. Re-enable only after the voting stack moves to Orchard 0.15.
 ## Fixed
+- Ordinary transfer, ZIP-321, and send-max proposals now apply the NU6.3 spend policy at the
+  proposal target height: Sapling and Orchard before activation, and Sapling and Ironwood at or
+  after activation. Transparent inputs remain excluded from ordinary shielded sends.
 - Migration terminal reconciliation now requires every confirmed migration transaction's exact
   Ironwood value to be **spendable** through upstream note selection, in addition to the existing
   ten-block transfer burial gate. Unrelated pre-existing Ironwood can no longer satisfy completion,
