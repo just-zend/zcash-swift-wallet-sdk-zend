@@ -39,28 +39,6 @@ private let roundTripVoteCommitment = [UInt8](repeating: 0xAA, count: votingFiel
 final class VotingRustBackendTests: XCTestCase {
     private var dbPath: String?
 
-    // Most zcash_voting FFI entry points are still honest stubs on the orchard 0.15 graph, pending
-    // a zcash_voting release that supports it. Probe one stubbed entry point once per run: tests
-    // that exercise stubbed entry points skip while the port is pending and re-arm automatically
-    // when the real implementations return.
-    private static let votingFFIPortPending: Bool = {
-        do {
-            _ = try VotingRustBackend.decomposeWeight(1)
-            return false
-        } catch VotingRustBackendError.rustError(let message) {
-            return message.contains("zcash_voting port pending")
-        } catch {
-            return false
-        }
-    }()
-
-    private func skipWhileVotingPortPending() throws {
-        try XCTSkipIf(
-            Self.votingFFIPortPending,
-            "Exercises an FFI entry point that is stubbed until a zcash_voting release supports the orchard 0.15 graph"
-        )
-    }
-
     override func tearDown() {
         if let dbPath {
             try? FileManager.default.removeItem(atPath: dbPath)
@@ -72,7 +50,6 @@ final class VotingRustBackendTests: XCTestCase {
     // MARK: - computeShareNullifier
 
     func test_computeShareNullifier_returnsExpectedValueForKnownFixture() throws {
-        try skipWhileVotingPortPending()
         var voteCommitment = [UInt8](repeating: 0, count: votingFieldElementByteCount)
         voteCommitment[0] = 0x01
         var primaryBlind = [UInt8](repeating: 0, count: votingFieldElementByteCount)
@@ -243,18 +220,6 @@ final class VotingRustBackendTests: XCTestCase {
 
     // MARK: - Foundation helpers
 
-    func test_decomposeWeight_isSuperseded() {
-        // The share split is denomination-based, PRF-keyed, and computed inside
-        // the vote commit flow; a standalone decomposition cannot describe it.
-        XCTAssertThrowsError(try VotingRustBackend.decomposeWeight(11)) { error in
-            guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-            XCTAssertTrue(message.contains("superseded"))
-        }
-    }
-
     func test_warmProvingCaches_doesNotThrow() throws {
         XCTAssertNoThrow(try VotingRustBackend.warmProvingCaches())
         XCTAssertNoThrow(try VotingRustBackend.warmProvingCaches())
@@ -348,6 +313,135 @@ final class VotingRustBackendTests: XCTestCase {
                 return
             }
             XCTAssertTrue(message.contains("64"), "unexpected message: \(message)")
+        }
+    }
+
+    // MARK: - Committed-vote recovery
+
+    func test_recordVcPosition_withoutCommittedVote_throwsRustError() throws {
+        let backend = try makeReadyBackend()
+        defer { backend.close() }
+
+        try createRoundWithBundle(backend, roundId: roundTripRoundId)
+
+        XCTAssertThrowsError(
+            try backend.recordVcPosition(
+                roundId: roundTripRoundId,
+                bundleIndex: roundTripBundleIndex,
+                proposalId: roundTripProposalId,
+                vcTreePosition: roundTripVoteCommitmentTreePosition
+            )
+        ) { error in
+            guard case VotingRustBackendError.rustError(let message) = error else {
+                XCTFail("expected .rustError, got \(error)")
+                return
+            }
+            XCTAssertTrue(message.contains("vote recovery bundle not found"), "unexpected message: \(message)")
+        }
+    }
+
+    func test_recoverCommittedVote_withoutCommittedVote_throwsRustError() throws {
+        let backend = try makeReadyBackend()
+        defer { backend.close() }
+
+        try createRoundWithBundle(backend, roundId: roundTripRoundId)
+
+        XCTAssertThrowsError(
+            try backend.recoverCommittedVote(
+                roundId: roundTripRoundId,
+                bundleIndex: roundTripBundleIndex,
+                proposalId: roundTripProposalId
+            )
+        ) { error in
+            guard case VotingRustBackendError.rustError(let message) = error else {
+                XCTFail("expected .rustError, got \(error)")
+                return
+            }
+            XCTAssertTrue(message.contains("vote recovery bundle not found"), "unexpected message: \(message)")
+        }
+    }
+
+    func test_recordShareDelegation_emptyNullifier_skipsShapeValidation() throws {
+        let backend = try makeReadyBackend()
+        defer { backend.close() }
+
+        try createRoundWithBundle(backend, roundId: roundTripRoundId)
+
+        // An empty nullifier must pass validation (the crate computes its own
+        // on record) and fail later on the missing recovery bundle instead.
+        XCTAssertThrowsError(
+            try backend.recordShareDelegation(
+                roundId: roundTripRoundId,
+                bundleIndex: roundTripBundleIndex,
+                proposalId: roundTripProposalId,
+                shareIndex: roundTripShareIndex0,
+                sentToURLs: [roundTripHelperAURL],
+                nullifier: "",
+                submitAt: 0
+            )
+        ) { error in
+            guard case VotingRustBackendError.rustError(let message) = error else {
+                XCTFail("expected .rustError, got \(error)")
+                return
+            }
+            XCTAssertFalse(message.contains("nullifier"), "empty nullifier must skip shape validation: \(message)")
+            XCTAssertTrue(message.contains("vote recovery bundle not found"), "unexpected message: \(message)")
+        }
+    }
+
+    // MARK: - scheduledShareSubmitAt
+
+    func test_scheduledShareSubmitAt_singleShare_returnsImmediate() throws {
+        let submitAt = try VotingRustBackend.scheduledShareSubmitAt(
+            nowSeconds: 1_000,
+            ceremonyStartSeconds: 0,
+            voteEndSeconds: 10_000,
+            singleShare: true,
+            entropy: []
+        )
+        XCTAssertEqual(submitAt, 0)
+    }
+
+    func test_scheduledShareSubmitAt_elapsedWindow_returnsImmediate() throws {
+        // Duration 10_000 → buffer ceil(2/5 · 10_000) = 4_000 → deadline
+        // 6_000; `now` past the deadline collapses the delay window.
+        let submitAt = try VotingRustBackend.scheduledShareSubmitAt(
+            nowSeconds: 9_000,
+            ceremonyStartSeconds: 0,
+            voteEndSeconds: 10_000,
+            singleShare: false,
+            entropy: []
+        )
+        XCTAssertEqual(submitAt, 0)
+    }
+
+    func test_scheduledShareSubmitAt_openWindow_schedulesInsideWindow() throws {
+        // Duration 10_000 → deadline 6_000; window = [1_000, 6_000).
+        let submitAt = try VotingRustBackend.scheduledShareSubmitAt(
+            nowSeconds: 1_000,
+            ceremonyStartSeconds: 0,
+            voteEndSeconds: 10_000,
+            singleShare: false,
+            entropy: [UInt8](repeating: 0xA5, count: 8)
+        )
+        XCTAssertGreaterThanOrEqual(submitAt, 1_000)
+        XCTAssertLessThan(submitAt, 6_000)
+    }
+
+    func test_scheduledShareSubmitAt_openWindow_rejectsShortEntropy() {
+        XCTAssertThrowsError(
+            try VotingRustBackend.scheduledShareSubmitAt(
+                nowSeconds: 1_000,
+                ceremonyStartSeconds: 0,
+                voteEndSeconds: 10_000,
+                singleShare: false,
+                entropy: [1, 2, 3]
+            )
+        ) { error in
+            guard case VotingRustBackendError.rustError = error else {
+                XCTFail("expected .rustError, got \(error)")
+                return
+            }
         }
     }
 
@@ -460,7 +554,6 @@ final class VotingRustBackendTests: XCTestCase {
     // MARK: - Round lifecycle
 
     func test_initRound_andGetRoundState_roundTripPersistsParams() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
@@ -514,7 +607,6 @@ final class VotingRustBackendTests: XCTestCase {
     }
 
     func test_listRounds_returnsInitializedRound() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
@@ -540,7 +632,6 @@ final class VotingRustBackendTests: XCTestCase {
     }
 
     func test_getVotes_returnsEmpty_forFreshRound() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
@@ -559,7 +650,6 @@ final class VotingRustBackendTests: XCTestCase {
     // MARK: - Recovery state
 
     func test_delegationTxHash_roundTrips() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
@@ -602,7 +692,6 @@ final class VotingRustBackendTests: XCTestCase {
     }
 
     func test_voteTxHash_roundTrips() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeReadyBackend(walletId: roundTripWalletId)
         defer { backend.close() }
 
@@ -639,41 +728,7 @@ final class VotingRustBackendTests: XCTestCase {
         )
     }
 
-    func test_storeCommitmentBundle_isSuperseded() throws {
-        let backend = try makeReadyBackend(walletId: roundTripWalletId)
-        defer { backend.close() }
-
-        try createRoundWithBundle(backend, roundId: roundTripRoundId)
-
-        // Nothing stored externally: reads fail cleanly…
-        XCTAssertThrowsError(
-            try backend.getCommitmentBundle(
-                roundId: roundTripRoundId,
-                bundleIndex: roundTripBundleIndex,
-                proposalId: roundTripProposalId
-            )
-        )
-        // …and external injection is rejected — zcash_voting persists
-        // commitment bundles itself as part of the vote commit flow.
-        XCTAssertThrowsError(
-            try backend.storeCommitmentBundle(
-                roundId: roundTripRoundId,
-                bundleIndex: roundTripBundleIndex,
-                proposalId: roundTripProposalId,
-                bundleJson: roundTripCommitmentBundleJson,
-                voteCommitmentTreePosition: roundTripVoteCommitmentTreePosition
-            )
-        ) { error in
-            guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-            XCTAssertTrue(message.contains("superseded"), "unexpected message: \(message)")
-        }
-    }
-
     func test_keystoneSignature_roundTrips() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
@@ -701,7 +756,6 @@ final class VotingRustBackendTests: XCTestCase {
     }
 
     func test_storeKeystoneSignature_rejectsBadLengths() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
@@ -827,7 +881,6 @@ final class VotingRustBackendTests: XCTestCase {
     // MARK: - Delegation workflow
 
     func test_setupBundles_rejectsEmptyNotes() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
@@ -1085,30 +1138,6 @@ final class VotingRustBackendTests: XCTestCase {
         }
     }
 
-    func test_encryptShares_beforeOpen_throwsDatabaseNotOpen() {
-        let backend = VotingRustBackend()
-        XCTAssertThrowsError(try backend.encryptShares(roundId: "0000000000000000000000000000000000000000000000000000000000000001", shares: [1])) { error in
-            guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
-                return
-            }
-        }
-    }
-
-    func test_encryptShares_afterOpen_isSuperseded() throws {
-        try skipWhileVotingPortPending()
-        let backend = try makeOpenBackend()
-        defer { backend.close() }
-
-        XCTAssertThrowsError(try backend.encryptShares(roundId: "missing-round", shares: [1, 2])) { error in
-            guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-            XCTAssertTrue(message.contains("superseded"), "unexpected message: \(message)")
-        }
-    }
-
     func test_buildVoteCommitment_beforeOpen_throwsDatabaseNotOpen() async {
         let backend = VotingRustBackend()
 
@@ -1140,7 +1169,6 @@ final class VotingRustBackendTests: XCTestCase {
     }
 
     func test_buildVoteCommitment_afterOpen_rejectsShortSeedAndDoesNotReportProgress() async throws {
-        try skipWhileVotingPortPending()
         let backend = try makeOpenBackend()
         defer { backend.close() }
         let progressReported = expectation(description: "progress must not be reported before seed validation")
@@ -1217,7 +1245,6 @@ final class VotingRustBackendTests: XCTestCase {
     }
 
     func test_voteSubmissionHelpers_afterOpen_buildPayloadsAndSignWithSyntheticCommitment() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeOpenBackend()
         defer { backend.close() }
         let commitment = makeVoteCommitmentBundle(proposalId: 7)
@@ -1247,15 +1274,6 @@ final class VotingRustBackendTests: XCTestCase {
         )
         XCTAssertEqual(nullifier.count, votingShareNullifierHexCharacterCount)
 
-        // Signing is superseded: the signature is produced inside the vote
-        // commit flow and returned as vote_auth_sig.
-        XCTAssertThrowsError(
-            try VotingRustBackend.signCastVote(
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-                networkId: 1,
-                commitment: commitment
-            )
-        )
     }
 
     func test_markVoteSubmitted_beforeOpen_throwsDatabaseNotOpen() {
@@ -1271,7 +1289,6 @@ final class VotingRustBackendTests: XCTestCase {
     }
 
     func test_markVoteSubmitted_afterOpen_missingVote_throwsRustError() throws {
-        try skipWhileVotingPortPending()
         let backend = try makeOpenBackend()
         defer { backend.close() }
 
@@ -1279,75 +1296,6 @@ final class VotingRustBackendTests: XCTestCase {
             try backend.markVoteSubmitted(roundId: "missing-round", bundleIndex: 0, proposalId: 0)
         ) { error in
             assertNoVoteFound(error)
-        }
-    }
-
-    func test_signCastVote_invalidCommitment_throwsRustError() {
-        XCTAssertThrowsError(
-            try VotingRustBackend.signCastVote(
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-                networkId: 1,
-                commitment: makeVoteCommitmentBundle(voteRoundId: "too-short")
-            )
-        ) { error in
-            guard case VotingRustBackendError.rustError = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-        }
-    }
-
-    func test_signCastVote_rejectsShortSeed() throws {
-        // The cast-vote signature is produced inside the vote commit flow
-        // (returned as vote_auth_sig); the detached entry point is superseded.
-        XCTAssertThrowsError(
-            try VotingRustBackend.signCastVote(
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-                networkId: 1,
-                commitment: makeVoteCommitmentBundle()
-            )
-        ) { error in
-            guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-            XCTAssertTrue(message.contains("superseded"), "unexpected message: \(message)")
-        }
-    }
-
-    func test_signCastVote_rejectsWrongSizedCanonicalFields() throws {
-        // The cast-vote signature is produced inside the vote commit flow
-        // (returned as vote_auth_sig); the detached entry point is superseded.
-        XCTAssertThrowsError(
-            try VotingRustBackend.signCastVote(
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-                networkId: 1,
-                commitment: makeVoteCommitmentBundle()
-            )
-        ) { error in
-            guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-            XCTAssertTrue(message.contains("superseded"), "unexpected message: \(message)")
-        }
-    }
-
-    func test_signCastVote_validFixture_returnsSignature() throws {
-        // The cast-vote signature is produced inside the vote commit flow
-        // (returned as vote_auth_sig); the detached entry point is superseded.
-        XCTAssertThrowsError(
-            try VotingRustBackend.signCastVote(
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-                networkId: 1,
-                commitment: makeVoteCommitmentBundle()
-            )
-        ) { error in
-            guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-            XCTAssertTrue(message.contains("superseded"), "unexpected message: \(message)")
         }
     }
 

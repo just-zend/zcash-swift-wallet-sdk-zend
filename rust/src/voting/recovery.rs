@@ -220,6 +220,107 @@ pub unsafe extern "C" fn zcashlc_voting_get_commitment_bundle(
     unwrap_exc_or_null(res)
 }
 
+/// The enriched committed-vote JSON plus the currently stored
+/// vote-commitment tree position.
+#[derive(serde::Serialize)]
+struct JsonRecoveredCommittedVote {
+    #[serde(flatten)]
+    committed: super::vote::JsonCommittedVoteBundle,
+    vc_tree_position: u64,
+}
+
+/// Record the confirmed vote-commitment tree position for a committed vote.
+///
+/// Wraps `CommittedVote::recover` + `record_vc_position`: after the cast-vote
+/// transaction confirms with a `leaf_index`, record the VC position so
+/// recovered helper-share payloads carry it. Returns 0 on success, -1 on error.
+///
+/// # Safety
+///
+/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// - `round_id` must be a valid UTF-8 pointer with its stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_record_vc_position(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+    bundle_index: u32,
+    proposal_id: u32,
+    vc_tree_position: u64,
+) -> i32 {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        let committed = zcash_voting::vote::CommittedVote::recover(
+            &handle.db,
+            &round_id_str,
+            bundle_index,
+            proposal_id,
+        )
+        .map_err(|e| anyhow!("record_vc_position failed: {}", e))?;
+        committed
+            .record_vc_position(&handle.db, vc_tree_position)
+            .map_err(|e| anyhow!("record_vc_position failed: {}", e))?;
+        Ok(0)
+    });
+    unwrap_exc_or(res, -1)
+}
+
+/// Reconstruct a committed vote from crate recovery state.
+///
+/// Returns the same enriched JSON as `zcashlc_voting_build_vote_commitment`
+/// (bundle fields + `vote_auth_sig` + `share_payloads`, with payloads carrying
+/// the currently stored VC tree position) plus `vc_tree_position`. Call after
+/// `zcashlc_voting_record_vc_position` to obtain payloads at the confirmed
+/// position. Returns null (with the error retrievable) when no committed vote
+/// exists for the key.
+///
+/// # Safety
+///
+/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// - `round_id` must be a valid UTF-8 pointer with its stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_recover_committed_vote(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> *mut crate::ffi::BoxedSlice {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        let committed = zcash_voting::vote::CommittedVote::recover(
+            &handle.db,
+            &round_id_str,
+            bundle_index,
+            proposal_id,
+        )
+        .map_err(|e| anyhow!("recover_committed_vote failed: {}", e))?;
+        let signed = committed
+            .signed_commitment(&handle.db)
+            .map_err(|e| anyhow!("failed to read committed vote: {}", e))?;
+        let vc_tree_position = zcash_voting::recovery::recoverable_commitment_bundle(
+            &handle.db,
+            &round_id_str,
+            bundle_index,
+            proposal_id,
+        )
+        .map_err(|e| anyhow!("recover_committed_vote failed: {}", e))?
+        .map(|bundle| bundle.vc_tree_position)
+        .unwrap_or(0);
+        json_to_boxed_slice(&JsonRecoveredCommittedVote {
+            committed: super::vote::committed_vote_json(&signed),
+            vc_tree_position,
+        })
+    });
+    unwrap_exc_or_null(res)
+}
+
 /// Persist a Keystone-produced PCZT signature.
 ///
 /// # Safety

@@ -111,6 +111,47 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
     unwrap_exc_or_null(res)
 }
 
+/// Compute the crate-scheduled helper-share submit time.
+///
+/// Pure policy over `zcash_voting`'s `share_policy`: derives the last-moment
+/// buffer from the ceremony timing and samples uniformly inside the
+/// pre-last-moment window from the supplied entropy (callers must pass at
+/// least 8 fresh CSPRNG bytes when a delay window exists; the crate owns the
+/// sampling). Returns the Unix seconds to submit at (0 = immediately), or -1
+/// on error.
+///
+/// # Safety
+///
+/// - If `entropy_len > 0` then `entropy` must be non-null and valid for reads
+///   for `entropy_len` bytes; if `entropy_len == 0`, `entropy` is ignored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_scheduled_share_submit_at(
+    now_seconds: u64,
+    ceremony_start_seconds: u64,
+    vote_end_seconds: u64,
+    single_share: u8,
+    entropy: *const u8,
+    entropy_len: usize,
+) -> i64 {
+    let res = catch_panic(|| {
+        let bytes = unsafe { bytes_from_ptr(entropy, entropy_len) }?;
+        let buffer = voting::share::policy::last_moment_buffer_seconds(
+            ceremony_start_seconds,
+            vote_end_seconds,
+        );
+        let submit_at = voting::share::policy::scheduled_share_submit_at_from_entropy(
+            now_seconds,
+            vote_end_seconds,
+            buffer,
+            single_share != 0,
+            bytes,
+        )
+        .map_err(|e| anyhow!("scheduled_share_submit_at failed: {}", e))?;
+        i64::try_from(submit_at).map_err(|_| anyhow!("submit_at exceeds i64 range"))
+    });
+    unwrap_exc_or(res, -1)
+}
+
 /// Record a share delegation after sending to helper servers.
 ///
 /// Returns 0 on success, -1 on error.
@@ -140,10 +181,14 @@ pub unsafe extern "C" fn zcashlc_voting_record_share_delegation(
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        // The nullifier now lives in recovery state and is owned by the crate;
-        // the parameter is validated for shape but no longer persisted here.
+        // The nullifier now lives in recovery state and is owned by the crate
+        // (`share::record` computes and persists its own); an empty parameter
+        // skips the legacy shape check, non-empty values are still validated
+        // for shape but never persisted here.
         let nullifier_hex_str = unsafe { str_from_ptr(nullifier_hex, nullifier_hex_len) }?;
-        decode_share_nullifier_hex(&nullifier_hex_str)?;
+        if !nullifier_hex_str.is_empty() {
+            decode_share_nullifier_hex(&nullifier_hex_str)?;
+        }
         let urls_bytes = unsafe { bytes_from_ptr(sent_to_urls_json, sent_to_urls_json_len) }?;
         let sent_to_urls: Vec<String> = serde_json::from_slice(urls_bytes)?;
 
