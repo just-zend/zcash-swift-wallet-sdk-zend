@@ -4,25 +4,15 @@ use prost::Message;
 use zcash_client_backend::proto::service::TreeState;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_voting as voting;
-use zip32::AccountId;
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
-use super::constants::{ORCHARD_FVK_LEN, SEED_FINGERPRINT_LEN};
-use super::helpers::{
-    bytes_from_ptr, derive_hotkey_side_inputs, json_to_boxed_slice, str_from_ptr, usk_from_seed,
-};
-use super::json::{JsonDelegationInputs, JsonWitnessData};
+use super::helpers::{bytes_from_ptr, str_from_ptr};
+use super::json::JsonWitnessData;
 
 // =============================================================================
 // Free functions (no VotingDatabase needed)
 // =============================================================================
-
-const HOTKEY_ACCOUNT_INDEX: u32 = 0;
-
-fn hotkey_account() -> AccountId {
-    AccountId::try_from(HOTKEY_ACCOUNT_INDEX).expect("hotkey account 0 is valid")
-}
 
 /// Warm process-lifetime proving-key caches used by voting proofs.
 ///
@@ -62,110 +52,52 @@ pub unsafe extern "C" fn zcashlc_voting_decompose_weight(
     unwrap_exc_or_null(res)
 }
 
-/// Generate delegation inputs from sender seed and hotkey seed.
-///
-/// Returns JSON-encoded `DelegationInputs` as `*mut FfiBoxedSlice`, or null on error.
+/// Superseded: zcash_voting 1.0 derives delegation inputs from the wallet database
+/// inside the delegation lanes (`build_pczt` / `build_and_prove_delegation` /
+/// `get_delegation_submission`); seed-derived side inputs no longer exist.
+/// Always returns null with a "superseded" error (C symbol preserved).
 ///
 /// # Safety
 ///
-/// - `sender_seed` and `hotkey_seed` must be valid for their stated lengths.
+/// - The pointer arguments are not read.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_generate_delegation_inputs(
-    sender_seed: *const u8,
-    sender_seed_len: usize,
-    hotkey_seed: *const u8,
-    hotkey_seed_len: usize,
-    network_id: u32,
-    account_index: u32,
+    _sender_seed: *const u8,
+    _sender_seed_len: usize,
+    _hotkey_seed: *const u8,
+    _hotkey_seed_len: usize,
+    _network_id: u32,
+    _account_index: u32,
 ) -> *mut crate::ffi::BoxedSlice {
     let res = catch_panic(|| {
-        let sender = unsafe { bytes_from_ptr(sender_seed, sender_seed_len) }?;
-        let hotkey = unsafe { bytes_from_ptr(hotkey_seed, hotkey_seed_len) }?;
-
-        let account = AccountId::try_from(account_index)
-            .map_err(|_| anyhow!("account_index must be < 2^31, got {}", account_index))?;
-
-        // Derive sender Orchard FVK
-        let sender_usk = usk_from_seed(network_id, sender, account)
-            .map_err(|e| anyhow!("failed to derive sender UnifiedSpendingKey: {}", e))?;
-
-        let sender_fvk = sender_usk
-            .to_unified_full_viewing_key()
-            .orchard()
-            .ok_or_else(|| anyhow!("sender UFVK is missing Orchard component"))?
-            .to_bytes()
-            .to_vec();
-
-        // zcash_voting derives the hotkey spending key at account 0 during signing.
-        let hotkey_inputs = derive_hotkey_side_inputs(hotkey, network_id, hotkey_account())?;
-
-        let seed_fp = zip32::fingerprint::SeedFingerprint::from_seed(sender)
-            .ok_or_else(|| anyhow!("failed to compute seed fingerprint (seed too short?)"))?;
-
-        let inputs = JsonDelegationInputs {
-            fvk_bytes: sender_fvk,
-            g_d_new_x: hotkey_inputs.g_d_new_x,
-            pk_d_new_x: hotkey_inputs.pk_d_new_x,
-            hotkey_raw_address: hotkey_inputs.hotkey_raw_address,
-            hotkey_public_key: hotkey_inputs.hotkey_public_key,
-            hotkey_address: hotkey_inputs.hotkey_address,
-            seed_fingerprint: seed_fp.to_bytes().to_vec(),
-        };
-        json_to_boxed_slice(&inputs)
+        Err(anyhow!(
+            "voting: generate_delegation_inputs is superseded — the delegation lanes derive inputs from the wallet database"
+        ))
     });
     unwrap_exc_or_null(res)
 }
 
-/// Generate delegation inputs using an explicit FVK instead of deriving from sender seed.
-///
-/// Returns JSON-encoded `DelegationInputs` as `*mut FfiBoxedSlice`, or null on error.
+/// Superseded: zcash_voting 1.0 derives delegation inputs from the wallet database
+/// inside the delegation lanes; see `zcashlc_voting_generate_delegation_inputs`.
+/// Always returns null with a "superseded" error (C symbol preserved).
 ///
 /// # Safety
 ///
-/// - All pointer/length pairs must be valid.
+/// - The pointer arguments are not read.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_generate_delegation_inputs_with_fvk(
-    fvk_bytes: *const u8,
-    fvk_bytes_len: usize,
-    hotkey_seed: *const u8,
-    hotkey_seed_len: usize,
-    network_id: u32,
-    seed_fingerprint: *const u8,
-    seed_fingerprint_len: usize,
+    _fvk_bytes: *const u8,
+    _fvk_bytes_len: usize,
+    _hotkey_seed: *const u8,
+    _hotkey_seed_len: usize,
+    _network_id: u32,
+    _seed_fingerprint: *const u8,
+    _seed_fingerprint_len: usize,
 ) -> *mut crate::ffi::BoxedSlice {
     let res = catch_panic(|| {
-        let fvk = unsafe { bytes_from_ptr(fvk_bytes, fvk_bytes_len) }?.to_vec();
-        let hotkey = unsafe { bytes_from_ptr(hotkey_seed, hotkey_seed_len) }?;
-        let seed_fp = unsafe { bytes_from_ptr(seed_fingerprint, seed_fingerprint_len) }?.to_vec();
-
-        if fvk.len() != ORCHARD_FVK_LEN {
-            return Err(anyhow!(
-                "fvk_bytes must be {} bytes, got {}",
-                ORCHARD_FVK_LEN,
-                fvk.len()
-            ));
-        }
-        if seed_fp.len() != SEED_FINGERPRINT_LEN {
-            return Err(anyhow!(
-                "seed_fingerprint must be {} bytes, got {}",
-                SEED_FINGERPRINT_LEN,
-                seed_fp.len()
-            ));
-        }
-
-        // zcash_voting derives the hotkey spending key at account 0 during signing.
-        let hotkey_inputs = derive_hotkey_side_inputs(hotkey, network_id, hotkey_account())?;
-
-        let inputs = JsonDelegationInputs {
-            fvk_bytes: fvk,
-            g_d_new_x: hotkey_inputs.g_d_new_x,
-            pk_d_new_x: hotkey_inputs.pk_d_new_x,
-            hotkey_raw_address: hotkey_inputs.hotkey_raw_address,
-            hotkey_public_key: hotkey_inputs.hotkey_public_key,
-            hotkey_address: hotkey_inputs.hotkey_address,
-            seed_fingerprint: seed_fp,
-        };
-        json_to_boxed_slice(&inputs)
+        Err(anyhow!(
+            "voting: generate_delegation_inputs_with_fvk is superseded — the delegation lanes derive inputs from the wallet database"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -303,7 +235,11 @@ mod tests {
     use zcash_client_backend::proto::service::TreeState;
     use zcash_keys::keys::UnifiedSpendingKey;
     use zcash_protocol::consensus::Network;
+    use zip32::AccountId;
     use zip32::Scope;
+
+    /// Raw Orchard FVK byte length — the extract lane's expected output size.
+    const ORCHARD_FVK_LEN: usize = 96;
 
     use super::*;
     use crate::{NETWORK_ID_MAINNET, NETWORK_ID_TESTNET};
@@ -349,17 +285,6 @@ mod tests {
             .to_raw_address_bytes()
             .to_vec()
     }
-
-    fn delegation_inputs_from_ptr(ptr: *mut crate::ffi::BoxedSlice) -> JsonDelegationInputs {
-        let json = boxed_slice_to_vec(ptr);
-        serde_json::from_slice(&json).expect("delegation inputs json")
-    }
-
-    // [IW-PORT] exercises seed-derived hotkeys (stubbed on this graph) —
-    // parked with the flow tests (see voting.rs).
-
-    // [IW-PORT] exercises seed-derived hotkeys (stubbed on this graph) —
-    // parked with the flow tests (see voting.rs).
 
     #[test]
     fn extract_orchard_fvk_returns_orchard_bytes_for_valid_mainnet_ufvk() {

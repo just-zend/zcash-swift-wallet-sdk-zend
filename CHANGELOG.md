@@ -79,6 +79,23 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Generated protobuf Swift stubs are regenerated with a pinned `swift-protobuf` 1.35.1.
 
 ## Fixed
+- `ValidateServerAction` no longer fails custom-network sync when the server reports an unrecognized
+  chain name: the chain-name recognition guard now runs only for standard networks, matching the
+  documented "skips the chain-name and consensus-branch-ID checks for custom networks" contract.
+- `evaluateBestOf(endpoints:...)` no longer returns an empty list for custom networks — the
+  chain-name and consensus-branch-ID candidate filters are skipped for them, mirroring
+  `ValidateServerAction` (all other quality checks still apply).
+- `Scripts/init-local-ffi.sh --cached` works again on pre-release pins and forks: the release tag
+  (including suffixes like `-alpha.6`) and the owner/repo are both derived from the binary-target URL
+  in `Package.swift`, and the downloaded macOS slice is converted to the versioned bundle layout so
+  Xcode embedding succeeds. `version-macos-framework.sh` reads the bundle version from
+  `BuildSupport/platform-Info.plist` instead of hardcoding it.
+- `zcashlc_voting_precompute_delegation_pir` honors its documented empty-`notes_json` contract
+  (treats `len == 0` as the empty note list) instead of failing to parse.
+- `zcashlc_set_custom_network` (and `ZcashRustBackend.setCustomNetwork`) now report a conflicting
+  re-registration — replacing a **different** already-registered custom network returns `false`
+  (the replacement is still applied, last writer wins), and the `Initializer` asserts on it in debug
+  builds. Registering twice with identical values remains a clean, idempotent `true`.
 - `prepare(with:...)` no longer throws `ZcashError.initializerSeedMismatch` (`ZINIT0006`) for a wallet whose only accounts are imported (hardware-wallet UFVKs). The seed-relevance check treats "the wallet has no seed-derived account" as relevant — there is nothing for the seed to conflict with — matching the documented exemption; previously an imported-spending account was miscounted as seed-derived, so a hardware-wallet-only wallet was bricked until `wipe()`. The `initializerSeedMismatch` message is also no longer truncated mid-sentence.
 - `putSaplingSubtreeRoots` / `putOrchardSubtreeRoots` / `putIronwoodSubtreeRoots` reject an out-of-range server-supplied `completingBlockHeight` (a `uint64` proto field) via `UInt32(exactly:)` instead of trapping. A malformed or hostile lightwalletd response can no longer crash the process at this conversion.
 - `UpdateSubtreeRootsAction` rethrows an Ironwood subtree-roots stream timeout into the retry machinery — like the Sapling and Orchard streams — instead of swallowing it. A server that black-holes the Ironwood stream no longer silently adds the full streaming deadline (~100 s) to every sync pass; genuine "Ironwood not supported" errors are still skipped best-effort.

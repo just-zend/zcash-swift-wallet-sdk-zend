@@ -1,16 +1,10 @@
-//! C FFI for the voting functionality.
+//! C FFI for the voting functionality, backed by upstream `zcash_voting` 1.0.
 //!
 //! Implementation is split into submodules for navigation. Exported FFI functions
-//! keep their stable C symbols with `#[unsafe(no_mangle)]`.
-//!
-//! [IW-PORT] On the ironwood-support graph, zcash_voting resolves to its 1.0
-//! (ironwood-aligned) line, which redesigned the proving/delegation/recovery
-//! APIs. The affected extern fns keep their C symbols but return honest
-//! "port pending" errors; tree-sync, round listing, and DB open/free remain
-//! live. The dead_code allow below covers the 0.11-shaped scaffolding
-//! (constants, ProgressBridge, validators, JSON types) kept for that port —
-//! remove it when the port lands (census: voting row).
-#![allow(dead_code)]
+//! keep their stable C symbols with `#[unsafe(no_mangle)]`. Entry points that the
+//! crate's 1.0 one-shot commit flow absorbed (`encrypt_shares`, `sign_cast_vote`,
+//! `store_commitment_bundle`, `decompose_weight`, `generate_delegation_inputs`)
+//! keep their symbols as honest "superseded" error stubs.
 
 mod constants;
 pub mod db;

@@ -885,30 +885,39 @@ public class SDKSynchronizer: Synchronizer {
 
             var tmpResults: [String: CheckResult] = [:]
 
+            // A custom-parameter network may reach servers that identify with a different base chain
+            // (e.g. chainName "main" for a modified-mainnet backend) and report a nonstandard consensus
+            // branch id, so the chain-name and branch-id checks are skipped for it — mirroring
+            // ValidateServerAction. Without the skip every candidate would be ruled out and this API
+            // would always return an empty list for custom networks.
+            let isCustomNetwork = initializer.network.customActivationHeights != nil
+
             for await result in group {
                 // rule out results where calls failed
                 guard let info = result.info, result.latestBlockHeight != nil else {
                     continue
                 }
 
-                // rule out if mismatch of networks
-                guard (info.chainName == "main" && network == .mainnet)
-                    || (info.chainName == "test" && network == .testnet)
-                    || (info.chainName == "regtest" && network == .regtest) else {
-                    continue
-                }
+                if !isCustomNetwork {
+                    // rule out if mismatch of networks
+                    guard (info.chainName == "main" && network == .mainnet)
+                        || (info.chainName == "test" && network == .testnet)
+                        || (info.chainName == "regtest" && network == .regtest) else {
+                        continue
+                    }
 
-                // rule out mismatch of consensus branch IDs
-                guard let localBranchID = await blockProcessor.consensusBranchIdFor(Int32(info.blockHeight)) else {
-                    continue
-                }
+                    // rule out mismatch of consensus branch IDs
+                    guard let localBranchID = await blockProcessor.consensusBranchIdFor(Int32(info.blockHeight)) else {
+                        continue
+                    }
 
-                guard let remoteBranchID = ConsensusBranchID.fromString(info.consensusBranchID) else {
-                    continue
-                }
+                    guard let remoteBranchID = ConsensusBranchID.fromString(info.consensusBranchID) else {
+                        continue
+                    }
 
-                guard remoteBranchID == localBranchID else {
-                    continue
+                    guard remoteBranchID == localBranchID else {
+                        continue
+                    }
                 }
 
                 // Rule out servers that are syncing, stuck, or probably on the wrong fork.

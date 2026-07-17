@@ -17,7 +17,6 @@ let votingVoteRoundIdHexCharacterCount = 64
 let votingKeystoneSignatureByteCount = 64
 let votingPcztSighashByteCount = 32
 let votingRandomizedKeyByteCount = 32
-let votingHotkeyRawAddressByteCount = 43
 let votingPirRootByteCount = 32
 let votingPirNullifierBoundsByteCount = votingPirRootByteCount * 3
 let votingPirPathElementCount = 29

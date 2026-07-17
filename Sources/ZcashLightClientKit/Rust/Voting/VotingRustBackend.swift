@@ -515,11 +515,11 @@ extension VotingRustBackend {
         }
     }
 
-    /// Generate the public delegation inputs for a sender seed + hotkey seed pair.
-    ///
-    /// Both seeds must be ≥ 32 bytes. The hotkey is always derived at account
-    /// index 0 to match `zcash_voting`'s signing convention; `accountIndex`
-    /// drives only the sender's UFVK derivation.
+    /// Superseded on `zcash_voting` 1.0: the delegation lanes (`buildPczt`,
+    /// `buildAndProveDelegation`, `getDelegationSubmission`) derive their inputs
+    /// from the wallet database, and seed-derived hotkeys no longer exist.
+    /// Inputs are still length-validated, then the call always throws a
+    /// "superseded" error.
     public static func generateDelegationInputs(
         senderSeed: [UInt8],
         hotkeySeed: [UInt8],
@@ -555,8 +555,10 @@ extension VotingRustBackend {
         return try staticDecodeJSON(from: ptr)
     }
 
-    /// Generate delegation inputs from an explicit sender FVK + hotkey seed,
-    /// bypassing sender-seed derivation.
+    /// Superseded on `zcash_voting` 1.0 — see
+    /// `generateDelegationInputs(senderSeed:hotkeySeed:networkId:accountIndex:)`.
+    /// Inputs are still length-validated, then the call always throws a
+    /// "superseded" error.
     public static func generateDelegationInputs(
         senderFvk: [UInt8],
         hotkeySeed: [UInt8],
