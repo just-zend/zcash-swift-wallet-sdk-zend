@@ -37,6 +37,9 @@ struct ChainMetadata: Sendable {
   /// the size of the Orchard note commitment tree as of the end of this block
   var orchardCommitmentTreeSize: UInt32 = 0
 
+  /// the size of the Ironwood note commitment tree as of the end of this block
+  var ironwoodCommitmentTreeSize: UInt32 = 0
+
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
   init() {}
@@ -118,6 +121,11 @@ struct CompactTx: Sendable {
 
   var actions: [CompactOrchardAction] = []
 
+  /// Ironwood (NU6.3) actions. Ironwood is Orchard note-version V3, so these reuse the
+  /// CompactOrchardAction shape but ride a separate stream. Field number 9 matches lightwalletd /
+  /// valargroup zcash_client_backend; fields 7-8 (transparent vin/vout) are intentionally unused here.
+  var ironwoodActions: [CompactOrchardAction] = []
+
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
   init() {}
@@ -192,7 +200,7 @@ fileprivate let _protobuf_package = "cash.z.wallet.sdk.rpc"
 
 extension ChainMetadata: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   static let protoMessageName: String = _protobuf_package + ".ChainMetadata"
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}saplingCommitmentTreeSize\0\u{1}orchardCommitmentTreeSize\0")
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}saplingCommitmentTreeSize\0\u{1}orchardCommitmentTreeSize\0\u{1}ironwoodCommitmentTreeSize\0")
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -202,6 +210,7 @@ extension ChainMetadata: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt32Field(value: &self.saplingCommitmentTreeSize) }()
       case 2: try { try decoder.decodeSingularUInt32Field(value: &self.orchardCommitmentTreeSize) }()
+      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.ironwoodCommitmentTreeSize) }()
       default: break
       }
     }
@@ -214,12 +223,16 @@ extension ChainMetadata: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
     if self.orchardCommitmentTreeSize != 0 {
       try visitor.visitSingularUInt32Field(value: self.orchardCommitmentTreeSize, fieldNumber: 2)
     }
+    if self.ironwoodCommitmentTreeSize != 0 {
+      try visitor.visitSingularUInt32Field(value: self.ironwoodCommitmentTreeSize, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   static func ==(lhs: ChainMetadata, rhs: ChainMetadata) -> Bool {
     if lhs.saplingCommitmentTreeSize != rhs.saplingCommitmentTreeSize {return false}
     if lhs.orchardCommitmentTreeSize != rhs.orchardCommitmentTreeSize {return false}
+    if lhs.ironwoodCommitmentTreeSize != rhs.ironwoodCommitmentTreeSize {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -296,7 +309,7 @@ extension CompactBlock: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementat
 
 extension CompactTx: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   static let protoMessageName: String = _protobuf_package + ".CompactTx"
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}index\0\u{1}hash\0\u{1}fee\0\u{1}spends\0\u{1}outputs\0\u{1}actions\0")
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}index\0\u{1}hash\0\u{1}fee\0\u{1}spends\0\u{1}outputs\0\u{1}actions\0\u{2}\u{3}ironwoodActions\0")
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -310,6 +323,7 @@ extension CompactTx: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
       case 4: try { try decoder.decodeRepeatedMessageField(value: &self.spends) }()
       case 5: try { try decoder.decodeRepeatedMessageField(value: &self.outputs) }()
       case 6: try { try decoder.decodeRepeatedMessageField(value: &self.actions) }()
+      case 9: try { try decoder.decodeRepeatedMessageField(value: &self.ironwoodActions) }()
       default: break
       }
     }
@@ -334,6 +348,9 @@ extension CompactTx: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     if !self.actions.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.actions, fieldNumber: 6)
     }
+    if !self.ironwoodActions.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.ironwoodActions, fieldNumber: 9)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -344,6 +361,7 @@ extension CompactTx: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     if lhs.spends != rhs.spends {return false}
     if lhs.outputs != rhs.outputs {return false}
     if lhs.actions != rhs.actions {return false}
+    if lhs.ironwoodActions != rhs.ironwoodActions {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
