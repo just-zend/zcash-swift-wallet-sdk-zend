@@ -48,12 +48,15 @@ pub unsafe extern "C" fn zcashlc_voting_decompose_weight(
     weight: u64,
 ) -> *mut crate::ffi::BoxedSlice {
     let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
-        // [IW-PORT] zcash_voting 1.0 dropped the standalone `decompose` module
-        // (weight decomposition moved inside note bundling/share policy). Honest
-        // error until the voting-FFI port (census: voting row).
+        // Superseded: the share split is denomination-based, PRF-keyed, and
+        // shuffled inside the vote proof builder (voting-circuits 0.9
+        // SHARE_SPLITTING.md) — it depends on the spending key and round
+        // context, so a standalone weight decomposition can no longer describe
+        // the real split (and a binary decomposition would fingerprint voter
+        // balances).
         let _ = weight;
         Err(anyhow!(
-            "voting: decompose_weight is unavailable on the ironwood-support graph (zcash_voting port pending)"
+            "voting: decompose_weight is superseded — shares are split inside the vote commit flow"
         ))
     });
     unwrap_exc_or_null(res)
@@ -352,86 +355,9 @@ mod tests {
 
     // [IW-PORT] exercises seed-derived hotkeys (stubbed on this graph) —
     // parked with the flow tests (see voting.rs).
-    #[cfg(feature = "voting-port-tests")]
-    #[test]
-    fn generate_delegation_inputs_uses_sender_account_but_hotkey_account_zero() {
-        let sender_seed = [1u8; 32];
-        let hotkey_seed = [2u8; 32];
-        let result = unsafe {
-            zcashlc_voting_generate_delegation_inputs(
-                sender_seed.as_ptr(),
-                sender_seed.len(),
-                hotkey_seed.as_ptr(),
-                hotkey_seed.len(),
-                NETWORK_ID_MAINNET,
-                1,
-            )
-        };
-
-        let inputs = delegation_inputs_from_ptr(result);
-
-        assert_eq!(
-            inputs.fvk_bytes,
-            derive_orchard_fvk_bytes(Network::MainNetwork, &sender_seed, 1),
-            "sender FVK should use the caller's account_index"
-        );
-        assert_ne!(
-            inputs.fvk_bytes,
-            derive_orchard_fvk_bytes(Network::MainNetwork, &sender_seed, 0),
-            "sender FVK should not be forced to account 0"
-        );
-        assert_eq!(
-            inputs.hotkey_raw_address,
-            derive_hotkey_raw_address(Network::MainNetwork, &hotkey_seed, 0),
-            "hotkey address should match zcash_voting signing account"
-        );
-        assert_ne!(
-            inputs.hotkey_raw_address,
-            derive_hotkey_raw_address(Network::MainNetwork, &hotkey_seed, 1),
-            "hotkey address should not follow the sender account_index"
-        );
-    }
 
     // [IW-PORT] exercises seed-derived hotkeys (stubbed on this graph) —
     // parked with the flow tests (see voting.rs).
-    #[cfg(feature = "voting-port-tests")]
-    #[test]
-    fn generate_delegation_inputs_with_fvk_uses_hotkey_account_zero() {
-        let sender_seed = [1u8; 32];
-        let hotkey_seed = [2u8; 32];
-        let fvk = derive_orchard_fvk_bytes(Network::MainNetwork, &sender_seed, 1);
-        let seed_fp = zip32::fingerprint::SeedFingerprint::from_seed(&sender_seed)
-            .expect("seed fingerprint")
-            .to_bytes();
-        let result = unsafe {
-            zcashlc_voting_generate_delegation_inputs_with_fvk(
-                fvk.as_ptr(),
-                fvk.len(),
-                hotkey_seed.as_ptr(),
-                hotkey_seed.len(),
-                NETWORK_ID_MAINNET,
-                seed_fp.as_ptr(),
-                seed_fp.len(),
-            )
-        };
-
-        let inputs = delegation_inputs_from_ptr(result);
-
-        assert_eq!(
-            inputs.fvk_bytes, fvk,
-            "explicit sender FVK should pass through unchanged"
-        );
-        assert_eq!(
-            inputs.hotkey_raw_address,
-            derive_hotkey_raw_address(Network::MainNetwork, &hotkey_seed, 0),
-            "hotkey address should match zcash_voting signing account"
-        );
-        assert_ne!(
-            inputs.hotkey_raw_address,
-            derive_hotkey_raw_address(Network::MainNetwork, &hotkey_seed, 1),
-            "hotkey address should not follow the sender account_index"
-        );
-    }
 
     #[test]
     fn extract_orchard_fvk_returns_orchard_bytes_for_valid_mainnet_ufvk() {

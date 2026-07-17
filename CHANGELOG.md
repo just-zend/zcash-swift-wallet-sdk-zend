@@ -31,12 +31,28 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Rust core builds against `zcash/librustzcash` main (Ironwood is merged and ungated upstream),
   pinned via `[patch.crates-io]` until the 0.24-era crates.io release; `orchard` 0.15.0 and
   `shardtree` 0.7.0 resolve from crates.io.
-- `zcash_voting` rides a pinned rev of its upstream repository (aligned to the same librustzcash rev
-  and orchard 0.15) instead of the published 0.11 release, which pins `orchard ^0.14` and cannot
-  coexist with the Ironwood graph. A subset of voting FFI entry points whose 1.0 API redesign is not
-  yet absorbed return honest errors ("zcash_voting port pending"); their acceptance tests sit behind
-  the `voting-port-tests` cargo feature, and the affected Swift tests skip themselves until the port
-  completes.
+- Voting rides upstream `zcash_voting` (a pinned rev of its repository's main, aligned to the same
+  librustzcash rev and orchard 0.15; the published 0.11 release pins `orchard ^0.14` and cannot
+  coexist with the Ironwood graph) with **real implementations across the FFI**. Behavioral changes
+  that follow the crate's 1.0/Ironwood redesign:
+  - Round ids are 32-byte values (64 lowercase hex chars, canonical Pallas field elements), rounds
+    persist their wallet network (`open` takes a `networkId`), and snapshot note selection is
+    Ironwood-only at the snapshot anchor.
+  - Vote commitment is one-shot: `buildVoteCommitment` builds ZKP#2 (the denomination-based,
+    PRF-keyed share split and encryption happen inside so ciphertexts always match the proof),
+    signs the cast vote, builds helper-share payloads, and persists recovery state. The bundle JSON
+    additionally carries `vote_auth_sig` and `share_payloads`. `encryptShares`, `signCastVote`,
+    `storeCommitmentBundle`, and `decomposeWeight` are superseded accordingly and return honest
+    errors pointing at the commit flow.
+  - Delegation derives snapshot-eligible notes and key material from the wallet database
+    (`buildPczt`, `buildAndProveDelegation`, and the seed-signing `getDelegationSubmission` take
+    the wallet DB path, account UUID, and the app-owned hotkey stored secret); the wallet seed
+    never enters the crate (the SpendAuth signature is produced in the FFI from the crate's
+    signing request). Voting hotkeys are app-owned random secrets (`generateHotkey` returns the
+    stored secret to persist; the legacy seed parameter is ignored).
+  - Helper-share submissions use crate-owned scheduling and nullifier material: shares can only be
+    recorded for committed votes, and vote tx hashes are recorded atomically
+    (`storeVoteTxHash`/`markVoteSubmitted`).
 - Generated protobuf Swift stubs are regenerated with a pinned `swift-protobuf` 1.35.1.
 
 ## Fixed

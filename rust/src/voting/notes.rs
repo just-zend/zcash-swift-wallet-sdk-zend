@@ -128,7 +128,7 @@ mod tests {
             std::process::id()
         ));
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let db = unsafe { zcashlc_voting_db_open(path_bytes.as_ptr(), path_bytes.len()) };
+        let db = unsafe { zcashlc_voting_db_open(path_bytes.as_ptr(), path_bytes.len(), 1) };
         assert!(!db.is_null(), "open voting db at {:?}", path);
         (db, path)
     }

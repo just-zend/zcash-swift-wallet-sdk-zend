@@ -95,11 +95,6 @@ zcash_voting = "1.0"
 zcash_keys = { version = "0.15.0", features = ["orchard"] }
 incrementalmerkletree = { version = "0.8", default-features = false }
 
-[features]
-# The voting flow tests that assert pre-1.0 zcash_voting behavior stubbed on
-# this graph; turn on when finishing the 1.0 API port.
-voting-port-tests = []
-
 [dev-dependencies]
 hex = "0.4"
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
+use zcash_voting as voting;
 use zcash_voting::storage::VotingDb;
 use zcash_voting::tree_sync::VoteTreeSync;
 
@@ -14,6 +15,8 @@ use super::helpers::str_from_ptr;
 pub struct VotingDatabaseHandle {
     pub(super) db: Arc<VotingDb>,
     pub(super) tree_sync: VoteTreeSync,
+    pub(super) network: voting::types::Network,
+    pub(super) network_id: u32,
 }
 
 /// Open a voting database at the given path.
@@ -30,14 +33,26 @@ pub struct VotingDatabaseHandle {
 pub unsafe extern "C" fn zcashlc_voting_db_open(
     path: *const u8,
     path_len: usize,
+    network_id: u32,
 ) -> *mut VotingDatabaseHandle {
     let res = catch_panic(|| {
         let path_str = unsafe { str_from_ptr(path, path_len) }?;
+        // zcash_voting persists each round's wallet network, so the handle
+        // carries it from open time (0 = testnet, 1 = mainnet, and the
+        // custom/regtest network slot).
+        let network = match network_id {
+            0 => voting::types::Network::Testnet,
+            1 => voting::types::Network::Mainnet,
+            crate::NETWORK_ID_REGTEST => voting::types::Network::Regtest,
+            other => return Err(anyhow!("invalid network id {other} for voting database")),
+        };
         let db = VotingDb::open(&path_str)
             .map_err(|e| anyhow!("Error opening voting database: {}", e))?;
         Ok(Box::into_raw(Box::new(VotingDatabaseHandle {
             db: Arc::new(db),
             tree_sync: VoteTreeSync::new(),
+            network,
+            network_id,
         })))
     });
     unwrap_exc_or_null(res)
@@ -94,7 +109,8 @@ mod tests {
     #[test]
     fn db_open_rejects_invalid_utf8_path() {
         let invalid_path = [0xff];
-        let handle = unsafe { zcashlc_voting_db_open(invalid_path.as_ptr(), invalid_path.len()) };
+        let handle =
+            unsafe { zcashlc_voting_db_open(invalid_path.as_ptr(), invalid_path.len(), 1) };
         assert!(handle.is_null());
     }
 
