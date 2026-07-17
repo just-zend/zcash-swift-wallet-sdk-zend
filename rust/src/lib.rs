@@ -47,8 +47,8 @@ use zcash_client_backend::{
         wallet::{
             self, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
             decrypt_and_store_transaction, extract_and_store_transaction_from_pczt,
-            input_selection::GreedyInputSelector, propose_send_max_transfer, propose_shielding,
-            propose_transfer,
+            input_selection::{GreedyInputSelector, SpendPolicy},
+            propose_send_max_transfer, propose_shielding, propose_transfer,
         },
     },
     encoding::AddressCodec,
@@ -1343,9 +1343,6 @@ pub unsafe extern "C" fn zcashlc_rewind_to_height(
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let height = BlockHeight::from(height);
-        // [IW-1 SPIKE] the ironwood-era fork dropped the `rewind_to_height`
-        // alias; `truncate_to_height` is the same operation (returns the height
-        // actually truncated to, or RequestedRewindInvalid).
         let result_height = db_data.truncate_to_height(height);
 
         result_height.map_or_else(
@@ -1910,7 +1907,7 @@ pub unsafe extern "C" fn zcashlc_put_utxo(
                 script_pubkey,
             ),
             Some(BlockHeight::from(height as u32)),
-            // This FFI call doesn't carry account context (new fork fields) — left unset.
+            // This UTXO is supplied by the caller with no account association or key scope.
             None,
             None,
             None,
@@ -2246,9 +2243,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             &change_strategy,
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
-            // [IW-6] main's spend-policy knob: all shielded pools (incl. Ironwood
-            // once active) — era-aware narrowing is MOB-1458's lane.
-            &zcash_client_backend::data_api::wallet::input_selection::SpendPolicy::default(),
+            &SpendPolicy::default(),
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2389,9 +2384,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             &change_strategy,
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
-            // [IW-6] main's spend-policy knob: all shielded pools (incl. Ironwood
-            // once active) — era-aware narrowing is MOB-1458's lane.
-            &zcash_client_backend::data_api::wallet::input_selection::SpendPolicy::default(),
+            &SpendPolicy::default(),
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2773,8 +2766,8 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
                 account_uuid,
                 OvkPolicy::Sender,
                 &proposal,
-                // [IW-6] main additions: no expiry override; standard (padded)
-                // orchard/ironwood bundles — matches the default change strategy.
+                // Use the transaction's default expiry height and the default Orchard
+                // bundle type; the SDK does not expose overrides for these.
                 None,
                 orchard::builder::BundleType::DEFAULT,
             )
@@ -2842,7 +2835,7 @@ pub unsafe extern "C" fn zcashlc_redact_pczt_for_signer(
             .finish();
 
         Ok(ffi::BoxedSlice::some(redacted_pczt.serialize().map_err(
-            |e| anyhow!("Failed to serialize PCZT: {:?}", e),
+            |e| anyhow!("Failed to serialize redacted PCZT: {:?}", e),
         )?))
     });
     unwrap_exc_or_null(res)
@@ -2935,15 +2928,27 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
         let pczt_bytes = unsafe { slice::from_raw_parts(pczt_ptr, pczt_len) };
         let pczt = Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Invalid PCZT: {:?}", e))?;
 
+        // The Orchard proving key must be built for the circuit governing the Orchard pool
+        // under the consensus branch this PCZT was created for; derive it from the PCZT's
+        // consensus branch id before the PCZT is consumed by the prover.
+        let pczt_branch_id = BranchId::try_from(*pczt.global().consensus_branch_id())
+            .map_err(|_| anyhow!("PCZT has an invalid consensus branch id"))?;
+
         let mut prover = Prover::new(pczt);
 
         if prover.requires_orchard_proof() {
-            // Regular Orchard-pool proving uses the current fixed (NU6.2-era)
-            // circuit; the Ironwood pool uses the separate PostNu6_3 circuit
-            // proven below.
+            let orchard_circuit_version =
+                zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
+                    pczt_branch_id,
+                    orchard::ValuePool::Orchard,
+                )
+                .ok_or_else(|| {
+                    anyhow!("PCZT's consensus branch does not support the Orchard pool")
+                })?
+                .circuit_version();
             prover = prover
                 .create_orchard_proof(&orchard::circuit::ProvingKey::build(
-                    orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2,
+                    orchard_circuit_version,
                 ))
                 .map_err(|e| anyhow!("Failed to create Orchard proof for PCZT: {:?}", e))?;
         }
@@ -2993,7 +2998,7 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
         Ok(ffi::BoxedSlice::some(
             pczt_with_proofs
                 .serialize()
-                .map_err(|e| anyhow!("Failed to serialize PCZT: {:?}", e))?,
+                .map_err(|e| anyhow!("Failed to serialize proven PCZT: {:?}", e))?,
         ))
     });
     unwrap_exc_or_null(res)
