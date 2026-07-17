@@ -1,4 +1,13 @@
 # Migrating from previous versions to _Unreleased_
+
+## `prepare` now validates the seed against the existing wallet
+
+If the wallet database already contains seed-derived account(s) and the seed passed to `prepare`
+does not match them, `prepare` throws `ZcashError.initializerSeedMismatch` (`ZINIT0006`) instead of
+silently opening the old wallet (which desynced the app's stored seed from the on-disk account).
+Restoring a different wallet requires `wipe()` first. Wallets whose only accounts are imported
+(hardware-wallet UFVKs) are exempt — there is no seed-derived account to compare.
+
 PendingDb is no longer used. Wallet developers should take care about deleting
 the database file since the SDK will no longer require it or any of the
 information stored. 
