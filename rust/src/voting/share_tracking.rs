@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use std::fmt::Write as _;
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
@@ -92,14 +93,20 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
     primary_blind: *const u8,
     share_index: u32,
 ) -> *mut c_char {
-    let res = catch_panic(|| -> anyhow::Result<*mut c_char> {
-        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch rides)
-        // redesigned share tracking — `share_tracking::compute_share_nullifier` has
-        // no 1.0 equivalent. Honest error until the voting-FFI port (census: voting row).
-        let _ = (vote_commitment, primary_blind, share_index);
-        Err(anyhow!(
-            "voting: compute_share_nullifier is unavailable on the ironwood-support graph (zcash_voting port pending)"
-        ))
+    let res = catch_panic(|| {
+        let vc: [u8; 32] = unsafe { std::slice::from_raw_parts(vote_commitment, 32) }
+            .try_into()
+            .map_err(|_| anyhow!("vote_commitment must be exactly 32 bytes"))?;
+        let blind: [u8; 32] = unsafe { std::slice::from_raw_parts(primary_blind, 32) }
+            .try_into()
+            .map_err(|_| anyhow!("primary_blind must be exactly 32 bytes"))?;
+
+        let nullifier = voting::share::compute_nullifier(&vc, share_index, &blind)
+            .map_err(|e| anyhow!("compute_share_nullifier failed: {}", e))?;
+
+        let hex_str = bytes_to_hex(&nullifier);
+        let c_str = CString::new(hex_str).map_err(|e| anyhow!("null byte in hex string: {}", e))?;
+        Ok(c_str.into_raw())
     });
     unwrap_exc_or_null(res)
 }
@@ -129,26 +136,28 @@ pub unsafe extern "C" fn zcashlc_voting_record_share_delegation(
     submit_at: u64,
 ) -> i32 {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| -> anyhow::Result<i32> {
-        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
-        // rides): record_share_delegation became private in 1.0.
-        // Honest error until the voting-FFI port (census: voting row).
-        let _ = (
-            &db,
-            round_id,
-            round_id_len,
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        // The nullifier now lives in recovery state and is owned by the crate;
+        // the parameter is validated for shape but no longer persisted here.
+        let nullifier_hex_str = unsafe { str_from_ptr(nullifier_hex, nullifier_hex_len) }?;
+        decode_share_nullifier_hex(&nullifier_hex_str)?;
+        let urls_bytes = unsafe { bytes_from_ptr(sent_to_urls_json, sent_to_urls_json_len) }?;
+        let sent_to_urls: Vec<String> = serde_json::from_slice(urls_bytes)?;
+
+        voting::share::record(
+            &handle.db,
+            &round_id_str,
             bundle_index,
             proposal_id,
             share_index,
-            sent_to_urls_json,
-            sent_to_urls_json_len,
-            nullifier_hex,
-            nullifier_hex_len,
+            &sent_to_urls,
             submit_at,
-        );
-        Err(anyhow!(
-            "voting: record_share_delegation is unavailable on the ironwood-support graph (zcash_voting port pending)"
-        ))
+        )
+        .map_err(|e| anyhow!("record_share_delegation failed: {}", e))?;
+        Ok(0)
     });
     unwrap_exc_or(res, -1)
 }
@@ -286,80 +295,4 @@ pub unsafe extern "C" fn zcashlc_voting_add_sent_servers(
         Ok(0)
     });
     unwrap_exc_or(res, -1)
-}
-
-// [IW-PORT] 0.11-flow tests parked behind `voting-port-tests` (see voting.rs).
-#[cfg(all(test, feature = "voting-port-tests"))]
-mod tests {
-    use super::*;
-    use crate::ffi::zcashlc_free_boxed_slice;
-    use crate::voting::db::zcashlc_voting_db_free;
-    use crate::voting::test_helpers::{insert_round_and_bundle, open_memory_db};
-
-    #[test]
-    fn record_share_delegation_rejects_invalid_nullifier_length() {
-        let db = open_memory_db();
-        let round_id = b"round";
-        insert_round_and_bundle(db, "round");
-        let urls_json = br#"["https://helper.example"]"#;
-        let nullifier_hex = [b'a'; SHARE_NULLIFIER_LEN * 2 - 1];
-
-        let code = unsafe {
-            zcashlc_voting_record_share_delegation(
-                db,
-                round_id.as_ptr(),
-                round_id.len(),
-                0,
-                0,
-                0,
-                urls_json.as_ptr(),
-                urls_json.len(),
-                nullifier_hex.as_ptr(),
-                nullifier_hex.len(),
-                0,
-            )
-        };
-
-        assert_eq!(code, -1);
-        unsafe { zcashlc_voting_db_free(db) };
-    }
-
-    #[test]
-    fn record_share_delegation_round_trips_hex_nullifier() {
-        let db = open_memory_db();
-        let round_id = b"round";
-        insert_round_and_bundle(db, "round");
-        let urls_json = br#"["https://helper.example"]"#;
-        let nullifier = (0u8..SHARE_NULLIFIER_LEN as u8).collect::<Vec<_>>();
-        let nullifier_hex = bytes_to_hex(&nullifier);
-
-        let code = unsafe {
-            zcashlc_voting_record_share_delegation(
-                db,
-                round_id.as_ptr(),
-                round_id.len(),
-                0,
-                0,
-                0,
-                urls_json.as_ptr(),
-                urls_json.len(),
-                nullifier_hex.as_ptr(),
-                nullifier_hex.len(),
-                0,
-            )
-        };
-        assert_eq!(code, 0);
-
-        let result =
-            unsafe { zcashlc_voting_get_share_delegations(db, round_id.as_ptr(), round_id.len()) };
-        assert!(!result.is_null());
-        let json = unsafe { (*result).as_slice() }.to_vec();
-        let records: Vec<JsonShareDelegationRecord> =
-            serde_json::from_slice(&json).expect("share delegation records");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].nullifier, nullifier_hex);
-
-        unsafe { zcashlc_free_boxed_slice(result) };
-        unsafe { zcashlc_voting_db_free(db) };
-    }
 }

@@ -62,7 +62,7 @@ public final class VotingRustBackend: @unchecked Sendable {
     ///
     /// Throws `VotingRustBackendError.databaseAlreadyOpen` if the backend
     /// already holds an open handle.
-    public func open(path: String) throws {
+    public func open(path: String, networkId: UInt32) throws {
         lock.lock()
         defer { lock.unlock() }
 
@@ -72,7 +72,7 @@ public final class VotingRustBackend: @unchecked Sendable {
 
         let pathBytes = [UInt8](path.utf8)
         guard let ptr = pathBytes.withUnsafeBufferPointer({ buf in
-            zcashlc_voting_db_open(buf.baseAddress, UInt(buf.count))
+            zcashlc_voting_db_open(buf.baseAddress, UInt(buf.count), networkId)
         }) else {
             throw VotingRustBackendError.rustError(
                 Self.staticLastErrorMessage(fallback: "`voting_db_open` failed")
@@ -1472,53 +1472,44 @@ extension VotingRustBackend {
     }
 
     /// Build the voting PCZT for a bundle.
+    ///
+    /// zcash_voting 1.0 selects the bundle's snapshot-eligible notes and
+    /// shapes key material from the wallet database.
     public func buildPczt(_ params: VotingBuildPcztParams) throws -> VotingPczt {
-        guard params.seedFingerprint.count == votingSeedFingerprintByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "seedFingerprint must be exactly \(votingSeedFingerprintByteCount) bytes"
-            )
-        }
-
         let roundIdBytes = [UInt8](params.roundId.utf8)
-        let notesJson = try JSONEncoder().encode(params.notes)
-        let notesBytes = [UInt8](notesJson)
+        let walletPathBytes = [UInt8](params.walletDbPath.utf8)
+        let accountUuidBytes = [UInt8](params.accountUuid.utf8)
         let roundNameBytes = [UInt8](params.roundName.utf8)
 
         let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
             let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                notesBytes.withUnsafeBufferPointer { notesBuf in
-                    params.fvk.withUnsafeBufferPointer { fvkBuf in
-                        params.hotkeyRawAddress.withUnsafeBufferPointer { addrBuf in
-                            params.seedFingerprint.withUnsafeBufferPointer { fpBuf in
-                                roundNameBytes.withUnsafeBufferPointer { nameBuf in
-                                    zcashlc_voting_build_pczt(
-                                        dbh,
-                                        ridBuf.baseAddress,
-                                        UInt(ridBuf.count),
-                                        params.bundleIndex,
-                                        notesBuf.baseAddress,
-                                        UInt(notesBuf.count),
-                                        fvkBuf.baseAddress,
-                                        UInt(fvkBuf.count),
-                                        addrBuf.baseAddress,
-                                        UInt(addrBuf.count),
-                                        params.consensusBranchId,
-                                        params.coinType,
-                                        fpBuf.baseAddress,
-                                        UInt(fpBuf.count),
-                                        params.accountIndex,
-                                        nameBuf.baseAddress,
-                                        UInt(nameBuf.count),
-                                        params.addressIndex
-                                    )
-                                }
+                walletPathBytes.withUnsafeBufferPointer { walletBuf in
+                    accountUuidBytes.withUnsafeBufferPointer { uuidBuf in
+                        params.hotkeySecret.withUnsafeBufferPointer { secretBuf in
+                            roundNameBytes.withUnsafeBufferPointer { nameBuf in
+                                zcashlc_voting_build_pczt(
+                                    dbh,
+                                    ridBuf.baseAddress,
+                                    UInt(ridBuf.count),
+                                    params.bundleIndex,
+                                    walletBuf.baseAddress,
+                                    UInt(walletBuf.count),
+                                    uuidBuf.baseAddress,
+                                    UInt(uuidBuf.count),
+                                    secretBuf.baseAddress,
+                                    UInt(secretBuf.count),
+                                    nameBuf.baseAddress,
+                                    UInt(nameBuf.count)
+                                )
                             }
                         }
                     }
                 }
             }
             guard let ptr else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`build_pczt` failed"))
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`build_pczt` failed")
+                )
             }
             return ptr
         }
@@ -1549,29 +1540,52 @@ extension VotingRustBackend {
         }
     }
 
-    /// Get the delegation submission payload using a seed-derived signing key.
+    /// Get the delegation submission payload, signing locally with the seed.
+    ///
+    /// The seed never enters zcash_voting: the crate provides the sighash and
+    /// randomizer, the SpendAuth signature is produced in the FFI layer, and
+    /// the submission is assembled from stored proof state.
     public func getDelegationSubmission(
         roundId: String,
         bundleIndex: UInt32,
-        senderSeed: [UInt8],
-        networkId: UInt32,
-        accountIndex: UInt32
+        walletDbPath: String,
+        accountUuid: String,
+        hotkeySecret: [UInt8],
+        roundName: String,
+        senderSeed: [UInt8]
     ) throws -> VotingDelegationSubmission {
         let roundIdBytes = [UInt8](roundId.utf8)
+        let walletPathBytes = [UInt8](walletDbPath.utf8)
+        let accountUuidBytes = [UInt8](accountUuid.utf8)
+        let roundNameBytes = [UInt8](roundName.utf8)
 
         let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
             let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                senderSeed.withUnsafeBufferPointer { seedBuf in
-                    zcashlc_voting_get_delegation_submission(
-                        dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        bundleIndex,
-                        seedBuf.baseAddress,
-                        UInt(seedBuf.count),
-                        networkId,
-                        accountIndex
-                    )
+                walletPathBytes.withUnsafeBufferPointer { walletBuf in
+                    accountUuidBytes.withUnsafeBufferPointer { uuidBuf in
+                        hotkeySecret.withUnsafeBufferPointer { secretBuf in
+                            roundNameBytes.withUnsafeBufferPointer { nameBuf in
+                                senderSeed.withUnsafeBufferPointer { seedBuf in
+                                    zcashlc_voting_get_delegation_submission(
+                                        dbh,
+                                        ridBuf.baseAddress,
+                                        UInt(ridBuf.count),
+                                        bundleIndex,
+                                        walletBuf.baseAddress,
+                                        UInt(walletBuf.count),
+                                        uuidBuf.baseAddress,
+                                        UInt(uuidBuf.count),
+                                        secretBuf.baseAddress,
+                                        UInt(secretBuf.count),
+                                        nameBuf.baseAddress,
+                                        UInt(nameBuf.count),
+                                        seedBuf.baseAddress,
+                                        UInt(seedBuf.count)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
             guard let ptr else {
@@ -1675,11 +1689,12 @@ extension VotingRustBackend {
     public func buildAndProveDelegation(
         roundId: String,
         bundleIndex: UInt32,
-        notes: [VotingNoteInfo],
-        hotkeyRawAddress: [UInt8],
+        walletDbPath: String,
+        accountUuid: String,
+        hotkeySecret: [UInt8],
+        roundName: String,
         pirEndpoints: [String],
         expectedSnapshotHeight: UInt64,
-        networkId: UInt32,
         pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
         progress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> VotingDelegationProofResult {
@@ -1698,10 +1713,11 @@ extension VotingRustBackend {
             try syncBuildAndProveDelegation(
                 roundId: roundId,
                 bundleIndex: bundleIndex,
-                notes: notes,
-                hotkeyRawAddress: hotkeyRawAddress,
+                walletDbPath: walletDbPath,
+                accountUuid: accountUuid,
+                hotkeySecret: hotkeySecret,
+                roundName: roundName,
                 pirServerUrl: pirServerUrl,
-                networkId: networkId,
                 progress: progress
             )
         }.value
@@ -1962,15 +1978,17 @@ private extension VotingRustBackend {
     func syncBuildAndProveDelegation(
         roundId: String,
         bundleIndex: UInt32,
-        notes: [VotingNoteInfo],
-        hotkeyRawAddress: [UInt8],
+        walletDbPath: String,
+        accountUuid: String,
+        hotkeySecret: [UInt8],
+        roundName: String,
         pirServerUrl: String,
-        networkId: UInt32,
         progress: (@Sendable (Double) -> Void)?
     ) throws -> VotingDelegationProofResult {
         let roundIdBytes = [UInt8](roundId.utf8)
-        let notesJson = try JSONEncoder().encode(notes)
-        let notesBytes = [UInt8](notesJson)
+        let walletPathBytes = [UInt8](walletDbPath.utf8)
+        let accountUuidBytes = [UInt8](accountUuid.utf8)
+        let roundNameBytes = [UInt8](roundName.utf8)
         let urlBytes = [UInt8](pirServerUrl.utf8)
 
         let progressBox = progress.map(VotingProgressBox.init(report:))
@@ -1984,24 +2002,31 @@ private extension VotingRustBackend {
 
         let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
             let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                notesBytes.withUnsafeBufferPointer { notesBuf in
-                    hotkeyRawAddress.withUnsafeBufferPointer { addrBuf in
-                        urlBytes.withUnsafeBufferPointer { urlBuf in
-                            zcashlc_voting_build_and_prove_delegation(
-                                dbh,
-                                ridBuf.baseAddress,
-                                UInt(ridBuf.count),
-                                bundleIndex,
-                                notesBuf.baseAddress,
-                                UInt(notesBuf.count),
-                                addrBuf.baseAddress,
-                                UInt(addrBuf.count),
-                                urlBuf.baseAddress,
-                                UInt(urlBuf.count),
-                                networkId,
-                                trampoline,
-                                progressContext
-                            )
+                walletPathBytes.withUnsafeBufferPointer { walletBuf in
+                    accountUuidBytes.withUnsafeBufferPointer { uuidBuf in
+                        hotkeySecret.withUnsafeBufferPointer { secretBuf in
+                            roundNameBytes.withUnsafeBufferPointer { nameBuf in
+                                urlBytes.withUnsafeBufferPointer { urlBuf in
+                                    zcashlc_voting_build_and_prove_delegation(
+                                        dbh,
+                                        ridBuf.baseAddress,
+                                        UInt(ridBuf.count),
+                                        bundleIndex,
+                                        walletBuf.baseAddress,
+                                        UInt(walletBuf.count),
+                                        uuidBuf.baseAddress,
+                                        UInt(uuidBuf.count),
+                                        secretBuf.baseAddress,
+                                        UInt(secretBuf.count),
+                                        nameBuf.baseAddress,
+                                        UInt(nameBuf.count),
+                                        urlBuf.baseAddress,
+                                        UInt(urlBuf.count),
+                                        trampoline,
+                                        progressContext
+                                    )
+                                }
+                            }
                         }
                     }
                 }

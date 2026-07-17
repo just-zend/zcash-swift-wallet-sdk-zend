@@ -117,14 +117,12 @@ pub(super) fn derive_hotkey_side_inputs(
     network_id: u32,
     hotkey_account: AccountId,
 ) -> anyhow::Result<HotkeySideInputs> {
-    // [IW-PORT] zcash_voting 1.0 deliberately removed seed-derived hotkeys
-    // (`hotkey::generate_hotkey(seed)`): hotkeys are now random per-identity
-    // secrets (`generate_random_voting_hotkey`) so root-seed material stays out
-    // of the voting API. Porting this flow means adopting the stored-secret
-    // model FFI-wide — honest error until then (census: voting row).
+    // Superseded: zcash_voting removed seed-derived hotkeys — hotkeys are
+    // random per-identity secrets (`generate_hotkey` returns the stored
+    // secret to persist) so root-seed material stays out of the voting API.
     let _ = (hotkey_seed, network_id, hotkey_account);
     Err(anyhow!(
-        "voting: seed-derived hotkey inputs are unavailable on the ironwood-support graph (zcash_voting 1.0 uses stored-secret hotkeys; port pending)"
+        "voting: seed-derived hotkey inputs are superseded — use the stored-secret hotkey from generate_hotkey"
     ))
 }
 

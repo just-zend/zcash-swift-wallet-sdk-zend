@@ -95,7 +95,7 @@ mod ffi;
 mod tor;
 // Voting stays UNGATED: the module compiles as honest-error stubs (15 C symbols preserved —
 // Zodl macOS links them; a cargo feature gate would drop them from the staticlib and break
-// that link). The real port lands with zcash_voting 1.0 (see `voting-port-tests`).
+// that link). Voting rides upstream zcash_voting with real implementations.
 mod voting;
 
 #[cfg(target_vendor = "apple")]
