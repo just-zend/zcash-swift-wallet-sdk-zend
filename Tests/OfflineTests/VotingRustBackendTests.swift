@@ -281,6 +281,24 @@ final class VotingRustBackendTests: XCTestCase {
         }
     }
 
+    func test_generateDelegationInputs_isSuperseded() {
+        let seed = [UInt8](repeating: 0x02, count: votingMinSeedByteCount)
+        XCTAssertThrowsError(
+            try VotingRustBackend.generateDelegationInputs(
+                senderSeed: seed,
+                hotkeySeed: seed,
+                networkId: 1,
+                accountIndex: 0
+            )
+        ) { error in
+            guard case VotingRustBackendError.rustError(let message) = error else {
+                XCTFail("expected .rustError, got \(error)")
+                return
+            }
+            XCTAssertTrue(message.contains("superseded"), "unexpected message: \(message)")
+        }
+    }
+
     // MARK: - generateHotkey
 
     func test_generateHotkey_reconstructsHotkeyFromStoredSecret() throws {

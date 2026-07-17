@@ -44,8 +44,12 @@ mkdir -p "$FW/Versions/A/Resources"
 [[ -d "$FW/Modules" ]] && mv "$FW/Modules" "$FW/Versions/A/Modules"
 
 # Drop the shallow (iOS) Info.plist and write the correct macOS one into Resources.
+# The bundle version comes from BuildSupport/platform-Info.plist (the single source
+# the Makefile stamps into every slice) so a future bump cannot drift; the fallback
+# only covers running against a framework outside a repo checkout.
+BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "BuildSupport/platform-Info.plist" 2>/dev/null || echo "0.8.1")
 rm -f "$FW/Info.plist"
-cat > "$FW/Versions/A/Resources/Info.plist" <<'PLIST'
+cat > "$FW/Versions/A/Resources/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -61,9 +65,9 @@ cat > "$FW/Versions/A/Resources/Info.plist" <<'PLIST'
 	<key>CFBundlePackageType</key>
 	<string>FMWK</string>
 	<key>CFBundleVersion</key>
-	<string>0.8.1</string>
+	<string>${BUNDLE_VERSION}</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.8.1</string>
+	<string>${BUNDLE_VERSION}</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>MacOSX</string>

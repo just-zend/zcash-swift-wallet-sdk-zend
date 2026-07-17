@@ -1,6 +1,5 @@
 use std::ffi::CString;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 
 use anyhow::anyhow;
 use ff::PrimeField;
@@ -423,14 +422,6 @@ pub unsafe extern "C" fn zcashlc_voting_generate_note_witnesses(
     unwrap_exc_or_null(res)
 }
 
-// Keep PIR client construction at the SDK boundary so zcash_voting can accept
-// an injected transport. Today we use direct Hyper/Rustls. In the future this will be the
-// single place to add a Tor-backed transport based on SDK configuration.
-fn connect_pir_client(pir_url: &str) -> anyhow::Result<voting::PirClientBlocking> {
-    voting::PirClientBlocking::with_transport(pir_url, Arc::new(voting::HyperTransport::new()))
-        .map_err(|e| anyhow!("connect to PIR server failed: {}", e))
-}
-
 /// Precompute PIR-backed nullifier data for one delegation bundle.
 ///
 /// Witnesses must already be stored (generate_note_witnesses). Returns
@@ -460,7 +451,11 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
         let _ = network_id;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
         let notes_bytes = unsafe { bytes_from_ptr(notes_json, notes_json_len) }?;
-        let json_notes: Vec<JsonNoteInfo> = serde_json::from_slice(notes_bytes)?;
+        let json_notes: Vec<JsonNoteInfo> = if notes_bytes.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_slice(notes_bytes)?
+        };
         let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
         let pir_url = unsafe { str_from_ptr(pir_server_url, pir_server_url_len) }?;
 

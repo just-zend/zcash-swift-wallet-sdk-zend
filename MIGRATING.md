@@ -15,6 +15,36 @@ information stored.
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
 track failures on its own. Wallet developers would have to account for those.
 
+## Custom (regtest-style) networks and `NetworkType.regtest`
+
+`NetworkType` gained a third case, `regtest`. **This is a source-breaking change for exhaustive
+`switch` statements over `NetworkType`** — add a `.regtest` arm (or a `default`) when updating.
+
+Custom networks let the SDK talk to a custom-parameter chain (for example a modified-mainnet
+Ironwood testing backend) whose network upgrades activate at arbitrary heights:
+
+- `ZcashNetworkBuilder.regtest(activationHeights:)` builds a regtest-identity network with the given
+  `NetworkActivationHeights` (a `nil` height means "not activated"; the heights are not validated —
+  mirror the `nuparams` of the node/`lightwalletd` you connect to).
+- `ZcashNetworkBuilder.custom(base:activationHeights:)` combines a chosen base identity (address
+  encoding + expected `chainName`, e.g. `.mainnet` for a modified-mainnet backend) with custom
+  heights. On-disk databases still use the `regtest`-slot name prefix, so a custom network never
+  collides with a real mainnet/testnet wallet in the same container.
+- Server validation relaxes for custom networks: `ValidateServerAction` and
+  `evaluateBestOf(endpoints:...)` skip the chain-name and consensus-branch-ID checks (the server of a
+  modified chain may identify with its base chain's name and a nonstandard branch id). The
+  Sapling-activation-height check still applies.
+
+**Process-global registration and ordering.** The custom network's parameters are registered with
+the Rust core **once per process** (the first `Initializer` created with a custom network does this).
+Anything that resolves the custom network id before that registration — e.g. a
+`DerivationTool(networkType: .regtest)` created before any `Initializer` — fails with
+"custom network (id 2) used before it was configured", and key validators return `false`. Create the
+`Initializer` first, or call `ZcashRustBackend.setCustomNetwork` yourself at startup. Registering a
+**different** custom network later in the same process is a configuration bug: the newest values win
+process-globally while earlier instances keep their own per-instance state (checkpoint sources,
+constants), so the two desynchronize — the registration call reports this (and asserts in debug).
+
 ## Voting: submission contract and pre-1.0 database reset
 
 The voting stack now rides upstream `zcash_voting` 1.0 (see the CHANGELOG for the full surface).
