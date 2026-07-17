@@ -5,10 +5,7 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use ff::PrimeField;
 use ffi_helpers::panic::catch_panic;
-use incrementalmerkletree::Position;
 use pasta_curves::pallas;
-use prost::Message;
-use zcash_client_backend::proto::service::TreeState;
 use zcash_voting::{self as voting, zkp1};
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
@@ -106,35 +103,6 @@ fn hotkey_network_params(network: voting::types::Network) -> zcash_protocol::con
             zcash_protocol::consensus::Network::TestNetwork
         }
     }
-}
-
-/// Validate that a cached lightwalletd `TreeState` is anchored to the voting
-/// round it will be used for.
-///
-/// Witness generation trusts the cached Orchard frontier as the historical
-/// checkpoint input. The generated Merkle path can verify against that
-/// frontier's own root, so we must also enforce that the frontier is exactly
-/// the round snapshot: same block height and same note commitment tree root.
-fn validate_cached_tree_state_for_round(
-    tree_state: &TreeState,
-    orchard_root: &[u8],
-    params: &voting::VotingRoundParams,
-) -> anyhow::Result<()> {
-    if tree_state.height != params.snapshot_height {
-        return Err(anyhow!(
-            "cached TreeState height {} does not match round snapshot_height {}",
-            tree_state.height,
-            params.snapshot_height
-        ));
-    }
-
-    if orchard_root != params.nc_root.as_slice() {
-        return Err(anyhow!(
-            "cached TreeState orchard root does not match round nc_root"
-        ));
-    }
-
-    Ok(())
 }
 
 // =============================================================================
@@ -430,92 +398,20 @@ pub unsafe extern "C" fn zcashlc_voting_generate_note_witnesses(
         };
         let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
 
-        let (tree_state_bytes, params) = {
-            let wallet_id = handle.db.wallet_id();
-            let conn = handle.db.conn();
-            let tree_state_bytes =
-                voting::storage::queries::load_tree_state(&conn, &round_id_str, &wallet_id)
-                    .map_err(|e| anyhow!("load_tree_state failed: {}", e))?;
-            let params =
-                voting::storage::queries::load_round_params(&conn, &round_id_str, &wallet_id)
-                    .map_err(|e| anyhow!("load_round_params failed: {}", e))?;
-            (tree_state_bytes, params)
-        };
+        // zcash_voting 1.0 owns shielded-protocol-aware witness generation: it
+        // loads the cached round snapshot tree state, resolves the Ironwood
+        // pool at the round height, reads the Ironwood note-commitment tree
+        // (not Orchard), generates historical Ironwood witnesses, and validates
+        // the frontier root against the round `nc_root`. Persist the result for
+        // the delegation proof.
+        let witnesses = voting::witness::generate_note_witnesses(
+            &handle.db,
+            &round_id_str,
+            &core_notes,
+            &wallet_db,
+        )
+        .map_err(|e| anyhow!("failed to generate voting note witnesses: {}", e))?;
 
-        // Decode the tree state
-        let tree_state = TreeState::decode(tree_state_bytes.as_slice())
-            .map_err(|e| anyhow!("failed to decode TreeState protobuf: {}", e))?;
-        let orchard_ct = tree_state
-            .orchard_tree()
-            .map_err(|e| anyhow!("failed to parse orchard tree from TreeState: {}", e))?;
-        let frontier_root = orchard_ct.root();
-        let frontier_root_bytes = frontier_root.to_bytes();
-        validate_cached_tree_state_for_round(&tree_state, &frontier_root_bytes[..], &params)?;
-        let frontier = orchard_ct.to_frontier();
-        let nonempty_frontier = frontier.take().ok_or_else(|| {
-            anyhow!("empty orchard frontier — no orchard activity at snapshot height")
-        })?;
-
-        // Convert note positions to Merkle positions
-        let positions: Vec<Position> = core_notes
-            .iter()
-            .map(|n| Position::from(n.position))
-            .collect();
-
-        // `BlockHeight` is u32-backed; `snapshot_height` is u64. A wallet that
-        // somehow synced past u32::MAX blocks is impossible in protocol terms,
-        // but reject it explicitly rather than silently truncating.
-        let snapshot_height = u32::try_from(params.snapshot_height).map_err(|_| {
-            anyhow!(
-                "snapshot_height {} does not fit in u32",
-                params.snapshot_height
-            )
-        })?;
-        let checkpoint_height = zcash_protocol::consensus::BlockHeight::from_u32(snapshot_height);
-
-        // Generate witnesses from wallet DB shard data + frontier
-        let merkle_paths = wallet_db
-            .generate_orchard_witnesses_at_historical_height(
-                &positions,
-                nonempty_frontier,
-                checkpoint_height,
-            )
-            .map_err(|e| {
-                anyhow!(
-                    "generate_orchard_witnesses_at_historical_height failed: {}",
-                    e
-                )
-            })?;
-
-        if merkle_paths.len() != core_notes.len() {
-            return Err(anyhow!(
-                "generated {} Merkle paths for {} notes",
-                merkle_paths.len(),
-                core_notes.len()
-            ));
-        }
-
-        // Convert MerklePaths to WitnessData
-        let root_bytes = frontier_root_bytes.to_vec();
-        let witnesses: Vec<voting::WitnessData> = merkle_paths
-            .into_iter()
-            .zip(core_notes.iter())
-            .map(|(path, note)| {
-                let auth_path: Vec<Vec<u8>> = path
-                    .path_elems()
-                    .iter()
-                    .map(|h| h.to_bytes().to_vec())
-                    .collect();
-                voting::WitnessData {
-                    note_commitment: note.commitment.clone(),
-                    position: note.position,
-                    root: root_bytes.clone(),
-                    auth_path,
-                }
-            })
-            .collect();
-
-        // Verify and cache in voting DB
         handle
             .db
             .store_witnesses(&round_id_str, bundle_index, &witnesses)
@@ -949,4 +845,319 @@ fn parse_path(bytes: &[u8]) -> anyhow::Result<[pallas::Base; PIR_PATH_ELEMENT_CO
         path[i] = parse_base(chunk, "path element")?;
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use incrementalmerkletree::Position;
+    use incrementalmerkletree::Retention;
+    use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
+    use orchard::tree::MerkleHashOrchard;
+    use prost::Message;
+    use zcash_client_backend::data_api::WalletCommitmentTrees;
+    use zcash_client_backend::proto::service::TreeState;
+    use zcash_client_sqlite::WalletDb;
+    use zcash_client_sqlite::util::SystemClock;
+    use zcash_client_sqlite::wallet::init::WalletMigrator;
+    use zcash_primitives::merkle_tree::write_commitment_tree;
+    use zcash_protocol::consensus::BlockHeight;
+
+    use crate::NETWORK_ID_TESTNET;
+    use crate::voting::db::{VotingDatabaseHandle, zcashlc_voting_db_free, zcashlc_voting_db_open};
+
+    /// Testnet NU6.3 activation height — the first height at which the voting
+    /// crate resolves the Ironwood shielded protocol on standard testnet params.
+    const SNAPSHOT_HEIGHT: u64 = 4_134_000;
+    const WALLET_ID: &str = "wallet1";
+
+    const TREE_DEPTH: u8 = orchard::NOTE_COMMITMENT_TREE_DEPTH as u8;
+
+    fn round_id() -> String {
+        "42".repeat(32)
+    }
+
+    fn merkle_hash(tag: u64) -> MerkleHashOrchard {
+        let repr = pallas::Base::from(tag).to_repr();
+        MerkleHashOrchard::from_bytes(&repr).expect("small field element is canonical")
+    }
+
+    fn commitment_tree_hex(frontier: &Frontier<MerkleHashOrchard, TREE_DEPTH>) -> String {
+        let commitment_tree = CommitmentTree::from_frontier(frontier);
+        let mut tree_bytes = Vec::new();
+        write_commitment_tree(&commitment_tree, &mut tree_bytes)
+            .expect("serialize note commitment tree state");
+        hex::encode(tree_bytes)
+    }
+
+    /// A small frontier distinct from the seeded Ironwood tree, used as the
+    /// orchard side of the cached `TreeState` so the test can prove which pool
+    /// the witness lane reads.
+    fn orchard_decoy_frontier() -> Frontier<MerkleHashOrchard, TREE_DEPTH> {
+        let mut frontier = Frontier::empty();
+        assert!(frontier.append(merkle_hash(77)));
+        assert!(frontier.append(merkle_hash(78)));
+        frontier
+    }
+
+    fn tree_state_from_frontiers(
+        height: u64,
+        orchard_frontier: Option<&Frontier<MerkleHashOrchard, TREE_DEPTH>>,
+        ironwood_frontier: Option<&Frontier<MerkleHashOrchard, TREE_DEPTH>>,
+    ) -> TreeState {
+        TreeState {
+            network: "test".to_string(),
+            height,
+            hash: String::new(),
+            time: 0,
+            sapling_tree: String::new(),
+            orchard_tree: orchard_frontier
+                .map(commitment_tree_hex)
+                .unwrap_or_default(),
+            ironwood_tree: ironwood_frontier
+                .map(commitment_tree_hex)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn round_params(snapshot_height: u64, nc_root: Vec<u8>) -> voting::VotingRoundParams {
+        voting::VotingRoundParams {
+            vote_round_id: round_id(),
+            snapshot_height,
+            ea_pk: vec![0; 32],
+            nc_root,
+            nullifier_imt_root: vec![1; 32],
+        }
+    }
+
+    fn note(position: u64) -> voting::NoteInfo {
+        voting::NoteInfo {
+            commitment: merkle_hash(position + 1).to_bytes().to_vec(),
+            nullifier: vec![0; 32],
+            value: 1,
+            position,
+            diversifier: vec![0; 11],
+            rho: vec![0; 32],
+            rseed: vec![0; 32],
+            scope: 0,
+            ufvk_str: "ufvk".to_string(),
+        }
+    }
+
+    /// Seed a file-backed wallet DB whose **Ironwood** commitment tree contains
+    /// marked leaves at `marked_positions`, checkpointed at the snapshot height,
+    /// and return the resulting frontier. The connection is dropped before the
+    /// FFI reopens the file.
+    fn seed_ironwood_wallet_db(
+        path: &std::path::Path,
+        snapshot_height: u64,
+        later_height: u32,
+        marked_positions: &[Position],
+    ) -> Frontier<MerkleHashOrchard, TREE_DEPTH> {
+        let max_position = marked_positions
+            .iter()
+            .map(|position| u64::from(*position))
+            .max()
+            .unwrap_or(2);
+        let leaf_count = max_position + 3;
+        let leaves = (1u64..=leaf_count).map(merkle_hash).collect::<Vec<_>>();
+        let mut frontier = Frontier::empty();
+        let mut wallet_db = WalletDb::from_connection(
+            rusqlite::Connection::open(path).expect("open wallet db file"),
+            zcash_protocol::consensus::Network::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+
+        WalletMigrator::new()
+            .init_or_migrate(&mut wallet_db)
+            .expect("initialize wallet db");
+        wallet_db
+            .with_ironwood_tree_mut(|tree| {
+                for (i, leaf) in leaves.iter().enumerate() {
+                    let retention = if marked_positions
+                        .iter()
+                        .any(|position| u64::from(*position) == i as u64)
+                    {
+                        Retention::Marked
+                    } else {
+                        Retention::Ephemeral
+                    };
+                    tree.append(*leaf, retention)?;
+                    frontier.append(*leaf);
+                }
+                tree.checkpoint(BlockHeight::from_u32(snapshot_height as u32))?;
+
+                for tag in (leaf_count + 1)..=(leaf_count + 5) {
+                    tree.append(merkle_hash(tag), Retention::Ephemeral)?;
+                }
+                tree.checkpoint(BlockHeight::from_u32(later_height))?;
+
+                Ok::<(), zcash_client_sqlite::error::SqliteClientError>(())
+            })
+            .expect("seed wallet Ironwood tree");
+
+        frontier
+    }
+
+    fn temp_path(tag: &str, suffix: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zcashlc_voting_witness_{}_{}_{}.sqlite",
+            tag,
+            suffix,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Open a voting DB via the FFI, register the wallet id, init the round,
+    /// and store the cached tree state — the exact preparation sequence the SDK
+    /// runs before asking for witnesses.
+    fn prepared_voting_db(
+        tag: &str,
+        params: &voting::VotingRoundParams,
+        tree_state: &TreeState,
+        positions: &[Position],
+    ) -> (*mut VotingDatabaseHandle, std::path::PathBuf) {
+        let path = temp_path(tag, "voting");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let db = unsafe {
+            zcashlc_voting_db_open(path_bytes.as_ptr(), path_bytes.len(), NETWORK_ID_TESTNET)
+        };
+        assert!(!db.is_null(), "open voting db at {:?}", path);
+        let handle = unsafe { &*db };
+        handle.db.set_wallet_id(WALLET_ID);
+        handle
+            .db
+            .init_round(voting::types::Network::Testnet, params, None)
+            .expect("init round");
+        // Bundle 0 must exist before witnesses can be cached against it.
+        voting::storage::queries::insert_bundle(
+            &handle.db.conn(),
+            &round_id(),
+            WALLET_ID,
+            0,
+            &positions.iter().map(|p| u64::from(*p)).collect::<Vec<_>>(),
+        )
+        .expect("insert bundle");
+        handle
+            .db
+            .store_tree_state(&round_id(), &tree_state.encode_to_vec())
+            .expect("store tree state");
+        (db, path)
+    }
+
+    fn generate_witnesses_ffi(
+        db: *mut VotingDatabaseHandle,
+        wallet_path: &std::path::Path,
+        notes: &[voting::NoteInfo],
+    ) -> *mut crate::ffi::BoxedSlice {
+        let round = round_id();
+        let wallet_path_bytes = wallet_path.to_string_lossy().as_bytes().to_vec();
+        let json_notes: Vec<JsonNoteInfo> = notes.iter().cloned().map(JsonNoteInfo::from).collect();
+        let notes_json = serde_json::to_vec(&json_notes).expect("serialize notes");
+        unsafe {
+            zcashlc_voting_generate_note_witnesses(
+                db,
+                round.as_ptr(),
+                round.len(),
+                0,
+                wallet_path_bytes.as_ptr(),
+                wallet_path_bytes.len(),
+                notes_json.as_ptr(),
+                notes_json.len(),
+                NETWORK_ID_TESTNET,
+            )
+        }
+    }
+
+    fn cleanup(db: *mut VotingDatabaseHandle, paths: &[std::path::PathBuf]) {
+        unsafe { zcashlc_voting_db_free(db) };
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// The load-bearing Ironwood-era behavior: voting notes live in the
+    /// Ironwood pool, so witnesses must come from the Ironwood commitment tree
+    /// and verify against the round's Ironwood `nc_root` — even when the cached
+    /// `TreeState` also carries a (different) Orchard tree.
+    #[test]
+    fn generate_note_witnesses_uses_ironwood_tree() {
+        let positions = vec![Position::from(1), Position::from(2)];
+        let notes = positions
+            .iter()
+            .map(|position| note(u64::from(*position)))
+            .collect::<Vec<_>>();
+        let wallet_path = temp_path("ironwood", "wallet");
+        let ironwood_frontier =
+            seed_ironwood_wallet_db(&wallet_path, SNAPSHOT_HEIGHT, 4_134_100, &positions);
+        let orchard_frontier = orchard_decoy_frontier();
+        let nc_root = ironwood_frontier.root().to_bytes().to_vec();
+        let params = round_params(SNAPSHOT_HEIGHT, nc_root.clone());
+        let tree_state = tree_state_from_frontiers(
+            SNAPSHOT_HEIGHT,
+            Some(&orchard_frontier),
+            Some(&ironwood_frontier),
+        );
+        let (db, voting_path) =
+            prepared_voting_db("uses_ironwood", &params, &tree_state, &positions);
+
+        let result = generate_witnesses_ffi(db, &wallet_path, &notes);
+
+        assert!(
+            !result.is_null(),
+            "witness generation must succeed against the Ironwood tree"
+        );
+        let bytes = unsafe { (*result).as_slice() }.to_vec();
+        unsafe { crate::ffi::zcashlc_free_boxed_slice(result) };
+        let witnesses: Vec<JsonWitnessData> = serde_json::from_slice(&bytes).expect("witness json");
+        assert_eq!(witnesses.len(), notes.len());
+        for (witness, note) in witnesses.iter().zip(notes.iter()) {
+            assert_eq!(witness.note_commitment, note.commitment);
+            assert_eq!(witness.position, note.position);
+            assert_eq!(
+                witness.root, nc_root,
+                "witness root must be the Ironwood nc_root"
+            );
+            assert_eq!(witness.auth_path.len(), orchard::NOTE_COMMITMENT_TREE_DEPTH);
+        }
+
+        let handle = unsafe { &*db };
+        let stored =
+            voting::storage::queries::load_witnesses(&handle.db.conn(), &round_id(), WALLET_ID, 0)
+                .expect("load stored witnesses");
+        assert_eq!(stored.len(), witnesses.len(), "witnesses must be cached");
+
+        cleanup(db, &[voting_path, wallet_path]);
+    }
+
+    /// The frontier root must be bound to the round: a tree state whose
+    /// Ironwood root differs from the round's `nc_root` is rejected.
+    #[test]
+    fn generate_note_witnesses_rejects_mismatched_round_root() {
+        let positions = vec![Position::from(1)];
+        let notes = positions
+            .iter()
+            .map(|position| note(u64::from(*position)))
+            .collect::<Vec<_>>();
+        let wallet_path = temp_path("wrong_root", "wallet");
+        let ironwood_frontier =
+            seed_ironwood_wallet_db(&wallet_path, SNAPSHOT_HEIGHT, 4_134_100, &positions);
+        let params = round_params(SNAPSHOT_HEIGHT, vec![9; 32]);
+        let tree_state = tree_state_from_frontiers(SNAPSHOT_HEIGHT, None, Some(&ironwood_frontier));
+        let (db, voting_path) = prepared_voting_db("wrong_root", &params, &tree_state, &positions);
+
+        let result = generate_witnesses_ffi(db, &wallet_path, &notes);
+
+        assert!(
+            result.is_null(),
+            "a mismatched Ironwood root must be rejected"
+        );
+
+        cleanup(db, &[voting_path, wallet_path]);
+    }
 }
