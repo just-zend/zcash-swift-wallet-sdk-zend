@@ -16,6 +16,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   convenience accessors (`shieldedSpendableValue`, `shieldedTotal`, `shieldedChangePendingConfirmation`,
   `shieldedValuePendingSpendability`) so hosts never hand-sum pools. The path is dormant until NU6.3
   activates and a lightwalletd serves the fields.
+- `addProofsToPCZT` now creates the Ironwood proof for a PCZT's Ironwood bundle (using the PostNu6_3
+  Orchard circuit) in addition to Orchard and Sapling. Post-activation proposals route
+  orchard-receiver outputs and change into Ironwood bundles, so without this a hardware-signed
+  (Keystone) transaction built after NU6.3 activation would fail at extraction with `MissingProof`
+  after the user had already signed.
 - Configurable network-upgrade activation heights for custom (regtest-style) networks:
   `NetworkType.regtest`, `ZcashNetworkBuilder.for(.regtest)` / `.custom(base:activationHeights:)`,
   `NetworkActivationHeights` (including `nu6_3`, "Ironwood"), a `RegtestCheckpointSource` that
