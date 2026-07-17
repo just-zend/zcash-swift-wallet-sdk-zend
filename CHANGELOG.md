@@ -44,6 +44,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     additionally carries `vote_auth_sig` and `share_payloads`. `encryptShares`, `signCastVote`,
     `storeCommitmentBundle`, and `decomposeWeight` are superseded accordingly and return honest
     errors pointing at the commit flow.
+  - The commit result is surfaced as `VotingCommittedVote` (`buildVoteCommitment` returns the
+    bundle plus `voteAuthSig` and the helper-share payloads). `recordVcPosition` records the
+    confirmed vote-commitment tree position, `recoverCommittedVote` reconstructs a committed vote
+    (payloads at the stored position) from crate recovery state, and the static
+    `scheduledShareSubmitAt` exposes the crate's helper-share submit-time policy (callers supply
+    fresh CSPRNG bytes; the crate owns the sampling). `recordShareDelegation` accepts an empty
+    nullifier (the crate computes and persists its own). The superseded Swift wrappers
+    (`signCastVote`, `encryptShares`, `decomposeWeight`, `storeCommitmentBundle`) are removed —
+    the C ABI keeps honest-error stubs.
   - Delegation derives snapshot-eligible notes and key material from the wallet database
     (`buildPczt`, `buildAndProveDelegation`, and the seed-signing `getDelegationSubmission` take
     the wallet DB path, account UUID, and the app-owned hotkey stored secret); the wallet seed

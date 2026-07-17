@@ -313,34 +313,6 @@ extension VotingRustBackend {
 // MARK: - Vote casting
 
 extension VotingRustBackend {
-    /// Encrypt voting shares for a round.
-    public func encryptShares(roundId: String, shares: [UInt64]) throws -> [VotingWireEncryptedShare] {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let sharesJson = try JSONEncoder().encode(shares)
-        let sharesBytes = [UInt8](sharesJson)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                sharesBytes.withUnsafeBufferPointer { sharesBuf in
-                    zcashlc_voting_encrypt_shares(
-                        dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        sharesBuf.baseAddress,
-                        UInt(sharesBuf.count)
-                    )
-                }
-            }
-
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`encrypt_shares` failed"))
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-
     /// Build a vote commitment proof for a proposal.
     ///
     /// The proof callback may be invoked from Rust worker threads. Do not call
@@ -361,7 +333,7 @@ extension VotingRustBackend {
         vanWitness: VotingVanWitness,
         singleShare: Bool,
         progress: (@Sendable (Double) -> Void)? = nil
-    ) async throws -> VotingVoteCommitmentBundle {
+    ) async throws -> VotingCommittedVote {
         try requireOpenDatabase()
 
         return try await Task.detached { [self] in
@@ -440,55 +412,6 @@ extension VotingRustBackend {
         }
     }
 
-    /// Sign a cast-vote transaction using fields from a vote commitment bundle.
-    public static func signCastVote(
-        hotkeySeed: [UInt8],
-        networkId: UInt32,
-        commitment: VotingVoteCommitmentBundle
-    ) throws -> VotingCastVoteSignature {
-        let roundIdBytes = [UInt8](commitment.voteRoundId.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = hotkeySeed.withUnsafeBufferPointer { seedBuf in
-            roundIdBytes.withUnsafeBufferPointer { roundBuf in
-                commitment.rVpkBytes.withUnsafeBufferPointer { rVpkBuf in
-                    commitment.vanNullifier.withUnsafeBufferPointer { vanNullifierBuf in
-                        commitment.voteAuthorityNoteNew.withUnsafeBufferPointer { vanNewBuf in
-                            commitment.voteCommitment.withUnsafeBufferPointer { voteCommitmentBuf in
-                                commitment.alphaV.withUnsafeBufferPointer { alphaBuf in
-                                    zcashlc_voting_sign_cast_vote(
-                                        seedBuf.baseAddress,
-                                        UInt(seedBuf.count),
-                                        networkId,
-                                        roundBuf.baseAddress,
-                                        UInt(roundBuf.count),
-                                        rVpkBuf.baseAddress,
-                                        UInt(rVpkBuf.count),
-                                        vanNullifierBuf.baseAddress,
-                                        UInt(vanNullifierBuf.count),
-                                        vanNewBuf.baseAddress,
-                                        UInt(vanNewBuf.count),
-                                        voteCommitmentBuf.baseAddress,
-                                        UInt(voteCommitmentBuf.count),
-                                        commitment.proposalId,
-                                        commitment.anchorHeight,
-                                        alphaBuf.baseAddress,
-                                        UInt(alphaBuf.count)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        guard let ptr else {
-            throw VotingRustBackendError.rustError(staticLastErrorMessage(fallback: "`sign_cast_vote` failed"))
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        let data = Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
-        return try JSONDecoder().decode(VotingCastVoteSignature.self, from: data)
-    }
 }
 
 // MARK: - Share tracking (static)
@@ -536,6 +459,38 @@ extension VotingRustBackend {
         defer { zcashlc_string_free(ptr) }
         return String(cString: ptr)
     }
+
+    /// Compute the crate-scheduled helper-share submit time.
+    ///
+    /// Pure `zcash_voting` policy: derives the last-moment buffer from the
+    /// ceremony timing and samples uniformly inside the pre-last-moment
+    /// window from `entropy`. Pass at least 8 fresh CSPRNG bytes per share —
+    /// the crate owns the sampling and ordering policy. Returns Unix seconds
+    /// (0 = submit immediately, e.g. single-share votes or an elapsed window).
+    public static func scheduledShareSubmitAt(
+        nowSeconds: UInt64,
+        ceremonyStartSeconds: UInt64,
+        voteEndSeconds: UInt64,
+        singleShare: Bool,
+        entropy: [UInt8]
+    ) throws -> UInt64 {
+        let result = entropy.withUnsafeBufferPointer { buf in
+            zcashlc_voting_scheduled_share_submit_at(
+                nowSeconds,
+                ceremonyStartSeconds,
+                voteEndSeconds,
+                singleShare ? 1 : 0,
+                buf.baseAddress,
+                UInt(buf.count)
+            )
+        }
+        guard result >= 0 else {
+            throw VotingRustBackendError.rustError(
+                staticLastErrorMessage(fallback: "`scheduled_share_submit_at` failed")
+            )
+        }
+        return UInt64(result)
+    }
 }
 
 // MARK: - Foundation helpers (static)
@@ -553,18 +508,6 @@ extension VotingRustBackend {
                 staticLastErrorMessage(fallback: "`warm_proving_caches` failed")
             )
         }
-    }
-
-    /// Decompose `weight` into the power-of-two components used by voting
-    /// share construction.
-    public static func decomposeWeight(_ weight: UInt64) throws -> [UInt64] {
-        guard let ptr = zcashlc_voting_decompose_weight(weight) else {
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`decompose_weight` failed")
-            )
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try staticDecodeJSON(from: ptr)
     }
 
     /// Generate the public delegation inputs for a sender seed + hotkey seed pair.
@@ -1067,38 +1010,73 @@ extension VotingRustBackend {
         return try decodeJSON(from: ptr)
     }
 
-    /// Persist a vote-commitment bundle as raw JSON, plus its position in the
-    /// vote-commitment tree.
-    public func storeCommitmentBundle(
+    /// Record the confirmed vote-commitment tree position for a committed vote.
+    ///
+    /// Call after the cast-vote transaction confirms with a `leaf_index` so
+    /// recovered helper-share payloads carry the confirmed position.
+    public func recordVcPosition(
         roundId: String,
         bundleIndex: UInt32,
         proposalId: UInt32,
-        bundleJson: String,
-        voteCommitmentTreePosition: UInt64
+        vcTreePosition: UInt64
     ) throws {
         let roundIdBytes = [UInt8](roundId.utf8)
-        let bundleBytes = [UInt8](bundleJson.utf8)
         try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                bundleBytes.withUnsafeBufferPointer { bundleBuf in
-                    zcashlc_voting_store_commitment_bundle(
-                        dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        bundleIndex,
-                        proposalId,
-                        bundleBuf.baseAddress,
-                        UInt(bundleBuf.count),
-                        voteCommitmentTreePosition
-                    )
-                }
+            let result = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_record_vc_position(
+                    dbh,
+                    buf.baseAddress,
+                    UInt(buf.count),
+                    bundleIndex,
+                    proposalId,
+                    vcTreePosition
+                )
             }
             guard result == 0 else {
                 throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`store_commitment_bundle` failed")
+                    lastErrorMessage(fallback: "`record_vc_position` failed")
                 )
             }
         }
+    }
+
+    /// Reconstruct a committed vote from crate recovery state.
+    ///
+    /// The recovered helper-share payloads carry the currently stored
+    /// vote-commitment tree position — call after `recordVcPosition(...)` to
+    /// obtain payloads at the confirmed position. Throws when no committed
+    /// vote exists for the key.
+    public func recoverCommittedVote(
+        roundId: String,
+        bundleIndex: UInt32,
+        proposalId: UInt32
+    ) throws -> VotingRecoveredVote {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_recover_committed_vote(
+                    dbh,
+                    buf.baseAddress,
+                    UInt(buf.count),
+                    bundleIndex,
+                    proposalId
+                )
+            }
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`recover_committed_vote` failed")
+                )
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        let data = Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+        let committed = try Self.decodeCommittedVote(from: data)
+        let position = try JSONDecoder().decode(RecoveredVotePosition.self, from: data)
+        return VotingRecoveredVote(
+            committedVote: committed,
+            vcTreePosition: position.vcTreePosition
+        )
     }
 
     /// Load a previously-stored commitment bundle, if any.
@@ -1242,13 +1220,18 @@ extension VotingRustBackend {
         nullifier: String,
         submitAt: UInt64
     ) throws {
-        guard nullifier.count == votingShareNullifierHexCharacterCount else {
-            throw VotingRustBackendError.invalidData(
-                "nullifier must be exactly \(votingShareNullifierHexCharacterCount) hex characters"
-            )
-        }
-        guard Self.isHexString(nullifier) else {
-            throw VotingRustBackendError.invalidData("nullifier must be hex encoded")
+        // An empty nullifier defers entirely to the crate (`share::record`
+        // computes and persists its own); non-empty values keep the legacy
+        // shape validation.
+        if !nullifier.isEmpty {
+            guard nullifier.count == votingShareNullifierHexCharacterCount else {
+                throw VotingRustBackendError.invalidData(
+                    "nullifier must be exactly \(votingShareNullifierHexCharacterCount) hex characters"
+                )
+            }
+            guard Self.isHexString(nullifier) else {
+                throw VotingRustBackendError.invalidData("nullifier must be hex encoded")
+            }
         }
 
         let roundIdBytes = [UInt8](roundId.utf8)
@@ -1838,7 +1821,7 @@ private extension VotingRustBackend {
         vanWitness: VotingVanWitness,
         singleShare: Bool,
         progress: (@Sendable (Double) -> Void)?
-    ) throws -> VotingVoteCommitmentBundle {
+    ) throws -> VotingCommittedVote {
         let roundIdBytes = [UInt8](roundId.utf8)
         let authPathJson = try JSONEncoder().encode(vanWitness.authPath)
         let authPathBytes = [UInt8](authPathJson)
@@ -1887,7 +1870,8 @@ private extension VotingRustBackend {
             return ptr
         }
         defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
+        let data = Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+        return try Self.decodeCommittedVote(from: data)
     }
 
     /// Reads the last error recorded by `libzcashlc` and clears it as a side
@@ -1912,6 +1896,38 @@ private extension VotingRustBackend {
     static func staticDecodeJSON<T: Decodable>(from ptr: UnsafeMutablePointer<FfiBoxedSlice>) throws -> T {
         let data = Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
         return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    /// Decode the enriched committed-vote JSON: the flat commitment-bundle
+    /// keys plus the one-shot enrichment (`vote_auth_sig`, `share_payloads`).
+    static func decodeCommittedVote(from data: Data) throws -> VotingCommittedVote {
+        let bundle = try JSONDecoder().decode(VotingVoteCommitmentBundle.self, from: data)
+        let enrichment = try JSONDecoder().decode(CommittedVoteEnrichment.self, from: data)
+        return VotingCommittedVote(
+            bundle: bundle,
+            voteAuthSig: enrichment.voteAuthSig,
+            sharePayloads: enrichment.sharePayloads
+        )
+    }
+
+    /// The one-shot enrichment keys of the committed-vote JSON.
+    private struct CommittedVoteEnrichment: Decodable {
+        let voteAuthSig: [UInt8]
+        let sharePayloads: [VotingSharePayload]
+
+        enum CodingKeys: String, CodingKey {
+            case voteAuthSig = "vote_auth_sig"
+            case sharePayloads = "share_payloads"
+        }
+    }
+
+    /// The stored VC tree position key of the recovered-vote JSON.
+    struct RecoveredVotePosition: Decodable {
+        let vcTreePosition: UInt64
+
+        enum CodingKeys: String, CodingKey {
+            case vcTreePosition = "vc_tree_position"
+        }
     }
 
     /// Decode Rust's persisted round phase without silently aliasing unknown values.

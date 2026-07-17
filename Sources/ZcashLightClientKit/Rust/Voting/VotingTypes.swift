@@ -371,14 +371,39 @@ public struct VotingSharePayload: Codable, Sendable {
     }
 }
 
-// MARK: - Cast Vote Signature (JSON)
+// MARK: - Committed Vote
 
-/// Signature for a cast vote transaction.
-public struct VotingCastVoteSignature: Codable, Sendable {
+/// A committed vote: the commitment bundle plus the fields the one-shot
+/// commit flow produces up front.
+public struct VotingCommittedVote: Sendable {
+    public let bundle: VotingVoteCommitmentBundle
+    /// SpendAuth signature over the canonical cast-vote sighash.
     public let voteAuthSig: [UInt8]
+    /// Helper-share payloads. Their tree positions reflect the currently
+    /// stored vote-commitment tree position — 0 until the confirmed position
+    /// is recorded via `recordVcPosition(...)`.
+    public let sharePayloads: [VotingSharePayload]
 
-    enum CodingKeys: String, CodingKey {
-        case voteAuthSig = "vote_auth_sig"
+    public init(
+        bundle: VotingVoteCommitmentBundle,
+        voteAuthSig: [UInt8],
+        sharePayloads: [VotingSharePayload]
+    ) {
+        self.bundle = bundle
+        self.voteAuthSig = voteAuthSig
+        self.sharePayloads = sharePayloads
+    }
+}
+
+/// A committed vote reconstructed from crate recovery state, with the
+/// currently stored vote-commitment tree position.
+public struct VotingRecoveredVote: Sendable {
+    public let committedVote: VotingCommittedVote
+    public let vcTreePosition: UInt64
+
+    public init(committedVote: VotingCommittedVote, vcTreePosition: UInt64) {
+        self.committedVote = committedVote
+        self.vcTreePosition = vcTreePosition
     }
 }
 

@@ -139,43 +139,7 @@ pub unsafe extern "C" fn zcashlc_voting_build_vote_commitment(
             .signed_commitment(&handle.db)
             .map_err(|e| anyhow!("failed to read committed vote: {}", e))?;
 
-        // The share blinds and alpha_v secrets stay inside the crate in 1.0
-        // (they only served the superseded detached share/sign entry points),
-        // so the legacy fields are emitted empty.
-        let json_bundle = JsonVoteCommitmentBundle {
-            van_nullifier: signed.van_nullifier.to_vec(),
-            vote_authority_note_new: signed.vote_authority_note_new.to_vec(),
-            vote_commitment: signed.vote_commitment.to_vec(),
-            proposal_id: signed.proposal_id,
-            proof: signed.proof.clone(),
-            enc_shares: signed
-                .encrypted_shares
-                .iter()
-                .map(|w| JsonWireEncryptedShare {
-                    c1: w.c1.to_vec(),
-                    c2: w.c2.to_vec(),
-                    share_index: w.share_index,
-                })
-                .collect(),
-            anchor_height: signed.anchor_height,
-            vote_round_id: signed.vote_round_id.clone(),
-            shares_hash: signed.shares_hash.to_vec(),
-            share_blinds: Vec::new(),
-            share_comms: signed.share_comms.iter().map(|c| c.to_vec()).collect(),
-            r_vpk_bytes: signed.r_vpk.to_vec(),
-            alpha_v: Vec::new(),
-        };
-        let enriched = JsonCommittedVoteBundle {
-            bundle: json_bundle,
-            vote_auth_sig: signed.vote_auth_sig.to_vec(),
-            share_payloads: signed
-                .share_payloads
-                .iter()
-                .cloned()
-                .map(Into::into)
-                .collect(),
-        };
-        json_to_boxed_slice(&enriched)
+        json_to_boxed_slice(&committed_vote_json(&signed))
     });
     unwrap_exc_or_null(res)
 }
@@ -410,9 +374,51 @@ impl voting::types::VoteCommitStageReporter for NoopVoteStages {
 /// The legacy commitment-bundle JSON enriched with the fields the one-shot
 /// commit flow now produces up front (old decoders ignore the additions).
 #[derive(serde::Serialize)]
-struct JsonCommittedVoteBundle {
+pub(super) struct JsonCommittedVoteBundle {
     #[serde(flatten)]
     bundle: JsonVoteCommitmentBundle,
     vote_auth_sig: Vec<u8>,
     share_payloads: Vec<JsonSharePayload>,
+}
+
+/// Build the enriched committed-vote JSON from a signed commitment.
+///
+/// The share blinds and alpha_v secrets stay inside the crate in 1.0 (they
+/// only served the superseded detached share/sign entry points), so the
+/// legacy fields are emitted empty.
+pub(super) fn committed_vote_json(
+    signed: &voting::vote::SignedVoteCommitment,
+) -> JsonCommittedVoteBundle {
+    JsonCommittedVoteBundle {
+        bundle: JsonVoteCommitmentBundle {
+            van_nullifier: signed.van_nullifier.to_vec(),
+            vote_authority_note_new: signed.vote_authority_note_new.to_vec(),
+            vote_commitment: signed.vote_commitment.to_vec(),
+            proposal_id: signed.proposal_id,
+            proof: signed.proof.clone(),
+            enc_shares: signed
+                .encrypted_shares
+                .iter()
+                .map(|w| JsonWireEncryptedShare {
+                    c1: w.c1.to_vec(),
+                    c2: w.c2.to_vec(),
+                    share_index: w.share_index,
+                })
+                .collect(),
+            anchor_height: signed.anchor_height,
+            vote_round_id: signed.vote_round_id.clone(),
+            shares_hash: signed.shares_hash.to_vec(),
+            share_blinds: Vec::new(),
+            share_comms: signed.share_comms.iter().map(|c| c.to_vec()).collect(),
+            r_vpk_bytes: signed.r_vpk.to_vec(),
+            alpha_v: Vec::new(),
+        },
+        vote_auth_sig: signed.vote_auth_sig.to_vec(),
+        share_payloads: signed
+            .share_payloads
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect(),
+    }
 }
