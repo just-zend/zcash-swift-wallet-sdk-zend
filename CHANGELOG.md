@@ -6,8 +6,39 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- Ironwood (NU6.3) receive/sync readiness. The lightwalletd protocol gains the Ironwood fields
+  (`CompactTx.ironwoodActions`, `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
+  `ShieldedProtocol.ironwood`); `UpdateSubtreeRootsAction` fetches and stores Ironwood subtree roots
+  via the new `putIronwoodSubtreeRoots` welding (skipping gracefully when the server does not serve
+  them yet); checkpoints can carry an `ironwoodTree` state; and the balance surface gains
+  `AccountBalance.ironwoodBalance`, `WalletSummary.nextIronwoodSubtreeIndex`, and the shielded-pool
+  convenience accessors (`shieldedSpendableValue`, `shieldedTotal`, `shieldedChangePendingConfirmation`,
+  `shieldedValuePendingSpendability`) so hosts never hand-sum pools. The path is dormant until NU6.3
+  activates and a lightwalletd serves the fields.
+- Configurable network-upgrade activation heights for custom (regtest-style) networks:
+  `NetworkType.regtest`, `ZcashNetworkBuilder.for(.regtest)` / `.custom(base:activationHeights:)`,
+  `NetworkActivationHeights` (including `nu6_3`, "Ironwood"), a `RegtestCheckpointSource` that
+  synthesizes birthdays without bundled checkpoints, and the `zcashlc_set_custom_network` FFI.
+  `ValidateServerAction` skips the chain-name and consensus-branch-ID checks for custom networks
+  (the Sapling-activation-height check still applies). This is the supported way to exercise the
+  Ironwood path against a modified-parameter chain before mainnet/testnet activation.
+- `ZcashError.initializerSeedMismatch` (`ZINIT0006`): `prepare(with:walletBirthday:for:name:keySource:)`
+  now validates the provided seed against the wallet's existing seed-derived accounts and throws
+  instead of silently opening a wallet the seed cannot spend from. See `MIGRATING.md`.
+
 ## Changed
 - `Initializer.initialize` / `Synchronizer.prepare` now return `InitializationResult.seedNotRelevant` instead of silently proceeding when the rust layer reports the provided seed is not relevant to the wallet database (breaking change: `InitializationResult` gained a new case, so exhaustive switches over it must add a case; see MIGRATING.md). Previously this case was indistinguishable from `.success`: account creation was skipped (accounts already existed) and callers proceeded as if they had prepared the wallet they expected, even when the database on disk belonged to a different wallet than the provided seed (e.g. a device-backup restore that brings back `data.db` without the matching keychain seed). Callers must now handle `.seedNotRelevant` the same way they already handle `.seedRequired`. (MOB-1512)
+- The Rust core builds against `zcash/librustzcash` main (Ironwood is merged and ungated upstream),
+  pinned via `[patch.crates-io]` until the 0.24-era crates.io release; `orchard` 0.15.0 and
+  `shardtree` 0.7.0 resolve from crates.io.
+- `zcash_voting` rides a pinned rev of its upstream repository (aligned to the same librustzcash rev
+  and orchard 0.15) instead of the published 0.11 release, which pins `orchard ^0.14` and cannot
+  coexist with the Ironwood graph. A subset of voting FFI entry points whose 1.0 API redesign is not
+  yet absorbed return honest errors ("zcash_voting port pending"); their acceptance tests sit behind
+  the `voting-port-tests` cargo feature, and the affected Swift tests skip themselves until the port
+  completes.
+- Generated protobuf Swift stubs are regenerated with a pinned `swift-protobuf` 1.35.1.
 
 ## Fixed
 - Tor-layer errors (`rustTorConnectToLightwalletd`, `rustTorLwdGetInfo`, `rustTorLwdSubmit`, `rustTorLwdFetchTransaction`, `rustTorLwdLatestBlockHeight`, `rustTorLwdGetTreeState`) are now classified as retryable service errors in `CompactBlockProcessor`. Previously these errors bypassed the service-error retry path and went straight to a fatal sync failure, so a transient Tor circuit/stream issue (e.g. "remote hostname lookup failure", "Failed to obtain exit circuit for ports", "Tor network protocol violation") required a full app restart to recover. They now trigger the same reset-and-retry behavior (including tearing down cached Tor connections via `service.closeConnections()`) as other transport errors, up to `ZcashSDK.serviceFailureRetries` times.
