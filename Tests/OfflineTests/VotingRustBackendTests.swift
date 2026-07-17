@@ -39,17 +39,16 @@ private let roundTripVoteCommitment = [UInt8](repeating: 0xAA, count: votingFiel
 final class VotingRustBackendTests: XCTestCase {
     private var dbPath: String?
 
-    // [#1755] IW-2a left most zcash_voting FFI entry points as honest stubs on
-    // the ironwood-support graph (zcash_voting 1.0 port pending — readiness
-    // board row B9). Probe one stubbed entry point once per run: tests that
-    // exercise stubbed entry points skip while the port is pending and re-arm
-    // automatically when the real implementations return.
+    // Most zcash_voting FFI entry points are still honest stubs on the orchard 0.15 graph, pending
+    // a zcash_voting release that supports it. Probe one stubbed entry point once per run: tests
+    // that exercise stubbed entry points skip while the port is pending and re-arm automatically
+    // when the real implementations return.
     private static let votingFFIPortPending: Bool = {
         do {
             _ = try VotingRustBackend.decomposeWeight(1)
             return false
         } catch VotingRustBackendError.rustError(let message) {
-            return message.contains("zcash_voting 1.0 port pending")
+            return message.contains("zcash_voting port pending")
         } catch {
             return false
         }
@@ -58,7 +57,7 @@ final class VotingRustBackendTests: XCTestCase {
     private func skipWhileVotingPortPending() throws {
         try XCTSkipIf(
             Self.votingFFIPortPending,
-            "Exercises an FFI entry point stubbed at IW-2a (zcash_voting 1.0 port pending - B9)"
+            "Exercises an FFI entry point that is stubbed until a zcash_voting release supports the orchard 0.15 graph"
         )
     }
 
