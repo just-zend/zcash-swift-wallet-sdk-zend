@@ -15,13 +15,7 @@ build = "rust/build.rs"
 [dependencies]
 
 # Zcash
-# Ironwood (NU6.3) is merged and ungated on zcash/librustzcash main, but the
-# 0.24-era crates are not on crates.io yet, so the librustzcash family rides
-# [patch.crates-io] (see below) until that release. orchard 0.15.0 and
-# shardtree 0.7.0 are real crates.io releases and need no patch. The `=x.y.z`
-# pins on the patched crates stop a future crates.io patch release from
-# out-resolving the [patch] block (a real hazard: 0.21.1 exists).
-orchard = { version = "0.15.0", features = ["unstable-voting-circuits"] }
+orchard = { version = "0.15", features = ["unstable-voting-circuits"] }
 pasta_curves = "0.5"
 ff = "0.13"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
@@ -39,8 +33,6 @@ zcash_client_sqlite = { version = "0.22.0-rc.1", features = ["orchard", "transpa
 zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.29"
 zcash_proofs = "0.29"
-# "local-consensus" backs the custom/regtest activation-heights support
-# (LocalNetwork) used to exercise Ironwood before NU6.3 activates.
 zcash_protocol = { version = "0.10", features = ["local-consensus"] }
 zcash_script = "0.4"
 zip32 = "0.2"
@@ -91,6 +83,7 @@ rust_decimal = { version = "1", default-features = false, features = ["c-repr"] 
 # - The "static" feature is required for the "compression" default feature of arti-client.
 xz2 = { version = "0.1", features = ["static"] }
 
+# Voting
 zcash_voting = "1.0"
 zcash_keys = { version = "0.15.0", features = ["orchard"] }
 incrementalmerkletree = { version = "0.8", default-features = false }

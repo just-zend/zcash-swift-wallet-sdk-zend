@@ -16,6 +16,7 @@ use zcash_client_backend::{
     tor::{Client, DormantMode},
     wallet::WalletTransparentOutput,
 };
+use zcash_client_sqlite::AccountUuid;
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::{
     TxId,
@@ -236,6 +237,8 @@ impl LwdConn {
                         Script(script::Code(result.script)),
                     ),
                     Some(BlockHeight::from(u32::try_from(result.height)?)),
+                    // These UTXOs are discovered by scanning lightwalletd for an address;
+                    // the wallet has no account association or key scope for them here.
                     None,
                     None,
                     None,
