@@ -702,9 +702,7 @@ public class SDKSynchronizer: Synchronizer {
 
     public func rescanFrom(height: BlockHeight) async throws {
         // Ensure sapling activation is the lowest possible
-        let saplingActivationHeight = network.networkType == .mainnet
-        ? ZcashMainnet().constants.saplingActivationHeight
-        : ZcashTestnet().constants.saplingActivationHeight
+        let saplingActivationHeight = network.saplingActivationHeight
 
         guard height >= saplingActivationHeight else {
             throw ZcashError.rescanFromHeightBellowSaplingActivation
@@ -900,7 +898,8 @@ public class SDKSynchronizer: Synchronizer {
 
                 // rule out if mismatch of networks
                 guard (info.chainName == "main" && network == .mainnet)
-                    || (info.chainName == "test" && network == .testnet) else {
+                    || (info.chainName == "test" && network == .testnet)
+                    || (info.chainName == "regtest" && network == .regtest) else {
                     continue
                 }
 
