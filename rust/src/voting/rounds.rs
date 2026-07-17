@@ -3,15 +3,12 @@ use std::panic::AssertUnwindSafe;
 
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
-use zcash_voting as voting;
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
 use super::db::VotingDatabaseHandle;
-use super::ffi_types::{
-    FfiRoundState, FfiRoundSummaries, FfiRoundSummary, FfiVoteRecord, FfiVoteRecords,
-};
-use super::helpers::{bytes_from_ptr, round_phase_to_u32, str_from_ptr};
+use super::ffi_types::{FfiRoundState, FfiRoundSummaries, FfiRoundSummary, FfiVoteRecords};
+use super::helpers::{round_phase_to_u32, str_from_ptr};
 
 /// Initialize a voting round.
 ///
@@ -37,37 +34,27 @@ pub unsafe extern "C" fn zcashlc_voting_init_round(
     session_json_len: usize,
 ) -> i32 {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let ea_pk_bytes = unsafe { bytes_from_ptr(ea_pk, ea_pk_len) }?.to_vec();
-        let nc_root_bytes = unsafe { bytes_from_ptr(nc_root, nc_root_len) }?.to_vec();
-        let nullifier_imt_root_bytes =
-            unsafe { bytes_from_ptr(nullifier_imt_root, nullifier_imt_root_len) }?.to_vec();
-
-        let session = if session_json.is_null() || session_json_len == 0 {
-            None
-        } else {
-            Some(unsafe { str_from_ptr(session_json, session_json_len) }?)
-        };
-
-        let params = voting::VotingRoundParams {
-            vote_round_id: round_id_str,
+    let res = catch_panic(|| -> anyhow::Result<i32> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): round init was re-signatured in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            round_id,
+            round_id_len,
             snapshot_height,
-            ea_pk: ea_pk_bytes,
-            nc_root: nc_root_bytes,
-            nullifier_imt_root: nullifier_imt_root_bytes,
-        };
-
-        voting::validate_round_params(&params)
-            .map_err(|e| anyhow!("invalid round params: {}", e))?;
-
-        handle
-            .db
-            .init_round(&params, session.as_deref())
-            .map_err(|e| anyhow!("init_round failed: {}", e))?;
-        Ok(0)
+            ea_pk,
+            ea_pk_len,
+            nc_root,
+            nc_root_len,
+            nullifier_imt_root,
+            nullifier_imt_root_len,
+            session_json,
+            session_json_len,
+        );
+        Err(anyhow!(
+            "voting: init_round is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or(res, -1)
 }
@@ -196,28 +183,14 @@ pub unsafe extern "C" fn zcashlc_voting_get_votes(
     round_id_len: usize,
 ) -> *mut FfiVoteRecords {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-
-        let votes = handle
-            .db
-            .get_votes(&round_id_str)
-            .map_err(|e| anyhow!("get_votes failed: {}", e))?;
-
-        let ffi_votes: Vec<FfiVoteRecord> = votes
-            .into_iter()
-            .map(|v| FfiVoteRecord {
-                proposal_id: v.proposal_id,
-                bundle_index: v.bundle_index,
-                choice: v.choice,
-                submitted: v.submitted,
-            })
-            .collect();
-
-        let (ptr, len) = crate::ptr_from_vec(ffi_votes);
-        Ok(Box::into_raw(Box::new(FfiVoteRecords { ptr, len })))
+    let res = catch_panic(|| -> anyhow::Result<*mut FfiVoteRecords> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): the vote-record shape changed in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (&db, round_id, round_id_len);
+        Err(anyhow!(
+            "voting: get_votes is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -279,7 +252,8 @@ pub unsafe extern "C" fn zcashlc_voting_delete_skipped_bundles(
     unwrap_exc_or(res, -1)
 }
 
-#[cfg(test)]
+// [IW-PORT] 0.11-flow tests parked behind `voting-port-tests` (see voting.rs).
+#[cfg(all(test, feature = "voting-port-tests"))]
 mod tests {
     use super::*;
     use crate::voting::db::zcashlc_voting_db_free;

@@ -12,6 +12,7 @@ import XCTest
 final class ValidateServerActionTests: ZcashTestCase {
     var underlyingChainName = ""
     var underlyingNetworkType = NetworkType.testnet
+    var underlyingNetwork: ZcashNetwork?
     var underlyingSaplingActivationHeight: BlockHeight?
     var underlyingConsensusBranchID = ""
 
@@ -20,6 +21,7 @@ final class ValidateServerActionTests: ZcashTestCase {
 
         underlyingChainName = "test"
         underlyingNetworkType = .testnet
+        underlyingNetwork = nil
         underlyingSaplingActivationHeight = nil
         underlyingConsensusBranchID = "c2d6d0b4"
     }
@@ -130,9 +132,59 @@ final class ValidateServerActionTests: ZcashTestCase {
         }
     }
 
+    func testValidateServerAction_CustomNetworkAcceptsMismatchedChainAndBranch() async throws {
+        // A regtest custom network syncing against a modified-mainnet Ironwood backend: the backend
+        // reports chainName "main" and a nonstandard branch id, but the Sapling activation matches.
+        underlyingNetwork = ZcashNetworkBuilder.regtest(
+            activationHeights: NetworkActivationHeights(sapling: 1, nu5: 1, nu6: 1, nu6_3: 5000)
+        )
+        underlyingChainName = "main"
+        underlyingConsensusBranchID = "ffffffff"
+        underlyingSaplingActivationHeight = nil
+
+        let validateServerAction = setupAction()
+
+        do {
+            let context = ActionContextMock.default()
+            let nextContext = try await validateServerAction.run(with: context) { _ in }
+
+            let acResult = nextContext.checkStateIs(.fetchUTXO)
+            XCTAssertTrue(acResult == .true, "Custom network should pass server validation, got '\(acResult)'")
+        } catch {
+            XCTFail("Custom network is not expected to fail server validation. \(error)")
+        }
+    }
+
+    func testValidateServerAction_CustomNetworkStillChecksSaplingActivation() async throws {
+        // Even for a custom network, a wrong Sapling-activation height (e.g. a real mainnet server)
+        // must still be rejected.
+        underlyingNetwork = ZcashNetworkBuilder.regtest(
+            activationHeights: NetworkActivationHeights(sapling: 1, nu6_3: 5000)
+        )
+        underlyingChainName = "main"
+        underlyingConsensusBranchID = "ffffffff"
+        underlyingSaplingActivationHeight = 419_200
+
+        let validateServerAction = setupAction()
+
+        do {
+            _ = try await validateServerAction.run(with: ActionContextMock()) { _ in }
+            XCTFail("Custom network with mismatched Sapling activation is expected to fail.")
+        } catch let ZcashError.compactBlockProcessorSaplingActivationMismatch(expected, found) {
+            XCTAssertEqual(expected, 1)
+            XCTAssertEqual(found, 419_200)
+        } catch {
+            XCTFail("""
+            testValidateServerAction_CustomNetworkStillChecksSaplingActivation is expected to fail but error \(error) doesn't match \
+            ZcashError.compactBlockProcessorSaplingActivationMismatch
+            """)
+        }
+    }
+
     private func setupAction() -> ValidateServerAction {
+        let network = underlyingNetwork ?? ZcashNetworkBuilder.network(for: underlyingNetworkType)
         let config: CompactBlockProcessor.Configuration = .standard(
-            for: ZcashNetworkBuilder.network(for: underlyingNetworkType), walletBirthday: 0
+            for: network, walletBirthday: 0
         )
 
         let rustBackendMock = ZcashRustBackendWeldingMock()

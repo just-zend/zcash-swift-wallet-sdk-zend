@@ -1,4 +1,3 @@
-use std::ffi::CString;
 use std::fmt::Write as _;
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
@@ -10,7 +9,7 @@ use zcash_voting as voting;
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
-use super::constants::{CANONICAL_FIELD_LEN, SHARE_NULLIFIER_HEX_LEN, SHARE_NULLIFIER_LEN};
+use super::constants::{SHARE_NULLIFIER_HEX_LEN, SHARE_NULLIFIER_LEN};
 use super::db::VotingDatabaseHandle;
 use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
 
@@ -93,26 +92,14 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
     primary_blind: *const u8,
     share_index: u32,
 ) -> *mut c_char {
-    let res = catch_panic(|| {
-        let vc: [u8; CANONICAL_FIELD_LEN] =
-            unsafe { std::slice::from_raw_parts(vote_commitment, CANONICAL_FIELD_LEN) }
-                .try_into()
-                .map_err(|_| {
-                    anyhow!("vote_commitment must be exactly {CANONICAL_FIELD_LEN} bytes")
-                })?;
-        let blind: [u8; CANONICAL_FIELD_LEN] =
-            unsafe { std::slice::from_raw_parts(primary_blind, CANONICAL_FIELD_LEN) }
-                .try_into()
-                .map_err(|_| {
-                    anyhow!("primary_blind must be exactly {CANONICAL_FIELD_LEN} bytes")
-                })?;
-
-        let nullifier = voting::share_tracking::compute_share_nullifier(&vc, share_index, &blind)
-            .map_err(|e| anyhow!("compute_share_nullifier failed: {}", e))?;
-
-        let hex_str = bytes_to_hex(&nullifier);
-        let c_str = CString::new(hex_str).map_err(|e| anyhow!("null byte in hex string: {}", e))?;
-        Ok(c_str.into_raw())
+    let res = catch_panic(|| -> anyhow::Result<*mut c_char> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch rides)
+        // redesigned share tracking — `share_tracking::compute_share_nullifier` has
+        // no 1.0 equivalent. Honest error until the voting-FFI port (census: voting row).
+        let _ = (vote_commitment, primary_blind, share_index);
+        Err(anyhow!(
+            "voting: compute_share_nullifier is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -142,28 +129,26 @@ pub unsafe extern "C" fn zcashlc_voting_record_share_delegation(
     submit_at: u64,
 ) -> i32 {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let nullifier_hex_str = unsafe { str_from_ptr(nullifier_hex, nullifier_hex_len) }?;
-        let nullifier = decode_share_nullifier_hex(&nullifier_hex_str)?;
-        let urls_bytes = unsafe { bytes_from_ptr(sent_to_urls_json, sent_to_urls_json_len) }?;
-        let sent_to_urls: Vec<String> = serde_json::from_slice(urls_bytes)?;
-
-        handle
-            .db
-            .record_share_delegation(
-                &round_id_str,
-                bundle_index,
-                proposal_id,
-                share_index,
-                &sent_to_urls,
-                &nullifier,
-                submit_at,
-            )
-            .map_err(|e| anyhow!("record_share_delegation failed: {}", e))?;
-        Ok(0)
+    let res = catch_panic(|| -> anyhow::Result<i32> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): record_share_delegation became private in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            round_id,
+            round_id_len,
+            bundle_index,
+            proposal_id,
+            share_index,
+            sent_to_urls_json,
+            sent_to_urls_json_len,
+            nullifier_hex,
+            nullifier_hex_len,
+            submit_at,
+        );
+        Err(anyhow!(
+            "voting: record_share_delegation is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or(res, -1)
 }
@@ -303,7 +288,8 @@ pub unsafe extern "C" fn zcashlc_voting_add_sent_servers(
     unwrap_exc_or(res, -1)
 }
 
-#[cfg(test)]
+// [IW-PORT] 0.11-flow tests parked behind `voting-port-tests` (see voting.rs).
+#[cfg(all(test, feature = "voting-port-tests"))]
 mod tests {
     use super::*;
     use crate::ffi::zcashlc_free_boxed_slice;

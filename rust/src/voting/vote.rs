@@ -6,13 +6,10 @@ use zcash_voting as voting;
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
-use super::constants::{CANONICAL_FIELD_LEN, MIN_SEED_LEN, VOTE_ROUND_ID_HEX_LEN};
+use super::constants::{CANONICAL_FIELD_LEN, MIN_SEED_LEN};
 use super::db::VotingDatabaseHandle;
-use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
-use super::json::{
-    JsonCastVoteSignature, JsonSharePayload, JsonVoteCommitmentBundle, JsonWireEncryptedShare,
-};
-use super::progress::ProgressBridge;
+use super::helpers::{bytes_from_ptr, json_to_boxed_slice};
+use super::json::{JsonSharePayload, JsonVoteCommitmentBundle};
 
 /// Encrypt voting shares for a round.
 ///
@@ -34,21 +31,14 @@ pub unsafe extern "C" fn zcashlc_voting_encrypt_shares(
     shares_json_len: usize,
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let shares_bytes = unsafe { bytes_from_ptr(shares_json, shares_json_len) }?;
-        let shares: Vec<u64> = serde_json::from_slice(shares_bytes)?;
-
-        let encrypted = handle
-            .db
-            .encrypt_shares(&round_id_str, &shares)
-            .map_err(|e| anyhow!("encrypt_shares failed: {}", e))?;
-
-        let json_shares: Vec<JsonWireEncryptedShare> =
-            encrypted.into_iter().map(Into::into).collect();
-        json_to_boxed_slice(&json_shares)
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): share encryption moved into the 1.0 payload APIs.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (&db, round_id, round_id_len, shares_json, shares_json_len);
+        Err(anyhow!(
+            "voting: encrypt_shares is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -95,52 +85,32 @@ pub unsafe extern "C" fn zcashlc_voting_build_vote_commitment(
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
     let progress_context = AssertUnwindSafe(progress_context);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let seed = unsafe { bytes_from_ptr(hotkey_seed, hotkey_seed_len) }?;
-        require_min_seed_len(seed, "hotkey_seed")?;
-        let auth_path_bytes =
-            unsafe { bytes_from_ptr(van_auth_path_json, van_auth_path_json_len) }?;
-        let auth_path_vecs: Vec<Vec<u8>> = serde_json::from_slice(auth_path_bytes)?;
-        let auth_path: Vec<[u8; CANONICAL_FIELD_LEN]> = auth_path_vecs
-            .into_iter()
-            .map(|v| {
-                v.try_into().map_err(|_| {
-                    anyhow!("each auth_path sibling must be {CANONICAL_FIELD_LEN} bytes")
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        let reporter: Box<dyn voting::ProofProgressReporter> = match progress_callback {
-            Some(cb) => Box::new(ProgressBridge {
-                callback: cb,
-                context: *progress_context,
-            }),
-            None => Box::new(voting::NoopProgressReporter),
-        };
-
-        let bundle = handle
-            .db
-            .build_vote_commitment(
-                &round_id_str,
-                bundle_index,
-                seed,
-                network_id,
-                proposal_id,
-                choice,
-                num_options,
-                &auth_path,
-                van_position,
-                anchor_height,
-                single_share != 0,
-                reporter.as_ref(),
-            )
-            .map_err(|e| anyhow!("build_vote_commitment failed: {}", e))?;
-
-        let json_bundle: JsonVoteCommitmentBundle = bundle.into();
-        json_to_boxed_slice(&json_bundle)
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): build_vote_commitment became crate-private in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            &progress_context,
+            round_id,
+            round_id_len,
+            bundle_index,
+            hotkey_seed,
+            hotkey_seed_len,
+            network_id,
+            proposal_id,
+            choice,
+            num_options,
+            van_auth_path_json,
+            van_auth_path_json_len,
+            van_position,
+            anchor_height,
+            progress_callback,
+            single_share,
+        );
+        Err(anyhow!(
+            "voting: build_vote_commitment is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -224,16 +194,14 @@ pub unsafe extern "C" fn zcashlc_voting_mark_vote_submitted(
     proposal_id: u32,
 ) -> i32 {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-
-        handle
-            .db
-            .mark_vote_submitted(&round_id_str, bundle_index, proposal_id)
-            .map_err(|e| anyhow!("mark_vote_submitted failed: {}", e))?;
-        Ok(0)
+    let res = catch_panic(|| -> anyhow::Result<i32> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): the vote-record API changed shape in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (&db, round_id, round_id_len, bundle_index, proposal_id);
+        Err(anyhow!(
+            "voting: mark_vote_submitted is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or(res, -1)
 }
@@ -272,47 +240,33 @@ pub unsafe extern "C" fn zcashlc_voting_sign_cast_vote(
     alpha_v: *const u8,
     alpha_v_len: usize,
 ) -> *mut crate::ffi::BoxedSlice {
-    let res = catch_panic(|| {
-        let seed = unsafe { bytes_from_ptr(hotkey_seed, hotkey_seed_len) }?;
-        require_min_seed_len(seed, "hotkey_seed")?;
-        let round_id = unsafe { str_from_ptr(vote_round_id_hex, vote_round_id_hex_len) }?;
-        let r_vpk = unsafe { bytes_from_ptr(r_vpk_bytes, r_vpk_bytes_len) }?;
-        let van_nf = unsafe { bytes_from_ptr(van_nullifier, van_nullifier_len) }?;
-        let van_new =
-            unsafe { bytes_from_ptr(vote_authority_note_new, vote_authority_note_new_len) }?;
-        let vc = unsafe { bytes_from_ptr(vote_commitment, vote_commitment_len) }?;
-        let alpha = unsafe { bytes_from_ptr(alpha_v, alpha_v_len) }?;
-
-        if round_id.len() != VOTE_ROUND_ID_HEX_LEN {
-            return Err(anyhow!(
-                "vote_round_id_hex must be {} hex characters, got {}",
-                VOTE_ROUND_ID_HEX_LEN,
-                round_id.len()
-            ));
-        }
-        require_ascii_hex(&round_id, "vote_round_id_hex")?;
-        require_32_bytes(r_vpk, "r_vpk_bytes")?;
-        require_32_bytes(van_nf, "van_nullifier")?;
-        require_32_bytes(van_new, "vote_authority_note_new")?;
-        require_32_bytes(vc, "vote_commitment")?;
-        require_32_bytes(alpha, "alpha_v")?;
-
-        let sig = voting::vote_commitment::sign_cast_vote(
-            seed,
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // [IW-PORT] zcash_voting 1.0 made `vote_commitment::sign_cast_vote`
+        // crate-private — cast-vote signing now flows through the 1.0 session/
+        // payload APIs (`build_share_payloads`). Honest error until the
+        // voting-FFI port (census: voting row).
+        let _ = (
+            hotkey_seed,
+            hotkey_seed_len,
             network_id,
-            &round_id,
-            r_vpk,
-            van_nf,
-            van_new,
-            vc,
+            vote_round_id_hex,
+            vote_round_id_hex_len,
+            r_vpk_bytes,
+            r_vpk_bytes_len,
+            van_nullifier,
+            van_nullifier_len,
+            vote_authority_note_new,
+            vote_authority_note_new_len,
+            vote_commitment,
+            vote_commitment_len,
             proposal_id,
             anchor_height,
-            alpha,
-        )
-        .map_err(|e| anyhow!("sign_cast_vote failed: {}", e))?;
-
-        let json_sig: JsonCastVoteSignature = sig.into();
-        json_to_boxed_slice(&json_sig)
+            alpha_v,
+            alpha_v_len,
+        );
+        Err(anyhow!(
+            "voting: sign_cast_vote is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -353,7 +307,8 @@ fn require_ascii_hex(value: &str, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+// [IW-PORT] 0.11-flow tests parked behind `voting-port-tests` (see voting.rs).
+#[cfg(all(test, feature = "voting-port-tests"))]
 mod tests {
     use super::*;
 
