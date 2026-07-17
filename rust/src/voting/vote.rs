@@ -37,7 +37,7 @@ pub unsafe extern "C" fn zcashlc_voting_encrypt_shares(
         // Honest error until the voting-FFI port (census: voting row).
         let _ = (&db, round_id, round_id_len, shares_json, shares_json_len);
         Err(anyhow!(
-            "voting: encrypt_shares is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: encrypt_shares is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn zcashlc_voting_build_vote_commitment(
             single_share,
         );
         Err(anyhow!(
-            "voting: build_vote_commitment is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: build_vote_commitment is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
@@ -200,7 +200,7 @@ pub unsafe extern "C" fn zcashlc_voting_mark_vote_submitted(
         // Honest error until the voting-FFI port (census: voting row).
         let _ = (&db, round_id, round_id_len, bundle_index, proposal_id);
         Err(anyhow!(
-            "voting: mark_vote_submitted is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: mark_vote_submitted is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or(res, -1)
@@ -265,7 +265,7 @@ pub unsafe extern "C" fn zcashlc_voting_sign_cast_vote(
             alpha_v_len,
         );
         Err(anyhow!(
-            "voting: sign_cast_vote is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: sign_cast_vote is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)

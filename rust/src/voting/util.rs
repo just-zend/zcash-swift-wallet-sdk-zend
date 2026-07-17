@@ -53,7 +53,7 @@ pub unsafe extern "C" fn zcashlc_voting_decompose_weight(
         // error until the voting-FFI port (census: voting row).
         let _ = weight;
         Err(anyhow!(
-            "voting: decompose_weight is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: decompose_weight is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)

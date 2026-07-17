@@ -98,7 +98,7 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
         // no 1.0 equivalent. Honest error until the voting-FFI port (census: voting row).
         let _ = (vote_commitment, primary_blind, share_index);
         Err(anyhow!(
-            "voting: compute_share_nullifier is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: compute_share_nullifier is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
@@ -147,7 +147,7 @@ pub unsafe extern "C" fn zcashlc_voting_record_share_delegation(
             submit_at,
         );
         Err(anyhow!(
-            "voting: record_share_delegation is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: record_share_delegation is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or(res, -1)

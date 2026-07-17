@@ -53,7 +53,7 @@ pub unsafe extern "C" fn zcashlc_voting_init_round(
             session_json_len,
         );
         Err(anyhow!(
-            "voting: init_round is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: init_round is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or(res, -1)
@@ -189,7 +189,7 @@ pub unsafe extern "C" fn zcashlc_voting_get_votes(
         // Honest error until the voting-FFI port (census: voting row).
         let _ = (&db, round_id, round_id_len);
         Err(anyhow!(
-            "voting: get_votes is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+            "voting: get_votes is unavailable on the ironwood-support graph (zcash_voting port pending)"
         ))
     });
     unwrap_exc_or_null(res)
