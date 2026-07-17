@@ -104,16 +104,22 @@ pub unsafe extern "C" fn zcashlc_voting_store_vote_tx_hash(
     tx_hash_len: usize,
 ) -> i32 {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let tx_hash_str = unsafe { str_from_ptr(tx_hash, tx_hash_len) }?;
-        handle
-            .db
-            .store_vote_tx_hash(&round_id_str, bundle_index, proposal_id, &tx_hash_str)
-            .map_err(|e| anyhow!("store_vote_tx_hash failed: {}", e))?;
-        Ok(0)
+    let res = catch_panic(|| -> anyhow::Result<i32> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): recovery storage was redesigned in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            round_id,
+            round_id_len,
+            bundle_index,
+            proposal_id,
+            tx_hash,
+            tx_hash_len,
+        );
+        Err(anyhow!(
+            "voting: store_vote_tx_hash is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or(res, -1)
 }
@@ -166,22 +172,23 @@ pub unsafe extern "C" fn zcashlc_voting_store_commitment_bundle(
     vc_tree_position: u64,
 ) -> i32 {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let json_str = unsafe { str_from_ptr(bundle_json, bundle_json_len) }?;
-        handle
-            .db
-            .store_commitment_bundle(
-                &round_id_str,
-                bundle_index,
-                proposal_id,
-                &json_str,
-                vc_tree_position,
-            )
-            .map_err(|e| anyhow!("store_commitment_bundle failed: {}", e))?;
-        Ok(0)
+    let res = catch_panic(|| -> anyhow::Result<i32> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): recovery storage was redesigned in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            round_id,
+            round_id_len,
+            bundle_index,
+            proposal_id,
+            bundle_json,
+            bundle_json_len,
+            vc_tree_position,
+        );
+        Err(anyhow!(
+            "voting: store_commitment_bundle is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or(res, -1)
 }
@@ -336,7 +343,8 @@ pub unsafe extern "C" fn zcashlc_voting_clear_recovery_state(
     unwrap_exc_or(res, -1)
 }
 
-#[cfg(test)]
+// [IW-PORT] 0.11-flow tests parked behind `voting-port-tests` (see voting.rs).
+#[cfg(all(test, feature = "voting-port-tests"))]
 mod tests {
     use super::*;
     use crate::ffi::zcashlc_free_boxed_slice;

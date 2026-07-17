@@ -12,6 +12,8 @@ pub(crate) fn open_memory_db() -> *mut VotingDatabaseHandle {
     db
 }
 
+// [IW-PORT] needs 0.11 `setup_bundles` — parked with the flow tests.
+#[cfg(feature = "voting-port-tests")]
 pub(crate) fn insert_round_and_bundle(db: *mut VotingDatabaseHandle, round_id: &str) {
     let handle = unsafe { db.as_ref() }.expect("db handle");
     let params = zcash_voting::VotingRoundParams {

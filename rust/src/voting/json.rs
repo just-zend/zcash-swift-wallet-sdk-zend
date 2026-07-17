@@ -380,8 +380,8 @@ pub struct JsonVanWitness {
     pub anchor_height: u32,
 }
 
-impl From<voting::tree_sync::VanWitness> for JsonVanWitness {
-    fn from(w: voting::tree_sync::VanWitness) -> Self {
+impl From<voting::vote::VanWitness> for JsonVanWitness {
+    fn from(w: voting::vote::VanWitness) -> Self {
         Self {
             auth_path: w.auth_path.iter().map(|h| h.to_vec()).collect(),
             position: w.position,

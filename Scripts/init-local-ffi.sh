@@ -136,6 +136,14 @@ build_arm_xcframework() {
     rm -rf "$XCFRAMEWORK_DIR"
     mv "$temp_xcfw" "$XCFRAMEWORK_DIR"
     rm -rf "$temp_dir"
+
+    # The slices above are assembled shallow (iOS layout). macOS embedded
+    # frameworks require the VERSIONED bundle layout, else the app build fails
+    # ("expected Versions/Current/Resources/Info.plist"). Same fix as the full
+    # make path below and rebuild-local-ffi.sh; guarded for iOS-only subsets.
+    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework" ]]; then
+        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    fi
 }
 
 # Parse the single optional flag.
@@ -208,6 +216,10 @@ elif [[ "$BUILD_MODE" == "cached" ]]; then
     fi
     echo "Checksum verified."
 
+    # Remove any existing framework first: extracting/copying onto an existing
+    # directory leaves stale files (or, for cp -R, nests the new framework inside
+    # the old one), so installs must always start from a clean target.
+    rm -rf "$XCFRAMEWORK_DIR"
     unzip -o LocalPackages/libzcashlc.xcframework.zip -d LocalPackages/
     rm LocalPackages/libzcashlc.xcframework.zip
     echo ""
@@ -219,7 +231,15 @@ else
     make xcframework
     cd ..
     mkdir -p LocalPackages
+    # cp -R into an EXISTING directory copies the source INSIDE it (nested
+    # libzcashlc.xcframework/libzcashlc.xcframework with stale slices at the top
+    # level — device builds silently run old code). Always replace, never merge.
+    rm -rf "$XCFRAMEWORK_DIR"
     cp -R BuildSupport/products/libzcashlc.xcframework "$XCFRAMEWORK_DIR"
+    # The Makefile assembles every slice shallow (iOS layout). macOS embedded
+    # frameworks require the versioned bundle layout, else Xcode rejects the app
+    # ("expected Versions/Current/Resources/Info.plist"). Fix the macOS slice.
+    ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
 fi
 
 # Create local SPM package wrapper

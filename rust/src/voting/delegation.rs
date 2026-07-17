@@ -14,18 +14,12 @@ use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
 use super::constants::{
     CANONICAL_FIELD_LEN, PIR_NULLIFIER_BOUNDS_LEN, PIR_NULLIFIER_LEN, PIR_PATH_ELEMENT_COUNT,
-    PIR_PATH_LEN, PIR_ROOT_LEN, SEED_FINGERPRINT_LEN,
+    PIR_PATH_LEN, PIR_ROOT_LEN,
 };
 use super::db::VotingDatabaseHandle;
 use super::ffi_types::{FfiBundleSetupResult, FfiVotingHotkey};
-use super::helpers::{
-    bytes_from_ptr, json_to_boxed_slice, open_wallet_db, str_from_ptr, voting_hotkey_to_ffi,
-};
-use super::json::{
-    JsonDelegationPirPrecomputeResult, JsonDelegationProofResult, JsonDelegationSubmission,
-    JsonNoteInfo, JsonVotingPczt, JsonWitnessData,
-};
-use super::progress::ProgressBridge;
+use super::helpers::{bytes_from_ptr, json_to_boxed_slice, open_wallet_db, str_from_ptr};
+use super::json::{JsonNoteInfo, JsonWitnessData};
 
 /// Validate that a cached lightwalletd `TreeState` is anchored to the voting
 /// round it will be used for.
@@ -75,17 +69,14 @@ pub unsafe extern "C" fn zcashlc_voting_generate_hotkey(
     seed_len: usize,
 ) -> *mut FfiVotingHotkey {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let seed_bytes = unsafe { bytes_from_ptr(seed, seed_len) }?;
-
-        let hotkey = handle
-            .db
-            .generate_hotkey(seed_bytes)
-            .map_err(|e| anyhow!("generate_hotkey failed: {}", e))?;
-
-        Ok(Box::into_raw(Box::new(voting_hotkey_to_ffi(hotkey)?)))
+    let res = catch_panic(|| -> anyhow::Result<*mut FfiVotingHotkey> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): seed-derived hotkeys were removed (1.0 uses stored-secret hotkeys).
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (&db, seed, seed_len);
+        Err(anyhow!(
+            "voting: generate_hotkey is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -109,23 +100,14 @@ pub unsafe extern "C" fn zcashlc_voting_setup_bundles(
     notes_json_len: usize,
 ) -> *mut FfiBundleSetupResult {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let notes_bytes = unsafe { bytes_from_ptr(notes_json, notes_json_len) }?;
-        let json_notes: Vec<JsonNoteInfo> = serde_json::from_slice(notes_bytes)?;
-        let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
-
-        let (count, weight) = handle
-            .db
-            .setup_bundles(&round_id_str, &core_notes)
-            .map_err(|e| anyhow!("setup_bundles failed: {}", e))?;
-
-        Ok(Box::into_raw(Box::new(FfiBundleSetupResult {
-            bundle_count: count,
-            eligible_weight: weight,
-        })))
+    let res = catch_panic(|| -> anyhow::Result<*mut FfiBundleSetupResult> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): bundle setup moved into the 1.0 session APIs.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (&db, round_id, round_id_len, notes_json, notes_json_len);
+        Err(anyhow!(
+            "voting: setup_bundles is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -190,44 +172,33 @@ pub unsafe extern "C" fn zcashlc_voting_build_pczt(
     address_index: u32,
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let notes_bytes = unsafe { bytes_from_ptr(notes_json, notes_json_len) }?;
-        let json_notes: Vec<JsonNoteInfo> = serde_json::from_slice(notes_bytes)?;
-        let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
-        let fvk = unsafe { bytes_from_ptr(fvk_bytes, fvk_bytes_len) }?;
-        let hotkey_addr = unsafe { bytes_from_ptr(hotkey_raw_address, hotkey_raw_address_len) }?;
-        let seed_fp_bytes = unsafe { bytes_from_ptr(seed_fingerprint, seed_fingerprint_len) }?;
-        let seed_fp_32: [u8; SEED_FINGERPRINT_LEN] = seed_fp_bytes.try_into().map_err(|_| {
-            anyhow!(
-                "seed_fingerprint must be {} bytes, got {}",
-                SEED_FINGERPRINT_LEN,
-                seed_fp_bytes.len()
-            )
-        })?;
-        let round_name_str = unsafe { str_from_ptr(round_name, round_name_len) }?;
-
-        let pczt = handle
-            .db
-            .build_governance_pczt(
-                &round_id_str,
-                bundle_index,
-                &core_notes,
-                fvk,
-                hotkey_addr,
-                consensus_branch_id,
-                coin_type,
-                &seed_fp_32,
-                account_index,
-                &round_name_str,
-                address_index,
-            )
-            .map_err(|e| anyhow!("build_voting_pczt failed: {}", e))?;
-
-        let json_pczt: JsonVotingPczt = pczt.into();
-        json_to_boxed_slice(&json_pczt)
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): build_governance_pczt was re-signatured (11->5 args) in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            round_id,
+            round_id_len,
+            bundle_index,
+            notes_json,
+            notes_json_len,
+            fvk_bytes,
+            fvk_bytes_len,
+            hotkey_raw_address,
+            hotkey_raw_address_len,
+            consensus_branch_id,
+            coin_type,
+            seed_fingerprint,
+            seed_fingerprint_len,
+            account_index,
+            round_name,
+            round_name_len,
+            address_index,
+        );
+        Err(anyhow!(
+            "voting: build_pczt is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -439,34 +410,24 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
     network_id: u32,
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        crate::parse_network(network_id)?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let notes_bytes = unsafe { bytes_from_ptr(notes_json, notes_json_len) }?;
-        let json_notes: Vec<JsonNoteInfo> = if notes_bytes.is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_slice(notes_bytes)?
-        };
-        let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
-        let pir_url = unsafe { str_from_ptr(pir_server_url, pir_server_url_len) }?;
-        let pir_client = connect_pir_client(&pir_url)?;
-
-        let result = handle
-            .db
-            .precompute_delegation_pir(
-                &round_id_str,
-                bundle_index,
-                &core_notes,
-                &pir_client,
-                network_id,
-            )
-            .map_err(|e| anyhow!("precompute_delegation_pir failed: {}", e))?;
-
-        let json_result: JsonDelegationPirPrecomputeResult = result.into();
-        json_to_boxed_slice(&json_result)
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): the PIR precompute API changed shape in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            round_id,
+            round_id_len,
+            bundle_index,
+            notes_json,
+            notes_json_len,
+            pir_server_url,
+            pir_server_url_len,
+            network_id,
+        );
+        Err(anyhow!(
+            "voting: precompute_delegation_pir is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -506,41 +467,28 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
     let progress_context = AssertUnwindSafe(progress_context);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        crate::parse_network(network_id)?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let notes_bytes = unsafe { bytes_from_ptr(notes_json, notes_json_len) }?;
-        let json_notes: Vec<JsonNoteInfo> = serde_json::from_slice(notes_bytes)?;
-        let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
-        let hotkey_addr = unsafe { bytes_from_ptr(hotkey_raw_address, hotkey_raw_address_len) }?;
-        let pir_url = unsafe { str_from_ptr(pir_server_url, pir_server_url_len) }?;
-        let pir_client = connect_pir_client(&pir_url)?;
-
-        let reporter: Box<dyn voting::ProofProgressReporter> = match progress_callback {
-            Some(cb) => Box::new(ProgressBridge {
-                callback: cb,
-                context: *progress_context,
-            }),
-            None => Box::new(voting::NoopProgressReporter),
-        };
-
-        let result = handle
-            .db
-            .build_and_prove_delegation(
-                &round_id_str,
-                bundle_index,
-                &core_notes,
-                hotkey_addr,
-                &pir_client,
-                network_id,
-                reporter.as_ref(),
-            )
-            .map_err(|e| anyhow!("build_and_prove_delegation failed: {}", e))?;
-
-        let json_result: JsonDelegationProofResult = result.into();
-        json_to_boxed_slice(&json_result)
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): the delegation proving API changed shape in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            &progress_context,
+            round_id,
+            round_id_len,
+            bundle_index,
+            notes_json,
+            notes_json_len,
+            hotkey_raw_address,
+            hotkey_raw_address_len,
+            pir_server_url,
+            pir_server_url_len,
+            network_id,
+            progress_callback,
+        );
+        Err(anyhow!(
+            "voting: build_and_prove_delegation is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -564,20 +512,23 @@ pub unsafe extern "C" fn zcashlc_voting_get_delegation_submission(
     account_index: u32,
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        crate::parse_network(network_id)?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let seed = unsafe { bytes_from_ptr(sender_seed, sender_seed_len) }?;
-
-        let submission = handle
-            .db
-            .get_delegation_submission(&round_id_str, bundle_index, seed, network_id, account_index)
-            .map_err(|e| anyhow!("get_delegation_submission failed: {}", e))?;
-
-        let json_sub: JsonDelegationSubmission = submission.into();
-        json_to_boxed_slice(&json_sub)
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): delegation submission storage was redesigned in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            round_id,
+            round_id_len,
+            bundle_index,
+            sender_seed,
+            sender_seed_len,
+            network_id,
+            account_index,
+        );
+        Err(anyhow!(
+            "voting: get_delegation_submission is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -601,25 +552,23 @@ pub unsafe extern "C" fn zcashlc_voting_get_delegation_submission_with_keystone_
     sighash_len: usize,
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let sig_bytes = unsafe { bytes_from_ptr(sig, sig_len) }?;
-        let sighash_bytes = unsafe { bytes_from_ptr(sighash, sighash_len) }?;
-
-        let submission = handle
-            .db
-            .get_delegation_submission_with_keystone_sig(
-                &round_id_str,
-                bundle_index,
-                sig_bytes,
-                sighash_bytes,
-            )
-            .map_err(|e| anyhow!("get_delegation_submission_with_keystone_sig failed: {}", e))?;
-
-        let json_sub: JsonDelegationSubmission = submission.into();
-        json_to_boxed_slice(&json_sub)
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // [IW-PORT] zcash_voting 1.0 (the ironwood-aligned line this branch
+        // rides): delegation submission storage was redesigned in 1.0.
+        // Honest error until the voting-FFI port (census: voting row).
+        let _ = (
+            &db,
+            round_id,
+            round_id_len,
+            bundle_index,
+            sig,
+            sig_len,
+            sighash,
+            sighash_len,
+        );
+        Err(anyhow!(
+            "voting: get_delegation_submission_with_keystone_sig is unavailable on the ironwood-support graph (zcash_voting 1.0 port pending)"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -745,7 +694,8 @@ fn parse_path(bytes: &[u8]) -> anyhow::Result<[pallas::Base; PIR_PATH_ELEMENT_CO
     Ok(path)
 }
 
-#[cfg(test)]
+// [IW-PORT] 0.11-flow tests parked behind `voting-port-tests` (see voting.rs).
+#[cfg(all(test, feature = "voting-port-tests"))]
 mod tests {
     use super::*;
 
@@ -818,6 +768,7 @@ mod tests {
             time: 0,
             sapling_tree: String::new(),
             orchard_tree: String::new(),
+            ironwood_tree: String::new(),
         }
     }
 
@@ -904,6 +855,7 @@ mod tests {
             time: 0,
             sapling_tree: String::new(),
             orchard_tree: bytes_to_hex(&orchard_tree_bytes),
+            ironwood_tree: String::new(),
         }
     }
 

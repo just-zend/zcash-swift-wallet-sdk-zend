@@ -1,15 +1,11 @@
-use std::ffi::CString;
-
 use anyhow::anyhow;
 use serde::Serialize;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_protocol::consensus::Network;
 use zcash_voting as voting;
-use zip32::{AccountId, Scope};
+use zip32::AccountId;
 
-use super::constants::{HOTKEY_RAW_ADDRESS_LEN, MIN_SEED_LEN};
-use super::ffi_types::FfiVotingHotkey;
+use super::constants::MIN_SEED_LEN;
 
 // =============================================================================
 // Helper functions
@@ -63,7 +59,12 @@ pub(super) fn open_wallet_db(
     wallet_db_path: &str,
     network_id: u32,
 ) -> anyhow::Result<
-    zcash_client_sqlite::WalletDb<rusqlite::Connection, Network, SystemClock, rand::rngs::OsRng>,
+    zcash_client_sqlite::WalletDb<
+        rusqlite::Connection,
+        crate::NetworkParams,
+        SystemClock,
+        rand::rngs::OsRng,
+    >,
 > {
     let network = crate::parse_network(network_id)?;
     zcash_client_sqlite::WalletDb::for_path(wallet_db_path, network, SystemClock, rand::rngs::OsRng)
@@ -116,58 +117,25 @@ pub(super) fn derive_hotkey_side_inputs(
     network_id: u32,
     hotkey_account: AccountId,
 ) -> anyhow::Result<HotkeySideInputs> {
-    let hotkey_usk = usk_from_seed(network_id, hotkey_seed, hotkey_account)
-        .map_err(|e| anyhow!("failed to derive hotkey UnifiedSpendingKey: {}", e))?;
-
-    let hotkey_ufvk = hotkey_usk.to_unified_full_viewing_key();
-    let hotkey_orchard_fvk = hotkey_ufvk
-        .orchard()
-        .ok_or_else(|| anyhow!("hotkey UFVK is missing Orchard component"))?;
-
-    let app_hotkey = voting::hotkey::generate_hotkey(hotkey_seed)
-        .map_err(|e| anyhow!("generate_hotkey failed: {}", e))?;
-    let hotkey_addr = hotkey_orchard_fvk.address_at(0u32, Scope::External);
-    let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
-
-    let hotkey_addr_bytes: [u8; HOTKEY_RAW_ADDRESS_LEN] = hotkey_raw_address
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("address serialization must be {HOTKEY_RAW_ADDRESS_LEN} bytes"))?;
-    let (g_d_new_x, pk_d_new_x) =
-        voting::action::derive_hotkey_x_coords_from_raw_address(&hotkey_addr_bytes)
-            .map_err(|e| anyhow!("derive_hotkey_x_coords failed: {}", e))?;
-
-    Ok(HotkeySideInputs {
-        g_d_new_x: g_d_new_x.to_vec(),
-        pk_d_new_x: pk_d_new_x.to_vec(),
-        hotkey_raw_address,
-        hotkey_public_key: app_hotkey.public_key,
-        hotkey_address: app_hotkey.address,
-    })
+    // [IW-PORT] zcash_voting 1.0 deliberately removed seed-derived hotkeys
+    // (`hotkey::generate_hotkey(seed)`): hotkeys are now random per-identity
+    // secrets (`generate_random_voting_hotkey`) so root-seed material stays out
+    // of the voting API. Porting this flow means adopting the stored-secret
+    // model FFI-wide — honest error until then (census: voting row).
+    let _ = (hotkey_seed, network_id, hotkey_account);
+    Err(anyhow!(
+        "voting: seed-derived hotkey inputs are unavailable on the ironwood-support graph (zcash_voting 1.0 uses stored-secret hotkeys; port pending)"
+    ))
 }
 
 // =============================================================================
 // Internal helpers
 // =============================================================================
 
-/// Convert a `voting::VotingHotkey` to the FFI representation.
-#[allow(dead_code)]
-pub(super) fn voting_hotkey_to_ffi(
-    hotkey: voting::VotingHotkey,
-) -> anyhow::Result<FfiVotingHotkey> {
-    let (sk_ptr, sk_len) = crate::ptr_from_vec(hotkey.secret_key);
-    let (pk_ptr, pk_len) = crate::ptr_from_vec(hotkey.public_key);
-    let address = CString::new(hotkey.address)
-        .map_err(|e| anyhow!("invalid hotkey address string: {}", e))?
-        .into_raw();
-    Ok(FfiVotingHotkey {
-        secret_key: sk_ptr,
-        secret_key_len: sk_len,
-        public_key: pk_ptr,
-        public_key_len: pk_len,
-        address,
-    })
-}
+// [IW-PORT] `voting_hotkey_to_ffi` (0.11 `VotingHotkey` → `FfiVotingHotkey`)
+// deleted: the 1.0 `VotingHotkey` is an opaque stored-secret type with none of
+// the 0.11 fields. The voting-FFI port re-introduces the conversion against
+// the 1.0 shape (census: voting row).
 
 #[cfg(test)]
 mod tests {

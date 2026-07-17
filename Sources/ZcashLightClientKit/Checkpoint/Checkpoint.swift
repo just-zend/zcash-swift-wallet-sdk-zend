@@ -31,6 +31,27 @@ struct Checkpoint: Equatable {
     let time: UInt32
     let saplingTree: String
     let orchardTree: String?
+    /// The Ironwood (Orchard note-version V3 / NU6.3) commitment tree at this height. Optional and
+    /// absent for every current checkpoint — populated only once NU6.3 activates.
+    let ironwoodTree: String?
+
+    /// The optional pool trees default to `nil`, since they are absent before their respective
+    /// activation (Orchard pre-NU5, Ironwood pre-NU6.3).
+    init(
+        height: BlockHeight,
+        hash: String,
+        time: UInt32,
+        saplingTree: String,
+        orchardTree: String? = nil,
+        ironwoodTree: String? = nil
+    ) {
+        self.height = height
+        self.hash = hash
+        self.time = time
+        self.saplingTree = saplingTree
+        self.orchardTree = orchardTree
+        self.ironwoodTree = ironwoodTree
+    }
 }
 
 extension Checkpoint: Decodable {
@@ -40,6 +61,7 @@ extension Checkpoint: Decodable {
         case time
         case saplingTree
         case orchardTree
+        case ironwoodTree
     }
 
     public init(from decoder: Decoder) throws {
@@ -50,6 +72,7 @@ extension Checkpoint: Decodable {
             self.time = try container.decode(UInt32.self, forKey: .time)
             self.saplingTree = try container.decode(String.self, forKey: .saplingTree)
             self.orchardTree = try container.decodeIfPresent(String.self, forKey: .orchardTree)
+            self.ironwoodTree = try container.decodeIfPresent(String.self, forKey: .ironwoodTree)
         } catch {
             throw ZcashError.checkpointDecode(error)
         }
@@ -80,6 +103,9 @@ extension Checkpoint: Decodable {
         ret.saplingTree = saplingTree
         if let tree = orchardTree {
             ret.orchardTree = tree
+        }
+        if let tree = ironwoodTree {
+            ret.ironwoodTree = tree
         }
         return ret
     }
