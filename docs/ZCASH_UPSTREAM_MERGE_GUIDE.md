@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-16
+Last reviewed: 2026-07-17
 
 ## Remote and branch invariants
 
@@ -74,6 +74,17 @@ environment is still not configured. Do not dispatch the manual FFI release work
 environment protections and WarpBuild GitHub App controls above are verified.
 
 ### Ironwood integration and upstream parity snapshot (as of 2026-07-16)
+
+### Upstream refresh (2026-07-17)
+
+- Fresh refs showed `origin/main...upstream/main` at `160 2`; upstream `main` advanced from
+  `d92a7940` to `7744bcec` through upstream PR `#1811`.
+- The two newly reachable commits are `7f5a266c` and merge commit `7744bcec`; together they add
+  one `CLAUDE.md` instruction to run `cargo fmt` before Rust changes are committed.
+- Zend branch `codex/zcash-upstream-sync-2026-07-17` merged `upstream/main` automatically with
+  no conflicts and no Zend-specific code or branding adaptation. It preserves Zend's existing
+  release artifacts, private-engine provenance controls, and Ironwood hardening behavior.
+- Run the Swift build and offline tests on the Zend merge branch before merging the parity PR.
 
 Current relationship after Zend PRs `#18`, `#17`, `#20`, and `#21` merged into `origin/main`:
 
@@ -168,6 +179,14 @@ Default-branch parity:
 
 Open upstream PRs assessed as not ready to carry right now:
 
+- `#1810` (`kris/lwd-network-privacy`): draft, `BLOCKED`, and review-required, despite green
+  build and zizmor checks. It replaces the Tor wrapper with the Rust network-privacy layer, so it
+  has runtime and dependency impact; wait for upstream API stabilization and review before Zend
+  considers it.
+- `#1807` (`michal/ironwood-support-2.6.0`): non-draft, `BLOCKED`, review-required, and green,
+  but it is an 18-commit Ironwood receive/sync, custom-network, FFI, and voting stack. Zend already
+  has an independently validated private-engine/FFI baseline; wait for upstream review and a
+  reconciliation plan instead of carrying this broad stack early.
 - `#1805` (`dependabot/swift/github.com/apple/swift-nio-http2-1.44.0`): non-draft,
   `mergeable=MERGEABLE`, green on `Build and Run Offline Tests` and zizmor, but still `BLOCKED` /
   review-required. It is a dependency bump, so wait for upstream dependency review and policy instead
@@ -233,6 +252,14 @@ Unmerged upstream branches (not carried):
 - `michal/MOB-1455-4-set-activation-height`: 29 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1797`, build-failing, and part of the Ironwood stack.
 - `michal/MOB-1455-5-final-fixes`: 35 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1798`, build-failing, and part of the Ironwood stack.
 - `michal/MOB-1455-6-integration-with-final-zodl`: 38 commits ahead and 7 behind `upstream/main`; no upstream PR exists yet, and the branch layers Keystone PCZT and final Zodl integration work on top of the draft build-failing Ironwood stack, so do not carry it until upstream opens/reviews it and the stack turns green.
+- `michal/slipstream-support`: 22 commits ahead and 2 behind `upstream/main`; no upstream PR is
+  open for this active branch. It is unreviewed Slipstream integration work, so do not carry it
+  until a scoped PR, review thread, and stable public artifact direction exist.
+- `michal/ironwood-support-2.6.0`: 18 commits ahead and 2 behind `upstream/main`; covered by open
+  upstream PR `#1807`, which is green but review-required and broad across protocol, FFI, and
+  voting surfaces. Wait for upstream merge/reconciliation rather than carrying it ahead.
+- `kris/lwd-network-privacy`: 5 commits ahead and 173 behind `upstream/main`; covered by draft
+  upstream PR `#1810`, so wait for its runtime/network-privacy API to stabilize.
 - `michal/MOB-1455-ironwood-migration-prototype-ffi`: 11 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1793`, build-failing, and still protocol-facing FFI work, so wait for upstream review and green CI.
 - `release-ci`: 4 commits ahead and 165 behind `upstream/main`; release branch integration artifact, not a clear standalone carry target.
 - `rust-build-plugin`: 2 commits ahead and 1114 behind `upstream/main`; stale draft build-plugin work covered by upstream PR `#1443`.
