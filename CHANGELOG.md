@@ -158,7 +158,9 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   to the upstream path, oracle-gated), an autonomous session with per-call Tor policy and server
   failover, poll-model snapshots (`SynchronizerState.isRecovering`), and a stall watchdog. FFI
   surface `zcashlc_slipstream_*` with error codes `ZRUST0093`–`ZRUST0097`. Hosts opt in by
-  constructing it; `SDKSynchronizer` remains the default engine.
+  constructing it; `SDKSynchronizer` remains the default engine. It also implements the
+  `Synchronizer` protocol's migration group (above) against its own `OrchardMigrationHost`, with
+  the same SDK-enforced start-gate/broadcast-guard session separation as `SDKSynchronizer`.
 - `Synchronizer.allTransactions()` is a formal protocol requirement, and
   `TransactionRepository.unreconciledTxids()` exposes the read-side reconciliation view (defaults
   to empty when the engine's view is absent).
