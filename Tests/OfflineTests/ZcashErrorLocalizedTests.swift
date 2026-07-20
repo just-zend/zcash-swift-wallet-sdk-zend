@@ -97,4 +97,16 @@ class ZcashErrorLocalizedTests: XCTestCase {
         let error = ZcashError.rustCreateToAddress("test")
         XCTAssertEqual(error.message, "Error from rust layer when calling ZcashRustBackend.createToAddress")
     }
+
+    // MARK: - Migration error codes (R4-B)
+
+    func testMigrationSyncBlockedErrorCode() {
+        XCTAssertEqual(ZcashError.migrationSyncBlocked.code, .migrationSyncBlocked)
+        XCTAssertEqual(ZcashError.migrationSyncBlocked.code.rawValue, "ZRUST0125")
+    }
+
+    func testMigrationBroadcastDuringSyncErrorCode() {
+        XCTAssertEqual(ZcashError.migrationBroadcastDuringSync.code, .migrationBroadcastDuringSync)
+        XCTAssertEqual(ZcashError.migrationBroadcastDuringSync.code.rawValue, "ZRUST0126")
+    }
 }
