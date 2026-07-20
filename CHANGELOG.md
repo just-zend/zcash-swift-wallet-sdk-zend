@@ -7,6 +7,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 # Unreleased
 
 ## Added
+- Orchard→Ironwood pool-migration FFI, welding, models, and error codes — the layer beneath the
+  `Synchronizer` migration surface that lands in the follow-up PR. The `zcash_pool_migration`
+  crate is bound through 22 `zcashlc_migration_*` FFI functions plus the
+  `zcashlc_ironwood_activation_height` helper (house conventions throughout: catch_panic,
+  thread-local last-error channel, paired free functions), welded as `@DBActor` methods on the
+  internal `ZcashRustBackendWelding` surface. The public migration model types ship here
+  (`MigrationState`, `MigrationProgress`, `NoteSplitProposal`, `MigrationTransferProposal`,
+  `MigrationSchedule`, `PreparedMigrationTransfer`, `MigrationTransferResult`,
+  `MigrationAttentionReason`, `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`),
+  together with the complete migration error vocabulary — new error codes ZRUST0098–ZRUST0108 and
+  ZRUST0111–ZRUST0126 — including the codes whose throwing call sites arrive with the Synchronizer
+  surface (`migrationTorUnavailable`, `migrationRecordFailedAfterBroadcast` ZRUST0124,
+  `migrationSyncBlocked` ZRUST0125, `migrationBroadcastDuringSync` ZRUST0126). Hardened per the
+  adversarial review: the FFI last-error channel is cleared before every sentinel read (stale
+  errors can no longer surface as spurious throws elsewhere) and one-time rust initialization is
+  race-free. No `Synchronizer` API changes in this PR.
 - Ironwood (NU6.3) receive/sync readiness. The lightwalletd protocol gains the Ironwood fields
   (`CompactTx.ironwoodActions`, `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
   `ShieldedProtocol.ironwood`); `UpdateSubtreeRootsAction` fetches and stores Ironwood subtree roots
@@ -33,9 +49,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of silently opening a wallet the seed cannot spend from. See `MIGRATING.md`.
 
 ## Changed
-- The Rust core builds against `zcash/librustzcash` main (Ironwood is merged and ungated upstream),
-  pinned via `[patch.crates-io]` until the 0.24-era crates.io release; `orchard` 0.15.0 and
-  `shardtree` 0.7.0 resolve from crates.io.
+- The Rust core builds against the `michal/ironwood-migration` line of `zcash/librustzcash`
+  (its base of main plus the cherry-picked Ironwood historical note selector, carrying the
+  unreleased `zcash_pool_migration` crate), pinned via `[patch.crates-io]` until the 0.24-era
+  crates.io release; `orchard` 0.15.0 and `shardtree` 0.7.0 resolve from crates.io. The pin
+  returns to a main rev in one move once the migration crate lands upstream.
 - Voting rides upstream `zcash_voting` (a pinned rev of its repository's main, aligned to the same
   librustzcash rev and orchard 0.15; the published 0.11 release pins `orchard ^0.14` and cannot
   coexist with the Ironwood graph) with **real implementations across the FFI**. Behavioral changes
