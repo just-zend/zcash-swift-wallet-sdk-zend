@@ -34,6 +34,10 @@ zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.29"
 zcash_proofs = "0.29"
 zcash_protocol = { version = "0.10", features = ["local-consensus"] }
+# Not on crates.io yet — lives only on the `michal/ironwood-migration` line of
+# zcash/librustzcash. Direct git dependency at the same rev as the
+# [patch.crates-io] family below so the whole graph stays one family instance.
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
 zcash_script = "0.4"
 zip32 = "0.2"
 pczt = { version = "0.8.0-rc.1", features = ["prover"] }
@@ -104,31 +108,36 @@ crate-type = ["staticlib"]
 [profile.release]
 lto = true
 
-# The Ironwood-era librustzcash family is not on crates.io yet; unreleased
-# sources ride [patch.crates-io] against the canonical repo — never direct
-# git+branch dependencies. The rev is current zcash/librustzcash main — the
-# same rev the zcash_voting workspace rides, so the whole graph resolves to a
-# single family instance. Bump it deliberately (build + OfflineTests green),
-# and delete the whole block at the 0.24-era crates.io release.
 [patch.crates-io]
 voting-circuits = { git = "https://github.com/zodl-inc/voting-circuits.git", rev = "a5aae410a6fb14fcbea2f0ce3393035195e86f69" }
 imt-tree = { git = "https://github.com/zodl-inc/vote-nullifier-pir.git", rev = "0dea3485429c80033e67a1ddb18ee72cc450cefb" }
 zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting.git", rev = "464f974865f2afa82bdac15d169168c77ecb9c74" }
 
-# Pin the whole librustzcash stack to a single git rev carrying the merged Ironwood
-# historical selector, pending a crates.io release. zcash_voting no longer hard-pins
-# librustzcash (it declares crates.io versions and patches from its own root), so this
-# workspace's patch governs the rev for the entire graph and everything resolves to one
-# copy. Bump this rev in one place to advance the stack.
-equihash = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
+# The Ironwood-era librustzcash family below is not on crates.io yet; unreleased
+# sources ride this [patch.crates-io] block against the canonical repo — never
+# direct git+branch dependencies — so the whole graph resolves to a single family
+# instance. zcash_voting (pinned above) no longer hard-pins librustzcash itself (it
+# declares crates.io versions and patches from its own root), so this block is what
+# governs the rev for the entire graph.
+#
+# [MOB-1495 / #1806] The pinned rev is currently the tip of `michal/ironwood-migration`
+# — NOT zcash/librustzcash main — carrying `zcash_pool_migration` (the direct git
+# dependency declared above in [dependencies]): based ~22 commits behind main, plus a
+# cherry-pick of main's e9581a78 "Add Ironwood historical note selection" which
+# zcash_voting@464f9748 requires. Bump the rev deliberately (build + OfflineTests
+# green). When the migration crate lands on main, advance this back to a main rev in
+# one move together with the `zcash_pool_migration` dependency; delete the
+# librustzcash-family patch entries below once the family reaches a 0.24-era
+# crates.io release.
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "5115cf26da590a3d610446f1d926ff7f2873c9d1" }
