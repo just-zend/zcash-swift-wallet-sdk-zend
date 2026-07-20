@@ -6,6 +6,37 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+- Pool-migration (Orchard→Ironwood) FFI surface over the `zcash_pool_migration`
+  crate: 23 entry points plus their `#[repr(C)]` return types and
+  `zcashlc_free_migration_*` destructors. Each call builds a `MigrationContext`
+  from the wallet-db path, 16-byte account uuid, and network id, and reports
+  failures through the thread-local last-error channel (`NULL` / `false` / `-1`
+  sentinels).
+  - State: `zcashlc_migration_state`, `zcashlc_migration_progress`,
+    `zcashlc_migration_is_note_split_needed`,
+    `zcashlc_migration_has_overdue_transfers`,
+    `zcashlc_migration_has_invalid_transfers`,
+    `zcashlc_migration_pending_transfer_proposal`.
+  - Note split: `zcashlc_migration_prepare_note_split`,
+    `zcashlc_migration_sign_note_split`.
+  - Proposal/commit: `zcashlc_migration_residual_after_migration`,
+    `zcashlc_migration_propose_transfers`,
+    `zcashlc_migration_propose_immediate_transfers`,
+    `zcashlc_migration_sign_and_store_schedule`.
+  - Delivery: `zcashlc_migration_next_due_transfer`,
+    `zcashlc_migration_extract_broadcast_tx`,
+    `zcashlc_migration_record_transfer_result`,
+    `zcashlc_migration_is_sync_required`.
+  - Recovery: `zcashlc_migration_restart_step`,
+    `zcashlc_migration_refresh_stale_transfers`.
+  - External signer: `zcashlc_migration_create_unsigned_note_split_pczt`,
+    `zcashlc_migration_store_signed_note_split_pczt`,
+    `zcashlc_migration_create_unsigned_transfer_pczts`,
+    `zcashlc_migration_store_signed_schedule_pczts`.
+  - Helper: `zcashlc_ironwood_activation_height` (NU6.3 activation height for
+    mainnet/testnet).
+
 ## 2.6.0-alpha.6 - 2026-06-26
 
 ### Fixed
