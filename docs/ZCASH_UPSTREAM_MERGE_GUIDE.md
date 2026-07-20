@@ -2,13 +2,36 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-07-19
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Current monitor status (2026-07-19)
+
+- After fetching both remotes, `origin/main` is `ee3abea2` and `upstream/main` is
+  `7744bcec` (upstream PR `#1811`). The default-branch count is `160 2`, so the
+  two upstream commits are not yet ancestors of the fork default branch.
+- Draft Zend PR `#26` (`codex/zcash-upstream-sync-2026-07-17`) is the sole parity
+  vehicle. It merges `7744bcec` cleanly, has no Zend-specific source adaptation,
+  and its `build` check passed at the current head `cd426fbf`. Do not open a
+  duplicate sync PR; rerun `swift build` and `swift test --filter OfflineTests`
+  only when the branch receives SDK changes or local disk space is adequate.
+- Upstream PR `#1812` is non-draft but `UNSTABLE` with a failed `build`. Its
+  55-commit Orchard-to-Ironwood migration stack changes `Synchronizer`, the FFI,
+  Rust dependencies, persistence, and generated mocks; its published binary also
+  lacks required migration symbols. Wait for upstream review, green artifact-backed
+  CI, and a Zend reconciliation plan.
+- The recently updated `michal/slipstream-support` branch is 63 commits ahead and
+  2 behind `upstream/main`, with no upstream PR. It layers the same migration stack
+  plus a Slipstream engine and touches 114 files, so it is neither reviewable nor
+  low-risk enough for an early Zend carry.
+- All other active upstream PRs remain in the existing wait-for-upstream classes:
+  draft, blocked/review-required, dirty, failed, or broad protocol/FFI/release work.
+  No early-carry candidate currently satisfies ready, useful, and low-risk.
 
 ## Parity sync workflow (upstream default branch)
 
