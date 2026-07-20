@@ -4115,4 +4115,517 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         try await deleteAccountClosure!(accountUUID)
     }
 
+    // MARK: - migrationState
+
+    var migrationStateForThrowableError: Error?
+    var migrationStateForCallsCount = 0
+    var migrationStateForCalled: Bool {
+        return migrationStateForCallsCount > 0
+    }
+    var migrationStateForReceivedAccount: AccountUUID?
+    var migrationStateForReturnValue: MigrationState!
+    var migrationStateForClosure: ((AccountUUID) async throws -> MigrationState)?
+
+    func migrationState(for account: AccountUUID) async throws -> MigrationState {
+        if let error = migrationStateForThrowableError {
+            throw error
+        }
+        migrationStateForCallsCount += 1
+        migrationStateForReceivedAccount = account
+        if let closure = migrationStateForClosure {
+            return try await closure(account)
+        } else {
+            return migrationStateForReturnValue
+        }
+    }
+
+    // MARK: - migrationProgress
+
+    var migrationProgressForThrowableError: Error?
+    var migrationProgressForCallsCount = 0
+    var migrationProgressForCalled: Bool {
+        return migrationProgressForCallsCount > 0
+    }
+    var migrationProgressForReceivedAccount: AccountUUID?
+    var migrationProgressForReturnValue: MigrationProgress?
+    var migrationProgressForClosure: ((AccountUUID) async throws -> MigrationProgress?)?
+
+    func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress? {
+        if let error = migrationProgressForThrowableError {
+            throw error
+        }
+        migrationProgressForCallsCount += 1
+        migrationProgressForReceivedAccount = account
+        if let closure = migrationProgressForClosure {
+            return try await closure(account)
+        } else {
+            return migrationProgressForReturnValue
+        }
+    }
+
+    // MARK: - migrationIsNoteSplitNeeded
+
+    var migrationIsNoteSplitNeededForThrowableError: Error?
+    var migrationIsNoteSplitNeededForCallsCount = 0
+    var migrationIsNoteSplitNeededForCalled: Bool {
+        return migrationIsNoteSplitNeededForCallsCount > 0
+    }
+    var migrationIsNoteSplitNeededForReceivedAccount: AccountUUID?
+    var migrationIsNoteSplitNeededForReturnValue: Bool!
+    var migrationIsNoteSplitNeededForClosure: ((AccountUUID) async throws -> Bool)?
+
+    func migrationIsNoteSplitNeeded(for account: AccountUUID) async throws -> Bool {
+        if let error = migrationIsNoteSplitNeededForThrowableError {
+            throw error
+        }
+        migrationIsNoteSplitNeededForCallsCount += 1
+        migrationIsNoteSplitNeededForReceivedAccount = account
+        if let closure = migrationIsNoteSplitNeededForClosure {
+            return try await closure(account)
+        } else {
+            return migrationIsNoteSplitNeededForReturnValue
+        }
+    }
+
+    // MARK: - migrationHasOverdueTransfers
+
+    var migrationHasOverdueTransfersForThrowableError: Error?
+    var migrationHasOverdueTransfersForCallsCount = 0
+    var migrationHasOverdueTransfersForCalled: Bool {
+        return migrationHasOverdueTransfersForCallsCount > 0
+    }
+    var migrationHasOverdueTransfersForReceivedAccount: AccountUUID?
+    var migrationHasOverdueTransfersForReturnValue: Bool!
+    var migrationHasOverdueTransfersForClosure: ((AccountUUID) async throws -> Bool)?
+
+    func migrationHasOverdueTransfers(for account: AccountUUID) async throws -> Bool {
+        if let error = migrationHasOverdueTransfersForThrowableError {
+            throw error
+        }
+        migrationHasOverdueTransfersForCallsCount += 1
+        migrationHasOverdueTransfersForReceivedAccount = account
+        if let closure = migrationHasOverdueTransfersForClosure {
+            return try await closure(account)
+        } else {
+            return migrationHasOverdueTransfersForReturnValue
+        }
+    }
+
+    // MARK: - migrationHasInvalidTransfers
+
+    var migrationHasInvalidTransfersForThrowableError: Error?
+    var migrationHasInvalidTransfersForCallsCount = 0
+    var migrationHasInvalidTransfersForCalled: Bool {
+        return migrationHasInvalidTransfersForCallsCount > 0
+    }
+    var migrationHasInvalidTransfersForReceivedAccount: AccountUUID?
+    var migrationHasInvalidTransfersForReturnValue: Bool!
+    var migrationHasInvalidTransfersForClosure: ((AccountUUID) async throws -> Bool)?
+
+    func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool {
+        if let error = migrationHasInvalidTransfersForThrowableError {
+            throw error
+        }
+        migrationHasInvalidTransfersForCallsCount += 1
+        migrationHasInvalidTransfersForReceivedAccount = account
+        if let closure = migrationHasInvalidTransfersForClosure {
+            return try await closure(account)
+        } else {
+            return migrationHasInvalidTransfersForReturnValue
+        }
+    }
+
+    // MARK: - migrationPrepareNoteSplit
+
+    var migrationPrepareNoteSplitForThrowableError: Error?
+    var migrationPrepareNoteSplitForCallsCount = 0
+    var migrationPrepareNoteSplitForCalled: Bool {
+        return migrationPrepareNoteSplitForCallsCount > 0
+    }
+    var migrationPrepareNoteSplitForReceivedAccount: AccountUUID?
+    var migrationPrepareNoteSplitForReturnValue: NoteSplitProposal!
+    var migrationPrepareNoteSplitForClosure: ((AccountUUID) async throws -> NoteSplitProposal)?
+
+    func migrationPrepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal {
+        if let error = migrationPrepareNoteSplitForThrowableError {
+            throw error
+        }
+        migrationPrepareNoteSplitForCallsCount += 1
+        migrationPrepareNoteSplitForReceivedAccount = account
+        if let closure = migrationPrepareNoteSplitForClosure {
+            return try await closure(account)
+        } else {
+            return migrationPrepareNoteSplitForReturnValue
+        }
+    }
+
+    // MARK: - migrationSignNoteSplit
+
+    var migrationSignNoteSplitProposalUskForThrowableError: Error?
+    var migrationSignNoteSplitProposalUskForCallsCount = 0
+    var migrationSignNoteSplitProposalUskForCalled: Bool {
+        return migrationSignNoteSplitProposalUskForCallsCount > 0
+    }
+    var migrationSignNoteSplitProposalUskForReceivedArguments: (proposal: NoteSplitProposal, usk: UnifiedSpendingKey, account: AccountUUID)?
+    var migrationSignNoteSplitProposalUskForReturnValue: PreparedMigrationTransfer!
+    var migrationSignNoteSplitProposalUskForClosure: ((NoteSplitProposal, UnifiedSpendingKey, AccountUUID) async throws -> PreparedMigrationTransfer)?
+
+    func migrationSignNoteSplit(proposal: NoteSplitProposal, usk: UnifiedSpendingKey, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
+        if let error = migrationSignNoteSplitProposalUskForThrowableError {
+            throw error
+        }
+        migrationSignNoteSplitProposalUskForCallsCount += 1
+        migrationSignNoteSplitProposalUskForReceivedArguments = (proposal: proposal, usk: usk, account: account)
+        if let closure = migrationSignNoteSplitProposalUskForClosure {
+            return try await closure(proposal, usk, account)
+        } else {
+            return migrationSignNoteSplitProposalUskForReturnValue
+        }
+    }
+
+    // MARK: - migrationResidualAfterMigration
+
+    var migrationResidualAfterMigrationForThrowableError: Error?
+    var migrationResidualAfterMigrationForCallsCount = 0
+    var migrationResidualAfterMigrationForCalled: Bool {
+        return migrationResidualAfterMigrationForCallsCount > 0
+    }
+    var migrationResidualAfterMigrationForReceivedAccount: AccountUUID?
+    var migrationResidualAfterMigrationForReturnValue: Zatoshi?
+    var migrationResidualAfterMigrationForClosure: ((AccountUUID) async throws -> Zatoshi?)?
+
+    func migrationResidualAfterMigration(for account: AccountUUID) async throws -> Zatoshi? {
+        if let error = migrationResidualAfterMigrationForThrowableError {
+            throw error
+        }
+        migrationResidualAfterMigrationForCallsCount += 1
+        migrationResidualAfterMigrationForReceivedAccount = account
+        if let closure = migrationResidualAfterMigrationForClosure {
+            return try await closure(account)
+        } else {
+            return migrationResidualAfterMigrationForReturnValue
+        }
+    }
+
+    // MARK: - migrationProposeTransfers
+
+    var migrationProposeTransfersIncludeResidualForThrowableError: Error?
+    var migrationProposeTransfersIncludeResidualForCallsCount = 0
+    var migrationProposeTransfersIncludeResidualForCalled: Bool {
+        return migrationProposeTransfersIncludeResidualForCallsCount > 0
+    }
+    var migrationProposeTransfersIncludeResidualForReceivedArguments: (includeResidual: Bool, account: AccountUUID)?
+    var migrationProposeTransfersIncludeResidualForReturnValue: MigrationSchedule!
+    var migrationProposeTransfersIncludeResidualForClosure: ((Bool, AccountUUID) async throws -> MigrationSchedule)?
+
+    func migrationProposeTransfers(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule {
+        if let error = migrationProposeTransfersIncludeResidualForThrowableError {
+            throw error
+        }
+        migrationProposeTransfersIncludeResidualForCallsCount += 1
+        migrationProposeTransfersIncludeResidualForReceivedArguments = (includeResidual: includeResidual, account: account)
+        if let closure = migrationProposeTransfersIncludeResidualForClosure {
+            return try await closure(includeResidual, account)
+        } else {
+            return migrationProposeTransfersIncludeResidualForReturnValue
+        }
+    }
+
+    // MARK: - migrationProposeImmediateTransfers
+
+    var migrationProposeImmediateTransfersForThrowableError: Error?
+    var migrationProposeImmediateTransfersForCallsCount = 0
+    var migrationProposeImmediateTransfersForCalled: Bool {
+        return migrationProposeImmediateTransfersForCallsCount > 0
+    }
+    var migrationProposeImmediateTransfersForReceivedAccount: AccountUUID?
+    var migrationProposeImmediateTransfersForReturnValue: MigrationSchedule!
+    var migrationProposeImmediateTransfersForClosure: ((AccountUUID) async throws -> MigrationSchedule)?
+
+    func migrationProposeImmediateTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
+        if let error = migrationProposeImmediateTransfersForThrowableError {
+            throw error
+        }
+        migrationProposeImmediateTransfersForCallsCount += 1
+        migrationProposeImmediateTransfersForReceivedAccount = account
+        if let closure = migrationProposeImmediateTransfersForClosure {
+            return try await closure(account)
+        } else {
+            return migrationProposeImmediateTransfersForReturnValue
+        }
+    }
+
+    // MARK: - migrationSignAndStoreSchedule
+
+    var migrationSignAndStoreScheduleUskForThrowableError: Error?
+    var migrationSignAndStoreScheduleUskForCallsCount = 0
+    var migrationSignAndStoreScheduleUskForCalled: Bool {
+        return migrationSignAndStoreScheduleUskForCallsCount > 0
+    }
+    var migrationSignAndStoreScheduleUskForReceivedArguments: (schedule: MigrationSchedule, usk: UnifiedSpendingKey, account: AccountUUID)?
+    var migrationSignAndStoreScheduleUskForClosure: ((MigrationSchedule, UnifiedSpendingKey, AccountUUID) async throws -> Void)?
+
+    func migrationSignAndStoreSchedule(_ schedule: MigrationSchedule, usk: UnifiedSpendingKey, for account: AccountUUID) async throws {
+        if let error = migrationSignAndStoreScheduleUskForThrowableError {
+            throw error
+        }
+        migrationSignAndStoreScheduleUskForCallsCount += 1
+        migrationSignAndStoreScheduleUskForReceivedArguments = (schedule: schedule, usk: usk, account: account)
+        try await migrationSignAndStoreScheduleUskForClosure!(schedule, usk, account)
+    }
+
+    // MARK: - migrationNextDueTransfer
+
+    var migrationNextDueTransferForThrowableError: Error?
+    var migrationNextDueTransferForCallsCount = 0
+    var migrationNextDueTransferForCalled: Bool {
+        return migrationNextDueTransferForCallsCount > 0
+    }
+    var migrationNextDueTransferForReceivedAccount: AccountUUID?
+    var migrationNextDueTransferForReturnValue: PreparedMigrationTransfer?
+    var migrationNextDueTransferForClosure: ((AccountUUID) async throws -> PreparedMigrationTransfer?)?
+
+    func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedMigrationTransfer? {
+        if let error = migrationNextDueTransferForThrowableError {
+            throw error
+        }
+        migrationNextDueTransferForCallsCount += 1
+        migrationNextDueTransferForReceivedAccount = account
+        if let closure = migrationNextDueTransferForClosure {
+            return try await closure(account)
+        } else {
+            return migrationNextDueTransferForReturnValue
+        }
+    }
+
+    // MARK: - migrationPendingTransferProposal
+
+    var migrationPendingTransferProposalForThrowableError: Error?
+    var migrationPendingTransferProposalForCallsCount = 0
+    var migrationPendingTransferProposalForCalled: Bool {
+        return migrationPendingTransferProposalForCallsCount > 0
+    }
+    var migrationPendingTransferProposalForReceivedAccount: AccountUUID?
+    var migrationPendingTransferProposalForReturnValue: MigrationTransferProposal?
+    var migrationPendingTransferProposalForClosure: ((AccountUUID) async throws -> MigrationTransferProposal?)?
+
+    func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal? {
+        if let error = migrationPendingTransferProposalForThrowableError {
+            throw error
+        }
+        migrationPendingTransferProposalForCallsCount += 1
+        migrationPendingTransferProposalForReceivedAccount = account
+        if let closure = migrationPendingTransferProposalForClosure {
+            return try await closure(account)
+        } else {
+            return migrationPendingTransferProposalForReturnValue
+        }
+    }
+
+    // MARK: - migrationExtractBroadcastTx
+
+    var migrationExtractBroadcastTxPcztForThrowableError: Error?
+    var migrationExtractBroadcastTxPcztForCallsCount = 0
+    var migrationExtractBroadcastTxPcztForCalled: Bool {
+        return migrationExtractBroadcastTxPcztForCallsCount > 0
+    }
+    var migrationExtractBroadcastTxPcztForReceivedArguments: (pczt: Data, account: AccountUUID)?
+    var migrationExtractBroadcastTxPcztForReturnValue: Data!
+    var migrationExtractBroadcastTxPcztForClosure: ((Data, AccountUUID) async throws -> Data)?
+
+    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data {
+        if let error = migrationExtractBroadcastTxPcztForThrowableError {
+            throw error
+        }
+        migrationExtractBroadcastTxPcztForCallsCount += 1
+        migrationExtractBroadcastTxPcztForReceivedArguments = (pczt: pczt, account: account)
+        if let closure = migrationExtractBroadcastTxPcztForClosure {
+            return try await closure(pczt, account)
+        } else {
+            return migrationExtractBroadcastTxPcztForReturnValue
+        }
+    }
+
+    // MARK: - migrationRecordTransferResult
+
+    var migrationRecordTransferResultTransferIdResultForThrowableError: Error?
+    var migrationRecordTransferResultTransferIdResultForCallsCount = 0
+    var migrationRecordTransferResultTransferIdResultForCalled: Bool {
+        return migrationRecordTransferResultTransferIdResultForCallsCount > 0
+    }
+    var migrationRecordTransferResultTransferIdResultForReceivedArguments: (transferId: String, result: MigrationTransferResult, account: AccountUUID)?
+    var migrationRecordTransferResultTransferIdResultForClosure: ((String, MigrationTransferResult, AccountUUID) async throws -> Void)?
+
+    func migrationRecordTransferResult(transferId: String, result: MigrationTransferResult, for account: AccountUUID) async throws {
+        if let error = migrationRecordTransferResultTransferIdResultForThrowableError {
+            throw error
+        }
+        migrationRecordTransferResultTransferIdResultForCallsCount += 1
+        migrationRecordTransferResultTransferIdResultForReceivedArguments = (transferId: transferId, result: result, account: account)
+        try await migrationRecordTransferResultTransferIdResultForClosure!(transferId, result, account)
+    }
+
+    // MARK: - migrationIsSyncRequired
+
+    var migrationIsSyncRequiredForThrowableError: Error?
+    var migrationIsSyncRequiredForCallsCount = 0
+    var migrationIsSyncRequiredForCalled: Bool {
+        return migrationIsSyncRequiredForCallsCount > 0
+    }
+    var migrationIsSyncRequiredForReceivedAccount: AccountUUID?
+    var migrationIsSyncRequiredForReturnValue: Bool!
+    var migrationIsSyncRequiredForClosure: ((AccountUUID) async throws -> Bool)?
+
+    func migrationIsSyncRequired(for account: AccountUUID) async throws -> Bool {
+        if let error = migrationIsSyncRequiredForThrowableError {
+            throw error
+        }
+        migrationIsSyncRequiredForCallsCount += 1
+        migrationIsSyncRequiredForReceivedAccount = account
+        if let closure = migrationIsSyncRequiredForClosure {
+            return try await closure(account)
+        } else {
+            return migrationIsSyncRequiredForReturnValue
+        }
+    }
+
+    // MARK: - migrationRestartStep
+
+    var migrationRestartStepIncludeResidualForThrowableError: Error?
+    var migrationRestartStepIncludeResidualForCallsCount = 0
+    var migrationRestartStepIncludeResidualForCalled: Bool {
+        return migrationRestartStepIncludeResidualForCallsCount > 0
+    }
+    var migrationRestartStepIncludeResidualForReceivedArguments: (includeResidual: Bool, account: AccountUUID)?
+    var migrationRestartStepIncludeResidualForReturnValue: MigrationSchedule!
+    var migrationRestartStepIncludeResidualForClosure: ((Bool, AccountUUID) async throws -> MigrationSchedule)?
+
+    func migrationRestartStep(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule {
+        if let error = migrationRestartStepIncludeResidualForThrowableError {
+            throw error
+        }
+        migrationRestartStepIncludeResidualForCallsCount += 1
+        migrationRestartStepIncludeResidualForReceivedArguments = (includeResidual: includeResidual, account: account)
+        if let closure = migrationRestartStepIncludeResidualForClosure {
+            return try await closure(includeResidual, account)
+        } else {
+            return migrationRestartStepIncludeResidualForReturnValue
+        }
+    }
+
+    // MARK: - migrationRefreshStaleTransfers
+
+    var migrationRefreshStaleTransfersUskIncludeResidualForThrowableError: Error?
+    var migrationRefreshStaleTransfersUskIncludeResidualForCallsCount = 0
+    var migrationRefreshStaleTransfersUskIncludeResidualForCalled: Bool {
+        return migrationRefreshStaleTransfersUskIncludeResidualForCallsCount > 0
+    }
+    var migrationRefreshStaleTransfersUskIncludeResidualForReceivedArguments: (usk: UnifiedSpendingKey, includeResidual: Bool, account: AccountUUID)?
+    var migrationRefreshStaleTransfersUskIncludeResidualForReturnValue: UInt32!
+    var migrationRefreshStaleTransfersUskIncludeResidualForClosure: ((UnifiedSpendingKey, Bool, AccountUUID) async throws -> UInt32)?
+
+    func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey, includeResidual: Bool, for account: AccountUUID) async throws -> UInt32 {
+        if let error = migrationRefreshStaleTransfersUskIncludeResidualForThrowableError {
+            throw error
+        }
+        migrationRefreshStaleTransfersUskIncludeResidualForCallsCount += 1
+        migrationRefreshStaleTransfersUskIncludeResidualForReceivedArguments = (usk: usk, includeResidual: includeResidual, account: account)
+        if let closure = migrationRefreshStaleTransfersUskIncludeResidualForClosure {
+            return try await closure(usk, includeResidual, account)
+        } else {
+            return migrationRefreshStaleTransfersUskIncludeResidualForReturnValue
+        }
+    }
+
+    // MARK: - migrationCreateUnsignedNoteSplitPczt
+
+    var migrationCreateUnsignedNoteSplitPcztForThrowableError: Error?
+    var migrationCreateUnsignedNoteSplitPcztForCallsCount = 0
+    var migrationCreateUnsignedNoteSplitPcztForCalled: Bool {
+        return migrationCreateUnsignedNoteSplitPcztForCallsCount > 0
+    }
+    var migrationCreateUnsignedNoteSplitPcztForReceivedAccount: AccountUUID?
+    var migrationCreateUnsignedNoteSplitPcztForReturnValue: Data!
+    var migrationCreateUnsignedNoteSplitPcztForClosure: ((AccountUUID) async throws -> Data)?
+
+    func migrationCreateUnsignedNoteSplitPczt(for account: AccountUUID) async throws -> Data {
+        if let error = migrationCreateUnsignedNoteSplitPcztForThrowableError {
+            throw error
+        }
+        migrationCreateUnsignedNoteSplitPcztForCallsCount += 1
+        migrationCreateUnsignedNoteSplitPcztForReceivedAccount = account
+        if let closure = migrationCreateUnsignedNoteSplitPcztForClosure {
+            return try await closure(account)
+        } else {
+            return migrationCreateUnsignedNoteSplitPcztForReturnValue
+        }
+    }
+
+    // MARK: - migrationStoreSignedNoteSplitPczt
+
+    var migrationStoreSignedNoteSplitPcztForThrowableError: Error?
+    var migrationStoreSignedNoteSplitPcztForCallsCount = 0
+    var migrationStoreSignedNoteSplitPcztForCalled: Bool {
+        return migrationStoreSignedNoteSplitPcztForCallsCount > 0
+    }
+    var migrationStoreSignedNoteSplitPcztForReceivedArguments: (pczt: Data, account: AccountUUID)?
+    var migrationStoreSignedNoteSplitPcztForReturnValue: PreparedMigrationTransfer!
+    var migrationStoreSignedNoteSplitPcztForClosure: ((Data, AccountUUID) async throws -> PreparedMigrationTransfer)?
+
+    func migrationStoreSignedNoteSplitPczt(_ pczt: Data, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
+        if let error = migrationStoreSignedNoteSplitPcztForThrowableError {
+            throw error
+        }
+        migrationStoreSignedNoteSplitPcztForCallsCount += 1
+        migrationStoreSignedNoteSplitPcztForReceivedArguments = (pczt: pczt, account: account)
+        if let closure = migrationStoreSignedNoteSplitPcztForClosure {
+            return try await closure(pczt, account)
+        } else {
+            return migrationStoreSignedNoteSplitPcztForReturnValue
+        }
+    }
+
+    // MARK: - migrationCreateUnsignedTransferPczts
+
+    var migrationCreateUnsignedTransferPcztsForForThrowableError: Error?
+    var migrationCreateUnsignedTransferPcztsForForCallsCount = 0
+    var migrationCreateUnsignedTransferPcztsForForCalled: Bool {
+        return migrationCreateUnsignedTransferPcztsForForCallsCount > 0
+    }
+    var migrationCreateUnsignedTransferPcztsForForReceivedArguments: (schedule: MigrationSchedule, account: AccountUUID)?
+    var migrationCreateUnsignedTransferPcztsForForReturnValue: [MigrationUnsignedTransferPczt]!
+    var migrationCreateUnsignedTransferPcztsForForClosure: ((MigrationSchedule, AccountUUID) async throws -> [MigrationUnsignedTransferPczt])?
+
+    func migrationCreateUnsignedTransferPczts(for schedule: MigrationSchedule, for account: AccountUUID) async throws -> [MigrationUnsignedTransferPczt] {
+        if let error = migrationCreateUnsignedTransferPcztsForForThrowableError {
+            throw error
+        }
+        migrationCreateUnsignedTransferPcztsForForCallsCount += 1
+        migrationCreateUnsignedTransferPcztsForForReceivedArguments = (schedule: schedule, account: account)
+        if let closure = migrationCreateUnsignedTransferPcztsForForClosure {
+            return try await closure(schedule, account)
+        } else {
+            return migrationCreateUnsignedTransferPcztsForForReturnValue
+        }
+    }
+
+    // MARK: - migrationStoreSignedSchedulePczts
+
+    var migrationStoreSignedSchedulePcztsForThrowableError: Error?
+    var migrationStoreSignedSchedulePcztsForCallsCount = 0
+    var migrationStoreSignedSchedulePcztsForCalled: Bool {
+        return migrationStoreSignedSchedulePcztsForCallsCount > 0
+    }
+    var migrationStoreSignedSchedulePcztsForReceivedArguments: (signed: [MigrationSignedTransferPczt], account: AccountUUID)?
+    var migrationStoreSignedSchedulePcztsForClosure: (([MigrationSignedTransferPczt], AccountUUID) async throws -> Void)?
+
+    func migrationStoreSignedSchedulePczts(_ signed: [MigrationSignedTransferPczt], for account: AccountUUID) async throws {
+        if let error = migrationStoreSignedSchedulePcztsForThrowableError {
+            throw error
+        }
+        migrationStoreSignedSchedulePcztsForCallsCount += 1
+        migrationStoreSignedSchedulePcztsForReceivedArguments = (signed: signed, account: account)
+        try await migrationStoreSignedSchedulePcztsForClosure!(signed, account)
+    }
+
 }
