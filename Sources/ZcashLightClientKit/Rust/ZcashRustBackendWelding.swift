@@ -403,4 +403,138 @@ protocol ZcashRustBackendWelding {
 
     /// Attempts to delete an account defined by UUID
     func deleteAccount(_ accountUUID: AccountUUID) async throws
+
+    // MARK: - Ironwood migration
+
+    /// Current Orchard -> Ironwood migration state for `account`. This is also the reconciliation
+    /// hub: call it on launch and after every migration-related operation.
+    /// - Throws: `rustMigrationState` if the rust layer returns an error.
+    func migrationState(for account: AccountUUID) async throws -> MigrationState
+
+    /// Live migration progress, or `nil` when no migration is in progress.
+    /// - Throws: `rustMigrationProgress` if the rust layer returns an error.
+    func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress?
+
+    /// Whether the Orchard notes must be split before migration.
+    ///
+    /// - Throws: `rustMigrationIsNoteSplitNeeded` if the rust layer returns an error. In particular,
+    ///   on a wallet that has never completed a sync (no chain tip known) this throws rather than
+    ///   returning `false`.
+    func migrationIsNoteSplitNeeded(for account: AccountUUID) async throws -> Bool
+
+    /// Whether any scheduled transfer is past its send height but not yet broadcast.
+    /// - Throws: `rustMigrationHasOverdueTransfers` if the rust layer returns an error.
+    func migrationHasOverdueTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// Whether the migration is in an invalid state (spendable Orchard remains but no scheduled
+    /// transfer covers it).
+    /// - Throws: `rustMigrationHasInvalidTransfers` if the rust layer returns an error.
+    func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// The optimal note split for the spendable Orchard balance.
+    /// - Throws: `rustMigrationPrepareNoteSplit` if the rust layer returns an error.
+    func migrationPrepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
+
+    /// Builds, signs, and persists the note-split transaction; returns the broadcastable prepared
+    /// transfer.
+    /// - Throws: `rustMigrationSignNoteSplit` if the rust layer returns an error.
+    func migrationSignNoteSplit(
+        proposal: NoteSplitProposal,
+        usk: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws -> PreparedMigrationTransfer
+
+    /// The leftover Orchard balance a migration would not cross, when it is large enough to be
+    /// worth offering the user a choice about; `nil` when there is no such residual.
+    ///
+    /// - Throws: `rustMigrationResidualAfterMigration` if the rust layer returns an error. In
+    ///   particular, on a wallet that has never completed a sync (no chain tip known) this throws
+    ///   rather than returning `nil`.
+    func migrationResidualAfterMigration(for account: AccountUUID) async throws -> Zatoshi?
+
+    /// The full migration schedule for the spendable Orchard balance. When `includeResidual` is
+    /// `true` and a worthwhile residual exists, one extra transfer for it is appended.
+    /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
+    func migrationProposeTransfers(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// Proposes the immediate (single-transaction) migration: sweeps the whole spendable Orchard
+    /// balance into one Ironwood output, executable now.
+    /// - Throws: `rustMigrationProposeImmediateTransfers` if the rust layer returns an error.
+    func migrationProposeImmediateTransfers(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// Pre-signs and persists every transfer in `schedule`.
+    /// - Throws: `rustMigrationSignAndStoreSchedule` if the rust layer returns an error.
+    func migrationSignAndStoreSchedule(
+        _ schedule: MigrationSchedule,
+        usk: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws
+
+    /// The next height-due pre-signed transfer, or `nil` when nothing is currently due.
+    /// - Throws: `rustMigrationNextDueTransfer` if the rust layer returns an error.
+    func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedMigrationTransfer?
+
+    /// The next height-due scheduled transfer's full proposal (amount, anchor, timing) for the
+    /// active run, or `nil` when nothing is currently pending (no active run, or only the note-split
+    /// prep is pending). The proposal-level counterpart of `migrationNextDueTransfer`: it exposes the
+    /// heights (notably `nextExecutableAfterHeight`) so a host can re-arm its own background window
+    /// without parsing the signed PCZT.
+    /// - Throws: `rustMigrationPendingTransferProposal` if the rust layer returns an error.
+    func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal?
+
+    /// Extracts the broadcast-ready consensus transaction bytes from a signed PCZT (the
+    /// `PreparedMigrationTransfer.pczt` returned by `migrationNextDueTransfer` or
+    /// `migrationSignNoteSplit`).
+    /// - Throws: `rustMigrationExtractBroadcastTx` if the rust layer returns an error.
+    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data
+
+    /// Records the platform's broadcast outcome for `transferId`, advancing the engine's state.
+    /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error;
+    ///           `migrationInvalidTxId` if `result` is `.success` and its `txId` does not decode
+    ///           to a 32-byte transaction id.
+    func migrationRecordTransferResult(
+        transferId: String,
+        result: MigrationTransferResult,
+        for account: AccountUUID
+    ) async throws
+
+    /// Whether a sync is required before the next transfer.
+    /// - Throws: `rustMigrationIsSyncRequired` if the rust layer returns an error.
+    func migrationIsSyncRequired(for account: AccountUUID) async throws -> Bool
+
+    /// Re-evaluates the remaining spendable Orchard balance and returns a fresh schedule.
+    /// `includeResidual` should match the choice made when the schedule being restarted was first
+    /// proposed.
+    /// - Throws: `rustMigrationRestartStep` if the rust layer returns an error.
+    func migrationRestartStep(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// Re-proposes at a fresh anchor and re-signs the active run's scheduled transfers; returns
+    /// the number refreshed. `includeResidual` should match the schedule's original choice.
+    /// - Throws: `rustMigrationRefreshStaleTransfers` if the rust layer returns an error.
+    func migrationRefreshStaleTransfers(
+        usk: UnifiedSpendingKey,
+        includeResidual: Bool,
+        for account: AccountUUID
+    ) async throws -> UInt32
+
+    /// Builds the note-split transaction as an unsigned, proven PCZT for an external signer.
+    /// - Throws: `rustMigrationCreateUnsignedNoteSplitPczt` if the rust layer returns an error.
+    func migrationCreateUnsignedNoteSplitPczt(for account: AccountUUID) async throws -> Data
+
+    /// Accepts the externally signed note-split PCZT and returns the broadcastable prepared
+    /// transfer.
+    /// - Throws: `rustMigrationStoreSignedNoteSplitPczt` if the rust layer returns an error.
+    func migrationStoreSignedNoteSplitPczt(_ pczt: Data, for account: AccountUUID) async throws -> PreparedMigrationTransfer
+
+    /// Builds one unsigned, proven PCZT per transfer of `schedule` for an external signer.
+    /// - Throws: `rustMigrationCreateUnsignedTransferPczts` if the rust layer returns an error.
+    func migrationCreateUnsignedTransferPczts(
+        for schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> [MigrationUnsignedTransferPczt]
+
+    /// Accepts the full set of externally signed transfer PCZTs (all-or-nothing) and, if every
+    /// staged transfer is matched exactly, persists the committed schedule.
+    /// - Throws: `rustMigrationStoreSignedSchedulePczts` if the rust layer returns an error.
+    func migrationStoreSignedSchedulePczts(_ signed: [MigrationSignedTransferPczt], for account: AccountUUID) async throws
 }

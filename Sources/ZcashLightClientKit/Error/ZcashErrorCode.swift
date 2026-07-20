@@ -265,6 +265,60 @@ public enum ZcashErrorCode: String {
     case rustTruncateToChainState = "ZRUST0091"
     /// Error from rust layer when calling ZcashEip681Backend.parseTransactionRequest
     case rustEip681Parse = "ZRUST0092"
+    /// Error from rust layer when calling ZcashRustBackend.migrationState
+    case rustMigrationState = "ZRUST0098"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProgress
+    case rustMigrationProgress = "ZRUST0099"
+    /// Error from rust layer when calling ZcashRustBackend.migrationIsNoteSplitNeeded
+    case rustMigrationIsNoteSplitNeeded = "ZRUST0100"
+    /// Error from rust layer when calling ZcashRustBackend.migrationHasOverdueTransfers
+    case rustMigrationHasOverdueTransfers = "ZRUST0101"
+    /// Error from rust layer when calling ZcashRustBackend.migrationHasInvalidTransfers
+    case rustMigrationHasInvalidTransfers = "ZRUST0102"
+    /// Error from rust layer when calling ZcashRustBackend.migrationPrepareNoteSplit
+    case rustMigrationPrepareNoteSplit = "ZRUST0103"
+    /// Error from rust layer when calling ZcashRustBackend.migrationSignNoteSplit
+    case rustMigrationSignNoteSplit = "ZRUST0104"
+    /// Error from rust layer when calling ZcashRustBackend.migrationResidualAfterMigration
+    case rustMigrationResidualAfterMigration = "ZRUST0105"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProposeTransfers
+    case rustMigrationProposeTransfers = "ZRUST0106"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProposeImmediateTransfers
+    case rustMigrationProposeImmediateTransfers = "ZRUST0107"
+    /// Error from rust layer when calling ZcashRustBackend.migrationSignAndStoreSchedule
+    case rustMigrationSignAndStoreSchedule = "ZRUST0108"
+    /// Error from rust layer when calling ZcashRustBackend.migrationNextDueTransfer
+    case rustMigrationNextDueTransfer = "ZRUST0111"
+    /// Error from rust layer when calling ZcashRustBackend.migrationExtractBroadcastTx
+    case rustMigrationExtractBroadcastTx = "ZRUST0112"
+    /// Error from rust layer when calling ZcashRustBackend.migrationRecordTransferResult
+    case rustMigrationRecordTransferResult = "ZRUST0113"
+    /// Error from rust layer when calling ZcashRustBackend.migrationIsSyncRequired
+    case rustMigrationIsSyncRequired = "ZRUST0114"
+    /// Error from rust layer when calling ZcashRustBackend.migrationRestartStep
+    case rustMigrationRestartStep = "ZRUST0115"
+    /// Error from rust layer when calling ZcashRustBackend.migrationRefreshStaleTransfers
+    case rustMigrationRefreshStaleTransfers = "ZRUST0116"
+    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedNoteSplitPczt
+    case rustMigrationCreateUnsignedNoteSplitPczt = "ZRUST0117"
+    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedNoteSplitPczt
+    case rustMigrationStoreSignedNoteSplitPczt = "ZRUST0118"
+    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedTransferPczts
+    case rustMigrationCreateUnsignedTransferPczts = "ZRUST0119"
+    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePczts
+    case rustMigrationStoreSignedSchedulePczts = "ZRUST0120"
+    /// Error from rust layer when calling ZcashRustBackend.migrationPendingTransferProposal
+    case rustMigrationPendingTransferProposal = "ZRUST0123"
+    /// Tor was requested for a migration broadcast but could not be established.
+    case migrationTorUnavailable = "ZRUST0121"
+    /// The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult.
+    case migrationInvalidTxId = "ZRUST0122"
+    /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land and the privacy sync gate is already marked; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned.
+    case migrationRecordFailedAfterBroadcast = "ZRUST0124"
+    /// Synchronizer.start() was refused because the migration privacy gate is active.
+    case migrationSyncBlocked = "ZRUST0125"
+    /// A broadcast-performing migration method was called while the synchronizer is actively syncing.
+    case migrationBroadcastDuringSync = "ZRUST0126"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.
