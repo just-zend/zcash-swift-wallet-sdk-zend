@@ -92,6 +92,7 @@ use zip32::fingerprint::SeedFingerprint;
 mod derivation;
 mod eip681;
 mod ffi;
+mod migration;
 mod tor;
 // Voting stays UNGATED: the module compiles as honest-error stubs (15 C symbols preserved —
 // Zodl macOS links them; a cargo feature gate would drop them from the staticlib and break
