@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-17
+Last reviewed: 2026-07-20
 
 ## Remote and branch invariants
 
@@ -86,6 +86,20 @@ environment protections and WarpBuild GitHub App controls above are verified.
   release artifacts, private-engine provenance controls, and Ironwood hardening behavior.
 - Run the Swift build and offline tests on the Zend merge branch before merging the parity PR.
 
+### Upstream refresh (2026-07-20)
+
+- Fresh refs show fork/upstream defaults remain `main`. `origin/main` is `ee3abea2` and
+  `upstream/main` is `89d85c49`; `git rev-list --left-right --count origin/main...upstream/main`
+  returns `160 4`.
+- Existing draft Zend PR `#26` remains the single parity vehicle. Its branch merged upstream through
+  `89d85c49` with no manual conflict resolution, preserving Zend artifact URLs, private-engine
+  provenance controls, branding, and Ironwood behavior. The newly adopted upstream PR `#1815`
+  changes `LICENSE` to the Znewco, Inc. copyright holder and removes `LICENSE` from the Swift
+  workflow's ignored paths so license-only changes run the required build check.
+- Verification on the parity branch passed: `git diff --check origin/main...HEAD`, `swift build`,
+  and `swift test --filter OfflineTests` (546 tests, 0 failures). The shared workspace has about
+  9 GiB free; the prior SwiftPM dependency-resolution failure was caused by disk exhaustion.
+
 Current relationship after Zend PRs `#18`, `#17`, `#20`, and `#21` merged into `origin/main`:
 
 - `origin/main...upstream/main`: `152 0` after fetching both remotes on 2026-07-16.
@@ -144,7 +158,24 @@ Zend parity branch note:
 - The July 3 refresh merged upstream through `018253d8` with no conflicts. The upstream `#1799` changes touch `CHANGELOG.md` and `Sources/ZcashLightClientKit/Block/CompactBlockProcessor.swift`; no Zend-specific artifact URL, checksum, branding, or release behavior changed.
 - The July 7 refresh merged upstream through `d92a7940` with no conflicts. The upstream `#1802` changes touch `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `docs/ci.md`; no Zend-specific artifact URL, checksum, branding, or support surface changed.
 
-## Bleeding-edge snapshot (2026-07-16)
+## Bleeding-edge snapshot (2026-07-16; refreshed 2026-07-20)
+
+Current carry decisions:
+
+- Upstream PR `#1813` (pool-migration FFI/welding) and PR `#1812` (pool-migration Synchronizer
+  surface) are non-draft, clean, and currently green, but are one coupled Orchard-to-Ironwood
+  migration stack. Relative to `upstream/main`, `#1813` spans 76 files (+7,946/-4,338) and `#1812`
+  spans 90 files (+13,767/-4,378), including Rust FFI, a `librustzcash` family-pin advance,
+  generated protobuf/mocks, public Synchronizer APIs, persistence, privacy gates, and migration
+  orchestration. Zend's existing committed-artifact/private-engine contract needs an explicit
+  reconciliation plan and artifact verification first; do not carry either ahead of upstream.
+- The unreviewed `michal/slipstream-support` branch was force-pushed to `22633349`; it is 37
+  commits ahead and 4 behind `upstream/main`, with 114 files changed (+20,706/-4,589). It layers
+  Slipstream on the migration stack and has no scoped upstream PR, so it is not an early-carry
+  candidate.
+- `#1810` remains draft, blocked, and review-required; `#1807` remains blocked and
+  review-required. Dependabot, Dandelion++, older FFI, and release-workflow branches continue to
+  lack the combined readiness, narrow scope, and Zend roadmap value required for an early carry.
 
 Zend Ironwood hardening line:
 
