@@ -101,6 +101,7 @@ Generated files and `Tests/` are excluded from the main `.swiftlint.yml` (tests 
 - **TODOs**: format as `TODO: [#<issue_number>] ...` — bare `TODO:`/`FIXME:` warn.
 - **SwiftLint disables**: only the exceptions listed in `SWIFTLINT.md` are permitted, always scoped with `// swiftlint:disable:next` / `disable:previous` / region blocks.
 - **Commits and PRs**: every PR must reference an issue. Commit title format is `[#<issue_number>] <self-descriptive title>` (see `CONTRIBUTING.md`). PRs are typically squash-merged.
+- **Rust formatting**: always run `cargo fmt` in `rust/` before committing changes to the Rust code. Consistent formatting keeps diffs minimal and avoids spurious conflicts when rebasing.
 - **Breaking API changes**: document them in `MIGRATING.md`, and add a `CHANGELOG.md` entry for every user-visible change.
 - **Main branch policy**: `main` is development-stable (all merges build + tests pass) but clients must depend on published tags, never on `main`.
 - **Sync concurrency**: `CompactBlockProcessor` is a Swift actor. Callers without structured concurrency should hop to `@MainActor` contexts rather than blocking.
