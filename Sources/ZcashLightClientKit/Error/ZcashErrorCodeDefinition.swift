@@ -931,6 +931,9 @@ enum ZcashErrorDefinition {
     /// Put Ironwood subtree roots to the DB failed.
     // sourcery: code="ZCBPEO0023"
     case compactBlockProcessorPutIronwoodSubtreeRoots(_ error: Error)
+    /// Every sampled server tip was below durable local wallet state. Retrying may select a healthy load-balanced replica.
+    // sourcery: code="ZCBPEO0024"
+    case compactBlockProcessorServerTipBehind(localFloor: BlockHeight, highestObserved: BlockHeight, attempts: Int)
 
     // MARK: - SDKSynchronizer
 

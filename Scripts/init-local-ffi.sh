@@ -244,6 +244,7 @@ elif [[ "$BUILD_MODE" == "cached" ]]; then
     echo "      Run './Scripts/rebuild-local-ffi.sh' to rebuild for your target platform."
 else
     echo "Building full xcframework from source (this takes a while)..."
+    rustup component add --toolchain "$RUST_TOOLCHAIN" llvm-tools-preview
     cd BuildSupport
     make xcframework
     cd ..
@@ -251,6 +252,7 @@ else
     rm -rf "$XCFRAMEWORK_DIR"
     cp -R BuildSupport/products/libzcashlc.xcframework "$XCFRAMEWORK_DIR"
     ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    ./Scripts/strip-ironwood-ffi-archives.sh "$XCFRAMEWORK_DIR"
 fi
 
 # Create local SPM package wrapper

@@ -19,6 +19,7 @@ files=(
     Scripts/init-local-ffi.sh
     Scripts/rebuild-local-ffi.sh
     Scripts/rust-build-env.sh
+    Scripts/strip-ironwood-ffi-archives.sh
     Scripts/version-macos-framework.sh
 )
 

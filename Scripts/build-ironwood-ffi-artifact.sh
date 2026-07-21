@@ -23,9 +23,12 @@ expected_librustzcash_revision="5115cf26da590a3d610446f1d926ff7f2873c9d1"
 expected_librustzcash_tree="62f79c17fe172735fce3df4e03991e90a736b60a"
 expected_sdk_base_revision="8f85838bcc7f59e11de45c96e1ed783093712901"
 expected_sdk_upstream_revision="2922143e4d686c999d9b3530282988a3838af220"
+expected_sdk_merge_revision="d555d060815b89def2337a9ad37407362b49f352"
+excluded_slipstream_sdk_revision="226333494ebe6bc377aaf4bbb513bb1ccbf16750"
 voting_circuits_revision="a5aae410a6fb14fcbea2f0ce3393035195e86f69"
 vote_nullifier_pir_revision="0dea3485429c80033e67a1ddb18ee72cc450cefb"
 zcash_voting_revision="464f974865f2afa82bdac15d169168c77ecb9c74"
+archive_postprocessing="thin-llvm-objcopy-remove-bitcode_lipo_apple-strip-S-x"
 
 librustzcash_revision=$(git -C "$librustzcash_repo" rev-parse HEAD)
 librustzcash_tree=$(git -C "$librustzcash_repo" rev-parse 'HEAD^{tree}')
@@ -38,10 +41,11 @@ then
     echo "Error: librustzcash checkout does not match the frozen compatibility branch/revision/tree" >&2
     exit 1
 fi
-if [[ "$(git rev-parse HEAD)" != "$expected_sdk_base_revision" \
-    || "$(git rev-parse MERGE_HEAD 2>/dev/null || true)" != "$expected_sdk_upstream_revision" ]]
+if ! git merge-base --is-ancestor "$expected_sdk_merge_revision" HEAD \
+    || [[ "$(git rev-parse "$expected_sdk_merge_revision^1")" != "$expected_sdk_base_revision" \
+    || "$(git rev-parse "$expected_sdk_merge_revision^2")" != "$expected_sdk_upstream_revision" ]]
 then
-    echo "Error: build must run while resolving the reviewed SDK base/upstream merge" >&2
+    echo "Error: SDK checkout does not contain the reviewed base/upstream merge" >&2
     exit 1
 fi
 
@@ -52,6 +56,7 @@ if [[ ! "$rust_toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 rustup toolchain install "$rust_toolchain" --profile minimal
+rustup component add --toolchain "$rust_toolchain" llvm-tools-preview
 rustup target add --toolchain "$rust_toolchain" \
     aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim \
     x86_64-apple-darwin x86_64-apple-ios
@@ -81,6 +86,10 @@ trap cleanup EXIT
 printf '%s\n' \
     "SDK_BASE_REVISION=$expected_sdk_base_revision" \
     "SDK_UPSTREAM_REVISION=$expected_sdk_upstream_revision" \
+    "SDK_MERGE_REVISION=$expected_sdk_merge_revision" \
+    "SYNC_ENGINE=SDKSynchronizer" \
+    "SLIPSTREAM_INCLUDED=false" \
+    "EXCLUDED_SLIPSTREAM_SDK_REVISION=$excluded_slipstream_sdk_revision" \
     "LIBRUSTZCASH_REPOSITORY=$expected_librustzcash_repository" \
     "LIBRUSTZCASH_BRANCH=$expected_librustzcash_branch" \
     "LIBRUSTZCASH_REVISION=$librustzcash_revision" \
@@ -90,6 +99,7 @@ printf '%s\n' \
     "ZCASH_VOTING_REVISION=$zcash_voting_revision" \
     "SOURCE_DATE_EPOCH=$source_date_epoch" \
     "RUST_TOOLCHAIN=$rust_toolchain" \
+    "FFI_ARCHIVE_POSTPROCESSING=$archive_postprocessing" \
     "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET" \
     "IPHONEOS_DEPLOYMENT_TARGET=$IPHONEOS_DEPLOYMENT_TARGET" \
     "IOS_ARM64_SIMULATOR_MINIMUM_OS=$IRONWOOD_IOS_ARM64_SIMULATOR_MINIMUM_OS" \
@@ -111,6 +121,10 @@ provenance_temp=$(mktemp)
 printf '%s\n' \
     "SDK_BASE_REVISION=$expected_sdk_base_revision" \
     "SDK_UPSTREAM_REVISION=$expected_sdk_upstream_revision" \
+    "SDK_MERGE_REVISION=$expected_sdk_merge_revision" \
+    "SYNC_ENGINE=SDKSynchronizer" \
+    "SLIPSTREAM_INCLUDED=false" \
+    "EXCLUDED_SLIPSTREAM_SDK_REVISION=$excluded_slipstream_sdk_revision" \
     "LIBRUSTZCASH_REPOSITORY=$expected_librustzcash_repository" \
     "LIBRUSTZCASH_BRANCH=$expected_librustzcash_branch" \
     "LIBRUSTZCASH_REVISION=$librustzcash_revision" \
@@ -121,6 +135,7 @@ printf '%s\n' \
     "SDK_FFI_SOURCE_SHA256=$sdk_ffi_source_sha256" \
     "SOURCE_DATE_EPOCH=$source_date_epoch" \
     "RUST_TOOLCHAIN=$rust_toolchain" \
+    "FFI_ARCHIVE_POSTPROCESSING=$archive_postprocessing" \
     "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET" \
     "IPHONEOS_DEPLOYMENT_TARGET=$IPHONEOS_DEPLOYMENT_TARGET" \
     "IOS_ARM64_SIMULATOR_MINIMUM_OS=$IRONWOOD_IOS_ARM64_SIMULATOR_MINIMUM_OS" \

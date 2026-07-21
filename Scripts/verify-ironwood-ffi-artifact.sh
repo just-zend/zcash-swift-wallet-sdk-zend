@@ -34,15 +34,71 @@ if [[ "$binary_count" != "3" ]]; then
     exit 1
 fi
 
+max_git_blob_bytes=100000000
+for binary in "${binaries[@]}"; do
+    binary_size=$(stat -f '%z' "$binary")
+    if (( binary_size >= max_git_blob_bytes )); then
+        echo "Error: committed archive exceeds GitHub's object limit: $binary ($binary_size bytes)" >&2
+        exit 1
+    fi
+done
+
+# Parse every thin archive with the same Apple linker used by Swift/Xcode. This is a focused
+# regression gate for Mach-O unwind relocations: llvm-strip -x can leave an archive that passes
+# llvm-nm and architecture checks but crashes Apple ld while reading compiler_builtins.
+link_smoke_dir=$(mktemp -d)
+cleanup_link_smoke() {
+    rm -rf "$link_smoke_dir"
+}
+trap cleanup_link_smoke EXIT
+link_smoke_binary() {
+    local binary="$1"
+    local platform="$2"
+    local minimum_version="$3"
+    local sdk="$4"
+    local sdk_version arch thin_archive linked_object
+    sdk_version=$(xcrun --sdk "$sdk" --show-sdk-version)
+    while IFS= read -r arch; do
+        thin_archive="$link_smoke_dir/$(basename "$(dirname "$binary")")-$platform-$arch.a"
+        linked_object="$thin_archive.linked.o"
+        if [[ "$(lipo -archs "$binary" | wc -w | tr -d ' ')" == "1" ]]; then
+            cp "$binary" "$thin_archive"
+        else
+            lipo "$binary" -thin "$arch" -output "$thin_archive"
+        fi
+        xcrun ld -r -all_load -arch "$arch" \
+            -platform_version "$platform" "$minimum_version" "$sdk_version" \
+            "$thin_archive" -o "$linked_object"
+        if (( $(stat -f '%z' "$linked_object") < 1000000 )); then
+            echo "Error: Apple linker smoke test did not load the full $arch archive" >&2
+            exit 1
+        fi
+    done < <(lipo -archs "$binary" | tr ' ' '\n')
+}
+link_smoke_binary "${binaries[0]}" ios 13.0 iphoneos
+link_smoke_binary "${binaries[1]}" ios-simulator 14.0 iphonesimulator
+link_smoke_binary "${binaries[2]}" macos 12.0 macosx
+
 required_symbols=()
 while IFS= read -r symbol; do
     required_symbols+=("$symbol")
 done < <(
-    rg -o --no-filename 'zcashlc_[a-z0-9_]+' Sources/ZcashLightClientKit/Rust \
+    rg --pcre2 -o --no-filename 'zcashlc_[a-z0-9_]+(?=\s*\()' Sources/ZcashLightClientKit/Rust \
         | LC_ALL=C sort -u
 )
 if [[ ${#required_symbols[@]} -eq 0 ]]; then
     echo "Error: no production zcashlc ABI calls were discovered" >&2
+    exit 1
+fi
+
+# Apple nm in Xcode 26 cannot parse the LLVM 22 attributes emitted by Rust 1.96.1's
+# compiler_builtins objects. Inspect the archives with llvm-nm from the exact pinned Rust
+# toolchain instead; the builder installs llvm-tools-preview for that toolchain.
+symbol_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+symbol_host=$(rustc "+$symbol_toolchain" --version --verbose | sed -n 's/^host: //p')
+llvm_nm="$(rustc "+$symbol_toolchain" --print sysroot)/lib/rustlib/$symbol_host/bin/llvm-nm"
+if [[ ! -x "$llvm_nm" ]]; then
+    echo "Error: pinned llvm-nm is missing; install llvm-tools-preview for Rust $symbol_toolchain" >&2
     exit 1
 fi
 
@@ -80,7 +136,7 @@ for binary in "${binaries[@]}"; do
     nm_output=$(mktemp)
     nm_errors=$(mktemp)
     nm_status=0
-    nm -gUj "$binary" > "$nm_output" 2> "$nm_errors" || nm_status=$?
+    "$llvm_nm" --defined-only --extern-only --just-symbol-name "$binary" > "$nm_output" 2> "$nm_errors" || nm_status=$?
     sed 's/^_//' "$nm_output" | LC_ALL=C sort -u > "$symbols_file"
     for symbol in "${required_symbols[@]}"; do
         if ! grep -Fq "$symbol" "$header"; then
@@ -221,10 +277,12 @@ for field in XCODE_BUILD_VERSION MACOS_BUILD_VERSION; do
 done
 
 expected_fields=(
-    SDK_BASE_REVISION SDK_UPSTREAM_REVISION
+    SDK_BASE_REVISION SDK_UPSTREAM_REVISION SDK_MERGE_REVISION
+    SYNC_ENGINE SLIPSTREAM_INCLUDED EXCLUDED_SLIPSTREAM_SDK_REVISION
     LIBRUSTZCASH_REPOSITORY LIBRUSTZCASH_BRANCH LIBRUSTZCASH_REVISION LIBRUSTZCASH_TREE
     VOTING_CIRCUITS_REVISION VOTE_NULLIFIER_PIR_REVISION ZCASH_VOTING_REVISION
-    SOURCE_DATE_EPOCH RUST_TOOLCHAIN MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET
+    SOURCE_DATE_EPOCH RUST_TOOLCHAIN FFI_ARCHIVE_POSTPROCESSING
+    MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET
     IOS_ARM64_SIMULATOR_MINIMUM_OS
 )
 for field in "${expected_fields[@]}"; do
@@ -236,6 +294,10 @@ done
 
 if [[ "$(read_field SDK_BASE_REVISION)" != "8f85838bcc7f59e11de45c96e1ed783093712901" \
     || "$(read_field SDK_UPSTREAM_REVISION)" != "2922143e4d686c999d9b3530282988a3838af220" \
+    || "$(read_field SDK_MERGE_REVISION)" != "d555d060815b89def2337a9ad37407362b49f352" \
+    || "$(read_field SYNC_ENGINE)" != "SDKSynchronizer" \
+    || "$(read_field SLIPSTREAM_INCLUDED)" != "false" \
+    || "$(read_field EXCLUDED_SLIPSTREAM_SDK_REVISION)" != "226333494ebe6bc377aaf4bbb513bb1ccbf16750" \
     || "$(read_field LIBRUSTZCASH_REPOSITORY)" != "https://github.com/just-zend/librustzcash" \
     || "$(read_field LIBRUSTZCASH_BRANCH)" != "agent/ironwood-nu63-compatibility" \
     || "$(read_field LIBRUSTZCASH_REVISION)" != "5115cf26da590a3d610446f1d926ff7f2873c9d1" \
@@ -245,6 +307,11 @@ if [[ "$(read_field SDK_BASE_REVISION)" != "8f85838bcc7f59e11de45c96e1ed78309371
     || "$(read_field ZCASH_VOTING_REVISION)" != "464f974865f2afa82bdac15d169168c77ecb9c74" ]]
 then
     echo "Error: provenance does not record the reviewed Ironwood source graph" >&2
+    exit 1
+fi
+
+if [[ "$(read_field FFI_ARCHIVE_POSTPROCESSING)" != "thin-llvm-objcopy-remove-bitcode_lipo_apple-strip-S-x" ]]; then
+    echo "Error: provenance does not record the relocation-safe archive post-processing pipeline" >&2
     exit 1
 fi
 

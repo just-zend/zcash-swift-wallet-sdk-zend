@@ -481,6 +481,8 @@ public enum ZcashErrorCode: String {
     case compactBlockProcessorPutOrchardSubtreeRoots = "ZCBPEO0022"
     /// Put Ironwood subtree roots to the DB failed.
     case compactBlockProcessorPutIronwoodSubtreeRoots = "ZCBPEO0023"
+    /// Every sampled server tip was below durable local wallet state. Retrying may select a healthy load-balanced replica.
+    case compactBlockProcessorServerTipBehind = "ZCBPEO0024"
     /// The synchronizer is unprepared.
     case synchronizerNotPrepared = "ZSYNCO0001"
     /// Memos can't be sent to transparent addresses.

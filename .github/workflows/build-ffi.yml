@@ -26,6 +26,12 @@ jobs:
       - name: Select Xcode version
         run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
+      - name: Install pinned Rust verification tools
+        run: |
+          rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$rust_toolchain" --profile minimal
+          rustup component add --toolchain "$rust_toolchain" llvm-tools-preview
+
       - name: Verify frozen committed artifact
         run: |
           ./Scripts/verify-ironwood-ffi-artifact.sh
@@ -33,7 +39,7 @@ jobs:
           for slice in "${expected[@]}"; do
             test -f "LocalPackages/libzcashlc.xcframework/${slice}/libzcashlc.framework/libzcashlc"
           done
-          count=$(find LocalPackages/libzcashlc.xcframework -type f -path '*/libzcashlc.framework/libzcashlc' | wc -l | tr -d ' ')
+          count=$(find LocalPackages/libzcashlc.xcframework \( -type f -o -type l \) -path '*/libzcashlc.framework/libzcashlc' | wc -l | tr -d ' ')
           test "$count" = "3"
 
       - name: Package and upload draft release

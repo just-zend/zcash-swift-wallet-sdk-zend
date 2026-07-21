@@ -897,6 +897,230 @@ typedef struct FfiEip681Erc20Request {
 } FfiEip681Erc20Request;
 
 /**
+ * Live migration progress. When returned standalone (`zcashlc_migration_progress`), `is_present`
+ * is `false` for the crate's `None` (no migration in progress); as the payload of
+ * [`FfiMigrationState::InProgress`] it is always `true`.
+ */
+typedef struct FfiMigrationProgress {
+  /**
+   * Whether the remaining fields carry a real progress snapshot.
+   */
+  bool is_present;
+  /**
+   * The number of scheduled transfers confirmed on-chain so far.
+   */
+  uint32_t completed_transfers;
+  /**
+   * The total number of transfers in the current schedule.
+   */
+  uint32_t total_transfers;
+  /**
+   * The Orchard-pool value (zatoshi) not yet migrated to Ironwood.
+   */
+  int64_t remaining_orchard_value;
+  /**
+   * The height at which the next transfer becomes broadcastable, or `-1` if none is scheduled.
+   */
+  int64_t next_transfer_ready_at_height;
+} FfiMigrationProgress;
+
+/**
+ * Why a migration requires user attention (payload of [`FfiMigrationState::RequiresAttention`]).
+ */
+enum FfiAttentionReason_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * The input note funding `transfer_id` was spent externally before its transfer broadcast.
+   * `transfer_id` is an owned C string, freed by [`zcashlc_free_migration_state`].
+   */
+  InvalidTransfer,
+  /**
+   * A transaction's anchor/expiry elapsed before it could be broadcast.
+   */
+  TransferExpired,
+  /**
+   * A transfer produced Orchard change that must be synced before the next spend.
+   */
+  SyncRequiredBeforeNext,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiAttentionReason_Tag FfiAttentionReason_Tag;
+#else
+typedef uint8_t FfiAttentionReason_Tag;
+#endif // __STDC_VERSION__ >= 202311L
+
+typedef struct InvalidTransfer_Body {
+  char *transfer_id;
+} InvalidTransfer_Body;
+
+typedef struct FfiAttentionReason {
+  FfiAttentionReason_Tag tag;
+  union {
+    InvalidTransfer_Body invalid_transfer;
+  };
+} FfiAttentionReason;
+
+/**
+ * The top-level migration state machine surfaced to the app (see
+ * [`zcash_pool_migration::MigrationState`]).
+ *
+ * `#[allow(dead_code)]`: the data-carrying variants' payloads are read by the C consumer across
+ * the FFI (cbindgen emits them into the header), which rustc cannot observe — the
+ * `InProgress` progress snapshot in particular is never matched back out in Rust.
+ */
+enum FfiMigrationState_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * No migration has been initiated (or a run was abandoned).
+   */
+  NotStarted,
+  /**
+   * The note-split transaction has been submitted and awaits confirmation.
+   */
+  SplitPendingConfirmation,
+  /**
+   * The split is confirmed (or was not needed); ready to propose transfers.
+   */
+  ReadyToPropose,
+  /**
+   * The schedule has been committed and transfers are executing.
+   */
+  InProgress,
+  /**
+   * A transfer cannot proceed automatically; the app must act.
+   */
+  RequiresAttention,
+  /**
+   * All transfers are confirmed; the Orchard balance is fully migrated.
+   */
+  Complete,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiMigrationState_Tag FfiMigrationState_Tag;
+#else
+typedef uint8_t FfiMigrationState_Tag;
+#endif // __STDC_VERSION__ >= 202311L
+
+typedef struct FfiMigrationState {
+  FfiMigrationState_Tag tag;
+  union {
+    struct {
+      struct FfiMigrationProgress in_progress;
+    };
+    struct {
+      struct FfiAttentionReason requires_attention;
+    };
+  };
+} FfiMigrationState;
+
+/**
+ * A planned note split: the per-note output values (zatoshi) and the split-transaction fee.
+ */
+typedef struct FfiNoteSplitProposal {
+  /**
+   * Heap array of `output_values_len` output-note values (zatoshi).
+   */
+  int64_t *output_values;
+  uintptr_t output_values_len;
+  /**
+   * The fee (zatoshi) paid by the note-split transaction itself.
+   */
+  int64_t fee;
+} FfiNoteSplitProposal;
+
+/**
+ * A fully proven, signed transaction persisted as a PCZT, ready for the platform to broadcast.
+ * When returned by `zcashlc_migration_next_due_transfer`, an all-null/zeroed value (`id` and
+ * `pczt` null) means "nothing is due" (as opposed to a NULL return, which signals an error).
+ */
+typedef struct FfiPreparedTransfer {
+  /**
+   * The transfer's opaque id, as an owned C string (null only in the "nothing due" sentinel).
+   */
+  char *id;
+  /**
+   * The finalized transaction's id, as raw (internal-order) 32-byte value.
+   */
+  uint8_t txid[32];
+  /**
+   * Heap `pczt_len`-byte serialized signed PCZT (null only in the "nothing due" sentinel).
+   */
+  uint8_t *pczt;
+  uintptr_t pczt_len;
+} FfiPreparedTransfer;
+
+/**
+ * A single scheduled Orchard→Ironwood transfer (element of [`FfiMigrationSchedule`]).
+ */
+typedef struct FfiTransferProposal {
+  /**
+   * The transfer's opaque id, as an owned C string.
+   */
+  char *id;
+  /**
+   * The value (zatoshi) that crosses the turnstile.
+   */
+  int64_t amount;
+  /**
+   * The anchor height the PCZT is built against.
+   */
+  int64_t anchor_height;
+  /**
+   * The height after which the platform may broadcast this transfer.
+   */
+  int64_t next_executable_after_height;
+  /**
+   * The height after which this transfer is no longer valid.
+   */
+  int64_t expiry_height;
+} FfiTransferProposal;
+
+/**
+ * A full migration schedule presented to the user for one-time confirmation.
+ */
+typedef struct FfiMigrationSchedule {
+  /**
+   * Heap array of `transfers_len` scheduled transfers, in execution order.
+   */
+  struct FfiTransferProposal *transfers;
+  uintptr_t transfers_len;
+  /**
+   * A rough estimate of how long the schedule takes to fully execute, in hours.
+   */
+  uint32_t estimated_duration_hours;
+} FfiMigrationSchedule;
+
+/**
+ * An unsigned-but-proven PCZT awaiting an external signer (element of
+ * [`FfiUnsignedTransferPczts`]).
+ */
+typedef struct FfiUnsignedTransferPczt {
+  /**
+   * The transfer's opaque id, as an owned C string.
+   */
+  char *id;
+  /**
+   * Heap `pczt_len`-byte serialized proven-but-unsigned PCZT.
+   */
+  uint8_t *pczt;
+  uintptr_t pczt_len;
+} FfiUnsignedTransferPczt;
+
+/**
+ * The set of unsigned transfer PCZTs to route to an external signer, one per scheduled transfer.
+ */
+typedef struct FfiUnsignedTransferPczts {
+  struct FfiUnsignedTransferPczt *ptr;
+  uintptr_t len;
+} FfiUnsignedTransferPczts;
+
+/**
  * Voting hotkey returned by `zcashlc_voting_generate_hotkey`.
  */
 typedef struct FfiVotingHotkey {
@@ -972,12 +1196,6 @@ typedef struct FfiVoteRecords {
   struct FfiVoteRecord *ptr;
   uintptr_t len;
 } FfiVoteRecords;
-
-/**
- * Takes the stable database-initialization failure code for the immediately preceding call on
- * this thread. Swift uses this typed channel for recovery policy and never parses Rust prose.
- */
-uint32_t zcashlc_last_database_init_error_code(void);
 
 /**
  * Initializes global Rust state, such as the logging infrastructure and threadpools.
@@ -2023,36 +2241,6 @@ struct FfiBoxedSlice *zcashlc_propose_transfer_from_uri(const uint8_t *db_data,
 int32_t zcashlc_branch_id_for_height(int32_t height, uint32_t network_id);
 
 /**
- * Returns the activation height of a consensus network upgrade for the requested network.
- *
- * `network_upgrade` uses a stable FFI mapping that is intentionally independent of Rust enum
- * discriminants: Overwinter through NU7 are numbered 0 through 10 in activation order. NU7 is
- * reported as not configured when this crate is built without upstream's `zcash_unstable="nu7"`
- * cfg (the production configuration of this SDK).
- *
- * Returns the non-negative activation height, `-1` when that upgrade is not configured to
- * activate, or `-2` when the network or upgrade id is invalid (with details in the last-error
- * channel). Standard mainnet/testnet values come directly from this linked librustzcash revision;
- * custom-network values come from the exact `LocalNetwork` registered for network id 2.
- */
-int64_t zcashlc_network_upgrade_activation_height(uint32_t network_id, uint32_t network_upgrade);
-
-/**
- * Returns the canonical chain id bound into the requested network's consensus configuration.
- * The returned string must be freed with [`zcashlc_string_free`].
- */
-char *zcashlc_consensus_chain_id(uint32_t network_id);
-
-/**
- * Returns the lowercase SHA-256 consensus-configuration fingerprint for the requested network.
- * It commits to the canonical chain id, actual consensus base identity, and every stable
- * activation height through NU7 (including an explicit absent marker when NU7 is gated off). The
- * returned string must be freed with
- * [`zcashlc_string_free`].
- */
-char *zcashlc_consensus_parameters_fingerprint(uint32_t network_id);
-
-/**
  * Frees strings returned by other zcashlc functions.
  *
  * # Safety
@@ -2836,17 +3024,18 @@ struct FfiAddressCheckResult *zcashlc_tor_lwd_conn_check_single_use_taddr(struct
  * Registers the **custom network** resolved for `network_id` [`NETWORK_ID_REGTEST`], which every
  * subsequent `zcashlc_*` call resolves through [`parse_network`]. `base_network_id` selects the base
  * identity — address encoding and `chainName` — as mainnet (1), testnet (0), or regtest (2); the
- * activation heights are custom regardless. `chain_id` is the canonical chain name expected from
- * lightwalletd `getInfo` and committed into the consensus fingerprint. Each height argument is a
- * block height, or a negative value meaning "not activated on this network"; set them to mirror
- * the `nuparams` of the node / `lightwalletd` being connected to. Idempotent for one exact
- * configuration; a later conflicting registration fails closed and preserves the first value.
+ * activation heights are custom regardless. Each height argument is a block height, or a negative value
+ * meaning "not activated on this network"; set them to mirror the `nuparams` of the node /
+ * `lightwalletd` being connected to. Idempotent; intended to be called once at init.
  *
- * Returns `true` on success, `false` on an invalid `base_network_id` or a poisoned lock.
+ * Returns `true` on a fresh registration or an identical re-registration. Returns `false` on an
+ * invalid `base_network_id`, a poisoned lock, or when the call **replaced a different existing
+ * configuration** — the replacement is still applied (last writer wins, since per-instance state
+ * such as checkpoint sources follows the newest `Initializer`), but the caller should treat a
+ * conflicting re-registration as a host configuration bug: the parameters are process-global, so
+ * two live instances with different custom networks cannot both be honored.
  */
 bool zcashlc_set_custom_network(uint32_t base_network_id,
-                                const uint8_t *chain_id,
-                                uintptr_t chain_id_len,
                                 int64_t overwinter,
                                 int64_t sapling,
                                 int64_t blossom,
@@ -2856,8 +3045,7 @@ bool zcashlc_set_custom_network(uint32_t base_network_id,
                                 int64_t nu6,
                                 int64_t nu6_1,
                                 int64_t nu6_2,
-                                int64_t nu6_3,
-                                int64_t nu7);
+                                int64_t nu6_3);
 
 /**
  * Returns the network type and address kind for the given address string,
@@ -3502,545 +3690,255 @@ void zcashlc_free_single_use_taddr(struct FfiSingleUseTaddr *ptr);
 void zcashlc_free_address_check_result(struct FfiAddressCheckResult *ptr);
 
 /**
- * Takes the stable migration-specific error code for the immediately preceding protected FFI
- * operation on this thread, resetting it to zero. `0` means no migration-specific classification.
- * Codes are a behavior boundary, not log text: Swift maps them to public typed failures and never
- * parses or exports the underlying Rust/SQLite message.
- */
-uint32_t zcashlc_last_migration_error_code(void);
-
-/**
- * Read migration-engine schema metadata without initialization or DDL (JSON
- * `MigrationEngineSchemaMetadata`). This stable forward-schema probe never parses error prose.
+ * Frees a [`FfiMigrationState`], including the attention transfer id if present.
  *
  * # Safety
- * `db_data` must satisfy [`migration_db_path`]. Free the returned pointer with
- * `zcashlc_free_boxed_slice`.
+ * `ptr` must be null or point to a [`FfiMigrationState`] handed out by this module.
  */
-struct FfiBoxedSlice *zcashlc_migration_engine_schema_metadata(const uint8_t *db_data,
-                                                               uintptr_t db_data_len);
+void zcashlc_free_migration_state(struct FfiMigrationState *ptr);
 
 /**
- * Current migration state (JSON `MigrationState`).
+ * Frees a [`FfiMigrationProgress`].
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * `ptr` must be null or point to a [`FfiMigrationProgress`] handed out by this module.
  */
-struct FfiBoxedSlice *zcashlc_migration_state(const uint8_t *db_data,
-                                              uintptr_t db_data_len,
-                                              const uint8_t *account_uuid_bytes,
-                                              uint32_t network_id);
+void zcashlc_free_migration_progress(struct FfiMigrationProgress *ptr);
 
 /**
- * Authoritative revisioned migration snapshot (JSON `MigrationSnapshot`). This performs the
- * engine's idempotent reconciliation before returning state, counts, failure/recovery metadata,
- * the next safe action, and the ordinary-spend reservation flag in one coherent read.
+ * Frees a [`FfiNoteSplitProposal`], including its output-values array.
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * `ptr` must be null or point to a [`FfiNoteSplitProposal`] handed out by this module.
  */
-struct FfiBoxedSlice *zcashlc_migration_snapshot(const uint8_t *db_data,
-                                                 uintptr_t db_data_len,
-                                                 const uint8_t *account_uuid_bytes,
-                                                 uint32_t network_id);
+void zcashlc_free_migration_note_split_proposal(struct FfiNoteSplitProposal *ptr);
 
 /**
- * Atomically persist the private-migration signer choice and SDK-validated submission policy
- * before proving/signing. Exact retries are idempotent and return the fresh authoritative
- * snapshot as JSON.
+ * Frees a [`FfiPreparedTransfer`], including its id string and PCZT bytes.
  *
  * # Safety
- * See [`context`]; `policy_ptr` must be valid for reads of `policy_len` bytes. Free the returned
- * pointer with `zcashlc_free_boxed_slice`.
+ * `ptr` must be null or point to a [`FfiPreparedTransfer`] handed out by this module.
  */
-struct FfiBoxedSlice *zcashlc_migration_begin_private(const uint8_t *db_data,
-                                                      uintptr_t db_data_len,
-                                                      const uint8_t *account_uuid_bytes,
-                                                      uint32_t network_id,
-                                                      bool external_signer,
-                                                      const uint8_t *policy_ptr,
-                                                      uintptr_t policy_len);
+void zcashlc_free_migration_prepared_transfer(struct FfiPreparedTransfer *ptr);
 
 /**
- * Bind a validated immutable submission policy to the active run at `expected_revision`,
- * returning the fresh authoritative snapshot as JSON.
+ * Frees a [`FfiMigrationSchedule`], including every transfer's id string.
  *
  * # Safety
- * See [`context`]; `policy_ptr` must be valid for reads of `policy_len` bytes. Free the returned
- * pointer with `zcashlc_free_boxed_slice`.
+ * `ptr` must be null or point to a [`FfiMigrationSchedule`] handed out by this module.
  */
-struct FfiBoxedSlice *zcashlc_migration_bind_submission_policy(const uint8_t *db_data,
-                                                               uintptr_t db_data_len,
-                                                               const uint8_t *account_uuid_bytes,
-                                                               uint32_t network_id,
-                                                               const char *expected_run_id,
-                                                               uint64_t expected_revision,
-                                                               const uint8_t *policy_ptr,
-                                                               uintptr_t policy_len);
+void zcashlc_free_migration_schedule(struct FfiMigrationSchedule *ptr);
 
 /**
- * Durably record why the selected endpoint/policy could not be validated before any network
- * submission. `failure` is a stable FFI discriminant: `0` means endpoint consensus mismatch and
- * `1` means the selected policy differs from the run's immutable bound policy. Exact retries at
- * the resulting revision are idempotent in the engine.
+ * Frees a standalone [`FfiTransferProposal`] (as returned by
+ * `zcashlc_migration_pending_transfer_proposal`), including its id string.
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * `ptr` must be null or point to a [`FfiTransferProposal`] handed out by this module.
  */
-struct FfiBoxedSlice *zcashlc_migration_record_submission_policy_validation_failure(const uint8_t *db_data,
-                                                                                    uintptr_t db_data_len,
-                                                                                    const uint8_t *account_uuid_bytes,
-                                                                                    uint32_t network_id,
-                                                                                    const char *expected_run_id,
-                                                                                    uint64_t expected_revision,
-                                                                                    uint32_t failure);
+void zcashlc_free_migration_transfer_proposal(struct FfiTransferProposal *ptr);
 
 /**
- * Pause the active run at an optimistic-concurrency revision and return its fresh snapshot.
+ * Frees a [`FfiUnsignedTransferPczts`], including every element's id string and PCZT bytes.
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * `ptr` must be null or point to a [`FfiUnsignedTransferPczts`] handed out by this module.
  */
-struct FfiBoxedSlice *zcashlc_migration_pause(const uint8_t *db_data,
-                                              uintptr_t db_data_len,
-                                              const uint8_t *account_uuid_bytes,
-                                              uint32_t network_id,
-                                              const char *expected_run_id,
-                                              uint64_t expected_revision);
+void zcashlc_free_migration_unsigned_transfer_pczts(struct FfiUnsignedTransferPczts *ptr);
 
 /**
- * Clear only an engine-owned `RetryAutomatically` failure at `expected_revision` and derive the
- * next durable continuation phase. User-reapproval, proof rebuild, paused, abandoning, and
- * terminal states are rejected by the engine rather than being generically reset.
+ * The current migration state. The app calls this on launch and after every operation; it is
+ * also the reconciliation hub (advancing split/transfer/completion phases as the wallet scans).
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_state`].
  */
-struct FfiBoxedSlice *zcashlc_migration_retry_automatic_recovery(const uint8_t *db_data,
+struct FfiMigrationState *zcashlc_migration_state(const uint8_t *db_data,
+                                                  uintptr_t db_data_len,
+                                                  const uint8_t *account_uuid_bytes,
+                                                  uint32_t network_id);
+
+/**
+ * Migration progress, present only while a migration is in progress. On success the returned
+ * pointer is non-null; its `is_present` flag is `false` when there is no progress to report. A
+ * NULL return signals an error.
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_progress`].
+ */
+struct FfiMigrationProgress *zcashlc_migration_progress(const uint8_t *db_data,
+                                                        uintptr_t db_data_len,
+                                                        const uint8_t *account_uuid_bytes,
+                                                        uint32_t network_id);
+
+/**
+ * Whether the Orchard notes must be split before migration. Returns `false` on error (see
+ * `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`].
+ */
+bool zcashlc_migration_is_note_split_needed(const uint8_t *db_data,
+                                            uintptr_t db_data_len,
+                                            const uint8_t *account_uuid_bytes,
+                                            uint32_t network_id);
+
+/**
+ * Whether any scheduled transfer is past its send height but not yet broadcast. Returns `false`
+ * on error (see `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`].
+ */
+bool zcashlc_migration_has_overdue_transfers(const uint8_t *db_data,
+                                             uintptr_t db_data_len,
+                                             const uint8_t *account_uuid_bytes,
+                                             uint32_t network_id);
+
+/**
+ * Whether the migration is in an invalid state (spendable Orchard remains but no scheduled
+ * transfer covers it). Returns `false` on error (see `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`].
+ */
+bool zcashlc_migration_has_invalid_transfers(const uint8_t *db_data,
+                                             uintptr_t db_data_len,
+                                             const uint8_t *account_uuid_bytes,
+                                             uint32_t network_id);
+
+/**
+ * Compute the optimal note-split proposal for the spendable Orchard balance.
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with
+ * [`zcashlc_free_migration_note_split_proposal`].
+ */
+struct FfiNoteSplitProposal *zcashlc_migration_prepare_note_split(const uint8_t *db_data,
+                                                                  uintptr_t db_data_len,
+                                                                  const uint8_t *account_uuid_bytes,
+                                                                  uint32_t network_id);
+
+/**
+ * Build, sign, and persist the note-split transaction, returning the broadcastable prepared
+ * transfer. The proposal is passed back as its `(output_values, fee)` parts (from
+ * `zcashlc_migration_prepare_note_split`); `usk` is the raw Orchard-era `UnifiedSpendingKey`
+ * bytes.
+ *
+ * # Safety
+ * See [`build_context`]; `output_values`/`usk_ptr` must be valid for reads of their lengths.
+ * Free the returned pointer with [`zcashlc_free_migration_prepared_transfer`].
+ */
+struct FfiPreparedTransfer *zcashlc_migration_sign_note_split(const uint8_t *db_data,
+                                                              uintptr_t db_data_len,
+                                                              const uint8_t *account_uuid_bytes,
+                                                              uint32_t network_id,
+                                                              const int64_t *output_values,
+                                                              uintptr_t output_values_len,
+                                                              int64_t fee,
+                                                              const uint8_t *usk_ptr,
+                                                              uintptr_t usk_len);
+
+/**
+ * The leftover Orchard balance a migration would not cross, when it is large enough to be worth
+ * offering the user a choice about (zatoshi). Returns `-1` when there is no such residual (and
+ * also `-1` on error, with `zcashlc_last_error_message` set).
+ *
+ * # Safety
+ * See [`build_context`].
+ */
+int64_t zcashlc_migration_residual_after_migration(const uint8_t *db_data,
+                                                   uintptr_t db_data_len,
+                                                   const uint8_t *account_uuid_bytes,
+                                                   uint32_t network_id);
+
+/**
+ * Generate the full migration schedule for the spendable Orchard balance. When `include_residual`
+ * is `true` and a worthwhile residual exists, one extra transfer for it is appended.
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
+ */
+struct FfiMigrationSchedule *zcashlc_migration_propose_transfers(const uint8_t *db_data,
                                                                  uintptr_t db_data_len,
                                                                  const uint8_t *account_uuid_bytes,
                                                                  uint32_t network_id,
-                                                                 const char *expected_run_id,
-                                                                 uint64_t expected_revision);
+                                                                 bool include_residual);
 
 /**
- * Resume a paused active run and return its fresh snapshot.
+ * Propose the immediate (single-transaction) migration: sweep the whole spendable Orchard
+ * balance into one Ironwood output, executable now.
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
  */
-struct FfiBoxedSlice *zcashlc_migration_resume(const uint8_t *db_data,
+struct FfiMigrationSchedule *zcashlc_migration_propose_immediate_transfers(const uint8_t *db_data,
+                                                                           uintptr_t db_data_len,
+                                                                           const uint8_t *account_uuid_bytes,
+                                                                           uint32_t network_id);
+
+/**
+ * Pre-sign and persist every transfer in the schedule. The schedule is passed back as JNI-style
+ * parallel arrays (all of length `ids_len`); `usk` is the raw Orchard-era `UnifiedSpendingKey`
+ * bytes. Returns `true` on success, `false` on error (see `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`] and [`rebuild_schedule`]; `usk_ptr` must be valid for `usk_len` bytes.
+ */
+bool zcashlc_migration_sign_and_store_schedule(const uint8_t *db_data,
                                                uintptr_t db_data_len,
                                                const uint8_t *account_uuid_bytes,
                                                uint32_t network_id,
-                                               const char *expected_run_id,
-                                               uint64_t expected_revision);
+                                               const char *const *ids,
+                                               uintptr_t ids_len,
+                                               const int64_t *amounts,
+                                               const int64_t *anchor_heights,
+                                               const int64_t *next_executable_after_heights,
+                                               const int64_t *expiry_heights,
+                                               uint32_t estimated_duration_hours,
+                                               const uint8_t *usk_ptr,
+                                               uintptr_t usk_len);
 
 /**
- * Request safe abandonment at an optimistic-concurrency revision and return the fresh snapshot.
+ * The next height-due pre-signed transfer. On success the returned pointer is non-null; its `id`
+ * and `pczt` are null when nothing is due. A NULL return signals an error.
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]. Free the returned pointer with
+ * [`zcashlc_free_migration_prepared_transfer`].
  */
-struct FfiBoxedSlice *zcashlc_migration_request_abandonment(const uint8_t *db_data,
-                                                            uintptr_t db_data_len,
-                                                            const uint8_t *account_uuid_bytes,
-                                                            uint32_t network_id,
-                                                            const char *expected_run_id,
-                                                            uint64_t expected_revision);
-
-/**
- * Migration progress (JSON `Option<MigrationProgress>`).
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_progress(const uint8_t *db_data,
-                                                 uintptr_t db_data_len,
-                                                 const uint8_t *account_uuid_bytes,
-                                                 uint32_t network_id);
-
-/**
- * Whether note splitting is required before migration (JSON `bool`).
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_is_note_split_needed(const uint8_t *db_data,
-                                                             uintptr_t db_data_len,
-                                                             const uint8_t *account_uuid_bytes,
-                                                             uint32_t network_id);
-
-/**
- * Compute the note-split proposal for the spendable Orchard balance (JSON `NoteSplitProposal`).
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_prepare_note_split(const uint8_t *db_data,
-                                                           uintptr_t db_data_len,
-                                                           const uint8_t *account_uuid_bytes,
-                                                           uint32_t network_id);
-
-/**
- * Build, sign and persist the note-split transaction (JSON `PreparedTx`). `proposal` is JSON
- * `NoteSplitProposal`; `usk` is the raw `UnifiedSpendingKey` (Orchard era) bytes.
- *
- * # Safety
- * See [`context`]; `proposal_ptr`/`usk_ptr` must be valid for reads of their lengths. Free the
- * returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_sign_note_split(const uint8_t *db_data,
-                                                        uintptr_t db_data_len,
-                                                        const uint8_t *account_uuid_bytes,
-                                                        uint32_t network_id,
-                                                        const char *expected_run_id,
-                                                        uint64_t expected_revision,
-                                                        const uint8_t *proposal_ptr,
-                                                        uintptr_t proposal_len,
-                                                        const uint8_t *usk_ptr,
-                                                        uintptr_t usk_len,
-                                                        const char *expected_policy_fingerprint);
-
-/**
- * Build the note-split transaction as an unsigned PCZT for an external signer (JSON
- * `ClaimedNoteSplitPczt`). The exact approved proposal is revalidated before proving or run
- * mutation; the original remains staged inside the engine under the signer-round token.
- *
- * # Safety
- * See [`context`]; `proposal_ptr` must be valid for reads of `proposal_len` bytes. Free the
- * returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_create_unsigned_note_split_pczt(const uint8_t *db_data,
-                                                                        uintptr_t db_data_len,
-                                                                        const uint8_t *account_uuid_bytes,
-                                                                        uint32_t network_id,
-                                                                        const char *expected_run_id,
-                                                                        uint64_t expected_revision,
-                                                                        const uint8_t *proposal_ptr,
-                                                                        uintptr_t proposal_len,
-                                                                        const char *expected_policy_fingerprint);
-
-/**
- * Accept the externally signed note-split PCZT: merge the device's signatures into the staged
- * original, verify + finalize, and persist the run (JSON `PreparedTx`). Broadcasting the
- * returned `PreparedTx` then flows through the existing extract + submit + record path.
- * `run_id` and `signer_token` must match the staged signer round; `pczt_ptr` is the raw
- * device-signed PCZT bytes.
- *
- * # Safety
- * See [`context`]; strings must be valid C strings and `pczt_ptr` valid for reads of
- * `pczt_len` bytes. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_store_signed_note_split_pczt(const uint8_t *db_data,
-                                                                     uintptr_t db_data_len,
-                                                                     const uint8_t *account_uuid_bytes,
-                                                                     uint32_t network_id,
-                                                                     const char *run_id,
-                                                                     const char *signer_token,
-                                                                     const uint8_t *pczt_ptr,
-                                                                     uintptr_t pczt_len,
-                                                                     const char *expected_policy_fingerprint);
-
-/**
- * Build one unsigned PCZT per transfer of the schedule for an external signer (JSON
- * `Vec<TransferPczt>`, each `{ id, raw_pczt }`). The proven originals are staged inside the
- * crate keyed by transfer id; the platform routes the unsigned PCZTs to the device and hands
- * the signed set back to `zcashlc_migration_store_signed_schedule_pczts`. `schedule` is JSON
- * `MigrationSchedule`.
- *
- * # Safety
- * See [`context`]; `schedule_ptr` must be valid for reads of `schedule_len` bytes. Free the
- * returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_create_unsigned_transfer_pczts(const uint8_t *db_data,
-                                                                       uintptr_t db_data_len,
-                                                                       const uint8_t *account_uuid_bytes,
-                                                                       uint32_t network_id,
-                                                                       const uint8_t *schedule_ptr,
-                                                                       uintptr_t schedule_len,
-                                                                       const char *expected_policy_fingerprint);
-
-/**
- * Accept the full set of externally signed transfer PCZTs — all-or-nothing (JSON `null` on
- * success). Every staged transfer must be matched by id; a partial, mismatched, or invalid set
- * stores nothing. `signed` is JSON `Vec<TransferPczt>` (`{ id, raw_pczt }` pairs).
- *
- * # Safety
- * See [`context`]; `signed_ptr` must be valid for reads of `signed_len` bytes. Free the
- * returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_store_signed_schedule_pczts(const uint8_t *db_data,
-                                                                    uintptr_t db_data_len,
-                                                                    const uint8_t *account_uuid_bytes,
-                                                                    uint32_t network_id,
-                                                                    const uint8_t *signed_ptr,
-                                                                    uintptr_t signed_len,
-                                                                    const char *expected_policy_fingerprint);
-
-/**
- * Generate the full migration schedule (JSON `MigrationSchedule`).
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_propose_transfers(const uint8_t *db_data,
-                                                          uintptr_t db_data_len,
-                                                          const uint8_t *account_uuid_bytes,
-                                                          uint32_t network_id);
-
-/**
- * Generate the immediate (single-transaction) migration schedule (JSON `MigrationSchedule`): one
- * transfer sweeping the whole spendable Orchard balance into Ironwood, executable now.
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_propose_immediate(const uint8_t *db_data,
-                                                          uintptr_t db_data_len,
-                                                          const uint8_t *account_uuid_bytes,
-                                                          uint32_t network_id);
-
-/**
- * Preview exact immediate-migration economics (JSON `ImmediateMigrationPreview`) without
- * creating a draft, run, reservation, signature, or transaction. The engine pins the wallet
- * reads and upstream ZIP-317 proposal probe to one SQLite snapshot.
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_preview_immediate(const uint8_t *db_data,
-                                                          uintptr_t db_data_len,
-                                                          const uint8_t *account_uuid_bytes,
-                                                          uint32_t network_id);
-
-/**
- * Propose the private, anchorless intent schedule (JSON `MigrationIntentSchedule`). No
- * transaction anchor or expiry is selected until an individual intent becomes due.
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_propose_private_intents(const uint8_t *db_data,
+struct FfiPreparedTransfer *zcashlc_migration_next_due_transfer(const uint8_t *db_data,
                                                                 uintptr_t db_data_len,
                                                                 const uint8_t *account_uuid_bytes,
                                                                 uint32_t network_id);
 
 /**
- * Propose one immediate, anchorless intent (JSON `MigrationIntentSchedule`).
+ * The next height-due scheduled transfer's full proposal (amount, anchor, timing) for an active
+ * run, or nothing when no transfer is currently due (no active run, or only the note-split prep is
+ * pending). Unlike `zcashlc_migration_next_due_transfer` (an opaque, already-signed PCZT), this
+ * exposes the same fields `zcashlc_migration_propose_transfers` originally returned, so a platform
+ * can re-arm its background window from `next_executable_after_height` without parsing the PCZT.
+ *
+ * A `NULL` return with no recorded last-error means "nothing pending" (an in-band `None`, like the
+ * `-1` sentinel of `zcashlc_migration_residual_after_migration`); a `NULL` return with a recorded
+ * last-error signals a failure (see `zcashlc_last_error_message`).
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]. Free the returned pointer with
+ * [`zcashlc_free_migration_transfer_proposal`].
  */
-struct FfiBoxedSlice *zcashlc_migration_propose_immediate_intent(const uint8_t *db_data,
-                                                                 uintptr_t db_data_len,
-                                                                 const uint8_t *account_uuid_bytes,
-                                                                 uint32_t network_id);
-
-/**
- * Atomically commit one user-approved anchorless intent schedule and SDK-validated submission
- * policy with a revision compare-and-set token (JSON `MigrationSnapshot` on success).
- * `external_signer` permanently selects the signer mode for the run.
- *
- * # Safety
- * See [`context`]; `schedule_ptr` and `policy_ptr` must be valid for reads of their respective
- * lengths. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_commit_intents(const uint8_t *db_data,
-                                                       uintptr_t db_data_len,
-                                                       const uint8_t *account_uuid_bytes,
-                                                       uint32_t network_id,
-                                                       const uint8_t *schedule_ptr,
-                                                       uintptr_t schedule_len,
-                                                       bool external_signer,
-                                                       const uint8_t *policy_ptr,
-                                                       uintptr_t policy_len);
-
-/**
- * Pre-sign and persist every transfer in the schedule (JSON `null` on success). `schedule` is JSON
- * `MigrationSchedule`; `usk` is the raw `UnifiedSpendingKey` (Orchard era) bytes.
- *
- * # Safety
- * See [`context`]; `schedule_ptr`/`usk_ptr` must be valid for reads of their lengths. Free the
- * returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_sign_and_store(const uint8_t *db_data,
-                                                       uintptr_t db_data_len,
-                                                       const uint8_t *account_uuid_bytes,
-                                                       uint32_t network_id,
-                                                       const uint8_t *schedule_ptr,
-                                                       uintptr_t schedule_len,
-                                                       const uint8_t *usk_ptr,
-                                                       uintptr_t usk_len,
-                                                       const char *expected_policy_fingerprint);
-
-/**
- * Whether a sync is required before the next transfer (JSON `bool`).
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_is_sync_required(const uint8_t *db_data,
-                                                         uintptr_t db_data_len,
-                                                         const uint8_t *account_uuid_bytes,
-                                                         uint32_t network_id);
-
-/**
- * The next height-due pre-signed transfer, or `None` (JSON `Option<PreparedTx>`).
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_next_due_transfer(const uint8_t *db_data,
-                                                          uintptr_t db_data_len,
-                                                          const uint8_t *account_uuid_bytes,
-                                                          uint32_t network_id);
-
-/**
- * Atomically claim the persisted prep transaction or a due legacy transfer (JSON
- * `Option<ClaimedTx>`). The claim token must accompany the submission result.
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_claim_next_due_transfer(const uint8_t *db_data,
-                                                                uintptr_t db_data_len,
-                                                                const uint8_t *account_uuid_bytes,
-                                                                uint32_t network_id,
-                                                                const char *expected_run_id,
-                                                                uint64_t expected_revision,
-                                                                uint64_t lease_duration_ms,
-                                                                const char *expected_policy_fingerprint);
-
-/**
- * Ingest and atomically claim the exact persisted denomination-split transaction (JSON
- * `Option<ClaimedTx>`). Both software and external-signer split flows call this after the signed
- * PCZT has been durably persisted. The claim token must accompany the submission result.
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_claim_note_split_submission(const uint8_t *db_data,
-                                                                    uintptr_t db_data_len,
-                                                                    const uint8_t *account_uuid_bytes,
-                                                                    uint32_t network_id,
-                                                                    const char *expected_run_id,
-                                                                    uint64_t expected_revision,
-                                                                    uint64_t lease_duration_ms,
-                                                                    const char *expected_policy_fingerprint);
-
-/**
- * Retrieve the exact already-staged proven-but-unsigned note-split signer envelope after
- * relaunch. This never proves or stages replacement bytes (JSON `Option<ClaimedNoteSplitPczt>`).
- *
- * # Safety
- * See [`context`]; string pointers must be valid C strings. Free the returned pointer with
- * `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_resume_note_split_external_pczt(const uint8_t *db_data,
+struct FfiTransferProposal *zcashlc_migration_pending_transfer_proposal(const uint8_t *db_data,
                                                                         uintptr_t db_data_len,
                                                                         const uint8_t *account_uuid_bytes,
-                                                                        uint32_t network_id,
-                                                                        const char *expected_run_id,
-                                                                        uint64_t expected_revision,
-                                                                        const char *expected_policy_fingerprint);
+                                                                        uint32_t network_id);
 
 /**
- * Materialize one due software-signer intent at a fresh natural anchor, durably stage and ingest
- * its exact bytes, then atomically lease it for submission (JSON `Option<ClaimedTx>`).
+ * Extract the broadcast-ready consensus transaction bytes from a serialized signed PCZT (a
+ * prepared transfer's `pczt`). Returns the raw transaction bytes as a [`ffi::BoxedSlice`].
  *
  * # Safety
- * See [`context`]; `usk_ptr` must be valid for reads of `usk_len` bytes. Free the returned pointer
- * with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_materialize_and_claim_next_due(const uint8_t *db_data,
-                                                                       uintptr_t db_data_len,
-                                                                       const uint8_t *account_uuid_bytes,
-                                                                       uint32_t network_id,
-                                                                       const char *expected_run_id,
-                                                                       uint64_t expected_revision,
-                                                                       uint64_t lease_duration_ms,
-                                                                       const uint8_t *usk_ptr,
-                                                                       uintptr_t usk_len,
-                                                                       const char *expected_policy_fingerprint);
-
-/**
- * Build and lease one due proven-but-unsigned PCZT for an external signer (JSON
- * `Option<ClaimedTransferPczt>`). It is never safe for a background worker to sign this value.
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_stage_next_due_external_pczt(const uint8_t *db_data,
-                                                                     uintptr_t db_data_len,
-                                                                     const uint8_t *account_uuid_bytes,
-                                                                     uint32_t network_id,
-                                                                     const char *expected_run_id,
-                                                                     uint64_t expected_revision,
-                                                                     uint64_t lease_duration_ms,
-                                                                     const char *expected_policy_fingerprint);
-
-/**
- * Retrieve an already-staged due external-signer envelope after relaunch, preserving its bytes
- * and signer token while atomically renewing the signing lease (JSON
- * `Option<ClaimedTransferPczt>`). This never materializes a new intent.
- *
- * # Safety
- * See [`context`]; string pointers must be valid C strings. Free the returned pointer with
- * `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_resume_due_external_pczt(const uint8_t *db_data,
-                                                                 uintptr_t db_data_len,
-                                                                 const uint8_t *account_uuid_bytes,
-                                                                 uint32_t network_id,
-                                                                 const char *expected_run_id,
-                                                                 uint64_t expected_revision,
-                                                                 uint64_t lease_duration_ms,
-                                                                 const char *expected_policy_fingerprint);
-
-/**
- * Resume a durably signed staged or expired-lease submitting intent without signer-session state
- * (JSON `Option<ClaimedTx>`). Unsigned external-signer rows are deliberately excluded.
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_resume_staged_submission(const uint8_t *db_data,
-                                                                 uintptr_t db_data_len,
-                                                                 const uint8_t *account_uuid_bytes,
-                                                                 uint32_t network_id,
-                                                                 const char *expected_run_id,
-                                                                 uint64_t expected_revision,
-                                                                 uint64_t lease_duration_ms,
-                                                                 const char *expected_policy_fingerprint);
-
-/**
- * Merge the device-signed PCZT into the engine-owned proven original, durably stage and ingest
- * the exact signed transaction, then return its submission claim (JSON `Option<ClaimedTx>`).
- *
- * # Safety
- * See [`context`]; `intent_id` and `attempt_token` must be valid C strings and `pczt_ptr` valid for
- * reads of `pczt_len` bytes. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_store_signed_due_intent(const uint8_t *db_data,
-                                                                uintptr_t db_data_len,
-                                                                const uint8_t *account_uuid_bytes,
-                                                                uint32_t network_id,
-                                                                const char *intent_id,
-                                                                const char *attempt_token,
-                                                                const uint8_t *pczt_ptr,
-                                                                uintptr_t pczt_len,
-                                                                uint64_t lease_duration_ms,
-                                                                const char *expected_policy_fingerprint);
-
-/**
- * Extract the broadcast-ready consensus transaction from a serialized signed PCZT
- * (`PreparedTx.raw_pczt`). Returns JSON `ExtractedTx { txid, raw_tx }`, with `txid` recomputed by
- * librustzcash from the exact extracted transaction bytes.
- *
- * # Safety
- * See [`context`]; `pczt_ptr` must be valid for reads of `pczt_len` bytes. Free the returned
- * pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]; `pczt_ptr` must be valid for reads of `pczt_len` bytes. Free the
+ * returned pointer with `zcashlc_free_boxed_slice`.
  */
 struct FfiBoxedSlice *zcashlc_migration_extract_broadcast_tx(const uint8_t *db_data,
                                                              uintptr_t db_data_len,
@@ -4050,148 +3948,145 @@ struct FfiBoxedSlice *zcashlc_migration_extract_broadcast_tx(const uint8_t *db_d
                                                              uintptr_t pczt_len);
 
 /**
- * Re-anchor, re-prove and re-sign the active run's scheduled transfers, returning the number
- * refreshed (JSON `u32`). `usk` is the raw `UnifiedSpendingKey` (Orchard era) bytes.
+ * Record the platform's broadcast outcome for a transfer, advancing the engine's state.
+ *
+ * `transfer_id` is the opaque id string the engine handed out. `result_tag` selects the
+ * [`TransferResult`] variant: `0` = Success (requires `txid_bytes`, 32 raw internal-order bytes),
+ * `1` = NetworkError (uses `retryable`), `2` = InvalidNote, `3` = Expired. `txid_bytes` may be
+ * null for every non-Success tag. Returns `true` on success, `false` on error (see
+ * `zcashlc_last_error_message`).
  *
  * # Safety
- * See [`context`]; `usk_ptr` must be valid for reads of `usk_len` bytes. Free the returned
- * pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]; `transfer_id` must be a valid C string and, when `result_tag == 0`,
+ * `txid_bytes` must be valid for reads of 32 bytes.
  */
-struct FfiBoxedSlice *zcashlc_migration_refresh_stale_transfers(const uint8_t *db_data,
-                                                                uintptr_t db_data_len,
-                                                                const uint8_t *account_uuid_bytes,
-                                                                uint32_t network_id,
-                                                                const uint8_t *usk_ptr,
-                                                                uintptr_t usk_len,
-                                                                const char *expected_policy_fingerprint);
+bool zcashlc_migration_record_transfer_result(const uint8_t *db_data,
+                                              uintptr_t db_data_len,
+                                              const uint8_t *account_uuid_bytes,
+                                              uint32_t network_id,
+                                              const char *transfer_id,
+                                              int32_t result_tag,
+                                              bool retryable,
+                                              const uint8_t *txid_bytes);
 
 /**
- * Record the platform's broadcast outcome (JSON `null` on success). `transfer_id` is a C string;
- * `result` is JSON `TransferResult`.
+ * Whether a sync is required before the next transfer. Returns `false` on error (see
+ * `zcashlc_last_error_message`).
  *
  * # Safety
- * See [`context`]; `transfer_id` must be a valid C string and `result_ptr` valid for `result_len`
- * bytes. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`].
  */
-struct FfiBoxedSlice *zcashlc_migration_record_transfer_result(const uint8_t *db_data,
-                                                               uintptr_t db_data_len,
-                                                               const uint8_t *account_uuid_bytes,
-                                                               uint32_t network_id,
-                                                               const char *transfer_id,
-                                                               const uint8_t *result_ptr,
-                                                               uintptr_t result_len);
+bool zcashlc_migration_is_sync_required(const uint8_t *db_data,
+                                        uintptr_t db_data_len,
+                                        const uint8_t *account_uuid_bytes,
+                                        uint32_t network_id);
 
 /**
- * Compare-and-set the platform's submission outcome for one leased transaction (JSON `null` on
- * success). A wrong or expired token is rejected without mutating state.
+ * Re-evaluate the remaining spendable Orchard balance and return a fresh schedule (which then
+ * flows through the normal confirm → sign path). `include_residual` should match the choice made
+ * when the schedule being restarted was first proposed.
  *
  * # Safety
- * See [`context`]; `transfer_id` and `attempt_token` must be valid C strings and `result_ptr`
- * valid for `result_len` bytes. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
  */
-struct FfiBoxedSlice *zcashlc_migration_record_claimed_transfer_result(const uint8_t *db_data,
-                                                                       uintptr_t db_data_len,
-                                                                       const uint8_t *account_uuid_bytes,
-                                                                       uint32_t network_id,
-                                                                       const char *transfer_id,
-                                                                       const char *attempt_token,
-                                                                       const uint8_t *result_ptr,
-                                                                       uintptr_t result_len);
+struct FfiMigrationSchedule *zcashlc_migration_restart_step(const uint8_t *db_data,
+                                                            uintptr_t db_data_len,
+                                                            const uint8_t *account_uuid_bytes,
+                                                            uint32_t network_id,
+                                                            bool include_residual);
 
 /**
- * Renew a still-live network submission lease (JSON `Option<ClaimedTx>`). The exact transaction
- * and attempt token are unchanged; a closed consensus window returns `None` after safe release.
+ * Re-propose at a fresh anchor and re-sign the active run's scheduled transfers, returning the
+ * number refreshed. Returns `-1` on error (see `zcashlc_last_error_message`). `usk` is the raw
+ * Orchard-era `UnifiedSpendingKey` bytes; `include_residual` should match the schedule's original
+ * choice.
  *
  * # Safety
- * See [`context`]; string pointers must be valid C strings. Free the returned pointer with
- * `zcashlc_free_boxed_slice`.
+ * See [`build_context`]; `usk_ptr` must be valid for reads of `usk_len` bytes.
  */
-struct FfiBoxedSlice *zcashlc_migration_renew_claimed_transfer_lease(const uint8_t *db_data,
-                                                                     uintptr_t db_data_len,
-                                                                     const uint8_t *account_uuid_bytes,
-                                                                     uint32_t network_id,
-                                                                     const char *transfer_id,
-                                                                     const char *attempt_token,
-                                                                     uint64_t lease_duration_ms,
-                                                                     const char *expected_policy_fingerprint);
+int64_t zcashlc_migration_refresh_stale_transfers(const uint8_t *db_data,
+                                                  uintptr_t db_data_len,
+                                                  const uint8_t *account_uuid_bytes,
+                                                  uint32_t network_id,
+                                                  const uint8_t *usk_ptr,
+                                                  uintptr_t usk_len,
+                                                  bool include_residual);
 
 /**
- * Release a live claim only after the SDK attests that no transport call began (JSON `null`).
+ * Build the note-split transaction as an unsigned, proven PCZT for an external signer, staging
+ * the proven original in the wallet database. Returns the raw unsigned PCZT bytes as a
+ * [`ffi::BoxedSlice`].
  *
  * # Safety
- * See [`context`]; strings must be valid C strings and `reason_ptr` valid for reads of
- * `reason_len` bytes. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
  */
-struct FfiBoxedSlice *zcashlc_migration_release_claimed_transfer_known_unsent(const uint8_t *db_data,
-                                                                              uintptr_t db_data_len,
-                                                                              const uint8_t *account_uuid_bytes,
-                                                                              uint32_t network_id,
-                                                                              const char *transfer_id,
-                                                                              const char *attempt_token,
-                                                                              const uint8_t *reason_ptr,
-                                                                              uintptr_t reason_len);
+struct FfiBoxedSlice *zcashlc_migration_create_unsigned_note_split_pczt(const uint8_t *db_data,
+                                                                        uintptr_t db_data_len,
+                                                                        const uint8_t *account_uuid_bytes,
+                                                                        uint32_t network_id);
 
 /**
- * Quarantine a local pre-transport integrity failure while retaining exact bytes (JSON `null`).
+ * Accept the externally signed note-split PCZT: combine it with the staged proven original,
+ * verify and finalize it, persist the run, and return the broadcastable prepared transfer.
  *
  * # Safety
- * See [`context`]; strings must be valid C strings and `failure_ptr` valid for reads of
- * `failure_len` bytes. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]; `signed_ptr` must be valid for reads of `signed_len` bytes. Free the
+ * returned pointer with [`zcashlc_free_migration_prepared_transfer`].
  */
-struct FfiBoxedSlice *zcashlc_migration_record_claimed_transfer_local_failure(const uint8_t *db_data,
-                                                                              uintptr_t db_data_len,
-                                                                              const uint8_t *account_uuid_bytes,
-                                                                              uint32_t network_id,
-                                                                              const char *transfer_id,
-                                                                              const char *attempt_token,
-                                                                              const uint8_t *failure_ptr,
-                                                                              uintptr_t failure_len);
+struct FfiPreparedTransfer *zcashlc_migration_store_signed_note_split_pczt(const uint8_t *db_data,
+                                                                           uintptr_t db_data_len,
+                                                                           const uint8_t *account_uuid_bytes,
+                                                                           uint32_t network_id,
+                                                                           const uint8_t *signed_ptr,
+                                                                           uintptr_t signed_len);
 
 /**
- * Whether any scheduled transfer is past its send height but not yet broadcast (JSON `bool`).
+ * Build one unsigned, proven PCZT per transfer of the schedule for an external signer, staging
+ * each. The schedule is passed as JNI-style parallel arrays (all of length `ids_len`). Returns
+ * the `(id, unsigned PCZT)` pairs to route to the signing device.
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`] and [`rebuild_schedule`]. Free the returned pointer with
+ * [`zcashlc_free_migration_unsigned_transfer_pczts`].
  */
-struct FfiBoxedSlice *zcashlc_migration_has_overdue_transfers(const uint8_t *db_data,
-                                                              uintptr_t db_data_len,
-                                                              const uint8_t *account_uuid_bytes,
-                                                              uint32_t network_id);
+struct FfiUnsignedTransferPczts *zcashlc_migration_create_unsigned_transfer_pczts(const uint8_t *db_data,
+                                                                                  uintptr_t db_data_len,
+                                                                                  const uint8_t *account_uuid_bytes,
+                                                                                  uint32_t network_id,
+                                                                                  const char *const *ids,
+                                                                                  uintptr_t ids_len,
+                                                                                  const int64_t *amounts,
+                                                                                  const int64_t *anchor_heights,
+                                                                                  const int64_t *next_executable_after_heights,
+                                                                                  const int64_t *expiry_heights,
+                                                                                  uint32_t estimated_duration_hours);
 
 /**
- * Whether the migration is in an invalid state (spendable Orchard remains but nothing covers it)
- * (JSON `bool`).
+ * Accept the full set of externally signed transfer PCZTs (all-or-nothing) and, if every staged
+ * transfer is matched exactly, persist the committed schedule. The signed set is passed as
+ * parallel `ids` / `(pczts, pczt_lens)` arrays (all of length `ids_len`). Returns `true` on
+ * success, `false` on error (see `zcashlc_last_error_message`).
  *
  * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * See [`build_context`]. `ids`, `pczts`, and `pczt_lens` must each be valid for reads of
+ * `ids_len` elements (or null when `ids_len == 0`); each `ids[i]` must be a valid C string and
+ * each `pczts[i]` valid for `pczt_lens[i]` bytes.
  */
-struct FfiBoxedSlice *zcashlc_migration_has_invalid_transfers(const uint8_t *db_data,
-                                                              uintptr_t db_data_len,
-                                                              const uint8_t *account_uuid_bytes,
-                                                              uint32_t network_id);
+bool zcashlc_migration_store_signed_schedule_pczts(const uint8_t *db_data,
+                                                   uintptr_t db_data_len,
+                                                   const uint8_t *account_uuid_bytes,
+                                                   uint32_t network_id,
+                                                   const char *const *ids,
+                                                   uintptr_t ids_len,
+                                                   const uint8_t *const *pczts,
+                                                   const uintptr_t *pczt_lens);
 
 /**
- * Re-evaluate the remaining spendable Orchard balance and return a fresh schedule (JSON
- * `MigrationSchedule`).
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ * The NU6.3 (Ironwood) activation height for the given network id (`0` = testnet, `1` =
+ * mainnet), or `-1` when NU6.3 is unset for that network. Returns `-1` on error for any other
+ * network id (see `zcashlc_last_error_message`). Regtest/custom networks are out of scope here.
  */
-struct FfiBoxedSlice *zcashlc_migration_restart_step(const uint8_t *db_data,
-                                                     uintptr_t db_data_len,
-                                                     const uint8_t *account_uuid_bytes,
-                                                     uint32_t network_id);
-
-/**
- * First-launch post-upgrade initialization (JSON `null` on success).
- *
- * # Safety
- * See [`context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
- */
-struct FfiBoxedSlice *zcashlc_migration_initialize_post_upgrade(const uint8_t *db_data,
-                                                                uintptr_t db_data_len,
-                                                                const uint8_t *account_uuid_bytes,
-                                                                uint32_t network_id);
+int64_t zcashlc_ironwood_activation_height(uint32_t network_id);
 
 /**
  * Open a voting database at the given path.
@@ -4205,7 +4100,9 @@ struct FfiBoxedSlice *zcashlc_migration_initialize_post_upgrade(const uint8_t *d
  *   ignored.
  * - Call `zcashlc_voting_db_free` to free the returned handle.
  */
-struct VotingDatabaseHandle *zcashlc_voting_db_open(const uint8_t *path, uintptr_t path_len);
+struct VotingDatabaseHandle *zcashlc_voting_db_open(const uint8_t *path,
+                                                    uintptr_t path_len,
+                                                    uint32_t network_id);
 
 /**
  * Free a `VotingDatabaseHandle`.
@@ -4237,7 +4134,13 @@ int32_t zcashlc_voting_set_wallet_id(struct VotingDatabaseHandle *db,
                                      uintptr_t wallet_id_len);
 
 /**
- * Generate a voting hotkey.
+ * Generate or reconstruct an app-owned voting hotkey.
+ *
+ * zcash_voting 1.0 uses app-owned hotkeys. Pass an empty `stored_secret` to
+ * generate a fresh random hotkey, or a previously stored 64-byte secret to
+ * deterministically reconstruct the same hotkey; any other length is an
+ * error. The caller must persist `secret_key` (the stored secret) — it is
+ * the only way to reconstruct the hotkey.
  *
  * Returns a pointer to `FfiVotingHotkey` on success, or null on error.
  * Call `zcashlc_voting_free_hotkey` to free the returned pointer.
@@ -4247,13 +4150,15 @@ int32_t zcashlc_voting_set_wallet_id(struct VotingDatabaseHandle *db,
  * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
  */
 struct FfiVotingHotkey *zcashlc_voting_generate_hotkey(struct VotingDatabaseHandle *db,
-                                                       const uint8_t *seed,
-                                                       uintptr_t seed_len);
+                                                       const uint8_t *stored_secret,
+                                                       uintptr_t stored_secret_len);
 
 /**
  * Set up note bundles for a voting round.
  *
- * `notes_json` is a JSON-encoded `Vec<NoteInfo>`.
+ * `notes_json` is a JSON-encoded `Vec<NoteInfo>`. Bundle packing follows the
+ * crate-owned policy (denomination-aware thresholds), and re-running with the
+ * same notes is idempotent.
  *
  * Returns a pointer to `FfiBundleSetupResult` on success, or null on error.
  * Call `zcashlc_voting_free_bundle_setup_result` to free the returned pointer.
@@ -4282,35 +4187,32 @@ int64_t zcashlc_voting_get_bundle_count(struct VotingDatabaseHandle *db,
                                         uintptr_t round_id_len);
 
 /**
- * Build a voting PCZT for a bundle.
+ * Build the governance PCZT for one delegation bundle.
  *
- * `notes_json` is a JSON-encoded `Vec<NoteInfo>`.
+ * zcash_voting 1.0 selects snapshot-eligible notes and shapes key material
+ * from the wallet database itself, so this takes the wallet DB path and
+ * account UUID plus the app-owned hotkey stored secret.
  *
- * Returns JSON-encoded `VotingPczt` as `*mut FfiBoxedSlice`, or null on error.
+ * Returns JSON-encoded `JsonDelegationSetup` as `*mut FfiBoxedSlice`, or null on error.
  *
  * # Safety
  *
  * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
- * - All pointer/length pairs must be valid.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
  */
 struct FfiBoxedSlice *zcashlc_voting_build_pczt(struct VotingDatabaseHandle *db,
                                                 const uint8_t *round_id,
                                                 uintptr_t round_id_len,
                                                 uint32_t bundle_index,
-                                                const uint8_t *notes_json,
-                                                uintptr_t notes_json_len,
-                                                const uint8_t *fvk_bytes,
-                                                uintptr_t fvk_bytes_len,
-                                                const uint8_t *hotkey_raw_address,
-                                                uintptr_t hotkey_raw_address_len,
-                                                uint32_t consensus_branch_id,
-                                                uint32_t coin_type,
-                                                const uint8_t *seed_fingerprint,
-                                                uintptr_t seed_fingerprint_len,
-                                                uint32_t account_index,
+                                                const uint8_t *wallet_db_data,
+                                                uintptr_t wallet_db_data_len,
+                                                const uint8_t *account_uuid,
+                                                uintptr_t account_uuid_len,
+                                                const uint8_t *hotkey_secret,
+                                                uintptr_t hotkey_secret_len,
                                                 const uint8_t *round_name,
-                                                uintptr_t round_name_len,
-                                                uint32_t address_index);
+                                                uintptr_t round_name_len);
 
 /**
  * Store a tree state for witness generation.
@@ -4358,19 +4260,16 @@ struct FfiBoxedSlice *zcashlc_voting_generate_note_witnesses(struct VotingDataba
                                                              uint32_t network_id);
 
 /**
- * Precompute and cache delegation PIR IMT proofs for the delegation ZKP.
+ * Precompute PIR-backed nullifier data for one delegation bundle.
  *
- * Returns JSON-encoded `DelegationPirPrecomputeResult` as `*mut FfiBoxedSlice`,
- * or null on error.
+ * Witnesses must already be stored (generate_note_witnesses). Returns
+ * JSON-encoded `JsonDelegationPirPrecomputeResult`, or null on error.
  *
  * # Safety
  *
  * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
- * - For every `(ptr, len)` byte argument (`round_id`, `notes_json`, `pir_server_url`):
- *   if `len > 0` then `ptr` must be non-null and valid for reads for `len` bytes; if
- *   `len == 0`, `ptr` is ignored. An empty `notes_json` is treated as the empty notes
- *   list (JSON is not parsed).
- * - `network_id` must be `0` (testnet) or `1` (mainnet), matching other `zcashlc_*` FFI.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
  */
 struct FfiBoxedSlice *zcashlc_voting_precompute_delegation_pir(struct VotingDatabaseHandle *db,
                                                                const uint8_t *round_id,
@@ -4383,56 +4282,70 @@ struct FfiBoxedSlice *zcashlc_voting_precompute_delegation_pir(struct VotingData
                                                                uint32_t network_id);
 
 /**
- * Build and prove the real delegation ZKP. Long-running.
+ * Generate and persist the delegation proof for one bundle.
  *
- * Returns JSON-encoded `DelegationProofResult` as `*mut FfiBoxedSlice`, or null on error.
+ * Witnesses and PIR precompute data must already be present. zcash_voting
+ * 1.0 shapes key material from the wallet database, so this takes the wallet
+ * DB path, account UUID, and app-owned hotkey stored secret.
+ *
+ * Returns JSON-encoded `JsonDelegationProofResult`, or null on error.
  *
  * # Safety
  *
  * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
- * - `progress_callback` must be a valid function pointer, or null to skip progress.
- *   If provided, it must remain callable until this function returns. It must be
- *   thread-safe and reentrant; callers must not assume it runs on the main thread,
- *   because progress may be reported from proving worker threads.
- * - `progress_context` is passed to `progress_callback` unchanged. If non-null,
- *   it must point to state that remains valid until this function returns. The
- *   callback must not store `progress_context` or use it after this function
- *   has returned.
- * - The callback must not call back into this voting database handle or perform
- *   work that can deadlock or reenter the active proof operation.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
+ * - `progress_callback`/`progress_context` follow the same contract as
+ *   `zcashlc_voting_build_vote_commitment`.
  */
 struct FfiBoxedSlice *zcashlc_voting_build_and_prove_delegation(struct VotingDatabaseHandle *db,
                                                                 const uint8_t *round_id,
                                                                 uintptr_t round_id_len,
                                                                 uint32_t bundle_index,
-                                                                const uint8_t *notes_json,
-                                                                uintptr_t notes_json_len,
-                                                                const uint8_t *hotkey_raw_address,
-                                                                uintptr_t hotkey_raw_address_len,
+                                                                const uint8_t *wallet_db_data,
+                                                                uintptr_t wallet_db_data_len,
+                                                                const uint8_t *account_uuid,
+                                                                uintptr_t account_uuid_len,
+                                                                const uint8_t *hotkey_secret,
+                                                                uintptr_t hotkey_secret_len,
+                                                                const uint8_t *round_name,
+                                                                uintptr_t round_name_len,
                                                                 const uint8_t *pir_server_url,
                                                                 uintptr_t pir_server_url_len,
-                                                                uint32_t network_id,
                                                                 void (*progress_callback)(double,
                                                                                           void*),
                                                                 void *progress_context);
 
 /**
- * Get the delegation submission payload using a seed-derived signing key.
+ * Assemble chain-ready delegation submission fields, signing locally.
  *
- * Returns JSON-encoded `DelegationSubmission` as `*mut FfiBoxedSlice`, or null on error.
+ * The wallet seed never enters zcash_voting: the crate returns a signing
+ * request (sighash + alpha + routing fingerprint), the SpendAuth signature is
+ * produced here from the seed, and the signed submission is assembled from
+ * stored proof state.
+ *
+ * Returns JSON-encoded `JsonDelegationSubmission`, or null on error.
  *
  * # Safety
  *
  * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
  */
 struct FfiBoxedSlice *zcashlc_voting_get_delegation_submission(struct VotingDatabaseHandle *db,
                                                                const uint8_t *round_id,
                                                                uintptr_t round_id_len,
                                                                uint32_t bundle_index,
+                                                               const uint8_t *wallet_db_data,
+                                                               uintptr_t wallet_db_data_len,
+                                                               const uint8_t *account_uuid,
+                                                               uintptr_t account_uuid_len,
+                                                               const uint8_t *hotkey_secret,
+                                                               uintptr_t hotkey_secret_len,
+                                                               const uint8_t *round_name,
+                                                               uintptr_t round_name_len,
                                                                const uint8_t *sender_seed,
-                                                               uintptr_t sender_seed_len,
-                                                               uint32_t network_id,
-                                                               uint32_t account_index);
+                                                               uintptr_t sender_seed_len);
 
 /**
  * Get the delegation submission payload using a Keystone-provided signature.
@@ -4658,6 +4571,46 @@ struct FfiBoxedSlice *zcashlc_voting_get_commitment_bundle(struct VotingDatabase
                                                            uint32_t proposal_id);
 
 /**
+ * Record the confirmed vote-commitment tree position for a committed vote.
+ *
+ * Wraps `CommittedVote::recover` + `record_vc_position`: after the cast-vote
+ * transaction confirms with a `leaf_index`, record the VC position so
+ * recovered helper-share payloads carry it. Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ */
+int32_t zcashlc_voting_record_vc_position(struct VotingDatabaseHandle *db,
+                                          const uint8_t *round_id,
+                                          uintptr_t round_id_len,
+                                          uint32_t bundle_index,
+                                          uint32_t proposal_id,
+                                          uint64_t vc_tree_position);
+
+/**
+ * Reconstruct a committed vote from crate recovery state.
+ *
+ * Returns the same enriched JSON as `zcashlc_voting_build_vote_commitment`
+ * (bundle fields + `vote_auth_sig` + `share_payloads`, with payloads carrying
+ * the currently stored VC tree position) plus `vc_tree_position`. Call after
+ * `zcashlc_voting_record_vc_position` to obtain payloads at the confirmed
+ * position. Returns null (with the error retrievable) when no committed vote
+ * exists for the key.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ */
+struct FfiBoxedSlice *zcashlc_voting_recover_committed_vote(struct VotingDatabaseHandle *db,
+                                                            const uint8_t *round_id,
+                                                            uintptr_t round_id_len,
+                                                            uint32_t bundle_index,
+                                                            uint32_t proposal_id);
+
+/**
  * Persist a Keystone-produced PCZT signature.
  *
  * # Safety
@@ -4807,6 +4760,28 @@ char *zcashlc_voting_compute_share_nullifier(const uint8_t *vote_commitment,
                                              uint32_t share_index);
 
 /**
+ * Compute the crate-scheduled helper-share submit time.
+ *
+ * Pure policy over `zcash_voting`'s `share_policy`: derives the last-moment
+ * buffer from the ceremony timing and samples uniformly inside the
+ * pre-last-moment window from the supplied entropy (callers must pass at
+ * least 8 fresh CSPRNG bytes when a delay window exists; the crate owns the
+ * sampling). Returns the Unix seconds to submit at (0 = immediately), or -1
+ * on error.
+ *
+ * # Safety
+ *
+ * - If `entropy_len > 0` then `entropy` must be non-null and valid for reads
+ *   for `entropy_len` bytes; if `entropy_len == 0`, `entropy` is ignored.
+ */
+int64_t zcashlc_voting_scheduled_share_submit_at(uint64_t now_seconds,
+                                                 uint64_t ceremony_start_seconds,
+                                                 uint64_t vote_end_seconds,
+                                                 uint8_t single_share,
+                                                 const uint8_t *entropy,
+                                                 uintptr_t entropy_len);
+
+/**
  * Record a share delegation after sending to helper servers.
  *
  * Returns 0 on success, -1 on error.
@@ -4954,37 +4929,38 @@ int32_t zcashlc_voting_warm_proving_caches(void);
 struct FfiBoxedSlice *zcashlc_voting_decompose_weight(uint64_t weight);
 
 /**
- * Generate delegation inputs from sender seed and hotkey seed.
- *
- * Returns JSON-encoded `DelegationInputs` as `*mut FfiBoxedSlice`, or null on error.
+ * Superseded: zcash_voting 1.0 derives delegation inputs from the wallet database
+ * inside the delegation lanes (`build_pczt` / `build_and_prove_delegation` /
+ * `get_delegation_submission`); seed-derived side inputs no longer exist.
+ * Always returns null with a "superseded" error (C symbol preserved).
  *
  * # Safety
  *
- * - `sender_seed` and `hotkey_seed` must be valid for their stated lengths.
+ * - The pointer arguments are not read.
  */
-struct FfiBoxedSlice *zcashlc_voting_generate_delegation_inputs(const uint8_t *sender_seed,
-                                                                uintptr_t sender_seed_len,
-                                                                const uint8_t *hotkey_seed,
-                                                                uintptr_t hotkey_seed_len,
-                                                                uint32_t network_id,
-                                                                uint32_t account_index);
+struct FfiBoxedSlice *zcashlc_voting_generate_delegation_inputs(const uint8_t *_sender_seed,
+                                                                uintptr_t _sender_seed_len,
+                                                                const uint8_t *_hotkey_seed,
+                                                                uintptr_t _hotkey_seed_len,
+                                                                uint32_t _network_id,
+                                                                uint32_t _account_index);
 
 /**
- * Generate delegation inputs using an explicit FVK instead of deriving from sender seed.
- *
- * Returns JSON-encoded `DelegationInputs` as `*mut FfiBoxedSlice`, or null on error.
+ * Superseded: zcash_voting 1.0 derives delegation inputs from the wallet database
+ * inside the delegation lanes; see `zcashlc_voting_generate_delegation_inputs`.
+ * Always returns null with a "superseded" error (C symbol preserved).
  *
  * # Safety
  *
- * - All pointer/length pairs must be valid.
+ * - The pointer arguments are not read.
  */
-struct FfiBoxedSlice *zcashlc_voting_generate_delegation_inputs_with_fvk(const uint8_t *fvk_bytes,
-                                                                         uintptr_t fvk_bytes_len,
-                                                                         const uint8_t *hotkey_seed,
-                                                                         uintptr_t hotkey_seed_len,
-                                                                         uint32_t network_id,
-                                                                         const uint8_t *seed_fingerprint,
-                                                                         uintptr_t seed_fingerprint_len);
+struct FfiBoxedSlice *zcashlc_voting_generate_delegation_inputs_with_fvk(const uint8_t *_fvk_bytes,
+                                                                         uintptr_t _fvk_bytes_len,
+                                                                         const uint8_t *_hotkey_seed,
+                                                                         uintptr_t _hotkey_seed_len,
+                                                                         uint32_t _network_id,
+                                                                         const uint8_t *_seed_fingerprint,
+                                                                         uintptr_t _seed_fingerprint_len);
 
 /**
  * Extract the ZIP-244 shielded sighash from finalized PCZT bytes.
@@ -5025,9 +5001,11 @@ struct FfiBoxedSlice *zcashlc_voting_extract_orchard_fvk_from_ufvk(const uint8_t
                                                                    uint32_t network_id);
 
 /**
- * Extract the Orchard note commitment tree root from a protobuf-encoded TreeState.
+ * Extract the Ironwood note commitment tree root from a protobuf-encoded TreeState.
  *
- * Returns the 32-byte nc_root as `*mut FfiBoxedSlice`, or null on error.
+ * Voting rounds anchor to the Ironwood pool (zcash_voting 1.0), so the `nc_root`
+ * comes from the Ironwood tree, not Orchard. Returns the 32-byte nc_root as
+ * `*mut FfiBoxedSlice`, or null on error.
  *
  * # Safety
  *

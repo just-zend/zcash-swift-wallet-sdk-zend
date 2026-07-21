@@ -859,6 +859,9 @@ public enum ZcashError: Equatable, Error {
     /// Put Ironwood subtree roots to the DB failed.
     /// ZCBPEO0023
     case compactBlockProcessorPutIronwoodSubtreeRoots(_ error: Error)
+    /// Every sampled server tip was below durable local wallet state. Retrying may select a healthy load-balanced replica.
+    /// ZCBPEO0024
+    case compactBlockProcessorServerTipBehind(_ localFloor: BlockHeight, _ highestObserved: BlockHeight, _ attempts: Int)
     /// The synchronizer is unprepared.
     /// ZSYNCO0001
     case synchronizerNotPrepared
@@ -1131,6 +1134,7 @@ public enum ZcashError: Equatable, Error {
         case .compactBlockProcessorSupportedSyncAlgorithm: return "Getting the `supportedSyncAlgorithm` failed but it's supposed to always provide some value."
         case .compactBlockProcessorPutOrchardSubtreeRoots: return "Put Orchard subtree roots to the DB failed."
         case .compactBlockProcessorPutIronwoodSubtreeRoots: return "Put Ironwood subtree roots to the DB failed."
+        case .compactBlockProcessorServerTipBehind: return "Every sampled server tip was below durable local wallet state. Retrying may select a healthy load-balanced replica."
         case .synchronizerNotPrepared: return "The synchronizer is unprepared."
         case .synchronizerSendMemoToTransparentAddress: return "Memos can't be sent to transparent addresses."
         case .synchronizerShieldFundsInsuficientTransparentFunds: return "There is not enough transparent funds to cover fee for the shielding."
@@ -1383,6 +1387,7 @@ public enum ZcashError: Equatable, Error {
         case .compactBlockProcessorSupportedSyncAlgorithm: return .compactBlockProcessorSupportedSyncAlgorithm
         case .compactBlockProcessorPutOrchardSubtreeRoots: return .compactBlockProcessorPutOrchardSubtreeRoots
         case .compactBlockProcessorPutIronwoodSubtreeRoots: return .compactBlockProcessorPutIronwoodSubtreeRoots
+        case .compactBlockProcessorServerTipBehind: return .compactBlockProcessorServerTipBehind
         case .synchronizerNotPrepared: return .synchronizerNotPrepared
         case .synchronizerSendMemoToTransparentAddress: return .synchronizerSendMemoToTransparentAddress
         case .synchronizerShieldFundsInsuficientTransparentFunds: return .synchronizerShieldFundsInsuficientTransparentFunds

@@ -1,0 +1,5163 @@
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+/**
+ * Specifies how a "spend max" request should be evaluated.
+ */
+typedef enum FfiMaxSpendMode {
+  /**
+   * `MaxSpendable` will target to spend all _currently_ spendable funds where it
+   * could be the case that the wallet has received other funds that are not
+   * confirmed and therefore not spendable yet and the caller evaluates that as
+   * an acceptable scenario.
+   */
+  MaxSpendable,
+  /**
+   * `Everything` will target to spend **all funds** and will fail if there are
+   * unspendable funds in the wallet or if the wallet is not yet synced.
+   */
+  Everything,
+} FfiMaxSpendMode;
+
+/**
+ * A type describing the mined-ness of transactions that should be returned in response to a
+ * [`TransactionDataRequest`].
+ *
+ */
+typedef enum TransactionStatusFilter {
+  /**
+   * Only mined transactions should be returned.
+   */
+  TransactionStatusFilter_Mined,
+  /**
+   * Only mempool transactions should be returned.
+   */
+  TransactionStatusFilter_Mempool,
+  /**
+   * Both mined transactions and transactions in the mempool should be returned.
+   */
+  TransactionStatusFilter_All,
+} TransactionStatusFilter;
+
+/**
+ * A type used to filter transactions to be returned in response to a [`TransactionDataRequest`],
+ * in terms of the spentness of the transaction's transparent outputs.
+ *
+ */
+typedef enum OutputStatusFilter {
+  /**
+   * Only transactions that have currently-unspent transparent outputs should be returned.
+   */
+  OutputStatusFilter_Unspent,
+  /**
+   * All transactions corresponding to the data request should be returned, irrespective of
+   * whether or not those transactions produce transparent outputs that are currently unspent.
+   */
+  OutputStatusFilter_All,
+} OutputStatusFilter;
+
+/**
+ * What level of sleep to put a Tor client into.
+ */
+typedef enum TorDormantMode {
+  /**
+   * The client functions as normal, and background tasks run periodically.
+   */
+  Normal,
+  /**
+   * Background tasks are suspended, conserving CPU usage. Attempts to use the client will
+   * wake it back up again.
+   */
+  Soft,
+} TorDormantMode;
+
+/**
+ * An exchange for which we know how to query the ZEC-USD exchange rate.
+ */
+typedef enum FfiZecUsdExchange {
+  Binance,
+  CoinEx,
+  Coinbase,
+  DigiFinex,
+  Gemini,
+  Kraken,
+  KuCoin,
+  Mexc,
+  Xt,
+} FfiZecUsdExchange;
+
+/**
+ * The type of an EIP-681 transaction request.
+ *
+ */
+typedef enum FfiEip681TransactionRequestType {
+  /**
+   * A native ETH/chain token transfer (no function call).
+   */
+  FfiEip681TransactionRequestType_Native,
+  /**
+   * An ERC-20 token transfer via `transfer(address,uint256)`.
+   */
+  FfiEip681TransactionRequestType_Erc20,
+  /**
+   * A valid EIP-681 request that is not a recognized transfer pattern.
+   */
+  FfiEip681TransactionRequestType_Unrecognised,
+} FfiEip681TransactionRequestType;
+
+/**
+ * A struct that contains a ZIP 325 Account Metadata Key.
+ */
+typedef struct FfiAccountMetadataKey FfiAccountMetadataKey;
+
+/**
+ * An opaque parsed EIP-681 transaction request.
+ *
+ * Obtain via [`zcashlc_eip681_parse_transaction_request`]. Free with
+ * [`zcashlc_free_eip681_transaction_request`].
+ */
+typedef struct FfiEip681TransactionRequest FfiEip681TransactionRequest;
+
+typedef struct LwdConn LwdConn;
+
+typedef struct TorRuntime TorRuntime;
+
+/**
+ * Opaque handle wrapping the voting database and its tree-sync state.
+ */
+typedef struct VotingDatabaseHandle VotingDatabaseHandle;
+
+/**
+ * A struct that contains a 16-byte account uuid.
+ */
+typedef struct FfiUuid {
+  uint8_t uuid_bytes[16];
+} FfiUuid;
+
+/**
+ * A struct that contains a pointer to, and length information for, a heap-allocated
+ * slice of [`Uuid`] values.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must be valid for reads for `len * mem::size_of::<Uuid>()`
+ *   many bytes, and it must be properly aligned. This means in particular:
+ *   - The entire memory range pointed to by `ptr` must be contained within a single allocated
+ *     object. Slices can never span across multiple allocated objects.
+ *   - `ptr` must be non-null and aligned even for zero-length slices.
+ *   - `ptr` must point to `len` consecutive properly initialized values of type
+ *     [`Uuid`].
+ * - The total size `len * mem::size_of::<Uuid>()` of the slice pointed to
+ *   by `ptr` must be no larger than isize::MAX. See the safety documentation of pointer::offset.
+ */
+typedef struct FfiAccounts {
+  struct FfiUuid *ptr;
+  uintptr_t len;
+} FfiAccounts;
+
+/**
+ * A struct that contains a 16-byte account uuid along with key derivation metadata for that
+ * account.
+ *
+ * A returned value containing the all-zeros seed fingerprint and/or u32::MAX for the
+ * hd_account_index indicates that no derivation metadata is available.
+ */
+typedef struct FfiAccount {
+  uint8_t uuid_bytes[16];
+  char *account_name;
+  char *key_source;
+  uint8_t seed_fingerprint[32];
+  uint32_t hd_account_index;
+  char *ufvk;
+  char *uivk;
+} FfiAccount;
+
+/**
+ * A struct that contains an account identifier along with a pointer to the binary encoding
+ * of an associated key.
+ *
+ * # Safety
+ *
+ * - `encoding` must be non-null and must point to an array of `encoding_len` bytes.
+ */
+typedef struct FFIBinaryKey {
+  uint8_t account_uuid[16];
+  uint8_t *encoding;
+  uintptr_t encoding_len;
+} FFIBinaryKey;
+
+/**
+ * A single-use transparent address, along with metadata about the address's use within the
+ * wallet's ephemeral gap limit.
+ */
+typedef struct FfiSingleUseTaddr {
+  char *address;
+  uint32_t gap_position;
+  uint32_t gap_limit;
+} FfiSingleUseTaddr;
+
+/**
+ * A struct that contains an account identifier along with a pointer to the string encoding
+ * of an associated key.
+ *
+ * # Safety
+ *
+ * - `encoding` must be non-null and must point to a null-terminated UTF-8 string.
+ */
+typedef struct FFIEncodedKey {
+  uint8_t account_uuid[16];
+  char *encoding;
+} FFIEncodedKey;
+
+/**
+ * A struct that contains a pointer to, and length information for, a heap-allocated
+ * slice of [`EncodedKey`] values.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must be valid for reads for `len * mem::size_of::<EncodedKey>()`
+ *   many bytes, and it must be properly aligned. This means in particular:
+ *   - The entire memory range pointed to by `ptr` must be contained within a single allocated
+ *     object. Slices can never span across multiple allocated objects.
+ *   - `ptr` must be non-null and aligned even for zero-length slices.
+ *   - `ptr` must point to `len` consecutive properly initialized values of type
+ *     [`EncodedKey`].
+ * - The total size `len * mem::size_of::<EncodedKey>()` of the slice pointed to
+ *   by `ptr` must be no larger than isize::MAX. See the safety documentation of pointer::offset.
+ * - See the safety documentation of [`EncodedKey`]
+ */
+typedef struct FFIEncodedKeys {
+  struct FFIEncodedKey *ptr;
+  uintptr_t len;
+} FFIEncodedKeys;
+
+/**
+ * A description of the policy that is used to determine what notes are available for spending,
+ * based upon the number of confirmations (the number of blocks in the chain since and including
+ * the block in which a note was produced.)
+ *
+ * See [`ZIP 315`] for details including the definitions of "trusted" and "untrusted" notes.
+ *
+ * # Note
+ *
+ * `trusted` and `untrusted` are both meant to be non-zero values.
+ * `0` will be treated as a request for a default value.
+ *
+ * [`ZIP 315`]: https://zips.z.cash/zip-0315
+ */
+typedef struct ConfirmationsPolicy {
+  /**
+   * The number of confirmations required before trusted notes may be spent. NonZero, set this
+   * and `untrusted` to zero to accept the default value for each.
+   */
+  uint32_t trusted;
+  /**
+   * The number of confirmations required before untrusted notes may be spent. NonZero, set this
+   * and `trusted` both to zero to accept the default value for each.
+   */
+  uint32_t untrusted;
+  /**
+   * A flag that enables selection of zero-conf transparent UTXOs for spends in shielding
+   * transactions.
+   */
+  bool allow_zero_conf_shielding;
+} ConfirmationsPolicy;
+
+/**
+ * A struct that contains a subtree root.
+ *
+ * # Safety
+ *
+ * - `root_hash_ptr` must be non-null and must be valid for reads for `root_hash_ptr_len`
+ *   bytes, and it must have an alignment of `1`.
+ * - The total size `root_hash_ptr_len` of the slice pointed to by `root_hash_ptr` must
+ *   be no larger than `isize::MAX`. See the safety documentation of `pointer::offset`.
+ */
+typedef struct FfiSubtreeRoot {
+  uint8_t *root_hash_ptr;
+  uintptr_t root_hash_ptr_len;
+  uint32_t completing_block_height;
+} FfiSubtreeRoot;
+
+/**
+ * A struct that contains a pointer to, and length information for, a heap-allocated
+ * slice of [`SubtreeRoot`] values.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must be valid for reads for `len * mem::size_of::<SubtreeRoot>()`
+ *   many bytes, and it must be properly aligned. This means in particular:
+ *   - The entire memory range pointed to by `ptr` must be contained within a single
+ *     allocated object. Slices can never span across multiple allocated objects.
+ *   - `ptr` must be non-null and aligned even for zero-length slices.
+ *   - `ptr` must point to `len` consecutive properly initialized values of type
+ *     [`SubtreeRoot`].
+ * - The total size `len * mem::size_of::<SubtreeRoot>()` of the slice pointed to
+ *   by `ptr` must be no larger than isize::MAX. See the safety documentation of
+ *   `pointer::offset`.
+ * - See the safety documentation of [`SubtreeRoot`]
+ */
+typedef struct FfiSubtreeRoots {
+  struct FfiSubtreeRoot *ptr;
+  uintptr_t len;
+} FfiSubtreeRoots;
+
+/**
+ * Balance information for a value within a single pool in an account.
+ */
+typedef struct FfiBalance {
+  /**
+   * The value in the account that may currently be spent; it is possible to compute witnesses
+   * for all the notes that comprise this value, and all of this value is confirmed to the
+   * required confirmation depth.
+   */
+  int64_t spendable_value;
+  /**
+   * The value in the account of shielded change notes that do not yet have sufficient
+   * confirmations to be spendable.
+   */
+  int64_t change_pending_confirmation;
+  /**
+   * The value in the account of all remaining received notes that either do not have sufficient
+   * confirmations to be spendable, or for which witnesses cannot yet be constructed without
+   * additional scanning.
+   */
+  int64_t value_pending_spendability;
+} FfiBalance;
+
+/**
+ * Balance information for a single account.
+ *
+ * The sum of this struct's fields is the total balance of the account.
+ */
+typedef struct FfiAccountBalance {
+  uint8_t account_uuid[16];
+  /**
+   * The value of unspent Sapling outputs belonging to the account.
+   */
+  struct FfiBalance sapling_balance;
+  /**
+   * The value of unspent Orchard outputs belonging to the account.
+   */
+  struct FfiBalance orchard_balance;
+  /**
+   * The value of unspent Ironwood (Orchard note-version V3) outputs belonging to the account.
+   */
+  struct FfiBalance ironwood_balance;
+  /**
+   * The value of all unspent transparent outputs belonging to the account,
+   * irrespective of confirmation depth.
+   *
+   * Unshielded balances are not subject to confirmation-depth constraints, because the
+   * only possible operation on a transparent balance is to shield it, it is possible
+   * to create a zero-conf transaction to perform that shielding, and the resulting
+   * shielded notes will be subject to normal confirmation rules.
+   */
+  int64_t unshielded;
+} FfiAccountBalance;
+
+/**
+ * A struct that contains details about scan progress.
+ *
+ * When `denominator` is zero, the numerator encodes a non-progress indicator:
+ * - 0: progress is unknown.
+ * - 1: an error occurred.
+ */
+typedef struct FfiScanProgress {
+  uint64_t numerator;
+  uint64_t denominator;
+} FfiScanProgress;
+
+/**
+ * A type representing the potentially-spendable value of unspent outputs in the wallet.
+ *
+ * The balances reported using this data structure may overestimate the total spendable
+ * value of the wallet, in the case that the spend of a previously received shielded note
+ * has not yet been detected by the process of scanning the chain. The balances reported
+ * using this data structure can only be certain to be unspent in the case that
+ * [`Self::is_synced`] is true, and even in this circumstance it is possible that a newly
+ * created transaction could conflict with a not-yet-mined transaction in the mempool.
+ *
+ * # Safety
+ *
+ * - `account_balances` must be non-null and must be valid for reads for
+ *   `account_balances_len * mem::size_of::<AccountBalance>()` many bytes, and it must
+ *   be properly aligned. This means in particular:
+ *   - The entire memory range pointed to by `account_balances` must be contained within
+ *     a single allocated object. Slices can never span across multiple allocated objects.
+ *   - `account_balances` must be non-null and aligned even for zero-length slices.
+ *   - `account_balances` must point to `len` consecutive properly initialized values of
+ *     type [`AccountBalance`].
+ * - The total size `account_balances_len * mem::size_of::<AccountBalance>()` of the
+ *   slice pointed to by `account_balances` must be no larger than `isize::MAX`. See the
+ *   safety documentation of `pointer::offset`.
+ * - `scan_progress` must, if non-null, point to a struct having the layout of
+ *   [`ScanProgress`].
+ * - `recovery_progress` must, if non-null, point to a struct having the layout of
+ *   [`ScanProgress`].
+ */
+typedef struct FfiWalletSummary {
+  struct FfiAccountBalance *account_balances;
+  uintptr_t account_balances_len;
+  int32_t chain_tip_height;
+  int32_t fully_scanned_height;
+  struct FfiScanProgress *scan_progress;
+  struct FfiScanProgress *recovery_progress;
+  uint64_t next_sapling_subtree_index;
+  uint64_t next_orchard_subtree_index;
+  uint64_t next_ironwood_subtree_index;
+} FfiWalletSummary;
+
+/**
+ * A struct that contains the start (inclusive) and end (exclusive) of a range of blocks
+ * to scan.
+ */
+typedef struct FfiScanRange {
+  int32_t start;
+  int32_t end;
+  uint8_t priority;
+} FfiScanRange;
+
+/**
+ * A struct that contains a pointer to, and length information for, a heap-allocated
+ * slice of [`ScanRange`] values.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must be valid for reads for `len * mem::size_of::<ScanRange>()`
+ *   many bytes, and it must be properly aligned. This means in particular:
+ *   - The entire memory range pointed to by `ptr` must be contained within a single
+ *     allocated object. Slices can never span across multiple allocated objects.
+ *   - `ptr` must be non-null and aligned even for zero-length slices.
+ *   - `ptr` must point to `len` consecutive properly initialized values of type
+ *     [`ScanRange`].
+ * - The total size `len * mem::size_of::<ScanRange>()` of the slice pointed to
+ *   by `ptr` must be no larger than isize::MAX. See the safety documentation of
+ *   `pointer::offset`.
+ */
+typedef struct FfiScanRanges {
+  struct FfiScanRange *ptr;
+  uintptr_t len;
+} FfiScanRanges;
+
+/**
+ * Metadata about modifications to the wallet state made in the course of scanning a set
+ * of blocks.
+ */
+typedef struct FfiScanSummary {
+  int32_t scanned_start;
+  int32_t scanned_end;
+  uint64_t spent_sapling_note_count;
+  uint64_t received_sapling_note_count;
+} FfiScanSummary;
+
+typedef struct FFIBlockMeta {
+  uint32_t height;
+  uint8_t *block_hash_ptr;
+  uintptr_t block_hash_ptr_len;
+  uint32_t block_time;
+  uint32_t sapling_outputs_count;
+  uint32_t orchard_actions_count;
+} FFIBlockMeta;
+
+typedef struct FFIBlocksMeta {
+  struct FFIBlockMeta *ptr;
+  uintptr_t len;
+} FFIBlocksMeta;
+
+/**
+ * A struct that optionally contains a pointer to, and length information for, a
+ * heap-allocated boxed slice.
+ *
+ * This is an FFI representation of `Option<Box<[u8]>>`.
+ *
+ * # Safety
+ *
+ * - If `ptr` is non-null, it must be valid for reads for `len` bytes, and it must have
+ *   an alignment of `1`.
+ * - The memory referenced by `ptr` must not be mutated for the lifetime of the struct
+ *   (up until [`zcashlc_free_boxed_slice`] is called with it).
+ * - The total size `len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ *   - When `ptr` is null, `len` should be zero.
+ */
+typedef struct FfiBoxedSlice {
+  uint8_t *ptr;
+  uintptr_t len;
+} FfiBoxedSlice;
+
+/**
+ * A struct that contains a pointer to, and length information for, a heap-allocated
+ * slice of `[u8; 32]` arrays.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must be valid for reads for `len * mem::size_of::<[u8; 32]>()`
+ *   many bytes, and it must be properly aligned. This means in particular:
+ *   - The entire memory range pointed to by `ptr` must be contained within a single
+ *     allocated object. Slices can never span across multiple allocated objects.
+ *   - `ptr` must be non-null and aligned even for zero-length slices.
+ *   - `ptr` must point to `len` consecutive properly initialized values of type
+ *     `[u8; 32]`.
+ * - The total size `len * mem::size_of::<[u8; 32]>()` of the slice pointed to
+ *   by `ptr` must be no larger than isize::MAX. See the safety documentation of
+ *   `pointer::offset`.
+ */
+typedef struct FfiSymmetricKeys {
+  uint8_t (*ptr)[32];
+  uintptr_t len;
+} FfiSymmetricKeys;
+
+typedef struct FfiSymmetricKeys FfiTxIds;
+
+/**
+ * Metadata about the status of a transaction obtained by inspecting the chain state.
+ */
+enum FfiTransactionStatus_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * The requested transaction ID was not recognized by the node.
+   */
+  TxidNotRecognized,
+  /**
+   * The requested transaction ID corresponds to a transaction that is recognized by the node,
+   * but is in the mempool or is otherwise not mined in the main chain (but may have been mined
+   * on a fork that was reorged away).
+   */
+  NotInMainChain,
+  /**
+   * The requested transaction ID corresponds to a transaction that has been included in the
+   * block at the provided height.
+   */
+  Mined,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiTransactionStatus_Tag FfiTransactionStatus_Tag;
+#else
+typedef uint8_t FfiTransactionStatus_Tag;
+#endif // __STDC_VERSION__ >= 202311L
+
+typedef struct FfiTransactionStatus {
+  FfiTransactionStatus_Tag tag;
+  union {
+    struct {
+      uint32_t mined;
+    };
+  };
+} FfiTransactionStatus;
+
+/**
+ * A request for transaction data enhancement, spentness check, or discovery
+ * of spends from a given transparent address within a specific block range.
+ */
+enum FfiTransactionDataRequest_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Information about the chain's view of a transaction is requested.
+   *
+   * The caller evaluating this request on behalf of the wallet backend should respond to this
+   * request by determining the status of the specified transaction with respect to the main
+   * chain; if using `lightwalletd` for access to chain data, this may be obtained by
+   * interpreting the results of the [`GetTransaction`] RPC method. It should then call
+   * [`WalletWrite::set_transaction_status`] to provide the resulting transaction status
+   * information to the wallet backend.
+   *
+   * [`GetTransaction`]: crate::proto::service::compact_tx_streamer_client::CompactTxStreamerClient::get_transaction
+   */
+  GetStatus,
+  /**
+   * Transaction enhancement (download of complete raw transaction data) is requested.
+   *
+   * The caller evaluating this request on behalf of the wallet backend should respond to this
+   * request by providing complete data for the specified transaction to
+   * [`wallet::decrypt_and_store_transaction`]; if using `lightwalletd` for access to chain
+   * state, this may be obtained via the [`GetTransaction`] RPC method. If no data is available
+   * for the specified transaction, this should be reported to the backend using
+   * [`WalletWrite::set_transaction_status`]. A [`TransactionDataRequest::Enhancement`] request
+   * subsumes any previously existing [`TransactionDataRequest::GetStatus`] request.
+   *
+   * [`GetTransaction`]: crate::proto::service::compact_tx_streamer_client::CompactTxStreamerClient::get_transaction
+   */
+  Enhancement,
+  /**
+   * Information about transactions that receive or spend funds belonging to the specified
+   * transparent address is requested.
+   *
+   * Fully transparent transactions, and transactions that do not contain either shielded inputs
+   * or shielded outputs belonging to the wallet, may not be discovered by the process of chain
+   * scanning; as a consequence, the wallet must actively query to find transactions that spend
+   * such funds. Ideally we'd be able to query by [`OutPoint`] but this is not currently
+   * functionality that is supported by the light wallet server.
+   *
+   * The caller evaluating this request on behalf of the wallet backend should respond to this
+   * request by detecting transactions involving the specified address within the provided block
+   * range; if using `lightwalletd` for access to chain data, this may be performed using the
+   * [`GetTaddressTxids`] RPC method. It should then call [`wallet::decrypt_and_store_transaction`]
+   * for each transaction so detected.
+   *
+   * [`GetTaddressTxids`]: crate::proto::service::compact_tx_streamer_client::CompactTxStreamerClient::get_taddress_txids
+   */
+  TransactionsInvolvingAddress,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiTransactionDataRequest_Tag FfiTransactionDataRequest_Tag;
+#else
+typedef uint8_t FfiTransactionDataRequest_Tag;
+#endif // __STDC_VERSION__ >= 202311L
+
+typedef struct TransactionsInvolvingAddress_Body {
+  /**
+   * The address to request transactions and/or UTXOs for.
+   */
+  char *address;
+  /**
+   * Only transactions mined at heights greater than or equal to this height should be
+   * returned.
+   */
+  uint32_t block_range_start;
+  /**
+   * Only transactions mined at heights less than this height should be returned.
+   *
+   * Either a `u32` value, or `-1` representing no end height.
+   */
+  int64_t block_range_end;
+  /**
+   * If `request_at` is non-negative, the caller evaluating this request should attempt to
+   * retrieve transaction data related to the specified address at a time that is as close
+   * as practical to the specified instant, and in a fashion that decorrelates this request
+   * to a light wallet server from other requests made by the same caller.
+   *
+   * `-1` is the only negative value, meaning "unset".
+   *
+   * This may be ignored by callers that are able to satisfy the request without exposing
+   * correlations between addresses to untrusted parties; for example, a wallet application
+   * that uses a private, trusted-for-privacy supplier of chain data can safely ignore this
+   * field.
+   */
+  int64_t request_at;
+  /**
+   * The caller should respond to this request only with transactions that conform to the
+   * specified transaction status filter.
+   */
+  enum TransactionStatusFilter tx_status_filter;
+  /**
+   * The caller should respond to this request only with transactions containing outputs
+   * that conform to the specified output status filter.
+   */
+  enum OutputStatusFilter output_status_filter;
+} TransactionsInvolvingAddress_Body;
+
+typedef struct FfiTransactionDataRequest {
+  FfiTransactionDataRequest_Tag tag;
+  union {
+    struct {
+      uint8_t get_status[32];
+    };
+    struct {
+      uint8_t enhancement[32];
+    };
+    TransactionsInvolvingAddress_Body transactions_involving_address;
+  };
+} FfiTransactionDataRequest;
+
+/**
+ * A struct that contains a pointer to, and length information for, a heap-allocated
+ * slice of [`TransactionDataRequest`] values.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must be valid for reads for `len * mem::size_of::<TransactionDataRequest>()`
+ *   many bytes, and it must be properly aligned. This means in particular:
+ *   - The entire memory range pointed to by `ptr` must be contained within a single allocated
+ *     object. Slices can never span across multiple allocated objects.
+ *   - `ptr` must be non-null and aligned even for zero-length slices.
+ *   - `ptr` must point to `len` consecutive properly initialized values of type
+ *     [`TransactionDataRequest`].
+ * - The total size `len * mem::size_of::<TransactionDataRequest>()` of the slice pointed to
+ *   by `ptr` must be no larger than isize::MAX. See the safety documentation of pointer::offset.
+ * - See the safety documentation of [`TransactionDataRequest`]
+ */
+typedef struct FfiTransactionDataRequests {
+  struct FfiTransactionDataRequest *ptr;
+  uintptr_t len;
+} FfiTransactionDataRequests;
+
+/**
+ * An HTTP header from a response.
+ *
+ * Memory is managed by Rust.
+ */
+typedef struct FfiHttpResponseHeader {
+  /**
+   * The header name as a C string.
+   */
+  char *name;
+  /**
+   * The header value as a C string.
+   */
+  char *value;
+} FfiHttpResponseHeader;
+
+/**
+ * A struct that contains an HTTP response.
+ */
+typedef struct FfiHttpResponseBytes {
+  /**
+   * The response's status.
+   */
+  uint16_t status;
+  /**
+   * The response's version.
+   */
+  char *version;
+  /**
+   * A pointer to a list of the response's headers.
+   */
+  struct FfiHttpResponseHeader *headers_ptr;
+  /**
+   * The length of the data in `headers_ptr`.
+   */
+  uintptr_t headers_len;
+  /**
+   * A pointer to the HTTP body bytes.
+   */
+  uint8_t *body_ptr;
+  /**
+   * The length of the data in `body_ptr`.
+   */
+  uintptr_t body_len;
+} FfiHttpResponseBytes;
+
+/**
+ * An HTTP header for a request.
+ *
+ * Memory is managed by Swift.
+ */
+typedef struct FfiHttpRequestHeader {
+  /**
+   * The header name as a C string.
+   */
+  const char *name;
+  /**
+   * The header value as a C string.
+   */
+  const char *value;
+} FfiHttpRequestHeader;
+
+/**
+ * A decimal suitable for converting into an `NSDecimalNumber`.
+ */
+typedef struct Decimal {
+  uint64_t mantissa;
+  int16_t exponent;
+  bool is_sign_negative;
+} Decimal;
+
+/**
+ * The result of checking for UTXOs received by an ephemeral address.
+ *
+ */
+enum FfiAddressCheckResult_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * No UTXOs were found as a result of the check.
+   */
+  FfiAddressCheckResult_NotFound,
+  /**
+   * UTXOs were found for the given address.
+   */
+  FfiAddressCheckResult_Found,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiAddressCheckResult_Tag FfiAddressCheckResult_Tag;
+#else
+typedef uint8_t FfiAddressCheckResult_Tag;
+#endif // __STDC_VERSION__ >= 202311L
+
+typedef struct FfiAddressCheckResult_Found_Body {
+  char *address;
+} FfiAddressCheckResult_Found_Body;
+
+typedef struct FfiAddressCheckResult {
+  FfiAddressCheckResult_Tag tag;
+  union {
+    FfiAddressCheckResult_Found_Body found;
+  };
+} FfiAddressCheckResult;
+
+/**
+ * A struct that contains a Zcash unified address, along with the diversifier index used to
+ * generate that address.
+ */
+typedef struct FfiAddress {
+  char *address;
+  uint8_t diversifier_index_bytes[11];
+} FfiAddress;
+
+/**
+ * A native ETH/chain token transfer extracted from a parsed EIP-681 request.
+ *
+ * All string fields are heap-allocated and must be freed by calling
+ * [`zcashlc_free_eip681_native_request`].
+ *
+ * # Safety
+ *
+ * - `schema_prefix` and `recipient_address` are non-null, null-terminated UTF-8 strings.
+ * - `value_hex`, `gas_limit_hex`, and `gas_price_hex` are either null (indicating the value
+ *   was not present in the URI) or non-null, null-terminated UTF-8 strings containing a
+ *   `0x`-prefixed hex-encoded `U256` value.
+ */
+typedef struct FfiEip681NativeRequest {
+  /**
+   * The URI schema prefix (e.g. "ethereum").
+   */
+  char *schema_prefix;
+  /**
+   * Whether the URI uses the "pay-" prefix after the schema (e.g. "ethereum:pay-").
+   */
+  bool has_pay;
+  /**
+   * Whether a chain ID was specified in the URI.
+   */
+  bool has_chain_id;
+  /**
+   * The chain ID, if `has_chain_id` is true. Undefined otherwise.
+   */
+  uint64_t chain_id;
+  /**
+   * The recipient address (ERC-55 checksummed hex or ENS name).
+   */
+  char *recipient_address;
+  /**
+   * The transfer value as a `0x`-prefixed hex string, or null if not specified.
+   */
+  char *value_hex;
+  /**
+   * The gas limit as a `0x`-prefixed hex string, or null if not specified.
+   */
+  char *gas_limit_hex;
+  /**
+   * The gas price as a `0x`-prefixed hex string, or null if not specified.
+   */
+  char *gas_price_hex;
+} FfiEip681NativeRequest;
+
+/**
+ * An ERC-20 token transfer extracted from a parsed EIP-681 request.
+ *
+ * All string fields are heap-allocated and must be freed by calling
+ * [`zcashlc_free_eip681_erc20_request`].
+ *
+ * # Safety
+ *
+ * - `schema_prefix`, `token_contract_address`, `recipient_address`, and `value_hex` are
+ *   non-null, null-terminated UTF-8 strings.
+ * - `value_hex` contains a `0x`-prefixed hex-encoded `U256` value.
+ */
+typedef struct FfiEip681Erc20Request {
+  /**
+   * The URI schema prefix (e.g. "ethereum").
+   */
+  char *schema_prefix;
+  /**
+   * Whether the URI uses the "pay-" prefix after the schema (e.g. "ethereum:pay-").
+   */
+  bool has_pay;
+  /**
+   * Whether a chain ID was specified in the URI.
+   */
+  bool has_chain_id;
+  /**
+   * The chain ID, if `has_chain_id` is true. Undefined otherwise.
+   */
+  uint64_t chain_id;
+  /**
+   * The ERC-20 token contract address (ERC-55 checksummed hex or ENS name).
+   */
+  char *token_contract_address;
+  /**
+   * The transfer recipient address (ERC-55 checksummed hex or ENS name).
+   */
+  char *recipient_address;
+  /**
+   * The transfer value in atomic units as a `0x`-prefixed hex string.
+   */
+  char *value_hex;
+} FfiEip681Erc20Request;
+
+/**
+ * Live migration progress. When returned standalone (`zcashlc_migration_progress`), `is_present`
+ * is `false` for the crate's `None` (no migration in progress); as the payload of
+ * [`FfiMigrationState::InProgress`] it is always `true`.
+ */
+typedef struct FfiMigrationProgress {
+  /**
+   * Whether the remaining fields carry a real progress snapshot.
+   */
+  bool is_present;
+  /**
+   * The number of scheduled transfers confirmed on-chain so far.
+   */
+  uint32_t completed_transfers;
+  /**
+   * The total number of transfers in the current schedule.
+   */
+  uint32_t total_transfers;
+  /**
+   * The Orchard-pool value (zatoshi) not yet migrated to Ironwood.
+   */
+  int64_t remaining_orchard_value;
+  /**
+   * The height at which the next transfer becomes broadcastable, or `-1` if none is scheduled.
+   */
+  int64_t next_transfer_ready_at_height;
+} FfiMigrationProgress;
+
+/**
+ * Why a migration requires user attention (payload of [`FfiMigrationState::RequiresAttention`]).
+ */
+enum FfiAttentionReason_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * The input note funding `transfer_id` was spent externally before its transfer broadcast.
+   * `transfer_id` is an owned C string, freed by [`zcashlc_free_migration_state`].
+   */
+  InvalidTransfer,
+  /**
+   * A transaction's anchor/expiry elapsed before it could be broadcast.
+   */
+  TransferExpired,
+  /**
+   * A transfer produced Orchard change that must be synced before the next spend.
+   */
+  SyncRequiredBeforeNext,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiAttentionReason_Tag FfiAttentionReason_Tag;
+#else
+typedef uint8_t FfiAttentionReason_Tag;
+#endif // __STDC_VERSION__ >= 202311L
+
+typedef struct InvalidTransfer_Body {
+  char *transfer_id;
+} InvalidTransfer_Body;
+
+typedef struct FfiAttentionReason {
+  FfiAttentionReason_Tag tag;
+  union {
+    InvalidTransfer_Body invalid_transfer;
+  };
+} FfiAttentionReason;
+
+/**
+ * The top-level migration state machine surfaced to the app (see
+ * [`zcash_pool_migration::MigrationState`]).
+ *
+ * `#[allow(dead_code)]`: the data-carrying variants' payloads are read by the C consumer across
+ * the FFI (cbindgen emits them into the header), which rustc cannot observe — the
+ * `InProgress` progress snapshot in particular is never matched back out in Rust.
+ */
+enum FfiMigrationState_Tag
+#if __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * No migration has been initiated (or a run was abandoned).
+   */
+  NotStarted,
+  /**
+   * The note-split transaction has been submitted and awaits confirmation.
+   */
+  SplitPendingConfirmation,
+  /**
+   * The split is confirmed (or was not needed); ready to propose transfers.
+   */
+  ReadyToPropose,
+  /**
+   * The schedule has been committed and transfers are executing.
+   */
+  InProgress,
+  /**
+   * A transfer cannot proceed automatically; the app must act.
+   */
+  RequiresAttention,
+  /**
+   * All transfers are confirmed; the Orchard balance is fully migrated.
+   */
+  Complete,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum FfiMigrationState_Tag FfiMigrationState_Tag;
+#else
+typedef uint8_t FfiMigrationState_Tag;
+#endif // __STDC_VERSION__ >= 202311L
+
+typedef struct FfiMigrationState {
+  FfiMigrationState_Tag tag;
+  union {
+    struct {
+      struct FfiMigrationProgress in_progress;
+    };
+    struct {
+      struct FfiAttentionReason requires_attention;
+    };
+  };
+} FfiMigrationState;
+
+/**
+ * A planned note split: the per-note output values (zatoshi) and the split-transaction fee.
+ */
+typedef struct FfiNoteSplitProposal {
+  /**
+   * Heap array of `output_values_len` output-note values (zatoshi).
+   */
+  int64_t *output_values;
+  uintptr_t output_values_len;
+  /**
+   * The fee (zatoshi) paid by the note-split transaction itself.
+   */
+  int64_t fee;
+} FfiNoteSplitProposal;
+
+/**
+ * A fully proven, signed transaction persisted as a PCZT, ready for the platform to broadcast.
+ * When returned by `zcashlc_migration_next_due_transfer`, an all-null/zeroed value (`id` and
+ * `pczt` null) means "nothing is due" (as opposed to a NULL return, which signals an error).
+ */
+typedef struct FfiPreparedTransfer {
+  /**
+   * The transfer's opaque id, as an owned C string (null only in the "nothing due" sentinel).
+   */
+  char *id;
+  /**
+   * The finalized transaction's id, as raw (internal-order) 32-byte value.
+   */
+  uint8_t txid[32];
+  /**
+   * Heap `pczt_len`-byte serialized signed PCZT (null only in the "nothing due" sentinel).
+   */
+  uint8_t *pczt;
+  uintptr_t pczt_len;
+} FfiPreparedTransfer;
+
+/**
+ * A single scheduled Orchard→Ironwood transfer (element of [`FfiMigrationSchedule`]).
+ */
+typedef struct FfiTransferProposal {
+  /**
+   * The transfer's opaque id, as an owned C string.
+   */
+  char *id;
+  /**
+   * The value (zatoshi) that crosses the turnstile.
+   */
+  int64_t amount;
+  /**
+   * The anchor height the PCZT is built against.
+   */
+  int64_t anchor_height;
+  /**
+   * The height after which the platform may broadcast this transfer.
+   */
+  int64_t next_executable_after_height;
+  /**
+   * The height after which this transfer is no longer valid.
+   */
+  int64_t expiry_height;
+} FfiTransferProposal;
+
+/**
+ * A full migration schedule presented to the user for one-time confirmation.
+ */
+typedef struct FfiMigrationSchedule {
+  /**
+   * Heap array of `transfers_len` scheduled transfers, in execution order.
+   */
+  struct FfiTransferProposal *transfers;
+  uintptr_t transfers_len;
+  /**
+   * A rough estimate of how long the schedule takes to fully execute, in hours.
+   */
+  uint32_t estimated_duration_hours;
+} FfiMigrationSchedule;
+
+/**
+ * An unsigned-but-proven PCZT awaiting an external signer (element of
+ * [`FfiUnsignedTransferPczts`]).
+ */
+typedef struct FfiUnsignedTransferPczt {
+  /**
+   * The transfer's opaque id, as an owned C string.
+   */
+  char *id;
+  /**
+   * Heap `pczt_len`-byte serialized proven-but-unsigned PCZT.
+   */
+  uint8_t *pczt;
+  uintptr_t pczt_len;
+} FfiUnsignedTransferPczt;
+
+/**
+ * The set of unsigned transfer PCZTs to route to an external signer, one per scheduled transfer.
+ */
+typedef struct FfiUnsignedTransferPczts {
+  struct FfiUnsignedTransferPczt *ptr;
+  uintptr_t len;
+} FfiUnsignedTransferPczts;
+
+/**
+ * Voting hotkey returned by `zcashlc_voting_generate_hotkey`.
+ */
+typedef struct FfiVotingHotkey {
+  uint8_t *secret_key;
+  uintptr_t secret_key_len;
+  uint8_t *public_key;
+  uintptr_t public_key_len;
+  char *address;
+} FfiVotingHotkey;
+
+/**
+ * Bundle setup result returned by `zcashlc_voting_setup_bundles`.
+ */
+typedef struct FfiBundleSetupResult {
+  uint32_t bundle_count;
+  uint64_t eligible_weight;
+} FfiBundleSetupResult;
+
+/**
+ * Round state returned by `zcashlc_voting_get_round_state`.
+ */
+typedef struct FfiRoundState {
+  char *round_id;
+  /**
+   * 0=Initialized, 1=HotkeyGenerated, 2=DelegationConstructed,
+   * 3=DelegationProved, 4=VoteReady
+   */
+  uint32_t phase;
+  uint64_t snapshot_height;
+  /**
+   * Nullable: null if no hotkey has been generated yet.
+   */
+  char *hotkey_address;
+  /**
+   * -1 if None, otherwise the delegated weight value.
+   */
+  int64_t delegated_weight;
+  bool proof_generated;
+} FfiRoundState;
+
+/**
+ * Round summary for list display.
+ */
+typedef struct FfiRoundSummary {
+  char *round_id;
+  uint32_t phase;
+  uint64_t snapshot_height;
+  uint64_t created_at;
+} FfiRoundSummary;
+
+/**
+ * Array of round summaries.
+ */
+typedef struct FfiRoundSummaries {
+  struct FfiRoundSummary *ptr;
+  uintptr_t len;
+} FfiRoundSummaries;
+
+/**
+ * Vote record for a single proposal/bundle.
+ */
+typedef struct FfiVoteRecord {
+  uint32_t proposal_id;
+  uint32_t bundle_index;
+  uint32_t choice;
+  bool submitted;
+} FfiVoteRecord;
+
+/**
+ * Array of vote records.
+ */
+typedef struct FfiVoteRecords {
+  struct FfiVoteRecord *ptr;
+  uintptr_t len;
+} FfiVoteRecords;
+
+/**
+ * Initializes global Rust state, such as the logging infrastructure and threadpools.
+ *
+ * `log_level` defines how the Rust layer logs its events. These values are supported,
+ * each level logging more information in addition to the earlier levels:
+ * - `off`: The logs are completely disabled.
+ * - `error`: Logs very serious errors.
+ * - `warn`: Logs hazardous situations.
+ * - `info`: Logs useful information.
+ * - `debug`: Logs lower priority information.
+ * - `trace`: Logs very low priority, often extremely verbose, information.
+ *
+ * # Safety
+ *
+ * - The memory pointed to by `log_level` must contain a valid nul terminator at the end
+ *   of the string.
+ * - `log_level` must be valid for reads of bytes up to and including the nul terminator.
+ *   This means in particular:
+ *   - The entire memory range of this `CStr` must be contained within a single allocated
+ *     object!
+ * - The memory referenced by the returned `CStr` must not be mutated for the duration of
+ *   the function call.
+ * - The nul terminator must be within `isize::MAX` from `log_level`.
+ *
+ * # Panics
+ *
+ * This method panics if called more than once.
+ */
+void zcashlc_init_on_load(const char *log_level);
+
+/**
+ * Returns the length of the last error message to be logged.
+ */
+int32_t zcashlc_last_error_length(void);
+
+/**
+ * Copies the last error message into the provided allocated buffer.
+ *
+ * # Safety
+ *
+ * - `buf` must be non-null and valid for reads for `length` bytes, and it must have an alignment
+ *   of `1`.
+ * - The memory referenced by `buf` must not be mutated for the duration of the function call.
+ * - The total size `length` must be no larger than `isize::MAX`. See the safety documentation of
+ *   pointer::offset.
+ */
+int32_t zcashlc_error_message_utf8(char *buf, int32_t length);
+
+/**
+ * Clears the record of the last error message.
+ */
+void zcashlc_clear_last_error(void);
+
+/**
+ * Sets up the internal structure of the data database.  The value for `seed` may be provided as a
+ * null pointer if the caller wishes to attempt migrations without providing the wallet's seed
+ * value.
+ *
+ * Returns:
+ * - 0 if successful.
+ * - 1 if the seed must be provided in order to execute the requested migrations
+ * - 2 if the provided seed is not relevant to any of the derived accounts in the wallet.
+ * - -1 on error.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `seed` must be non-null and valid for reads for `seed_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `seed` must not be mutated for the duration of the function call.
+ * - The total size `seed_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of pointer::offset.
+ */
+int32_t zcashlc_init_data_database(const uint8_t *db_data,
+                                   uintptr_t db_data_len,
+                                   const uint8_t *seed,
+                                   uintptr_t seed_len,
+                                   uint32_t network_id);
+
+/**
+ * Returns a list of the accounts in the wallet.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_accounts`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+struct FfiAccounts *zcashlc_list_accounts(const uint8_t *db_data,
+                                          uintptr_t db_data_len,
+                                          uint32_t network_id);
+
+/**
+ * Returns the account data for the specified account identifier, or the [`ffi::Account::NOT_FOUND`]
+ * sentinel value if the account id does not correspond to an account in the wallet.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - Call [`zcashlc_free_account`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+struct FfiAccount *zcashlc_get_account(const uint8_t *db_data,
+                                       uintptr_t db_data_len,
+                                       uint32_t network_id,
+                                       const uint8_t *account_uuid_bytes);
+
+/**
+ * Adds the next available account-level spend authority, given the current set of [ZIP 316]
+ * account identifiers known, to the wallet database.
+ *
+ * Returns the newly created [ZIP 316] account identifier, along with the binary encoding of the
+ * [`UnifiedSpendingKey`] for the newly created account.  The caller should manage the memory of
+ * (and store) the returned spending keys in a secure fashion.
+ *
+ * If `seed` was imported from a backup and this method is being used to restore a
+ * previous wallet state, you should use this method to add all of the desired
+ * accounts before scanning the chain from the seed's birthday height.
+ *
+ * By convention, wallets should only allow a new account to be generated after funds
+ * have been received by the currently available account (in order to enable
+ * automated account recovery).
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `seed` must be non-null and valid for reads for `seed_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `seed` must not be mutated for the duration of the function call.
+ * - The total size `seed_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of pointer::offset.
+ * - `treestate` must be non-null and valid for reads for `treestate_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `treestate` must not be mutated for the duration of the function call.
+ * - The total size `treestate_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_binary_key`] to free the memory associated with the returned pointer when
+ *   you are finished using it.
+ *
+ * [ZIP 316]: https://zips.z.cash/zip-0316
+ */
+struct FFIBinaryKey *zcashlc_create_account(const uint8_t *db_data,
+                                            uintptr_t db_data_len,
+                                            const uint8_t *seed,
+                                            uintptr_t seed_len,
+                                            const uint8_t *treestate,
+                                            uintptr_t treestate_len,
+                                            int64_t recover_until,
+                                            uint32_t network_id,
+                                            const char *account_name,
+                                            const char *key_source);
+
+/**
+ * Adds a new account to the wallet by importing the UFVK that will be used to detect incoming
+ * payments.
+ *
+ * Derivation metadata may optionally be included. To indicate that no derivation metadata is
+ * available, the `seed_fingerprint` argument should be set to the null pointer and
+ * `hd_account_index` should be set to the value `u32::MAX`. Derivation metadata will not be
+ * stored unless both the seed fingerprint and the HD account index are provided.
+ *
+ * Returns the globally unique identifier for the account.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `ufvk` must be non-null and must point to a null-terminated UTF-8 string.
+ * - `treestate` must be non-null and valid for reads for `treestate_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `treestate` must not be mutated for the duration of the function call.
+ * - The total size `treestate_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `seed_fingerprint` must either be either null or valid for reads for 32 bytes, and it must
+ *   have an alignment of `1`.
+ *
+ * - Call [`zcashlc_free_ffi_uuid`] to free the memory associated with the returned pointer when
+ *   you are finished using it.
+ */
+struct FfiUuid *zcashlc_import_account_ufvk(const uint8_t *db_data,
+                                            uintptr_t db_data_len,
+                                            const char *ufvk,
+                                            const uint8_t *treestate,
+                                            uintptr_t treestate_len,
+                                            int64_t recover_until,
+                                            uint32_t network_id,
+                                            uint32_t purpose,
+                                            const char *account_name,
+                                            const char *key_source,
+                                            const uint8_t *seed_fingerprint,
+                                            uint32_t hd_account_index_raw);
+
+/**
+ * Checks whether the given seed is relevant to any of the accounts in the wallet.
+ *
+ * Returns:
+ * - `1` for `Ok(true)`.
+ * - `0` for `Ok(false)`.
+ * - `-1` for `Err(_)`.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `seed` must be non-null and valid for reads for `seed_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `seed` must not be mutated for the duration of the function call.
+ * - The total size `seed_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of pointer::offset.
+ */
+int8_t zcashlc_is_seed_relevant_to_any_derived_account(const uint8_t *db_data,
+                                                       uintptr_t db_data_len,
+                                                       const uint8_t *seed,
+                                                       uintptr_t seed_len,
+                                                       uint32_t network_id);
+
+/**
+ * Deletes the specified account, and all transactions that exclusively involve it, from the
+ * wallet database.
+ *
+ * WARNING: This is a destructive operation and may result in the permanent loss of
+ * potentially important information that is not recoverable from chain data, including:
+ * * Data about transactions sent by the account for which [`OvkPolicy::Discard`] (or
+ *   [`OvkPolicy::Custom`] with random OVKs) was used;
+ * * Data related to transactions that the account attempted to send that expired or were
+ *   otherwise invalidated without having been mined in the main chain;
+ * * Data related to transactions that were observed in the mempool as having inputs or
+ *   outputs that involved the account, but that were never mined in the main chain;
+ * * Data related to transactions that were received by the wallet in a mined block, where
+ *   that block was later un-mined in a chain reorg and the transaction was either invalidated
+ *   or was never re-mined.
+ *
+ * Returns `true` on success, or `false` if an error is raised.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `seed` must be non-null and valid for reads for `seed_len` bytes, and it must have an
+ *   alignment of `1`.
+ *
+ * [`OvkPolicy::Discard`]: zcash_client_backend::wallet::OvkPolicy::Discard
+ * [`OvkPolicy::Custom`]: zcash_client_backend::wallet::OvkPolicy::Custom
+ */
+bool zcashlc_delete_account(const uint8_t *db_data,
+                            uintptr_t db_data_len,
+                            uint32_t network_id,
+                            const uint8_t *account_uuid_bytes);
+
+/**
+ * Returns the most-recently-generated unified payment address for the specified account.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+char *zcashlc_get_current_address(const uint8_t *db_data,
+                                  uintptr_t db_data_len,
+                                  const uint8_t *account_uuid_bytes,
+                                  uint32_t network_id);
+
+/**
+ * Generates and returns an ephemeral address for one-time use, such as when receiving a swap from
+ * a decentralized exchange.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - Call [`zcashlc_free_single_use_address`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+struct FfiSingleUseTaddr *zcashlc_get_single_use_taddr(const uint8_t *db_data,
+                                                       uintptr_t db_data_len,
+                                                       uint32_t network_id,
+                                                       const uint8_t *account_uuid_bytes);
+
+/**
+ * Returns a newly-generated unified payment address for the specified account, with the next
+ * available diversifier and the specified set of receivers.
+ *
+ * The set of receivers to include in the generated address is specified by a byte which may have
+ * any of the following bits set:
+ * * P2PKH = 0b00000001
+ * * SAPLING = 0b00000100
+ * * ORCHARD = 0b00001000
+ *
+ * For each bit set, a corresponding receiver will be required to be generated. If no
+ * corresponding viewing key exists in the wallet for a required receiver, this will return an
+ * error. At present, p2pkh-only unified addresses are not supported.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+char *zcashlc_get_next_available_address(const uint8_t *db_data,
+                                         uintptr_t db_data_len,
+                                         const uint8_t *account_uuid_bytes,
+                                         uint32_t network_id,
+                                         uint32_t receiver_flags);
+
+/**
+ * Returns a list of the transparent addresses that have been allocated for the provided account,
+ * including potentially-unrevealed public-scope and private-scope (change) addresses within the
+ * gap limit, which is currently set to 10 for public-scope addresses and 5 for change addresses.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - Call [`zcashlc_free_keys`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+struct FFIEncodedKeys *zcashlc_list_transparent_receivers(const uint8_t *db_data,
+                                                          uintptr_t db_data_len,
+                                                          const uint8_t *account_uuid_bytes,
+                                                          uint32_t network_id);
+
+/**
+ * Returns the verified transparent balance for `address`, which ignores utxos that have been
+ * received too recently and are not yet deemed spendable according to `confirmations_policy`.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `address` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `address` must not be mutated for the duration of the function call.
+ */
+int64_t zcashlc_get_verified_transparent_balance(const uint8_t *db_data,
+                                                 uintptr_t db_data_len,
+                                                 const char *address,
+                                                 uint32_t network_id,
+                                                 struct ConfirmationsPolicy confirmations_policy);
+
+/**
+ * Returns the verified transparent balance for `account`, which ignores utxos that have been
+ * received too recently and are not yet deemed spendable according to `confirmations_policy`.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ */
+int64_t zcashlc_get_verified_transparent_balance_for_account(const uint8_t *db_data,
+                                                             uintptr_t db_data_len,
+                                                             uint32_t network_id,
+                                                             const uint8_t *account_uuid_bytes,
+                                                             struct ConfirmationsPolicy confirmations_policy);
+
+/**
+ * Returns the balance for `address`, including all UTXOs that we know about.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `address` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `address` must not be mutated for the duration of the function call.
+ */
+int64_t zcashlc_get_total_transparent_balance(const uint8_t *db_data,
+                                              uintptr_t db_data_len,
+                                              const char *address,
+                                              uint32_t network_id);
+
+/**
+ * Returns the balance for `account`, including all UTXOs that we know about.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ */
+int64_t zcashlc_get_total_transparent_balance_for_account(const uint8_t *db_data,
+                                                          uintptr_t db_data_len,
+                                                          uint32_t network_id,
+                                                          const uint8_t *account_uuid_bytes);
+
+/**
+ * Returns the memo for a note by copying the corresponding bytes to the received
+ * pointer in `memo_bytes_ret`.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `txid_bytes` must be non-null and valid for reads for 32 bytes, and it must have an alignment
+ *   of `1`.
+ * - `memo_bytes_ret` must be non-null and must point to an allocated 512-byte region of memory.
+ */
+bool zcashlc_get_memo(const uint8_t *db_data,
+                      uintptr_t db_data_len,
+                      const uint8_t *txid_bytes,
+                      uint32_t output_pool,
+                      uint16_t output_index,
+                      uint8_t *memo_bytes_ret,
+                      uint32_t network_id);
+
+/**
+ * Returns a ZIP-32 signature of the given seed bytes.
+ *
+ * # Safety
+ * - `seed` must be non-null and valid for reads for `seed_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `seed` must not be mutated for the duration of the function call.
+ * - The total size `seed_len` must be at least 32 no larger than `252`. See the safety documentation
+ *   of pointer::offset.
+ */
+bool zcashlc_seed_fingerprint(const uint8_t *seed,
+                              uintptr_t seed_len,
+                              uint8_t *signature_bytes_ret);
+
+/**
+ * Rewinds the data database to at most the given height.
+ *
+ * If the requested height is greater than or equal to the height of the last scanned block, this
+ * function sets the `safe_rewind_ret` output parameter to `-1` and does nothing else.
+ *
+ * This procedure returns the height to which the database was actually rewound, or `-1` if no
+ * rewind was performed.
+ *
+ * If the requested rewind could not be performed, but a rewind to a different (greater) height
+ * would be valid, the `safe_rewind_ret` output parameter will be set to that value on completion;
+ * otherwise, it will be set to `-1`.
+ *
+ * # Safety
+ *
+ * - `safe_rewind_ret` must be non-null, aligned, and valid for writing an `int64_t`.
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+int64_t zcashlc_rewind_to_height(const uint8_t *db_data,
+                                 uintptr_t db_data_len,
+                                 uint32_t height,
+                                 uint32_t network_id,
+                                 int64_t *safe_rewind_ret);
+
+/**
+ * Truncates the data database to the specified chain state.
+ *
+ * In contrast to [`zcashlc_rewind_to_height`], this function allows the caller to truncate the
+ * wallet database to a precise height by providing additional chain state information needed for
+ * note commitment tree maintenance after the truncation.
+ *
+ * The `chain_state` parameter is a protobuf-encoded `TreeState` value representing the chain
+ * state at the height to which the database should be truncated.
+ *
+ * Returns `true` if the truncation succeeded, or `false` if an error occurred. When `false` is
+ * returned, the caller should check for errors.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `chain_state` must be non-null and valid for reads for `chain_state_len` bytes, and it must
+ *   have an alignment of `1`. Its contents must be a protobuf-encoded `TreeState` value.
+ * - The memory referenced by `chain_state` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `chain_state_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+bool zcashlc_truncate_to_chain_state(const uint8_t *db_data,
+                                     uintptr_t db_data_len,
+                                     const uint8_t *chain_state,
+                                     uintptr_t chain_state_len,
+                                     uint32_t network_id);
+
+/**
+ * Adds a sequence of Sapling subtree roots to the data store.
+ *
+ * Returns true if the subtrees could be stored, false otherwise. When false is returned,
+ * caller should check for errors.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `roots` must be non-null and initialized.
+ * - The memory referenced by `roots` must not be mutated for the duration of the function call.
+ */
+bool zcashlc_put_sapling_subtree_roots(const uint8_t *db_data,
+                                       uintptr_t db_data_len,
+                                       uint64_t start_index,
+                                       const struct FfiSubtreeRoots *roots,
+                                       uint32_t network_id);
+
+/**
+ * Adds a sequence of Orchard subtree roots to the data store.
+ *
+ * Returns true if the subtrees could be stored, false otherwise. When false is returned,
+ * caller should check for errors.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `roots` must be non-null and initialized.
+ * - The memory referenced by `roots` must not be mutated for the duration of the function call.
+ */
+bool zcashlc_put_orchard_subtree_roots(const uint8_t *db_data,
+                                       uintptr_t db_data_len,
+                                       uint64_t start_index,
+                                       const struct FfiSubtreeRoots *roots,
+                                       uint32_t network_id);
+
+/**
+ * Adds a sequence of Ironwood subtree roots to the data store.
+ *
+ * Ironwood is Orchard note-version V3 and shares Orchard's commitment-tree machinery, so the roots
+ * are Orchard-shaped; they are tracked in a dedicated Ironwood commitment tree.
+ *
+ * Returns true if the subtrees could be stored, false otherwise. When false is returned,
+ * caller should check for errors.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `roots` must be non-null and initialized.
+ * - The memory referenced by `roots` must not be mutated for the duration of the function call.
+ */
+bool zcashlc_put_ironwood_subtree_roots(const uint8_t *db_data,
+                                        uintptr_t db_data_len,
+                                        uint64_t start_index,
+                                        const struct FfiSubtreeRoots *roots,
+                                        uint32_t network_id);
+
+/**
+ * Updates the wallet's view of the blockchain.
+ *
+ * This method is used to provide the wallet with information about the state of the blockchain,
+ * and detect any previously scanned data that needs to be re-validated before proceeding with
+ * scanning. It should be called at wallet startup prior to calling `zcashlc_suggest_scan_ranges`
+ * in order to provide the wallet with the information it needs to correctly prioritize scanning
+ * operations.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ */
+bool zcashlc_update_chain_tip(const uint8_t *db_data,
+                              uintptr_t db_data_len,
+                              int32_t height,
+                              uint32_t network_id);
+
+/**
+ * Returns the height to which the wallet has been fully scanned.
+ *
+ * This is the height for which the wallet has fully trial-decrypted this and all
+ * preceding blocks above the wallet's birthday height.
+ *
+ * Returns a non-negative block height, -1 if empty, or -2 if an error occurred.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ */
+int64_t zcashlc_fully_scanned_height(const uint8_t *db_data,
+                                     uintptr_t db_data_len,
+                                     uint32_t network_id);
+
+/**
+ * Returns the maximum height that the wallet has scanned.
+ *
+ * If the wallet is fully synced, this will be equivalent to `zcashlc_block_fully_scanned`;
+ * otherwise the maximal scanned height is likely to be greater than the fully scanned
+ * height due to the fact that out-of-order scanning can leave gaps.
+ *
+ * Returns a non-negative block height, -1 if empty, or -2 if an error occurred.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ */
+int64_t zcashlc_max_scanned_height(const uint8_t *db_data,
+                                   uintptr_t db_data_len,
+                                   uint32_t network_id);
+
+/**
+ * Returns the account balances and sync status given the specified minimum number of
+ * confirmations.
+ *
+ * Returns `fully_scanned_height = -1` if the wallet has no balance data available.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must
+ *   have an alignment of `1`. Its contents must be a string representing a valid system
+ *   path in the operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_wallet_summary`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiWalletSummary *zcashlc_get_wallet_summary(const uint8_t *db_data,
+                                                    uintptr_t db_data_len,
+                                                    uint32_t network_id,
+                                                    struct ConfirmationsPolicy confirmations_policy);
+
+/**
+ * Returns a list of suggested scan ranges based upon the current wallet state.
+ *
+ * This method should only be used in cases where the `CompactBlock` data that will be
+ * made available to `zcashlc_scan_blocks` for the requested block ranges includes note
+ * commitment tree size information for each block; or else the scan is likely to fail if
+ * notes belonging to the wallet are detected.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must
+ *   have an alignment of `1`. Its contents must be a string representing a valid system
+ *   path in the operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_scan_ranges`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiScanRanges *zcashlc_suggest_scan_ranges(const uint8_t *db_data,
+                                                  uintptr_t db_data_len,
+                                                  uint32_t network_id);
+
+/**
+ * Scans new blocks added to the cache for any transactions received by the tracked
+ * accounts, while checking that they form a valid chan.
+ *
+ * This function is built on the core assumption that the information provided in the
+ * block cache is more likely to be accurate than the previously-scanned information.
+ * This follows from the design (and trust) assumption that the `lightwalletd` server
+ * provides accurate block information as of the time it was requested.
+ *
+ * This function **assumes** that the caller is handling rollbacks.
+ *
+ * For brand-new light client databases, this function starts scanning from the Sapling
+ * activation height. This height can be fast-forwarded to a more recent block by calling
+ * [`zcashlc_init_blocks_table`] before this function.
+ *
+ * Scanned blocks are required to be height-sequential. If a block is missing from the
+ * cache, an error will be signalled.
+ *
+ * # Safety
+ *
+ * - `fs_block_db_root` must be non-null and valid for reads for `fs_block_db_root_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `fs_block_db_root` must not be mutated for the duration of the function call.
+ * - The total size `fs_block_db_root_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+struct FfiScanSummary *zcashlc_scan_blocks(const uint8_t *fs_block_cache_root,
+                                           uintptr_t fs_block_cache_root_len,
+                                           const uint8_t *db_data,
+                                           uintptr_t db_data_len,
+                                           int32_t from_height,
+                                           const uint8_t *from_state,
+                                           uintptr_t from_state_len,
+                                           uint32_t scan_limit,
+                                           uint32_t network_id);
+
+/**
+ * Inserts a UTXO into the wallet database.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `txid_bytes` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `txid_bytes_len` must not be mutated for the duration of the function call.
+ * - The total size `txid_bytes_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `script_bytes` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `script_bytes_len` must not be mutated for the duration of the function call.
+ * - The total size `script_bytes_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+bool zcashlc_put_utxo(const uint8_t *db_data,
+                      uintptr_t db_data_len,
+                      const uint8_t *txid_bytes,
+                      uintptr_t txid_bytes_len,
+                      int32_t index,
+                      const uint8_t *script_bytes,
+                      uintptr_t script_bytes_len,
+                      int64_t value,
+                      int32_t height,
+                      uint32_t network_id);
+
+/**
+ * # Safety
+ * Initializes the `FsBlockDb` sqlite database. Does nothing if already created
+ *
+ * Returns true when successful, false otherwise. When false is returned caller
+ * should check for errors.
+ * - `fs_block_db_root` must be non-null and valid for reads for `fs_block_db_root_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `fs_block_db_root` must not be mutated for the duration of the function call.
+ * - The total size `fs_block_db_root_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+bool zcashlc_init_block_metadata_db(const uint8_t *fs_block_db_root,
+                                    uintptr_t fs_block_db_root_len);
+
+/**
+ * Writes the blocks provided in `blocks_meta` into the `BlockMeta` database
+ *
+ * Returns true if the `blocks_meta` could be stored into the `FsBlockDb`. False
+ * otherwise.
+ *
+ * When false is returned caller should check for errors.
+ *
+ * # Safety
+ *
+ * - `fs_block_db_root` must be non-null and valid for reads for `fs_block_db_root_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `fs_block_db_root` must not be mutated for the duration of the function call.
+ * - The total size `fs_block_db_root_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Block metadata represented in `blocks_meta` must be non-null. Caller must guarantee that the
+ *   memory reference by this pointer is not freed up, dereferenced or invalidated while this
+ *   function is invoked.
+ */
+bool zcashlc_write_block_metadata(const uint8_t *fs_block_db_root,
+                                  uintptr_t fs_block_db_root_len,
+                                  struct FFIBlocksMeta *blocks_meta);
+
+/**
+ * Rewinds the data database to the given height.
+ *
+ * If the requested height is greater than or equal to the height of the last scanned
+ * block, this function does nothing.
+ *
+ * # Safety
+ *
+ * - `fs_block_db_root` must be non-null and valid for reads for `fs_block_db_root_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `fs_block_db_root` must not be mutated for the duration of the function call.
+ * - The total size `fs_block_db_root_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+bool zcashlc_rewind_fs_block_cache_to_height(const uint8_t *fs_block_db_root,
+                                             uintptr_t fs_block_db_root_len,
+                                             int32_t height);
+
+/**
+ * Get the latest cached block height in the filesystem block cache
+ *
+ * Returns a non-negative block height, -1 if empty, or -2 if an error occurred.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `tx` must be non-null and valid for reads for `tx_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `tx` must not be mutated for the duration of the function call.
+ * - The total size `tx_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+int32_t zcashlc_latest_cached_block_height(const uint8_t *fs_block_db_root,
+                                           uintptr_t fs_block_db_root_len);
+
+/**
+ * Decrypts whatever parts of the specified transaction it can and stores them in db_data.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `tx` must be non-null and valid for reads for `tx_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `tx` must not be mutated for the duration of the function call.
+ * - The total size `tx_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `txid_ret` must be non-null and valid for writes of 32 bytes with an alignment of 1.
+ *   On successful execution this will contain the txid of the decrypted transaction.
+ */
+int32_t zcashlc_decrypt_and_store_transaction(const uint8_t *db_data,
+                                              uintptr_t db_data_len,
+                                              const uint8_t *tx,
+                                              uintptr_t tx_len,
+                                              int64_t mined_height,
+                                              uint32_t network_id,
+                                              uint8_t *txid_ret);
+
+/**
+ * Select transaction inputs, compute fees, and construct a proposal for a transaction
+ * that can then be authorized and made ready for submission to the network with
+ * `zcashlc_create_proposed_transaction`.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an alignment
+ *   of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - `to` must be non-null and must point to a null-terminated UTF-8 string.
+ * - `memo` must either be null (indicating an empty memo or a transparent recipient) or point to a
+ *   512-byte array.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_propose_transfer(const uint8_t *db_data,
+                                               uintptr_t db_data_len,
+                                               const uint8_t *account_uuid_bytes,
+                                               const char *to,
+                                               int64_t value,
+                                               const uint8_t *memo,
+                                               uint32_t network_id,
+                                               struct ConfirmationsPolicy confirmations_policy);
+
+/**
+ * Selects all spendable transaction inputs, computes fees, and constructs a proposal for a transaction
+ * that can then be authorized and made ready for submission to the network with
+ * `zcashlc_create_proposed_transaction`.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an alignment
+ *   of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - `to` must be non-null and must point to a null-terminated UTF-8 string.
+ * - `memo` must either be null (indicating an empty memo or a transparent recipient) or point to a
+ *   512-byte array.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_propose_send_max_transfer(const uint8_t *db_data,
+                                                        uintptr_t db_data_len,
+                                                        uint32_t network_id,
+                                                        const uint8_t *account_uuid_bytes,
+                                                        const char *to,
+                                                        const uint8_t *memo,
+                                                        enum FfiMaxSpendMode mode,
+                                                        struct ConfirmationsPolicy confirmations_policy);
+
+/**
+ * Select transaction inputs, compute fees, and construct a proposal for a transaction
+ * from a ZIP-321 payment URI that can then be authorized and made ready for submission to the
+ * network with `zcashlc_create_proposed_transaction`.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an alignment
+ *   of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - `payment_uri` must be non-null and must point to a null-terminated UTF-8 string.
+ * - `network_id` a u32. 0 for Testnet and 1 for Mainnet
+ * - `confirmations_policy` number of trusted/untrusted confirmations of the funds to spend
+ * - `use_zip317_fees` `true` to use ZIP-317 fees.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_propose_transfer_from_uri(const uint8_t *db_data,
+                                                        uintptr_t db_data_len,
+                                                        const uint8_t *account_uuid_bytes,
+                                                        const char *payment_uri,
+                                                        uint32_t network_id,
+                                                        struct ConfirmationsPolicy confirmations_policy);
+
+int32_t zcashlc_branch_id_for_height(int32_t height, uint32_t network_id);
+
+/**
+ * Frees strings returned by other zcashlc functions.
+ *
+ * # Safety
+ *
+ * - `s` should be a non-null pointer returned as a string by another zcashlc function.
+ */
+void zcashlc_string_free(char *s);
+
+/**
+ * Select transaction inputs, compute fees, and construct a proposal for a shielding
+ * transaction that can then be authorized and made ready for submission to the network
+ * with `zcashlc_create_proposed_transaction`. If there are no receivers (as selected
+ * by `transparent_receiver`) for which at least `shielding_threshold` of value is
+ * available to shield, fail with an error.
+ *
+ * # Parameters
+ *
+ * - db_data: A string represented as a sequence of UTF-8 bytes.
+ * - db_data_len: The length of `db_data`, in bytes.
+ * - account_uuid_bytes: a 16-byte array representing the UUID for an account
+ * - memo: `null` to represent "no memo", or a pointer to an array containing exactly 512 bytes.
+ * - shielding_threshold: the minimum value to be shielded for each receiver.
+ * - transparent_receiver: `null` to represent "all receivers with shieldable funds", or a single
+ *   transparent address for which to shield funds. WARNING: Note that calling this with `null`
+ *   will leak the fact that all the addresses from which funds are drawn in the shielding
+ *   transaction belong to the same wallet *ON CHAIN*. This immutably reveals the shared ownership
+ *   of these addresses to all blockchain observers. If a caller wishes to avoid such linkability,
+ *   they should not pass `null` for this parameter; however, note that temporal correlations can
+ *   also heuristically be used to link addresses on-chain if funds from multiple addresses are
+ *   individually shielded in transactions that may be temporally clustered. Keeping transparent
+ *   activity private is very difficult; caveat emptor.
+ * - network_id: The identifier for the network in use: 0 for testnet, 1 for mainnet.
+ * - confirmations_policy: The minimum number of confirmations that are required for a UTXO to be considered
+ *   for shielding.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an alignment
+ *   of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - `shielding_threshold` a non-negative shielding threshold amount in zatoshi
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_propose_shielding(const uint8_t *db_data,
+                                                uintptr_t db_data_len,
+                                                const uint8_t *account_uuid_bytes,
+                                                const uint8_t *memo,
+                                                uint64_t shielding_threshold,
+                                                const char *transparent_receiver,
+                                                uint32_t network_id,
+                                                struct ConfirmationsPolicy confirmations_policy);
+
+/**
+ * Creates a transaction from the given proposal.
+ *
+ * Returns the row index of the newly-created transaction in the `transactions` table
+ * within the data database. The caller can read the raw transaction bytes from the `raw`
+ * column in order to broadcast the transaction to the network.
+ *
+ * Do not call this multiple times in parallel, or you will generate transactions that
+ * double-spend the same notes.
+ *
+ * # Parameters
+ * - `spend_params`: A pointer to a buffer containing the operating system path of the Sapling
+ *   spend proving parameters, in the operating system's preferred path representation.
+ * - `spend_params_len`: the length of the `spend_params` buffer.
+ * - `output_params`: A pointer to a buffer containing the operating system path of the Sapling
+ *   output proving parameters, in the operating system's preferred path representation.
+ * - `output_params_len`: the length of the `output_params` buffer.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must
+ *   have an alignment of `1`. Its contents must be a string representing a valid system
+ *   path in the operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `proposal_ptr` must be non-null and valid for reads for `proposal_len` bytes, and it
+ *   must have an alignment of `1`. Its contents must be an encoded Proposal protobuf.
+ * - The memory referenced by `proposal_ptr` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `proposal_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `usk_ptr` must be non-null and must point to an array of `usk_len` bytes containing
+ *   a unified spending key encoded as returned from the `zcashlc_create_account` or
+ *   `zcashlc_derive_spending_key` functions.
+ * - The memory referenced by `usk_ptr` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `usk_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `spend_params` must be non-null and valid for reads for `spend_params_len` bytes,
+ *   and it must have an alignment of `1`.
+ * - The memory referenced by `spend_params` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `spend_params_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `output_params` must be non-null and valid for reads for `output_params_len` bytes,
+ *   and it must have an alignment of `1`.
+ * - The memory referenced by `output_params` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `output_params_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+FfiTxIds *zcashlc_create_proposed_transactions(const uint8_t *db_data,
+                                               uintptr_t db_data_len,
+                                               const uint8_t *proposal_ptr,
+                                               uintptr_t proposal_len,
+                                               const uint8_t *usk_ptr,
+                                               uintptr_t usk_len,
+                                               const uint8_t *spend_params,
+                                               uintptr_t spend_params_len,
+                                               const uint8_t *output_params,
+                                               uintptr_t output_params_len,
+                                               uint32_t network_id);
+
+/**
+ * Creates a partially-constructed (unsigned without proofs) transaction from the given proposal.
+ *
+ * Returns the partially constructed transaction in the `postcard` format generated by the `pczt`
+ * crate.
+ *
+ * Do not call this multiple times in parallel, or you will generate pczt instances that, if
+ * finalized, would double-spend the same notes.
+ *
+ * # Parameters
+ * - `db_data`: A pointer to a buffer containing the operating system path of the wallet database,
+ *   in the operating system's preferred path representation.
+ * - `db_data_len`: The length of the `db_data` buffer.
+ * - `proposal_ptr`: A pointer to a buffer containing an encoded `Proposal` protobuf.
+ * - `proposal_len`: The length of the `proposal_ptr` buffer.
+ * - `account_uuid_bytes`: A pointer to the 16-byte representaion of the account UUID.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `proposal_ptr` must be non-null and valid for reads for `proposal_len` bytes, and it
+ *   must have an alignment of `1`.
+ * - The memory referenced by `proposal_ptr` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `proposal_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+ *   function call.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_create_pczt_from_proposal(const uint8_t *db_data,
+                                                        uintptr_t db_data_len,
+                                                        uint32_t network_id,
+                                                        const uint8_t *proposal_ptr,
+                                                        uintptr_t proposal_len,
+                                                        const uint8_t *account_uuid_bytes);
+
+/**
+ * Redacts information from the given PCZT that is unnecessary for the Signer role.
+ *
+ * Returns the updated PCZT in its serialized format.
+ *
+ * # Parameters
+ * - `pczt_ptr`: A pointer to a byte array containing the encoded partially-constructed
+ *   transaction to be redacted.
+ * - `pczt_len`: The length of the `pczt_ptr` buffer.
+ *
+ * # Safety
+ *
+ * - `pczt_ptr` must be non-null and valid for reads for `pczt_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `pczt_ptr` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `pczt_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of `pointer::offset`.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_redact_pczt_for_signer(const uint8_t *pczt_ptr, uintptr_t pczt_len);
+
+/**
+ * Returns `true` if this PCZT requires Sapling proofs (and thus the caller needs to have
+ * downloaded them). If the PCZT is invalid, `false` will be returned.
+ *
+ * # Parameters
+ * - `pczt_ptr`: A pointer to a byte array containing the encoded partially-constructed
+ *   transaction to be redacted.
+ * - `pczt_len`: The length of the `pczt_ptr` buffer.
+ *
+ * # Safety
+ *
+ * - `pczt_ptr` must be non-null and valid for reads for `pczt_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `pczt_ptr` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `pczt_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of `pointer::offset`.
+ */
+bool zcashlc_pczt_requires_sapling_proofs(const uint8_t *pczt_ptr, uintptr_t pczt_len);
+
+/**
+ * Adds proofs to the given PCZT.
+ *
+ * Returns the updated PCZT in its serialized format.
+ *
+ * # Parameters
+ * - `pczt_ptr`: A pointer to a byte array containing the encoded partially-constructed
+ *   transaction for which proofs will be computed.
+ * - `pczt_len`: The length of the `pczt_ptr` buffer.
+ * - `spend_params`: A pointer to a buffer containing the operating system path of the Sapling
+ *   spend proving parameters, in the operating system's preferred path representation.
+ * - `spend_params_len`: the length of the `spend_params` buffer.
+ * - `output_params`: A pointer to a buffer containing the operating system path of the Sapling
+ *   output proving parameters, in the operating system's preferred path representation.
+ * - `output_params_len`: the length of the `output_params` buffer.
+ *
+ * # Safety
+ *
+ * - `pczt_ptr` must be non-null and valid for reads for `pczt_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `pczt_ptr` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `pczt_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of `pointer::offset`.
+ * - `spend_params` must be non-null and valid for reads for `spend_params_len` bytes, and it must
+ *   have an alignment of `1`.
+ * - The memory referenced by `spend_params` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `spend_params_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `output_params` must be non-null and valid for reads for `output_params_len` bytes, and it
+ *   must have an alignment of `1`.
+ * - The memory referenced by `output_params` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `output_params_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_add_proofs_to_pczt(const uint8_t *pczt_ptr,
+                                                 uintptr_t pczt_len,
+                                                 const uint8_t *spend_params,
+                                                 uintptr_t spend_params_len,
+                                                 const uint8_t *output_params,
+                                                 uintptr_t output_params_len);
+
+/**
+ * Takes a PCZT that has been separately proven and signed, finalizes it, and stores it
+ * in the wallet.
+ *
+ * Returns the txid of the completed transaction as a byte array.
+ *
+ * # Parameters
+ * - `db_data`: A pointer to a buffer containing the operating system path of the wallet database,
+ *   in the operating system's preferred path representation.
+ * - `db_data_len`: The length of the `db_data` buffer.
+ * - `pczt_with_proofs`: A pointer to a byte array containing the encoded partially-constructed
+ *   transaction to which proofs have been added.
+ * - `pczt_with_proofs_len`: The length of the `pczt_with_proofs` buffer.
+ * - `pczt_with_sigs_ptr`: A pointer to a byte array containing the encoded partially-constructed
+ *   transaction to which signatures have been added.
+ * - `pczt_with_sigs_len`: The length of the `pczt_with_sigs` buffer.
+ * - `spend_params`: A pointer to a buffer containing the operating system path of the Sapling
+ *   spend proving parameters, in the operating system's preferred path representation.
+ * - `spend_params_len`: the length of the `spend_params` buffer.
+ * - `output_params`: A pointer to a buffer containing the operating system path of the Sapling
+ *   output proving parameters, in the operating system's preferred path representation.
+ * - `output_params_len`: the length of the `output_params` buffer.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `pczt_with_proofs_ptr` must be non-null and valid for reads for `pczt_with_proofs_len` bytes,
+ *   and it must have an alignment of `1`.
+ * - The memory referenced by `pczt_with_proofs_ptr` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `pczt_with_proofs_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `pczt_with_sigs_ptr` must be non-null and valid for reads for `pczt_with_sigs_len` bytes, and
+ *   it must have an alignment of `1`.
+ * - The memory referenced by `pczt_with_sigs_ptr` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `pczt_with_sigs_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `spend_params` must either be null, or it must be valid for reads for `spend_params_len` bytes
+ *   and have an alignment of `1`.
+ * - The memory referenced by `spend_params` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `spend_params_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `output_params` must either be null, or it must be valid for reads for `output_params_len`
+ *   bytes and have an alignment of `1`.
+ * - The memory referenced by `output_params` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `output_params_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_extract_and_store_from_pczt(const uint8_t *db_data,
+                                                          uintptr_t db_data_len,
+                                                          uint32_t network_id,
+                                                          const uint8_t *pczt_with_proofs_ptr,
+                                                          uintptr_t pczt_with_proofs_len,
+                                                          const uint8_t *pczt_with_sigs_ptr,
+                                                          uintptr_t pczt_with_sigs_len,
+                                                          const uint8_t *spend_params,
+                                                          uintptr_t spend_params_len,
+                                                          const uint8_t *output_params,
+                                                          uintptr_t output_params_len);
+
+/**
+ * Sets the transaction status to the provided value.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must
+ *   have an alignment of `1`. Its contents must be a string representing a valid system
+ *   path in the operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - `txid_bytes` must be non-null and valid for reads for `db_data_len` bytes, and it must have
+ *   an alignment of `1`.
+ * - The memory referenced by `txid_bytes_len` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `txid_bytes_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+void zcashlc_set_transaction_status(const uint8_t *db_data,
+                                    uintptr_t db_data_len,
+                                    uint32_t network_id,
+                                    const uint8_t *txid_bytes,
+                                    uintptr_t txid_bytes_len,
+                                    struct FfiTransactionStatus status);
+
+/**
+ * Returns a list of transaction data requests that the network client should satisfy.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_transaction_data_requests`] to free the memory associated with the
+ *   returned pointer when done using it.
+ */
+struct FfiTransactionDataRequests *zcashlc_transaction_data_requests(const uint8_t *db_data,
+                                                                     uintptr_t db_data_len,
+                                                                     uint32_t network_id);
+
+/**
+ * Detects notes with corrupt witnesses, and adds the block ranges corresponding to the corrupt
+ * ranges to the scan queue so that the ordinary scanning process will re-scan these ranges to fix
+ * the corruption in question.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+void zcashlc_fix_witnesses(const uint8_t *db_data, uintptr_t db_data_len, uint32_t network_id);
+
+/**
+ * Creates a Tor runtime.
+ *
+ * # Safety
+ *
+ * - `tor_dir` must be non-null and valid for reads for `tor_dir_len` bytes, and it must
+ *   have an alignment of `1`. Its contents must be a string representing a valid system
+ *   path in the operating system's preferred representation.
+ * - The memory referenced by `tor_dir` must not be mutated for the duration of the
+ *   function call.
+ * - The total size `tor_dir_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_tor_runtime`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct TorRuntime *zcashlc_create_tor_runtime(const uint8_t *tor_dir, uintptr_t tor_dir_len);
+
+/**
+ * Frees a Tor runtime.
+ *
+ * # Safety
+ *
+ * - If `ptr` is non-null, it must be a pointer returned by a `zcashlc_*` method with
+ *   return type `*mut TorRuntime` that has not previously been freed.
+ */
+void zcashlc_free_tor_runtime(struct TorRuntime *ptr);
+
+/**
+ * Returns a new isolated `TorRuntime` handle.
+ *
+ * The two `TorRuntime`s will share internal state and configuration, but their streams
+ * will never share circuits with one another.
+ *
+ * Use this method when you want separate parts of your program to each have a
+ * `TorRuntime` handle, but where you don't want their activities to be linkable to one
+ * another over the Tor network.
+ *
+ * Calling this method is usually preferable to creating a completely separate
+ * `TorRuntime` instance, since it can share its internals with the existing `TorRuntime`.
+ *
+ * # Safety
+ *
+ * - `tor_runtime` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut TorRuntime` that has not previously been freed.
+ * - `tor_runtime` must not be passed to two FFI calls at the same time.
+ * - Call [`zcashlc_free_tor_runtime`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct TorRuntime *zcashlc_tor_isolated_client(struct TorRuntime *tor_runtime);
+
+/**
+ * Changes the client's current dormant mode, putting background tasks to sleep or waking
+ * them up as appropriate.
+ *
+ * This can be used to conserve CPU usage if you aren’t planning on using the client for
+ * a while, especially on mobile platforms.
+ *
+ * See the [`ffi::TorDormantMode`] documentation for more details.
+ *
+ * # Safety
+ *
+ * - `tor_runtime` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut TorRuntime` that has not previously been freed.
+ * - `tor_runtime` must not be passed to two FFI calls at the same time.
+ */
+bool zcashlc_tor_set_dormant(struct TorRuntime *tor_runtime, enum TorDormantMode mode);
+
+/**
+ * Makes an HTTP GET request over Tor.
+ *
+ * `retry_limit` is the maximum number of times that a failed request should be retried.
+ * You can disable retries by setting this to 0.
+ *
+ * # Safety
+ *
+ * - `tor_runtime` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut TorRuntime` that has not previously been freed.
+ * - `tor_runtime` must not be passed to two FFI calls at the same time.
+ * - `url` must be non-null and must point to a null-terminated UTF-8 string.
+ * - `headers` must be non-null and valid for reads for
+ *   `headers_len * size_of::<ffi::HttpRequestHeader>()` bytes, and it must be properly
+ *   aligned. This means in particular:
+ *   - The entire memory range of this slice must be contained within a single allocated
+ *     object! Slices can never span across multiple allocated objects.
+ *   - `headers` must be non-null and aligned even for zero-length slices.
+ * - `headers` must point to `headers_len` consecutive properly initialized values of
+ *   type `ffi::HttpRequestHeader`.
+ * - The memory referenced by `headers` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `headers_len * size_of::<ffi::HttpRequestHeader>()` of the slice must
+ *   be no larger than `isize::MAX`, and adding that size to `headers` must not "wrap
+ *   around" the address space.  See the safety documentation of pointer::offset.
+ * - Call [`zcashlc_free_http_response_bytes`] to free the memory associated with the
+ *   returned pointer when done using it.
+ */
+struct FfiHttpResponseBytes *zcashlc_tor_http_get(struct TorRuntime *tor_runtime,
+                                                  const char *url,
+                                                  const struct FfiHttpRequestHeader *headers,
+                                                  uintptr_t headers_len,
+                                                  uint8_t retry_limit);
+
+/**
+ * Makes an HTTP POST request over Tor.
+ *
+ * `retry_limit` is the maximum number of times that a failed request should be retried.
+ * You can disable retries by setting this to 0.
+ *
+ * # Safety
+ *
+ * - `tor_runtime` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut TorRuntime` that has not previously been freed.
+ * - `tor_runtime` must not be passed to two FFI calls at the same time.
+ * - `url` must be non-null and must point to a null-terminated UTF-8 string.
+ * - `headers` must be non-null and valid for reads for
+ *   `headers_len * size_of::<ffi::HttpRequestHeader>()` bytes, and it must be properly
+ *   aligned. This means in particular:
+ *   - The entire memory range of this slice must be contained within a single allocated
+ *     object! Slices can never span across multiple allocated objects.
+ *   - `headers` must be non-null and aligned even for zero-length slices.
+ * - `headers` must point to `headers_len` consecutive properly initialized values of
+ *   type `ffi::HttpRequestHeader`.
+ * - The memory referenced by `headers` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `headers_len * size_of::<ffi::HttpRequestHeader>()` of the slice must
+ *   be no larger than `isize::MAX`, and adding that size to `headers` must not "wrap
+ *   around" the address space.  See the safety documentation of pointer::offset.
+ * - `body` must be non-null and valid for reads for `body_len` bytes, and it must have
+ *   an alignment of `1`.
+ * - The memory referenced by `body` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `body_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_http_response_bytes`] to free the memory associated with the
+ *   returned pointer when done using it.
+ */
+struct FfiHttpResponseBytes *zcashlc_tor_http_post(struct TorRuntime *tor_runtime,
+                                                   const char *url,
+                                                   const struct FfiHttpRequestHeader *headers,
+                                                   uintptr_t headers_len,
+                                                   const uint8_t *body,
+                                                   uintptr_t body_len,
+                                                   uint8_t retry_limit);
+
+/**
+ * Fetches the current ZEC-USD exchange rate over Tor.
+ *
+ * The result is a [`Decimal`] struct containing the fields necessary to construct an
+ * [`NSDecimalNumber`](https://developer.apple.com/documentation/foundation/nsdecimalnumber/1416003-init).
+ *
+ * Returns a negative value on error.
+ *
+ * # Safety
+ *
+ * - `tor_runtime` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut TorRuntime` that has not previously been freed.
+ * - `tor_runtime` must not be passed to two FFI calls at the same time.
+ */
+struct Decimal zcashlc_get_exchange_rate_usd(struct TorRuntime *tor_runtime);
+
+/**
+ * Fetches the current ZEC-USD exchange rate over Tor from the specified exchanges.
+ *
+ * The result is a [`Decimal`] struct containing the fields necessary to construct an
+ * [`NSDecimalNumber`](https://developer.apple.com/documentation/foundation/nsdecimalnumber/1416003-init).
+ *
+ * Returns a negative value on error.
+ *
+ * # Safety
+ *
+ * - `tor_runtime` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut TorRuntime` that has not previously been freed.
+ * - `tor_runtime` must not be passed to two FFI calls at the same time.
+ * - `exchanges` must be non-null and valid for reads for
+ *   `exchanges_len * size_of::<ffi::ZecUsdExchange>()` bytes, and it must be properly
+ *   aligned. This means in particular:
+ *   - The entire memory range of this slice must be contained within a single allocated
+ *     object! Slices can never span across multiple allocated objects.
+ *   - `exchanges` must be non-null and aligned even for zero-length slices.
+ * - `exchanges` must point to `exchanges_len` consecutive properly initialized values of
+ *   type `ffi::ZecUsdExchange`.
+ * - The memory referenced by `exchanges` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `exchanges_len * size_of::<ffi::ZecUsdExchange>()` of the slice must
+ *   be no larger than `isize::MAX`, and adding that size to `exchanges` must not "wrap
+ *   around" the address space.  See the safety documentation of `pointer::offset`.
+ */
+struct Decimal zcashlc_get_exchange_rate_usd_from(struct TorRuntime *tor_runtime,
+                                                  enum FfiZecUsdExchange trusted_exchange,
+                                                  const enum FfiZecUsdExchange *exchanges,
+                                                  uintptr_t exchanges_len);
+
+/**
+ * Connects to the lightwalletd server at the given endpoint.
+ *
+ * Each connection returned by this method is isolated from any other Tor usage.
+ *
+ * # Safety
+ *
+ * - `tor_runtime` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut TorRuntime` that has not previously been freed.
+ * - `tor_runtime` must not be passed to two FFI calls at the same time.
+ * - `endpoint` must be non-null and must point to a null-terminated UTF-8 string.
+ * - Call [`zcashlc_free_tor_lwd_conn`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct LwdConn *zcashlc_tor_connect_to_lightwalletd(struct TorRuntime *tor_runtime,
+                                                    const char *endpoint);
+
+/**
+ * Frees a Tor lightwalletd connection.
+ *
+ * # Safety
+ *
+ * - If `ptr` is non-null, it must be a pointer returned by a `zcashlc_*` method with
+ *   return type `*mut tor::LwdConn` that has not previously been freed.
+ */
+void zcashlc_free_tor_lwd_conn(struct LwdConn *ptr);
+
+/**
+ * Returns information about this lightwalletd instance and the blockchain.
+ *
+ * # Safety
+ *
+ * - `lwd_conn` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut tor::LwdConn` that has not previously been freed.
+ * - `lwd_conn` must not be passed to two FFI calls at the same time.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_tor_lwd_conn_get_info(struct LwdConn *lwd_conn);
+
+/**
+ * Fetches the height and hash of the block at the tip of the best chain.
+ *
+ * # Safety
+ *
+ * - `lwd_conn` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut tor::LwdConn` that has not previously been freed.
+ * - `lwd_conn` must not be passed to two FFI calls at the same time.
+ * - `height_ret` must be non-null and valid for writes for 4 bytes, and it must have an
+ *   alignment of `1`.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_tor_lwd_conn_latest_block(struct LwdConn *lwd_conn,
+                                                        uint32_t *height_ret);
+
+/**
+ * Fetches the transaction with the given ID.
+ *
+ * # Safety
+ *
+ * - `lwd_conn` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut tor::LwdConn` that has not previously been freed.
+ * - `lwd_conn` must not be passed to two FFI calls at the same time.
+ * - `txid_bytes` must be non-null and valid for reads for 32 bytes, and it must have an
+ *   alignment of `1`.
+ * - `height_ret` must be non-null and valid for writes for 8 bytes, and it must have an
+ *   alignment of `1`.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_tor_lwd_conn_fetch_transaction(struct LwdConn *lwd_conn,
+                                                             const uint8_t *txid_bytes,
+                                                             uint64_t *height_ret);
+
+/**
+ * Submits a transaction to the Zcash network via the given lightwalletd connection.
+ *
+ * # Safety
+ *
+ * - `lwd_conn` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut tor::LwdConn` that has not previously been freed.
+ * - `lwd_conn` must not be passed to two FFI calls at the same time.
+ * - `tx` must be non-null and valid for reads for `tx_len` bytes, and it must have an
+ *   alignment of `1`.
+ * - The memory referenced by `tx` must not be mutated for the duration of the function call.
+ * - The total size `tx_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ */
+bool zcashlc_tor_lwd_conn_submit_transaction(struct LwdConn *lwd_conn,
+                                             const uint8_t *tx,
+                                             uintptr_t tx_len);
+
+/**
+ * Fetches the note commitment tree state corresponding to the given block height.
+ *
+ * # Safety
+ *
+ * - `lwd_conn` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut tor::LwdConn` that has not previously been freed.
+ * - `lwd_conn` must not be passed to two FFI calls at the same time.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_tor_lwd_conn_get_tree_state(struct LwdConn *lwd_conn,
+                                                          uint32_t height);
+
+/**
+ * Finds all transactions associated with the given transparent address within the given block
+ * range, and calls [`decrypt_and_store_transaction`] with each such transaction.
+ *
+ * The query to the light wallet server will cover the provided block range. The end height is
+ * optional; to omit the end height for the query range use the sentinel value `-1`. If any other
+ * value is specified, it must be in the range of a valid u32. Note that older versions of
+ * `lightwalletd` will return an error if the end height is not specified.
+ *
+ * Returns an [`ffi::AddressCheckResult`] if successful, or a null pointer in the case of an
+ * error.
+ *
+ * # Safety
+ *
+ * - `lwd_conn` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut tor::LwdConn` that has not previously been freed.
+ * - `lwd_conn` must not be passed to two FFI calls at the same time.
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_address_check_result`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiAddressCheckResult *zcashlc_tor_lwd_conn_update_transparent_address_transactions(struct LwdConn *lwd_conn,
+                                                                                           const uint8_t *db_data,
+                                                                                           uintptr_t db_data_len,
+                                                                                           uint32_t network_id,
+                                                                                           const char *address,
+                                                                                           uint32_t start,
+                                                                                           int64_t end);
+
+/**
+ * Checks to find any UTXOs associated with the given transparent address.
+ *
+ * This check will cover the block range starting at the exposure height for that address, if
+ * known, or otherwise at the birthday height of the specified account.
+ *
+ * Returns an [`ffi::AddressCheckResult`] if successful, or a null pointer in the case of an
+ * error.
+ *
+ * # Safety
+ *
+ * - `lwd_conn` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut tor::LwdConn` that has not previously been freed.
+ * - `lwd_conn` must not be passed to two FFI calls at the same time.
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_address_check_result`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiAddressCheckResult *zcashlc_tor_lwd_conn_fetch_utxos_by_address(struct LwdConn *lwd_conn,
+                                                                          const uint8_t *db_data,
+                                                                          uintptr_t db_data_len,
+                                                                          uint32_t network_id,
+                                                                          const uint8_t *account_uuid_bytes,
+                                                                          const char *address);
+
+/**
+ * Checks to find any single-use ephemeral addresses exposed in the past day that have not yet
+ * received funds, excluding any whose next check time is in the future. This will then choose the
+ * address that is most overdue for checking, retrieve any UTXOs for that address over Tor, and
+ * add them to the wallet database. If no such UTXOs are found, the check will be rescheduled
+ * following an expoential-backoff-with-jitter algorithm.
+ *
+ * Returns an [`ffi::AddressCheckResult`] if successful, or a null pointer in the case of an
+ * error.
+ *
+ * # Safety
+ *
+ * - `lwd_conn` must be a non-null pointer returned by a `zcashlc_*` method with
+ *   return type `*mut tor::LwdConn` that has not previously been freed.
+ * - `lwd_conn` must not be passed to two FFI calls at the same time.
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of pointer::offset.
+ * - Call [`zcashlc_free_address_check_result`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiAddressCheckResult *zcashlc_tor_lwd_conn_check_single_use_taddr(struct LwdConn *lwd_conn,
+                                                                          const uint8_t *db_data,
+                                                                          uintptr_t db_data_len,
+                                                                          uint32_t network_id,
+                                                                          const uint8_t *account_uuid_bytes);
+
+/**
+ * Registers the **custom network** resolved for `network_id` [`NETWORK_ID_REGTEST`], which every
+ * subsequent `zcashlc_*` call resolves through [`parse_network`]. `base_network_id` selects the base
+ * identity — address encoding and `chainName` — as mainnet (1), testnet (0), or regtest (2); the
+ * activation heights are custom regardless. Each height argument is a block height, or a negative value
+ * meaning "not activated on this network"; set them to mirror the `nuparams` of the node /
+ * `lightwalletd` being connected to. Idempotent; intended to be called once at init.
+ *
+ * Returns `true` on a fresh registration or an identical re-registration. Returns `false` on an
+ * invalid `base_network_id`, a poisoned lock, or when the call **replaced a different existing
+ * configuration** — the replacement is still applied (last writer wins, since per-instance state
+ * such as checkpoint sources follows the newest `Initializer`), but the caller should treat a
+ * conflicting re-registration as a host configuration bug: the parameters are process-global, so
+ * two live instances with different custom networks cannot both be honored.
+ */
+bool zcashlc_set_custom_network(uint32_t base_network_id,
+                                int64_t overwinter,
+                                int64_t sapling,
+                                int64_t blossom,
+                                int64_t heartwood,
+                                int64_t canopy,
+                                int64_t nu5,
+                                int64_t nu6,
+                                int64_t nu6_1,
+                                int64_t nu6_2,
+                                int64_t nu6_3);
+
+/**
+ * Returns the network type and address kind for the given address string,
+ * if the address is a valid Zcash address.
+ *
+ * Address kind codes are as follows:
+ * * p2pkh: 0
+ * * p2sh: 1
+ * * sapling: 2
+ * * unified: 3
+ * * tex: 4
+ *
+ * # Safety
+ *
+ * - `address` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `address` must not be mutated for the duration of the function call.
+ */
+bool zcashlc_get_address_metadata(const char *address,
+                                  uint32_t *network_id_ret,
+                                  uint32_t *addr_kind_ret);
+
+/**
+ * Extracts the typecodes of the receivers within the given Unified Address.
+ *
+ * Returns a pointer to a slice of typecodes. `len_ret` is set to the length of the
+ * slice.
+ *
+ * See the following sections of ZIP 316 for details on how to interpret typecodes:
+ * - [List of known typecodes](https://zips.z.cash/zip-0316#encoding-of-unified-addresses)
+ * - [Adding new types](https://zips.z.cash/zip-0316#adding-new-types)
+ * - [Metadata Items](https://zips.z.cash/zip-0316#metadata-items)
+ *
+ * # Safety
+ *
+ * - `ua` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `ua` must not be mutated for the duration of the function call.
+ * - Call [`zcashlc_free_typecodes`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+uint32_t *zcashlc_get_typecodes_for_unified_address_receivers(const char *ua, uintptr_t *len_ret);
+
+/**
+ * Frees a list of typecodes previously obtained from the FFI.
+ *
+ * # Safety
+ *
+ * - `data` and `len` must have been obtained from
+ *   [`zcashlc_get_typecodes_for_unified_address_receivers`].
+ */
+void zcashlc_free_typecodes(uint32_t *data, uintptr_t len);
+
+/**
+ * Returns true when the provided key decodes to a valid Sapling extended spending key for the
+ * specified network, false in any other case.
+ *
+ * # Safety
+ *
+ * - `extsk` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `extsk` must not be mutated for the duration of the function call.
+ */
+bool zcashlc_is_valid_sapling_extended_spending_key(const char *extsk, uint32_t network_id);
+
+/**
+ * Returns true when the provided key decodes to a valid Sapling extended full viewing key for the
+ * specified network, false in any other case.
+ *
+ * # Safety
+ *
+ * - `key` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `key` must not be mutated for the duration of the function call.
+ */
+bool zcashlc_is_valid_viewing_key(const char *key, uint32_t network_id);
+
+/**
+ * Returns true when the provided key decodes to a valid unified full viewing key for the
+ * specified network, false in any other case.
+ *
+ * # Safety
+ *
+ * - `ufvk` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `ufvk` must not be mutated for the duration of the
+ *   function call.
+ */
+bool zcashlc_is_valid_unified_full_viewing_key(const char *ufvk, uint32_t network_id);
+
+/**
+ * Returns true when the provided key encoding is a valid unified incoming viewing key for the
+ * given network, false in any other case.
+ *
+ * # Safety
+ *
+ * - `uivk` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `uivk` must not be mutated for the duration of the
+ *   function call.
+ */
+bool zcashlc_is_valid_unified_incoming_viewing_key(const char *uivk, uint32_t network_id);
+
+/**
+ * Derives and returns a unified spending key from the given seed for the given account ID.
+ *
+ * Returns the binary encoding of the spending key. The caller should manage the memory of (and
+ * store, if necessary) the returned spending key in a secure fashion.
+ *
+ * # Safety
+ *
+ * - `seed` must be non-null and valid for reads for `seed_len` bytes.
+ * - The memory referenced by `seed` must not be mutated for the duration of the function call.
+ * - The total size `seed_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of `pointer::offset`.
+ * - Call `zcashlc_free_binary_key` to free the memory associated with the returned pointer when
+ *   you are finished using it.
+ */
+struct FfiBoxedSlice *zcashlc_derive_spending_key(const uint8_t *seed,
+                                                  uintptr_t seed_len,
+                                                  int32_t hd_account_index,
+                                                  uint32_t network_id);
+
+/**
+ * Obtains the unified full viewing key for the given binary-encoded unified spending key
+ * and returns the resulting encoded UFVK string. `usk_ptr` should point to an array of `usk_len`
+ * bytes containing a unified spending key encoded as returned from the `zcashlc_create_account`
+ * or `zcashlc_derive_spending_key` functions.
+ *
+ * # Safety
+ *
+ * - `usk_ptr` must be non-null and must point to an array of `usk_len` bytes.
+ * - The memory referenced by `usk_ptr` must not be mutated for the duration of the function call.
+ * - The total size `usk_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of `pointer::offset`.
+ * - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
+ *   when you are done using it.
+ */
+char *zcashlc_spending_key_to_full_viewing_key(const uint8_t *usk_ptr,
+                                               uintptr_t usk_len,
+                                               uint32_t network_id);
+
+/**
+ * Derives a unified address address for the provided UFVK, along with the diversifier at which it
+ * was derived; this may not be equal to the provided diversifier index if no valid Sapling
+ * address could be derived at that index. If the `diversifier_index_bytes` parameter is null, the
+ * default address for the UFVK is returned.
+ *
+ * # Safety
+ *
+ * - `ufvk` must be non-null and must point to a null-terminated UTF-8 string.
+ * - `diversifier_index_bytes must either be null or be valid for reads for 11 bytes and have an
+ *   alignment of `1`.
+ * - Call [`zcashlc_free_ffi_address`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+struct FfiAddress *zcashlc_derive_address_from_ufvk(uint32_t network_id,
+                                                    const char *ufvk,
+                                                    const uint8_t *diversifier_index_bytes);
+
+/**
+ * Derives a unified address address for the provided UIVK, along with the diversifier at which it
+ * was derived; this may not be equal to the provided diversifier index if no valid Sapling
+ * address could be derived at that index. If the `diversifier_index_bytes` parameter is null, the
+ * default address for the UIVK is returned.
+ *
+ * # Safety
+ *
+ * - `uivk` must be non-null and must point to a null-terminated UTF-8 string.
+ * - `diversifier_index_bytes must either be null or be valid for reads for 11 bytes and have an
+ *   alignment of `1`.
+ * - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+struct FfiAddress *zcashlc_derive_address_from_uivk(uint32_t network_id,
+                                                    const char *uivk,
+                                                    const uint8_t *diversifier_index_bytes);
+
+/**
+ * Returns the transparent receiver within the given Unified Address, if any.
+ *
+ * # Safety
+ *
+ * - `ua` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `ua` must not be mutated for the duration of the function call.
+ * - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+char *zcashlc_get_transparent_receiver_for_unified_address(const char *ua);
+
+/**
+ * Returns the Sapling receiver within the given Unified Address, if any.
+ *
+ * # Safety
+ *
+ * - `ua` must be non-null and must point to a null-terminated UTF-8 string.
+ * - The memory referenced by `ua` must not be mutated for the duration of the function call.
+ * - Call [`zcashlc_string_free`] to free the memory associated with the returned pointer
+ *   when done using it.
+ */
+char *zcashlc_get_sapling_receiver_for_unified_address(const char *ua);
+
+/**
+ * Constructs an ffi::AccountMetadataKey from its parts.
+ *
+ * # Safety
+ *
+ * - `sk` must be non-null and valid for reads for 32 bytes, and it must have an alignment of `1`.
+ * - The memory referenced by `sk` must not be mutated for the duration of the function call.
+ * - `chain_code` must be non-null and valid for reads for 32 bytes, and it must have an alignment
+ *   of `1`.
+ * - The memory referenced by `chain_code` must not be mutated for the duration of the function
+ *   call.
+ * - Call [`zcashlc_free_account_metadata_key`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiAccountMetadataKey *zcashlc_account_metadata_key_from_parts(const uint8_t *sk,
+                                                                      const uint8_t *chain_code);
+
+/**
+ * Derives a ZIP 325 Account Metadata Key from the given seed.
+ *
+ * # Safety
+ *
+ * - `seed` must be non-null and valid for reads for `seed_len` bytes.
+ * - The memory referenced by `seed` must not be mutated for the duration of the function call.
+ * - The total size `seed_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of `pointer::offset`.
+ * - Call [`zcashlc_free_account_metadata_key`] to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiAccountMetadataKey *zcashlc_derive_account_metadata_key(const uint8_t *seed,
+                                                                  uintptr_t seed_len,
+                                                                  int32_t account,
+                                                                  uint32_t network_id);
+
+/**
+ * Derives a metadata key for private use from a ZIP 325 Account Metadata Key.
+ *
+ * - `ufvk` is the external UFVK for which a metadata key is required, or `null` if the
+ *   metadata key is "inherent" (for the same account as the Account Metadata Key).
+ * - `private_use_subject` is a globally unique non-empty sequence of at most 252 bytes
+ *   that identifies the desired private-use context.
+ *
+ * If `ufvk` is null, this function will return a single 32-byte metadata key.
+ *
+ * If `ufvk` is non-null, this function will return one metadata key for every FVK item
+ * contained within the UFVK, in preference order. As UFVKs may in general change over
+ * time (due to the inclusion of new higher-preference FVK items, or removal of older
+ * deprecated FVK items), private usage of these keys should always follow preference
+ * order:
+ * - For encryption-like private usage, the first key in the array should always be
+ *   used, and all other keys ignored.
+ * - For decryption-like private usage, each key in the array should be tried in turn
+ *   until metadata can be recovered, and then the metadata should be re-encrypted
+ *   under the first key.
+ *
+ * # Safety
+ *
+ * - `account_metadata_key` must be non-null and must point to a struct having the layout
+ *   of [`ffi::AccountMetadataKey`].
+ * - The memory referenced by `account_metadata_key` must not be mutated for the duration
+ *   of the function call.
+ * - If `ufvk` is non-null, it must point to a null-terminated UTF-8 string.
+ * - `private_use_subject` must be non-null and valid for reads for `private_use_subject_len`
+ *   bytes.
+ * - The memory referenced by `private_use_subject` must not be mutated for the duration
+ *   of the function call.
+ * - The total size `private_use_subject_len` must be no larger than `isize::MAX`. See
+ *   the safety documentation of `pointer::offset`.
+ * - Call `zcashlc_free_symmetric_keys` to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiSymmetricKeys *zcashlc_derive_private_use_metadata_key(const struct FfiAccountMetadataKey *account_metadata_key,
+                                                                 const char *ufvk,
+                                                                 const uint8_t *private_use_subject,
+                                                                 uintptr_t private_use_subject_len,
+                                                                 uint32_t network_id);
+
+/**
+ * Derives and returns a ZIP 32 Arbitrary Key from the given seed at the "wallet level", i.e.
+ * directly from the seed with no ZIP 32 path applied.
+ *
+ * The resulting key will be the same across all networks (Zcash mainnet, Zcash testnet, OtherCoin
+ * mainnet, and so on). You can think of it as a context-specific seed fingerprint that can be used
+ * as (static) key material.
+ *
+ * `context_string` is a globally-unique non-empty sequence of at most 252 bytes that identifies
+ * the desired context.
+ *
+ * # Safety
+ *
+ * - `context_string` must be non-null and valid for reads for `context_string_len` bytes.
+ * - The memory referenced by `context_string` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `context_string_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `seed` must be non-null and valid for reads for `seed_len` bytes.
+ * - The memory referenced by `seed` must not be mutated for the duration of the function call.
+ * - The total size `seed_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of `pointer::offset`.
+ * - Call `zcashlc_free_boxed_slice` to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_derive_arbitrary_wallet_key(const uint8_t *context_string,
+                                                          uintptr_t context_string_len,
+                                                          const uint8_t *seed,
+                                                          uintptr_t seed_len);
+
+/**
+ * Derives and returns a ZIP 32 Arbitrary Key from the given seed at the account level.
+ *
+ * `context_string` is a globally-unique non-empty sequence of at most 252 bytes that identifies
+ * the desired context.
+ *
+ * # Safety
+ *
+ * - `context_string` must be non-null and valid for reads for `context_string_len` bytes.
+ * - The memory referenced by `context_string` must not be mutated for the duration of the function
+ *   call.
+ * - The total size `context_string_len` must be no larger than `isize::MAX`. See the safety
+ *   documentation of `pointer::offset`.
+ * - `seed` must be non-null and valid for reads for `seed_len` bytes`.
+ * - The memory referenced by `seed` must not be mutated for the duration of the function call.
+ * - The total size `seed_len` must be no larger than `isize::MAX`. See the safety documentation
+ *   of `pointer::offset`.
+ * - Call `zcashlc_free_boxed_slice` to free the memory associated with the returned
+ *   pointer when done using it.
+ */
+struct FfiBoxedSlice *zcashlc_derive_arbitrary_account_key(const uint8_t *context_string,
+                                                           uintptr_t context_string_len,
+                                                           const uint8_t *seed,
+                                                           uintptr_t seed_len,
+                                                           int32_t account,
+                                                           uint32_t network_id);
+
+/**
+ * Parse an EIP-681 URI string into a [`Eip681TransactionRequest`].
+ *
+ * Returns a pointer to the parsed request on success, or null on failure.
+ * On failure the error can be retrieved via `zcashlc_last_error_message`.
+ *
+ * The returned pointer must be freed with [`zcashlc_free_eip681_transaction_request`].
+ *
+ * # Safety
+ *
+ * - `input` must be a non-null pointer to a null-terminated UTF-8 string.
+ */
+struct FfiEip681TransactionRequest *zcashlc_eip681_parse_transaction_request(const char *input);
+
+/**
+ * Returns the type of the parsed EIP-681 transaction request.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a valid [`Eip681TransactionRequest`] as
+ *   returned by [`zcashlc_eip681_parse_transaction_request`].
+ */
+enum FfiEip681TransactionRequestType zcashlc_eip681_transaction_request_type(const struct FfiEip681TransactionRequest *ptr);
+
+/**
+ * Extract the native transfer data from a parsed EIP-681 transaction request.
+ *
+ * Returns a pointer to an [`Eip681NativeRequest`] on success, or null if the parsed
+ * request is not a native transfer.
+ *
+ * The returned pointer must be freed with [`zcashlc_free_eip681_native_request`].
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a valid [`Eip681TransactionRequest`] as
+ *   returned by [`zcashlc_eip681_parse_transaction_request`].
+ */
+struct FfiEip681NativeRequest *zcashlc_eip681_transaction_request_as_native(const struct FfiEip681TransactionRequest *ptr);
+
+/**
+ * Extract the ERC-20 transfer data from a parsed EIP-681 transaction request.
+ *
+ * Returns a pointer to an [`Eip681Erc20Request`] on success, or null if the parsed
+ * request is not an ERC-20 transfer.
+ *
+ * The returned pointer must be freed with [`zcashlc_free_eip681_erc20_request`].
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a valid [`Eip681TransactionRequest`] as
+ *   returned by [`zcashlc_eip681_parse_transaction_request`].
+ */
+struct FfiEip681Erc20Request *zcashlc_eip681_transaction_request_as_erc20(const struct FfiEip681TransactionRequest *ptr);
+
+/**
+ * Serialize a parsed EIP-681 transaction request back to a URI string.
+ *
+ * Returns a heap-allocated null-terminated UTF-8 string, or null on failure.
+ * The returned string must be freed with [`zcashlc_string_free`](crate::zcashlc_string_free).
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a valid [`Eip681TransactionRequest`] as
+ *   returned by [`zcashlc_eip681_parse_transaction_request`].
+ */
+char *zcashlc_eip681_transaction_request_to_uri(const struct FfiEip681TransactionRequest *ptr);
+
+/**
+ * Construct an [`Eip681TransactionRequest`] for a native ETH/chain token transfer
+ * from individual parts.
+ *
+ * Returns a pointer to the constructed request on success, or null on failure.
+ * On failure the error can be retrieved via `zcashlc_last_error_message`.
+ *
+ * The returned pointer must be freed with [`zcashlc_free_eip681_transaction_request`].
+ *
+ * # Safety
+ *
+ * - `schema_prefix` must be a non-null pointer to a null-terminated UTF-8 string.
+ * - `recipient` must be a non-null pointer to a null-terminated UTF-8 string.
+ * - `value_hex`, `gas_limit_hex`, and `gas_price_hex` are either null (indicating the
+ *   parameter should be omitted) or non-null pointers to null-terminated UTF-8 strings
+ *   containing `0x`-prefixed hex-encoded `U256` values.
+ * - If `has_chain_id` is false, `chain_id` is ignored.
+ */
+struct FfiEip681TransactionRequest *zcashlc_eip681_native_request_from_parts(const char *schema_prefix,
+                                                                             bool has_pay,
+                                                                             bool has_chain_id,
+                                                                             uint64_t chain_id,
+                                                                             const char *recipient,
+                                                                             const char *value_hex,
+                                                                             const char *gas_limit_hex,
+                                                                             const char *gas_price_hex);
+
+/**
+ * Construct an [`Eip681TransactionRequest`] for an ERC-20 token transfer
+ * from individual parts.
+ *
+ * Returns a pointer to the constructed request on success, or null on failure.
+ * On failure the error can be retrieved via `zcashlc_last_error_message`.
+ *
+ * The returned pointer must be freed with [`zcashlc_free_eip681_transaction_request`].
+ *
+ * # Safety
+ *
+ * - `schema_prefix`, `token_contract_address`, `recipient_address`, and `value_hex` must
+ *   be non-null pointers to null-terminated UTF-8 strings.
+ * - `value_hex` must contain a `0x`-prefixed hex-encoded `U256` value.
+ * - If `has_chain_id` is false, `chain_id` is ignored.
+ */
+struct FfiEip681TransactionRequest *zcashlc_eip681_erc20_request_from_parts(const char *schema_prefix,
+                                                                            bool has_pay,
+                                                                            bool has_chain_id,
+                                                                            uint64_t chain_id,
+                                                                            const char *token_contract_address,
+                                                                            const char *recipient_address,
+                                                                            const char *value_hex);
+
+/**
+ * Frees an [`Eip681TransactionRequest`] value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of
+ *   [`Eip681TransactionRequest`] as returned by
+ *   [`zcashlc_eip681_parse_transaction_request`].
+ */
+void zcashlc_free_eip681_transaction_request(struct FfiEip681TransactionRequest *ptr);
+
+/**
+ * Frees an [`Eip681NativeRequest`] value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of
+ *   [`Eip681NativeRequest`] as returned by
+ *   [`zcashlc_eip681_transaction_request_as_native`].
+ */
+void zcashlc_free_eip681_native_request(struct FfiEip681NativeRequest *ptr);
+
+/**
+ * Frees an [`Eip681Erc20Request`] value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of
+ *   [`Eip681Erc20Request`] as returned by
+ *   [`zcashlc_eip681_transaction_request_as_erc20`].
+ */
+void zcashlc_free_eip681_erc20_request(struct FfiEip681Erc20Request *ptr);
+
+/**
+ * Frees an [`Account`] value
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`Account`].
+ */
+void zcashlc_free_account(struct FfiAccount *ptr);
+
+/**
+ * Frees a [`Uuid`] value
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`Uuid`].
+ */
+void zcashlc_free_ffi_uuid(struct FfiUuid *ptr);
+
+/**
+ * Frees an array of [`Uuid`] values as allocated by `zcashlc_list_accounts`.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`Accounts`].
+ *   See the safety documentation of [`Accounts`].
+ */
+void zcashlc_free_accounts(struct FfiAccounts *ptr);
+
+/**
+ * Frees a [`BinaryKey`] value
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`BinaryKey`].
+ *   See the safety documentation of [`BinaryKey`].
+ */
+void zcashlc_free_binary_key(struct FFIBinaryKey *ptr);
+
+/**
+ * Frees an array of [`EncodedKey`] values as allocated by `zcashlc_list_transparent_receivers`.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`EncodedKeys`].
+ *   See the safety documentation of [`EncodedKeys`].
+ */
+void zcashlc_free_keys(struct FFIEncodedKeys *ptr);
+
+/**
+ * Frees an [`WalletSummary`] value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`WalletSummary`].
+ *   See the safety documentation of [`WalletSummary`].
+ */
+void zcashlc_free_wallet_summary(struct FfiWalletSummary *ptr);
+
+/**
+ * Frees an array of [`ScanRange`] values as allocated by `zcashlc_suggest_scan_ranges`.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`ScanRanges`].
+ *   See the safety documentation of [`ScanRanges`].
+ */
+void zcashlc_free_scan_ranges(struct FfiScanRanges *ptr);
+
+/**
+ * Frees a [`ScanSummary`] value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`ScanSummary`].
+ */
+void zcashlc_free_scan_summary(struct FfiScanSummary *ptr);
+
+/**
+ * Frees a [`BoxedSlice`].
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of
+ *   [`BoxedSlice`]. See the safety documentation of [`BoxedSlice`].
+ */
+void zcashlc_free_boxed_slice(struct FfiBoxedSlice *ptr);
+
+/**
+ * Frees an array of `[u8; 32]` values.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of
+ *   [`SymmetricKeys`]. See the safety documentation of [`SymmetricKeys`].
+ */
+void zcashlc_free_symmetric_keys(struct FfiSymmetricKeys *ptr);
+
+/**
+ * Frees an array of `[u8; 32]` values as allocated by `zcashlc_create_proposed_transactions`.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`TxIds`].
+ *   See the safety documentation of [`TxIds`].
+ */
+void zcashlc_free_txids(FfiTxIds *ptr);
+
+/**
+ * Frees an array of [`TransactionDataRequest`] values as allocated by `zcashlc_transaction_data_requests`.
+ *
+ * # Safety
+ *
+ * - `ptr` if `ptr` is non-null it must point to a struct having the layout of [`TransactionDataRequests`].
+ *   See the safety documentation of [`TransactionDataRequests`].
+ */
+void zcashlc_free_transaction_data_requests(struct FfiTransactionDataRequests *ptr);
+
+/**
+ * Frees an [`Address`] value
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`Address`].
+ */
+void zcashlc_free_ffi_address(struct FfiAddress *ptr);
+
+/**
+ * Frees an AccountMetadataKey value
+ *
+ * # Safety
+ *
+ * - `ptr` must either be null or point to a struct having the layout of [`AccountMetadataKey`].
+ */
+void zcashlc_free_account_metadata_key(struct FfiAccountMetadataKey *ptr);
+
+/**
+ * Frees an HttpResponseBytes value
+ *
+ * # Safety
+ *
+ * - `ptr` must either be null or point to a struct having the layout of [`HttpResponseBytes`].
+ */
+void zcashlc_free_http_response_bytes(struct FfiHttpResponseBytes *ptr);
+
+/**
+ * Frees an [`SingleUseTaddr`] value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`SingleUseTaddr`].
+ */
+void zcashlc_free_single_use_taddr(struct FfiSingleUseTaddr *ptr);
+
+/**
+ * Frees an [`AddressCheckResult`] value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct having the layout of [`AddressCheckResult`].
+ */
+void zcashlc_free_address_check_result(struct FfiAddressCheckResult *ptr);
+
+/**
+ * Frees a [`FfiMigrationState`], including the attention transfer id if present.
+ *
+ * # Safety
+ * `ptr` must be null or point to a [`FfiMigrationState`] handed out by this module.
+ */
+void zcashlc_free_migration_state(struct FfiMigrationState *ptr);
+
+/**
+ * Frees a [`FfiMigrationProgress`].
+ *
+ * # Safety
+ * `ptr` must be null or point to a [`FfiMigrationProgress`] handed out by this module.
+ */
+void zcashlc_free_migration_progress(struct FfiMigrationProgress *ptr);
+
+/**
+ * Frees a [`FfiNoteSplitProposal`], including its output-values array.
+ *
+ * # Safety
+ * `ptr` must be null or point to a [`FfiNoteSplitProposal`] handed out by this module.
+ */
+void zcashlc_free_migration_note_split_proposal(struct FfiNoteSplitProposal *ptr);
+
+/**
+ * Frees a [`FfiPreparedTransfer`], including its id string and PCZT bytes.
+ *
+ * # Safety
+ * `ptr` must be null or point to a [`FfiPreparedTransfer`] handed out by this module.
+ */
+void zcashlc_free_migration_prepared_transfer(struct FfiPreparedTransfer *ptr);
+
+/**
+ * Frees a [`FfiMigrationSchedule`], including every transfer's id string.
+ *
+ * # Safety
+ * `ptr` must be null or point to a [`FfiMigrationSchedule`] handed out by this module.
+ */
+void zcashlc_free_migration_schedule(struct FfiMigrationSchedule *ptr);
+
+/**
+ * Frees a standalone [`FfiTransferProposal`] (as returned by
+ * `zcashlc_migration_pending_transfer_proposal`), including its id string.
+ *
+ * # Safety
+ * `ptr` must be null or point to a [`FfiTransferProposal`] handed out by this module.
+ */
+void zcashlc_free_migration_transfer_proposal(struct FfiTransferProposal *ptr);
+
+/**
+ * Frees a [`FfiUnsignedTransferPczts`], including every element's id string and PCZT bytes.
+ *
+ * # Safety
+ * `ptr` must be null or point to a [`FfiUnsignedTransferPczts`] handed out by this module.
+ */
+void zcashlc_free_migration_unsigned_transfer_pczts(struct FfiUnsignedTransferPczts *ptr);
+
+/**
+ * The current migration state. The app calls this on launch and after every operation; it is
+ * also the reconciliation hub (advancing split/transfer/completion phases as the wallet scans).
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_state`].
+ */
+struct FfiMigrationState *zcashlc_migration_state(const uint8_t *db_data,
+                                                  uintptr_t db_data_len,
+                                                  const uint8_t *account_uuid_bytes,
+                                                  uint32_t network_id);
+
+/**
+ * Migration progress, present only while a migration is in progress. On success the returned
+ * pointer is non-null; its `is_present` flag is `false` when there is no progress to report. A
+ * NULL return signals an error.
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_progress`].
+ */
+struct FfiMigrationProgress *zcashlc_migration_progress(const uint8_t *db_data,
+                                                        uintptr_t db_data_len,
+                                                        const uint8_t *account_uuid_bytes,
+                                                        uint32_t network_id);
+
+/**
+ * Whether the Orchard notes must be split before migration. Returns `false` on error (see
+ * `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`].
+ */
+bool zcashlc_migration_is_note_split_needed(const uint8_t *db_data,
+                                            uintptr_t db_data_len,
+                                            const uint8_t *account_uuid_bytes,
+                                            uint32_t network_id);
+
+/**
+ * Whether any scheduled transfer is past its send height but not yet broadcast. Returns `false`
+ * on error (see `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`].
+ */
+bool zcashlc_migration_has_overdue_transfers(const uint8_t *db_data,
+                                             uintptr_t db_data_len,
+                                             const uint8_t *account_uuid_bytes,
+                                             uint32_t network_id);
+
+/**
+ * Whether the migration is in an invalid state (spendable Orchard remains but no scheduled
+ * transfer covers it). Returns `false` on error (see `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`].
+ */
+bool zcashlc_migration_has_invalid_transfers(const uint8_t *db_data,
+                                             uintptr_t db_data_len,
+                                             const uint8_t *account_uuid_bytes,
+                                             uint32_t network_id);
+
+/**
+ * Compute the optimal note-split proposal for the spendable Orchard balance.
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with
+ * [`zcashlc_free_migration_note_split_proposal`].
+ */
+struct FfiNoteSplitProposal *zcashlc_migration_prepare_note_split(const uint8_t *db_data,
+                                                                  uintptr_t db_data_len,
+                                                                  const uint8_t *account_uuid_bytes,
+                                                                  uint32_t network_id);
+
+/**
+ * Build, sign, and persist the note-split transaction, returning the broadcastable prepared
+ * transfer. The proposal is passed back as its `(output_values, fee)` parts (from
+ * `zcashlc_migration_prepare_note_split`); `usk` is the raw Orchard-era `UnifiedSpendingKey`
+ * bytes.
+ *
+ * # Safety
+ * See [`build_context`]; `output_values`/`usk_ptr` must be valid for reads of their lengths.
+ * Free the returned pointer with [`zcashlc_free_migration_prepared_transfer`].
+ */
+struct FfiPreparedTransfer *zcashlc_migration_sign_note_split(const uint8_t *db_data,
+                                                              uintptr_t db_data_len,
+                                                              const uint8_t *account_uuid_bytes,
+                                                              uint32_t network_id,
+                                                              const int64_t *output_values,
+                                                              uintptr_t output_values_len,
+                                                              int64_t fee,
+                                                              const uint8_t *usk_ptr,
+                                                              uintptr_t usk_len);
+
+/**
+ * The leftover Orchard balance a migration would not cross, when it is large enough to be worth
+ * offering the user a choice about (zatoshi). Returns `-1` when there is no such residual (and
+ * also `-1` on error, with `zcashlc_last_error_message` set).
+ *
+ * # Safety
+ * See [`build_context`].
+ */
+int64_t zcashlc_migration_residual_after_migration(const uint8_t *db_data,
+                                                   uintptr_t db_data_len,
+                                                   const uint8_t *account_uuid_bytes,
+                                                   uint32_t network_id);
+
+/**
+ * Generate the full migration schedule for the spendable Orchard balance. When `include_residual`
+ * is `true` and a worthwhile residual exists, one extra transfer for it is appended.
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
+ */
+struct FfiMigrationSchedule *zcashlc_migration_propose_transfers(const uint8_t *db_data,
+                                                                 uintptr_t db_data_len,
+                                                                 const uint8_t *account_uuid_bytes,
+                                                                 uint32_t network_id,
+                                                                 bool include_residual);
+
+/**
+ * Propose the immediate (single-transaction) migration: sweep the whole spendable Orchard
+ * balance into one Ironwood output, executable now.
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
+ */
+struct FfiMigrationSchedule *zcashlc_migration_propose_immediate_transfers(const uint8_t *db_data,
+                                                                           uintptr_t db_data_len,
+                                                                           const uint8_t *account_uuid_bytes,
+                                                                           uint32_t network_id);
+
+/**
+ * Pre-sign and persist every transfer in the schedule. The schedule is passed back as JNI-style
+ * parallel arrays (all of length `ids_len`); `usk` is the raw Orchard-era `UnifiedSpendingKey`
+ * bytes. Returns `true` on success, `false` on error (see `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`] and [`rebuild_schedule`]; `usk_ptr` must be valid for `usk_len` bytes.
+ */
+bool zcashlc_migration_sign_and_store_schedule(const uint8_t *db_data,
+                                               uintptr_t db_data_len,
+                                               const uint8_t *account_uuid_bytes,
+                                               uint32_t network_id,
+                                               const char *const *ids,
+                                               uintptr_t ids_len,
+                                               const int64_t *amounts,
+                                               const int64_t *anchor_heights,
+                                               const int64_t *next_executable_after_heights,
+                                               const int64_t *expiry_heights,
+                                               uint32_t estimated_duration_hours,
+                                               const uint8_t *usk_ptr,
+                                               uintptr_t usk_len);
+
+/**
+ * The next height-due pre-signed transfer. On success the returned pointer is non-null; its `id`
+ * and `pczt` are null when nothing is due. A NULL return signals an error.
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with
+ * [`zcashlc_free_migration_prepared_transfer`].
+ */
+struct FfiPreparedTransfer *zcashlc_migration_next_due_transfer(const uint8_t *db_data,
+                                                                uintptr_t db_data_len,
+                                                                const uint8_t *account_uuid_bytes,
+                                                                uint32_t network_id);
+
+/**
+ * The next height-due scheduled transfer's full proposal (amount, anchor, timing) for an active
+ * run, or nothing when no transfer is currently due (no active run, or only the note-split prep is
+ * pending). Unlike `zcashlc_migration_next_due_transfer` (an opaque, already-signed PCZT), this
+ * exposes the same fields `zcashlc_migration_propose_transfers` originally returned, so a platform
+ * can re-arm its background window from `next_executable_after_height` without parsing the PCZT.
+ *
+ * A `NULL` return with no recorded last-error means "nothing pending" (an in-band `None`, like the
+ * `-1` sentinel of `zcashlc_migration_residual_after_migration`); a `NULL` return with a recorded
+ * last-error signals a failure (see `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with
+ * [`zcashlc_free_migration_transfer_proposal`].
+ */
+struct FfiTransferProposal *zcashlc_migration_pending_transfer_proposal(const uint8_t *db_data,
+                                                                        uintptr_t db_data_len,
+                                                                        const uint8_t *account_uuid_bytes,
+                                                                        uint32_t network_id);
+
+/**
+ * Extract the broadcast-ready consensus transaction bytes from a serialized signed PCZT (a
+ * prepared transfer's `pczt`). Returns the raw transaction bytes as a [`ffi::BoxedSlice`].
+ *
+ * # Safety
+ * See [`build_context`]; `pczt_ptr` must be valid for reads of `pczt_len` bytes. Free the
+ * returned pointer with `zcashlc_free_boxed_slice`.
+ */
+struct FfiBoxedSlice *zcashlc_migration_extract_broadcast_tx(const uint8_t *db_data,
+                                                             uintptr_t db_data_len,
+                                                             const uint8_t *account_uuid_bytes,
+                                                             uint32_t network_id,
+                                                             const uint8_t *pczt_ptr,
+                                                             uintptr_t pczt_len);
+
+/**
+ * Record the platform's broadcast outcome for a transfer, advancing the engine's state.
+ *
+ * `transfer_id` is the opaque id string the engine handed out. `result_tag` selects the
+ * [`TransferResult`] variant: `0` = Success (requires `txid_bytes`, 32 raw internal-order bytes),
+ * `1` = NetworkError (uses `retryable`), `2` = InvalidNote, `3` = Expired. `txid_bytes` may be
+ * null for every non-Success tag. Returns `true` on success, `false` on error (see
+ * `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`]; `transfer_id` must be a valid C string and, when `result_tag == 0`,
+ * `txid_bytes` must be valid for reads of 32 bytes.
+ */
+bool zcashlc_migration_record_transfer_result(const uint8_t *db_data,
+                                              uintptr_t db_data_len,
+                                              const uint8_t *account_uuid_bytes,
+                                              uint32_t network_id,
+                                              const char *transfer_id,
+                                              int32_t result_tag,
+                                              bool retryable,
+                                              const uint8_t *txid_bytes);
+
+/**
+ * Whether a sync is required before the next transfer. Returns `false` on error (see
+ * `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`].
+ */
+bool zcashlc_migration_is_sync_required(const uint8_t *db_data,
+                                        uintptr_t db_data_len,
+                                        const uint8_t *account_uuid_bytes,
+                                        uint32_t network_id);
+
+/**
+ * Re-evaluate the remaining spendable Orchard balance and return a fresh schedule (which then
+ * flows through the normal confirm → sign path). `include_residual` should match the choice made
+ * when the schedule being restarted was first proposed.
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
+ */
+struct FfiMigrationSchedule *zcashlc_migration_restart_step(const uint8_t *db_data,
+                                                            uintptr_t db_data_len,
+                                                            const uint8_t *account_uuid_bytes,
+                                                            uint32_t network_id,
+                                                            bool include_residual);
+
+/**
+ * Re-propose at a fresh anchor and re-sign the active run's scheduled transfers, returning the
+ * number refreshed. Returns `-1` on error (see `zcashlc_last_error_message`). `usk` is the raw
+ * Orchard-era `UnifiedSpendingKey` bytes; `include_residual` should match the schedule's original
+ * choice.
+ *
+ * # Safety
+ * See [`build_context`]; `usk_ptr` must be valid for reads of `usk_len` bytes.
+ */
+int64_t zcashlc_migration_refresh_stale_transfers(const uint8_t *db_data,
+                                                  uintptr_t db_data_len,
+                                                  const uint8_t *account_uuid_bytes,
+                                                  uint32_t network_id,
+                                                  const uint8_t *usk_ptr,
+                                                  uintptr_t usk_len,
+                                                  bool include_residual);
+
+/**
+ * Build the note-split transaction as an unsigned, proven PCZT for an external signer, staging
+ * the proven original in the wallet database. Returns the raw unsigned PCZT bytes as a
+ * [`ffi::BoxedSlice`].
+ *
+ * # Safety
+ * See [`build_context`]. Free the returned pointer with `zcashlc_free_boxed_slice`.
+ */
+struct FfiBoxedSlice *zcashlc_migration_create_unsigned_note_split_pczt(const uint8_t *db_data,
+                                                                        uintptr_t db_data_len,
+                                                                        const uint8_t *account_uuid_bytes,
+                                                                        uint32_t network_id);
+
+/**
+ * Accept the externally signed note-split PCZT: combine it with the staged proven original,
+ * verify and finalize it, persist the run, and return the broadcastable prepared transfer.
+ *
+ * # Safety
+ * See [`build_context`]; `signed_ptr` must be valid for reads of `signed_len` bytes. Free the
+ * returned pointer with [`zcashlc_free_migration_prepared_transfer`].
+ */
+struct FfiPreparedTransfer *zcashlc_migration_store_signed_note_split_pczt(const uint8_t *db_data,
+                                                                           uintptr_t db_data_len,
+                                                                           const uint8_t *account_uuid_bytes,
+                                                                           uint32_t network_id,
+                                                                           const uint8_t *signed_ptr,
+                                                                           uintptr_t signed_len);
+
+/**
+ * Build one unsigned, proven PCZT per transfer of the schedule for an external signer, staging
+ * each. The schedule is passed as JNI-style parallel arrays (all of length `ids_len`). Returns
+ * the `(id, unsigned PCZT)` pairs to route to the signing device.
+ *
+ * # Safety
+ * See [`build_context`] and [`rebuild_schedule`]. Free the returned pointer with
+ * [`zcashlc_free_migration_unsigned_transfer_pczts`].
+ */
+struct FfiUnsignedTransferPczts *zcashlc_migration_create_unsigned_transfer_pczts(const uint8_t *db_data,
+                                                                                  uintptr_t db_data_len,
+                                                                                  const uint8_t *account_uuid_bytes,
+                                                                                  uint32_t network_id,
+                                                                                  const char *const *ids,
+                                                                                  uintptr_t ids_len,
+                                                                                  const int64_t *amounts,
+                                                                                  const int64_t *anchor_heights,
+                                                                                  const int64_t *next_executable_after_heights,
+                                                                                  const int64_t *expiry_heights,
+                                                                                  uint32_t estimated_duration_hours);
+
+/**
+ * Accept the full set of externally signed transfer PCZTs (all-or-nothing) and, if every staged
+ * transfer is matched exactly, persist the committed schedule. The signed set is passed as
+ * parallel `ids` / `(pczts, pczt_lens)` arrays (all of length `ids_len`). Returns `true` on
+ * success, `false` on error (see `zcashlc_last_error_message`).
+ *
+ * # Safety
+ * See [`build_context`]. `ids`, `pczts`, and `pczt_lens` must each be valid for reads of
+ * `ids_len` elements (or null when `ids_len == 0`); each `ids[i]` must be a valid C string and
+ * each `pczts[i]` valid for `pczt_lens[i]` bytes.
+ */
+bool zcashlc_migration_store_signed_schedule_pczts(const uint8_t *db_data,
+                                                   uintptr_t db_data_len,
+                                                   const uint8_t *account_uuid_bytes,
+                                                   uint32_t network_id,
+                                                   const char *const *ids,
+                                                   uintptr_t ids_len,
+                                                   const uint8_t *const *pczts,
+                                                   const uintptr_t *pczt_lens);
+
+/**
+ * The NU6.3 (Ironwood) activation height for the given network id (`0` = testnet, `1` =
+ * mainnet), or `-1` when NU6.3 is unset for that network. Returns `-1` on error for any other
+ * network id (see `zcashlc_last_error_message`). Regtest/custom networks are out of scope here.
+ */
+int64_t zcashlc_ironwood_activation_height(uint32_t network_id);
+
+/**
+ * Open a voting database at the given path.
+ *
+ * Returns an opaque `*mut VotingDatabaseHandle` on success, or null on error.
+ *
+ * # Safety
+ *
+ * - For the `(path, path_len)` byte argument: if `path_len > 0` then `path` must be
+ *   non-null and valid for reads for `path_len` bytes; if `path_len == 0`, `path` is
+ *   ignored.
+ * - Call `zcashlc_voting_db_free` to free the returned handle.
+ */
+struct VotingDatabaseHandle *zcashlc_voting_db_open(const uint8_t *path,
+                                                    uintptr_t path_len,
+                                                    uint32_t network_id);
+
+/**
+ * Free a `VotingDatabaseHandle`.
+ *
+ * # Safety
+ *
+ * - If `ptr` is non-null, it must be a pointer previously returned by
+ *   `zcashlc_voting_db_open` that has not already been freed.
+ * - Calling this twice on the same non-null pointer, or on any pointer not obtained
+ *   from `zcashlc_voting_db_open`, is undefined behavior.
+ */
+void zcashlc_voting_db_free(struct VotingDatabaseHandle *ptr);
+
+/**
+ * Set the wallet identifier for all subsequent voting operations.
+ * Must be called after `zcashlc_voting_db_open` and before any round operations.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For the `(wallet_id, wallet_id_len)` byte argument: if `wallet_id_len > 0` then
+ *   `wallet_id` must be non-null and valid for reads for `wallet_id_len` bytes; if
+ *   `wallet_id_len == 0`, `wallet_id` is ignored.
+ */
+int32_t zcashlc_voting_set_wallet_id(struct VotingDatabaseHandle *db,
+                                     const uint8_t *wallet_id,
+                                     uintptr_t wallet_id_len);
+
+/**
+ * Generate or reconstruct an app-owned voting hotkey.
+ *
+ * zcash_voting 1.0 uses app-owned hotkeys. Pass an empty `stored_secret` to
+ * generate a fresh random hotkey, or a previously stored 64-byte secret to
+ * deterministically reconstruct the same hotkey; any other length is an
+ * error. The caller must persist `secret_key` (the stored secret) — it is
+ * the only way to reconstruct the hotkey.
+ *
+ * Returns a pointer to `FfiVotingHotkey` on success, or null on error.
+ * Call `zcashlc_voting_free_hotkey` to free the returned pointer.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+struct FfiVotingHotkey *zcashlc_voting_generate_hotkey(struct VotingDatabaseHandle *db,
+                                                       const uint8_t *stored_secret,
+                                                       uintptr_t stored_secret_len);
+
+/**
+ * Set up note bundles for a voting round.
+ *
+ * `notes_json` is a JSON-encoded `Vec<NoteInfo>`. Bundle packing follows the
+ * crate-owned policy (denomination-aware thresholds), and re-running with the
+ * same notes is idempotent.
+ *
+ * Returns a pointer to `FfiBundleSetupResult` on success, or null on error.
+ * Call `zcashlc_voting_free_bundle_setup_result` to free the returned pointer.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+struct FfiBundleSetupResult *zcashlc_voting_setup_bundles(struct VotingDatabaseHandle *db,
+                                                          const uint8_t *round_id,
+                                                          uintptr_t round_id_len,
+                                                          const uint8_t *notes_json,
+                                                          uintptr_t notes_json_len);
+
+/**
+ * Get the number of bundles for a round.
+ *
+ * Returns the bundle count on success, or -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+int64_t zcashlc_voting_get_bundle_count(struct VotingDatabaseHandle *db,
+                                        const uint8_t *round_id,
+                                        uintptr_t round_id_len);
+
+/**
+ * Build the governance PCZT for one delegation bundle.
+ *
+ * zcash_voting 1.0 selects snapshot-eligible notes and shapes key material
+ * from the wallet database itself, so this takes the wallet DB path and
+ * account UUID plus the app-owned hotkey stored secret.
+ *
+ * Returns JSON-encoded `JsonDelegationSetup` as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
+ */
+struct FfiBoxedSlice *zcashlc_voting_build_pczt(struct VotingDatabaseHandle *db,
+                                                const uint8_t *round_id,
+                                                uintptr_t round_id_len,
+                                                uint32_t bundle_index,
+                                                const uint8_t *wallet_db_data,
+                                                uintptr_t wallet_db_data_len,
+                                                const uint8_t *account_uuid,
+                                                uintptr_t account_uuid_len,
+                                                const uint8_t *hotkey_secret,
+                                                uintptr_t hotkey_secret_len,
+                                                const uint8_t *round_name,
+                                                uintptr_t round_name_len);
+
+/**
+ * Store a tree state for witness generation.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+int32_t zcashlc_voting_store_tree_state(struct VotingDatabaseHandle *db,
+                                        const uint8_t *round_id,
+                                        uintptr_t round_id_len,
+                                        const uint8_t *tree_state_bytes,
+                                        uintptr_t tree_state_bytes_len);
+
+/**
+ * Generate Merkle inclusion witnesses for the notes in a bundle and cache
+ * them in the voting DB.
+ *
+ * `notes_json` is a JSON-encoded `Vec<NoteInfo>`.
+ *
+ * Returns JSON-encoded `Vec<WitnessData>` as `*mut FfiBoxedSlice`, or null on
+ * error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For every `(ptr, len)` byte argument (`round_id`, `wallet_db_path`,
+ *   `notes_json`): if `len > 0` then `ptr` must be non-null and valid for
+ *   reads for `len` bytes; if `len == 0`, `ptr` is ignored. An empty
+ *   `notes_json` is treated as the empty notes list (JSON is not parsed),
+ *   and produces an empty witness list.
+ * - `network_id` must be `0` (testnet) or `1` (mainnet), matching other
+ *   `zcashlc_*` FFI.
+ */
+struct FfiBoxedSlice *zcashlc_voting_generate_note_witnesses(struct VotingDatabaseHandle *db,
+                                                             const uint8_t *round_id,
+                                                             uintptr_t round_id_len,
+                                                             uint32_t bundle_index,
+                                                             const uint8_t *wallet_db_path,
+                                                             uintptr_t wallet_db_path_len,
+                                                             const uint8_t *notes_json,
+                                                             uintptr_t notes_json_len,
+                                                             uint32_t network_id);
+
+/**
+ * Precompute PIR-backed nullifier data for one delegation bundle.
+ *
+ * Witnesses must already be stored (generate_note_witnesses). Returns
+ * JSON-encoded `JsonDelegationPirPrecomputeResult`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
+ */
+struct FfiBoxedSlice *zcashlc_voting_precompute_delegation_pir(struct VotingDatabaseHandle *db,
+                                                               const uint8_t *round_id,
+                                                               uintptr_t round_id_len,
+                                                               uint32_t bundle_index,
+                                                               const uint8_t *notes_json,
+                                                               uintptr_t notes_json_len,
+                                                               const uint8_t *pir_server_url,
+                                                               uintptr_t pir_server_url_len,
+                                                               uint32_t network_id);
+
+/**
+ * Generate and persist the delegation proof for one bundle.
+ *
+ * Witnesses and PIR precompute data must already be present. zcash_voting
+ * 1.0 shapes key material from the wallet database, so this takes the wallet
+ * DB path, account UUID, and app-owned hotkey stored secret.
+ *
+ * Returns JSON-encoded `JsonDelegationProofResult`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
+ * - `progress_callback`/`progress_context` follow the same contract as
+ *   `zcashlc_voting_build_vote_commitment`.
+ */
+struct FfiBoxedSlice *zcashlc_voting_build_and_prove_delegation(struct VotingDatabaseHandle *db,
+                                                                const uint8_t *round_id,
+                                                                uintptr_t round_id_len,
+                                                                uint32_t bundle_index,
+                                                                const uint8_t *wallet_db_data,
+                                                                uintptr_t wallet_db_data_len,
+                                                                const uint8_t *account_uuid,
+                                                                uintptr_t account_uuid_len,
+                                                                const uint8_t *hotkey_secret,
+                                                                uintptr_t hotkey_secret_len,
+                                                                const uint8_t *round_name,
+                                                                uintptr_t round_name_len,
+                                                                const uint8_t *pir_server_url,
+                                                                uintptr_t pir_server_url_len,
+                                                                void (*progress_callback)(double,
+                                                                                          void*),
+                                                                void *progress_context);
+
+/**
+ * Assemble chain-ready delegation submission fields, signing locally.
+ *
+ * The wallet seed never enters zcash_voting: the crate returns a signing
+ * request (sighash + alpha + routing fingerprint), the SpendAuth signature is
+ * produced here from the seed, and the signed submission is assembled from
+ * stored proof state.
+ *
+ * Returns JSON-encoded `JsonDelegationSubmission`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
+ */
+struct FfiBoxedSlice *zcashlc_voting_get_delegation_submission(struct VotingDatabaseHandle *db,
+                                                               const uint8_t *round_id,
+                                                               uintptr_t round_id_len,
+                                                               uint32_t bundle_index,
+                                                               const uint8_t *wallet_db_data,
+                                                               uintptr_t wallet_db_data_len,
+                                                               const uint8_t *account_uuid,
+                                                               uintptr_t account_uuid_len,
+                                                               const uint8_t *hotkey_secret,
+                                                               uintptr_t hotkey_secret_len,
+                                                               const uint8_t *round_name,
+                                                               uintptr_t round_name_len,
+                                                               const uint8_t *sender_seed,
+                                                               uintptr_t sender_seed_len);
+
+/**
+ * Get the delegation submission payload using a Keystone-provided signature.
+ *
+ * Returns JSON-encoded `DelegationSubmission` as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+struct FfiBoxedSlice *zcashlc_voting_get_delegation_submission_with_keystone_sig(struct VotingDatabaseHandle *db,
+                                                                                 const uint8_t *round_id,
+                                                                                 uintptr_t round_id_len,
+                                                                                 uint32_t bundle_index,
+                                                                                 const uint8_t *sig,
+                                                                                 uintptr_t sig_len,
+                                                                                 const uint8_t *sighash,
+                                                                                 uintptr_t sighash_len);
+
+/**
+ * Store the VAN leaf position after delegation transaction confirmation.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+int32_t zcashlc_voting_store_van_position(struct VotingDatabaseHandle *db,
+                                          const uint8_t *round_id,
+                                          uintptr_t round_id_len,
+                                          uint32_t bundle_index,
+                                          uint32_t position);
+
+/**
+ * Validate a PIR-fetched IMT non-membership proof bytewise.
+ *
+ * Inputs are the wire format of `zcash_voting::ImtProofData`: 32-byte LE
+ * pallas::Base values for the root and the three nf_bounds, a u32 leaf
+ * position, and 29 32-byte path siblings.
+ *
+ * Returns 1 if the proof is valid, 0 if it is well-formed but invalid, and -1
+ * if inputs are malformed or a panic occurs.
+ *
+ * # Safety
+ *
+ * - `root`, `nullifier`, and `expected_root` must each point to exactly 32 bytes.
+ * - `nf_bounds` must point to exactly 96 bytes (3 * 32).
+ * - `path` must point to exactly 928 bytes (29 * 32).
+ */
+int32_t zcashlc_voting_validate_pir_proof(const uint8_t *root,
+                                          const uint8_t *nf_bounds,
+                                          uint32_t leaf_pos,
+                                          const uint8_t *path,
+                                          const uint8_t *nullifier,
+                                          const uint8_t *expected_root);
+
+/**
+ * Free an `FfiRoundState` value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct returned by
+ *   `zcashlc_voting_get_round_state`.
+ */
+void zcashlc_voting_free_round_state(struct FfiRoundState *ptr);
+
+/**
+ * Free an `FfiVotingHotkey` value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct returned by the voting FFI.
+ */
+void zcashlc_voting_free_hotkey(struct FfiVotingHotkey *ptr);
+
+/**
+ * Free an `FfiBundleSetupResult` value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct returned by
+ *   `zcashlc_voting_setup_bundles`.
+ */
+void zcashlc_voting_free_bundle_setup_result(struct FfiBundleSetupResult *ptr);
+
+/**
+ * Free an `FfiRoundSummaries` value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct returned by
+ *   `zcashlc_voting_list_rounds`.
+ */
+void zcashlc_voting_free_round_summaries(struct FfiRoundSummaries *ptr);
+
+/**
+ * Free an `FfiVoteRecords` value.
+ *
+ * # Safety
+ *
+ * - `ptr` must be non-null and must point to a struct returned by
+ *   `zcashlc_voting_get_votes`.
+ */
+void zcashlc_voting_free_vote_records(struct FfiVoteRecords *ptr);
+
+/**
+ * Get wallet notes eligible for voting at the given snapshot height.
+ *
+ * Returns JSON-encoded `Vec<NoteInfo>` as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * `account_uuid` must be a non-null pointer to exactly `ACCOUNT_UUID_BYTE_LEN` bytes
+ * (binary account UUID).
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `wallet_db_path` must be a valid path for reads of `wallet_db_path_len` bytes.
+ * - When `account_uuid_len == ACCOUNT_UUID_BYTE_LEN`, `account_uuid` must be valid for
+ *   reads of `ACCOUNT_UUID_BYTE_LEN` bytes.
+ */
+struct FfiBoxedSlice *zcashlc_voting_get_wallet_notes(struct VotingDatabaseHandle *db,
+                                                      const uint8_t *wallet_db_path,
+                                                      uintptr_t wallet_db_path_len,
+                                                      uint64_t snapshot_height,
+                                                      uint32_t network_id,
+                                                      const uint8_t *account_uuid,
+                                                      uintptr_t account_uuid_len);
+
+/**
+ * Persist the on-chain transaction hash of a submitted delegation bundle.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` and `tx_hash` must be valid UTF-8 pointers with their stated lengths.
+ */
+int32_t zcashlc_voting_store_delegation_tx_hash(struct VotingDatabaseHandle *db,
+                                                const uint8_t *round_id,
+                                                uintptr_t round_id_len,
+                                                uint32_t bundle_index,
+                                                const uint8_t *tx_hash,
+                                                uintptr_t tx_hash_len);
+
+/**
+ * Load a previously stored delegation transaction hash.
+ *
+ * Returns a JSON-encoded `Option<String>`.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ */
+struct FfiBoxedSlice *zcashlc_voting_get_delegation_tx_hash(struct VotingDatabaseHandle *db,
+                                                            const uint8_t *round_id,
+                                                            uintptr_t round_id_len,
+                                                            uint32_t bundle_index);
+
+/**
+ * Persist the on-chain transaction hash of a submitted vote.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` and `tx_hash` must be valid UTF-8 pointers with their stated lengths.
+ */
+int32_t zcashlc_voting_store_vote_tx_hash(struct VotingDatabaseHandle *db,
+                                          const uint8_t *round_id,
+                                          uintptr_t round_id_len,
+                                          uint32_t bundle_index,
+                                          uint32_t proposal_id,
+                                          const uint8_t *tx_hash,
+                                          uintptr_t tx_hash_len);
+
+/**
+ * Load a previously stored vote transaction hash.
+ *
+ * Returns a JSON-encoded `Option<String>`.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ */
+struct FfiBoxedSlice *zcashlc_voting_get_vote_tx_hash(struct VotingDatabaseHandle *db,
+                                                      const uint8_t *round_id,
+                                                      uintptr_t round_id_len,
+                                                      uint32_t bundle_index,
+                                                      uint32_t proposal_id);
+
+/**
+ * Persist a vote commitment bundle and vote-commitment-tree position.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` and `bundle_json` must be valid UTF-8 pointers with their stated lengths.
+ */
+int32_t zcashlc_voting_store_commitment_bundle(struct VotingDatabaseHandle *db,
+                                               const uint8_t *round_id,
+                                               uintptr_t round_id_len,
+                                               uint32_t bundle_index,
+                                               uint32_t proposal_id,
+                                               const uint8_t *bundle_json,
+                                               uintptr_t bundle_json_len,
+                                               uint64_t vc_tree_position);
+
+/**
+ * Load a stored commitment bundle and vote-commitment-tree position.
+ *
+ * Returns a JSON-encoded `Option<(String, u64)>`.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ */
+struct FfiBoxedSlice *zcashlc_voting_get_commitment_bundle(struct VotingDatabaseHandle *db,
+                                                           const uint8_t *round_id,
+                                                           uintptr_t round_id_len,
+                                                           uint32_t bundle_index,
+                                                           uint32_t proposal_id);
+
+/**
+ * Record the confirmed vote-commitment tree position for a committed vote.
+ *
+ * Wraps `CommittedVote::recover` + `record_vc_position`: after the cast-vote
+ * transaction confirms with a `leaf_index`, record the VC position so
+ * recovered helper-share payloads carry it. Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ */
+int32_t zcashlc_voting_record_vc_position(struct VotingDatabaseHandle *db,
+                                          const uint8_t *round_id,
+                                          uintptr_t round_id_len,
+                                          uint32_t bundle_index,
+                                          uint32_t proposal_id,
+                                          uint64_t vc_tree_position);
+
+/**
+ * Reconstruct a committed vote from crate recovery state.
+ *
+ * Returns the same enriched JSON as `zcashlc_voting_build_vote_commitment`
+ * (bundle fields + `vote_auth_sig` + `share_payloads`, with payloads carrying
+ * the currently stored VC tree position) plus `vc_tree_position`. Call after
+ * `zcashlc_voting_record_vc_position` to obtain payloads at the confirmed
+ * position. Returns null (with the error retrievable) when no committed vote
+ * exists for the key.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ */
+struct FfiBoxedSlice *zcashlc_voting_recover_committed_vote(struct VotingDatabaseHandle *db,
+                                                            const uint8_t *round_id,
+                                                            uintptr_t round_id_len,
+                                                            uint32_t bundle_index,
+                                                            uint32_t proposal_id);
+
+/**
+ * Persist a Keystone-produced PCZT signature.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ * - `sig` must point to exactly 64 bytes.
+ * - `sighash` and `rk` must each point to exactly 32 bytes.
+ */
+int32_t zcashlc_voting_store_keystone_signature(struct VotingDatabaseHandle *db,
+                                                const uint8_t *round_id,
+                                                uintptr_t round_id_len,
+                                                uint32_t bundle_index,
+                                                const uint8_t *sig,
+                                                uintptr_t sig_len,
+                                                const uint8_t *sighash,
+                                                uintptr_t sighash_len,
+                                                const uint8_t *rk,
+                                                uintptr_t rk_len);
+
+/**
+ * Load all Keystone signatures stored for a round.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ */
+struct FfiBoxedSlice *zcashlc_voting_get_keystone_signatures(struct VotingDatabaseHandle *db,
+                                                             const uint8_t *round_id,
+                                                             uintptr_t round_id_len);
+
+/**
+ * Remove all recovery-state rows for a round.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `round_id` must be a valid UTF-8 pointer with its stated length.
+ */
+int32_t zcashlc_voting_clear_recovery_state(struct VotingDatabaseHandle *db,
+                                            const uint8_t *round_id,
+                                            uintptr_t round_id_len);
+
+/**
+ * Initialize a voting round.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - String/byte parameters must be valid for their stated lengths.
+ */
+int32_t zcashlc_voting_init_round(struct VotingDatabaseHandle *db,
+                                  const uint8_t *round_id,
+                                  uintptr_t round_id_len,
+                                  uint64_t snapshot_height,
+                                  const uint8_t *ea_pk,
+                                  uintptr_t ea_pk_len,
+                                  const uint8_t *nc_root,
+                                  uintptr_t nc_root_len,
+                                  const uint8_t *nullifier_imt_root,
+                                  uintptr_t nullifier_imt_root_len,
+                                  const uint8_t *session_json,
+                                  uintptr_t session_json_len);
+
+/**
+ * Get the state of a voting round.
+ *
+ * Returns a pointer to `FfiRoundState` on success, or null on error.
+ * Call `zcashlc_voting_free_round_state` to free the returned pointer.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+struct FfiRoundState *zcashlc_voting_get_round_state(struct VotingDatabaseHandle *db,
+                                                     const uint8_t *round_id,
+                                                     uintptr_t round_id_len);
+
+/**
+ * List all voting rounds.
+ *
+ * Returns a pointer to `FfiRoundSummaries` on success, or null on error.
+ * Call `zcashlc_voting_free_round_summaries` to free the returned pointer.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+struct FfiRoundSummaries *zcashlc_voting_list_rounds(struct VotingDatabaseHandle *db);
+
+/**
+ * Get vote records for a round.
+ *
+ * Returns a pointer to `FfiVoteRecords` on success, or null on error.
+ * Call `zcashlc_voting_free_vote_records` to free the returned pointer.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+struct FfiVoteRecords *zcashlc_voting_get_votes(struct VotingDatabaseHandle *db,
+                                                const uint8_t *round_id,
+                                                uintptr_t round_id_len);
+
+/**
+ * Clear all data for a voting round.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+int32_t zcashlc_voting_clear_round(struct VotingDatabaseHandle *db,
+                                   const uint8_t *round_id,
+                                   uintptr_t round_id_len);
+
+/**
+ * Delete bundle rows with index >= `keep_count`, removing skipped bundles.
+ *
+ * Returns the number of deleted rows on success, or -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+int64_t zcashlc_voting_delete_skipped_bundles(struct VotingDatabaseHandle *db,
+                                              const uint8_t *round_id,
+                                              uintptr_t round_id_len,
+                                              uint32_t keep_count);
+
+/**
+ * Compute the share reveal nullifier from client-known inputs.
+ *
+ * Returns the 32-byte nullifier as a hex string (64 chars), or null on error.
+ *
+ * # Safety
+ *
+ * - `vote_commitment` must point to exactly 32 bytes.
+ * - `primary_blind` must point to exactly 32 bytes.
+ */
+char *zcashlc_voting_compute_share_nullifier(const uint8_t *vote_commitment,
+                                             const uint8_t *primary_blind,
+                                             uint32_t share_index);
+
+/**
+ * Compute the crate-scheduled helper-share submit time.
+ *
+ * Pure policy over `zcash_voting`'s `share_policy`: derives the last-moment
+ * buffer from the ceremony timing and samples uniformly inside the
+ * pre-last-moment window from the supplied entropy (callers must pass at
+ * least 8 fresh CSPRNG bytes when a delay window exists; the crate owns the
+ * sampling). Returns the Unix seconds to submit at (0 = immediately), or -1
+ * on error.
+ *
+ * # Safety
+ *
+ * - If `entropy_len > 0` then `entropy` must be non-null and valid for reads
+ *   for `entropy_len` bytes; if `entropy_len == 0`, `entropy` is ignored.
+ */
+int64_t zcashlc_voting_scheduled_share_submit_at(uint64_t now_seconds,
+                                                 uint64_t ceremony_start_seconds,
+                                                 uint64_t vote_end_seconds,
+                                                 uint8_t single_share,
+                                                 const uint8_t *entropy,
+                                                 uintptr_t entropy_len);
+
+/**
+ * Record a share delegation after sending to helper servers.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - String params must be valid UTF-8 pointers with correct lengths.
+ * - `nullifier_hex` must point to exactly 64 hex chars.
+ * - `sent_to_urls_json` must be a JSON array of strings.
+ */
+int32_t zcashlc_voting_record_share_delegation(struct VotingDatabaseHandle *db,
+                                               const uint8_t *round_id,
+                                               uintptr_t round_id_len,
+                                               uint32_t bundle_index,
+                                               uint32_t proposal_id,
+                                               uint32_t share_index,
+                                               const uint8_t *sent_to_urls_json,
+                                               uintptr_t sent_to_urls_json_len,
+                                               const uint8_t *nullifier_hex,
+                                               uintptr_t nullifier_hex_len,
+                                               uint64_t submit_at);
+
+/**
+ * Get all share delegations for a round.
+ *
+ * Returns a JSON array of `JsonShareDelegationRecord`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+struct FfiBoxedSlice *zcashlc_voting_get_share_delegations(struct VotingDatabaseHandle *db,
+                                                           const uint8_t *round_id,
+                                                           uintptr_t round_id_len);
+
+/**
+ * Get unconfirmed share delegations for a round.
+ *
+ * Returns a JSON array of `JsonShareDelegationRecord`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+struct FfiBoxedSlice *zcashlc_voting_get_unconfirmed_delegations(struct VotingDatabaseHandle *db,
+                                                                 const uint8_t *round_id,
+                                                                 uintptr_t round_id_len);
+
+/**
+ * Mark a share delegation as confirmed on-chain.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+int32_t zcashlc_voting_mark_share_confirmed(struct VotingDatabaseHandle *db,
+                                            const uint8_t *round_id,
+                                            uintptr_t round_id_len,
+                                            uint32_t bundle_index,
+                                            uint32_t proposal_id,
+                                            uint32_t share_index);
+
+/**
+ * Append new server URLs to a share delegation's `sent_to_urls`.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - `new_urls_json` must be a JSON array of strings.
+ */
+int32_t zcashlc_voting_add_sent_servers(struct VotingDatabaseHandle *db,
+                                        const uint8_t *round_id,
+                                        uintptr_t round_id_len,
+                                        uint32_t bundle_index,
+                                        uint32_t proposal_id,
+                                        uint32_t share_index,
+                                        const uint8_t *new_urls_json,
+                                        uintptr_t new_urls_json_len);
+
+/**
+ * Sync the vote commitment tree from a chain node.
+ *
+ * Returns the latest synced block height on success (>= 0), or -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+int64_t zcashlc_voting_sync_vote_tree(struct VotingDatabaseHandle *db,
+                                      const uint8_t *round_id,
+                                      uintptr_t round_id_len,
+                                      const uint8_t *node_url,
+                                      uintptr_t node_url_len);
+
+/**
+ * Generate a Vote Authority Note (VAN) Merkle witness.
+ *
+ * Returns JSON-encoded `VanWitness` as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+struct FfiBoxedSlice *zcashlc_voting_generate_van_witness(struct VotingDatabaseHandle *db,
+                                                          const uint8_t *round_id,
+                                                          uintptr_t round_id_len,
+                                                          uint32_t bundle_index,
+                                                          uint32_t anchor_height);
+
+/**
+ * Drop the in-memory TreeClient so the next `sync_vote_tree()` call
+ * creates a fresh one.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ */
+int32_t zcashlc_voting_reset_tree_client(struct VotingDatabaseHandle *db,
+                                         const uint8_t *round_id,
+                                         uintptr_t round_id_len);
+
+/**
+ * Warm process-lifetime proving-key caches used by voting proofs.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t zcashlc_voting_warm_proving_caches(void);
+
+/**
+ * Decompose a weight into power-of-two components.
+ *
+ * Returns JSON-encoded `Vec<u64>` as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * No pointer parameters.
+ */
+struct FfiBoxedSlice *zcashlc_voting_decompose_weight(uint64_t weight);
+
+/**
+ * Superseded: zcash_voting 1.0 derives delegation inputs from the wallet database
+ * inside the delegation lanes (`build_pczt` / `build_and_prove_delegation` /
+ * `get_delegation_submission`); seed-derived side inputs no longer exist.
+ * Always returns null with a "superseded" error (C symbol preserved).
+ *
+ * # Safety
+ *
+ * - The pointer arguments are not read.
+ */
+struct FfiBoxedSlice *zcashlc_voting_generate_delegation_inputs(const uint8_t *_sender_seed,
+                                                                uintptr_t _sender_seed_len,
+                                                                const uint8_t *_hotkey_seed,
+                                                                uintptr_t _hotkey_seed_len,
+                                                                uint32_t _network_id,
+                                                                uint32_t _account_index);
+
+/**
+ * Superseded: zcash_voting 1.0 derives delegation inputs from the wallet database
+ * inside the delegation lanes; see `zcashlc_voting_generate_delegation_inputs`.
+ * Always returns null with a "superseded" error (C symbol preserved).
+ *
+ * # Safety
+ *
+ * - The pointer arguments are not read.
+ */
+struct FfiBoxedSlice *zcashlc_voting_generate_delegation_inputs_with_fvk(const uint8_t *_fvk_bytes,
+                                                                         uintptr_t _fvk_bytes_len,
+                                                                         const uint8_t *_hotkey_seed,
+                                                                         uintptr_t _hotkey_seed_len,
+                                                                         uint32_t _network_id,
+                                                                         const uint8_t *_seed_fingerprint,
+                                                                         uintptr_t _seed_fingerprint_len);
+
+/**
+ * Extract the ZIP-244 shielded sighash from finalized PCZT bytes.
+ *
+ * Returns the 32-byte sighash as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `pczt_bytes` must be valid for reads of `pczt_bytes_len` bytes.
+ */
+struct FfiBoxedSlice *zcashlc_voting_extract_pczt_sighash(const uint8_t *pczt_bytes,
+                                                          uintptr_t pczt_bytes_len);
+
+/**
+ * Extract a spend auth signature from a signed PCZT.
+ *
+ * Returns the signature bytes as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `signed_pczt_bytes` must be valid for reads of `signed_pczt_bytes_len` bytes.
+ */
+struct FfiBoxedSlice *zcashlc_voting_extract_spend_auth_sig(const uint8_t *signed_pczt_bytes,
+                                                            uintptr_t signed_pczt_bytes_len,
+                                                            uint32_t action_index);
+
+/**
+ * Extract the 96-byte Orchard FVK from a UFVK string.
+ *
+ * Returns the raw 96-byte Orchard FVK as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `ufvk_str` must be valid for reads of `ufvk_str_len` bytes (UTF-8 encoded).
+ */
+struct FfiBoxedSlice *zcashlc_voting_extract_orchard_fvk_from_ufvk(const uint8_t *ufvk_str,
+                                                                   uintptr_t ufvk_str_len,
+                                                                   uint32_t network_id);
+
+/**
+ * Extract the Ironwood note commitment tree root from a protobuf-encoded TreeState.
+ *
+ * Voting rounds anchor to the Ironwood pool (zcash_voting 1.0), so the `nc_root`
+ * comes from the Ironwood tree, not Orchard. Returns the 32-byte nc_root as
+ * `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `tree_state_bytes` must be valid for reads of `tree_state_bytes_len` bytes.
+ */
+struct FfiBoxedSlice *zcashlc_voting_extract_nc_root(const uint8_t *tree_state_bytes,
+                                                     uintptr_t tree_state_bytes_len);
+
+/**
+ * Verify a Merkle witness.
+ *
+ * `witness_json` is a JSON-encoded `WitnessData`.
+ *
+ * Returns 1 if valid, 0 if invalid, -1 on error.
+ *
+ * # Safety
+ *
+ * - `witness_json` must be valid for reads of `witness_json_len` bytes.
+ */
+int32_t zcashlc_voting_verify_witness(const uint8_t *witness_json, uintptr_t witness_json_len);
+
+/**
+ * Encrypt voting shares for a round.
+ *
+ * `shares_json` is a JSON-encoded `Vec<u64>`.
+ *
+ * Returns JSON-encoded `Vec<WireEncryptedShare>` as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
+ */
+struct FfiBoxedSlice *zcashlc_voting_encrypt_shares(struct VotingDatabaseHandle *db,
+                                                    const uint8_t *round_id,
+                                                    uintptr_t round_id_len,
+                                                    const uint8_t *shares_json,
+                                                    uintptr_t shares_json_len);
+
+/**
+ * Build a vote commitment proof for a proposal.
+ *
+ * `van_auth_path_json` is a JSON-encoded `Vec<Vec<u8>>`, where each element is 32 bytes.
+ *
+ * Returns JSON-encoded `VoteCommitmentBundle` as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
+ * - `progress_callback` must be a valid function pointer, or null to skip
+ *   progress. If provided, it must remain callable until this function returns.
+ *   It must be thread-safe and reentrant; callers must not assume it runs on
+ *   the main thread, because progress may be reported from proving worker threads.
+ * - `progress_context` is passed to `progress_callback` unchanged. If non-null,
+ *   it must point to state that remains valid until this function returns. The
+ *   callback must not store `progress_context` or use it after this function returns.
+ * - The callback must not call back into this voting database handle or perform
+ *   work that can deadlock or reenter the active proof operation.
+ */
+struct FfiBoxedSlice *zcashlc_voting_build_vote_commitment(struct VotingDatabaseHandle *db,
+                                                           const uint8_t *round_id,
+                                                           uintptr_t round_id_len,
+                                                           uint32_t bundle_index,
+                                                           const uint8_t *hotkey_seed,
+                                                           uintptr_t hotkey_seed_len,
+                                                           uint32_t network_id,
+                                                           uint32_t proposal_id,
+                                                           uint32_t choice,
+                                                           uint32_t num_options,
+                                                           const uint8_t *van_auth_path_json,
+                                                           uintptr_t van_auth_path_json_len,
+                                                           uint32_t van_position,
+                                                           uint32_t anchor_height,
+                                                           void (*progress_callback)(double, void*),
+                                                           void *progress_context,
+                                                           uint8_t single_share);
+
+/**
+ * Build share payloads for delegated share submission.
+ *
+ * `commitment_json` is the JSON-encoded `VoteCommitmentBundle` returned by
+ * `zcashlc_voting_build_vote_commitment`. Its `enc_shares` field is extracted
+ * to wire-share form before reconstructing the core commitment, ensuring
+ * helper payloads are built from the ciphertexts committed by the vote proof.
+ *
+ * Returns JSON-encoded `Vec<SharePayload>` as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
+ */
+struct FfiBoxedSlice *zcashlc_voting_build_share_payloads(struct VotingDatabaseHandle *db,
+                                                          const uint8_t *commitment_json,
+                                                          uintptr_t commitment_json_len,
+                                                          uint32_t vote_decision,
+                                                          uint32_t num_options,
+                                                          uint64_t vc_tree_position,
+                                                          uint8_t single_share);
+
+/**
+ * Mark a vote as submitted for a specific proposal and bundle.
+ *
+ * Returns 0 on success, or -1 on error.
+ *
+ * # Safety
+ *
+ * - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+ * - For the `(round_id, round_id_len)` byte argument, if `round_id_len > 0`
+ *   then `round_id` must be non-null and valid for reads for `round_id_len`
+ *   bytes; if `round_id_len == 0`, `round_id` is ignored.
+ */
+int32_t zcashlc_voting_mark_vote_submitted(struct VotingDatabaseHandle *db,
+                                           const uint8_t *round_id,
+                                           uintptr_t round_id_len,
+                                           uint32_t bundle_index,
+                                           uint32_t proposal_id);
+
+/**
+ * Sign a cast-vote transaction.
+ *
+ * Takes fields from `VoteCommitmentBundle` plus the hotkey seed and computes
+ * the spend authorization signature.
+ * `vote_round_id_hex` must encode exactly 32 bytes as ASCII hex. `r_vpk_bytes`,
+ * `van_nullifier`, `vote_authority_note_new`, `vote_commitment`, and
+ * `alpha_v` must each be exactly 32 bytes.
+ *
+ * Returns JSON-encoded `CastVoteSignature` as `*mut FfiBoxedSlice`, or null on error.
+ *
+ * # Safety
+ *
+ * - For every `(ptr, len)` byte argument, if `len > 0` then `ptr` must be
+ *   non-null and valid for reads for `len` bytes; if `len == 0`, `ptr` is ignored.
+ */
+struct FfiBoxedSlice *zcashlc_voting_sign_cast_vote(const uint8_t *hotkey_seed,
+                                                    uintptr_t hotkey_seed_len,
+                                                    uint32_t network_id,
+                                                    const uint8_t *vote_round_id_hex,
+                                                    uintptr_t vote_round_id_hex_len,
+                                                    const uint8_t *r_vpk_bytes,
+                                                    uintptr_t r_vpk_bytes_len,
+                                                    const uint8_t *van_nullifier,
+                                                    uintptr_t van_nullifier_len,
+                                                    const uint8_t *vote_authority_note_new,
+                                                    uintptr_t vote_authority_note_new_len,
+                                                    const uint8_t *vote_commitment,
+                                                    uintptr_t vote_commitment_len,
+                                                    uint32_t proposal_id,
+                                                    uint32_t anchor_height,
+                                                    const uint8_t *alpha_v,
+                                                    uintptr_t alpha_v_len);
