@@ -3077,6 +3077,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             &SpendingKeys::from_unified_spending_key(usk),
             OvkPolicy::Sender,
             &proposal,
+            None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
