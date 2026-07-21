@@ -10,6 +10,23 @@ Last reviewed: 2026-07-20
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
+## Current monitor status (2026-07-20)
+
+- After fetching both remotes, `origin/main` is `ee3abea2` and `upstream/main` is
+  `89d85c49` (upstream PR `#1815`). The default-branch count is `160 4`; PR `#26`
+  is the sole parity vehicle and its head contains all four upstream commits.
+- The parity merge adopted the copyright-holder update and required-build-path change without
+  altering Zend artifacts, private-engine provenance, branding, or Ironwood behavior. Local
+  `swift build` and `swift test --filter OfflineTests` both pass (546 offline tests, 0 failures).
+- Upstream PRs `#1813` and `#1812` are now clean and green but remain one 90-file
+  Orchard-to-Ironwood protocol/FFI/persistence/API stack. Keep them out of Zend until upstream
+  merges them and a Zend artifact/reconciliation plan is reviewed.
+- `michal/slipstream-support` is 37 commits ahead and 4 behind `upstream/main`, has no scoped
+  upstream PR, and still changes 114 files. It is not a reviewable low-risk early carry.
+- All other active upstream PRs remain in the existing wait-for-upstream classes:
+  draft, blocked/review-required, dirty, failed, or broad protocol/FFI/release work.
+  No early-carry candidate currently satisfies ready, useful, and low-risk.
+
 ## Parity sync workflow (upstream default branch)
 
 Use this flow when `upstream/main` has commits not present in `origin/main`.
@@ -203,13 +220,22 @@ Zend Ironwood hardening line:
 Default-branch parity:
 
 - Zend PR `#18` merged as `b3569196`, PR `#17` merged as `1bbc35a6`, PR `#20` merged as `2e6d8a27`,
-  and PR `#21` merged as `02f9a78e`, so `origin/main` contains upstream `main` through `d92a7940` /
-  upstream PR `#1802` plus the current Ironwood SDK baseline and Swift CI optimization.
-- `git rev-list --left-right --count origin/main...upstream/main` returns `152 0`, and
-  `git merge-base --is-ancestor upstream/main origin/main` succeeds.
+  and PR `#21` merged as `02f9a78e`; `origin/main` remains through upstream `d92a7940` / PR `#1802`
+  plus the current Ironwood SDK baseline and Swift CI optimization.
+- Upstream advanced through `7744bcec` / PR `#1811` (a one-line `CLAUDE.md` pre-commit-formatting
+  instruction). Draft Zend PR `#26` (`codex/zcash-upstream-sync-2026-07-17`) cleanly merges those
+  two upstream commits; its GitHub `build` check passed. As of this review,
+  `git rev-list --left-right --count origin/main...upstream/main` returns `160 2`, so leave PR `#26`
+  as the parity vehicle until it is reviewed and merged.
 
 Open upstream PRs assessed as not ready to carry right now:
 
+- `#1813` and `#1812` (`michal/MOB-1455/MOB-1495-sdk-pool-migration-*`): non-draft, clean, and
+  green, but jointly a 90-file Orchard-to-Ironwood migration stack. They change the public
+  `Synchronizer` API, Rust dependency family and FFI, migration privacy gates, persistence,
+  generated mocks, and OfflineTests. Zend already has a separately reviewed Ironwood baseline, so
+  wait for an upstream merge plus an explicit artifact/reconciliation plan rather than carry this
+  protocol-facing stack early.
 - `#1810` (`kris/lwd-network-privacy`): draft, `BLOCKED`, and review-required, despite green
   build and zizmor checks. It replaces the Tor wrapper with the Rust network-privacy layer, so it
   has runtime and dependency impact; wait for upstream API stabilization and review before Zend
@@ -283,9 +309,13 @@ Unmerged upstream branches (not carried):
 - `michal/MOB-1455-4-set-activation-height`: 29 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1797`, build-failing, and part of the Ironwood stack.
 - `michal/MOB-1455-5-final-fixes`: 35 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1798`, build-failing, and part of the Ironwood stack.
 - `michal/MOB-1455-6-integration-with-final-zodl`: 38 commits ahead and 7 behind `upstream/main`; no upstream PR exists yet, and the branch layers Keystone PCZT and final Zodl integration work on top of the draft build-failing Ironwood stack, so do not carry it until upstream opens/reviews it and the stack turns green.
-- `michal/slipstream-support`: 22 commits ahead and 2 behind `upstream/main`; no upstream PR is
-  open for this active branch. It is unreviewed Slipstream integration work, so do not carry it
-  until a scoped PR, review thread, and stable public artifact direction exist.
+- `michal/MOB-1455/MOB-1495-sdk-pool-migration`: 4 commits ahead and 29 behind `upstream/main`;
+  covered by upstream PR `#1812`, now clean and green but still broad across public `Synchronizer`,
+  FFI, Rust dependency, migration privacy, and persistence surfaces. Wait for upstream merge, a
+  released FFI artifact, and a Zend reconciliation plan.
+- `michal/slipstream-support`: 37 commits ahead and 4 behind `upstream/main` after a force-push; no
+  upstream PR is open for this active branch. It is unreviewed Slipstream integration work, so do
+  not carry it until a scoped PR, review thread, and stable public artifact direction exist.
 - `michal/ironwood-support-2.6.0`: 18 commits ahead and 2 behind `upstream/main`; covered by open
   upstream PR `#1807`, which is green but review-required and broad across protocol, FFI, and
   voting surfaces. Wait for upstream merge/reconciliation rather than carrying it ahead.
