@@ -94,9 +94,8 @@ jobs:
 
     # --- Swift manual build steps (mirrors swift.yml) ---
     #
-    # Swift does not support build-mode: none. The private migration engine is built and tested in
-    # its own repository; public SDK CodeQL consumes the reviewed, committed FFI artifact without
-    # requiring private-repository credentials.
+    # Swift does not support build-mode: none. Public SDK CodeQL consumes the reviewed, committed
+    # FFI artifact from the exact public Rust graph.
 
     - name: Select Xcode version
       if: matrix.language == 'swift'

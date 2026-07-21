@@ -1,4 +1,13 @@
 # Migrating from previous versions to _Unreleased_
+
+## `prepare` now validates the seed against the existing wallet
+
+If the wallet database already contains seed-derived account(s) and the seed passed to `prepare`
+does not match them, `prepare` throws `ZcashError.initializerSeedMismatch` (`ZINIT0006`) instead of
+silently opening the old wallet (which desynced the app's stored seed from the on-disk account).
+Restoring a different wallet requires `wipe()` first. Wallets whose only accounts are imported
+(hardware-wallet UFVKs) are exempt — there is no seed-derived account to compare.
+
 PendingDb is no longer used. Wallet developers should take care about deleting
 the database file since the SDK will no longer require it or any of the
 information stored. 
@@ -6,28 +15,58 @@ information stored.
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
 track failures on its own. Wallet developers would have to account for those.
 
-## Configurable activation heights (regtest / custom networks)
+## Custom (regtest-style) networks and `NetworkType.regtest`
 
-New, **additive** capability for pointing the SDK at a custom-parameter (regtest) `lightwalletd` — e.g. an Ironwood testing backend — whose network upgrades activate at arbitrary heights instead of the hardcoded mainnet/testnet values. Existing code is unaffected; you opt in by building a regtest `ZcashNetwork`:
+`NetworkType` gained a third case, `regtest`. **This is a source-breaking change for exhaustive
+`switch` statements over `NetworkType`** — add a `.regtest` arm (or a `default`) when updating.
 
-```swift
-let network = ZcashNetworkBuilder.regtest(activationHeights: NetworkActivationHeights(
-    sapling: 1,
-    nu5: 100,
-    nu6: 200,
-    nu6_3: 5000   // Ironwood
-))
-let initializer = Initializer(/* … */, network: network)
-```
+Custom networks let the SDK talk to a custom-parameter chain (for example a modified-mainnet
+Ironwood testing backend) whose network upgrades activate at arbitrary heights:
 
-- Set the heights to mirror the `nuparams` of the node / `lightwalletd` you connect to. `nil` means "not activated".
-- A regtest network reports its type as **Regtest**: addresses are regtest-encoded and its databases use a `ZcashSdk_regtest_` name prefix (no collision with mainnet/testnet data). The SDK expects the server to report `chainName == "regtest"`.
-- Regtest ships no bundled checkpoints; a fresh wallet scans from the Sapling activation height (empty tree). For a higher birthday, seed a tree state via `Synchronizer.getTreeState(height:)`.
-- Running the Orchard→Ironwood **migration** on regtest is not yet supported. See `docs/handoffs/ZODL-regtest-activation-heights.md`.
+- `ZcashNetworkBuilder.regtest(activationHeights:)` builds a regtest-identity network with the given
+  `NetworkActivationHeights` (a `nil` height means "not activated"; the heights are not validated —
+  mirror the `nuparams` of the node/`lightwalletd` you connect to).
+- `ZcashNetworkBuilder.custom(base:activationHeights:)` combines a chosen base identity (address
+  encoding + expected `chainName`, e.g. `.mainnet` for a modified-mainnet backend) with custom
+  heights. On-disk databases still use the `regtest`-slot name prefix, so a custom network never
+  collides with a real mainnet/testnet wallet in the same container.
+- Server validation relaxes for custom networks: `ValidateServerAction` and
+  `evaluateBestOf(endpoints:...)` skip the chain-name and consensus-branch-ID checks (the server of a
+  modified chain may identify with its base chain's name and a nonstandard branch id). The
+  Sapling-activation-height check still applies.
 
-## Ironwood (NU6.3) balance on `AccountBalance`
+**Process-global registration and ordering.** The custom network's parameters are registered with
+the Rust core **once per process** (the first `Initializer` created with a custom network does this).
+Anything that resolves the custom network id before that registration — e.g. a
+`DerivationTool(networkType: .regtest)` created before any `Initializer` — fails with
+"custom network (id 2) used before it was configured", and key validators return `false`. Create the
+`Initializer` first, or call `ZcashRustBackend.setCustomNetwork` yourself at startup. Registering a
+**different** custom network later in the same process is a configuration bug: the newest values win
+process-globally while earlier instances keep their own per-instance state (checkpoint sources,
+constants), so the two desynchronize — the registration call reports this (and asserts in debug).
 
-`AccountBalance` gains a public `ironwoodBalance: PoolBalance` field (Ironwood is Orchard note-version V3, received at the account's existing Orchard receiver — there is no separate Ironwood address). The field is **additive** and is `.zero` for every wallet until NU6.3 activates and a lightwalletd serves Ironwood compact blocks. No action is required now; an app that wants to surface Ironwood can read/total it alongside `orchardBalance`. (If you construct `AccountBalance` yourself, e.g. in tests, the new field defaults to `.zero` via the memberwise initializer, so existing call sites keep compiling.)
+## Voting: submission contract and pre-1.0 database reset
+
+The voting stack now rides upstream `zcash_voting` 1.0 (see the CHANGELOG for the full surface).
+Two changes affect callers of the voting API directly:
+
+- **`storeVoteTxHash` is what records submission.** Persisting the on-chain transaction hash now
+  marks the vote submitted (submission state is derived from the stored hash and written atomically).
+  Call `storeVoteTxHash` once the vote transaction is broadcast. `markVoteSubmitted` no longer stands
+  alone — it re-applies that state idempotently (rejecting a conflicting hash) and throws if no hash
+  has been stored yet. Any flow that previously called `markVoteSubmitted` as the submission mark must
+  call `storeVoteTxHash` first.
+- **Alpha-era voting databases are reset on open.** The voting database schema was rebuilt for 1.0;
+  opening a voting database created by a 2.6.0-alpha build drops and recreates every voting table
+  (rounds, votes, bundles, proofs, witnesses, share delegations, …). In-progress votes from an alpha
+  build do not survive the upgrade and must be re-cast. This is the separate voting database only —
+  wallet balances and the main wallet database are unaffected.
+
+The voting hotkey contract also changed: `generateHotkey` takes `storedSecret:` (an app-owned
+opaque secret) instead of `seed:`. Passing an empty array mints a fresh random hotkey; passing a
+previously stored 64-byte secret deterministically reconstructs the same hotkey. Persisting that
+secret is the only way to recover the same hotkey — the pre-1.0 seed-derived derivation is not
+reproducible under 1.0.
 
 ## `Broadcaster` redesign (multi-server submission)
 
@@ -48,53 +87,6 @@ let outcome = await synchronizer.broadcaster.submit(
 - Retry semantics: the endpoint list passed to `submit` is persisted as the transaction's retry plan. The SDK's background resubmission retries pending transactions through those endpoints (sequentially) instead of the synchronizer's default endpoint, and never auto-submits transactions created through `Broadcaster` that the app hasn't submitted yet. If the plan store cannot be read, background resubmission skips the affected transactions rather than falling back to the default endpoint. Plans are kept until the transaction expires (so a chain reorg cannot detach a transaction from its recorded endpoints), and `Synchronizer.wipe()` deletes the plan database file.
 - The retry plan is recorded before any network attempt and stays recorded when `submit` returns `.cancelled` or `.timedOut`: background resubmission may still broadcast the transaction later. Treat those outcomes as "outcome unknown", not as "not sent".
 - `LightWalletEndpoint` now conforms to `Equatable`. If your app declared that conformance retroactively, remove your declaration.
-
-## Orchard → Ironwood migration API on `Synchronizer`
-
-The early anchored, pre-sign-all migration API has been replaced. Remove calls to
-`proposeMigrationTransfers`, `proposeImmediateMigrationTransfers`,
-`signAndStoreMigrationSchedule`, `proposeMigrationTransferPCZTs`,
-`storeSignedMigrationTransferPCZTs`, `executeNextPendingTransfer`,
-`refreshStaleTransfers`, and `restartCurrentMigrationStep`; they are no longer in the public
-`Synchronizer` contract. The supported flow commits anchorless intents once and materializes at
-most one due transaction with a fresh anchor and expiry window.
-
-Migration UI and background workers must read one authoritative `migrationSnapshot(for:)` and
-render its `phase`, `state`, `failureCode`, `recoveryAction`, and `nextAction`. Every mutation of an
-existing run takes the caller's `expectedRunId` and `expectedRevision`. If either changed, discard
-the result, refresh the snapshot, and re-drive from its new `nextAction`; never apply an action to a
-replacement run merely because its revision number happens to match.
-
-The principal APIs are:
-
-- `beginPrivateMigration(externalSigner:options:for:)` validates the selected endpoint first, then
-  atomically creates the private run and immutable submission policy. Endpoint validation cannot
-  leave a policyless run or block ordinary spends while RPC is in flight.
-- `proposePrivateMigrationIntents(for:)` and `proposeImmediateMigrationIntent(for:)` return the
-  exact anchorless plan for confirmation. `commitMigrationIntents(_:externalSigner:options:for:)`
-  validates the endpoint and atomically commits an Immediate run, its policy, and its intents; an
-  existing Private run must already carry the same policy.
-- `executeNextMigrationAction(expectedRunId:expectedRevision:spendingKey:options:for:)` performs at
-  most one engine-authorized software/background step. Offline missed windows are rebased by the
-  engine; signed or possibly submitted bytes are reconciled instead of blindly rebuilt.
-- `stageNextDueMigrationPCZT`, `resumeNoteSplitExternalSigning`, and
-  `resumeDueMigrationExternalSigning` also require the expected run/revision. They return the exact
-  persisted signer envelope after process death. Signed-PCZT submission APIs require the caller's
-  current revision and preserve the engine claim token through finalization and broadcast.
-- `bindMigrationSubmissionPolicy(expectedRunId:expectedRevision:options:for:)` is only the explicit
-  repair path for upgraded legacy runs. Chain-exposed policyless bytes remain quarantined until
-  mining or positive consensus expiry resolves them.
-
-`NetworkPrivacyOptions` is authoritative. Direct and Tor transports never silently fall back to
-one another; the endpoint's TLS identity, chain name, sampled tip, consensus branch, transaction
-branch, and expiry safety window are validated before submission. A nonzero lightwalletd submit
-code is not success unless exact-txid reconciliation proves the transaction is known.
-
-Snapshot read/decode/corruption failures surface as a non-operational
-`.walletSchemaUnavailable` projection (`nextAction == .none`, ordinary spends blocked). Do not
-render or execute a cached runnable snapshot in that state. Ordinary-spend reservations are scoped
-to the migrating account, so another account in the same wallet remains usable when its own
-authoritative guard succeeds.
 
 # Migrating from previous versions to 0.20.0-beta
 The `SDKSynchronizer` no longer uses `NotificationCenter` to send notifications.

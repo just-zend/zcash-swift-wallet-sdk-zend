@@ -1,4 +1,14 @@
-# Fetch git dependencies through the system git CLI so private just-zend repos resolve with the
-# environment's normal ssh credentials (cargo's built-in fetcher has no access to them).
+# [#1806] zcash_voting gates all of its Ironwood (NU6.3) support behind this
+# rustc cfg; without it the crate compiles with `VotingShieldedProtocol` as an
+# empty enum and every delegation entry point fails at runtime. librustzcash
+# ships NU6.3 ungated, so only the voting crate needs the flag. Cargo config
+# discovery is cwd-based: this single file covers Scripts/*, the BuildSupport
+# Makefile, CI workflows, and local `cargo test`, all of which run inside the
+# repo.
+[build]
+rustflags = ["--cfg", 'zcash_unstable="nu6.3"']
+
+# Use the system Git client for exact git dependencies. This keeps local and CI
+# resolution aligned with the configured Git credential helper and SSH setup.
 [net]
 git-fetch-with-cli = true

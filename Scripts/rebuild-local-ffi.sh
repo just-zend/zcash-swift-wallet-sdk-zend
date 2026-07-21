@@ -170,6 +170,10 @@ rm -rf "$XCFRAMEWORK_DIR"
 mv "$TEMP_XCFW" "$XCFRAMEWORK_DIR"
 rm -rf "$TEMP_DIR"
 
+if [[ "$TARGET" == "macos" ]]; then
+    ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/$XCFRAMEWORK_SLICE/libzcashlc.framework"
+fi
+
 echo ""
 echo "Rebuilt $TARGET ($ARCH) in $XCFRAMEWORK_DIR"
 echo ""

@@ -1,19 +1,25 @@
-use std::ffi::CString;
-
 use anyhow::anyhow;
 use serde::Serialize;
 use zcash_client_sqlite::util::SystemClock;
-use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_protocol::consensus::Network;
 use zcash_voting as voting;
-use zip32::{AccountId, Scope};
-
-use super::constants::{HOTKEY_RAW_ADDRESS_LEN, MIN_SEED_LEN};
-use super::ffi_types::FfiVotingHotkey;
 
 // =============================================================================
 // Helper functions
 // =============================================================================
+
+/// Converts the FFI `network_id` convention (`0` = testnet, `1` = mainnet) into the
+/// [`zcash_voting::Network`] value now required by the voting database API.
+pub(super) fn voting_network(network_id: u32) -> anyhow::Result<voting::Network> {
+    match network_id {
+        crate::NETWORK_ID_TESTNET => Ok(voting::Network::Testnet),
+        crate::NETWORK_ID_MAINNET => Ok(voting::Network::Mainnet),
+        other => Err(anyhow!(
+            "Invalid network id: {other}. Expected {} (testnet) or {} (mainnet).",
+            crate::NETWORK_ID_TESTNET,
+            crate::NETWORK_ID_MAINNET,
+        )),
+    }
+}
 
 /// Borrow a byte slice from a raw `(ptr, len)` pair.
 ///
@@ -63,7 +69,12 @@ pub(super) fn open_wallet_db(
     wallet_db_path: &str,
     network_id: u32,
 ) -> anyhow::Result<
-    zcash_client_sqlite::WalletDb<rusqlite::Connection, Network, SystemClock, rand::rngs::OsRng>,
+    zcash_client_sqlite::WalletDb<
+        rusqlite::Connection,
+        crate::NetworkParams,
+        SystemClock,
+        rand::rngs::OsRng,
+    >,
 > {
     let network = crate::parse_network(network_id)?;
     zcash_client_sqlite::WalletDb::for_path(wallet_db_path, network, SystemClock, rand::rngs::OsRng)
@@ -83,91 +94,9 @@ pub(super) fn round_phase_to_u32(phase: voting::storage::RoundPhase) -> u32 {
     }
 }
 
-pub(super) fn usk_from_seed(
-    network_id: u32,
-    seed: &[u8],
-    account: AccountId,
-) -> anyhow::Result<UnifiedSpendingKey> {
-    if seed.len() < MIN_SEED_LEN {
-        return Err(anyhow!(
-            "seed must be at least {} bytes, got {}",
-            MIN_SEED_LEN,
-            seed.len()
-        ));
-    }
-
-    let network = crate::parse_network(network_id)?;
-    let usk = UnifiedSpendingKey::from_seed(&network, seed, account)
-        .map_err(|e| anyhow!("failed to derive UnifiedSpendingKey: {}", e))?;
-
-    Ok(usk)
-}
-
-pub(super) struct HotkeySideInputs {
-    pub(super) g_d_new_x: Vec<u8>,
-    pub(super) pk_d_new_x: Vec<u8>,
-    pub(super) hotkey_raw_address: Vec<u8>,
-    pub(super) hotkey_public_key: Vec<u8>,
-    pub(super) hotkey_address: String,
-}
-
-pub(super) fn derive_hotkey_side_inputs(
-    hotkey_seed: &[u8],
-    network_id: u32,
-    hotkey_account: AccountId,
-) -> anyhow::Result<HotkeySideInputs> {
-    let hotkey_usk = usk_from_seed(network_id, hotkey_seed, hotkey_account)
-        .map_err(|e| anyhow!("failed to derive hotkey UnifiedSpendingKey: {}", e))?;
-
-    let hotkey_ufvk = hotkey_usk.to_unified_full_viewing_key();
-    let hotkey_orchard_fvk = hotkey_ufvk
-        .orchard()
-        .ok_or_else(|| anyhow!("hotkey UFVK is missing Orchard component"))?;
-
-    let app_hotkey = voting::hotkey::generate_hotkey(hotkey_seed)
-        .map_err(|e| anyhow!("generate_hotkey failed: {}", e))?;
-    let hotkey_addr = hotkey_orchard_fvk.address_at(0u32, Scope::External);
-    let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
-
-    let hotkey_addr_bytes: [u8; HOTKEY_RAW_ADDRESS_LEN] = hotkey_raw_address
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("address serialization must be {HOTKEY_RAW_ADDRESS_LEN} bytes"))?;
-    let (g_d_new_x, pk_d_new_x) =
-        voting::action::derive_hotkey_x_coords_from_raw_address(&hotkey_addr_bytes)
-            .map_err(|e| anyhow!("derive_hotkey_x_coords failed: {}", e))?;
-
-    Ok(HotkeySideInputs {
-        g_d_new_x: g_d_new_x.to_vec(),
-        pk_d_new_x: pk_d_new_x.to_vec(),
-        hotkey_raw_address,
-        hotkey_public_key: app_hotkey.public_key,
-        hotkey_address: app_hotkey.address,
-    })
-}
-
 // =============================================================================
 // Internal helpers
 // =============================================================================
-
-/// Convert a `voting::VotingHotkey` to the FFI representation.
-#[allow(dead_code)]
-pub(super) fn voting_hotkey_to_ffi(
-    hotkey: voting::VotingHotkey,
-) -> anyhow::Result<FfiVotingHotkey> {
-    let (sk_ptr, sk_len) = crate::ptr_from_vec(hotkey.secret_key);
-    let (pk_ptr, pk_len) = crate::ptr_from_vec(hotkey.public_key);
-    let address = CString::new(hotkey.address)
-        .map_err(|e| anyhow!("invalid hotkey address string: {}", e))?
-        .into_raw();
-    Ok(FfiVotingHotkey {
-        secret_key: sk_ptr,
-        secret_key_len: sk_len,
-        public_key: pk_ptr,
-        public_key_len: pk_len,
-        address,
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -196,48 +125,5 @@ mod tests {
     fn str_from_ptr_rejects_null_when_nonzero_len() {
         let err = unsafe { str_from_ptr(std::ptr::null(), 3) }.expect_err("null");
         assert!(err.to_string().contains("null"));
-    }
-
-    #[test]
-    fn usk_from_seed_uses_sdk_network_ids() {
-        let seed = [7u8; 32];
-        let account = AccountId::try_from(0).expect("account 0");
-
-        let mainnet_usk = usk_from_seed(1, &seed, account).expect("mainnet usk");
-        let expected_mainnet =
-            UnifiedSpendingKey::from_seed(&MAIN_NETWORK, &seed, account).expect("mainnet seed");
-        assert_eq!(
-            mainnet_usk
-                .to_unified_full_viewing_key()
-                .encode(&MAIN_NETWORK),
-            expected_mainnet
-                .to_unified_full_viewing_key()
-                .encode(&MAIN_NETWORK)
-        );
-
-        let testnet_usk = usk_from_seed(0, &seed, account).expect("testnet usk");
-        let expected_testnet =
-            UnifiedSpendingKey::from_seed(&TEST_NETWORK, &seed, account).expect("testnet seed");
-        assert_eq!(
-            testnet_usk
-                .to_unified_full_viewing_key()
-                .encode(&TEST_NETWORK),
-            expected_testnet
-                .to_unified_full_viewing_key()
-                .encode(&TEST_NETWORK)
-        );
-    }
-
-    #[test]
-    fn usk_from_seed_rejects_short_seed() {
-        let seed = [7u8; MIN_SEED_LEN - 1];
-        let account = AccountId::try_from(0).expect("account 0");
-
-        let err = usk_from_seed(1, &seed, account).expect_err("short seed");
-
-        assert!(
-            err.to_string()
-                .contains("seed must be at least 32 bytes, got 31")
-        );
     }
 }

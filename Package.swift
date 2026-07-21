@@ -52,11 +52,7 @@ targets.append(contentsOf: [
             "Modules/Service/GRPC/ProtoBuf/proto/compact_formats.proto",
             "Modules/Service/GRPC/ProtoBuf/proto/proposal.proto",
             "Modules/Service/GRPC/ProtoBuf/proto/service.proto",
-            "Error/Sourcery/",
-            // Voting is gated off on this Ironwood branch: the underlying zcashlc_voting_* FFI
-            // symbols are not built because latest zcash_voting 1.0.0 still targets Orchard 0.14,
-            // while the exact audited upstream Ironwood graph uses Orchard 0.15. See Cargo.toml.
-            "Rust/Voting"
+            "Error/Sourcery/"
         ],
         resources: [
             .copy("Resources/checkpoints")
@@ -76,12 +72,6 @@ targets.append(contentsOf: [
             .copy("Resources/cache.db"),
             .copy("Resources/darkside_caches.db"),
             .copy("Resources/darkside_data.db"),
-            .copy("Resources/zend_2_6_0_alpha_6_orchard.sqlite"),
-            .copy("Resources/zend_2_6_0_alpha_6_orchard.compactblocks"),
-            .copy("Resources/zend_2_6_0_alpha_6_orchard.provenance.md"),
-            .copy("Resources/zend_2_6_0_alpha_6_orchard_mainnet.sqlite"),
-            .copy("Resources/zend_2_6_0_alpha_6_orchard_mainnet.compactblocks"),
-            .copy("Resources/zend_2_6_0_alpha_6_orchard_mainnet.provenance.md"),
             .copy("Resources/sandblasted_mainnet_block.json"),
             .copy("Resources/txBase64String.txt"),
             .copy("Resources/txFromAndroidSDK.txt"),
@@ -92,13 +82,7 @@ targets.append(contentsOf: [
     ),
     .testTarget(
         name: "OfflineTests",
-        dependencies: ["ZcashLightClientKit", "TestUtils"],
-        exclude: [
-            // Voting is gated off on this Ironwood branch (see the ZcashLightClientKit target):
-            // these test the excluded Rust/Voting layer (VotingRustBackend, PirSnapshotResolver).
-            "VotingRustBackendTests.swift",
-            "PirSnapshotResolverTests.swift"
-        ]
+        dependencies: ["ZcashLightClientKit", "TestUtils"]
     ),
     .testTarget(
         name: "NetworkTests",

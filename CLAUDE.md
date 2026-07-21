@@ -36,7 +36,7 @@ Scripts:
 - `./Scripts/rebuild-local-ffi.sh [ios-sim|ios-device|macos]` — fast single-arch incremental rebuild after Rust edits. `ios-sim` is default.
 - `./Scripts/reset-local-ffi.sh` — remove `LocalPackages/` and switch back to the release binary.
 
-For FFI work, open `ZcashSDK.xcworkspace` (not `Package.swift`) so `FFIBuilder` auto-runs. After switching modes or if headers look stale, in Xcode: Cmd+Shift+K, then File > Packages > Reset Package Caches. When modifying the Rust/Swift FFI boundary, freeze and exact-pin the private engine, then use `Scripts/build-ironwood-ffi-artifact.sh` to build all three Apple arm64 slices and their provenance record. `rebuild-local-ffi.sh` remains a fast single-slice iteration tool, not a release artifact builder.
+For FFI work, open `ZcashSDK.xcworkspace` (not `Package.swift`) so `FFIBuilder` auto-runs. After switching modes or if headers look stale, in Xcode: Cmd+Shift+K, then File > Packages > Reset Package Caches. When modifying the Rust/Swift FFI boundary, preserve the exact public librustzcash and voting pins, then use `Scripts/build-ironwood-ffi-artifact.sh` to build the full five-architecture XCFramework and its provenance record. `rebuild-local-ffi.sh` remains a fast single-slice iteration tool, not a release artifact builder.
 
 See `docs/LOCAL_DEVELOPMENT.md` for the full reference.
 
@@ -57,7 +57,8 @@ The Swift↔Rust bridge lives in `Sources/ZcashLightClientKit/Rust/`:
 - `ZcashRustBackend` conforms to `ZcashRustBackendWelding` — the DB-bound surface.
 - `ZcashKeyDerivationBackend` conforms to `ZcashKeyDerivationBackendWelding` — the stateless key-derivation surface.
 
-Both are the only callers of the generated C header `libzcashlc`.
+Both are the primary callers of the generated C header `libzcashlc`; migration and voting wrappers
+under `Rust/` use the same frozen artifact contract.
 
 ### Synchronizer is the public entry point
 

@@ -32,13 +32,9 @@ jobs:
     - name: Select Xcode version
       run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
-    # The migration engine is a private exact-revision dependency. Public SDK CI intentionally
-    # consumes the reviewed, committed FFI artifact and never needs private-repository credentials.
+    # Public SDK CI consumes the reviewed, committed artifact from the exact public Rust graph.
     - name: Verify committed XCFramework
       run: ./Scripts/verify-ironwood-ffi-artifact.sh
-
-    - name: Verify canonical pre-Ironwood fixtures
-      run: ./Scripts/verify-old-orchard-fixtures.sh
 
     # `swift test` builds the library and test targets in one package-planning pass.
     - name: Build package and run OfflineTests suite

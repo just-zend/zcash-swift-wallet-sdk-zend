@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Public-artifact gate for the committed Ironwood FFI. This intentionally requires no access to
-# the private migration-engine repository.
+# Public-artifact gate for the committed Ironwood FFI. It requires no source checkout beyond this
+# SDK and validates the complete ABI used by production Swift code in every binary slice.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -14,7 +14,7 @@ test -f "$provenance"
 test -f "$build_recipe"
 
 if find LocalPackages -type f \( -name '*.rs' -o -name Cargo.toml -o -name Cargo.lock -o -name '*.rlib' \) | grep -q .; then
-    echo "Error: private/source Rust material must not be committed under LocalPackages" >&2
+    echo "Error: Rust source material must not be committed under LocalPackages" >&2
     exit 1
 fi
 if find LocalPackages -type d -name .git | grep -q .; then
@@ -22,75 +22,64 @@ if find LocalPackages -type d -name .git | grep -q .; then
     exit 1
 fi
 
-required_symbols=(
-    zcashlc_network_upgrade_activation_height
-    zcashlc_consensus_chain_id
-    zcashlc_consensus_parameters_fingerprint
-    zcashlc_last_migration_error_code
+binaries=(
+    "$xcframework/ios-arm64/libzcashlc.framework/libzcashlc"
+    "$xcframework/ios-arm64_x86_64-simulator/libzcashlc.framework/libzcashlc"
+    "$xcframework/macos-arm64_x86_64/libzcashlc.framework/libzcashlc"
 )
+for binary in "${binaries[@]}"; do test -f "$binary"; done
+binary_count=$(find "$xcframework" \( -type f -o -type l \) -path '*/libzcashlc.framework/libzcashlc' | wc -l | tr -d ' ')
+if [[ "$binary_count" != "3" ]]; then
+    echo "Error: expected exactly three platform slices in the full XCFramework, found $binary_count" >&2
+    exit 1
+fi
 
-# Derive the complete migration ABI from every production Swift welding call. A hand-maintained
-# subset previously let a stale XCFramework pass while newer lifecycle/resume/commit entry points
-# were absent. The committed artifact must export every migration symbol the SDK can call, in every
-# slice, and its generated header must declare the same set.
+required_symbols=()
 while IFS= read -r symbol; do
     required_symbols+=("$symbol")
 done < <(
-    LC_ALL=C grep -Eo 'zcashlc_migration_[a-z0-9_]+' \
-        Sources/ZcashLightClientKit/Rust/ZcashRustBackend.swift \
+    rg -o --no-filename 'zcashlc_[a-z0-9_]+' Sources/ZcashLightClientKit/Rust \
         | LC_ALL=C sort -u
 )
+if [[ ${#required_symbols[@]} -eq 0 ]]; then
+    echo "Error: no production zcashlc ABI calls were discovered" >&2
+    exit 1
+fi
 
 forbidden_paths=(
     '/host-users/'
     '/home/runner'
+    '/private/tmp/'
     '.codex/worktrees'
 )
 while IFS= read -r artifact_file; do
     for forbidden in "${forbidden_paths[@]}"; do
         if LC_ALL=C grep -aFq "$forbidden" "$artifact_file"; then
-            echo "Error: non-reproducible/private build path '$forbidden' found in $artifact_file" >&2
+            echo "Error: non-reproducible build path '$forbidden' found in $artifact_file" >&2
             exit 1
         fi
     done
 done < <(find LocalPackages -type f | LC_ALL=C sort)
 
-# Rust's precompiled macOS compiler-builtins archive carries its public upstream CI source prefix.
-# Build-time remapping cannot rewrite those already-compiled members. Allow only that exact Rust
-# distribution prefix; any other `/Users/...` string is a local/private path leak.
+# Rust's compiler-builtins archive can carry this public upstream CI prefix; no other /Users path
+# may remain after remapping.
 while IFS= read -r artifact_file; do
     if strings "$artifact_file" \
         | sed 's@/Users/runner/work/rust/rust/@/rust-distribution/@g' \
         | LC_ALL=C grep -Fq '/Users/'
     then
-        echo "Error: non-reproducible/private /Users path found in $artifact_file" >&2
+        echo "Error: non-reproducible /Users path found in $artifact_file" >&2
         exit 1
     fi
 done < <(find LocalPackages -type f | LC_ALL=C sort)
 
-# The repository basename is intentionally present once in the canonical provenance URL. It must
-# not leak into any generated framework/header, where it would indicate embedded private source
-# metadata or a build path.
-while IFS= read -r artifact_file; do
-    if LC_ALL=C grep -aFq 'ZODLIronwoodMigrationRust' "$artifact_file"; then
-        echo "Error: private migration-engine source metadata found in $artifact_file" >&2
-        exit 1
-    fi
-done < <(find LocalPackages -type f ! -path "$provenance" | LC_ALL=C sort)
-
-binary_count=0
-while IFS= read -r binary; do
-    binary_count=$((binary_count + 1))
+for binary in "${binaries[@]}"; do
     header="$(dirname "$binary")/Headers/zcashlc.h"
     test -f "$header"
     symbols_file=$(mktemp)
     nm_output=$(mktemp)
     nm_errors=$(mktemp)
     nm_status=0
-    # Rust 1.96 uses LLVM 22 bitcode attributes that the current Apple `nm` may warn it cannot
-    # decode for unrelated compiler-builtins archive members. Capture all successfully decoded
-    # global defined symbols and verify every required ABI entry explicitly; do not let those
-    # unrelated member diagnostics hide a missing production symbol.
     nm -gUj "$binary" > "$nm_output" 2> "$nm_errors" || nm_status=$?
     sed 's/^_//' "$nm_output" | LC_ALL=C sort -u > "$symbols_file"
     for symbol in "${required_symbols[@]}"; do
@@ -101,31 +90,29 @@ while IFS= read -r binary; do
         fi
         if ! grep -Fxq "$symbol" "$symbols_file"; then
             echo "Error: $symbol missing from exported symbols in $binary" >&2
-            if [[ "$nm_status" != "0" ]]; then
-                sed -n '1,10p' "$nm_errors" >&2
-            fi
+            if [[ "$nm_status" != "0" ]]; then sed -n '1,10p' "$nm_errors" >&2; fi
             rm -f "$symbols_file" "$nm_output" "$nm_errors"
             exit 1
         fi
     done
     rm -f "$symbols_file" "$nm_output" "$nm_errors"
-done < <(find "$xcframework" -type f -path '*/libzcashlc.framework/libzcashlc' | LC_ALL=C sort)
+done
 
-if [[ "$binary_count" == "0" ]]; then
-    echo "Error: no FFI binaries found" >&2
-    exit 1
-fi
+read_field() {
+    local field="$1"
+    local file="${2:-$provenance}"
+    sed -n "s/^${field}=//p" "$file"
+}
 
 verify_hash() {
     local variable="$1"
     local relative_path="$2"
     local expected actual
-    expected=$(sed -n "s/^${variable}=//p" "$provenance")
+    expected=$(read_field "$variable")
     if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
         echo "Error: missing or invalid $variable in $provenance" >&2
         exit 1
     fi
-    test -f "$relative_path"
     actual=$(shasum -a 256 "$relative_path" | awk '{print $1}')
     if [[ "$actual" != "$expected" ]]; then
         echo "Error: hash mismatch for $relative_path" >&2
@@ -133,9 +120,24 @@ verify_hash() {
     fi
 }
 
-verify_hash IOS_ARM64_SHA256 "$xcframework/ios-arm64/libzcashlc.framework/libzcashlc"
-verify_hash IOS_ARM64_SIMULATOR_SHA256 "$xcframework/ios-arm64-simulator/libzcashlc.framework/libzcashlc"
-verify_hash MACOS_ARM64_SHA256 "$xcframework/macos-arm64/libzcashlc.framework/libzcashlc"
+verify_hash IOS_ARM64_SHA256 "${binaries[0]}"
+verify_hash IOS_SIMULATOR_UNIVERSAL_SHA256 "${binaries[1]}"
+verify_hash MACOS_UNIVERSAL_SHA256 "${binaries[2]}"
+verify_hash XCFRAMEWORK_INFO_SHA256 "$xcframework/Info.plist"
+
+verify_arches() {
+    local binary="$1"
+    local expected="$2"
+    local actual
+    actual=$(lipo -archs "$binary" | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Error: unexpected architectures for $binary: $actual" >&2
+        exit 1
+    fi
+}
+verify_arches "${binaries[0]}" "arm64"
+verify_arches "${binaries[1]}" "arm64 x86_64"
+verify_arches "${binaries[2]}" "arm64 x86_64"
 
 verify_archive_platform_floor() {
     local binary="$1"
@@ -144,40 +146,25 @@ verify_archive_platform_floor() {
     if ! otool -l "$binary" 2>/dev/null | awk \
         -v expected_platform="$expected_platform" -v maximum_minos="$maximum_minos" '
         function version_gt(found, maximum, f, m, i) {
-            split(found, f, ".")
-            split(maximum, m, ".")
+            split(found, f, "."); split(maximum, m, ".")
             for (i = 1; i <= 3; i++) {
                 if ((f[i] + 0) > (m[i] + 0)) return 1
                 if ((f[i] + 0) < (m[i] + 0)) return 0
             }
             return 0
         }
-        $1 == "platform" {
-            found_build_version = 1
-            if ($2 != expected_platform) invalid = 1
-        }
+        $1 == "platform" { found = 1; if ($2 != expected_platform) invalid = 1 }
         $1 == "minos" && version_gt($2, maximum_minos) { invalid = 1 }
-        END { exit (!found_build_version || invalid) }
+        END { exit (!found || invalid) }
         '
     then
         echo "Error: $binary contains a wrong-platform or too-new deployment target" >&2
         exit 1
     fi
 }
-
-# Mach-O LC_BUILD_VERSION platform constants: macOS=1, iOS=2, iOS Simulator=7.
-verify_archive_platform_floor \
-    "$xcframework/ios-arm64/libzcashlc.framework/libzcashlc" 2 13.0
-verify_archive_platform_floor \
-    "$xcframework/ios-arm64-simulator/libzcashlc.framework/libzcashlc" 7 14.0
-verify_archive_platform_floor \
-    "$xcframework/macos-arm64/libzcashlc.framework/libzcashlc" 1 12.0
-
-read_field() {
-    local field="$1"
-    local file="${2:-$provenance}"
-    sed -n "s/^${field}=//p" "$file"
-}
+verify_archive_platform_floor "${binaries[0]}" 2 13.0
+verify_archive_platform_floor "${binaries[1]}" 7 14.0
+verify_archive_platform_floor "${binaries[2]}" 1 12.0
 
 recorded_source_hash=$(read_field SDK_FFI_SOURCE_SHA256)
 actual_source_hash=$(./Scripts/hash-ironwood-ffi-sources.sh)
@@ -219,6 +206,7 @@ if ! grep -Fq '.iOS(.v13)' Package.swift || ! grep -Fq '.macOS(.v12)' Package.sw
     echo "Error: Package.swift platform floor differs from the frozen FFI deployment targets" >&2
     exit 1
 fi
+
 for field in XCODE_VERSION IPHONEOS_SDK_VERSION IPHONESIMULATOR_SDK_VERSION MACOSX_SDK_VERSION MACOS_VERSION; do
     if [[ ! "$(read_field "$field")" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
         echo "Error: missing or invalid $field in artifact provenance" >&2
@@ -232,43 +220,37 @@ for field in XCODE_BUILD_VERSION MACOS_BUILD_VERSION; do
     fi
 done
 
-recorded_source_date_epoch=$(read_field SOURCE_DATE_EPOCH)
-recipe_source_date_epoch=$(read_field SOURCE_DATE_EPOCH "$build_recipe")
-if [[ ! "$recorded_source_date_epoch" =~ ^[0-9]+$ || "$recorded_source_date_epoch" != "$recipe_source_date_epoch" ]]; then
-    echo "Error: SOURCE_DATE_EPOCH differs from the frozen build recipe" >&2
-    exit 1
-fi
+expected_fields=(
+    SDK_BASE_REVISION SDK_UPSTREAM_REVISION
+    LIBRUSTZCASH_REPOSITORY LIBRUSTZCASH_BRANCH LIBRUSTZCASH_REVISION LIBRUSTZCASH_TREE
+    VOTING_CIRCUITS_REVISION VOTE_NULLIFIER_PIR_REVISION ZCASH_VOTING_REVISION
+    SOURCE_DATE_EPOCH RUST_TOOLCHAIN MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET
+    IOS_ARM64_SIMULATOR_MINIMUM_OS
+)
+for field in "${expected_fields[@]}"; do
+    if [[ -z "$(read_field "$field")" || "$(read_field "$field")" != "$(read_field "$field" "$build_recipe")" ]]; then
+        echo "Error: $field differs from the frozen build recipe" >&2
+        exit 1
+    fi
+done
 
-expected_librustzcash_rev="266a75ae3af076bbe9437088947fddb1add8bd99"
-recorded_librustzcash_rev=$(read_field LIBRUSTZCASH_REVISION)
-if [[ "$recorded_librustzcash_rev" != "$expected_librustzcash_rev" ]]; then
-    echo "Error: provenance does not record the audited librustzcash revision" >&2
-    exit 1
-fi
-
-migration_revision=$(read_field MIGRATION_ENGINE_REVISION)
-migration_tree=$(read_field MIGRATION_ENGINE_TREE)
-expected_migration_repository="ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git"
-migration_repository=$(read_field MIGRATION_ENGINE_REPOSITORY)
-if [[ ! "$migration_revision" =~ ^[0-9a-f]{40}$ || ! "$migration_tree" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "Error: invalid migration-engine commit/tree provenance" >&2
-    exit 1
-fi
-if [[ "$migration_repository" != "$expected_migration_repository" \
-    || "$migration_repository" != "$(read_field MIGRATION_ENGINE_REPOSITORY "$build_recipe")" \
-    || "$migration_revision" != "$(read_field MIGRATION_ENGINE_REVISION "$build_recipe")" \
-    || "$migration_tree" != "$(read_field MIGRATION_ENGINE_TREE "$build_recipe")" \
-    || "$recorded_toolchain" != "$(read_field RUST_TOOLCHAIN "$build_recipe")" ]]
+if [[ "$(read_field SDK_BASE_REVISION)" != "8f85838bcc7f59e11de45c96e1ed783093712901" \
+    || "$(read_field SDK_UPSTREAM_REVISION)" != "2922143e4d686c999d9b3530282988a3838af220" \
+    || "$(read_field LIBRUSTZCASH_REPOSITORY)" != "https://github.com/just-zend/librustzcash" \
+    || "$(read_field LIBRUSTZCASH_BRANCH)" != "agent/ironwood-nu63-compatibility" \
+    || "$(read_field LIBRUSTZCASH_REVISION)" != "5115cf26da590a3d610446f1d926ff7f2873c9d1" \
+    || "$(read_field LIBRUSTZCASH_TREE)" != "62f79c17fe172735fce3df4e03991e90a736b60a" \
+    || "$(read_field VOTING_CIRCUITS_REVISION)" != "a5aae410a6fb14fcbea2f0ce3393035195e86f69" \
+    || "$(read_field VOTE_NULLIFIER_PIR_REVISION)" != "0dea3485429c80033e67a1ddb18ee72cc450cefb" \
+    || "$(read_field ZCASH_VOTING_REVISION)" != "464f974865f2afa82bdac15d169168c77ecb9c74" ]]
 then
-    echo "Error: artifact provenance differs from the frozen build recipe" >&2
-    exit 1
-fi
-if ! grep -Fxq \
-    "zodl_ironwood_migration = { git = \"$migration_repository\", rev = \"$migration_revision\" }" \
-    Cargo.toml
-then
-    echo "Error: Cargo.toml migration-engine pin differs from FFI provenance" >&2
+    echo "Error: provenance does not record the reviewed Ironwood source graph" >&2
     exit 1
 fi
 
-echo "Committed Ironwood FFI passed provenance, hash, symbol, and path-leak checks."
+if [[ ! "$(read_field SOURCE_DATE_EPOCH)" =~ ^[0-9]+$ ]]; then
+    echo "Error: invalid SOURCE_DATE_EPOCH" >&2
+    exit 1
+fi
+
+echo "Committed Ironwood FFI passed source, hash, architecture, ABI, platform, and path-leak checks."

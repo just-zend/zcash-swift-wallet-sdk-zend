@@ -108,43 +108,32 @@ public struct VotingNoteInfo: Codable, Sendable {
 /// Result of building a voting PCZT.
 public struct VotingPczt: Codable, Sendable {
     public let pcztBytes: [UInt8]
+    public let pcztSighash: [UInt8]
     /// Randomized verification key (`rk` on the wire).
     public let randomizedKey: [UInt8]
-    public let alpha: [UInt8]
-    public let nfSigned: [UInt8]
-    public let cmxNew: [UInt8]
-    public let govNullifiers: [[UInt8]]
-    public let van: [UInt8]
-    public let vanCommRand: [UInt8]
-    public let dummyNullifiers: [[UInt8]]
-    public let rhoSigned: [UInt8]
-    public let paddedCmx: [[UInt8]]
-    public let rseedSigned: [UInt8]
-    public let rseedOutput: [UInt8]
-    public let actionBytes: [UInt8]
     public let actionIndex: UInt32
-    /// Each element is [rho, rseed].
-    public let paddedNoteSecrets: [[[UInt8]]]
-    public let pcztSighash: [UInt8]
+    public let actionBytes: [UInt8]
 
     enum CodingKeys: String, CodingKey {
         case pcztBytes = "pczt_bytes"
-        case randomizedKey = "rk"
-        case alpha
-        case nfSigned = "nf_signed"
-        case cmxNew = "cmx_new"
-        case govNullifiers = "gov_nullifiers"
-        case van
-        case vanCommRand = "van_comm_rand"
-        case dummyNullifiers = "dummy_nullifiers"
-        case rhoSigned = "rho_signed"
-        case paddedCmx = "padded_cmx"
-        case rseedSigned = "rseed_signed"
-        case rseedOutput = "rseed_output"
-        case actionBytes = "action_bytes"
-        case actionIndex = "action_index"
-        case paddedNoteSecrets = "padded_note_secrets"
         case pcztSighash = "pczt_sighash"
+        case randomizedKey = "rk"
+        case actionIndex = "action_index"
+        case actionBytes = "action_bytes"
+    }
+
+    public init(
+        pcztBytes: [UInt8],
+        pcztSighash: [UInt8],
+        randomizedKey: [UInt8],
+        actionIndex: UInt32,
+        actionBytes: [UInt8]
+    ) {
+        self.pcztBytes = pcztBytes
+        self.pcztSighash = pcztSighash
+        self.randomizedKey = randomizedKey
+        self.actionIndex = actionIndex
+        self.actionBytes = actionBytes
     }
 }
 
@@ -382,14 +371,39 @@ public struct VotingSharePayload: Codable, Sendable {
     }
 }
 
-// MARK: - Cast Vote Signature (JSON)
+// MARK: - Committed Vote
 
-/// Signature for a cast vote transaction.
-public struct VotingCastVoteSignature: Codable, Sendable {
+/// A committed vote: the commitment bundle plus the fields the one-shot
+/// commit flow produces up front.
+public struct VotingCommittedVote: Sendable {
+    public let bundle: VotingVoteCommitmentBundle
+    /// SpendAuth signature over the canonical cast-vote sighash.
     public let voteAuthSig: [UInt8]
+    /// Helper-share payloads. Their tree positions reflect the currently
+    /// stored vote-commitment tree position — 0 until the confirmed position
+    /// is recorded via `recordVcPosition(...)`.
+    public let sharePayloads: [VotingSharePayload]
 
-    enum CodingKeys: String, CodingKey {
-        case voteAuthSig = "vote_auth_sig"
+    public init(
+        bundle: VotingVoteCommitmentBundle,
+        voteAuthSig: [UInt8],
+        sharePayloads: [VotingSharePayload]
+    ) {
+        self.bundle = bundle
+        self.voteAuthSig = voteAuthSig
+        self.sharePayloads = sharePayloads
+    }
+}
+
+/// A committed vote reconstructed from crate recovery state, with the
+/// currently stored vote-commitment tree position.
+public struct VotingRecoveredVote: Sendable {
+    public let committedVote: VotingCommittedVote
+    public let vcTreePosition: UInt64
+
+    public init(committedVote: VotingCommittedVote, vcTreePosition: UInt64) {
+        self.committedVote = committedVote
+        self.vcTreePosition = vcTreePosition
     }
 }
 
@@ -467,40 +481,25 @@ public struct VotingKeystoneSignatureRecord: Codable, Sendable, Equatable {
 public struct VotingBuildPcztParams: Sendable {
     public let roundId: String
     public let bundleIndex: UInt32
-    public let notes: [VotingNoteInfo]
-    public let fvk: [UInt8]
-    public let hotkeyRawAddress: [UInt8]
-    public let consensusBranchId: UInt32
-    public let coinType: UInt32
-    public let seedFingerprint: [UInt8]
-    public let accountIndex: UInt32
+    public let walletDbPath: String
+    public let accountUuid: String
+    public let hotkeySecret: [UInt8]
     public let roundName: String
-    public let addressIndex: UInt32
 
     public init(
         roundId: String,
         bundleIndex: UInt32,
-        notes: [VotingNoteInfo],
-        fvk: [UInt8],
-        hotkeyRawAddress: [UInt8],
-        consensusBranchId: UInt32,
-        coinType: UInt32,
-        seedFingerprint: [UInt8],
-        accountIndex: UInt32,
-        roundName: String,
-        addressIndex: UInt32
+        walletDbPath: String,
+        accountUuid: String,
+        hotkeySecret: [UInt8],
+        roundName: String
     ) {
         self.roundId = roundId
         self.bundleIndex = bundleIndex
-        self.notes = notes
-        self.fvk = fvk
-        self.hotkeyRawAddress = hotkeyRawAddress
-        self.consensusBranchId = consensusBranchId
-        self.coinType = coinType
-        self.seedFingerprint = seedFingerprint
-        self.accountIndex = accountIndex
+        self.walletDbPath = walletDbPath
+        self.accountUuid = accountUuid
+        self.hotkeySecret = hotkeySecret
         self.roundName = roundName
-        self.addressIndex = addressIndex
     }
 }
 

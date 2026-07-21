@@ -132,14 +132,14 @@ final class ValidateServerActionTests: ZcashTestCase {
         }
     }
 
-    func testValidateServerAction_CustomNetworkAcceptsExactNormalizedChainAndBranch() async throws {
-        underlyingNetwork = ZcashNetworkBuilder.custom(
-            base: .mainnet,
-            chainName: " MAIN ",
+    func testValidateServerAction_CustomNetworkAcceptsMismatchedChainAndBranch() async throws {
+        // A regtest custom network syncing against a modified-mainnet Ironwood backend: the backend
+        // reports chainName "main" and a nonstandard branch id, but the Sapling activation matches.
+        underlyingNetwork = ZcashNetworkBuilder.regtest(
             activationHeights: NetworkActivationHeights(sapling: 1, nu5: 1, nu6: 1, nu6_3: 5000)
         )
-        underlyingChainName = " Main "
-        underlyingConsensusBranchID = "c2d6d0b4"
+        underlyingChainName = "main"
+        underlyingConsensusBranchID = "ffffffff"
         underlyingSaplingActivationHeight = nil
 
         let validateServerAction = setupAction()
@@ -155,52 +155,14 @@ final class ValidateServerActionTests: ZcashTestCase {
         }
     }
 
-    func testValidateServerAction_CustomNetworkRejectsWrongCanonicalChain() async throws {
-        underlyingNetwork = ZcashNetworkBuilder.custom(
-            base: .mainnet,
-            chainName: "main",
-            activationHeights: NetworkActivationHeights(sapling: 1, nu5: 1, nu6: 1, nu6_3: 5000)
-        )
-        underlyingChainName = "test"
-        underlyingSaplingActivationHeight = 1
-
-        do {
-            _ = try await setupAction().run(with: ActionContextMock()) { _ in }
-            XCTFail("Custom network with the wrong chain name is expected to fail.")
-        } catch ZcashError.compactBlockProcessorChainName(let chainName) {
-            XCTAssertEqual(chainName, "test")
-        }
-    }
-
-    func testValidateServerAction_CustomNetworkRejectsWrongConsensusBranch() async throws {
-        underlyingNetwork = ZcashNetworkBuilder.custom(
-            base: .mainnet,
-            chainName: "main",
-            activationHeights: NetworkActivationHeights(sapling: 1, nu5: 1, nu6: 1, nu6_3: 5000)
-        )
-        underlyingChainName = "main"
-        underlyingConsensusBranchID = "ffffffff"
-        underlyingSaplingActivationHeight = 1
-
-        do {
-            _ = try await setupAction().run(with: ActionContextMock()) { _ in }
-            XCTFail("Custom network with the wrong branch id is expected to fail.")
-        } catch let ZcashError.compactBlockProcessorWrongConsensusBranchId(expected, found) {
-            XCTAssertEqual(expected, -1026109260)
-            XCTAssertEqual(found, -1)
-        }
-    }
-
     func testValidateServerAction_CustomNetworkStillChecksSaplingActivation() async throws {
         // Even for a custom network, a wrong Sapling-activation height (e.g. a real mainnet server)
         // must still be rejected.
-        underlyingNetwork = ZcashNetworkBuilder.custom(
-            base: .mainnet,
-            chainName: "main",
+        underlyingNetwork = ZcashNetworkBuilder.regtest(
             activationHeights: NetworkActivationHeights(sapling: 1, nu6_3: 5000)
         )
         underlyingChainName = "main"
-        underlyingConsensusBranchID = "c2d6d0b4"
+        underlyingConsensusBranchID = "ffffffff"
         underlyingSaplingActivationHeight = 419_200
 
         let validateServerAction = setupAction()
@@ -227,7 +189,7 @@ final class ValidateServerActionTests: ZcashTestCase {
 
         let rustBackendMock = ZcashRustBackendWeldingMock()
         rustBackendMock.consensusBranchIdForHeightClosure = { height in
-            XCTAssertEqual(height, 3, "")
+            XCTAssertEqual(height, 2, "")
             return -1026109260
         }
 

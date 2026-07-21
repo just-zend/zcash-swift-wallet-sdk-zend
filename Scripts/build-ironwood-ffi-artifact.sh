@@ -1,65 +1,64 @@
 #!/bin/bash
 
-# Builds the three arm64 Ironwood FFI slices from a frozen private-engine commit and writes the
-# complete reproducibility/provenance record consumed by public CI. The final Cargo dependency
-# must already be an immutable git revision; path dependencies are intentionally rejected.
+# Builds the full five-architecture Ironwood XCFramework from the frozen Rust source graph and
+# writes the reproducibility/provenance record consumed by public CI.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-migration_engine_repo="${IRONWOOD_MIGRATION_ENGINE_REPO:-}"
-if [[ -z "$migration_engine_repo" || ! -d "$migration_engine_repo" ]]; then
-    echo "Error: set IRONWOOD_MIGRATION_ENGINE_REPO to the frozen private-engine checkout" >&2
+librustzcash_repo="${LIBRUSTZCASH_REPO:-}"
+if [[ -z "$librustzcash_repo" || ! -d "$librustzcash_repo" ]]; then
+    echo "Error: set LIBRUSTZCASH_REPO to the frozen just-zend/librustzcash checkout" >&2
     exit 1
 fi
-migration_engine_repo=$(cd "$migration_engine_repo" && pwd -P)
-if [[ -n "$(git -C "$migration_engine_repo" status --porcelain)" ]]; then
-    echo "Error: migration-engine checkout must be clean before an artifact build" >&2
-    exit 1
-fi
-
-migration_revision=$(git -C "$migration_engine_repo" rev-parse HEAD)
-migration_tree=$(git -C "$migration_engine_repo" rev-parse 'HEAD^{tree}')
-source_date_epoch=$(git -C "$migration_engine_repo" log -1 --format=%ct)
-expected_migration_repository="ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git"
-migration_repository=$(sed -nE \
-    's@^zodl_ironwood_migration = \{ git = "([^"]+)", rev = "[0-9a-f]{40}".*@\1@p' \
-    Cargo.toml)
-expected_migration_revision=$(sed -nE \
-    's@^zodl_ironwood_migration = \{ git = "[^"]+", rev = "([0-9a-f]{40})".*@\1@p' \
-    Cargo.toml)
-if [[ "$migration_repository" != "$expected_migration_repository" ]]; then
-    echo "Error: Cargo.toml must use the canonical private migration-engine repository" >&2
-    exit 1
-fi
-if [[ -z "$expected_migration_revision" ]]; then
-    echo "Error: Cargo.toml must use an exact git revision for zodl_ironwood_migration" >&2
-    exit 1
-fi
-if [[ "$migration_revision" != "$expected_migration_revision" ]]; then
-    echo "Error: private-engine checkout HEAD differs from the Cargo.toml revision" >&2
+librustzcash_repo=$(cd "$librustzcash_repo" && pwd -P)
+if [[ -n "$(git -C "$librustzcash_repo" status --porcelain)" ]]; then
+    echo "Error: librustzcash checkout must be clean before an artifact build" >&2
     exit 1
 fi
 
-librustzcash_revision=$(sed -nE \
-    's@^zcash_client_backend = .*rev = "([0-9a-f]{40})".*@\1@p' \
-    Cargo.toml | tail -1)
+expected_librustzcash_repository="https://github.com/just-zend/librustzcash"
+expected_librustzcash_branch="agent/ironwood-nu63-compatibility"
+expected_librustzcash_revision="5115cf26da590a3d610446f1d926ff7f2873c9d1"
+expected_librustzcash_tree="62f79c17fe172735fce3df4e03991e90a736b60a"
+expected_sdk_base_revision="8f85838bcc7f59e11de45c96e1ed783093712901"
+expected_sdk_upstream_revision="2922143e4d686c999d9b3530282988a3838af220"
+voting_circuits_revision="a5aae410a6fb14fcbea2f0ce3393035195e86f69"
+vote_nullifier_pir_revision="0dea3485429c80033e67a1ddb18ee72cc450cefb"
+zcash_voting_revision="464f974865f2afa82bdac15d169168c77ecb9c74"
+
+librustzcash_revision=$(git -C "$librustzcash_repo" rev-parse HEAD)
+librustzcash_tree=$(git -C "$librustzcash_repo" rev-parse 'HEAD^{tree}')
+librustzcash_branch=$(git -C "$librustzcash_repo" branch --show-current)
+source_date_epoch=$(git -C "$librustzcash_repo" log -1 --format=%ct)
+if [[ "$librustzcash_revision" != "$expected_librustzcash_revision" \
+    || "$librustzcash_tree" != "$expected_librustzcash_tree" \
+    || "$librustzcash_branch" != "$expected_librustzcash_branch" ]]
+then
+    echo "Error: librustzcash checkout does not match the frozen compatibility branch/revision/tree" >&2
+    exit 1
+fi
+if [[ "$(git rev-parse HEAD)" != "$expected_sdk_base_revision" \
+    || "$(git rev-parse MERGE_HEAD 2>/dev/null || true)" != "$expected_sdk_upstream_revision" ]]
+then
+    echo "Error: build must run while resolving the reviewed SDK base/upstream merge" >&2
+    exit 1
+fi
+
 rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
-if [[ ! "$librustzcash_revision" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "Error: Cargo.toml must pin zcash_client_backend to an exact revision" >&2
-    exit 1
-fi
 if [[ ! "$rust_toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "Error: rust-toolchain.toml must pin an exact stable release" >&2
     exit 1
 fi
 
 rustup toolchain install "$rust_toolchain" --profile minimal
+rustup target add --toolchain "$rust_toolchain" \
+    aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim \
+    x86_64-apple-darwin x86_64-apple-ios
 rustc_release=$(rustc "+$rust_toolchain" --version --verbose | sed -n 's/^release: //p')
 rustc_commit=$(rustc "+$rust_toolchain" --version --verbose | sed -n 's/^commit-hash: //p')
 cargo_release=$(cargo "+$rust_toolchain" --version --verbose | sed -n 's/^release: //p')
 cargo_commit=$(cargo "+$rust_toolchain" --version --verbose | sed -n 's/^commit-hash: //p')
-
 xcode_version=$(xcodebuild -version | sed -n '1s/^Xcode //p')
 xcode_build_version=$(xcodebuild -version | sed -n '2s/^Build version //p')
 iphoneos_sdk_version=$(xcrun --sdk iphoneos --show-sdk-version)
@@ -72,37 +71,53 @@ export SOURCE_DATE_EPOCH="$source_date_epoch"
 # shellcheck source=rust-build-env.sh
 source Scripts/rust-build-env.sh
 
-mkdir -p BuildSupport
-build_recipe_temp=$(mktemp)
-trap 'rm -f "$build_recipe_temp"' EXIT
+recipe_temp=$(mktemp)
+provenance_temp=""
+cleanup() {
+    rm -f "$recipe_temp"
+    if [[ -n "$provenance_temp" ]]; then rm -f "$provenance_temp"; fi
+}
+trap cleanup EXIT
 printf '%s\n' \
-    "MIGRATION_ENGINE_REPOSITORY=$migration_repository" \
-    "MIGRATION_ENGINE_REVISION=$migration_revision" \
-    "MIGRATION_ENGINE_TREE=$migration_tree" \
+    "SDK_BASE_REVISION=$expected_sdk_base_revision" \
+    "SDK_UPSTREAM_REVISION=$expected_sdk_upstream_revision" \
+    "LIBRUSTZCASH_REPOSITORY=$expected_librustzcash_repository" \
+    "LIBRUSTZCASH_BRANCH=$expected_librustzcash_branch" \
+    "LIBRUSTZCASH_REVISION=$librustzcash_revision" \
+    "LIBRUSTZCASH_TREE=$librustzcash_tree" \
+    "VOTING_CIRCUITS_REVISION=$voting_circuits_revision" \
+    "VOTE_NULLIFIER_PIR_REVISION=$vote_nullifier_pir_revision" \
+    "ZCASH_VOTING_REVISION=$zcash_voting_revision" \
     "SOURCE_DATE_EPOCH=$source_date_epoch" \
     "RUST_TOOLCHAIN=$rust_toolchain" \
     "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET" \
     "IPHONEOS_DEPLOYMENT_TARGET=$IPHONEOS_DEPLOYMENT_TARGET" \
     "IOS_ARM64_SIMULATOR_MINIMUM_OS=$IRONWOOD_IOS_ARM64_SIMULATOR_MINIMUM_OS" \
-    > "$build_recipe_temp"
-mv "$build_recipe_temp" BuildSupport/IRONWOOD_FFI_BUILD.env
+    > "$recipe_temp"
+mv "$recipe_temp" BuildSupport/IRONWOOD_FFI_BUILD.env
 
 ./Scripts/audit-ironwood-dependency-graph.sh
-./Scripts/init-local-ffi.sh --arm-all
+make -C BuildSupport clean
+./Scripts/init-local-ffi.sh
 
 sdk_ffi_source_sha256=$(./Scripts/hash-ironwood-ffi-sources.sh)
 xcframework=LocalPackages/libzcashlc.xcframework
 ios_arm64_sha256=$(shasum -a 256 "$xcframework/ios-arm64/libzcashlc.framework/libzcashlc" | awk '{print $1}')
-ios_arm64_simulator_sha256=$(shasum -a 256 "$xcframework/ios-arm64-simulator/libzcashlc.framework/libzcashlc" | awk '{print $1}')
-macos_arm64_sha256=$(shasum -a 256 "$xcframework/macos-arm64/libzcashlc.framework/libzcashlc" | awk '{print $1}')
+ios_simulator_universal_sha256=$(shasum -a 256 "$xcframework/ios-arm64_x86_64-simulator/libzcashlc.framework/libzcashlc" | awk '{print $1}')
+macos_universal_sha256=$(shasum -a 256 "$xcframework/macos-arm64_x86_64/libzcashlc.framework/libzcashlc" | awk '{print $1}')
+xcframework_info_sha256=$(shasum -a 256 "$xcframework/Info.plist" | awk '{print $1}')
 
 provenance_temp=$(mktemp)
-trap 'rm -f "$provenance_temp"' EXIT
 printf '%s\n' \
-    "MIGRATION_ENGINE_REPOSITORY=$migration_repository" \
-    "MIGRATION_ENGINE_REVISION=$migration_revision" \
-    "MIGRATION_ENGINE_TREE=$migration_tree" \
+    "SDK_BASE_REVISION=$expected_sdk_base_revision" \
+    "SDK_UPSTREAM_REVISION=$expected_sdk_upstream_revision" \
+    "LIBRUSTZCASH_REPOSITORY=$expected_librustzcash_repository" \
+    "LIBRUSTZCASH_BRANCH=$expected_librustzcash_branch" \
     "LIBRUSTZCASH_REVISION=$librustzcash_revision" \
+    "LIBRUSTZCASH_TREE=$librustzcash_tree" \
+    "VOTING_CIRCUITS_REVISION=$voting_circuits_revision" \
+    "VOTE_NULLIFIER_PIR_REVISION=$vote_nullifier_pir_revision" \
+    "ZCASH_VOTING_REVISION=$zcash_voting_revision" \
     "SDK_FFI_SOURCE_SHA256=$sdk_ffi_source_sha256" \
     "SOURCE_DATE_EPOCH=$source_date_epoch" \
     "RUST_TOOLCHAIN=$rust_toolchain" \
@@ -121,9 +136,11 @@ printf '%s\n' \
     "MACOS_VERSION=$macos_version" \
     "MACOS_BUILD_VERSION=$macos_build_version" \
     "IOS_ARM64_SHA256=$ios_arm64_sha256" \
-    "IOS_ARM64_SIMULATOR_SHA256=$ios_arm64_simulator_sha256" \
-    "MACOS_ARM64_SHA256=$macos_arm64_sha256" \
+    "IOS_SIMULATOR_UNIVERSAL_SHA256=$ios_simulator_universal_sha256" \
+    "MACOS_UNIVERSAL_SHA256=$macos_universal_sha256" \
+    "XCFRAMEWORK_INFO_SHA256=$xcframework_info_sha256" \
     > "$provenance_temp"
 mv "$provenance_temp" LocalPackages/IRONWOOD_FFI_PROVENANCE.env
+provenance_temp=""
 
 ./Scripts/verify-ironwood-ffi-artifact.sh

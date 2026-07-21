@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Emits one deterministic SHA-256 over every public SDK input that can change the Rust FFI binary
-# or XCFramework assembly. Private migration-engine source is represented separately by its exact
-# commit and tree in IRONWOOD_FFI_PROVENANCE.env.
+# Emits one deterministic SHA-256 over every SDK input that can change the Rust FFI binary or
+# XCFramework assembly. Exact external git sources are represented by Cargo.lock and the frozen
+# repository revision/tree in IRONWOOD_FFI_PROVENANCE.env.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -19,6 +19,7 @@ files=(
     Scripts/init-local-ffi.sh
     Scripts/rebuild-local-ffi.sh
     Scripts/rust-build-env.sh
+    Scripts/version-macos-framework.sh
 )
 
 while IFS= read -r file; do

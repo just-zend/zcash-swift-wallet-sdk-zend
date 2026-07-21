@@ -331,23 +331,23 @@ public class Initializer {
 
         // It's not possible to fail from constructor. Technically it's possible but it can be pain for the client apps to handle errors thrown
         // from constructor. So `parsingError` is just stored in initializer and `SDKSynchronizer.prepare()` throw this error if it exists.
-        let (updatedURLs, urlParsingError) = Self.tryToUpdateURLs(with: alias, urls: urls)
-        var parsingError = urlParsingError
+        let (updatedURLs, parsingError) = Self.tryToUpdateURLs(with: alias, urls: urls)
 
         // A custom network carries a base identity + custom NU activation heights; register them with
         // the Rust core before any FFI call resolves the custom (regtest-slot) network id.
         // Process-global (see MIGRATING.md).
         if let activationHeights = network.customActivationHeights {
-            let configured = ZcashRustBackend.setCustomNetwork(
+            let cleanRegistration = ZcashRustBackend.setCustomNetwork(
                 base: network.customNetworkBase ?? network.networkType,
-                chainName: network.chainName,
                 activationHeights
             )
-            if !configured, parsingError == nil {
-                parsingError = .unknown(
-                    ConsensusParametersError.unavailable(
-                        "Custom consensus parameters are invalid or conflict with an existing process-wide configuration"
-                    )
+            if !cleanRegistration {
+                // A different custom network was already registered in this process. The new values
+                // are applied (last writer wins), but per-instance state of any earlier Initializer
+                // (e.g. its checkpoint source) no longer matches the process-global parameters —
+                // a host configuration bug worth failing fast on during development.
+                assertionFailure(
+                    "Conflicting custom-network registration: a different custom network was already registered in this process."
                 )
             }
         }
@@ -470,7 +470,9 @@ public class Initializer {
         self.walletBirthday = checkpoint.height
 
         // If there are no accounts it must be created, the default amount of accounts is 1
-        if let seed, try await rustBackend.listAccounts().isEmpty {
+        let existingAccounts = try await rustBackend.listAccounts()
+        try await validateSeedAgainstExistingAccounts(seed, existingAccounts: existingAccounts)
+        if let seed, existingAccounts.isEmpty {
             var chainTip: UInt32?
             var accountTreeState = checkpoint.treeState()
 
@@ -513,6 +515,24 @@ public class Initializer {
 
         return .success
     }
+    /// Seed↔account integrity guard: `initialize` is idempotent for an existing wallet, so
+    /// restoring a DIFFERENT seed over existing accounts previously no-op'd silently — the
+    /// keychain held seed B while data.db kept seed A's account, the app showed A's balance AND
+    /// receive address (funds receivable but unspendable), and sends failed ZRUST0002. Validate
+    /// the caller's seed against the stored derived account(s) before opening.
+    ///
+    /// The relevance check is delegated to the Rust core, which reports the seed relevant when it
+    /// derives an existing account, when there are no accounts, or when there is no seed-derived
+    /// account to validate against — so imported-only wallets (hardware-wallet UFVKs) are exempt.
+    /// Only a genuine mismatch against existing seed-derived accounts throws. This must not use a
+    /// Swift-side heuristic on `seedFingerprint`/`hdAccountIndex`, since those are also populated
+    /// for imported-spending accounts and would falsely brick hardware-wallet-only wallets.
+    private func validateSeedAgainstExistingAccounts(_ seed: [UInt8]?, existingAccounts: [Account]) async throws {
+        guard let seed, !existingAccounts.isEmpty else { return }
+        let seedIsRelevant = try await rustBackend.isSeedRelevantToAnyDerivedAccount(seed: seed)
+        guard seedIsRelevant else { throw ZcashError.initializerSeedMismatch }
+    }
+
 
     /**
     checks if the provided address is a valid sapling address
@@ -526,5 +546,62 @@ public class Initializer {
     */
     public func isValidTransparentAddress(_ address: String) -> Bool {
         DerivationTool(networkType: network.networkType).isValidTransparentAddress(address)
+    }
+}
+
+extension Initializer.LoggingPolicy {
+    /// Builds the `Logger` this policy specifies.
+    ///
+    /// Extracted from what were two independently maintained copies of this exact mapping
+    /// (`Synchronizer/Dependencies.swift`'s DI registration, `OrchardMigration`'s standalone
+    /// backend setup) so there is one implementation to keep in sync with `LoggingPolicy`'s cases.
+    ///
+    /// - Parameters:
+    ///   - category: the OSLog category for the `.default` case's `OSLogger`. Defaults to
+    ///     `OSLogger`'s own default (`"sdkLogs"`).
+    ///   - alias: the synchronizer alias folded into the `.default` case's `OSLogger` category
+    ///     suffix, mirroring the DI-registered per-synchronizer-instance logger. Pass `nil` when the
+    ///     logger is not scoped to a synchronizer instance (e.g. `OrchardMigration`, which predates
+    ///     any `Synchronizer`).
+    func makeLogger(category: String = "sdkLogs", alias: ZcashSynchronizerAlias? = nil) -> Logger {
+        switch self {
+        case let .default(logLevel):
+            return OSLogger(logLevel: logLevel, category: category, alias: alias)
+        case let .custom(customLogger):
+            return customLogger
+        case .noLogging:
+            return NullLogger()
+        }
+    }
+
+    /// Maps this policy to the Rust FFI's log-level enum: `.default` translates its `OSLogger.LogLevel`
+    /// directly, `.custom` reads the supplied logger's own `maxLogLevel()` (`nil` -> `.off`), and
+    /// `.noLogging` is always `.off`. Extracted alongside `makeLogger(category:alias:)` -- see its
+    /// doc for the two call sites this used to be duplicated across.
+    func makeRustLogging() -> RustLogging {
+        switch self {
+        case .default(let logLevel):
+            return Self.rustLogging(for: logLevel)
+        case .custom(let customLogger):
+            guard let logLevel = customLogger.maxLogLevel() else {
+                return RustLogging.off
+            }
+            return Self.rustLogging(for: logLevel)
+        case .noLogging:
+            return RustLogging.off
+        }
+    }
+
+    private static func rustLogging(for logLevel: OSLogger.LogLevel) -> RustLogging {
+        switch logLevel {
+        case .debug:
+            return RustLogging.debug
+        case .info, .event:
+            return RustLogging.info
+        case .warning:
+            return RustLogging.warn
+        case .error:
+            return RustLogging.error
+        }
     }
 }

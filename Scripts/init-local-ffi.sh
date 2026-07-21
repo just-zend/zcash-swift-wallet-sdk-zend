@@ -152,6 +152,10 @@ build_arm_xcframework() {
     rm -rf "$XCFRAMEWORK_DIR"
     mv "$temp_xcfw" "$XCFRAMEWORK_DIR"
     rm -rf "$temp_dir"
+
+    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64/libzcashlc.framework" ]]; then
+        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64/libzcashlc.framework"
+    fi
 }
 
 # Parse the single optional flag.
@@ -190,14 +194,19 @@ if [[ "$BUILD_MODE" == "arm" ]]; then
     build_arm_xcframework "${ARM_TARGETS[@]}"
 elif [[ "$BUILD_MODE" == "cached" ]]; then
     echo "Downloading pre-built xcframework..."
-    REPO="just-zend/zcash-swift-wallet-sdk-zend"
 
-    # Extract the version from the download URL in Package.swift
-    SDK_VERSION=$(grep -oE 'releases/download/[^/"]+' Package.swift | head -1 | sed 's|releases/download/||')
-    if [[ -z "$SDK_VERSION" ]]; then
-        echo "Error: Could not determine SDK version from Package.swift"
+    DOWNLOAD_URL=$(grep -oE 'https://github.com/[^"]+/releases/download/[^"]+/libzcashlc\.xcframework\.zip' Package.swift | head -1)
+    if [[ -z "$DOWNLOAD_URL" ]]; then
+        echo "Error: Could not find the libzcashlc.xcframework.zip URL in Package.swift"
         exit 1
     fi
+    REPO=$(echo "$DOWNLOAD_URL" | sed -E 's|https://github.com/([^/]+/[^/]+)/releases/download/.*|\1|')
+    SDK_VERSION=$(echo "$DOWNLOAD_URL" | sed -E 's|.*/releases/download/([^/]+)/.*|\1|')
+    if [[ -z "$REPO" || -z "$SDK_VERSION" ]]; then
+        echo "Error: Could not parse repo/version from download URL: $DOWNLOAD_URL"
+        exit 1
+    fi
+    echo "  release $SDK_VERSION from $REPO"
 
     # Extract the expected checksum from Package.swift
     EXPECTED_CHECKSUM=$(grep -A1 'libzcashlc.xcframework.zip' Package.swift | grep 'checksum:' | sed -E 's/.*checksum: "([a-f0-9]+)".*/\1/')
@@ -224,8 +233,12 @@ elif [[ "$BUILD_MODE" == "cached" ]]; then
     fi
     echo "Checksum verified."
 
+    rm -rf "$XCFRAMEWORK_DIR"
     unzip -o LocalPackages/libzcashlc.xcframework.zip -d LocalPackages/
     rm LocalPackages/libzcashlc.xcframework.zip
+    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework" ]]; then
+        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    fi
     echo ""
     echo "Note: Downloaded pre-built xcframework may not match your local source."
     echo "      Run './Scripts/rebuild-local-ffi.sh' to rebuild for your target platform."
@@ -235,7 +248,9 @@ else
     make xcframework
     cd ..
     mkdir -p LocalPackages
+    rm -rf "$XCFRAMEWORK_DIR"
     cp -R BuildSupport/products/libzcashlc.xcframework "$XCFRAMEWORK_DIR"
+    ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
 fi
 
 # Create local SPM package wrapper
