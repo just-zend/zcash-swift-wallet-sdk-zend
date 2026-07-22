@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-20
+Last reviewed: 2026-07-21
 
 ## Remote and branch invariants
 
@@ -10,19 +10,19 @@ Last reviewed: 2026-07-20
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current monitor status (2026-07-20)
+## Current monitor status (2026-07-21)
 
-- After fetching both remotes, `origin/main` is `ee3abea2` and `upstream/main` is
-  `89d85c49` (upstream PR `#1815`). The default-branch count is `160 4`; PR `#26`
-  is the sole parity vehicle and its head contains all four upstream commits.
-- The parity merge adopted the copyright-holder update and required-build-path change without
-  altering Zend artifacts, private-engine provenance, branding, or Ironwood behavior. Local
-  `swift build` and `swift test --filter OfflineTests` both pass (546 offline tests, 0 failures).
-- Upstream PRs `#1813` and `#1812` are now clean and green but remain one 90-file
-  Orchard-to-Ironwood protocol/FFI/persistence/API stack. Keep them out of Zend until upstream
-  merges them and a Zend artifact/reconciliation plan is reviewed.
-- `michal/slipstream-support` is 37 commits ahead and 4 behind `upstream/main`, has no scoped
-  upstream PR, and still changes 114 files. It is not a reviewable low-risk early carry.
+- After fetching both remotes, both default branches remain `main`; `origin/main` is
+  `8f85838b` and `upstream/main` is `89d85c49` (upstream PR `#1815`). The parity count is
+  `168 0`, and `upstream/main` is an ancestor of `origin/main`: Zend PR `#26` has merged.
+- The merged parity adopted the copyright-holder update and required-build-path change without
+  altering Zend artifacts, private-engine provenance, branding, or Ironwood behavior. Its
+  verification passed: `swift build` and `swift test --filter OfflineTests` (546 tests, 0 failures).
+- The 2026-07-21 force-pushes to the Orchard-to-Ironwood migration branches make the early-carry
+  case weaker, not stronger: the Synchronizer branch is 36 commits ahead / 93 files, the FFI branch
+  is 26 commits ahead / 79 files, and `michal/slipstream-support` is 45 commits ahead / 117 files.
+  Together they change public API, Rust/FFI, persistence, privacy gates, generated mocks, and the
+  engine family. Wait for upstream merge plus a Zend artifact/provenance reconciliation plan.
 - All other active upstream PRs remain in the existing wait-for-upstream classes:
   draft, blocked/review-required, dirty, failed, or broad protocol/FFI/release work.
   No early-carry candidate currently satisfies ready, useful, and low-risk.
@@ -116,6 +116,20 @@ environment protections and WarpBuild GitHub App controls above are verified.
 - Verification on the parity branch passed: `git diff --check origin/main...HEAD`, `swift build`,
   and `swift test --filter OfflineTests` (546 tests, 0 failures). The shared workspace has about
   9 GiB free; the prior SwiftPM dependency-resolution failure was caused by disk exhaustion.
+
+### Upstream refresh (2026-07-21)
+
+- Zend PR `#26` merged at `8f85838b`, so `origin/main` now contains upstream `main` through
+  `89d85c49` / upstream PR `#1815`; fetched parity is `168 0` and no default-branch merge is due.
+- The only fresh upstream branch activity is a force-pushed final-engine migration stack:
+  `michal/MOB-1455/MOB-1495-sdk-pool-migration` is 36 commits ahead / 93 files,
+  `...-ffi` is 26 commits ahead / 79 files, and the unscoped `michal/slipstream-support` is
+  45 commits ahead / 117 files. None is a low-risk early Zend carry because it replaces the
+  protocol-facing migration, FFI, persistence, and generated-test surface that Zend currently
+  validates against committed, provenance-locked artifacts.
+- This documentation-only monitor update did not rerun local Swift commands. Reuse the successful
+  PR `#26` build and OfflineTests result above; run the full artifact/provenance and funded-wallet
+  validation before considering any future migration-stack adoption.
 
 Current relationship after Zend PRs `#18`, `#17`, `#20`, and `#21` merged into `origin/main`:
 
