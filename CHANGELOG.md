@@ -43,6 +43,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per the adversarial review: the FFI last-error channel is cleared before every
   sentinel read (stale errors can no longer surface as spurious throws elsewhere) and one-time
   rust initialization is race-free. No `Synchronizer` API changes in this PR.
+- Migration residual locking and locked balance. `ZcashRustBackendWelding` gains
+  `lockMigrationResidual(accountUUID:)` — locks every currently-spendable, not-already-locked
+  legacy-Orchard note of the account until explicit unlock and returns the total value locked
+  (the "Lock balance" choice at migration `Complete`; the lock never expires on its own, and
+  repeating the call locks only notes that became spendable since) — and
+  `unlockMigrationResidual(accountUUID:)`, the release half (clears all of the account's output
+  locks and returns the cleared count). New error codes `rustMigrationLockResidual` ZRUST0132
+  and `rustMigrationUnlockResidual` ZRUST0133. The public `PoolBalance` gains `lockedValue`:
+  locked value leaves `spendableValue` but stays in the account — `total()` now includes it —
+  marshaled from the rust balance so locked funds never vanish from app-visible sums.
 - Ironwood (NU6.3) receive/sync readiness. The lightwalletd protocol gains the Ironwood fields
   (`CompactTx.ironwoodActions`, `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
   `ShieldedProtocol.ironwood`); `UpdateSubtreeRootsAction` fetches and stores Ironwood subtree roots

@@ -41,8 +41,10 @@ extension WalletSummary {
     /// The [#1591] stale-tip protection as a pure transform: every account's SPENDABLE value
     /// is masked to zero (shifted into `valuePendingSpendability`; transparent into
     /// `awaitingResolution`) — applied while `SDKFlags.chainTipUpdated == false`, i.e. until
-    /// the current run has refreshed the wallet DB chain tip. Extracted VERBATIM from
-    /// `ZcashRustBackend.getWalletSummary()` so the transform has a single, shared definition.
+    /// the current run has refreshed the wallet DB chain tip. `lockedValue` passes through
+    /// unchanged: locked value is already non-spendable, so the mask has nothing to shift.
+    /// Extracted VERBATIM from `ZcashRustBackend.getWalletSummary()` so the transform has a
+    /// single, shared definition.
     func withSpendableMasked() -> WalletSummary {
         var masked = accountBalances
         masked.forEach { key, _ in
@@ -52,19 +54,22 @@ extension WalletSummary {
                         spendableValue: .zero,
                         changePendingConfirmation: accountBalance.saplingBalance.changePendingConfirmation,
                         valuePendingSpendability: accountBalance.saplingBalance.valuePendingSpendability
-                        + accountBalance.saplingBalance.spendableValue
+                        + accountBalance.saplingBalance.spendableValue,
+                        lockedValue: accountBalance.saplingBalance.lockedValue
                     ),
                     orchardBalance: PoolBalance(
                         spendableValue: .zero,
                         changePendingConfirmation: accountBalance.orchardBalance.changePendingConfirmation,
                         valuePendingSpendability: accountBalance.orchardBalance.valuePendingSpendability
-                        + accountBalance.orchardBalance.spendableValue
+                        + accountBalance.orchardBalance.spendableValue,
+                        lockedValue: accountBalance.orchardBalance.lockedValue
                     ),
                     ironwoodBalance: PoolBalance(
                         spendableValue: .zero,
                         changePendingConfirmation: accountBalance.ironwoodBalance.changePendingConfirmation,
                         valuePendingSpendability: accountBalance.ironwoodBalance.valuePendingSpendability
-                        + accountBalance.ironwoodBalance.spendableValue
+                        + accountBalance.ironwoodBalance.spendableValue,
+                        lockedValue: accountBalance.ironwoodBalance.lockedValue
                     ),
                     unshielded: .zero,
                     awaitingResolution: accountBalance.unshielded

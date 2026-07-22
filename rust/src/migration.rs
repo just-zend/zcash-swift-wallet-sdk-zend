@@ -45,13 +45,15 @@ use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use rand::rngs::OsRng;
 use rusqlite::Connection;
-use zcash_client_backend::data_api::WalletRead;
+use zcash_client_backend::data_api::wallet::TargetHeight;
+use zcash_client_backend::data_api::{InputSource, WalletRead, WalletWrite};
+use zcash_client_backend::wallet::OutputRef;
 use zcash_client_sqlite::AccountUuid;
-use zcash_protocol::TxId;
 use zcash_protocol::consensus::{
     BLOCKS_PER_HOUR, BlockHeight, Network, NetworkUpgrade, Parameters,
 };
 use zcash_protocol::value::Zatoshis;
+use zcash_protocol::{PoolType, ShieldedPool, TxId};
 
 use zcash_pool_migration_backend::engine::{
     self, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction, MigrationTxId,
@@ -1369,6 +1371,88 @@ pub unsafe extern "C" fn zcashlc_migration_residual_after_migration(
     unwrap_exc_or(res, -1)
 }
 
+/// Locks EVERY currently-spendable, not-already-locked legacy-Orchard note of the account until
+/// explicit unlock, and returns the TOTAL LOCKED VALUE in zatoshi. `0` is a legitimate result
+/// (nothing was spendable, or everything spendable is already locked); `-1` signals an error (see
+/// `zcashlc_last_error_message`).
+///
+/// Intended to be called when a migration run reaches `Complete` to lock the sub-threshold
+/// residual that stays in Orchard (the "Lock balance" choice): the lock expiry is permanent
+/// (`u32::MAX`), so no chain height ever releases it — only an explicit
+/// `zcashlc_migration_unlock_residual` does. Note selection excludes already-locked notes, so
+/// repeating the call is idempotent-additive: it locks only notes that became spendable since
+/// (and returns only their value). A concurrent-lock race (another caller locked one of the
+/// selected notes between selection and locking) surfaces as an error
+/// (`LockError::LockFailure`); nothing is partially locked and the caller may retry.
+///
+/// # Safety
+/// See [`open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_lock_residual(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> i64 {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        // Selection targets the next block, mirroring `Backend::selection_target`.
+        let target = TargetHeight::from(u32::from(ctx.tip()?) + 1);
+        let received = ctx
+            .wallet
+            .select_unspent_notes(ctx.account, &[ShieldedPool::Orchard], target, &[], false)
+            .map_err(|e| anyhow!("spendable-note selection failed: {e}"))?;
+        let mut refs = Vec::new();
+        let mut total = Zatoshis::ZERO;
+        for rn in received.orchard() {
+            refs.push(OutputRef::new(
+                *rn.txid(),
+                PoolType::Shielded(ShieldedPool::Orchard),
+                u32::from(rn.output_index()),
+            ));
+            let value = Zatoshis::from_u64(rn.note().value().inner())
+                .map_err(|_| anyhow!("a spendable note has an out-of-range value"))?;
+            total = (total + value).ok_or_else(|| anyhow!("locked Orchard balance overflows"))?;
+        }
+        if refs.is_empty() {
+            return Ok(0);
+        }
+        ctx.wallet
+            .lock_outputs(refs.into_iter(), BlockHeight::from(u32::MAX))
+            .map_err(|e| anyhow!("locking the migration residual failed: {e}"))?;
+        Ok(zat_to_i64(total))
+    });
+    unwrap_exc_or(res, -1)
+}
+
+/// Unlocks the account's locked outputs — the release half of
+/// `zcashlc_migration_lock_residual` — and returns the number of outputs unlocked (`0` when
+/// nothing was locked; `-1` signals an error, see `zcashlc_last_error_message`).
+///
+/// Clears ALL locks held for the account, regardless of expiry. That blanket clear is safe here
+/// because this SDK never creates proposal-scoped output locks: the only locks an account can
+/// hold are the permanent residual locks placed by `zcashlc_migration_lock_residual`.
+///
+/// # Safety
+/// See [`open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_unlock_residual(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> i64 {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let cleared = ctx
+            .wallet
+            .clear_locked_outputs(ctx.account)
+            .map_err(|e| anyhow!("unlocking the migration residual failed: {e}"))?;
+        Ok(cleared as i64)
+    });
+    unwrap_exc_or(res, -1)
+}
+
 /// The migration schedule preview for the account's live balance, in chronological broadcast
 /// order. Plans fresh (drawing new ZIP 318 randomness) and caches the preview — a later commit
 /// signs exactly this plan. An EMPTY schedule means there is nothing to migrate: after a
@@ -2187,6 +2271,95 @@ mod tests {
         clear_invalid_marks(&conn, &account).unwrap();
         assert!(invalid_marks(&conn, &account).unwrap().is_empty());
         assert_eq!(invalid_marks(&conn, &other).unwrap(), vec![7]);
+    }
+
+    /// On a freshly initialized wallet database with a chain tip but no spendable notes, locking
+    /// the residual locks nothing (returns `0`, not an error) and unlocking clears nothing
+    /// (returns `0`). The fixture mirrors `migration_state_on_fresh_db_is_not_started`
+    /// (`zcashlc_init_data_database` first), plus `zcashlc_update_chain_tip` — the lock path
+    /// selects notes against the tip + 1, so it needs a chain tip to exist, exactly like a real
+    /// post-sync caller.
+    #[test]
+    fn migration_lock_and_unlock_residual_on_fresh_db_are_zero() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_migration_lock_residual_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let init = unsafe {
+            crate::zcashlc_init_data_database(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                std::ptr::null(),
+                0,
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(init >= 0, "wallet-db initialization must succeed");
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_000_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        let account = [7u8; 16];
+        let locked = unsafe {
+            zcashlc_migration_lock_residual(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(locked, 0, "no spendable notes exist, so nothing locks");
+        let unlocked = unsafe {
+            zcashlc_migration_unlock_residual(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(unlocked, 0, "no locks exist, so nothing clears");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Both locking entry points report `-1` (with the last-error channel set) on a wallet
+    /// database that was never initialized: the error-path smoke for the `i64` sentinel.
+    #[test]
+    fn migration_lock_and_unlock_residual_on_uninitialized_db_are_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_migration_lock_residual_uninit_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = [7u8; 16];
+        let locked = unsafe {
+            zcashlc_migration_lock_residual(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(locked, -1, "an uninitialized database must error");
+        let unlocked = unsafe {
+            zcashlc_migration_unlock_residual(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(unlocked, -1, "an uninitialized database must error");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A freshly initialized wallet database has no stored migration, so its state marshals as

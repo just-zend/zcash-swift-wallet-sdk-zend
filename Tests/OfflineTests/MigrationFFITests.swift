@@ -129,6 +129,34 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertNil(residual, "a fresh wallet with nothing to migrate has no residual")
     }
 
+    // MARK: - Residual locking
+
+    /// On a fresh wallet with no spendable Orchard notes, locking the residual locks nothing:
+    /// `Zatoshi(0)` is the legitimate "nothing was spendable" answer, not an error. (The
+    /// account-creation fixture gives the wallet a chain tip via the checkpoint birthday, which
+    /// the lock path's note selection targets — the same reason `isNoteSplitNeeded` plans
+    /// benignly above.)
+    func testFreshWalletLockResidualLocksNothing() async throws {
+        let locked = try await rustBackend.lockMigrationResidual(accountUUID: account)
+        XCTAssertEqual(locked, Zatoshi(0))
+    }
+
+    /// The release half on a fresh wallet: no locks exist, so the cleared-output count is `0`.
+    func testFreshWalletUnlockResidualClearsNothing() async throws {
+        let unlocked = try await rustBackend.unlockMigrationResidual(accountUUID: account)
+        XCTAssertEqual(unlocked, 0)
+    }
+
+    /// Lock-then-unlock on the empty wallet is a stable round trip (both legs `0`), pinning that
+    /// a no-op lock leaves no stray lock state behind for unlock to find.
+    func testLockThenUnlockResidualOnFreshWalletIsAZeroRoundTrip() async throws {
+        let locked = try await rustBackend.lockMigrationResidual(accountUUID: account)
+        XCTAssertEqual(locked, Zatoshi(0))
+
+        let unlocked = try await rustBackend.unlockMigrationResidual(accountUUID: account)
+        XCTAssertEqual(unlocked, 0)
+    }
+
     // MARK: - Invalid-state transitions
 
     /// A commit without a matching previewed plan is the plan-stale contract: the engine signs

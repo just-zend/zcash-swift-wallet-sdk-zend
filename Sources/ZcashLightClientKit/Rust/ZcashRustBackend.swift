@@ -1621,6 +1621,45 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
+    func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi {
+        let locked = zcashlc_migration_lock_residual(
+            dbData.0,
+            dbData.1,
+            accountUUID.id,
+            networkType.networkId
+        )
+
+        // Unlike the ambiguous sentinels above, `-1` here means only "error": `0` is the
+        // legitimate "nothing was spendable" answer, so no last-error disambiguation is needed.
+        guard locked >= 0 else {
+            throw ZcashError.rustMigrationLockResidual(
+                lastErrorMessage(fallback: "`lockMigrationResidual` failed with unknown error")
+            )
+        }
+
+        return Zatoshi(locked)
+    }
+
+    @DBActor
+    func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int {
+        let unlocked = zcashlc_migration_unlock_residual(
+            dbData.0,
+            dbData.1,
+            accountUUID.id,
+            networkType.networkId
+        )
+
+        // `-1` means only "error" (`0` is the legitimate "nothing was locked" answer).
+        guard unlocked >= 0 else {
+            throw ZcashError.rustMigrationUnlockResidual(
+                lastErrorMessage(fallback: "`unlockMigrationResidual` failed with unknown error")
+            )
+        }
+
+        return Int(unlocked)
+    }
+
+    @DBActor
     func migrationProposeTransfers(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule {
         let schedulePtr = zcashlc_migration_propose_transfers(
             dbData.0,
@@ -2309,10 +2348,11 @@ extension Array where Element == FfiSubtreeRoot {
 extension FfiBalance {
     /// Converts an [`FfiBalance`] into a [`PoolBalance`].
     func toPoolBalance() -> PoolBalance {
-        .init(
+        PoolBalance(
             spendableValue: Zatoshi(self.spendable_value),
             changePendingConfirmation: Zatoshi(self.change_pending_confirmation),
-            valuePendingSpendability: Zatoshi(self.value_pending_spendability)
+            valuePendingSpendability: Zatoshi(self.value_pending_spendability),
+            lockedValue: Zatoshi(self.locked_value)
         )
     }
 }

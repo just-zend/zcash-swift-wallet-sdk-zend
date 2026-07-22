@@ -452,6 +452,25 @@ protocol ZcashRustBackendWelding {
     ///   rather than returning `nil`.
     func migrationResidualAfterMigration(for account: AccountUUID) async throws -> Zatoshi?
 
+    /// Locks EVERY currently-spendable, not-already-locked legacy-Orchard note of the account
+    /// until explicit unlock and returns the total value locked (`Zatoshi(0)` when nothing was
+    /// spendable — a legitimate result). Intended to be called at migration `Complete` to lock
+    /// the sub-threshold residual that stays in Orchard (the "Lock balance" choice); the lock
+    /// never expires on its own, so only `unlockMigrationResidual` releases it. Already-locked
+    /// notes are excluded from selection, so repeating the call locks (and reports) only notes
+    /// that became spendable since. Locked value leaves `PoolBalance.spendableValue` but stays
+    /// in `PoolBalance.lockedValue` (and therefore in `total()`).
+    /// - Throws: `rustMigrationLockResidual` if the rust layer returns an error (including a
+    ///   concurrent-lock race, which the caller may retry).
+    func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi
+
+    /// Unlocks the account's locked outputs — the release half of `lockMigrationResidual` — and
+    /// returns the number of outputs unlocked (`0` when nothing was locked). Clears ALL locks
+    /// held for the account; that blanket clear is safe because the SDK never creates
+    /// proposal-scoped output locks.
+    /// - Throws: `rustMigrationUnlockResidual` if the rust layer returns an error.
+    func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int
+
     /// The full migration schedule for the spendable Orchard balance. When `includeResidual` is
     /// `true` and a worthwhile residual exists, one extra transfer for it is appended.
     /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.

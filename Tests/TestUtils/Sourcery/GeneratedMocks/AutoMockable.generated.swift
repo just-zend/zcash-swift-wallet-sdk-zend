@@ -4311,6 +4311,54 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
+    // MARK: - lockMigrationResidual
+
+    var lockMigrationResidualAccountUUIDThrowableError: Error?
+    var lockMigrationResidualAccountUUIDCallsCount = 0
+    var lockMigrationResidualAccountUUIDCalled: Bool {
+        return lockMigrationResidualAccountUUIDCallsCount > 0
+    }
+    var lockMigrationResidualAccountUUIDReceivedAccountUUID: AccountUUID?
+    var lockMigrationResidualAccountUUIDReturnValue: Zatoshi!
+    var lockMigrationResidualAccountUUIDClosure: ((AccountUUID) async throws -> Zatoshi)?
+
+    func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi {
+        if let error = lockMigrationResidualAccountUUIDThrowableError {
+            throw error
+        }
+        lockMigrationResidualAccountUUIDCallsCount += 1
+        lockMigrationResidualAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = lockMigrationResidualAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return lockMigrationResidualAccountUUIDReturnValue
+        }
+    }
+
+    // MARK: - unlockMigrationResidual
+
+    var unlockMigrationResidualAccountUUIDThrowableError: Error?
+    var unlockMigrationResidualAccountUUIDCallsCount = 0
+    var unlockMigrationResidualAccountUUIDCalled: Bool {
+        return unlockMigrationResidualAccountUUIDCallsCount > 0
+    }
+    var unlockMigrationResidualAccountUUIDReceivedAccountUUID: AccountUUID?
+    var unlockMigrationResidualAccountUUIDReturnValue: Int!
+    var unlockMigrationResidualAccountUUIDClosure: ((AccountUUID) async throws -> Int)?
+
+    func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int {
+        if let error = unlockMigrationResidualAccountUUIDThrowableError {
+            throw error
+        }
+        unlockMigrationResidualAccountUUIDCallsCount += 1
+        unlockMigrationResidualAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = unlockMigrationResidualAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return unlockMigrationResidualAccountUUIDReturnValue
+        }
+    }
+
     // MARK: - migrationProposeTransfers
 
     var migrationProposeTransfersIncludeResidualForThrowableError: Error?
