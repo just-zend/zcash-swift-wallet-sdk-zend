@@ -1,5 +1,5 @@
 //! FFI over the final Orchard→Ironwood pool-migration engine
-//! ([`zcash_pool_migration_backend`] + [`zcash_pool_migration_sqlite`]).
+//! ([`zcash_pool_migration_backend`] + the `zcash_client_sqlite::pool_migration` store).
 //!
 //! The engine is a set of free functions over traits — [`crate::migration_engine::Backend`] wires
 //! this SDK's wallet database (and the account-keyed migration store living inside it) into them;
@@ -57,7 +57,6 @@ use zcash_pool_migration_backend::engine::{
     self, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction, MigrationTxId,
     MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
-use zcash_pool_migration_sqlite::orchard_ironwood::init_migration_tables;
 
 use crate::migration_engine::{Backend, MigrationWallet};
 use crate::migration_finalize;
@@ -138,9 +137,9 @@ struct CallCtx {
 }
 
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
-/// drops it at the end (no persistent handle). The store tables are ensured idempotently (they are
-/// also created by the wallet schema migration during `init_data_db`; this covers databases opened
-/// before that migration ran).
+/// drops it at the end (no persistent handle). The engine's store tables are created by the wallet
+/// schema migrations during `init_data_db` (`zcash_client_sqlite::pool_migration` registers them);
+/// only the SDK's own side tables are ensured idempotently here.
 ///
 /// # Safety
 /// - `db_data` must be valid for reads of `db_data_len` bytes and encode a filesystem path.
@@ -158,8 +157,6 @@ unsafe fn open(
     let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network.clone())? };
     let store_conn = Connection::open(&db_path)
         .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
-    init_migration_tables(&store_conn)
-        .map_err(|e| anyhow!("Error initializing migration tables: {e:?}"))?;
     init_invalid_marks(&store_conn)
         .map_err(|e| anyhow!("Error initializing migration marks table: {e}"))?;
     let account = account_uuid_from_bytes(account_uuid_bytes)
@@ -219,8 +216,8 @@ fn insert_invalid_mark(
 }
 
 fn invalid_marks(conn: &Connection, account: &[u8; 16]) -> rusqlite::Result<Vec<u32>> {
-    let mut stmt = conn
-        .prepare("SELECT tx_id FROM sdk_invalid_marks WHERE account_uuid = ?1 ORDER BY tx_id")?;
+    let mut stmt =
+        conn.prepare("SELECT tx_id FROM sdk_invalid_marks WHERE account_uuid = ?1 ORDER BY tx_id")?;
     let rows = stmt.query_map(rusqlite::params![&account[..]], |row| row.get::<_, u32>(0))?;
     rows.collect()
 }
@@ -252,10 +249,9 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
         .transactions()
         .iter()
         .filter_map(|t| match t.state() {
-            MigrationTxState::Broadcast { .. } => t
-                .state()
-                .broadcast_txid()
-                .map(|txid| (t.id(), txid)),
+            MigrationTxState::Broadcast { .. } => {
+                t.state().broadcast_txid().map(|txid| (t.id(), txid))
+            }
             _ => None,
         })
         .collect();
@@ -288,7 +284,12 @@ fn plan_and_cache(ctx: &mut CallCtx, immediate: bool) -> anyhow::Result<Option<M
     let mut rng = OsRng;
     match engine::plan_migration(&ctx.network, &backend, &mut rng) {
         Ok(plan) => {
-            migration_plan_cache::set(ctx.db_path.clone(), ctx.account_bytes, plan.clone(), immediate);
+            migration_plan_cache::set(
+                ctx.db_path.clone(),
+                ctx.account_bytes,
+                plan.clone(),
+                immediate,
+            );
             Ok(Some(plan))
         }
         Err(engine::MigrationError::NothingToMigrate) => Ok(None),
@@ -364,7 +365,7 @@ fn encode_schedule_from_plan(
     plan: &MigrationPlan,
     now_reference: BlockHeight,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
-    let rows = schedule_rows(plan.funding_notes(), plan.schedule(), prep_tx_count(plan))?;
+    let rows = schedule_rows(&plan.funding_notes(), plan.schedule(), prep_tx_count(plan))?;
     let transfers = rows
         .into_iter()
         .map(|(id, amount, broadcast, expiry)| {
@@ -400,7 +401,11 @@ fn encode_empty_schedule() -> *mut FfiMigrationSchedule {
 /// exactly these values). Order-independent: the platform displays chronologically while
 /// `funding_notes()` is in crossing order.
 fn validate_amounts_against_plan(plan: &MigrationPlan, amounts: &[i64]) -> anyhow::Result<()> {
-    let mut expected: Vec<i64> = plan.funding_notes().iter().map(|z| zat_to_i64(*z)).collect();
+    let mut expected: Vec<i64> = plan
+        .funding_notes()
+        .iter()
+        .map(|z| zat_to_i64(*z))
+        .collect();
     let mut got: Vec<i64> = amounts.to_vec();
     expected.sort_unstable();
     got.sort_unstable();
@@ -467,14 +472,9 @@ fn commit_or_resume(
             unsigned.into_iter().map(|tx| tx.into_parts()).collect(),
         )
     } else {
-        let state = engine::commit_preparation(
-            &ctx.network,
-            target,
-            &mut backend,
-            &cached.plan,
-            &mut rng,
-        )
-        .map_err(map_commit_err)?;
+        let state =
+            engine::commit_preparation(&ctx.network, target, &mut backend, &cached.plan, &mut rng)
+                .map_err(map_commit_err)?;
         (state, Vec::new())
     };
 
@@ -505,7 +505,6 @@ fn commit_or_resume(
         state = MigrationState::from_parts(
             state.status(),
             state.note_split().clone(),
-            state.funding_notes().clone(),
             state.preparation().clone(),
             transactions,
         );
@@ -521,9 +520,9 @@ fn commit_or_resume(
 /// "re-propose" signal).
 fn map_commit_err(e: engine::CommitError<anyhow::Error>) -> anyhow::Error {
     match e {
-        engine::CommitError::StalePlan => plan_stale(
-            "the previewed plan no longer matches the wallet or the build height",
-        ),
+        engine::CommitError::StalePlan => {
+            plan_stale("the previewed plan no longer matches the wallet or the build height")
+        }
         other => anyhow!("Error committing migration: {other}"),
     }
 }
@@ -557,7 +556,10 @@ fn prove_if_needed(
             let anchor = migration_finalize::resolve_proving_anchor(&ctx.wallet, tx)?;
             let (fvk, spendable) = {
                 let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
-                (backend.stored_orchard_fvk()?, backend.spendable_orchard_notes()?)
+                (
+                    backend.stored_orchard_fvk()?,
+                    backend.spendable_orchard_notes()?,
+                )
             };
             let pczt_bytes = tx.pczt().clone();
             match migration_finalize::finalize_transaction(
@@ -629,9 +631,10 @@ fn derive_state(
     if let Some(&id) = invalid_marks.first() {
         return DerivedState::InvalidTransfer(id);
     }
-    let expired_unmined = state.transactions().iter().any(|t| {
-        !matches!(t.state(), MigrationTxState::Mined { .. }) && tip > t.expiry_height()
-    });
+    let expired_unmined = state
+        .transactions()
+        .iter()
+        .any(|t| !matches!(t.state(), MigrationTxState::Mined { .. }) && tip > t.expiry_height());
     if expired_unmined {
         return DerivedState::TransferExpired;
     }
@@ -781,7 +784,11 @@ pub struct FfiPreparedTransfer {
 }
 
 impl FfiPreparedTransfer {
-    fn from_parts(id: MigrationTxId, txid: [u8; 32], pczt_bytes: Vec<u8>) -> anyhow::Result<*mut Self> {
+    fn from_parts(
+        id: MigrationTxId,
+        txid: [u8; 32],
+        pczt_bytes: Vec<u8>,
+    ) -> anyhow::Result<*mut Self> {
         let id = cstring_raw(&u32::from(id).to_string(), "prepared transfer id")?;
         let (pczt, pczt_len) = ptr_from_vec(pczt_bytes);
         Ok(Box::into_raw(Box::new(FfiPreparedTransfer {
@@ -876,7 +883,10 @@ impl FfiUnsignedTransferPczts {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let (ptr, len) = ptr_from_vec(items);
-        Ok(Box::into_raw(Box::new(FfiUnsignedTransferPczts { ptr, len })))
+        Ok(Box::into_raw(Box::new(FfiUnsignedTransferPczts {
+            ptr,
+            len,
+        })))
     }
 }
 
@@ -925,7 +935,9 @@ pub unsafe extern "C" fn zcashlc_free_migration_progress(ptr: *mut FfiMigrationP
 /// # Safety
 /// `ptr` must be null or point to a [`FfiNoteSplitProposal`] handed out by this module.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_free_migration_note_split_proposal(ptr: *mut FfiNoteSplitProposal) {
+pub unsafe extern "C" fn zcashlc_free_migration_note_split_proposal(
+    ptr: *mut FfiNoteSplitProposal,
+) {
     if !ptr.is_null() {
         let boxed = unsafe { Box::from_raw(ptr) };
         free_ptr_from_vec(boxed.output_values, boxed.output_values_len);
@@ -1406,7 +1418,8 @@ pub unsafe extern "C" fn zcashlc_migration_propose_immediate_transfers(
         match plan_and_cache(&mut ctx, true)? {
             Some(plan) => {
                 // Preview mirrors the commit-time rewrite: every transfer due at the tip.
-                let rows = schedule_rows(plan.funding_notes(), plan.schedule(), prep_tx_count(&plan))?;
+                let rows =
+                    schedule_rows(&plan.funding_notes(), plan.schedule(), prep_tx_count(&plan))?;
                 let transfers = rows
                     .into_iter()
                     .map(|(id, amount, _, expiry)| {
@@ -1461,7 +1474,13 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
-        let _ = (ids, anchor_heights, next_executable_after_heights, expiry_heights, estimated_duration_hours);
+        let _ = (
+            ids,
+            anchor_heights,
+            next_executable_after_heights,
+            expiry_heights,
+            estimated_duration_hours,
+        );
         let amounts = unsafe { slice_or_empty(amounts, ids_len) }.to_vec();
         commit_or_resume(&mut ctx, Some(usk), Some(&amounts), false)?;
         Ok(true)
@@ -1565,7 +1584,8 @@ pub unsafe extern "C" fn zcashlc_migration_extract_broadcast_tx(
     let res = catch_panic(|| {
         let _ = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let pczt_bytes = unsafe { slice_or_empty(pczt_ptr, pczt_len) };
-        let pczt = pczt::Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Error parsing PCZT: {e:?}"))?;
+        let pczt =
+            pczt::Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Error parsing PCZT: {e:?}"))?;
         let (raw, _) = migration_finalize::extract_tx(pczt)?;
         Ok(ffi::BoxedSlice::some(raw))
     });
@@ -1614,7 +1634,11 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
             }
             1 => Ok(true),
             2 | 3 => {
-                let reason = if result_tag == 2 { "invalid_note" } else { "expired" };
+                let reason = if result_tag == 2 {
+                    "invalid_note"
+                } else {
+                    "expired"
+                };
                 insert_invalid_mark(&ctx.store_conn, &ctx.account_bytes, id, reason)
                     .map_err(|e| anyhow!("marks write failed: {e}"))?;
                 Ok(true)
@@ -1671,7 +1695,6 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
                     let cancelled = MigrationState::from_parts(
                         MigrationStatus::Failed,
                         state.note_split().clone(),
-                        state.funding_notes().clone(),
                         state.preparation().clone(),
                         state.transactions().clone(),
                     );
@@ -2000,7 +2023,6 @@ mod tests {
                 zat(999_000_000),
             )
             .unwrap(),
-            funding,
             PreparationPlan::from_parts(Vec::new(), Vec::new()),
             transactions,
         )
@@ -2167,9 +2189,11 @@ mod tests {
         assert_eq!(invalid_marks(&conn, &other).unwrap(), vec![7]);
     }
 
-    /// A fresh wallet database has no stored migration, so its state marshals as `NotStarted`
-    /// without touching the (schemaless) wallet tables. This also exercises `open` (path decode,
-    /// `parse_network`, store-table creation) end to end over the FFI.
+    /// A freshly initialized wallet database has no stored migration, so its state marshals as
+    /// `NotStarted`. The store tables come from the wallet schema migrations (they are no longer
+    /// created by `open`), so the fixture runs `zcashlc_init_data_database` first, exactly like a
+    /// real caller. This exercises `open` (path decode, `parse_network`, store read) end to end
+    /// over the FFI.
     #[test]
     fn migration_state_on_fresh_db_is_not_started() {
         let path = std::env::temp_dir().join(format!(
@@ -2178,6 +2202,16 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let path_bytes = path.to_str().unwrap().as_bytes();
+        let init = unsafe {
+            crate::zcashlc_init_data_database(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                std::ptr::null(),
+                0,
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(init >= 0, "wallet-db initialization must succeed");
         let account = [7u8; 16];
         let ptr = unsafe {
             zcashlc_migration_state(

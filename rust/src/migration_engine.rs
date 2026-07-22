@@ -18,13 +18,14 @@
 //! is isolated.
 
 use anyhow::anyhow;
+use incrementalmerkletree::Position;
 use orchard::keys::{FullViewingKey, SpendAuthorizingKey};
 use orchard::note::Note as OrchardNote;
-use incrementalmerkletree::Position;
 use rand::rngs::OsRng;
 use zcash_client_backend::data_api::wallet::TargetHeight;
 use zcash_client_backend::data_api::{Account, InputSource, WalletRead};
 use zcash_client_sqlite::AccountUuid;
+use zcash_client_sqlite::pool_migration::orchard_ironwood::PoolMigrations;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_pool_migration_backend::build::sign_pczt;
@@ -32,7 +33,6 @@ use zcash_pool_migration_backend::engine::{
     MigrationBackend, MigrationCrypto, MigrationState, MigrationTxId, MigrationTxState,
     PoolMigrationRead, PoolMigrationWrite,
 };
-use zcash_pool_migration_sqlite::orchard_ironwood::PoolMigrations;
 use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
@@ -69,7 +69,7 @@ impl<'a> Backend<'a> {
             wallet,
             account,
             usk,
-            store: PoolMigrations::for_account(store_conn, account.expose_uuid()),
+            store: PoolMigrations::for_account(store_conn, account),
         }
     }
 
@@ -90,7 +90,7 @@ impl<'a> Backend<'a> {
         let target = self.selection_target()?;
         let received = self
             .wallet
-            .select_unspent_notes(self.account, &[ShieldedPool::Orchard], target, &[])
+            .select_unspent_notes(self.account, &[ShieldedPool::Orchard], target, &[], false)
             .map_err(|e| anyhow!("spendable-note selection failed: {e}"))?;
         let mut notes: Vec<SpendableNote> = received
             .orchard()
@@ -167,21 +167,6 @@ impl MigrationCrypto for Backend<'_> {
             .ok_or_else(|| anyhow!("signing requires the account's spending key"))?;
         let ask = SpendAuthorizingKey::from(usk.orchard());
         sign_pczt(pczt, &ask).map_err(|e| anyhow!("signing the migration failed: {e}"))
-    }
-
-    fn prove_transfer(
-        &self,
-        _pczt: pczt::Pczt,
-        _anchor_boundary: BlockHeight,
-    ) -> Result<pczt::Pczt, Self::Error> {
-        // Never called: this FFI does not drive the engine's `prove_transfer` flow, because
-        // resolving witnesses needs `&mut` access to the wallet's note commitment tree, which this
-        // adapter's shared wallet borrow cannot provide. Proving lives in
-        // `crate::migration_finalize` (see its module doc for the anchor policy and the current
-        // ZIP 318 deviation).
-        Err(anyhow!(
-            "engine-driven proving is not used by this FFI; proving lives in migration_finalize"
-        ))
     }
 }
 

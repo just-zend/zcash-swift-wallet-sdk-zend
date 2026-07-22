@@ -9,10 +9,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Added
 - Orchard→Ironwood pool-migration FFI, welding, models, and error codes — the layer beneath the
   `Synchronizer` migration surface that lands in the follow-up PR, wired to the FINAL migration
-  engine (`zcash_pool_migration_backend` + `zcash_pool_migration_sqlite` on librustzcash's
-  `feat/pool-migration-sqlite` line, extended by the account-keyed store of librustzcash PR
-  #2712 so several accounts of one wallet database — a software account next to an imported
-  hardware-wallet account — migrate independently, concurrently or one after another). The
+  engine (`zcash_pool_migration_backend` plus the account-keyed store that now lives inside
+  `zcash_client_sqlite::pool_migration` — both on librustzcash main since PR #2712 merged — so
+  several accounts of one wallet database — a software account next to an imported
+  hardware-wallet account — migrate independently, concurrently or one after another; the
+  family pin targets the standing aggregation branch carrying the still-unmerged note locking
+  #2716 and boundary-anchor proving #2710). The
   engine is bound through 23 `zcashlc_migration_*` FFI functions plus the
   `zcashlc_ironwood_activation_height` helper (house conventions throughout: catch_panic,
   thread-local last-error channel, paired free functions), welded as `@DBActor` methods on the
@@ -35,8 +37,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`migrationCreateUnsignedNoteSplitPczts` / `migrationStoreSignedNoteSplitPczts`): the engine
   builds N preparation transactions rather than one split transaction, and one signing ceremony
   covers them all. Transfers currently prove against the wallet's natural anchor (an approved,
-  loudly-documented ZIP 318 stopgap pending upstream anchor-checkpoint retention, librustzcash
-  #2700). Hardened per the adversarial review: the FFI last-error channel is cleared before every
+  loudly-documented ZIP 318 stopgap: upstream anchor-checkpoint retention landed — librustzcash
+  #2700/#2710 — but retains every 288 blocks while boundaries are drawn on the 144-block grid, so
+  flipping now would leave the odd-multiple half of the draws permanently unwitnessable). Hardened
+  per the adversarial review: the FFI last-error channel is cleared before every
   sentinel read (stale errors can no longer surface as spurious throws elsewhere) and one-time
   rust initialization is race-free. No `Synchronizer` API changes in this PR.
 - Ironwood (NU6.3) receive/sync readiness. The lightwalletd protocol gains the Ironwood fields

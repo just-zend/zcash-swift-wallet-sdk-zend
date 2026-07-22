@@ -7,9 +7,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
-- Pool-migration (Orchard→Ironwood) FFI surface over the final engine crates
-  (`zcash_pool_migration_backend` + `zcash_pool_migration_sqlite`, pinned to the
-  account-keyed store line — librustzcash PR #2712 on `feat/pool-migration-sqlite`):
+- Pool-migration (Orchard→Ironwood) FFI surface over the final engine
+  (`zcash_pool_migration_backend` + the account-keyed store inside
+  `zcash_client_sqlite::pool_migration`, both on librustzcash main; the family pin
+  targets the standing aggregation branch = main + note locking (#2716) +
+  boundary-anchor proving (#2710)):
   23 entry points plus their `#[repr(C)]` return types and
   `zcashlc_free_migration_*` destructors. Each call opens the wallet database and
   the account-keyed migration store (a second connection into the same file) from
@@ -20,8 +22,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carried propose→commit by an in-process plan cache), commits the note split and
   the transfer schedule atomically (pre-signing every transaction), defers anchors
   and witnesses to proving time (ZIP 374) — proving currently targets the wallet's
-  natural anchor for transfers too, an approved stopgap pending upstream
-  anchor-checkpoint retention (librustzcash #2700) — and leaves broadcasting,
+  natural anchor for transfers too, an approved stopgap: upstream retention
+  (librustzcash #2700/#2710) landed but on the 288-block grid, missing half of
+  the 144-block boundary draw grid — and leaves broadcasting,
   mined-reconciliation, rejection classification (the `sdk_invalid_marks` side
   table), and the platform's 6-state derivation to this layer. `Complete` is
   per-run; sequential runs commit over a terminal predecessor. The external-signer
