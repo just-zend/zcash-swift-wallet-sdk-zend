@@ -273,6 +273,15 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   after a single attempt and leaving the transaction unresolved.
 - Transaction resubmission no longer re-broadcasts a freshly submitted transaction during the first
   sync cycle of a session; its five-minute throttle now engages on first invocation.
+- `getAccountsBalances()` (and the migration-eligibility read that depends on it) no longer briefly
+  reports empty balances right after a wallet restore completes. When the engine flips out of
+  recovery, the upstream wallet summary can transiently report no balance data for up to ~30 s while
+  it finalizes the just-restored notes; the Slipstream unified summary was serving that gap as empty,
+  so the restored funds — and the "Migration Required" eligibility — flickered to zero. The summary
+  now holds the engine-owned reconciled recovery-view balances across that window: bounded to 120 s,
+  released the instant the upstream summary returns real balances (whose value then wins
+  unconditionally), and suppressed whenever a pending unmined outgoing spend could otherwise make the
+  held value over-show. A process restart inside the window falls back to the prior behavior.
 
 # 2.6.0-alpha.6
 
