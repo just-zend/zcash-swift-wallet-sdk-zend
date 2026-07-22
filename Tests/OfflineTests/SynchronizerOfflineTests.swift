@@ -365,7 +365,7 @@ class SynchronizerOfflineTests: ZcashTestCase {
         let synchronizer = SDKSynchronizer(initializer: initializer)
 
         let result = try await synchronizer.prepare(
-            with: nil,
+            with: Environment.seedBytes,
             walletBirthday: 1900000,
             for: .existingWallet,
             name: "",

@@ -112,7 +112,7 @@ class WalletTests: ZcashTestCase {
         )
 
         let result = try await initializer.initialize(
-            with: nil,
+            with: seedData.bytes,
             walletBirthday: 663194,
             for: .existingWallet,
             name: ""
