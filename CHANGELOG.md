@@ -55,8 +55,9 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   `MigrationSignedTransferPczt`, `MigrationAttentionReason.invalidTransfer`, and
   `migrationRecordTransferResult(transferId:result:for:)`.
 - These are the value types the `Synchronizer` migration group below produces and consumes.
-- New `ZcashError` cases for the migration surface: `ZRUST0098`–`ZRUST0108`, `ZRUST0111`–`ZRUST0128`,
-  and `ZRUST0132`–`ZRUST0134`.
+- New `ZcashError` cases for the migration surface: `ZRUST0098`–`ZRUST0106`, `ZRUST0108`, and
+  `ZRUST0111`–`ZRUST0134` (`ZRUST0107` was retired with the engine-backed immediate lane; see
+  `## Changed`).
 
 ### Orchard → Ironwood migration (`Synchronizer` surface)
 
@@ -68,7 +69,7 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   hardware-wallet account): all engine state is account-keyed, per-account broadcasts stay
   single-flight without cross-account serialization, and every account shares one dedicated
   migration Tor runtime. The group covers the migration state machine and progress, note-split
-  propose/sign/submit, gradual (randomized-cadence) and immediate schedule proposal, one-confirmation
+  propose/sign/submit, a gradual (randomized-cadence) schedule proposal with one-confirmation
   `signAndStoreMigrationSchedule`, height-gated background delivery
   (`executeNextPendingMigrationTransfer` — migration members work without `prepare()`, so a
   background session can broadcast without starting sync; the delivery lane serves preparation
@@ -157,6 +158,13 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
 - `Synchronizer.submitTransactions` re-checks a non-zero submit error against the same server and
   reports `TransactionSubmitResult.success` when the server already knows the transaction, instead
   of surfacing a spurious failure.
+- The immediate (single-transaction) migration lane leaves the engine:
+  `proposeImmediateMigration(accountUUID:)` now returns an ordinary `ImmediateMigrationProposal` (a
+  `Proposal` plus its decoded `amount`/`fee`) instead of a `MigrationSchedule`, executed through the
+  normal transfer pipeline (`createProposedTransactions` / `createPCZTFromProposal`) rather than the
+  engine's schedule/commit machinery; a new `recordImmediateMigration(accountUUID:txid:)` folds a
+  successful broadcast into the same platform state machine (`InProgress` / `Complete` / re-offer).
+  See `MIGRATING.md`.
 
 ## Removed
 
