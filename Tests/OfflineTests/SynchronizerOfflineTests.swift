@@ -336,6 +336,48 @@ class SynchronizerOfflineTests: ZcashTestCase {
         await fulfillment(of: [expectation], timeout: 1)
     }
 
+    /// MOB-1512: `SDKSynchronizer.prepare` must propagate `.seedNotRelevant` from `Initializer.initialize` instead of
+    /// treating it the same as `.success`, otherwise a caller can end up "prepared" against a wallet database that
+    /// doesn't belong to the seed it holds (e.g. a restored `data.db` paired with an unrelated keychain seed).
+    func testPreparePropagatesSeedNotRelevantFromRustBackend() async throws {
+        let rustBackendMock = ZcashRustBackendWeldingMock()
+        rustBackendMock.initBlockMetadataDbClosure = { }
+        rustBackendMock.initDataDbSeedClosure = { _ in DbInitResult.seedNotRelevant }
+
+        mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in rustBackendMock }
+
+        let initializer = Initializer(
+            container: mockContainer,
+            cacheDbURL: nil,
+            fsBlockDbRoot: testTempDirectory,
+            generalStorageURL: testGeneralStorageDirectory,
+            dataDbURL: try __dataDbURL(),
+            torDirURL: try __torDirURL(),
+            endpoint: LightWalletEndpointBuilder.default,
+            network: network,
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            isTorEnabled: false,
+            isExchangeRateEnabled: false
+        )
+
+        let synchronizer = SDKSynchronizer(initializer: initializer)
+
+        let result = try await synchronizer.prepare(
+            with: nil,
+            walletBirthday: 1900000,
+            for: .existingWallet,
+            name: "",
+            keySource: nil
+        )
+
+        guard case .seedNotRelevant = result else {
+            XCTFail("Expected `.seedNotRelevant` to propagate from `Initializer.initialize`, got \(result) instead.")
+            return
+        }
+    }
+
     func testIsNewSessionOnUnpreparedToValidTransition() {
         XCTAssertTrue(SessionTicker.live.isNewSyncSession(.unprepared, .syncing(0, false)))
     }
