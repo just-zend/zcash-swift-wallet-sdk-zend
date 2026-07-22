@@ -1038,6 +1038,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance(
                 target,
                 confirmations_policy,
                 CoinbaseFilter::AllTransparentOutputs,
+                false,
             )
             .map_err(|e| anyhow!("Error while fetching verified transparent balance: {}", e))?;
         let amount = utxos
@@ -1102,6 +1103,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
                         target,
                         confirmations_policy,
                         CoinbaseFilter::AllTransparentOutputs,
+                        false,
                     )
                     .map_err(|e| {
                         anyhow!("Error while fetching verified transparent balance: {}", e)
@@ -1153,6 +1155,7 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance(
                 target,
                 wallet::ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
                 CoinbaseFilter::AllTransparentOutputs,
+                false,
             )
             .map_err(|e| anyhow!("Error while fetching total transparent balance: {}", e))?
             .iter()
@@ -2249,6 +2252,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
             &SpendPolicy::default(),
             None,
+            None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2327,6 +2331,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             memo,
             mode,
             confirmation_policy,
+            None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2389,6 +2394,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
             &SpendPolicy::default(),
+            None,
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2597,6 +2603,7 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
             account_uuid,
             confirmations_policy,
             CoinbaseFilter::AllTransparentOutputs,
+            None,
         )
         .map_err(|e| anyhow!("Error while shielding transaction: {}", e))?;
 
