@@ -157,6 +157,21 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertEqual(unlocked, 0)
     }
 
+    // MARK: - Run-count estimate
+
+    /// On a fresh wallet with nothing to migrate, the run-count estimate is the ZERO-RUN
+    /// estimate — `runCount` 0 and no residual — a legitimate answer decoded from a non-null
+    /// FFI struct, not an error: the estimate analog of the empty propose schedule (and of
+    /// `isNoteSplitNeeded`'s benign `false` above).
+    func testFreshWalletEstimateMigrationRunsIsZeroRuns() async throws {
+        let estimate = try await rustBackend.estimateMigrationRuns(accountUUID: account)
+
+        XCTAssertEqual(estimate.runCount, 0)
+        XCTAssertTrue(estimate.runs.isEmpty)
+        XCTAssertEqual(estimate.finalResidual, .zero)
+        XCTAssertEqual(estimate.totalSigningSessions(maxTransactionsPerSession: 1), 0)
+    }
+
     // MARK: - Invalid-state transitions
 
     /// A commit without a matching previewed plan is the plan-stale contract: the engine signs

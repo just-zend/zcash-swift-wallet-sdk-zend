@@ -53,6 +53,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `rustMigrationUnlockResidual` ZRUST0133. The public `PoolBalance` gains `lockedValue`:
   locked value leaves `spendableValue` but stays in the account — `total()` now includes it —
   marshaled from the rust balance so locked funds never vanish from app-visible sums.
+- Migration run-count estimate. `ZcashRustBackendWelding` gains
+  `estimateMigrationRuns(accountUUID:)`, returning the new public `MigrationRunEstimate` model:
+  how many migration RUNS ("rounds") migrating the whole spendable Orchard balance takes, and
+  per run BOTH what it migrates (`migratable`, `crossings`) and what preparing it costs
+  (`preparationLayers`, `preparationTransactions`), with cross-run totals and external-signer
+  session math (`Run.signingSessions(maxTransactionsPerSession:)` and
+  `totalSigningSessions(maxTransactionsPerSession:)` — the latter deliberately sums per-run
+  sessions rather than pooling transactions across runs, because a later run's transactions
+  spend notes an earlier run must mine first). A zero balance yields the zero-run estimate, not
+  an error. New error code `rustMigrationEstimateRuns` ZRUST0134.
 - Ironwood (NU6.3) receive/sync readiness. The lightwalletd protocol gains the Ironwood fields
   (`CompactTx.ironwoodActions`, `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
   `ShieldedProtocol.ironwood`); `UpdateSubtreeRootsAction` fetches and stores Ironwood subtree roots

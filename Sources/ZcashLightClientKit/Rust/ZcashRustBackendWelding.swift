@@ -471,6 +471,15 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationUnlockResidual` if the rust layer returns an error.
     func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int
 
+    /// Estimates how the account migrates its whole spendable Orchard balance: the number of
+    /// migration RUNS ("rounds") it takes, and for each run both what it migrates and what
+    /// preparing it costs, so the platform can preview and compare the two — including external-
+    /// signer session counts for any per-session capacity — before anything is planned or
+    /// committed. A zero (or fully sub-quantum) balance yields the ZERO-RUN estimate
+    /// (`runCount == 0`), a legitimate answer, not an error.
+    /// - Throws: `rustMigrationEstimateRuns` if the rust layer returns an error.
+    func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate
+
     /// The full migration schedule for the spendable Orchard balance. When `includeResidual` is
     /// `true` and a worthwhile residual exists, one extra transfer for it is appended.
     /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.

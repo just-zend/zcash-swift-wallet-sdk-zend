@@ -64,6 +64,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FfiAccountBalance`/`FfiWalletSummary`) gains a trailing `locked_value` field
   marshaled from the upstream balance, keeping the "sum of the fields is the
   account's total" contract true now that upstream totals include locked value.
+- Migration run-count estimate: `zcashlc_migration_estimate_runs` marshals
+  `zcash_pool_migration_backend::engine::estimate_migration_runs` — one
+  `FfiRunEstimate` (migratable zatoshi, crossings, prep layers, prep
+  transactions) per run inside an `FfiMigrationRunEstimate` (runs array +
+  final residual), freed by `zcashlc_free_migration_run_estimate`. A zero (or
+  fully sub-quantum) balance marshals as the zero-run estimate
+  (`runs_len == 0`), not an error; NULL = error. Signer per-session capacity
+  is deliberately NOT a parameter: the platform evaluates signing sessions
+  from the per-run transaction counts.
 
 ## 2.6.0-alpha.6 - 2026-06-26
 

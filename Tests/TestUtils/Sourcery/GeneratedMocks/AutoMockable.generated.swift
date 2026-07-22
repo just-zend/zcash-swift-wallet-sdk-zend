@@ -4359,6 +4359,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
+    // MARK: - estimateMigrationRuns
+
+    var estimateMigrationRunsAccountUUIDThrowableError: Error?
+    var estimateMigrationRunsAccountUUIDCallsCount = 0
+    var estimateMigrationRunsAccountUUIDCalled: Bool {
+        return estimateMigrationRunsAccountUUIDCallsCount > 0
+    }
+    var estimateMigrationRunsAccountUUIDReceivedAccountUUID: AccountUUID?
+    var estimateMigrationRunsAccountUUIDReturnValue: MigrationRunEstimate!
+    var estimateMigrationRunsAccountUUIDClosure: ((AccountUUID) async throws -> MigrationRunEstimate)?
+
+    func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate {
+        if let error = estimateMigrationRunsAccountUUIDThrowableError {
+            throw error
+        }
+        estimateMigrationRunsAccountUUIDCallsCount += 1
+        estimateMigrationRunsAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = estimateMigrationRunsAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return estimateMigrationRunsAccountUUIDReturnValue
+        }
+    }
+
     // MARK: - migrationProposeTransfers
 
     var migrationProposeTransfersIncludeResidualForThrowableError: Error?
