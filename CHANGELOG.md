@@ -171,8 +171,16 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   `Proposal` plus its decoded `amount`/`fee`) instead of a `MigrationSchedule`, executed through the
   normal transfer pipeline (`createProposedTransactions` / `createPCZTFromProposal`) rather than the
   engine's schedule/commit machinery; a new `recordImmediateMigration(accountUUID:txid:)` folds a
-  successful broadcast into the same platform state machine (`InProgress` / `Complete` / re-offer).
-  See `MIGRATING.md`.
+  successful broadcast into the same platform state machine (`InProgress` while unmined, then quiet
+  once mined — see the immediate-aftermath entry below). See `MIGRATING.md`.
+- The immediate-migration aftermath goes quiet, and `MigrationProgress` gains `isImmediate: Bool`:
+  once an immediate (send-max) sweep recorded via `recordImmediateMigration(accountUUID:txid:)`
+  mines, the migration state machine no longer reports `.complete` for it — the mined run is consumed
+  and the state falls back to `.notStarted` (nothing to acknowledge; the balance-gated "Migration
+  Required" prompt re-offers only if new Orchard funds arrive later). `MigrationProgress.isImmediate`
+  is `true` only for an in-progress immediate sweep and `false` for engine-tracked runs, so the app
+  can suppress per-transfer progress UI during the immediate lane; the public initializer defaults
+  `isImmediate` to `false`, so it is source-compatible. (MOB-1513)
 
 ## Removed
 
