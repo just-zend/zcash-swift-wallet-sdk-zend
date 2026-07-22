@@ -61,7 +61,7 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
 
 ### Orchard → Ironwood migration (`Synchronizer` surface)
 
-- Orchard→Ironwood pool-migration engine, exposed as a 23-member migration group on the
+- Orchard→Ironwood pool-migration engine, exposed as a 27-member migration group on the
   `Synchronizer` protocol, built over the pool-migration FFI/welding layer whose model types
   are listed above: the app talks only to `Synchronizer` — the per-account migration engine,
   broadcaster, and privacy gate behind it are internal. Account-scoped members take an
@@ -97,6 +97,14 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   hardcoding it. Schedule persistence after commit is the host's responsibility: the SDK
   deliberately keeps no local copy of the committed proposal list. The Closure/Combine wrapper
   synchronizers deliberately do not mirror the migration group.
+  - The residual-lock pair and the rounds preview are group members too:
+    `lockMigrationResidual(accountUUID:)` (the "Lock balance" choice at migration `Complete` —
+    locks every currently-spendable, not-already-locked legacy-Orchard note until explicit unlock
+    and returns the total locked), `unlockMigrationResidual(accountUUID:)` (the release half,
+    returning the number of locks cleared), and `estimateMigrationRuns(accountUUID:)` (the
+    `MigrationRunEstimate` behind the multi-round UI). "Migrate anyway" over a locked residual
+    composes as `unlockMigrationResidual` then `proposeImmediateMigration`, in that order, since
+    locked notes are excluded from note selection.
   - Duplicate re-submissions self-heal: a submit rejection identifying the transaction as already
     known (zcashd's already-in-chain code −27, or the already-in-block-chain/mempool-duplicate
     reject messages) is recorded as success, so a retried broadcast whose first attempt actually
