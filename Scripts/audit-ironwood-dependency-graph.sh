@@ -7,7 +7,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-expected_librustzcash_rev="36d78385ebe117f0913a42df39470c0d0c0e8dec"
+expected_librustzcash_rev="0c2775f5ed1561360b164b3971ecf0cf734e75eb"
+expected_orchard_rev="fa6e5fee02ce38b54193005a35289ec705d4f5b2"
 tree_file=$(mktemp)
 duplicates_file=$(mktemp)
 trap 'rm -f "$tree_file" "$duplicates_file"' EXIT
@@ -42,7 +43,7 @@ assert_one() {
     fi
 }
 
-assert_one orchard 0.15.0
+assert_one orchard 0.15.0 "github.com/zcash/orchard.git?rev=$expected_orchard_rev"
 for crate_and_version in \
     "pczt 0.8.0-rc.1" \
     "zcash_address 0.13.0" \

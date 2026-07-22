@@ -239,10 +239,18 @@ if [[ ! "$recorded_source_date_epoch" =~ ^[0-9]+$ || "$recorded_source_date_epoc
     exit 1
 fi
 
-expected_librustzcash_rev="36d78385ebe117f0913a42df39470c0d0c0e8dec"
+expected_librustzcash_rev="0c2775f5ed1561360b164b3971ecf0cf734e75eb"
 recorded_librustzcash_rev=$(read_field LIBRUSTZCASH_REVISION)
 if [[ "$recorded_librustzcash_rev" != "$expected_librustzcash_rev" ]]; then
     echo "Error: provenance does not record the audited librustzcash revision" >&2
+    exit 1
+fi
+expected_orchard_rev="fa6e5fee02ce38b54193005a35289ec705d4f5b2"
+recorded_orchard_rev=$(sed -nE \
+    's@^orchard[[:space:]]*= .*git = "https://github.com/zcash/orchard.git", rev = "([0-9a-f]{40})".*@\1@p' \
+    Cargo.toml)
+if [[ "$recorded_orchard_rev" != "$expected_orchard_rev" ]]; then
+    echo "Error: Cargo.toml does not pin the audited Orchard revision" >&2
     exit 1
 fi
 
