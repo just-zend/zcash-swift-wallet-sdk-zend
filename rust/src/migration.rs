@@ -99,6 +99,13 @@ fn height_opt_to_i64(h: Option<BlockHeight>) -> i64 {
     h.map_or(-1, |h| i64::from(u32::from(h)))
 }
 
+/// A count as a `u32`, erroring (rather than truncating) on overflow. The engine's per-run counts
+/// (crossings, layers, transactions) are bounded by the note cap, so overflow never happens in
+/// practice; this keeps the marshaling honest anyway.
+fn count_to_u32(v: usize, what: &str) -> anyhow::Result<u32> {
+    u32::try_from(v).map_err(|_| anyhow!("{what} count {v} exceeds u32"))
+}
+
 /// Borrow an FFI array as a slice, tolerating a null pointer when `len == 0` (calling
 /// `slice::from_raw_parts` with a null pointer is undefined behaviour even for a zero length).
 ///
@@ -857,6 +864,37 @@ pub struct FfiMigrationSchedule {
     pub estimated_duration_hours: u32,
 }
 
+/// A single run's estimate (element of [`FfiMigrationRunEstimate`]): what one migration run
+/// migrates (the note-split side) and what preparing it costs (the note-preparation side), so
+/// the two can be compared.
+#[repr(C)]
+pub struct FfiRunEstimate {
+    /// The total value (zatoshi) that crosses the turnstile in this run.
+    pub migratable: i64,
+    /// The number of pool-crossing transfers this run makes: one per self-funding note.
+    pub crossings: u32,
+    /// The number of sequential note-preparation layers this run needs — its wall-clock depth,
+    /// since each layer waits for the previous one to mine before it can be broadcast.
+    pub prep_layers: u32,
+    /// The number of note-preparation transactions this run builds across all its layers.
+    pub prep_transactions: u32,
+}
+
+/// An estimate of migrating the account's whole spendable balance across successive migration
+/// RUNS ("rounds"): one [`FfiRunEstimate`] per run, plus the value left un-migrated at the end.
+/// `runs_len == 0` means nothing migrates (a zero or fully sub-quantum balance) — a legitimate
+/// estimate, not an error.
+#[repr(C)]
+pub struct FfiMigrationRunEstimate {
+    /// Heap array of `runs_len` per-run estimates, in run order.
+    pub runs: *mut FfiRunEstimate,
+    pub runs_len: usize,
+    /// The value (zatoshi) left in the source pool after the last run — below the smallest
+    /// self-funding note, so it never migrates. Zero when the balance divides exactly into
+    /// self-funding notes and fees.
+    pub final_residual: i64,
+}
+
 /// An unsigned PCZT awaiting an external signer (element of [`FfiUnsignedTransferPczts`]).
 #[repr(C)]
 pub struct FfiUnsignedTransferPczt {
@@ -992,6 +1030,19 @@ pub unsafe extern "C" fn zcashlc_free_migration_transfer_proposal(ptr: *mut FfiT
         if !boxed.id.is_null() {
             unsafe { zcashlc_string_free(boxed.id) }
         }
+        drop(boxed);
+    }
+}
+
+/// Frees a [`FfiMigrationRunEstimate`], including its runs array.
+///
+/// # Safety
+/// `ptr` must be null or point to a [`FfiMigrationRunEstimate`] handed out by this module.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_migration_run_estimate(ptr: *mut FfiMigrationRunEstimate) {
+    if !ptr.is_null() {
+        let boxed = unsafe { Box::from_raw(ptr) };
+        free_ptr_from_vec(boxed.runs, boxed.runs_len);
         drop(boxed);
     }
 }
@@ -1451,6 +1502,71 @@ pub unsafe extern "C" fn zcashlc_migration_unlock_residual(
         Ok(cleared as i64)
     });
     unwrap_exc_or(res, -1)
+}
+
+/// Estimates how the account migrates its whole spendable balance: the number of migration RUNS
+/// ("rounds") it takes, and for each run BOTH what it migrates (the note-split crossings) and
+/// what preparing it costs (the note-preparation layers and transactions), so the platform can
+/// preview and compare the two before anything is planned or committed. A balance beyond one
+/// run's capacity migrates over several runs; the estimate depends on the wallet's NOTE
+/// STRUCTURE, not just its total value (each run is decomposed with the real planners, and the
+/// notes a run spends plus the residuals it leaves form the next run's structure).
+///
+/// An external signer's per-session capacity is NOT part of the estimate: the SDK evaluates
+/// signing sessions from the returned per-run transaction counts for any signer capacity,
+/// without re-running the planners. A zero (or fully sub-quantum) balance yields the ZERO-RUN
+/// estimate (`runs_len == 0`) — a legitimate result, not an error. NULL signals an error (see
+/// `zcashlc_last_error_message`).
+///
+/// # Safety
+/// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_run_estimate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_estimate_runs(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> *mut FfiMigrationRunEstimate {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+        let mut rng = OsRng;
+        let estimate = match engine::estimate_migration_runs(&ctx.network, &backend, &mut rng) {
+            Ok(estimate) => Some(estimate),
+            // The estimator answers a zero balance with the zero-run estimate rather than this
+            // error, so this arm should never fire; map it to the same zero-run answer anyway,
+            // for symmetry with the propose path's empty schedule.
+            Err(engine::MigrationError::NothingToMigrate) => None,
+            Err(e) => return Err(anyhow!("Error estimating migration runs: {e}")),
+        };
+        let (runs, final_residual) = match &estimate {
+            Some(est) => (
+                est.runs()
+                    .iter()
+                    .map(|run| {
+                        Ok(FfiRunEstimate {
+                            migratable: zat_to_i64(run.migratable()),
+                            crossings: count_to_u32(run.crossings(), "crossings")?,
+                            prep_layers: count_to_u32(run.prep_layers(), "prep-layers")?,
+                            prep_transactions: count_to_u32(
+                                run.prep_transactions(),
+                                "prep-transactions",
+                            )?,
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+                zat_to_i64(est.final_residual()),
+            ),
+            None => (Vec::new(), 0),
+        };
+        let (runs, runs_len) = ptr_from_vec(runs);
+        Ok(Box::into_raw(Box::new(FfiMigrationRunEstimate {
+            runs,
+            runs_len,
+            final_residual,
+        })))
+    });
+    unwrap_exc_or_null(res)
 }
 
 /// The migration schedule preview for the account's live balance, in chronological broadcast
@@ -2327,6 +2443,60 @@ mod tests {
             )
         };
         assert_eq!(unlocked, 0, "no locks exist, so nothing clears");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// On a freshly initialized wallet database with a chain tip but no spendable notes, the
+    /// run-count estimate is the ZERO-RUN estimate (`runs_len == 0`, `final_residual == 0`) —
+    /// a legitimate answer marshaled as a non-null pointer, not an error — and the free
+    /// function round-trips it (the empty runs array uses the null-for-empty `ptr_from_vec`
+    /// convention, which `free_ptr_from_vec` handles).
+    #[test]
+    fn migration_estimate_runs_on_fresh_db_is_zero_runs() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_migration_estimate_runs_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let init = unsafe {
+            crate::zcashlc_init_data_database(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                std::ptr::null(),
+                0,
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(init >= 0, "wallet-db initialization must succeed");
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_000_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        let account = [7u8; 16];
+        let ptr = unsafe {
+            zcashlc_migration_estimate_runs(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "estimate pointer must be non-null on success"
+        );
+        let est = unsafe { &*ptr };
+        assert_eq!(est.runs_len, 0, "nothing to migrate estimates zero runs");
+        assert_eq!(est.final_residual, 0, "a zero balance leaves no residual");
+        unsafe { zcashlc_free_migration_run_estimate(ptr) };
         let _ = std::fs::remove_file(&path);
     }
 

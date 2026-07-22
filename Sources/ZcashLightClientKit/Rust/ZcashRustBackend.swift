@@ -1660,6 +1660,26 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
+    func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate {
+        let estimatePtr = zcashlc_migration_estimate_runs(
+            dbData.0,
+            dbData.1,
+            accountUUID.id,
+            networkType.networkId
+        )
+
+        guard let estimatePtr else {
+            throw ZcashError.rustMigrationEstimateRuns(
+                lastErrorMessage(fallback: "`estimateMigrationRuns` failed with unknown error")
+            )
+        }
+
+        defer { zcashlc_free_migration_run_estimate(estimatePtr) }
+
+        return estimatePtr.pointee.toMigrationRunEstimate()
+    }
+
+    @DBActor
     func migrationProposeTransfers(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule {
         let schedulePtr = zcashlc_migration_propose_transfers(
             dbData.0,
@@ -2515,6 +2535,30 @@ extension FfiMigrationSchedule {
         }
 
         return MigrationSchedule(transfers: proposals, estimatedDurationHours: Int(estimated_duration_hours))
+    }
+}
+
+extension FfiMigrationRunEstimate {
+    /// Converts an [`FfiMigrationRunEstimate`] into a [`MigrationRunEstimate`]. Total, not
+    /// failable: every field is a plain value, and an empty runs array (`runs_len == 0`) is the
+    /// legitimate zero-run estimate.
+    func toMigrationRunEstimate() -> MigrationRunEstimate {
+        var decodedRuns: [MigrationRunEstimate.Run] = []
+        decodedRuns.reserveCapacity(Int(runs_len))
+
+        for index in 0 ..< Int(runs_len) {
+            let run = runs.advanced(by: index).pointee
+            decodedRuns.append(
+                MigrationRunEstimate.Run(
+                    migratable: Zatoshi(run.migratable),
+                    crossings: Int(run.crossings),
+                    preparationLayers: Int(run.prep_layers),
+                    preparationTransactions: Int(run.prep_transactions)
+                )
+            )
+        }
+
+        return MigrationRunEstimate(runs: decodedRuns, finalResidual: Zatoshi(final_residual))
     }
 }
 

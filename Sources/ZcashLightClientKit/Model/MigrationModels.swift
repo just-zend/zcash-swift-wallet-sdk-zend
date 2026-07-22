@@ -121,6 +121,119 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
     }
 }
 
+/// An estimate of migrating the account's whole spendable Orchard balance across successive
+/// migration RUNS ("rounds"), as returned by
+/// `ZcashRustBackendWelding.estimateMigrationRuns(accountUUID:)`.
+///
+/// A balance beyond one run's capacity (the note cap times the maximum denomination) migrates
+/// over several runs; each run carries BOTH what it migrates (the note-split crossings) and what
+/// preparing it costs (the note-preparation layers and transactions), so the two can be compared
+/// before anything is planned or committed. An external signer's per-session capacity is a query
+/// parameter (`Run.signingSessions(maxTransactionsPerSession:)` /
+/// `totalSigningSessions(maxTransactionsPerSession:)`), not part of the estimate, so any signer
+/// capacity can be evaluated without re-running the planners.
+public struct MigrationRunEstimate: Equatable, Sendable {
+    /// A per-run entry: what one migration run migrates (the note-split side) and what preparing
+    /// it costs (the note-preparation side), so the two can be compared.
+    public struct Run: Equatable, Sendable {
+        /// The total value that crosses the turnstile in this run (the sum of its crossing
+        /// denominations).
+        public let migratable: Zatoshi
+        /// The number of pool-crossing transfers this run makes: one per self-funding note the
+        /// note split produced for it.
+        public let crossings: Int
+        /// The number of sequential note-preparation layers this run needs — its wall-clock
+        /// depth, since each layer waits for the previous one to mine before it can broadcast.
+        public let preparationLayers: Int
+        /// The number of note-preparation transactions this run builds across all its layers.
+        public let preparationTransactions: Int
+
+        /// Creates a `Run`.
+        public init(migratable: Zatoshi, crossings: Int, preparationLayers: Int, preparationTransactions: Int) {
+            self.migratable = migratable
+            self.crossings = crossings
+            self.preparationLayers = preparationLayers
+            self.preparationTransactions = preparationTransactions
+        }
+
+        /// The total number of transactions this run builds and signs: its preparation
+        /// transactions plus one pool-crossing transfer per funding note.
+        public var transactions: Int {
+            preparationTransactions + crossings
+        }
+
+        /// The number of signing sessions this run needs when an external signer (for example a
+        /// Keystone hardware wallet) can sign at most `maxTransactionsPerSession` transactions in
+        /// one interaction: `ceil(transactions / maxTransactionsPerSession)`. All of a run's
+        /// transactions are built and signed together (anchors and witnesses are deferred to
+        /// proving time, ZIP 374), so they pool into sessions bounded only by the signer's
+        /// capacity.
+        /// - Precondition: `maxTransactionsPerSession > 0`.
+        public func signingSessions(maxTransactionsPerSession: Int) -> Int {
+            precondition(maxTransactionsPerSession > 0, "maxTransactionsPerSession must be positive")
+            return (transactions + maxTransactionsPerSession - 1) / maxTransactionsPerSession
+        }
+    }
+
+    /// The per-run estimates, in run order. Empty when nothing migrates (a zero or fully
+    /// sub-quantum balance) — a legitimate estimate, not an error.
+    public let runs: [Run]
+    /// The value left in Orchard after the last run — below the smallest self-funding note, so it
+    /// never migrates. `.zero` when the balance divides exactly into self-funding notes and fees.
+    public let finalResidual: Zatoshi
+
+    /// Creates a `MigrationRunEstimate`.
+    public init(runs: [Run], finalResidual: Zatoshi) {
+        self.runs = runs
+        self.finalResidual = finalResidual
+    }
+
+    /// The expected number of migration runs ("rounds") to migrate the whole balance: zero when
+    /// the balance is below the smallest self-funding note, so nothing migrates.
+    public var runCount: Int {
+        runs.count
+    }
+
+    /// The total value that migrates across all runs (the sum of each run's `migratable`).
+    public var totalMigratable: Zatoshi {
+        runs.reduce(Zatoshi.zero) { $0 + $1.migratable }
+    }
+
+    /// The total number of pool-crossing transfers across all runs.
+    public var totalCrossings: Int {
+        runs.reduce(0) { $0 + $1.crossings }
+    }
+
+    /// The total number of note-preparation layers across all runs.
+    public var totalPreparationLayers: Int {
+        runs.reduce(0) { $0 + $1.preparationLayers }
+    }
+
+    /// The total number of note-preparation transactions across all runs.
+    public var totalPreparationTransactions: Int {
+        runs.reduce(0) { $0 + $1.preparationTransactions }
+    }
+
+    /// The total number of transactions the whole migration builds and signs across all runs
+    /// (equivalently `totalPreparationTransactions` plus `totalCrossings`).
+    public var totalTransactions: Int {
+        runs.reduce(0) { $0 + $1.transactions }
+    }
+
+    /// The total number of signing sessions the whole migration needs when an external signer can
+    /// sign at most `maxTransactionsPerSession` transactions in one interaction — the number of
+    /// times the user must interact with a capacity-limited hardware signer.
+    ///
+    /// This is the SUM of each run's `signingSessions(maxTransactionsPerSession:)`, NOT
+    /// `ceil(totalTransactions / maxTransactionsPerSession)`: signing sessions cannot span runs,
+    /// because a later run's transactions spend notes an earlier run must mine first, so each run
+    /// is signed on its own (any spare capacity in a run's last session goes unused).
+    /// - Precondition: `maxTransactionsPerSession > 0`.
+    public func totalSigningSessions(maxTransactionsPerSession: Int) -> Int {
+        runs.reduce(0) { $0 + $1.signingSessions(maxTransactionsPerSession: maxTransactionsPerSession) }
+    }
+}
+
 /// A fully proven, signed migration transaction persisted by the engine, ready for the platform
 /// to broadcast (see `ZcashRustBackendWelding.migrationExtractBroadcastTx(pczt:for:)`).
 public struct PreparedMigrationTransfer: Equatable, Sendable {
