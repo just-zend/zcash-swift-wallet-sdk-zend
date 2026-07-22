@@ -54,6 +54,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `zcashlc_migration_store_signed_schedule_pczts`.
   - Helper: `zcashlc_ironwood_activation_height` (NU6.3 activation height for
     mainnet/testnet).
+- Migration residual note locking: `zcashlc_migration_lock_residual` locks every
+  currently-spendable, not-already-locked legacy-Orchard note of the account until
+  explicit unlock (permanent lock expiry) and returns the total locked zatoshi
+  (`0` is a legitimate "nothing was spendable" result; `-1` = error), and
+  `zcashlc_migration_unlock_residual` clears ALL of the account's output locks —
+  safe because this SDK never creates proposal-scoped locks — returning the
+  cleared-output count (`-1` = error). `Balance` (inside
+  `FfiAccountBalance`/`FfiWalletSummary`) gains a trailing `locked_value` field
+  marshaled from the upstream balance, keeping the "sum of the fields is the
+  account's total" contract true now that upstream totals include locked value.
 
 ## 2.6.0-alpha.6 - 2026-06-26
 

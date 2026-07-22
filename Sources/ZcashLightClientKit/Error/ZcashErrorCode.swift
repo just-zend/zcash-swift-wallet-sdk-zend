@@ -323,6 +323,10 @@ public enum ZcashErrorCode: String {
     case migrationProvingUnavailable = "ZRUST0127"
     /// A migration commit was requested without a matching previewed plan.
     case migrationPlanStale = "ZRUST0128"
+    /// Error from rust layer when calling ZcashRustBackend.lockMigrationResidual
+    case rustMigrationLockResidual = "ZRUST0132"
+    /// Error from rust layer when calling ZcashRustBackend.unlockMigrationResidual
+    case rustMigrationUnlockResidual = "ZRUST0133"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.

@@ -59,4 +59,21 @@ final class IronwoodFFITests: XCTestCase {
         XCTAssertEqual(balance.ironwoodBalance.total(), Zatoshi(8))
         XCTAssertEqual(AccountBalance.zero.ironwoodBalance, .zero)
     }
+
+    /// `PoolBalance.lockedValue` participates in `total()` — the FFI balance contract is that the
+    /// sum of the fields is the account's total, and locked value (e.g. the Orchard migration
+    /// residual locked via `lockMigrationResidual`) leaves `spendableValue` without leaving the
+    /// account. Fixtures that predate locking default it to `.zero`.
+    func testPoolBalanceTotalIncludesLockedValue() {
+        let balance = PoolBalance(
+            spendableValue: Zatoshi(5),
+            changePendingConfirmation: Zatoshi(2),
+            valuePendingSpendability: Zatoshi(1),
+            lockedValue: Zatoshi(7)
+        )
+
+        XCTAssertEqual(balance.lockedValue, Zatoshi(7))
+        XCTAssertEqual(balance.total(), Zatoshi(15))
+        XCTAssertEqual(PoolBalance.zero.lockedValue, .zero)
+    }
 }
