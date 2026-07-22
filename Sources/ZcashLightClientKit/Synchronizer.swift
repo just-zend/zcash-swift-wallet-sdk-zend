@@ -121,6 +121,11 @@ public protocol Synchronizer: AnyObject {
     /// and is view-only, or by a wallet that does have the seed but the process does not have the
     /// consent of the OS to fetch the keys from the secure storage, like on background tasks.
     ///
+    /// `InitializationResult.seedNotRelevant` is returned when the provided seed does not match the accounts
+    /// already present in the wallet database. The rust layer currently reports this during seed-requiring
+    /// migrations; callers must treat it as "this database belongs to a different wallet" rather than proceed
+    /// as if initialization succeeded.
+    ///
     /// 'cache.db' and 'data.db' files are created by this function (if they
     /// do not already exist). These files can be given a prefix for scenarios where multiple wallets
     ///
