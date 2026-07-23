@@ -47,10 +47,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the stored run in place through the engine's rebuild-on-expiry — the same funding note
   (recovered by nullifier identity from the expired PCZT, never an equal-value substitute),
   rescheduled from the current tip with a fresh canonical expiry and a freshly drawn boundary
-  anchor — returning the number rebuilt; the now-optional spending key selects the lane (a usk
-  signs each rebuilt transfer anew in-process; `nil`, the external-signer account, leaves it
-  awaiting its signature so the unsigned-transfer PCZT ceremony re-serves and completes it), and
-  a funding note spent outside the migration surfaces as a hard error naming
+  anchor — returning the run's full `MigrationSchedule` as stored after the refresh (empty when
+  no run is stored or the stored run is terminal; unchanged when nothing had expired): a rebuilt
+  transfer's fresh scheduled/expiry heights exist nowhere else, so the host re-displays the
+  returned schedule and echoes it on the consent-verified calls. The now-optional spending key
+  selects the lane (a usk signs each rebuilt transfer anew in-process; `nil`, the external-signer
+  account, leaves it awaiting its signature so the unsigned-transfer PCZT ceremony re-serves and
+  completes it), and a funding note spent outside the migration surfaces as a hard error naming
   `restartCurrentMigrationStep` (cancel and re-plan) as the remedy. Transfers prove against the
   boundary anchor their schedule drew (ZIP 318
   anchor cohorts), through the upstream prover: proving reads each transfer's persisted boundary

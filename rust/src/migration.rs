@@ -507,6 +507,27 @@ fn expected_rows_from_cached_plan(
     }
 }
 
+/// The stored run's TRANSFER subset, in engine order.
+fn stored_transfers(state: &MigrationState) -> Vec<&MigrationTransaction> {
+    state
+        .transactions()
+        .iter()
+        .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }))
+        .collect()
+}
+
+/// The schedule-duration estimate derived from STORED transfer rows (`max - min` scheduled
+/// height, in hours) — the state-side counterpart of [`estimated_duration_hours`], shared by the
+/// consent-echo expectation ([`expected_rows_from_state`]) and the state-encoded schedule DTO
+/// ([`encode_schedule_from_state`]) so the two can never drift apart.
+fn stored_duration_hours(transfers: &[&MigrationTransaction]) -> u32 {
+    let heights = transfers.iter().map(|t| u32::from(t.scheduled_height()));
+    match (heights.clone().max(), heights.min()) {
+        (Some(max), Some(min)) => max.saturating_sub(min) / BLOCKS_PER_HOUR,
+        _ => 0,
+    }
+}
+
 /// The consent-echo rows and duration for the stored run's TRANSFER subset — the values a commit
 /// call validates the platform's echo against once a run is committed (there is no cache to
 /// consult post-commit; this is ALWAYS the ground truth of what is about to be signed, whether the
@@ -516,11 +537,7 @@ fn expected_rows_from_cached_plan(
 /// transfer's stored `scheduled_height` is the SAME single commit-tip value, so `max - min` is
 /// `0`, matching the immediate preview's hardcoded `0` regardless of any tip drift.
 fn expected_rows_from_state(state: &MigrationState) -> (Vec<StoredEchoRow>, u32) {
-    let transfers: Vec<&MigrationTransaction> = state
-        .transactions()
-        .iter()
-        .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }))
-        .collect();
+    let transfers = stored_transfers(state);
     let rows = transfers
         .iter()
         .filter_map(|t| {
@@ -531,12 +548,46 @@ fn expected_rows_from_state(state: &MigrationState) -> (Vec<StoredEchoRow>, u32)
             })
         })
         .collect();
-    let heights = transfers.iter().map(|t| u32::from(t.scheduled_height()));
-    let duration = match (heights.clone().max(), heights.min()) {
-        (Some(max), Some(min)) => max.saturating_sub(min) / BLOCKS_PER_HOUR,
-        _ => 0,
-    };
+    let duration = stored_duration_hours(&transfers);
     (rows, duration)
+}
+
+/// Marshal the STORED run's full transfer subset into the platform's schedule DTO — the
+/// post-commit counterpart of [`encode_schedule_from_plan`], read from persisted state instead of
+/// a previewed plan. Every transfer of the run is included (mined ones too: the state-side
+/// consent echo, [`validate_schedule_echo_against_state`], compares the FULL subset, and this DTO
+/// is what the host re-displays and later echoes), sorted chronologically by stored scheduled
+/// height; `anchor_height` carries the same display-only "now" reference as the plan-side
+/// encoding, and the duration is derived from the stored scheduled heights exactly as the echo
+/// expectation derives it ([`stored_duration_hours`]) — so a host echoing these rows back
+/// converges with the echo validation by construction.
+fn encode_schedule_from_state(
+    state: &MigrationState,
+    now_reference: BlockHeight,
+) -> anyhow::Result<*mut FfiMigrationSchedule> {
+    let mut transfers = stored_transfers(state);
+    let estimated = stored_duration_hours(&transfers);
+    transfers.sort_by_key(|t| t.scheduled_height());
+    let rows = transfers
+        .into_iter()
+        .map(|t| {
+            let amount = transfer_amount(state, t)
+                .ok_or_else(|| anyhow!("stored transfer has no funding-note amount"))?;
+            Ok(FfiTransferProposal {
+                id: cstring_raw(&u32::from(t.id()).to_string(), "transfer proposal id")?,
+                amount: zat_to_i64(amount),
+                anchor_height: i64::from(u32::from(now_reference)),
+                next_executable_after_height: i64::from(u32::from(t.scheduled_height())),
+                expiry_height: i64::from(u32::from(t.expiry_height())),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let (transfers, transfers_len) = ptr_from_vec(rows);
+    Ok(Box::into_raw(Box::new(FfiMigrationSchedule {
+        transfers,
+        transfers_len,
+        estimated_duration_hours: estimated,
+    })))
 }
 
 /// Decode the platform's parallel echo arrays into [`EchoRow`]s (the CACHE-side shape, including
@@ -2338,19 +2389,25 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
 /// `zcashlc_migration_store_signed_schedule_pczts` completes it (`apply_signature`), exactly like
 /// an originally committed transfer.
 ///
-/// Returns the number of transfers rebuilt — `0` when no migration is stored, the stored run is
-/// terminal (a completed or cancelled run has nothing to refresh), or nothing has expired at the
-/// current tip. The rebuilt state persists once, all-or-nothing: on any rebuild error nothing is
-/// persisted and `-1` is returned (see `zcashlc_last_error_message`). A gone funding note (spent
-/// outside the migration) is a hard error naming `restartCurrentMigrationStep`
-/// (`zcashlc_migration_restart_step`) as the remedy — the remaining balance must be re-planned.
-/// An expired PREPARATION transaction also surfaces as a hard error: the engine rebuilds only
-/// transfers (leaves of the dependency graph; an expired preparation invalidates its dependents'
-/// pre-signatures), and its remediation is the same restart.
+/// Returns the stored run's FULL, freshly persisted transfer schedule (the same DTO
+/// `zcashlc_migration_restart_step` returns, here encoded from the post-refresh STORED state):
+/// after a rebuild the host has no other way to learn the fresh scheduled/expiry values, and its
+/// stale copy would fail the state-side consent echo forever — the returned schedule is the
+/// atomically-persisted truth to re-display and echo. With nothing rebuilt the CURRENT stored
+/// schedule is returned unchanged; with no stored migration, or a terminal stored run (a
+/// completed or cancelled run has nothing to refresh and nothing the echo lane compares
+/// against), the EMPTY schedule. The rebuilt state persists once, all-or-nothing: on any rebuild
+/// error nothing is persisted and NULL is returned (see `zcashlc_last_error_message`). A gone
+/// funding note (spent outside the migration) is a hard error naming
+/// `restartCurrentMigrationStep` (`zcashlc_migration_restart_step`) as the remedy — the
+/// remaining balance must be re-planned. An expired PREPARATION transaction also surfaces as a
+/// hard error: the engine rebuilds only transfers (leaves of the dependency graph; an expired
+/// preparation invalidates its dependents' pre-signatures), and its remediation is the same
+/// restart.
 ///
 /// # Safety
 /// See [`open`]; `usk_ptr` must be null (with `usk_len == 0`) or valid for reads of `usk_len`
-/// bytes.
+/// bytes. Free the returned pointer with [`zcashlc_free_migration_schedule`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
     db_data: *const u8,
@@ -2359,7 +2416,7 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
     network_id: u32,
     usk_ptr: *const u8,
     usk_len: usize,
-) -> i64 {
+) -> *mut FfiMigrationSchedule {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let usk = if usk_ptr.is_null() {
@@ -2373,17 +2430,20 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
 
         // Reconcile before judging expiry: a Broadcast transfer the wallet has since observed
         // on-chain must count as Mined here, or it would look expired and be rebuilt into a
-        // double spend of its own mined copy.
+        // double spend of its own mined copy. The no-run and terminal answers come before any
+        // tip lookup, so they hold even before the wallet ever saw a chain tip.
         let Some(mut state) = reconcile_mined(&mut ctx)? else {
-            return Ok(0);
+            return Ok(encode_empty_schedule());
         };
         if state.is_terminal() {
-            return Ok(0);
+            return Ok(encode_empty_schedule());
         }
-        let target = BlockHeight::from(u32::from(ctx.tip()?) + 1);
+        let tip = ctx.tip()?;
+        let target = BlockHeight::from(u32::from(tip) + 1);
         let expired = state.expired_transactions(target);
         if expired.is_empty() {
-            return Ok(0);
+            // Nothing to rebuild: the stored schedule IS current — serve it for re-display.
+            return encode_schedule_from_state(&state, tip);
         }
 
         let sign_in_process = usk.is_some();
@@ -2408,9 +2468,9 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
             }
         }
         backend.replace_migration(&state)?;
-        count_to_u32(expired.len(), "rebuilt transfer").map(i64::from)
+        encode_schedule_from_state(&state, tip)
     });
-    unwrap_exc_or(res, -1)
+    unwrap_exc_or_null(res)
 }
 
 /// Builds the whole migration UNSIGNED (external-signer lane): every transaction is persisted
@@ -3511,16 +3571,16 @@ mod tests {
     }
 
     /// On a freshly initialized wallet database with a created account but NO stored migration,
-    /// refreshing stale transfers is the benign zero — nothing to refresh — not an error, on the
-    /// NULL-usk (external-signer) lane pinned here (the usk lane rides the welding offline
-    /// tests). The stored state is read before any tip lookup, so the answer holds even before
-    /// the wallet ever saw a chain tip.
+    /// refreshing stale transfers returns the benign EMPTY schedule — nothing to refresh and
+    /// nothing to re-display — not an error, on the NULL-usk (external-signer) lane pinned here
+    /// (the usk lane rides the welding offline tests). The stored state is read before any tip
+    /// lookup, so the answer holds even before the wallet ever saw a chain tip.
     #[test]
-    fn migration_refresh_stale_transfers_on_fresh_db_returns_zero() {
+    fn migration_refresh_stale_transfers_on_fresh_db_returns_an_empty_schedule() {
         let path = init_fixture_db("zcashlc_migration_refresh_fresh");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
-        let refreshed = unsafe {
+        let schedule_ptr = unsafe {
             zcashlc_migration_refresh_stale_transfers(
                 path_bytes.as_ptr(),
                 path_bytes.len(),
@@ -3530,15 +3590,57 @@ mod tests {
                 0,
             )
         };
-        assert_eq!(refreshed, 0, "no stored migration means nothing to refresh");
+        assert!(
+            !schedule_ptr.is_null(),
+            "no stored migration means nothing to refresh, not an error"
+        );
+        let schedule = unsafe { &*schedule_ptr };
+        assert_eq!(
+            schedule.transfers_len, 0,
+            "no stored migration yields the empty schedule"
+        );
+        assert_eq!(schedule.estimated_duration_hours, 0);
+        unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A stored run whose transfer has NOT expired at the tip refreshes nothing: `0`, with the
-    /// stored state untouched. This lane decodes a REAL spending key (the in-process signing
-    /// selector), pinning that the usk input form is accepted even when no rebuild runs.
+    /// A stored TERMINAL run (completed or cancelled) has nothing to refresh and nothing the
+    /// consent-echo lane would ever compare against: the EMPTY schedule, again read before any
+    /// tip lookup (no chain tip is set in this fixture).
     #[test]
-    fn migration_refresh_stale_transfers_with_nothing_expired_returns_zero() {
+    fn migration_refresh_stale_transfers_on_a_terminal_run_returns_an_empty_schedule() {
+        let path = init_fixture_db("zcashlc_migration_refresh_terminal");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        let state = test_state(MigrationStatus::Complete, &[MINED], &[MINED], 50, 10_000);
+        store_fixture_state(&path, &account, &state);
+        let schedule_ptr = unsafe {
+            zcashlc_migration_refresh_stale_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert!(!schedule_ptr.is_null(), "a terminal run is not an error");
+        let schedule = unsafe { &*schedule_ptr };
+        assert_eq!(
+            schedule.transfers_len, 0,
+            "a terminal run yields the empty schedule"
+        );
+        unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stored run whose transfer has NOT expired at the tip rebuilds nothing and returns the
+    /// CURRENT stored schedule — the atomically-persisted truth the host re-displays and later
+    /// echoes — with the stored state untouched. This lane decodes a REAL spending key (the
+    /// in-process signing selector), pinning that the usk input form is accepted even when no
+    /// rebuild runs.
+    #[test]
+    fn migration_refresh_stale_transfers_with_nothing_expired_returns_the_current_schedule() {
         let path = init_fixture_db("zcashlc_migration_refresh_unexpired");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let (account, usk) = create_fixture_account_with_usk(&path);
@@ -3562,7 +3664,7 @@ mod tests {
             4_000_000,
         );
         store_fixture_state(&path, &account, &state);
-        let refreshed = unsafe {
+        let schedule_ptr = unsafe {
             zcashlc_migration_refresh_stale_transfers(
                 path_bytes.as_ptr(),
                 path_bytes.len(),
@@ -3572,7 +3674,48 @@ mod tests {
                 usk.len(),
             )
         };
-        assert_eq!(refreshed, 0, "an unexpired schedule refreshes nothing");
+        assert!(
+            !schedule_ptr.is_null(),
+            "an unexpired schedule refreshes nothing, not an error"
+        );
+        let schedule = unsafe { &*schedule_ptr };
+        assert_eq!(
+            schedule.transfers_len, 1,
+            "the current stored schedule has its one transfer row"
+        );
+        assert_eq!(schedule.estimated_duration_hours, 0);
+        let row = unsafe { &*schedule.transfers };
+        let row_id = unsafe { CStr::from_ptr(row.id) }
+            .to_str()
+            .expect("the row id is UTF-8");
+        assert_eq!(row_id, "0", "the stored transfer's engine id");
+        // The state-side amount is the FUNDING NOTE (crossing + fee buffer), exactly what the
+        // consent echo compares (`expected_rows_from_state` uses the same `transfer_amount`).
+        assert_eq!(row.amount, 100_010_000);
+        assert_eq!(
+            row.next_executable_after_height, 3_499_000,
+            "the stored scheduled height is served unchanged"
+        );
+        assert_eq!(
+            row.expiry_height, 4_000_000,
+            "the stored expiry is served unchanged"
+        );
+        assert_eq!(
+            row.anchor_height, 3_600_000,
+            "the display-only now reference is the tip at encode time"
+        );
+        unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
+
+        // Nothing was rebuilt: the stored transfer still holds its fixture bytes, still Signed.
+        let stored = read_fixture_state(&path, &account);
+        let tx = stored
+            .transactions()
+            .first()
+            .expect("the transfer row remains");
+        assert!(
+            matches!(tx.state(), MigrationTxState::Signed),
+            "an unexpired transfer must stay untouched"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -3580,8 +3723,9 @@ mod tests {
     /// real built transfer — one unwitnessed spend revealing the funding nullifier — the refresh
     /// path attempts the rebuild, and on this otherwise-empty wallet (the funding note is not
     /// among the spendable notes) surfaces the `FundingNoteUnavailable` HARD error naming the
-    /// restart remedy: `-1`, with NOTHING persisted (the expired artifact stays stored
-    /// untouched). This pins expired-detection plus the error routing end to end over the FFI.
+    /// restart remedy: NULL with the last-error channel set, and NOTHING persisted (the expired
+    /// artifact stays stored untouched). This pins expired-detection plus the error routing end
+    /// to end over the FFI.
     #[test]
     fn migration_refresh_stale_transfers_surfaces_funding_note_unavailable() {
         let path = init_fixture_db("zcashlc_migration_refresh_expired");
@@ -3633,7 +3777,7 @@ mod tests {
         );
         store_fixture_state(&path, &account, &state);
 
-        let refreshed = unsafe {
+        let schedule_ptr = unsafe {
             zcashlc_migration_refresh_stale_transfers(
                 path_bytes.as_ptr(),
                 path_bytes.len(),
@@ -3643,7 +3787,10 @@ mod tests {
                 0,
             )
         };
-        assert_eq!(refreshed, -1, "a gone funding note must be a hard error");
+        assert!(
+            schedule_ptr.is_null(),
+            "a gone funding note must be a hard error"
+        );
         let message = ffi_helpers::error_handling::error_message()
             .expect("the last-error channel must carry the failure");
         assert!(

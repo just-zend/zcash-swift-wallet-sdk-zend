@@ -69,10 +69,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     drawn boundary anchor. The optional spending key selects the lane —
     with a usk the rebuilt transfer is signed anew in-process; a NULL usk
     (external signer) leaves it awaiting its signature for the unsigned
-    PCZT ceremony to re-serve and complete. Returns the number rebuilt
-    (`0` when nothing is stored or nothing expired), persisted
-    all-or-nothing; a funding note spent outside the migration is a hard
-    error naming the restart remedy.
+    PCZT ceremony to re-serve and complete. Returns the run's FULL
+    transfer schedule as stored after the refresh (the same
+    `FfiMigrationSchedule` the restart returns, here encoded from the
+    persisted state) — the atomically-persisted truth the host
+    re-displays and echoes, since a rebuilt transfer's fresh
+    scheduled/expiry heights exist nowhere else; with nothing expired
+    the current stored schedule comes back unchanged, and with no
+    stored run or a terminal (completed or cancelled) stored run it is
+    empty. Persisted all-or-nothing (on any rebuild error nothing
+    persists and NULL is returned); a funding note spent outside the
+    migration is a hard error naming the restart remedy.
   - External signer: `zcashlc_migration_create_unsigned_note_split_pczts`,
     `zcashlc_migration_store_signed_note_split_pczts`,
     `zcashlc_migration_create_unsigned_transfer_pczts`,
