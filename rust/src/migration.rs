@@ -143,6 +143,15 @@ fn transfer_id_from_c(id: *const c_char) -> anyhow::Result<MigrationTxId> {
     Ok(MigrationTxId::new(idx))
 }
 
+/// The engine's target height for a given chain tip: `tip + 1`, the height of the next block.
+/// Every [`MigrationState`] query (`next_provable`, `next_broadcastable`, `expired_transactions`)
+/// is defined over this height, never the raw tip — see [`CallCtx::target`], the primary way
+/// callers reach this from a live wallet handle. Exposed as a pure function too for the rare
+/// caller (like [`derive_state`]) that already holds a `tip` value rather than a [`CallCtx`].
+fn target_from_tip(tip: BlockHeight) -> BlockHeight {
+    BlockHeight::from(u32::from(tip) + 1)
+}
+
 /// The common per-call context: the network parameters, the wallet handle, the migration-store
 /// connection (a second, independent connection to the same wallet database file — the
 /// account-keyed migration tables live inside it), and the raw path/account for the plan cache.
@@ -200,6 +209,18 @@ impl CallCtx {
             .chain_height()
             .map_err(|e| anyhow!("chain height lookup failed: {e}"))?
             .ok_or_else(|| anyhow!("the wallet has no chain tip yet; sync first"))
+    }
+
+    /// The engine's target height (`tip + 1`; see [`target_from_tip`]): a transaction may be
+    /// mined only in a block at or below its expiry (ZIP 203), so it first becomes un-mineable in
+    /// the NEXT block once the tip reaches its expiry height, and a scheduled transaction first
+    /// becomes due once the NEXT block reaches its scheduled height. Every call that feeds a
+    /// [`MigrationState`] query (`next_provable`, `next_broadcastable`, `expired_transactions`,
+    /// `commit_preparation`, `build_preparation_unsigned`) must use this, never `tip()` directly.
+    /// SDK-owned, tip-based policy (the immediate lane's fallback expiry bound, display-only "now"
+    /// references) keeps using `tip()`.
+    fn target(&self) -> anyhow::Result<BlockHeight> {
+        Ok(target_from_tip(self.tip()?))
     }
 }
 
@@ -871,7 +892,7 @@ fn commit_or_resume(
     let cached = migration_plan_cache::get(&ctx.db_path, ctx.account_bytes)
         .ok_or_else(|| plan_stale("no previewed migration plan for this account"))?;
 
-    let target = BlockHeight::from(u32::from(ctx.tip()?) + 1);
+    let target = ctx.target()?;
     let mut rng = OsRng;
     let mut backend = Backend::new(&ctx.wallet, ctx.account, usk, &mut ctx.store_conn)?;
     let (state, unsigned) = if unsigned_out {
@@ -998,7 +1019,8 @@ fn prove_if_needed(
 }
 
 /// The delivery lane's drive-and-serve: returns the next broadcastable transaction as
-/// `(id, txid, proven pczt bytes)`, or `None` when nothing is due.
+/// `(id, txid, proven pczt bytes)` due at `target` (the engine's `chain tip + 1` — see
+/// [`CallCtx::target`]), or `None` when nothing is due.
 ///
 /// Commit stores every in-process-signed transaction `Signed` (and the external-signer ceremony
 /// lands its rows `Signed` too), while `next_broadcastable` serves only `Proved` rows — so before
@@ -1019,14 +1041,14 @@ fn prove_if_needed(
 /// is generic over `impl MigrationProver`) plus a fixture-store persist.
 fn drive_and_serve_next_due(
     state: &mut MigrationState,
-    tip: BlockHeight,
+    target: BlockHeight,
     mut prove: impl FnMut(
         &mut MigrationState,
         MigrationTxId,
     ) -> anyhow::Result<Option<(Vec<u8>, [u8; 32])>>,
 ) -> anyhow::Result<Option<(MigrationTxId, [u8; 32], Vec<u8>)>> {
-    while state.next_broadcastable(tip).is_none() {
-        let Some(provable) = state.next_provable(tip) else {
+    while state.next_broadcastable(target).is_none() {
+        let Some(provable) = state.next_provable(target) else {
             return Ok(None);
         };
         if prove(state, provable)?.is_none() {
@@ -1034,33 +1056,34 @@ fn drive_and_serve_next_due(
         }
     }
     let id = state
-        .next_broadcastable(tip)
+        .next_broadcastable(target)
         .expect("the drive loop exits with a broadcastable row");
     Ok(prove(state, id)?.map(|(proven, txid)| (id, txid, proven)))
 }
 
-/// The id [`zcashlc_migration_next_due_transfer`] WOULD serve at `tip`, assuming every due proof
-/// succeeds: the next broadcastable row after virtually proving every prove-ready `Signed` row
-/// over a scratch copy — no prover runs and nothing persists (`set_transaction_proved` with the
-/// row's own bytes only flips the lifecycle state, mirroring [`drive_and_serve_next_due`]'s loop
-/// without its side effects). `None` when the delivery lane has nothing actionable: nothing
-/// schedule-due yet, dependencies unmined, rows awaiting an external signature (the signing
-/// ceremony, not the delivery lane, advances those), or everything already broadcast/mined.
+/// The id [`zcashlc_migration_next_due_transfer`] WOULD serve at `target` (the engine's `chain
+/// tip + 1` — see [`CallCtx::target`]), assuming every due proof succeeds: the next broadcastable
+/// row after virtually proving every prove-ready `Signed` row over a scratch copy — no prover
+/// runs and nothing persists (`set_transaction_proved` with the row's own bytes only flips the
+/// lifecycle state, mirroring [`drive_and_serve_next_due`]'s loop without its side effects).
+/// `None` when the delivery lane has nothing actionable: nothing schedule-due yet, dependencies
+/// unmined, rows awaiting an external signature (the signing ceremony, not the delivery lane,
+/// advances those), or everything already broadcast/mined.
 ///
 /// The queries built on this ([`zcashlc_migration_has_overdue_transfers`],
 /// [`zcashlc_migration_pending_transfer_proposal`]) deliberately assume proofs succeed: a
 /// transiently unwitnessable anchor (a restored wallet mid-sync) defers the actual delivery, not
 /// the report — the due work exists either way, and the delivery call stays the one place that
 /// consults the prover.
-fn due_assuming_proving(state: &MigrationState, tip: BlockHeight) -> Option<MigrationTxId> {
-    if let Some(id) = state.next_broadcastable(tip) {
+fn due_assuming_proving(state: &MigrationState, target: BlockHeight) -> Option<MigrationTxId> {
+    if let Some(id) = state.next_broadcastable(target) {
         return Some(id);
     }
-    if state.next_provable(tip).is_none() {
+    if state.next_provable(target).is_none() {
         return None;
     }
     let mut scratch = state.clone();
-    while let Some(id) = scratch.next_provable(tip) {
+    while let Some(id) = scratch.next_provable(target) {
         let bytes = scratch
             .transactions()
             .iter()
@@ -1069,7 +1092,7 @@ fn due_assuming_proving(state: &MigrationState, tip: BlockHeight) -> Option<Migr
             .unwrap_or_default();
         scratch.set_transaction_proved(id, bytes);
     }
-    scratch.next_broadcastable(tip)
+    scratch.next_broadcastable(target)
 }
 
 // ----- public-state derivation (pure; unit-tested) -----
@@ -1168,6 +1191,11 @@ fn derive_immediate_run(run: &ImmediateRunLookup, tip: BlockHeight) -> Option<De
 /// -> consumed: `NotStarted`, masking any stale engine `Complete`; unmined and not expired ->
 /// `InProgress` of one, flagged `is_immediate`; expired or vanished -> ignored) before falling back
 /// to the engine's own terminal/absent verdict.
+///
+/// `tip` carries two distinct meanings inside: it feeds `immediate_run`'s SDK-owned, tip-based
+/// fallback-expiry policy unchanged (see [`ImmediateRunLookup::expiry_bound`]), while the
+/// engine-mirroring expiry check on an ACTIVE run is computed from `target_from_tip(tip)` — the
+/// engine's `chain tip + 1` contract (see [`CallCtx::target`]).
 fn derive_state(
     persisted: Option<&MigrationState>,
     tip: BlockHeight,
@@ -1193,11 +1221,10 @@ fn derive_state(
     if let Some(&id) = invalid_marks.first() {
         return DerivedState::InvalidTransfer(id);
     }
-    let expired_unmined = state
-        .transactions()
-        .iter()
-        .any(|t| !matches!(t.state(), MigrationTxState::Mined { .. }) && tip > t.expiry_height());
-    if expired_unmined {
+    // The engine's expiry predicate is defined over `target = tip + 1` (see `target_from_tip`),
+    // not the raw tip — membership in `expired_transactions` already excludes `Mined` rows and
+    // treats `expiry_height == 0` as "never expires" (see `MigrationState::is_expired`'s doc).
+    if !state.expired_transactions(target_from_tip(tip)).is_empty() {
         return DerivedState::TransferExpired;
     }
 
@@ -1811,8 +1838,8 @@ pub unsafe extern "C" fn zcashlc_migration_has_overdue_transfers(
         if state.is_terminal() {
             return Ok(false);
         }
-        let tip = ctx.tip()?;
-        Ok(due_assuming_proving(&state, tip).is_some())
+        let target = ctx.target()?;
+        Ok(due_assuming_proving(&state, target).is_some())
     });
     unwrap_exc_or(res, false)
 }
@@ -1843,10 +1870,11 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
         if !marks.is_empty() {
             return Ok(true);
         }
-        let tip = ctx.tip()?;
-        Ok(state.transactions().iter().any(|t| {
-            !matches!(t.state(), MigrationTxState::Mined { .. }) && tip > t.expiry_height()
-        }))
+        // The engine's expiry predicate is defined over `target = tip + 1`, not the raw tip (see
+        // `CallCtx::target`); membership in `expired_transactions` already excludes `Mined` rows
+        // and treats `expiry_height == 0` as "never expires".
+        let target = ctx.target()?;
+        Ok(!state.expired_transactions(target).is_empty())
     });
     unwrap_exc_or(res, false)
 }
@@ -2313,8 +2341,8 @@ pub unsafe extern "C" fn zcashlc_migration_next_due_transfer(
         if state.is_terminal() {
             return Ok(FfiPreparedTransfer::none());
         }
-        let tip = ctx.tip()?;
-        let served = drive_and_serve_next_due(&mut state, tip, |state, id| {
+        let target = ctx.target()?;
+        let served = drive_and_serve_next_due(&mut state, target, |state, id| {
             prove_if_needed(&mut ctx, state, id)
         })?;
         match served {
@@ -2354,8 +2382,12 @@ pub unsafe extern "C" fn zcashlc_migration_pending_transfer_proposal(
         if state.is_terminal() {
             return Ok(ptr::null_mut());
         }
+        // `tip` is the display-only "now" reference the DTO carries (see
+        // `FfiTransferProposal::anchor_height`'s doc); `target` (`tip + 1`) is what the engine
+        // query below is actually defined over — see `CallCtx::target`.
         let tip = ctx.tip()?;
-        let next_transfer = due_assuming_proving(&state, tip)
+        let target = target_from_tip(tip);
+        let next_transfer = due_assuming_proving(&state, target)
             .and_then(|id| state.transactions().iter().find(|t| t.id() == id))
             .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }));
         match next_transfer {
@@ -2596,7 +2628,7 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
             return Ok(encode_empty_schedule());
         }
         let tip = ctx.tip()?;
-        let target = BlockHeight::from(u32::from(tip) + 1);
+        let target = target_from_tip(tip);
         let expired = state.expired_transactions(target);
         if expired.is_empty() {
             // Nothing to rebuild: the stored schedule IS current — serve it for re-display.
@@ -3081,6 +3113,52 @@ mod tests {
             derive_state(Some(&state), h(100), &[], None),
             DerivedState::TransferExpired
         ));
+    }
+
+    /// ZIP 203 / engine semantics (`zcash_pool_migration_backend::state::MigrationState::is_expired`):
+    /// a transaction may be mined only in a block at or below its `expiry_height`, so it is
+    /// expired as soon as the NEXT block (`target = tip + 1`) would exceed that height — i.e.
+    /// exactly when `tip == expiry_height`, one block EARLIER than a naive `tip > expiry_height`
+    /// check would catch it. Pins the exact boundary the old hand-rolled check in `derive_state`
+    /// missed.
+    #[test]
+    fn derive_expired_at_exact_tip_boundary_requires_attention() {
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[MINED],
+            &[MigrationTxState::Signed],
+            50,
+            100, // expiry_height == tip
+        );
+        assert!(
+            matches!(
+                derive_state(Some(&state), h(100), &[], None),
+                DerivedState::TransferExpired
+            ),
+            "expiry_height == tip can no longer be mined in the next block and must derive \
+             TransferExpired, not InProgress"
+        );
+    }
+
+    /// `expiry_height == 0` is the engine's "never expires" sentinel (see
+    /// `MigrationState::is_expired`'s doc); it must not be caught by any expiry check, however
+    /// large the tip grows.
+    #[test]
+    fn derive_never_expires_when_expiry_height_is_zero() {
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[MINED],
+            &[MigrationTxState::Signed],
+            50,
+            0, // expiry_height == 0: never expires
+        );
+        assert!(
+            matches!(
+                derive_state(Some(&state), h(1_000_000), &[], None),
+                DerivedState::InProgress { .. }
+            ),
+            "expiry_height == 0 must never expire, even at a huge tip"
+        );
     }
 
     /// Builds an [`ImmediateRunLookup`] directly (bypassing the wallet-DB lookup), for exercising
@@ -5020,6 +5098,184 @@ mod tests {
         assert!(
             overdue,
             "a due-but-unproved Signed transfer is overdue delivery work"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- engine target-height boundary (F2): `next_broadcastable`/`next_provable`/
+    // `expired_transactions` are all defined over `target = tip + 1`, never the raw tip -----
+
+    /// Engine semantics: `next_broadcastable` is defined over `target = tip + 1` (the height of
+    /// the NEXT block), with schedule test `scheduled_height <= target` — so a `Proved` transfer
+    /// scheduled at EXACTLY `tip + 1` is due for broadcast right now, one block earlier than a
+    /// raw-tip check (`scheduled_height <= tip`) would have admitted it.
+    #[test]
+    fn has_overdue_transfers_reports_scheduled_at_target_as_due() {
+        let path = init_fixture_db("zcashlc_migration_overdue_target_boundary");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        // Proved, scheduled at exactly tip + 1 (the target height), expiry comfortably above.
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Proved],
+            3_600_001, // scheduled_height == tip + 1
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &state);
+        let overdue = unsafe {
+            zcashlc_migration_has_overdue_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(
+            overdue,
+            "a Proved transfer scheduled at tip + 1 must be due (engine: scheduled_height <= target)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An engine-expired `Proved` transfer (`expiry_height == tip`, so it can no longer be mined
+    /// in the next block) must never be reported as due delivery work — a node would reject its
+    /// broadcast outright. This already holds once the target fix lands (`next_broadcastable`
+    /// already excludes expired rows when fed the right height); kept as an explicit regression
+    /// pin on the exact boundary the old raw-tip call missed.
+    #[test]
+    fn has_overdue_transfers_does_not_report_an_expired_proved_transfer_at_the_tip() {
+        let path = init_fixture_db("zcashlc_migration_overdue_expired_at_tip");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        // Proved, schedule-due, but expiry == tip: expired per the engine, and must not be
+        // offered for broadcast even though it is otherwise ready.
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Proved],
+            3_499_000,
+            3_600_000, // expiry_height == tip
+        );
+        store_fixture_state(&path, &account, &state);
+        let overdue = unsafe {
+            zcashlc_migration_has_overdue_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(
+            !overdue,
+            "an expired (expiry_height == tip) transfer must never be reported as due delivery work"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ZIP 203 / engine semantics pin for the hand-rolled expiry check inside
+    /// `zcashlc_migration_has_invalid_transfers`: `expiry_height == tip` can no longer be mined
+    /// in the next block and must report as an invalid/attention-worthy transfer, one block
+    /// earlier than the old `tip > expiry_height` check would catch it.
+    #[test]
+    fn has_invalid_transfers_reports_expiry_equal_to_tip_as_expired() {
+        let path = init_fixture_db("zcashlc_migration_has_invalid_expiry_eq_tip");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            3_499_000,
+            3_600_000, // expiry_height == tip
+        );
+        store_fixture_state(&path, &account, &state);
+        let invalid = unsafe {
+            zcashlc_migration_has_invalid_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(
+            invalid,
+            "a transfer with expiry_height == tip can no longer be mined in the next block and \
+             must report as an invalid transfer"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `expiry_height == 0` is the engine's "never expires" sentinel; the hand-rolled check
+    /// inside `zcashlc_migration_has_invalid_transfers` must not treat it as expired at any tip.
+    #[test]
+    fn has_invalid_transfers_ignores_expiry_zero_never_expires() {
+        let path = init_fixture_db("zcashlc_migration_has_invalid_expiry_zero");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            3_499_000,
+            0, // expiry_height == 0: never expires
+        );
+        store_fixture_state(&path, &account, &state);
+        let invalid = unsafe {
+            zcashlc_migration_has_invalid_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(
+            !invalid,
+            "expiry_height == 0 must never expire, even at a huge tip"
         );
         let _ = std::fs::remove_file(&path);
     }
