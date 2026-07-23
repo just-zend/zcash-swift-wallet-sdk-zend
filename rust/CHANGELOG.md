@@ -30,11 +30,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anchor, and a boundary the wallet has not scanned or retained yet surfaces as
   the transient nothing-due, not an error — and leaves broadcasting,
   mined-reconciliation, rejection classification (the `sdk_invalid_marks` side
-  table), and the platform's 6-state derivation to this layer. `Complete` is
+  table), and the platform's 5-state derivation to this layer (the v1 crate's
+  `ReadyToPropose` state and `SyncRequiredBeforeNext` attention reason are gone
+  entirely — the engine's atomic split+schedule commit means that intermediate
+  moment cannot occur). `Complete` is
   per-run; sequential runs commit over a terminal predecessor. The external-signer
   note-split pair is plural (`zcashlc_migration_create_unsigned_note_split_pczts` /
   `zcashlc_migration_store_signed_note_split_pczts`): the engine builds N
-  preparation transactions, not one split transaction.
+  preparation transactions, not one split transaction. The schedule/note-split
+  echo parameters (`ids`/`amounts`/heights/duration on the schedule-commit calls;
+  `output_values`/`fee` on the note-split-commit call) are verified consent
+  echoes: each is checked against the previewed plan (or, once committed, the
+  stored state) and a mismatch surfaces `MIGRATION_PLAN_STALE`, so a stale or
+  tampered display can never sign different values than the ones the user
+  approved. `include_residual` and `retryable` parameters, and the
+  `is_sync_required` query, are removed — they never had a use.
   - State: `zcashlc_migration_state`, `zcashlc_migration_progress`,
     `zcashlc_migration_is_note_split_needed`,
     `zcashlc_migration_has_overdue_transfers`,

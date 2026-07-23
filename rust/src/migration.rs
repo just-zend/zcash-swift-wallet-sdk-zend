@@ -298,11 +298,16 @@ fn plan_and_cache(ctx: &mut CallCtx, immediate: bool) -> anyhow::Result<Option<M
     let mut rng = OsRng;
     match engine::plan_migration(&ctx.network, &backend, &mut rng) {
         Ok(plan) => {
+            // `plan_migration` itself just resolved the tip internally (`chain_tip_height`) to
+            // plan against, so this can't newly fail here; it just makes the same value available
+            // to cache alongside the plan.
+            let reference_height = ctx.tip()?;
             migration_plan_cache::set(
                 ctx.db_path.clone(),
                 ctx.account_bytes,
                 plan.clone(),
                 immediate,
+                reference_height,
             );
             Ok(Some(plan))
         }
@@ -411,21 +416,208 @@ fn encode_empty_schedule() -> *mut FfiMigrationSchedule {
     }))
 }
 
-/// Validate that the platform-echoed transfer amounts match the cached plan (the user consented to
-/// exactly these values). Order-independent: the platform displays chronologically while
-/// `funding_notes()` is in crossing order.
-fn validate_amounts_against_plan(plan: &MigrationPlan, amounts: &[i64]) -> anyhow::Result<()> {
-    let mut expected: Vec<i64> = plan
-        .funding_notes()
+// ----- verified consent echoes (F4) -----
+//
+// `zcashlc_migration_sign_and_store_schedule` and `zcashlc_migration_create_unsigned_transfer_pczts`
+// take back the transfer schedule the platform displayed and got the user's consent for — the same
+// shape `zcashlc_migration_propose_transfers`/`_immediate_transfers` returned. These are verified
+// consent echoes: the values the user approved must match what is about to be signed, or the call
+// fails with the `MIGRATION_PLAN_STALE:` prefix (the app's existing recovery — re-propose/re-read
+// and re-display — reused rather than adding a new error route).
+
+/// One transfer's consent-echo fields. `anchor_height` is deliberately excluded from this
+/// comparison: it is a display-only "now" reference at encode time (see
+/// `FfiTransferProposal::anchor_height`'s doc — "callers must not treat it as one"), not a value
+/// any transaction commits to, and the stored (post-commit) state has no durable record of it to
+/// compare against.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct EchoRow {
+    id: u32,
+    amount: i64,
+    next_executable_after_height: i64,
+    expiry_height: i64,
+}
+
+/// The consent-echo rows and duration `zcashlc_migration_propose_transfers` /
+/// `zcashlc_migration_propose_immediate_transfers` returned for the cached plan, reconstructed
+/// byte-for-byte from the cache: the plan itself is deterministic (ids/amounts/expiry never move),
+/// but the immediate lane's preview shows every transfer due at the PREVIEW-TIME tip (not the
+/// schedule's drawn broadcast height) with a fixed zero duration — `cached.reference_height` and
+/// `cached.immediate` reproduce exactly that, rather than a freshly re-read tip that could have
+/// moved on without the plan itself going stale.
+fn expected_rows_from_cached_plan(
+    cached: &migration_plan_cache::CachedPlan,
+) -> anyhow::Result<(Vec<EchoRow>, u32)> {
+    let rows = schedule_rows(
+        &cached.plan.funding_notes(),
+        cached.plan.schedule(),
+        prep_tx_count(&cached.plan),
+    )?;
+    if cached.immediate {
+        let rows = rows
+            .into_iter()
+            .map(|(id, amount, _broadcast, expiry)| EchoRow {
+                id: u32::from(id),
+                amount: zat_to_i64(amount),
+                next_executable_after_height: i64::from(u32::from(cached.reference_height)),
+                expiry_height: i64::from(u32::from(expiry)),
+            })
+            .collect();
+        Ok((rows, 0))
+    } else {
+        let duration = estimated_duration_hours(cached.plan.schedule());
+        let rows = rows
+            .into_iter()
+            .map(|(id, amount, broadcast, expiry)| EchoRow {
+                id: u32::from(id),
+                amount: zat_to_i64(amount),
+                next_executable_after_height: i64::from(u32::from(broadcast)),
+                expiry_height: i64::from(u32::from(expiry)),
+            })
+            .collect();
+        Ok((rows, duration))
+    }
+}
+
+/// The consent-echo rows and duration for the stored run's TRANSFER subset — the values a commit
+/// call validates the platform's echo against once a run is committed (there is no cache to
+/// consult post-commit; this is ALWAYS the ground truth of what is about to be signed, whether the
+/// run was just now committed fresh or is being resumed).
+fn expected_rows_from_state(state: &MigrationState) -> (Vec<EchoRow>, u32) {
+    let transfers: Vec<&MigrationTransaction> = state
+        .transactions()
         .iter()
-        .map(|z| zat_to_i64(*z))
+        .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }))
         .collect();
-    let mut got: Vec<i64> = amounts.to_vec();
-    expected.sort_unstable();
-    got.sort_unstable();
-    if expected != got {
+    let rows = transfers
+        .iter()
+        .filter_map(|t| {
+            transfer_amount(state, t).map(|amount| EchoRow {
+                id: u32::from(t.id()),
+                amount: zat_to_i64(amount),
+                next_executable_after_height: i64::from(u32::from(t.scheduled_height())),
+                expiry_height: i64::from(u32::from(t.expiry_height())),
+            })
+        })
+        .collect();
+    let heights = transfers.iter().map(|t| u32::from(t.scheduled_height()));
+    let duration = match (heights.clone().max(), heights.min()) {
+        (Some(max), Some(min)) => max.saturating_sub(min) / BLOCKS_PER_HOUR,
+        _ => 0,
+    };
+    (rows, duration)
+}
+
+/// Decode the platform's parallel echo arrays into [`EchoRow`]s. A decode failure (e.g. a
+/// non-UTF8 or non-numeric id string) propagates as a plain error — a malformed echo, not a
+/// semantic mismatch, so it is deliberately NOT routed through the `MIGRATION_PLAN_STALE` prefix.
+fn decode_echo_rows(
+    ids: &[*const c_char],
+    amounts: &[i64],
+    next_executable_after_heights: &[i64],
+    expiry_heights: &[i64],
+) -> anyhow::Result<Vec<EchoRow>> {
+    ids.iter()
+        .enumerate()
+        .map(|(i, &id_ptr)| {
+            Ok(EchoRow {
+                id: u32::from(transfer_id_from_c(id_ptr)?),
+                amount: amounts[i],
+                next_executable_after_height: next_executable_after_heights[i],
+                expiry_height: expiry_heights[i],
+            })
+        })
+        .collect()
+}
+
+/// Whether the platform's echoed transfer-schedule consent values match `expected`,
+/// order-independent (both sides are sorted by id — the platform's own display order never
+/// matters here).
+fn schedule_echo_matches(
+    mut expected: Vec<EchoRow>,
+    expected_duration_hours: u32,
+    mut got: Vec<EchoRow>,
+    estimated_duration_hours: u32,
+) -> bool {
+    expected.sort();
+    got.sort();
+    expected == got && expected_duration_hours == estimated_duration_hours
+}
+
+/// Whether the platform's echoed note-split consent values (`zcashlc_migration_sign_note_split`'s
+/// `output_values`/`fee`) match the previewed plan's note split: the output values
+/// order-independent (the platform may display them in any order), the fee exactly.
+fn note_split_echo_matches(
+    expected_outputs: &[i64],
+    expected_fee: i64,
+    mut got_outputs: Vec<i64>,
+    got_fee: i64,
+) -> bool {
+    let mut expected_outputs = expected_outputs.to_vec();
+    expected_outputs.sort_unstable();
+    got_outputs.sort_unstable();
+    expected_outputs == got_outputs && expected_fee == got_fee
+}
+
+/// Validates the platform's echoed transfer-schedule values against the plan cached for this
+/// account — the values `zcashlc_migration_propose_transfers`/`_immediate_transfers` returned.
+/// `Ok(())` when nothing is cached: that is the resume case (a run is already stored, so there is
+/// nothing "about to commit" to check the echo against here); `commit_or_resume`'s own cache
+/// lookup handles the "neither a cache nor a stored run" case.
+#[allow(clippy::too_many_arguments)]
+fn validate_schedule_echo_against_cache(
+    db_path: &PathBuf,
+    account_bytes: [u8; 16],
+    ids: &[*const c_char],
+    amounts: &[i64],
+    next_executable_after_heights: &[i64],
+    expiry_heights: &[i64],
+    estimated_duration_hours: u32,
+) -> anyhow::Result<()> {
+    let Some(cached) = migration_plan_cache::get(db_path, account_bytes) else {
+        return Ok(());
+    };
+    let (expected, expected_duration) = expected_rows_from_cached_plan(&cached)?;
+    if ids.len() != expected.len() {
+        return Err(plan_stale(&format!(
+            "the echoed schedule has {} transfer(s) but the previewed plan has {} — propose again",
+            ids.len(),
+            expected.len()
+        )));
+    }
+    let got = decode_echo_rows(ids, amounts, next_executable_after_heights, expiry_heights)?;
+    if !schedule_echo_matches(expected, expected_duration, got, estimated_duration_hours) {
         return Err(plan_stale(
             "the echoed schedule does not match the previewed plan — propose again",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates the platform's echoed transfer-schedule values against the run's STORED, already
+/// committed transfer subset — the source of truth once a run exists (there is no cache to consult
+/// post-commit).
+fn validate_schedule_echo_against_state(
+    state: &MigrationState,
+    ids: &[*const c_char],
+    amounts: &[i64],
+    next_executable_after_heights: &[i64],
+    expiry_heights: &[i64],
+    estimated_duration_hours: u32,
+) -> anyhow::Result<()> {
+    let (expected, expected_duration) = expected_rows_from_state(state);
+    if ids.len() != expected.len() {
+        return Err(plan_stale(&format!(
+            "the echoed schedule has {} transfer(s) but the committed migration has {} — \
+             re-read the current state",
+            ids.len(),
+            expected.len()
+        )));
+    }
+    let got = decode_echo_rows(ids, amounts, next_executable_after_heights, expiry_heights)?;
+    if !schedule_echo_matches(expected, expected_duration, got, estimated_duration_hours) {
+        return Err(plan_stale(
+            "the echoed schedule does not match the committed migration — re-read the current state",
         ));
     }
     Ok(())
@@ -439,13 +631,9 @@ fn validate_amounts_against_plan(plan: &MigrationPlan, amounts: &[i64]) -> anyho
 /// the immediate lane, the committed transfers' scheduled heights are rewritten to the commit tip
 /// (everything due at once; preparation mining order still gates transfers via their
 /// dependencies).
-///
-/// `validate_amounts`: the platform-echoed transfer amounts to check against the cached plan
-/// (`None` skips validation — the Keystone build path has no echo).
 fn commit_or_resume(
     ctx: &mut CallCtx,
     usk: Option<zcash_keys::keys::UnifiedSpendingKey>,
-    validate_amounts: Option<&[i64]>,
     unsigned_out: bool,
 ) -> anyhow::Result<(MigrationState, Vec<(MigrationTxId, Vec<u8>)>)> {
     {
@@ -465,9 +653,6 @@ fn commit_or_resume(
 
     let cached = migration_plan_cache::get(&ctx.db_path, ctx.account_bytes)
         .ok_or_else(|| plan_stale("no previewed migration plan for this account"))?;
-    if let Some(amounts) = validate_amounts {
-        validate_amounts_against_plan(&cached.plan, amounts)?;
-    }
 
     let target = BlockHeight::from(u32::from(ctx.tip()?) + 1);
     let mut rng = OsRng;
@@ -1321,8 +1506,11 @@ pub unsafe extern "C" fn zcashlc_migration_prepare_note_split(
 /// one pass with the spending key), then proves and returns the first preparation transaction for
 /// immediate broadcast. If a matching non-terminal run is already stored, resumes it instead of
 /// recommitting (the retry path); a terminal stored run is replaced (the sequential-runs path).
-/// The `output_values`/`fee` echo is validated against the previewed plan
-/// (`MIGRATION_PLAN_STALE` on mismatch or when no preview is cached).
+///
+/// `output_values`/`fee` are verified consent echoes — the values the user approved must match
+/// what will be signed — checked against the previewed plan's note split when one is cached for
+/// this account (`MIGRATION_PLAN_STALE` on mismatch; a missing cache falls through to
+/// `commit_or_resume`, which either resumes a stored non-terminal run or reports the same error).
 ///
 /// # Safety
 /// See [`open`]; `output_values`/`usk_ptr` must be valid for reads of their lengths.
@@ -1343,26 +1531,23 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
-        let _ = fee; // The fee is display-echo only; amounts are the consent-critical values.
         let echoed: Vec<i64> = unsafe { slice_or_empty(output_values, output_values_len) }.to_vec();
 
-        // Note: the echoed values are the note-split outputs; validation happens against the
+        // The echoed values are the note-split outputs and fee; validation happens against the
         // funding notes inside `commit_or_resume` only for the schedule echo. For the split echo,
-        // validate against the previewed split outputs here.
+        // validate against the previewed split outputs/fee here.
         {
             let cached = migration_plan_cache::get(&ctx.db_path, ctx.account_bytes);
             if let Some(cached) = &cached {
-                let mut expected: Vec<i64> = cached
+                let expected: Vec<i64> = cached
                     .plan
                     .note_split()
                     .migration_outputs()
                     .iter()
                     .map(|z| zat_to_i64(*z))
                     .collect();
-                let mut got = echoed.clone();
-                expected.sort_unstable();
-                got.sort_unstable();
-                if expected != got {
+                let expected_fee = zat_to_i64(cached.plan.note_split().prep_fees());
+                if !note_split_echo_matches(&expected, expected_fee, echoed.clone(), fee) {
                     return Err(plan_stale(
                         "the echoed note split does not match the previewed plan — propose again",
                     ));
@@ -1372,7 +1557,7 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
             // non-terminal run (no cache needed) or reports MIGRATION_PLAN_STALE.
         }
 
-        let (mut state, _) = commit_or_resume(&mut ctx, Some(usk), None, false)?;
+        let (mut state, _) = commit_or_resume(&mut ctx, Some(usk), false)?;
 
         // The first broadcastable preparation transaction (lowest scheduled height not yet
         // broadcast): proven now, against the wallet's natural anchor, and returned for the
@@ -1680,9 +1865,18 @@ pub unsafe extern "C" fn zcashlc_migration_propose_immediate_transfers(
 
 /// Commits the previewed migration with the spending key if nothing is committed yet (covering
 /// the no-split lane); when a matching non-terminal run is already stored (the normal case — the
-/// note-split submission committed it), validates the echoed schedule shape and succeeds as a
-/// no-op. The echoed amounts are validated against the previewed plan when a fresh commit
-/// happens (`MIGRATION_PLAN_STALE` on mismatch or missing preview).
+/// note-split submission committed it), succeeds as a no-op.
+///
+/// `ids`/`amounts`/`next_executable_after_heights`/`expiry_heights`/`estimated_duration_hours` are
+/// verified consent echoes — the values the user approved must match what will be signed. They
+/// are checked against the previewed plan cached for this account when nothing is committed yet
+/// (a fresh commit is about to happen), or against the STORED committed state when a matching
+/// non-terminal run already exists (the resume/no-op case — there is no cache to consult, and the
+/// stored state is the actual thing about to be (re-)signed). Mismatch — including a length
+/// mismatch — errors with the `MIGRATION_PLAN_STALE:` prefix (the app's existing recovery:
+/// re-propose/re-read and re-display). `anchor_heights` is accepted but not checked: it is a
+/// display-only "now" reference the schedule DTO carries for duration math, not a value any
+/// transaction commits to.
 ///
 /// # Safety
 /// See [`open`]; array pointers must be valid for reads of `ids_len` elements; `usk_ptr` for
@@ -1707,15 +1901,43 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
-        let _ = (
-            ids,
-            anchor_heights,
-            next_executable_after_heights,
-            expiry_heights,
-            estimated_duration_hours,
-        );
-        let amounts = unsafe { slice_or_empty(amounts, ids_len) }.to_vec();
-        commit_or_resume(&mut ctx, Some(usk), Some(&amounts), false)?;
+        let _ = anchor_heights;
+        let ids_slice = unsafe { slice_or_empty(ids, ids_len) };
+        let amounts = unsafe { slice_or_empty(amounts, ids_len) };
+        let next_executable_after_heights =
+            unsafe { slice_or_empty(next_executable_after_heights, ids_len) };
+        let expiry_heights = unsafe { slice_or_empty(expiry_heights, ids_len) };
+
+        // A matching non-terminal stored run means this call resumes/no-ops (no fresh commit
+        // happens): the echo is checked against the actual stored state. Otherwise it is checked
+        // against the cached preview this call is about to commit.
+        let stored = {
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend
+                .get_migration()?
+                .filter(|state| !state.is_terminal())
+        };
+        match &stored {
+            Some(state) => validate_schedule_echo_against_state(
+                state,
+                ids_slice,
+                amounts,
+                next_executable_after_heights,
+                expiry_heights,
+                estimated_duration_hours,
+            )?,
+            None => validate_schedule_echo_against_cache(
+                &ctx.db_path,
+                ctx.account_bytes,
+                ids_slice,
+                amounts,
+                next_executable_after_heights,
+                expiry_heights,
+                estimated_duration_hours,
+            )?,
+        }
+
+        commit_or_resume(&mut ctx, Some(usk), false)?;
         Ok(true)
     });
     unwrap_exc_or(res, false)
@@ -2030,7 +2252,7 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczts(
 ) -> *mut FfiUnsignedTransferPczts {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let (state, unsigned) = commit_or_resume(&mut ctx, None, None, true)?;
+        let (state, unsigned) = commit_or_resume(&mut ctx, None, true)?;
         let prep_ids: HashSet<MigrationTxId> = state
             .transactions()
             .iter()
@@ -2097,8 +2319,14 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
 
 /// Serves the TRANSFER subset of the unsigned build for the signing ceremony (see
 /// `zcashlc_migration_create_unsigned_note_split_pczts` — the run and every unsigned transaction
-/// already exist; the echoed schedule arrays are accepted and ignored, since the engine signs the
-/// stored build, not a caller echo).
+/// already exist).
+///
+/// `ids`/`amounts`/`next_executable_after_heights`/`expiry_heights`/`estimated_duration_hours` are
+/// verified consent echoes, checked against the STORED committed state this call serves from
+/// (there is no cache to consult post-commit): mismatch — including a length mismatch — errors
+/// with the `MIGRATION_PLAN_STALE:` prefix (the app re-reads the current state).
+/// `anchor_heights` is accepted but not checked — see
+/// `zcashlc_migration_sign_and_store_schedule`'s doc.
 ///
 /// # Safety
 /// See [`open`]; array pointers must be valid for reads of `ids_len` elements. Free the returned
@@ -2119,17 +2347,22 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_transfer_pczts(
     estimated_duration_hours: u32,
 ) -> *mut FfiUnsignedTransferPczts {
     let res = catch_panic(|| {
-        let _ = (
-            ids,
-            ids_len,
+        let _ = anchor_heights;
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let (state, unsigned) = commit_or_resume(&mut ctx, None, true)?;
+        let ids_slice = unsafe { slice_or_empty(ids, ids_len) };
+        let amounts = unsafe { slice_or_empty(amounts, ids_len) };
+        let next_executable_after_heights =
+            unsafe { slice_or_empty(next_executable_after_heights, ids_len) };
+        let expiry_heights = unsafe { slice_or_empty(expiry_heights, ids_len) };
+        validate_schedule_echo_against_state(
+            &state,
+            ids_slice,
             amounts,
-            anchor_heights,
             next_executable_after_heights,
             expiry_heights,
             estimated_duration_hours,
-        );
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let (state, unsigned) = commit_or_resume(&mut ctx, None, None, true)?;
+        )?;
         let transfer_ids: HashSet<MigrationTxId> = state
             .transactions()
             .iter()
@@ -2476,6 +2709,241 @@ mod tests {
         let schedule = scheduling::schedule(h(1_000), 3, &mut rng);
         let amounts = vec![zat(100)];
         assert!(schedule_rows(&amounts, &schedule, 0).is_err());
+    }
+
+    // ----- verified consent echoes (F4) -----
+
+    fn row(id: u32, amount: i64, next_executable_after_height: i64, expiry_height: i64) -> EchoRow {
+        EchoRow {
+            id,
+            amount,
+            next_executable_after_height,
+            expiry_height,
+        }
+    }
+
+    #[test]
+    fn schedule_echo_matches_accepts_a_matching_echo_regardless_of_order() {
+        let expected = vec![row(1, 100, 50, 5_000), row(2, 200, 60, 6_000)];
+        // The platform's echo is in the OPPOSITE order — order must not matter.
+        let got = vec![row(2, 200, 60, 6_000), row(1, 100, 50, 5_000)];
+        assert!(schedule_echo_matches(expected, 10, got, 10));
+    }
+
+    #[test]
+    fn schedule_echo_matches_detects_wrong_amount() {
+        let expected = vec![row(1, 100, 50, 5_000), row(2, 200, 60, 6_000)];
+        // Id 2's amount is echoed wrong (201 instead of 200).
+        let got = vec![row(1, 100, 50, 5_000), row(2, 201, 60, 6_000)];
+        assert!(!schedule_echo_matches(expected, 10, got, 10));
+    }
+
+    #[test]
+    fn schedule_echo_matches_detects_a_length_mismatch() {
+        let expected = vec![row(1, 100, 50, 5_000), row(2, 200, 60, 6_000)];
+        // Only one of the two expected transfers is echoed back (a wrong id COUNT).
+        let got = vec![row(1, 100, 50, 5_000)];
+        assert!(!schedule_echo_matches(expected, 10, got, 10));
+    }
+
+    #[test]
+    fn schedule_echo_matches_detects_wrong_duration() {
+        let expected = vec![row(1, 100, 50, 5_000)];
+        let got = vec![row(1, 100, 50, 5_000)];
+        assert!(!schedule_echo_matches(expected, 10, got, 11));
+    }
+
+    #[test]
+    fn note_split_echo_matches_accepts_a_matching_echo_regardless_of_order() {
+        assert!(note_split_echo_matches(&[100, 200], 50, vec![200, 100], 50));
+    }
+
+    #[test]
+    fn note_split_echo_matches_detects_wrong_fee() {
+        assert!(!note_split_echo_matches(
+            &[100, 200],
+            50,
+            vec![100, 200],
+            51
+        ));
+    }
+
+    #[test]
+    fn note_split_echo_matches_detects_wrong_outputs() {
+        assert!(!note_split_echo_matches(
+            &[100, 200],
+            50,
+            vec![100, 201],
+            50
+        ));
+    }
+
+    /// [`expected_rows_from_state`] pins the state-derived echo used to validate
+    /// `zcashlc_migration_create_unsigned_transfer_pczts`'s echo: only the TRANSFER subset
+    /// appears (the preparation transaction is excluded), amounts pair via `funding_notes()`
+    /// (crossing-indexed, not declaration order), and duration is the scheduled-height spread.
+    #[test]
+    fn expected_rows_from_state_pins_transfer_subset_and_duration() {
+        let transactions = vec![
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(0),
+                MigrationTxKind::Preparation { layer: 0, index: 0 },
+                vec![0u8],
+                Vec::new(),
+                h(50),
+                h(10_000),
+                None,
+                MigrationTxState::Mined { height: h(60) },
+                None,
+            ),
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(1),
+                MigrationTxKind::Transfer { crossing: 0 },
+                vec![0u8],
+                Vec::new(),
+                h(100),
+                h(5_000),
+                Some(h(100)),
+                MigrationTxState::Signed,
+                None,
+            ),
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(2),
+                MigrationTxKind::Transfer { crossing: 1 },
+                vec![0u8],
+                Vec::new(),
+                h(220),
+                h(6_000),
+                Some(h(220)),
+                MigrationTxState::Signed,
+                None,
+            ),
+        ];
+        // Crossing values, a zero fee buffer (so `funding_notes()` == these values exactly,
+        // keeping the amounts under test free of extra fee-buffer arithmetic).
+        let crossing_values = vec![zat(100_000_000), zat(250_000_000)];
+        let state = MigrationState::from_parts(
+            MigrationStatus::InProgress,
+            NoteSplitPlan::from_stored_parts(
+                crossing_values,
+                zat(0),
+                None,
+                zat(20_000),
+                zat(1_000_000_000),
+                zat(999_000_000),
+            )
+            .unwrap(),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            transactions,
+        );
+
+        let (mut rows, duration) = expected_rows_from_state(&state);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                row(1, zat_to_i64(zat(100_000_000)), 100, 5_000),
+                row(2, zat_to_i64(zat(250_000_000)), 220, 6_000),
+            ]
+        );
+        assert_eq!(duration, (220u32 - 100) / BLOCKS_PER_HOUR);
+    }
+
+    /// Builds real, null-terminated C strings for `ids` (matching what the FFI layer decodes) and
+    /// hands back both the owning `CString`s (keep them alive for the duration of the call) and
+    /// the `*const c_char` pointers to pass.
+    fn c_ids(ids: &[u32]) -> (Vec<CString>, Vec<*const c_char>) {
+        let owned: Vec<CString> = ids
+            .iter()
+            .map(|id| CString::new(id.to_string()).unwrap())
+            .collect();
+        let ptrs = owned.iter().map(|s| s.as_ptr()).collect();
+        (owned, ptrs)
+    }
+
+    #[test]
+    fn validate_schedule_echo_against_state_accepts_a_matching_echo() {
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed, MigrationTxState::Signed],
+            50,
+            10_000,
+        );
+        // `test_state`'s two transfers (ids 0, 1) both crossing 100_000_000 zatoshi, plus its
+        // fixed 10_000-zatoshi fee buffer (`funding_notes()` == crossing + buffer), at height 50,
+        // expiring at 10_000; duration is zero (both share one scheduled height).
+        let (_owned, ids) = c_ids(&[0, 1]);
+        let amounts = [100_010_000i64, 100_010_000i64];
+        let next_executable_after_heights = [50i64, 50i64];
+        let expiry_heights = [10_000i64, 10_000i64];
+        assert!(
+            validate_schedule_echo_against_state(
+                &state,
+                &ids,
+                &amounts,
+                &next_executable_after_heights,
+                &expiry_heights,
+                0,
+            )
+            .is_ok()
+        );
+    }
+
+    /// Pins Part B's "wrong id count" lane (`zcashlc_migration_create_unsigned_transfer_pczts`):
+    /// the stored run has two transfers, but only one is echoed back — a real
+    /// [`MigrationState`] (built the same way the real production code reads one, via
+    /// `test_state`), driven through the exact function the FFI entry point calls.
+    #[test]
+    fn validate_schedule_echo_against_state_detects_wrong_id_count() {
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed, MigrationTxState::Signed],
+            50,
+            10_000,
+        );
+        let (_owned, ids) = c_ids(&[0]);
+        let amounts = [100_010_000i64];
+        let next_executable_after_heights = [50i64];
+        let expiry_heights = [10_000i64];
+        let err = validate_schedule_echo_against_state(
+            &state,
+            &ids,
+            &amounts,
+            &next_executable_after_heights,
+            &expiry_heights,
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().starts_with(PLAN_STALE_PREFIX));
+    }
+
+    #[test]
+    fn validate_schedule_echo_against_state_detects_wrong_amount() {
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            50,
+            10_000,
+        );
+        let (_owned, ids) = c_ids(&[0]);
+        // The stored transfer funds 100_010_000 zatoshi (100_000_000 crossing + `test_state`'s
+        // fixed 10_000 fee buffer); the echo claims 100_010_001.
+        let amounts = [100_010_001i64];
+        let next_executable_after_heights = [50i64];
+        let expiry_heights = [10_000i64];
+        let err = validate_schedule_echo_against_state(
+            &state,
+            &ids,
+            &amounts,
+            &next_executable_after_heights,
+            &expiry_heights,
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().starts_with(PLAN_STALE_PREFIX));
     }
 
     #[test]
