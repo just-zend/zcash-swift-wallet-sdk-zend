@@ -181,14 +181,19 @@ public class SDKSynchronizer: Synchronizer {
             throw error
         }
 
-        if case .seedRequired = try await self.initializer.initialize(
+        let initResult = try await self.initializer.initialize(
             with: seed,
             walletBirthday: walletBirthday,
             for: walletMode,
             name: name,
             keySource: keySource
-        ) {
-            return .seedRequired
+        )
+
+        switch initResult {
+        case .seedRequired, .seedNotRelevant:
+            return initResult
+        case .success:
+            break
         }
 
         await latestBlocksDataProvider.updateWalletBirthday(initializer.walletBirthday)

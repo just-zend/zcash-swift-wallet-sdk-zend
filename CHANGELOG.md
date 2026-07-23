@@ -55,6 +55,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apps to choose truthful retry-versus-preservation UI without parsing Rust or SQLite prose.
 
 ## Changed
+- `Initializer.initialize` and `Synchronizer.prepare` now return
+  `InitializationResult.seedNotRelevant` instead of silently proceeding when the supplied seed does
+  not match the wallet database. This is a breaking addition to the enum: exhaustive switches must
+  handle the new case. Treat it like `.seedRequired` so a restored database cannot be used with an
+  unrelated keychain seed (upstream MOB-1512; see `MIGRATING.md`).
 - Breaking: removed the legacy anchored pre-sign-all migration methods from the public
   `Synchronizer` contract (`proposeMigrationTransfers`, `signAndStoreMigrationSchedule`, full-schedule
   PCZT propose/store, `executeNextPendingTransfer`, `refreshStaleTransfers`, and

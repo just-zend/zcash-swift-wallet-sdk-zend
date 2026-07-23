@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-21
+Last reviewed: 2026-07-22
 
 ## Remote and branch invariants
 
@@ -10,22 +10,26 @@ Last reviewed: 2026-07-21
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current monitor status (2026-07-21)
+## Current monitor status (2026-07-22)
 
-- After fetching both remotes, both default branches remain `main`; `origin/main` is
-  `8f85838b` and `upstream/main` is `89d85c49` (upstream PR `#1815`). The parity count is
-  `168 0`, and `upstream/main` is an ancestor of `origin/main`: Zend PR `#26` has merged.
-- The merged parity adopted the copyright-holder update and required-build-path change without
-  altering Zend artifacts, private-engine provenance, branding, or Ironwood behavior. Its
-  verification passed: `swift build` and `swift test --filter OfflineTests` (546 tests, 0 failures).
-- The 2026-07-21 force-pushes to the Orchard-to-Ironwood migration branches make the early-carry
-  case weaker, not stronger: the Synchronizer branch is 36 commits ahead / 93 files, the FFI branch
-  is 26 commits ahead / 79 files, and `michal/slipstream-support` is 45 commits ahead / 117 files.
-  Together they change public API, Rust/FFI, persistence, privacy gates, generated mocks, and the
-  engine family. Wait for upstream merge plus a Zend artifact/provenance reconciliation plan.
-- All other active upstream PRs remain in the existing wait-for-upstream classes:
-  draft, blocked/review-required, dirty, failed, or broad protocol/FFI/release work.
-  No early-carry candidate currently satisfies ready, useful, and low-risk.
+- Both defaults remain `main`. `origin/main` is `faef1a52`; upstream advanced from `89d85c49` to
+  `74cdbbc0` through upstream PR `#1816` / MOB-1512. The new public
+  `InitializationResult.seedNotRelevant` result prevents an existing database with a mismatched
+  seed from being silently treated as prepared. The Zend parity branch
+  `codex/zcash-upstream-sync-2026-07-22` merges all four upstream commits.
+- Merge conflicts were documentation-only (`CHANGELOG.md`, `MIGRATING.md`). Keep Zend's Ironwood,
+  artifact, and release notes, and add the upstream breaking-result migration note. The Swift
+  implementation and its OfflineTests merged without manual source changes.
+- Fresh Ironwood branches are still not low-risk early carries. The integrated Synchronizer line is
+  43 commits / 94 files, FFI line 29 commits / 80 files, QA2 line 45 commits / 94 files, and
+  Slipstream 59 commits / 118 files ahead of upstream main. They jointly alter public API, Rust/FFI,
+  persistence, privacy gates, mocks, and the engine graph. The new bug-fix branch is 38 commits /
+  93 files and depends on that same stack. Wait for upstream merge plus Zend artifact/provenance
+  reconciliation and funded-wallet validation.
+- The remaining unmerged branches remain wait-for-upstream: dependabot updates await upstream
+  dependency review; network-privacy, release-workflow, and legacy Ironwood work are broader than
+  Zend's safe early-carry boundary. No active upstream PR or branch currently meets the ready,
+  useful, and low-risk gates.
 
 ## Parity sync workflow (upstream default branch)
 
