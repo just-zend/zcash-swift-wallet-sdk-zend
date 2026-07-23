@@ -85,7 +85,7 @@ public struct AccountBalance: Equatable {
         saplingBalance.spendableValue + orchardBalance.spendableValue + ironwoodBalance.spendableValue
     }
 
-    /// The total value (spendable + pending change + pending spendability) summed
+    /// The total value (spendable + pending change + pending spendability + locked) summed
     /// across every shielded pool.
     public func shieldedTotal() -> Zatoshi {
         saplingBalance.total() + orchardBalance.total() + ironwoodBalance.total()

@@ -425,16 +425,44 @@ fn encode_empty_schedule() -> *mut FfiMigrationSchedule {
 // fails with the `MIGRATION_PLAN_STALE:` prefix (the app's existing recovery — re-propose/re-read
 // and re-display — reused rather than adding a new error route).
 
-/// One transfer's consent-echo fields. `anchor_height` is deliberately excluded from this
-/// comparison: it is a display-only "now" reference at encode time (see
+/// One transfer's consent-echo fields, checked against the CACHED preview plan (before commit —
+/// see [`validate_schedule_echo_against_cache`]). `anchor_height` is deliberately excluded from
+/// this comparison: it is a display-only "now" reference at encode time (see
 /// `FfiTransferProposal::anchor_height`'s doc — "callers must not treat it as one"), not a value
 /// any transaction commits to, and the stored (post-commit) state has no durable record of it to
-/// compare against.
+/// compare against. For the POST-COMMIT comparison against stored state, see [`StoredEchoRow`],
+/// which additionally excludes `next_executable_after_height`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct EchoRow {
     id: u32,
     amount: i64,
     next_executable_after_height: i64,
+    expiry_height: i64,
+}
+
+/// One transfer's consent-echo fields, checked against the STORED (post-commit) migration state
+/// (see [`validate_schedule_echo_against_state`]). Unlike [`EchoRow`], `next_executable_after_height`
+/// is absent here — not just unchecked, structurally not part of the comparison — because it can
+/// legitimately change between what the platform previewed and what ends up stored:
+/// `zcashlc_migration_propose_immediate_transfers` previews every transfer's
+/// `next_executable_after_height` as the tip AT PREVIEW TIME (`T0`), but `commit_or_resume`'s
+/// immediate-lane branch rewrites every transfer's stored `scheduled_height` to the tip AT COMMIT
+/// TIME (`T1`) and clears the plan cache. Whenever a block lands during the user's review window
+/// (ordinary Zcash block times, ~75s — not a rare race), `T1 != T0`, so an honest, unmodified echo
+/// of the preview the user actually approved would mismatch the stored state on this field alone.
+/// Unlike a genuinely stale plan, the platform cannot converge on a match by re-proposing here:
+/// re-proposing only produces a NEW cache entry with yet another preview-time tip, while the
+/// STORED value is already fixed by the completed commit — re-proposing never re-touches it. So
+/// comparing this field post-commit would surface `MIGRATION_PLAN_STALE` on a correct, unmodified
+/// echo with no recovery path, which is worse than not checking it. `ids`/`amounts`/
+/// `expiry_heights` do not have this problem (the commit never rewrites them for either lane), and
+/// duration heals structurally too: the immediate lane's preview hardcodes `0`, and every
+/// transfer's stored `scheduled_height` becomes the SAME single commit-tip value, so the
+/// state-derived duration (`max - min`) is also `0` — see [`expected_rows_from_state`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct StoredEchoRow {
+    id: u32,
+    amount: i64,
     expiry_height: i64,
 }
 
@@ -482,8 +510,12 @@ fn expected_rows_from_cached_plan(
 /// The consent-echo rows and duration for the stored run's TRANSFER subset — the values a commit
 /// call validates the platform's echo against once a run is committed (there is no cache to
 /// consult post-commit; this is ALWAYS the ground truth of what is about to be signed, whether the
-/// run was just now committed fresh or is being resumed).
-fn expected_rows_from_state(state: &MigrationState) -> (Vec<EchoRow>, u32) {
+/// run was just now committed fresh or is being resumed). Returns [`StoredEchoRow`]s (no
+/// `next_executable_after_height` — see its doc for why); the duration is still derived from
+/// `scheduled_height()`, which is exactly what makes it heal for the immediate lane: every
+/// transfer's stored `scheduled_height` is the SAME single commit-tip value, so `max - min` is
+/// `0`, matching the immediate preview's hardcoded `0` regardless of any tip drift.
+fn expected_rows_from_state(state: &MigrationState) -> (Vec<StoredEchoRow>, u32) {
     let transfers: Vec<&MigrationTransaction> = state
         .transactions()
         .iter()
@@ -492,10 +524,9 @@ fn expected_rows_from_state(state: &MigrationState) -> (Vec<EchoRow>, u32) {
     let rows = transfers
         .iter()
         .filter_map(|t| {
-            transfer_amount(state, t).map(|amount| EchoRow {
+            transfer_amount(state, t).map(|amount| StoredEchoRow {
                 id: u32::from(t.id()),
                 amount: zat_to_i64(amount),
-                next_executable_after_height: i64::from(u32::from(t.scheduled_height())),
                 expiry_height: i64::from(u32::from(t.expiry_height())),
             })
         })
@@ -508,9 +539,10 @@ fn expected_rows_from_state(state: &MigrationState) -> (Vec<EchoRow>, u32) {
     (rows, duration)
 }
 
-/// Decode the platform's parallel echo arrays into [`EchoRow`]s. A decode failure (e.g. a
-/// non-UTF8 or non-numeric id string) propagates as a plain error — a malformed echo, not a
-/// semantic mismatch, so it is deliberately NOT routed through the `MIGRATION_PLAN_STALE` prefix.
+/// Decode the platform's parallel echo arrays into [`EchoRow`]s (the CACHE-side shape, including
+/// `next_executable_after_height`). A decode failure (e.g. a non-UTF8 or non-numeric id string)
+/// propagates as a plain error — a malformed echo, not a semantic mismatch, so it is deliberately
+/// NOT routed through the `MIGRATION_PLAN_STALE` prefix.
 fn decode_echo_rows(
     ids: &[*const c_char],
     amounts: &[i64],
@@ -530,13 +562,47 @@ fn decode_echo_rows(
         .collect()
 }
 
+/// Decode the platform's parallel echo arrays into [`StoredEchoRow`]s (the STORED-state shape —
+/// no `next_executable_after_height`; see its doc). Same decode-failure handling as
+/// [`decode_echo_rows`].
+fn decode_stored_echo_rows(
+    ids: &[*const c_char],
+    amounts: &[i64],
+    expiry_heights: &[i64],
+) -> anyhow::Result<Vec<StoredEchoRow>> {
+    ids.iter()
+        .enumerate()
+        .map(|(i, &id_ptr)| {
+            Ok(StoredEchoRow {
+                id: u32::from(transfer_id_from_c(id_ptr)?),
+                amount: amounts[i],
+                expiry_height: expiry_heights[i],
+            })
+        })
+        .collect()
+}
+
 /// Whether the platform's echoed transfer-schedule consent values match `expected`,
 /// order-independent (both sides are sorted by id — the platform's own display order never
-/// matters here).
+/// matters here). CACHE-side (see [`EchoRow`]).
 fn schedule_echo_matches(
     mut expected: Vec<EchoRow>,
     expected_duration_hours: u32,
     mut got: Vec<EchoRow>,
+    estimated_duration_hours: u32,
+) -> bool {
+    expected.sort();
+    got.sort();
+    expected == got && expected_duration_hours == estimated_duration_hours
+}
+
+/// Whether the platform's echoed transfer-schedule consent values match `expected`,
+/// order-independent. STORED-state side (see [`StoredEchoRow`] — `next_executable_after_height`
+/// is not part of either side's row, by construction).
+fn stored_schedule_echo_matches(
+    mut expected: Vec<StoredEchoRow>,
+    expected_duration_hours: u32,
+    mut got: Vec<StoredEchoRow>,
     estimated_duration_hours: u32,
 ) -> bool {
     expected.sort();
@@ -596,7 +662,12 @@ fn validate_schedule_echo_against_cache(
 
 /// Validates the platform's echoed transfer-schedule values against the run's STORED, already
 /// committed transfer subset — the source of truth once a run exists (there is no cache to consult
-/// post-commit).
+/// post-commit). `next_executable_after_heights` is accepted but deliberately NOT compared here —
+/// see [`StoredEchoRow`]'s doc: the immediate lane's commit-time reschedule can legitimately move
+/// this value away from what the platform honestly previewed and is echoing back, and unlike an
+/// actually stale plan there is no way to converge on a match by re-proposing (the stored value is
+/// already fixed by the completed commit). `ids`/`amounts`/`expiry_heights`/
+/// `estimated_duration_hours` are still checked exactly.
 fn validate_schedule_echo_against_state(
     state: &MigrationState,
     ids: &[*const c_char],
@@ -605,6 +676,7 @@ fn validate_schedule_echo_against_state(
     expiry_heights: &[i64],
     estimated_duration_hours: u32,
 ) -> anyhow::Result<()> {
+    let _ = next_executable_after_heights;
     let (expected, expected_duration) = expected_rows_from_state(state);
     if ids.len() != expected.len() {
         return Err(plan_stale(&format!(
@@ -614,8 +686,8 @@ fn validate_schedule_echo_against_state(
             expected.len()
         )));
     }
-    let got = decode_echo_rows(ids, amounts, next_executable_after_heights, expiry_heights)?;
-    if !schedule_echo_matches(expected, expected_duration, got, estimated_duration_hours) {
+    let got = decode_stored_echo_rows(ids, amounts, expiry_heights)?;
+    if !stored_schedule_echo_matches(expected, expected_duration, got, estimated_duration_hours) {
         return Err(plan_stale(
             "the echoed schedule does not match the committed migration — re-read the current state",
         ));
@@ -1868,15 +1940,20 @@ pub unsafe extern "C" fn zcashlc_migration_propose_immediate_transfers(
 /// note-split submission committed it), succeeds as a no-op.
 ///
 /// `ids`/`amounts`/`next_executable_after_heights`/`expiry_heights`/`estimated_duration_hours` are
-/// verified consent echoes — the values the user approved must match what will be signed. They
-/// are checked against the previewed plan cached for this account when nothing is committed yet
-/// (a fresh commit is about to happen), or against the STORED committed state when a matching
-/// non-terminal run already exists (the resume/no-op case — there is no cache to consult, and the
-/// stored state is the actual thing about to be (re-)signed). Mismatch — including a length
-/// mismatch — errors with the `MIGRATION_PLAN_STALE:` prefix (the app's existing recovery:
-/// re-propose/re-read and re-display). `anchor_heights` is accepted but not checked: it is a
-/// display-only "now" reference the schedule DTO carries for duration math, not a value any
-/// transaction commits to.
+/// verified consent echoes — the values the user approved must match what will be signed. When
+/// nothing is committed yet (a fresh commit is about to happen), all five are checked against the
+/// previewed plan cached for this account. When a matching non-terminal run already exists (the
+/// resume/no-op case — there is no cache to consult, and the stored state is the actual thing
+/// about to be (re-)signed), `ids`/`amounts`/`expiry_heights`/`estimated_duration_hours` are
+/// checked against the STORED state, but `next_executable_after_heights` is NOT: the immediate
+/// lane's commit legitimately reschedules every transfer to the commit-time tip, which can differ
+/// from the preview-time tip the platform is honestly echoing back (e.g. a block landed during
+/// user review), and unlike an actually stale plan the platform cannot converge on a match by
+/// re-proposing (the stored value is already fixed by the completed commit — see
+/// `StoredEchoRow`'s doc). Mismatch — including a length mismatch — errors with the
+/// `MIGRATION_PLAN_STALE:` prefix (the app's existing recovery: re-propose/re-read and
+/// re-display). `anchor_heights` is never checked, in either branch: it is a display-only "now"
+/// reference the schedule DTO carries for duration math, not a value any transaction commits to.
 ///
 /// # Safety
 /// See [`open`]; array pointers must be valid for reads of `ids_len` elements; `usk_ptr` for
@@ -2321,12 +2398,13 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
 /// `zcashlc_migration_create_unsigned_note_split_pczts` — the run and every unsigned transaction
 /// already exist).
 ///
-/// `ids`/`amounts`/`next_executable_after_heights`/`expiry_heights`/`estimated_duration_hours` are
-/// verified consent echoes, checked against the STORED committed state this call serves from
-/// (there is no cache to consult post-commit): mismatch — including a length mismatch — errors
-/// with the `MIGRATION_PLAN_STALE:` prefix (the app re-reads the current state).
-/// `anchor_heights` is accepted but not checked — see
-/// `zcashlc_migration_sign_and_store_schedule`'s doc.
+/// `ids`/`amounts`/`expiry_heights`/`estimated_duration_hours` are verified consent echoes,
+/// checked against the STORED committed state this call serves from (there is no cache to consult
+/// post-commit): mismatch — including a length mismatch — errors with the `MIGRATION_PLAN_STALE:`
+/// prefix (the app re-reads the current state). `next_executable_after_heights`/`anchor_heights`
+/// are accepted but NOT checked — see `zcashlc_migration_sign_and_store_schedule`'s doc for why
+/// (the immediate lane's commit-time reschedule can legitimately move the former away from an
+/// honest echo, with no way to converge by re-proposing; the latter is never consent-critical).
 ///
 /// # Safety
 /// See [`open`]; array pointers must be valid for reads of `ids_len` elements. Free the returned
@@ -2722,6 +2800,14 @@ mod tests {
         }
     }
 
+    fn stored_row(id: u32, amount: i64, expiry_height: i64) -> StoredEchoRow {
+        StoredEchoRow {
+            id,
+            amount,
+            expiry_height,
+        }
+    }
+
     #[test]
     fn schedule_echo_matches_accepts_a_matching_echo_regardless_of_order() {
         let expected = vec![row(1, 100, 50, 5_000), row(2, 200, 60, 6_000)];
@@ -2839,11 +2925,14 @@ mod tests {
 
         let (mut rows, duration) = expected_rows_from_state(&state);
         rows.sort();
+        // No `next_executable_after_height` field: the state-side echo excludes it (see
+        // `StoredEchoRow`'s doc) even though the two transfers here have DIFFERENT scheduled
+        // heights (100, 220) — duration is still derived from them below.
         assert_eq!(
             rows,
             vec![
-                row(1, zat_to_i64(zat(100_000_000)), 100, 5_000),
-                row(2, zat_to_i64(zat(250_000_000)), 220, 6_000),
+                stored_row(1, zat_to_i64(zat(100_000_000)), 5_000),
+                stored_row(2, zat_to_i64(zat(250_000_000)), 6_000),
             ]
         );
         assert_eq!(duration, (220u32 - 100) / BLOCKS_PER_HOUR);
@@ -2944,6 +3033,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().starts_with(PLAN_STALE_PREFIX));
+    }
+
+    #[test]
+    fn validate_schedule_echo_against_state_detects_wrong_expiry() {
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            50,
+            10_000,
+        );
+        let (_owned, ids) = c_ids(&[0]);
+        let amounts = [100_010_000i64];
+        let next_executable_after_heights = [50i64];
+        // The stored transfer expires at 10_000; the echo claims 10_001.
+        let expiry_heights = [10_001i64];
+        let err = validate_schedule_echo_against_state(
+            &state,
+            &ids,
+            &amounts,
+            &next_executable_after_heights,
+            &expiry_heights,
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().starts_with(PLAN_STALE_PREFIX));
+    }
+
+    /// Regression test for the false-fail the review caught: `propose_immediate_transfers`
+    /// previews `next_executable_after_height` as the tip AT PREVIEW TIME, but the immediate
+    /// lane's commit rewrites the STORED `scheduled_height` to the tip AT COMMIT TIME — these
+    /// legitimately differ whenever a block lands during the user's review window (ordinary
+    /// ~75s Zcash block times, not a rare race). An honest, unmodified echo of the displayed
+    /// preview must still succeed against the stored state even though this one field "drifted";
+    /// unlike a genuinely stale plan, re-proposing could never make it converge (the stored value
+    /// is already fixed by the completed commit), so the only correct behavior is to not compare
+    /// it at all here (ids/amounts/expiry/duration are unaffected and still pinned above/below).
+    #[test]
+    fn validate_schedule_echo_against_state_ignores_drifted_next_executable_after_height() {
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            50,
+            10_000,
+        );
+        let (_owned, ids) = c_ids(&[0]);
+        let amounts = [100_010_000i64];
+        // Drifted far from the stored transfer's actual scheduled height (50) — as if a block (or
+        // several) landed between the immediate-lane preview and the commit that rescheduled it.
+        let next_executable_after_heights = [999_999i64];
+        let expiry_heights = [10_000i64];
+        assert!(
+            validate_schedule_echo_against_state(
+                &state,
+                &ids,
+                &amounts,
+                &next_executable_after_heights,
+                &expiry_heights,
+                0,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
