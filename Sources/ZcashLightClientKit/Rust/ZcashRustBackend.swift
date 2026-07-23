@@ -1680,13 +1680,12 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationProposeTransfers(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule {
+    func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
         let schedulePtr = zcashlc_migration_propose_transfers(
             dbData.0,
             dbData.1,
             account.id,
-            networkType.networkId,
-            includeResidual
+            networkType.networkId
         )
 
         guard let schedulePtr else {
@@ -1857,7 +1856,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         for account: AccountUUID
     ) async throws {
         let resultTag: Int32
-        var retryable = false
         var txidBytes: [UInt8]?
 
         switch result {
@@ -1871,9 +1869,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
             resultTag = 0
             txidBytes = parsedTxId.id
-        case .networkError(let isRetryable):
+        case .networkError:
+            // `retryable` is a Swift-level signal for the caller's own retry policy; the rust
+            // layer's behavior for a network error never depended on it (tag 1 alone drives it).
             resultTag = 1
-            retryable = isRetryable
         case .invalidNote:
             resultTag = 2
         case .expired:
@@ -1887,7 +1886,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             networkType.networkId,
             [CChar](transferId.utf8CString),
             resultTag,
-            retryable,
             txidBytes
         )
 
@@ -1899,36 +1897,12 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationIsSyncRequired(for account: AccountUUID) async throws -> Bool {
-        // Clear any stale, unconsumed last-error before this sentinel read (see
-        // `migrationIsNoteSplitNeeded` above).
-        zcashlc_clear_last_error()
-
-        let syncRequired = zcashlc_migration_is_sync_required(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId
-        )
-
-        // `false` overloads "legitimately not required" and "error"; check last-error to disambiguate.
-        if !syncRequired, zcashlc_last_error_length() > 0 {
-            throw ZcashError.rustMigrationIsSyncRequired(
-                lastErrorMessage(fallback: "`migrationIsSyncRequired` failed with unknown error")
-            )
-        }
-
-        return syncRequired
-    }
-
-    @DBActor
-    func migrationRestartStep(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule {
+    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule {
         let schedulePtr = zcashlc_migration_restart_step(
             dbData.0,
             dbData.1,
             account.id,
-            networkType.networkId,
-            includeResidual
+            networkType.networkId
         )
 
         guard let schedulePtr else {
@@ -2448,8 +2422,6 @@ extension FfiAttentionReason {
             return .invalidTransfer(transferId: transferId)
         case 1:
             return .transferExpired
-        case 2:
-            return .syncRequiredBeforeNext
         default:
             return nil
         }
@@ -2466,14 +2438,12 @@ extension FfiMigrationState {
         case 1:
             return .splitPendingConfirmation
         case 2:
-            return .readyToPropose
-        case 3:
             guard let progress = in_progress.unsafeToMigrationProgress() else { return nil }
             return .inProgress(progress)
-        case 4:
+        case 3:
             guard let reason = requires_attention.unsafeToMigrationAttentionReason() else { return nil }
             return .requiresAttention(reason)
-        case 5:
+        case 4:
             return .complete
         default:
             return nil

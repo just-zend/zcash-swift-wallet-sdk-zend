@@ -4385,25 +4385,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     // MARK: - migrationProposeTransfers
 
-    var migrationProposeTransfersIncludeResidualForThrowableError: Error?
-    var migrationProposeTransfersIncludeResidualForCallsCount = 0
-    var migrationProposeTransfersIncludeResidualForCalled: Bool {
-        return migrationProposeTransfersIncludeResidualForCallsCount > 0
+    var migrationProposeTransfersForThrowableError: Error?
+    var migrationProposeTransfersForCallsCount = 0
+    var migrationProposeTransfersForCalled: Bool {
+        return migrationProposeTransfersForCallsCount > 0
     }
-    var migrationProposeTransfersIncludeResidualForReceivedArguments: (includeResidual: Bool, account: AccountUUID)?
-    var migrationProposeTransfersIncludeResidualForReturnValue: MigrationSchedule!
-    var migrationProposeTransfersIncludeResidualForClosure: ((Bool, AccountUUID) async throws -> MigrationSchedule)?
+    var migrationProposeTransfersForReceivedAccount: AccountUUID?
+    var migrationProposeTransfersForReturnValue: MigrationSchedule!
+    var migrationProposeTransfersForClosure: ((AccountUUID) async throws -> MigrationSchedule)?
 
-    func migrationProposeTransfers(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule {
-        if let error = migrationProposeTransfersIncludeResidualForThrowableError {
+    func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule {
+        if let error = migrationProposeTransfersForThrowableError {
             throw error
         }
-        migrationProposeTransfersIncludeResidualForCallsCount += 1
-        migrationProposeTransfersIncludeResidualForReceivedArguments = (includeResidual: includeResidual, account: account)
-        if let closure = migrationProposeTransfersIncludeResidualForClosure {
-            return try await closure(includeResidual, account)
+        migrationProposeTransfersForCallsCount += 1
+        migrationProposeTransfersForReceivedAccount = account
+        if let closure = migrationProposeTransfersForClosure {
+            return try await closure(account)
         } else {
-            return migrationProposeTransfersIncludeResidualForReturnValue
+            return migrationProposeTransfersForReturnValue
         }
     }
 
@@ -4541,51 +4541,27 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         try await migrationRecordTransferResultTransferIdResultForClosure!(transferId, result, account)
     }
 
-    // MARK: - migrationIsSyncRequired
-
-    var migrationIsSyncRequiredForThrowableError: Error?
-    var migrationIsSyncRequiredForCallsCount = 0
-    var migrationIsSyncRequiredForCalled: Bool {
-        return migrationIsSyncRequiredForCallsCount > 0
-    }
-    var migrationIsSyncRequiredForReceivedAccount: AccountUUID?
-    var migrationIsSyncRequiredForReturnValue: Bool!
-    var migrationIsSyncRequiredForClosure: ((AccountUUID) async throws -> Bool)?
-
-    func migrationIsSyncRequired(for account: AccountUUID) async throws -> Bool {
-        if let error = migrationIsSyncRequiredForThrowableError {
-            throw error
-        }
-        migrationIsSyncRequiredForCallsCount += 1
-        migrationIsSyncRequiredForReceivedAccount = account
-        if let closure = migrationIsSyncRequiredForClosure {
-            return try await closure(account)
-        } else {
-            return migrationIsSyncRequiredForReturnValue
-        }
-    }
-
     // MARK: - migrationRestartStep
 
-    var migrationRestartStepIncludeResidualForThrowableError: Error?
-    var migrationRestartStepIncludeResidualForCallsCount = 0
-    var migrationRestartStepIncludeResidualForCalled: Bool {
-        return migrationRestartStepIncludeResidualForCallsCount > 0
+    var migrationRestartStepForThrowableError: Error?
+    var migrationRestartStepForCallsCount = 0
+    var migrationRestartStepForCalled: Bool {
+        return migrationRestartStepForCallsCount > 0
     }
-    var migrationRestartStepIncludeResidualForReceivedArguments: (includeResidual: Bool, account: AccountUUID)?
-    var migrationRestartStepIncludeResidualForReturnValue: MigrationSchedule!
-    var migrationRestartStepIncludeResidualForClosure: ((Bool, AccountUUID) async throws -> MigrationSchedule)?
+    var migrationRestartStepForReceivedAccount: AccountUUID?
+    var migrationRestartStepForReturnValue: MigrationSchedule!
+    var migrationRestartStepForClosure: ((AccountUUID) async throws -> MigrationSchedule)?
 
-    func migrationRestartStep(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule {
-        if let error = migrationRestartStepIncludeResidualForThrowableError {
+    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule {
+        if let error = migrationRestartStepForThrowableError {
             throw error
         }
-        migrationRestartStepIncludeResidualForCallsCount += 1
-        migrationRestartStepIncludeResidualForReceivedArguments = (includeResidual: includeResidual, account: account)
-        if let closure = migrationRestartStepIncludeResidualForClosure {
-            return try await closure(includeResidual, account)
+        migrationRestartStepForCallsCount += 1
+        migrationRestartStepForReceivedAccount = account
+        if let closure = migrationRestartStepForClosure {
+            return try await closure(account)
         } else {
-            return migrationRestartStepIncludeResidualForReturnValue
+            return migrationRestartStepForReturnValue
         }
     }
 

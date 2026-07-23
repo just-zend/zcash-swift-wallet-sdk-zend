@@ -14,10 +14,6 @@ public enum MigrationState: Equatable, Sendable {
     case notStarted
     /// The run is committed and its preparation (note-split) transactions are not yet all mined.
     case splitPendingConfirmation
-    /// Never emitted by the final engine (the note split and the transfer schedule commit
-    /// atomically, so the v1 "split confirmed, schedule pending" moment no longer exists). Kept
-    /// for source compatibility.
-    case readyToPropose
     /// Preparation is mined and the run's transfers are executing.
     case inProgress(MigrationProgress)
     /// A transfer cannot proceed automatically; the app must act.
@@ -104,7 +100,7 @@ public struct MigrationTransferProposal: Identifiable, Equatable, Sendable, Coda
 }
 
 /// A full migration schedule presented to the user for one-time confirmation, as returned by
-/// `ZcashRustBackendWelding.migrationProposeTransfers(includeResidual:for:)` and related calls.
+/// `ZcashRustBackendWelding.migrationProposeTransfers(for:)` and related calls.
 ///
 /// `Codable` so the platform can cache the confirmed schedule (e.g. while awaiting an external
 /// signer) without re-deriving it from the engine.
@@ -280,8 +276,6 @@ public enum MigrationAttentionReason: Equatable, Sendable {
     case invalidTransfer(transferId: String)
     /// A transaction's anchor/expiry elapsed before it could be broadcast.
     case transferExpired
-    /// A transfer produced Orchard change that must be synced before the next spend.
-    case syncRequiredBeforeNext
 }
 
 /// An unsigned-but-proven PCZT for one scheduled transfer, awaiting an external signer (see

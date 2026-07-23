@@ -13,16 +13,15 @@
 //! builds N preparation transactions rather than one split transaction).
 //!
 //! Semantics that moved into this layer (the v1 crate did them internally):
-//! - The public 6-state machine is DERIVED (see [`derive_state`]): `ReadyToPropose` and the
-//!   `SyncRequiredBeforeNext` attention reason are permanently unemitted (the engine commits the
-//!   split and the schedule atomically), and `Complete` is PER-RUN — "the stored run is fully
-//!   mined", never "nothing left to migrate". After completion the platform asks
-//!   `zcashlc_migration_propose_transfers` whether anything remains (an empty schedule means no).
+//! - The public 5-state machine is DERIVED (see [`derive_state`]): the v1 crate's `ReadyToPropose`
+//!   state and `SyncRequiredBeforeNext` attention reason are gone entirely (the engine commits the
+//!   split and the schedule atomically, so that intermediate moment cannot occur), and `Complete`
+//!   is PER-RUN — "the stored run is fully mined", never "nothing left to migrate". After
+//!   completion the platform asks `zcashlc_migration_propose_transfers` whether anything remains
+//!   (an empty schedule means no).
 //! - Mined-transaction reconciliation ([`reconcile_mined`]) runs at the head of every read.
 //! - Rejection classification is recorded in the SDK-owned `sdk_invalid_marks` side table (the
 //!   engine has no failure states).
-//! - `include_residual` is accepted and ignored (documented-inert; the engine plans canonically
-//!   and ZIP 318 expects the residual to remain in Orchard).
 //!
 //! Error channel: failures land in the thread-local last-error message. Two stable prefixes let
 //! the Swift layer surface dedicated errors: `MIGRATION_PLAN_STALE:` (commit without a matching
@@ -622,7 +621,7 @@ fn prove_if_needed(
 
 // ----- public-state derivation (pure; unit-tested) -----
 
-/// What the platform's 6-state machine derives to, before marshaling.
+/// What the platform's 5-state machine derives to, before marshaling.
 enum DerivedState {
     NotStarted,
     SplitPendingConfirmation,
@@ -642,9 +641,9 @@ enum DerivedState {
 /// - A stored `Failed` run (our cancel) -> `NotStarted` (the platform re-plans).
 /// - `Complete` is PER-RUN: the stored run is fully mined. Whether anything REMAINS to migrate is
 ///   answered by a fresh propose, never by this state.
-/// - `ReadyToPropose` and `SyncRequiredBeforeNext` are never derived: the engine commits the note
-///   split and the transfer schedule atomically, so the v1 "split confirmed, schedule pending"
-///   moment no longer exists.
+/// - The v1 crate's "split confirmed, schedule pending" intermediate state and its matching
+///   attention reason are gone: the engine commits the note split and the transfer schedule
+///   atomically, so that moment cannot occur anymore.
 fn derive_state(
     persisted: Option<&MigrationState>,
     tip: BlockHeight,
@@ -748,10 +747,6 @@ impl FfiMigrationProgress {
 }
 
 /// Why a migration requires user attention (payload of [`FfiMigrationState::RequiresAttention`]).
-///
-/// `#[allow(dead_code)]`: `SyncRequiredBeforeNext` is never constructed by this integration but
-/// stays for ABI stability (the C header and the Swift decoder both know the tag).
-#[allow(dead_code)]
 #[repr(C, u8)]
 pub enum FfiAttentionReason {
     /// The transfer identified by `transfer_id` was terminally rejected at broadcast (its input
@@ -760,16 +755,12 @@ pub enum FfiAttentionReason {
     InvalidTransfer { transfer_id: *mut c_char },
     /// A transaction's expiry elapsed before it could be broadcast (or mined).
     TransferExpired,
-    /// Unused: never derived by this integration (kept for ABI stability).
-    SyncRequiredBeforeNext,
 }
 
 /// The top-level migration state machine surfaced to the app.
 ///
 /// `#[allow(dead_code)]`: the data-carrying variants' payloads are read by the C consumer across
-/// the FFI (cbindgen emits them into the header), which rustc cannot observe; `ReadyToPropose` and
-/// the `SyncRequiredBeforeNext` reason are additionally never constructed by this integration (the
-/// engine commits the split and the schedule atomically) but stay for ABI stability.
+/// the FFI (cbindgen emits them into the header), which rustc cannot observe.
 #[allow(dead_code)]
 #[repr(C, u8)]
 pub enum FfiMigrationState {
@@ -777,8 +768,6 @@ pub enum FfiMigrationState {
     NotStarted,
     /// The run is committed and its preparation (note-split) transactions are not yet all mined.
     SplitPendingConfirmation,
-    /// Unused: never emitted by this integration (kept for ABI stability).
-    ReadyToPropose,
     /// Preparation is mined and the run's transfers are executing.
     InProgress(FfiMigrationProgress),
     /// A transfer cannot proceed automatically; the app must act.
@@ -1623,9 +1612,6 @@ pub unsafe extern "C" fn zcashlc_migration_estimate_runs(
 /// signs exactly this plan. An EMPTY schedule means there is nothing to migrate: after a
 /// completed run this is the "does anything remain" answer.
 ///
-/// `include_residual` is accepted and IGNORED (documented-inert): the engine plans canonically,
-/// and ZIP 318 expects the residual to remain in Orchard.
-///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
 #[unsafe(no_mangle)]
@@ -1634,10 +1620,8 @@ pub unsafe extern "C" fn zcashlc_migration_propose_transfers(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    include_residual: bool,
 ) -> *mut FfiMigrationSchedule {
     let res = catch_panic(|| {
-        let _ = include_residual;
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         match plan_and_cache(&mut ctx, false)? {
             Some(plan) => encode_schedule_from_plan(&plan, ctx.tip()?),
@@ -1858,13 +1842,11 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
     network_id: u32,
     transfer_id: *const c_char,
     result_tag: i32,
-    retryable: bool,
     txid_bytes: *const u8,
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let id = transfer_id_from_c(transfer_id)?;
-        let _ = retryable;
         match result_tag {
             0 => {
                 if txid_bytes.is_null() {
@@ -1899,31 +1881,9 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
     unwrap_exc_or(res, false)
 }
 
-/// Whether a wallet sync is required before the next transfer can broadcast. Always `false`: ZIP
-/// 318's sync/broadcast decoupling MUST is enforced by the SDK's Swift privacy gate and the app's
-/// background-session policy, not by the engine (the engine surfaces no such predicate). Returns
-/// `false` on error too (see `zcashlc_last_error_message`).
-///
-/// # Safety
-/// See [`open`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_is_sync_required(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-) -> bool {
-    let res = catch_panic(|| {
-        let _ = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        Ok(false)
-    });
-    unwrap_exc_or(res, false)
-}
-
 /// Cancels the stored run (persisting it as `Failed` — its pre-signed transactions are abandoned;
 /// already-broadcast ones are unaffected on-chain), clears the invalid marks, and previews a
-/// fresh plan against the live balance for the platform's re-confirm lane. `include_residual` is
-/// accepted and ignored (documented-inert).
+/// fresh plan against the live balance for the platform's re-confirm lane.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
@@ -1933,10 +1893,8 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    include_residual: bool,
 ) -> *mut FfiMigrationSchedule {
     let res = catch_panic(|| {
-        let _ = include_residual;
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         {
             let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
