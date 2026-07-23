@@ -610,19 +610,18 @@ struct StoredEchoRow {
     expiry_height: i64,
 }
 
-/// The consent-echo rows and duration `zcashlc_migration_propose_transfers` /
-/// `zcashlc_migration_propose_immediate_transfers` returned for the cached plan, reconstructed
-/// byte-for-byte from the cache: the plan itself is deterministic (ids/amounts/expiry never move),
-/// but the immediate lane's preview shows every transfer due at the PREVIEW-TIME tip (not the
-/// schedule's drawn broadcast height) with a fixed zero duration — `cached.reference_height` and
-/// `cached.immediate` reproduce exactly that, rather than a freshly re-read tip that could have
-/// moved on without the plan itself going stale. The non-immediate branch's duration is, for the
-/// same reason, measured from `cached.reference_height` (the ORIGINAL propose-time `now`, see
-/// [`estimated_duration_hours`]) rather than a freshly re-read tip: it is what
-/// `encode_schedule_from_plan` used to compute the value this call reproduces, byte for byte. This
-/// PRE-commit path is, since #1806, the ONLY place `estimated_duration_hours` is still checked as
-/// a verified consent echo — see [`StoredEchoRow`]'s doc for why the POST-commit (STORED-state)
-/// path deliberately excludes it instead of re-deriving a value that could disagree here.
+/// The consent-echo rows and duration `zcashlc_migration_propose_transfers` returned for the
+/// cached plan, reconstructed byte-for-byte from the cache: the plan is deterministic — ids,
+/// net amounts, drawn broadcast heights, and expiries never move between propose and commit for
+/// the scheduled lane, so no row-level tip re-read is involved. (The immediate lane is an
+/// ordinary send-max sweep outside the engine and never touches the plan cache — see the module
+/// doc.) The duration is, since #1806, measured from `cached.reference_height` (the ORIGINAL
+/// propose-time `now`, see [`estimated_duration_hours`]) rather than a freshly re-read tip: it is
+/// exactly what `encode_schedule_from_plan` used to compute the value this call reproduces, byte
+/// for byte. This PRE-commit path is also, since #1806, the ONLY place
+/// `estimated_duration_hours` is still checked as a verified consent echo — see
+/// [`StoredEchoRow`]'s doc for why the POST-commit (STORED-state) path deliberately excludes it
+/// instead of re-deriving a value that could disagree here.
 fn expected_rows_from_cached_plan(
     cached: &migration_plan_cache::CachedPlan,
 ) -> anyhow::Result<(Vec<EchoRow>, u32)> {
@@ -630,34 +629,22 @@ fn expected_rows_from_cached_plan(
         &cached.plan.funding_notes(),
         cached.plan.schedule(),
         prep_tx_count(&cached.plan),
+        cached.plan.note_split().note_fee_buffer(),
     )?;
-    if cached.immediate {
-        let rows = rows
-            .into_iter()
-            .map(|(id, amount, _broadcast, expiry)| EchoRow {
-                id: u32::from(id),
-                amount: zat_to_i64(amount),
-                next_executable_after_height: i64::from(u32::from(cached.reference_height)),
-                expiry_height: i64::from(u32::from(expiry)),
-            })
-            .collect();
-        Ok((rows, 0))
-    } else {
-        let duration = estimated_duration_hours(
-            cached.plan.schedule().iter().map(|e| e.broadcast_height()),
-            cached.reference_height,
-        );
-        let rows = rows
-            .into_iter()
-            .map(|(id, amount, broadcast, expiry)| EchoRow {
-                id: u32::from(id),
-                amount: zat_to_i64(amount),
-                next_executable_after_height: i64::from(u32::from(broadcast)),
-                expiry_height: i64::from(u32::from(expiry)),
-            })
-            .collect();
-        Ok((rows, duration))
-    }
+    let duration = estimated_duration_hours(
+        cached.plan.schedule().iter().map(|e| e.broadcast_height()),
+        cached.reference_height,
+    );
+    let rows = rows
+        .into_iter()
+        .map(|(id, amount, broadcast, expiry)| EchoRow {
+            id: u32::from(id),
+            amount: zat_to_i64(amount),
+            next_executable_after_height: i64::from(u32::from(broadcast)),
+            expiry_height: i64::from(u32::from(expiry)),
+        })
+        .collect();
+    Ok((rows, duration))
 }
 
 /// The stored run's TRANSFER subset, in engine order.
@@ -2271,7 +2258,6 @@ pub unsafe extern "C" fn zcashlc_migration_propose_transfers(
     unwrap_exc_or_null(res)
 }
 
->>>>>>> 80c42da4 ([#1806] Record SDK-orchestrated immediate migration runs and marshal net crossing amounts)
 /// Commits the previewed migration with the spending key if nothing is committed yet (covering
 /// the no-split lane); when a matching non-terminal run is already stored (the normal case — the
 /// note-split submission committed it), succeeds as a no-op.
@@ -2596,12 +2582,8 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
         }
         clear_invalid_marks(&ctx.store_conn, &ctx.account_bytes)
             .map_err(|e| anyhow!("marks clear failed: {e}"))?;
-<<<<<<< HEAD
-        match plan_and_cache(&mut ctx, false)? {
-            Some((plan, reference_height)) => encode_schedule_from_plan(&plan, reference_height),
-=======
         match plan_and_cache(&mut ctx)? {
-            Some(plan) => encode_schedule_from_plan(&plan, ctx.tip()?),
+            Some((plan, reference_height)) => encode_schedule_from_plan(&plan, reference_height),
             None => Ok(encode_empty_schedule()),
         }
     });
@@ -3691,11 +3673,13 @@ mod tests {
             50,
             10_000,
         );
-        // `test_state`'s two transfers (ids 0, 1) both crossing 100_000_000 zatoshi, plus its
-        // fixed 10_000-zatoshi fee buffer (`funding_notes()` == crossing + buffer), at height 50,
-        // expiring at 10_000.
+        // `test_state`'s two transfers (ids 0, 1) both cross 100_000_000 zatoshi NET (the stored
+        // funding note is gross of the fixed 10_000-zatoshi fee buffer; `transfer_amount` nets it
+        // back out), at height 50, expiring at 10_000; the echoed duration (`0` below) is
+        // excluded from the state-side comparison entirely (see `StoredEchoRow`), so its value
+        // is arbitrary here.
         let (_owned, ids) = c_ids(&[0, 1]);
-        let amounts = [100_010_000i64, 100_010_000i64];
+        let amounts = [100_000_000i64, 100_000_000i64];
         let next_executable_after_heights = [50i64, 50i64];
         let expiry_heights = [10_000i64, 10_000i64];
         assert!(
@@ -3725,7 +3709,7 @@ mod tests {
             10_000,
         );
         let (_owned, ids) = c_ids(&[0]);
-        let amounts = [100_010_000i64];
+        let amounts = [100_000_000i64];
         let next_executable_after_heights = [50i64];
         let expiry_heights = [10_000i64];
         let err = validate_schedule_echo_against_state(
@@ -3750,9 +3734,8 @@ mod tests {
             10_000,
         );
         let (_owned, ids) = c_ids(&[0]);
-        // The stored transfer funds 100_010_000 zatoshi (100_000_000 crossing + `test_state`'s
-        // fixed 10_000 fee buffer); the echo claims 100_010_001.
-        let amounts = [100_010_001i64];
+        // The stored transfer crosses 100_000_000 zatoshi net; the echo claims one more.
+        let amounts = [100_000_001i64];
         let next_executable_after_heights = [50i64];
         let expiry_heights = [10_000i64];
         let err = validate_schedule_echo_against_state(
@@ -3777,7 +3760,7 @@ mod tests {
             10_000,
         );
         let (_owned, ids) = c_ids(&[0]);
-        let amounts = [100_010_000i64];
+        let amounts = [100_000_000i64];
         let next_executable_after_heights = [50i64];
         // The stored transfer expires at 10_000; the echo claims 10_001.
         let expiry_heights = [10_001i64];
@@ -3815,7 +3798,7 @@ mod tests {
             10_000,
         );
         let (_owned, ids) = c_ids(&[0]);
-        let amounts = [100_010_000i64];
+        let amounts = [100_000_000i64];
         // Drifted far from the stored transfer's actual scheduled height (50) — as if a block (or
         // several) landed between the immediate-lane preview and the commit that rescheduled it.
         let next_executable_after_heights = [999_999i64];
