@@ -497,11 +497,15 @@ protocol ZcashRustBackendWelding {
     /// Pre-signs and persists every transfer in `schedule` (a no-op when a matching non-terminal
     /// run is already stored — the normal case, since the note-split submission commits the run).
     /// `schedule` is a VERIFIED consent echo of what the user approved, not an inert display
-    /// value: ids, amounts, expiry heights, and the estimated duration are checked against the
-    /// previewed plan (or, once a run is committed, against the stored run itself);
-    /// `nextExecutableAfterHeight` is additionally checked against the preview before commit but
-    /// never post-commit (the immediate lane's commit-time reschedule can legitimately move it
-    /// away from an honest echo), and `anchorHeight` is display-only, never compared.
+    /// value: ids, amounts, and expiry heights are checked against the previewed plan (or, once a
+    /// run is committed, against the stored run itself). `nextExecutableAfterHeight` is
+    /// additionally checked against the preview before commit but never post-commit (the
+    /// immediate lane's commit-time reschedule can legitimately move it away from an honest
+    /// echo), and the estimated duration is likewise checked pre-commit only: a refresh rebuilds
+    /// an expired transfer with a fresh scheduled height, and the duration is measured from serve
+    /// time, so an honest echo of an earlier serve can legitimately disagree with a later
+    /// re-derivation, with no way to converge by re-proposing. `anchorHeight` is display-only,
+    /// never compared.
     /// - Throws: `migrationPlanStale` when the echo mismatches, or when nothing is committed and
     ///   no previewed plan is cached — recover by re-proposing and re-displaying (pre-commit) or
     ///   re-reading the stored schedule (post-commit); `rustMigrationSignAndStoreSchedule` for
@@ -593,12 +597,16 @@ protocol ZcashRustBackendWelding {
 
     /// Serves the TRANSFER subset of the unsigned build for the signing ceremony (see
     /// `migrationCreateUnsignedNoteSplitPczts`). `schedule` is a VERIFIED consent echo, not an
-    /// inert display value: its ids, amounts, expiry heights, and estimated duration are checked
-    /// against the STORED committed run this call serves from, so a stale or tampered display
-    /// cannot route different values than the ones the user approved into the ceremony.
+    /// inert display value: its ids, amounts, and expiry heights are checked against the STORED
+    /// committed run this call serves from, so a stale or tampered display cannot route
+    /// different values than the ones the user approved into the ceremony.
     /// `nextExecutableAfterHeight` is accepted but not compared post-commit (the immediate
     /// lane's commit-time reschedule can legitimately move it away from an honest echo, with no
-    /// way to converge by re-proposing), and `anchorHeight` is display-only, never compared.
+    /// way to converge by re-proposing), and the estimated duration is likewise accepted but not
+    /// compared post-commit (a refresh rebuilds expired transfers with fresh scheduled heights,
+    /// and the duration is measured from serve time — an honest echo of an earlier serve can
+    /// legitimately disagree with a later re-derivation, with no way to converge by
+    /// re-proposing); `anchorHeight` is display-only, never compared.
     /// - Throws: `migrationPlanStale` when the echoed schedule does not match the stored run —
     ///   recover by re-reading the run's stored schedule (`migrationRefreshStaleTransfers`
     ///   returns exactly that) and re-displaying it — or when nothing is committed and no
