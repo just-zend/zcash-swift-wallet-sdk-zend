@@ -40,10 +40,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preparation transactions, not one split transaction. The schedule/note-split
   echo parameters (`ids`/`amounts`/heights/duration on the schedule-commit calls;
   `output_values`/`fee` on the note-split-commit call) are verified consent
-  echoes: each is checked against the previewed plan (or, once committed, the
-  stored state) and a mismatch surfaces `MIGRATION_PLAN_STALE`, so a stale or
+  echoes, checked against the previewed plan (or, once committed, the stored
+  state), with a mismatch surfacing `MIGRATION_PLAN_STALE`, so a stale or
   tampered display can never sign different values than the ones the user
-  approved. `include_residual` and `retryable` parameters, and the
+  approved. Ids, amounts, expiry heights, and the estimated duration are
+  always compared; next-executable heights are compared only against the
+  previewed plan, never post-commit (the immediate lane's commit-time
+  reschedule legitimately moves them away from an honest echo, with no way
+  to converge by re-proposing); anchor heights are display-only, never
+  compared. `include_residual` and `retryable` parameters, and the
   `is_sync_required` query, are removed — they never had a use.
   - State: `zcashlc_migration_state`, `zcashlc_migration_progress`,
     `zcashlc_migration_is_note_split_needed`,
