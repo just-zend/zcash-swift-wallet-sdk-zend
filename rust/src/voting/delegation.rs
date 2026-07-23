@@ -655,7 +655,7 @@ pub unsafe extern "C" fn zcashlc_voting_get_delegation_submission(
         )
         .ok_or_else(|| anyhow!("delegation alpha is not a valid Pallas scalar"))?;
         let rsk = ask.randomize(&alpha);
-        let sig: [u8; 64] = (&rsk.sign(&mut rand::rngs::OsRng, &request.sighash)).into();
+        let sig: [u8; 64] = (&rsk.sign(rand::rngs::OsRng, &request.sighash)).into();
 
         let data = handle
             .db

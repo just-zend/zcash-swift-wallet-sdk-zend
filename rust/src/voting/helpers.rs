@@ -101,7 +101,6 @@ pub(super) fn round_phase_to_u32(phase: voting::storage::RoundPhase) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcash_protocol::consensus::{MAIN_NETWORK, TEST_NETWORK};
 
     #[test]
     fn bytes_from_ptr_zero_len_accepts_null() {

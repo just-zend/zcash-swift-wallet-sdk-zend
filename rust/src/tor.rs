@@ -16,7 +16,6 @@ use zcash_client_backend::{
     tor::{Client, DormantMode},
     wallet::WalletTransparentOutput,
 };
-use zcash_client_sqlite::AccountUuid;
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::{
     TxId,
@@ -94,7 +93,8 @@ impl TorRuntime {
     pub(crate) fn connect_to_lightwalletd(&self, endpoint: Uri) -> anyhow::Result<LwdConn> {
         let Self { runtime, client } = self.isolated_client();
 
-        let conn = runtime.block_on(async { client.connect_to_lightwalletd(endpoint).await })?;
+        let conn =
+            runtime.block_on(async { client.connect_to_lightwalletd(endpoint, false).await })?;
 
         Ok(LwdConn {
             runtime,

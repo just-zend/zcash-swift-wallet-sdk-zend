@@ -84,7 +84,7 @@ rust_decimal = { version = "1", default-features = false, features = ["c-repr"] 
 xz2 = { version = "0.1", features = ["static"] }
 
 # Voting
-zcash_voting = "1.0"
+zcash_voting = "1"
 zcash_keys = { version = "0.15.0", features = ["orchard"] }
 incrementalmerkletree = { version = "0.8", default-features = false }
 
@@ -111,24 +111,22 @@ lto = true
 # single family instance. Bump it deliberately (build + OfflineTests green),
 # and delete the whole block at the 0.24-era crates.io release.
 [patch.crates-io]
-voting-circuits = { git = "https://github.com/zodl-inc/voting-circuits.git", rev = "a5aae410a6fb14fcbea2f0ce3393035195e86f69" }
-imt-tree = { git = "https://github.com/zodl-inc/vote-nullifier-pir.git", rev = "0dea3485429c80033e67a1ddb18ee72cc450cefb" }
-zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting.git", rev = "464f974865f2afa82bdac15d169168c77ecb9c74" }
+zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting.git", rev = "a4daaf77f793b35a98a3d811b920a01b95fbfa7a" }
 
 # Pin the whole librustzcash stack to a single git rev carrying the merged Ironwood
 # historical selector, pending a crates.io release. zcash_voting no longer hard-pins
 # librustzcash (it declares crates.io versions and patches from its own root), so this
 # workspace's patch governs the rev for the entire graph and everything resolves to one
 # copy. Bump this rev in one place to advance the stack.
-equihash = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "4faf8711189950cf38f99b59b8c21208d0946427" }
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
