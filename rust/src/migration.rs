@@ -1572,9 +1572,11 @@ impl FfiUnsignedTransferPczts {
 
 /// One migration transaction's LIVE status, as the engine computes it — an element of
 /// [`FfiMigrationTransactionStatuses`]. Mirrors
-/// [`zcash_pool_migration_backend::state::TransactionStatus`] field-for-field (see
-/// [`zcashlc_migration_transaction_statuses`]): nothing here is derived independently of the
-/// engine's own view.
+/// [`zcash_pool_migration_backend::state::TransactionStatus`] field-for-field — minus its
+/// `depends_on` edge list, deliberately not marshaled so every row stays heap-pointer-free (a
+/// `blocked_on = dependencies` row reports THAT it waits, not on which ids) — and nothing here
+/// is derived independently of the engine's own view (see
+/// [`zcashlc_migration_transaction_statuses`]).
 #[repr(C)]
 pub struct FfiMigrationTransactionStatus {
     /// This transaction's stable id (`MigrationTxId`'s raw ordinal). Stable across reads and
