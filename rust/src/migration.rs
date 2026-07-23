@@ -435,50 +435,43 @@ fn plan_and_cache(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationPlan>> {
 /// The row set the platform sees for a plan's transfer schedule: `(engine tx id, amount, broadcast
 /// height, expiry height)`, sorted chronologically by broadcast height.
 ///
-/// - `amount` is the NET value that crosses the turnstile (`funding_notes()[i] - note_fee_buffer`),
-///   not the gross funding-note value the note-split minted. The row is still KEYED off
-///   `funding_notes()` (the post-reconciliation values), NOT the note split's raw
-///   `crossing_values()` — the two differ whenever preparation fees drop the smallest
-///   denominations, and indexing `crossing_values()` directly would silently mispair a
-///   denomination with the wrong schedule height. Subtracting the (constant) fee buffer from the
-///   already-correctly-paired funding note sidesteps that entirely.
+/// - `amount` is the engine's authoritative crossing value — `NoteSplitPlan::crossing_values()[i]`
+///   (F3) — the NET value that crosses the turnstile when the funding note at the same index is
+///   spent (see `crossing_values`'s doc: "the denomination values ... that will cross the
+///   turnstile ... when the note at the same index is spent"). It is index-aligned with
+///   `funding_notes()`/`schedule()` by construction: `funding_notes()` (`migration_outputs()`) maps
+///   `crossing_values()` 1:1 (each funding note is `crossing_values()[i] + note_fee_buffer`), so
+///   reading `crossing_values()[i]` directly pairs correctly with schedule entry `i` — no
+///   re-derivation (`funding_notes()[i] - note_fee_buffer`) needed.
 /// - The engine numbers every preparation transaction first, then transfers in `schedule()`
 ///   order, so transfer `i`'s real committed id is `prep_tx_count + i`.
 /// - The sort makes the platform's row order chronological: ZIP 318 SHUFFLE deliberately makes
 ///   funding-note order differ from broadcast order.
 fn schedule_rows(
-    funding_notes: &[Zatoshis],
+    crossing_values: &[Zatoshis],
     schedule: &[zcash_pool_migration_backend::scheduling::Schedule],
     prep_tx_count: u32,
-    note_fee_buffer: Zatoshis,
 ) -> anyhow::Result<Vec<(MigrationTxId, Zatoshis, BlockHeight, BlockHeight)>> {
-    if funding_notes.len() != schedule.len() {
+    if crossing_values.len() != schedule.len() {
         return Err(anyhow!(
-            "migration plan invariant violated: {} funding notes but {} schedule entries",
-            funding_notes.len(),
+            "migration plan invariant violated: {} crossing values but {} schedule entries",
+            crossing_values.len(),
             schedule.len()
         ));
     }
-    let mut rows: Vec<_> = funding_notes
+    let mut rows: Vec<_> = crossing_values
         .iter()
         .zip(schedule.iter())
         .enumerate()
-        .map(|(i, (funding_note, entry))| {
-            let crossing = (*funding_note - note_fee_buffer).ok_or_else(|| {
-                anyhow!(
-                    "funding note {} zatoshi is smaller than the fee buffer {} zatoshi",
-                    u64::from(*funding_note),
-                    u64::from(note_fee_buffer)
-                )
-            })?;
-            Ok((
+        .map(|(i, (crossing_value, entry))| {
+            (
                 MigrationTxId::new(prep_tx_count + i as u32),
-                crossing,
+                *crossing_value,
                 entry.broadcast_height(),
                 entry.expiry_height(),
-            ))
+            )
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect();
     rows.sort_by_key(|(_, _, broadcast, _)| *broadcast);
     Ok(rows)
 }
@@ -513,10 +506,9 @@ fn encode_schedule_from_plan(
     now_reference: BlockHeight,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
     let rows = schedule_rows(
-        &plan.funding_notes(),
+        plan.note_split().crossing_values(),
         plan.schedule(),
         prep_tx_count(plan),
-        plan.note_split().note_fee_buffer(),
     )?;
     let transfers = rows
         .into_iter()
@@ -604,10 +596,9 @@ fn expected_rows_from_cached_plan(
     cached: &migration_plan_cache::CachedPlan,
 ) -> anyhow::Result<(Vec<EchoRow>, u32)> {
     let rows = schedule_rows(
-        &cached.plan.funding_notes(),
+        cached.plan.note_split().crossing_values(),
         cached.plan.schedule(),
         prep_tx_count(&cached.plan),
-        cached.plan.note_split().note_fee_buffer(),
     )?;
     let duration = estimated_duration_hours(cached.plan.schedule());
     let rows = rows
@@ -1246,9 +1237,20 @@ fn derive_state(
         .iter()
         .filter(|t| matches!(t.state(), MigrationTxState::Mined { .. }))
         .count() as u32;
+    // F6: min over transfers still AWAITING BROADCAST only (`AwaitingSignature`/`Signed`/
+    // `Proved`) — NOT merely "not yet mined". A `Broadcast` transfer is already in the mempool;
+    // there is nothing left for the platform to prepare for it, so its height must not surface
+    // here even when it is numerically the smallest (see `next_transfer_ready_at_height`'s doc).
     let next_ready = transfers
         .iter()
-        .filter(|t| !matches!(t.state(), MigrationTxState::Mined { .. }))
+        .filter(|t| {
+            matches!(
+                t.state(),
+                MigrationTxState::AwaitingSignature
+                    | MigrationTxState::Signed
+                    | MigrationTxState::Proved
+            )
+        })
         .map(|t| t.scheduled_height())
         .min();
     DerivedState::InProgress {
@@ -1259,15 +1261,15 @@ fn derive_state(
     }
 }
 
-/// The NET amount a stored transfer crosses the turnstile: its funding note (`Transfer { crossing
-/// }` indexes into `funding_notes()`) minus the plan's constant fee buffer. `None` when `tx` is not
-/// a transfer, its crossing index is out of range, or (invariantly impossible) the funding note is
-/// smaller than the buffer.
+/// The NET amount a stored transfer crosses the turnstile: the engine's authoritative crossing
+/// value at `tx`'s crossing index (F3) — `note_split().crossing_values()[crossing]`, read directly
+/// rather than re-derived as `funding_notes()[crossing] - note_fee_buffer` (the two are identical
+/// by construction; see `schedule_rows`'s doc). `None` when `tx` is not a transfer, or its crossing
+/// index is out of range.
 fn transfer_amount(state: &MigrationState, tx: &MigrationTransaction) -> Option<Zatoshis> {
     match tx.kind() {
         MigrationTxKind::Transfer { crossing } => {
-            let funding_note = state.funding_notes().get(crossing).copied()?;
-            funding_note - state.note_split().note_fee_buffer()
+            state.note_split().crossing_values().get(crossing).copied()
         }
         _ => None,
     }
@@ -1296,6 +1298,9 @@ pub struct FfiMigrationProgress {
     /// spendable Orchard balance.
     pub remaining_orchard_value: i64,
     /// The height at which the next transfer becomes broadcastable, or `-1` if none is scheduled.
+    /// Only transfers still AWAITING broadcast count (F6): one already `Broadcast` (in the
+    /// mempool, awaiting mining) has nothing left to prepare for, so it never sets this field,
+    /// even when its own scheduled height is lower than another transfer's.
     pub next_transfer_ready_at_height: i64,
     /// Whether this progress belongs to the immediate (single-transaction) send-max migration lane
     /// rather than an engine-tracked schedule. The app uses it to keep the immediate aftermath
@@ -3085,6 +3090,129 @@ mod tests {
         }
     }
 
+    /// F6: `next_transfer_ready_at_height` must be the min `scheduled_height()` over transfers
+    /// that are still awaiting broadcast (`AwaitingSignature`/`Signed`/`Proved`), not merely "not
+    /// yet mined". A `Broadcast` transfer is already in the mempool — there is nothing left for
+    /// the platform to prepare or broadcast for it — so its height must not win even when it is
+    /// numerically the smallest. Two transfers at DIFFERENT scheduled heights (the low one
+    /// `Broadcast`, the high one `Signed`) pin the exact bug: today's `!= Mined` filter still
+    /// counts the `Broadcast` row, reporting its LOWER height instead of the `Signed` row's.
+    #[test]
+    fn derive_next_ready_height_excludes_already_broadcast_transfers() {
+        let transactions = vec![
+            // Broadcast (in-mempool) at the LOW height — must be excluded.
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(0),
+                MigrationTxKind::Transfer { crossing: 0 },
+                vec![0u8],
+                Vec::new(),
+                h(50),
+                h(10_000),
+                Some(h(50)),
+                MigrationTxState::Broadcast {
+                    txid: TxId::from_bytes([0u8; 32]),
+                },
+                None,
+            ),
+            // Signed (still awaiting broadcast) at the HIGHER height — must win.
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(1),
+                MigrationTxKind::Transfer { crossing: 1 },
+                vec![0u8],
+                Vec::new(),
+                h(150),
+                h(10_000),
+                Some(h(150)),
+                MigrationTxState::Signed,
+                None,
+            ),
+        ];
+        let state = MigrationState::from_parts(
+            MigrationStatus::InProgress,
+            NoteSplitPlan::from_stored_parts(
+                vec![zat(100_000_000), zat(100_000_000)],
+                zat(10_000),
+                None,
+                zat(20_000),
+                zat(1_000_000_000),
+                zat(999_000_000),
+            )
+            .unwrap(),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            transactions,
+        );
+        match derive_state(Some(&state), h(200), &[], None) {
+            DerivedState::InProgress {
+                next_transfer_ready_at_height,
+                ..
+            } => {
+                assert_eq!(
+                    next_transfer_ready_at_height,
+                    Some(h(150)),
+                    "a Broadcast (in-mempool) transfer must not count as 'next ready' even when \
+                     its scheduled height is numerically lower than a not-yet-broadcast \
+                     transfer's"
+                );
+            }
+            _ => panic!("expected InProgress"),
+        }
+    }
+
+    /// F6: once every transfer is `Broadcast` or `Mined`, nothing remains awaiting broadcast, so
+    /// there is no "next ready" height at all (the field's `-1`/`None` sentinel).
+    #[test]
+    fn derive_next_ready_height_is_none_when_all_transfers_are_broadcast_or_mined() {
+        let transactions = vec![
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(0),
+                MigrationTxKind::Transfer { crossing: 0 },
+                vec![0u8],
+                Vec::new(),
+                h(50),
+                h(10_000),
+                Some(h(50)),
+                MigrationTxState::Broadcast {
+                    txid: TxId::from_bytes([0u8; 32]),
+                },
+                None,
+            ),
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(1),
+                MigrationTxKind::Transfer { crossing: 1 },
+                vec![0u8],
+                Vec::new(),
+                h(150),
+                h(10_000),
+                Some(h(150)),
+                MINED,
+                None,
+            ),
+        ];
+        let state = MigrationState::from_parts(
+            MigrationStatus::InProgress,
+            NoteSplitPlan::from_stored_parts(
+                vec![zat(100_000_000), zat(100_000_000)],
+                zat(10_000),
+                None,
+                zat(20_000),
+                zat(1_000_000_000),
+                zat(999_000_000),
+            )
+            .unwrap(),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            transactions,
+        );
+        match derive_state(Some(&state), h(200), &[], None) {
+            DerivedState::InProgress {
+                next_transfer_ready_at_height,
+                ..
+            } => {
+                assert_eq!(next_transfer_ready_at_height, None);
+            }
+            _ => panic!("expected InProgress"),
+        }
+    }
+
     #[test]
     fn derive_invalid_mark_wins() {
         let state = test_state(
@@ -3318,9 +3446,14 @@ mod tests {
     fn schedule_rows_sort_chronologically_with_prep_offset() {
         let mut rng = StdRng::seed_from_u64(7);
         let schedule = scheduling::schedule(h(1_000), 5, &mut rng);
+        // `crossing_values` mirrors a real plan's `note_split().crossing_values()`: the NET
+        // turnstile value at each index (F3 — `schedule_rows` reads this directly, it no longer
+        // takes a gross funding note plus a fee buffer to subtract).
         let buffer = zat(10_000);
-        let amounts: Vec<Zatoshis> = (1..=5).map(|i| zat(i * 100_000_000)).collect();
-        let rows = schedule_rows(&amounts, &schedule, 3, buffer).unwrap();
+        let crossing_values: Vec<Zatoshis> = (1..=5)
+            .map(|i| (zat(i * 100_000_000) - buffer).unwrap())
+            .collect();
+        let rows = schedule_rows(&crossing_values, &schedule, 3).unwrap();
         assert_eq!(rows.len(), 5);
         // Chronological by broadcast height.
         for pair in rows.windows(2) {
@@ -3330,31 +3463,29 @@ mod tests {
         let mut ids: Vec<u32> = rows.iter().map(|(id, _, _, _)| u32::from(*id)).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![3, 4, 5, 6, 7]);
-        // Amount pairing survives the sort: each id maps back to its funding note's NET crossing
-        // value (the gross funding note minus the constant fee buffer), not the gross value.
+        // Amount pairing survives the sort: each id maps back to the crossing value at the same
+        // index — the engine's authoritative NET value, not a re-derived one.
         for (id, amount, _, _) in &rows {
             let crossing = u32::from(*id) - 3;
-            let gross = (u64::from(crossing) + 1) * 100_000_000;
-            assert_eq!(*amount, zat(gross - 10_000));
+            assert_eq!(*amount, crossing_values[crossing as usize]);
         }
     }
 
     #[test]
     fn schedule_rows_net_amounts_are_stable_across_reshuffled_schedules() {
         // Two different draws (different rng seeds -> different shuffled broadcast order) of the
-        // same funding notes must still report the same total (and the same multiset) of NET
+        // same crossing values must still report the same total (and the same multiset) of NET
         // amounts, even though the rows themselves may come back in a different order.
-        let amounts: Vec<Zatoshis> = (1..=5).map(|i| zat(i * 100_000_000)).collect();
-        let buffer = zat(10_000);
-        let expected_total: u64 = amounts.iter().map(|z| u64::from(*z) - 10_000).sum();
+        let crossing_values: Vec<Zatoshis> = (1..=5).map(|i| zat(i * 100_000_000)).collect();
+        let expected_total: u64 = crossing_values.iter().map(|z| u64::from(*z)).sum();
 
         let mut rng_a = StdRng::seed_from_u64(1);
         let schedule_a = scheduling::schedule(h(1_000), 5, &mut rng_a);
-        let rows_a = schedule_rows(&amounts, &schedule_a, 0, buffer).unwrap();
+        let rows_a = schedule_rows(&crossing_values, &schedule_a, 0).unwrap();
 
         let mut rng_b = StdRng::seed_from_u64(99);
         let schedule_b = scheduling::schedule(h(1_000), 5, &mut rng_b);
-        let rows_b = schedule_rows(&amounts, &schedule_b, 0, buffer).unwrap();
+        let rows_b = schedule_rows(&crossing_values, &schedule_b, 0).unwrap();
 
         let total_a: u64 = rows_a
             .iter()
@@ -3384,16 +3515,41 @@ mod tests {
     fn schedule_rows_reject_length_mismatch() {
         let mut rng = StdRng::seed_from_u64(7);
         let schedule = scheduling::schedule(h(1_000), 3, &mut rng);
-        let amounts = vec![zat(100)];
-        assert!(schedule_rows(&amounts, &schedule, 0, zat(0)).is_err());
+        let crossing_values = vec![zat(100)];
+        assert!(schedule_rows(&crossing_values, &schedule, 0).is_err());
     }
 
+    /// F3 pin: `schedule_rows`' amount is BOTH the engine's authoritative
+    /// `note_split().crossing_values()[crossing]` (trivially — that is now its input) AND the
+    /// legacy `funding_notes()[crossing] - note_fee_buffer` computation it replaces, proven equal
+    /// for a real `NoteSplitPlan`. Pure refactor: values are identical, so this is green
+    /// immediately (no red phase — see F3's task doc).
     #[test]
-    fn schedule_rows_reject_funding_note_below_fee_buffer() {
-        let mut rng = StdRng::seed_from_u64(7);
-        let schedule = scheduling::schedule(h(1_000), 1, &mut rng);
-        let amounts = vec![zat(100)];
-        assert!(schedule_rows(&amounts, &schedule, 0, zat(10_000)).is_err());
+    fn schedule_rows_amount_matches_engine_crossing_values_and_legacy_subtraction() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let crossing_values = vec![zat(100_000_000), zat(250_000_000), zat(40_000_000)];
+        let note_split = NoteSplitPlan::from_stored_parts(
+            crossing_values.clone(),
+            zat(10_000),
+            None,
+            zat(20_000),
+            zat(1_000_000_000),
+            zat(999_000_000),
+        )
+        .unwrap();
+        let schedule = scheduling::schedule(h(1_000), crossing_values.len(), &mut rng);
+        let rows = schedule_rows(note_split.crossing_values(), &schedule, 0).unwrap();
+        assert_eq!(rows.len(), crossing_values.len());
+        for (id, amount, _, _) in &rows {
+            let crossing = u32::from(*id) as usize;
+            // Side 1 of the identity: the engine's authoritative crossing value.
+            assert_eq!(*amount, note_split.crossing_values()[crossing]);
+            // Side 2: the legacy `funding_notes()[crossing] - note_fee_buffer` computation F3
+            // replaced — provably the same value, never re-derived at runtime anymore.
+            let legacy = (note_split.migration_outputs()[crossing] - note_split.note_fee_buffer())
+                .expect("a real plan's funding note is never smaller than its own fee buffer");
+            assert_eq!(*amount, legacy);
+        }
     }
 
     // ----- verified consent echoes (F4) -----
