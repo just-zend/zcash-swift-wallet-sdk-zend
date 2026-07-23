@@ -4573,10 +4573,10 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         return migrationRefreshStaleTransfersUskForCallsCount > 0
     }
     var migrationRefreshStaleTransfersUskForReceivedArguments: (usk: UnifiedSpendingKey?, account: AccountUUID)?
-    var migrationRefreshStaleTransfersUskForReturnValue: UInt32!
-    var migrationRefreshStaleTransfersUskForClosure: ((UnifiedSpendingKey?, AccountUUID) async throws -> UInt32)?
+    var migrationRefreshStaleTransfersUskForReturnValue: MigrationSchedule!
+    var migrationRefreshStaleTransfersUskForClosure: ((UnifiedSpendingKey?, AccountUUID) async throws -> MigrationSchedule)?
 
-    func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey?, for account: AccountUUID) async throws -> UInt32 {
+    func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey?, for account: AccountUUID) async throws -> MigrationSchedule {
         if let error = migrationRefreshStaleTransfersUskForThrowableError {
             throw error
         }

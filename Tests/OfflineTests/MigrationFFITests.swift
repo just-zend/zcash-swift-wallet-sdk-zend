@@ -260,20 +260,24 @@ final class MigrationFFITests: XCTestCase {
     }
 
     /// Rebuild-on-expiry is live in the engine: on a fresh wallet with NO stored migration run
-    /// there is nothing to refresh, so `refreshStaleTransfers` returns the legitimate count `0`
-    /// — not a throw. The in-process lane (a real spending key selects sign-anew rebuilds).
-    func testRefreshStaleTransfersOnFreshWalletReturnsZeroWithSpendingKey() async throws {
+    /// there is nothing to refresh and nothing to re-display, so `refreshStaleTransfers` returns
+    /// the legitimate EMPTY schedule — not a throw. (The call returns the run's stored schedule
+    /// so a host can re-display and echo the post-refresh truth; with no run stored that truth
+    /// is empty.) The in-process lane (a real spending key selects sign-anew rebuilds).
+    func testRefreshStaleTransfersOnFreshWalletReturnsAnEmptyScheduleWithSpendingKey() async throws {
         let refreshed = try await rustBackend.migrationRefreshStaleTransfers(usk: usk, for: account)
-        XCTAssertEqual(refreshed, 0)
+        XCTAssertTrue(refreshed.transfers.isEmpty)
+        XCTAssertEqual(refreshed.estimatedDurationHours, 0)
     }
 
     /// The external-signer lane of the same nothing-to-refresh answer: a `nil` spending key
     /// (NULL over the FFI) selects the unsigned rebuild and must be a legitimate input — an
     /// imported hardware-wallet account has no in-process spend authority — so it too returns
-    /// `0` on a fresh wallet rather than throwing.
-    func testRefreshStaleTransfersOnFreshWalletReturnsZeroWithNilSpendingKey() async throws {
+    /// the empty schedule on a fresh wallet rather than throwing.
+    func testRefreshStaleTransfersOnFreshWalletReturnsAnEmptyScheduleWithNilSpendingKey() async throws {
         let refreshed = try await rustBackend.migrationRefreshStaleTransfers(usk: nil, for: account)
-        XCTAssertEqual(refreshed, 0)
+        XCTAssertTrue(refreshed.transfers.isEmpty)
+        XCTAssertEqual(refreshed.estimatedDurationHours, 0)
     }
 
     /// Guards against last-error-channel pollution across calls: a throwing call must not corrupt
@@ -282,7 +286,7 @@ final class MigrationFFITests: XCTestCase {
     /// sandwiched around it. The throwing predecessor is `recordTransferResult` with no active
     /// run — deterministic and sync-independent (see
     /// `testRecordTransferResultWithNoActiveRunThrows`) — now that `refreshStaleTransfers`
-    /// legitimately returns `0` on this fixture instead of throwing.
+    /// legitimately returns the empty schedule on this fixture instead of throwing.
     func testHasOverdueTransfersIsUnaffectedByAPrecedingThrowingMigrationCall() async throws {
         let before = try await rustBackend.migrationHasOverdueTransfers(for: account)
         XCTAssertFalse(before)

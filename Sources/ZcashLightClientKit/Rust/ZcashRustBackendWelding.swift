@@ -538,16 +538,24 @@ protocol ZcashRustBackendWelding {
     /// boundary anchor. Passing a spending key signs each rebuilt transfer anew in-process;
     /// passing `nil` (an external-signer account, whose spend authority never exists on this
     /// device) leaves it awaiting its signature, so the `migrationCreateUnsignedTransferPczts` /
-    /// `migrationStoreSignedSchedulePczts` ceremony re-serves and completes it. Returns the
-    /// number of transfers rebuilt (`0` when no run is stored, the run is terminal, or nothing
-    /// has expired), persisted all-or-nothing.
+    /// `migrationStoreSignedSchedulePczts` ceremony re-serves and completes it.
+    ///
+    /// Returns the run's FULL transfer schedule as stored AFTER the refresh — the same shape
+    /// `migrationRestartStep` returns, here read from the persisted run. The rebuilt state
+    /// persists all-or-nothing, and the returned schedule is that atomically-persisted truth:
+    /// the host must re-display it and echo it on the consent-verified calls (a rebuilt
+    /// transfer's fresh scheduled/expiry heights exist nowhere else, so holding on to the
+    /// pre-refresh copy would fail the schedule echo with `migrationPlanStale` from then on).
+    /// With nothing expired the current stored schedule comes back unchanged; with no stored
+    /// run, or a terminal (completed or cancelled) one, the schedule is empty.
     /// - Throws: `rustMigrationRefreshStaleTransfers` if the rust layer returns an error —
     ///   notably when an expired transfer's funding note was spent outside the migration, where
-    ///   the message names `restartCurrentMigrationStep` (cancel and re-plan) as the remedy.
+    ///   the message names `restartCurrentMigrationStep` (cancel and re-plan) as the remedy. On
+    ///   any throw nothing was persisted.
     func migrationRefreshStaleTransfers(
         usk: UnifiedSpendingKey?,
         for account: AccountUUID
-    ) async throws -> UInt32
+    ) async throws -> MigrationSchedule
 
     /// Builds the whole previewed migration UNSIGNED for an external signer — the run is created
     /// by this call, with every transaction persisted awaiting its signature — and returns the
