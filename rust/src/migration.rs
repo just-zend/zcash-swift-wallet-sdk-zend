@@ -4,8 +4,9 @@
 //! The engine is a set of free functions over traits — [`crate::migration_engine::Backend`] wires
 //! this SDK's wallet database (and the account-keyed migration store living inside it) into them;
 //! [`crate::migration_finalize`] proves transactions at broadcast time (ZIP 374 deferred
-//! anchors/witnesses; see its module doc for the anchor policy and its current, approved ZIP 318
-//! deviation); [`crate::migration_plan_cache`] carries the previewed plan from propose to commit.
+//! anchors/witnesses, resolved through the upstream prover — transfers against their drawn
+//! ZIP 318 boundary anchor, preparations against the natural anchor; see its module doc);
+//! [`crate::migration_plan_cache`] carries the previewed plan from propose to commit.
 //! This module keeps the platform-facing C ABI of the v1 integration: the same entry points, the
 //! same `#[repr(C)]` DTOs, the same sentinels — the engine swap is absorbed here, with two
 //! deliberate exceptions (the external-signer note-split pair went plural, because the engine
@@ -62,6 +63,7 @@ use zcash_pool_migration_backend::engine::{
     self, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction, MigrationTxId,
     MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
+use zcash_pool_migration_backend::wallet::WalletMigrationProver;
 
 use crate::migration_engine::{Backend, MigrationWallet};
 use crate::migration_finalize;
@@ -86,8 +88,9 @@ fn plan_stale(detail: &str) -> anyhow::Error {
 }
 
 /// Proving a migration transaction failed hard (as opposed to the transient "not witnessable yet"
-/// state, which is reported as "nothing due").
-fn proving_unavailable(detail: impl std::fmt::Display) -> anyhow::Error {
+/// state, which is reported as "nothing due"). Shared with [`crate::migration_finalize`], where
+/// the prove dispatch classifies prover failures onto the two lanes.
+pub(crate) fn proving_unavailable(detail: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("{PROVING_UNAVAILABLE_PREFIX}: {detail}")
 }
 
@@ -540,11 +543,13 @@ fn map_commit_err(e: engine::CommitError<anyhow::Error>) -> anyhow::Error {
     }
 }
 
-/// Proves a due transaction if it is still `Signed` (installing anchor + witnesses per the policy
-/// in [`migration_finalize`]), persisting the proven bytes through the engine's own `Proved`
-/// state. Returns the broadcastable `(proven pczt bytes, txid)` — or `None` when the transaction
-/// is not finalizable yet (funding note not yet observed/witnessable), the ordinary transient
-/// state the caller maps to "nothing due".
+/// Proves a due transaction if it is still `Signed`, dispatching through the upstream engine
+/// prover ([`migration_finalize::prove_due_transaction`] driving a `WalletMigrationProver`): a
+/// transfer against the boundary anchor persisted on its row, a preparation against the wallet's
+/// natural anchor. The engine persists the proven bytes through its own `Proved` state. Returns
+/// the broadcastable `(proven pczt bytes, txid)` — or `None` when the wallet has not
+/// scanned/retained the needed anchor yet (a restored wallet mid-sync, a boundary not yet
+/// checkpointed), the ordinary transient state the caller maps to "nothing due".
 fn prove_if_needed(
     ctx: &mut CallCtx,
     state: &mut MigrationState,
@@ -566,33 +571,29 @@ fn prove_if_needed(
             Ok(Some((bytes, txid)))
         }
         MigrationTxState::Signed => {
-            let anchor = migration_finalize::resolve_proving_anchor(&ctx.wallet, tx)?;
-            let (fvk, spendable) = {
-                let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-                (
-                    backend.stored_orchard_fvk()?,
-                    backend.spendable_orchard_notes()?,
-                )
-            };
-            let pczt_bytes = tx.pczt().clone();
-            match migration_finalize::finalize_transaction(
-                &mut ctx.wallet,
-                &fvk,
-                &spendable,
-                anchor,
-                &pczt_bytes,
-            )
-            .map_err(proving_unavailable)?
+            let natural_anchor = migration_finalize::natural_anchor_height(&ctx.wallet)?;
+            let fvk = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?
+                .stored_orchard_fvk()?;
+            let mut prover = WalletMigrationProver::new(&mut ctx.wallet, ctx.account, fvk);
+            if migration_finalize::prove_due_transaction(&mut prover, state, id, natural_anchor)?
+                .is_none()
             {
-                Some((proven, txid)) => {
-                    state.set_transaction_proved(id, proven.clone());
-                    let mut backend =
-                        Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-                    backend.replace_migration(state)?;
-                    Ok(Some((proven, txid)))
-                }
-                None => Ok(None),
+                // Not scanned/retained yet — transient, retry on a later call.
+                return Ok(None);
             }
+            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend.replace_migration(state)?;
+            // Re-read the engine-stored proven bytes and extract the txid to serve alongside.
+            let tx = state
+                .transactions()
+                .iter()
+                .find(|t| t.id() == id)
+                .ok_or_else(|| anyhow!("no migration transaction with id {}", u32::from(id)))?;
+            let bytes = tx.pczt().clone();
+            let pczt = pczt::Pczt::parse(&bytes)
+                .map_err(|e| proving_unavailable(format!("re-parse proven pczt: {e:?}")))?;
+            let (_, txid) = migration_finalize::extract_tx(pczt).map_err(proving_unavailable)?;
+            Ok(Some((bytes, txid)))
         }
         other => Err(anyhow!(
             "migration transaction {} is not broadcastable (state {})",
@@ -2638,5 +2639,306 @@ mod tests {
         );
         unsafe { zcashlc_free_migration_state(ptr) };
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- prove dispatch (kind routing + transient/hard error mapping) -----
+
+    use zcash_pool_migration_backend::engine::MigrationProver;
+    use zcash_pool_migration_backend::wallet::WalletProveError;
+    use zcash_protocol::consensus::BranchId;
+
+    /// The prover error type the dispatch tests fail with: the REAL upstream
+    /// [`WalletProveError`] (so the classification under test is the production one), with unit
+    /// tree/note/chain-state error parameters.
+    type TestProveError = WalletProveError<(), (), ()>;
+
+    /// Which prover method the dispatch routed a transaction to, and with which anchor.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ProveCall {
+        Transfer(BlockHeight),
+        Preparation(BlockHeight),
+    }
+
+    /// A recording test prover: captures every call and "proves" by returning the PCZT unchanged.
+    struct RecordingProver {
+        calls: Vec<ProveCall>,
+    }
+
+    impl MigrationProver for RecordingProver {
+        type Error = TestProveError;
+
+        fn prove_transfer(
+            &mut self,
+            pczt: pczt::Pczt,
+            anchor_boundary: BlockHeight,
+        ) -> Result<pczt::Pczt, Self::Error> {
+            self.calls.push(ProveCall::Transfer(anchor_boundary));
+            Ok(pczt)
+        }
+
+        fn prove_preparation(
+            &mut self,
+            pczt: pczt::Pczt,
+            anchor: BlockHeight,
+        ) -> Result<pczt::Pczt, Self::Error> {
+            self.calls.push(ProveCall::Preparation(anchor));
+            Ok(pczt)
+        }
+    }
+
+    /// A test prover that fails its one expected call with the configured error.
+    struct FailingProver {
+        error: Option<TestProveError>,
+    }
+
+    impl MigrationProver for FailingProver {
+        type Error = TestProveError;
+
+        fn prove_transfer(
+            &mut self,
+            _pczt: pczt::Pczt,
+            _anchor_boundary: BlockHeight,
+        ) -> Result<pczt::Pczt, Self::Error> {
+            Err(self.error.take().expect("the prover is consulted once"))
+        }
+
+        fn prove_preparation(
+            &mut self,
+            _pczt: pczt::Pczt,
+            _anchor: BlockHeight,
+        ) -> Result<pczt::Pczt, Self::Error> {
+            Err(self.error.take().expect("the prover is consulted once"))
+        }
+    }
+
+    /// Minimal valid PCZT bytes (an empty NU6.3 v6 PCZT). The engine's prove path parses the
+    /// stored PCZT before consulting the prover, so prove fixtures need bytes that parse — unlike
+    /// the state-derivation fixtures' `vec![0u8]` placeholder.
+    fn minimal_pczt_bytes() -> Vec<u8> {
+        pczt::roles::creator::Creator::new(u32::from(BranchId::Nu6_3), 10_000, 133, None, None)
+            .expect("an NU6.3 PCZT creator")
+            .build()
+            .expect("an empty v6 PCZT builds")
+            .serialize()
+            .expect("an empty v6 PCZT serializes")
+    }
+
+    /// The [`test_state`] skeleton (`InProgress`, scheduled 50, expiry 10_000) with parseable
+    /// PCZT bytes on every transaction and the given drawn boundary on every TRANSFER row
+    /// (preparation rows keep `None` — they never carry one).
+    fn provable_state(
+        prep_states: &[MigrationTxState],
+        transfer_states: &[MigrationTxState],
+        transfer_boundary: Option<BlockHeight>,
+    ) -> MigrationState {
+        let base = test_state(
+            MigrationStatus::InProgress,
+            prep_states,
+            transfer_states,
+            50,
+            10_000,
+        );
+        let bytes = minimal_pczt_bytes();
+        let transactions = base
+            .transactions()
+            .iter()
+            .map(|t| {
+                MigrationTransaction::from_parts(
+                    t.id(),
+                    t.kind(),
+                    bytes.clone(),
+                    t.depends_on().clone(),
+                    t.scheduled_height(),
+                    t.expiry_height(),
+                    match t.kind() {
+                        MigrationTxKind::Transfer { .. } => transfer_boundary,
+                        MigrationTxKind::Preparation { .. } => None,
+                    },
+                    t.state(),
+                    t.lock_owner(),
+                )
+            })
+            .collect();
+        MigrationState::from_parts(
+            base.status(),
+            base.note_split().clone(),
+            base.preparation().clone(),
+            transactions,
+        )
+    }
+
+    /// A TRANSFER proves via `prove_transfer` with EXACTLY the boundary persisted on its row —
+    /// not the natural anchor passed alongside — and the proven bytes persist through the
+    /// engine's `Proved` state.
+    #[test]
+    fn prove_dispatch_routes_a_transfer_to_its_stored_boundary() {
+        let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let res = migration_finalize::prove_due_transaction(
+            &mut prover,
+            &mut state,
+            MigrationTxId::new(1),
+            h(999),
+        )
+        .expect("a boundary-carrying transfer proves");
+        assert_eq!(res, Some(()), "the transfer must prove, not defer");
+        assert_eq!(
+            prover.calls,
+            vec![ProveCall::Transfer(h(1440))],
+            "the prover must receive the row's drawn boundary, never the natural anchor"
+        );
+        let tx = state
+            .transactions()
+            .iter()
+            .find(|t| t.id() == MigrationTxId::new(1))
+            .expect("the transfer row remains");
+        assert!(
+            matches!(tx.state(), MigrationTxState::Proved),
+            "the engine must persist Signed -> Proved"
+        );
+        let expected = pczt::Pczt::parse(&minimal_pczt_bytes())
+            .expect("fixture bytes parse")
+            .serialize()
+            .expect("fixture pczt re-serializes");
+        assert_eq!(
+            tx.pczt(),
+            &expected,
+            "the stored artifact must be the proven PCZT the prover returned"
+        );
+    }
+
+    /// A PREPARATION proves via `prove_preparation` with the caller-supplied natural anchor (a
+    /// preparation carries no drawn boundary).
+    #[test]
+    fn prove_dispatch_routes_a_preparation_to_the_natural_anchor() {
+        let mut state = provable_state(
+            &[MigrationTxState::Signed],
+            &[MigrationTxState::Signed],
+            Some(h(1440)),
+        );
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let res = migration_finalize::prove_due_transaction(
+            &mut prover,
+            &mut state,
+            MigrationTxId::new(0),
+            h(777),
+        )
+        .expect("a signed preparation proves");
+        assert_eq!(res, Some(()), "the preparation must prove, not defer");
+        assert_eq!(
+            prover.calls,
+            vec![ProveCall::Preparation(h(777))],
+            "the prover must receive the natural anchor"
+        );
+        let tx = state
+            .transactions()
+            .iter()
+            .find(|t| t.id() == MigrationTxId::new(0))
+            .expect("the preparation row remains");
+        assert!(
+            matches!(tx.state(), MigrationTxState::Proved),
+            "the engine must persist Signed -> Proved"
+        );
+    }
+
+    /// A TRANSFER whose row carries NO drawn boundary is a corrupt store: a hard error on the
+    /// proving-unavailable route — never a silent fallback to the natural anchor (the prover is
+    /// not consulted at all).
+    #[test]
+    fn prove_dispatch_transfer_without_boundary_is_a_hard_error() {
+        let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], None);
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let err = migration_finalize::prove_due_transaction(
+            &mut prover,
+            &mut state,
+            MigrationTxId::new(1),
+            h(999),
+        )
+        .expect_err("a boundary-less transfer must not prove");
+        assert!(
+            err.to_string().starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "the corrupt store must surface on the proving-unavailable route, got: {err}"
+        );
+        assert!(
+            prover.calls.is_empty(),
+            "the prover must never be consulted without a boundary"
+        );
+        let tx = state
+            .transactions()
+            .iter()
+            .find(|t| t.id() == MigrationTxId::new(1))
+            .expect("the transfer row remains");
+        assert!(
+            matches!(tx.state(), MigrationTxState::Signed),
+            "the transaction must stay Signed"
+        );
+    }
+
+    /// Every prover failure meaning "the wallet has not scanned or retained that boundary yet"
+    /// (a restored wallet mid-sync, or a transfer due before the wallet scanned past its
+    /// boundary) maps to the transient nothing-due `Ok(None)`, leaving the transaction `Signed`
+    /// for a later retry.
+    #[test]
+    fn prove_dispatch_maps_every_transient_prover_error_to_nothing_due() {
+        let transients: Vec<TestProveError> = vec![
+            WalletProveError::AnchorNotFound(h(1440)),
+            WalletProveError::WitnessNotFound(h(1440)),
+            WalletProveError::ChainTipUnknown,
+            WalletProveError::IronwoodTreeUnavailable,
+        ];
+        for error in transients {
+            let label = format!("{error}");
+            let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
+            let mut prover = FailingProver { error: Some(error) };
+            let res = migration_finalize::prove_due_transaction(
+                &mut prover,
+                &mut state,
+                MigrationTxId::new(1),
+                h(999),
+            )
+            .unwrap_or_else(|e| panic!("{label} must be transient, got hard error: {e}"));
+            assert_eq!(res, None, "{label} must map to the nothing-due lane");
+            let tx = state
+                .transactions()
+                .iter()
+                .find(|t| t.id() == MigrationTxId::new(1))
+                .expect("the transfer row remains");
+            assert!(
+                matches!(tx.state(), MigrationTxState::Signed),
+                "{label} must leave the transaction Signed for a retry"
+            );
+        }
+    }
+
+    /// Every other prover failure is HARD and carries the stable proving-unavailable prefix the
+    /// Swift layer maps to `migrationProvingUnavailable`.
+    #[test]
+    fn prove_dispatch_routes_hard_prover_errors_through_the_proving_unavailable_prefix() {
+        let nullifier = Option::from(orchard::note::Nullifier::from_bytes(&[0u8; 32]))
+            .expect("zero is a valid nullifier encoding");
+        let hards: Vec<TestProveError> = vec![
+            WalletProveError::UnknownSpentNote(nullifier),
+            WalletProveError::Notes(()),
+            WalletProveError::Tree(shardtree::error::ShardTreeError::Query(
+                shardtree::error::QueryError::CheckpointPruned,
+            )),
+            WalletProveError::Prove("proof backend failure".into()),
+        ];
+        for error in hards {
+            let label = format!("{error}");
+            let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
+            let mut prover = FailingProver { error: Some(error) };
+            let err = migration_finalize::prove_due_transaction(
+                &mut prover,
+                &mut state,
+                MigrationTxId::new(1),
+                h(999),
+            )
+            .expect_err(&format!("{label} must be a hard error"));
+            assert!(
+                err.to_string().starts_with(PROVING_UNAVAILABLE_PREFIX),
+                "{label} must carry the proving-unavailable prefix, got: {err}"
+            );
+        }
     }
 }

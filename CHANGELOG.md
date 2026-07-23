@@ -36,10 +36,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the residual stays in Orchard per ZIP 318), and the external-signer note-split pair went plural
   (`migrationCreateUnsignedNoteSplitPczts` / `migrationStoreSignedNoteSplitPczts`): the engine
   builds N preparation transactions rather than one split transaction, and one signing ceremony
-  covers them all. Transfers currently prove against the wallet's natural anchor (an approved,
-  loudly-documented ZIP 318 stopgap: upstream anchor-checkpoint retention landed — librustzcash
-  #2700/#2710 — but retains every 288 blocks while boundaries are drawn on the 144-block grid, so
-  flipping now would leave the odd-multiple half of the draws permanently unwitnessable). Hardened
+  covers them all. Transfers prove against the boundary anchor their schedule drew (ZIP 318
+  anchor cohorts), through the upstream prover: proving reads each transfer's persisted boundary
+  and resolves its anchors and witnesses at that checkpoint, which upstream anchor-checkpoint
+  retention (librustzcash #2700/#2710) keeps durably witnessable on the matching 144-block
+  boundary grid from NU6.3 activation; preparation transactions prove against the wallet's
+  natural anchor, and a boundary the wallet has not scanned or retained yet surfaces as the
+  transient "nothing due", not an error. Hardened
   per the adversarial review: the FFI last-error channel is cleared before every
   sentinel read (stale errors can no longer surface as spurious throws elsewhere) and one-time
   rust initialization is race-free. No `Synchronizer` API changes in this PR.
