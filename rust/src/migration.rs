@@ -576,20 +576,17 @@ struct EchoRow {
 
 /// One transfer's consent-echo fields, checked against the STORED (post-commit) migration state
 /// (see [`validate_schedule_echo_against_state`]). Unlike [`EchoRow`], `next_executable_after_height`
-/// is absent here — not just unchecked, structurally not part of the comparison — because it can
-/// legitimately change between what the platform previewed and what ends up stored:
-/// `zcashlc_migration_propose_immediate_transfers` previews every transfer's
-/// `next_executable_after_height` as the tip AT PREVIEW TIME (`T0`), but `commit_or_resume`'s
-/// immediate-lane branch rewrites every transfer's stored `scheduled_height` to the tip AT COMMIT
-/// TIME (`T1`) and clears the plan cache. Whenever a block lands during the user's review window
-/// (ordinary Zcash block times, ~75s — not a rare race), `T1 != T0`, so an honest, unmodified echo
-/// of the preview the user actually approved would mismatch the stored state on this field alone.
-/// Unlike a genuinely stale plan, the platform cannot converge on a match by re-proposing here:
-/// re-proposing only produces a NEW cache entry with yet another preview-time tip, while the
-/// STORED value is already fixed by the completed commit — re-proposing never re-touches it. So
-/// comparing this field post-commit would surface `MIGRATION_PLAN_STALE` on a correct, unmodified
-/// echo with no recovery path, which is worse than not checking it. `ids`/`amounts`/
-/// `expiry_heights` do not have this problem (the commit never rewrites them for either lane).
+/// is absent here — not just unchecked, structurally not part of the comparison — because a
+/// stored transfer's scheduled height can legitimately move after the platform captured its
+/// display copy: `zcashlc_migration_refresh_stale_transfers` rebuilds an expired transfer with a
+/// FRESH scheduled height drawn from the current tip (the whole point of the rebuild). An honest,
+/// unmodified echo of what the platform last displayed would then mismatch the stored state on
+/// this field alone — and unlike a genuinely stale plan, re-proposing can never converge here:
+/// the STORED value is already fixed by the committed run, and re-proposing never re-touches it.
+/// So comparing this field post-commit would surface `MIGRATION_PLAN_STALE` on a correct echo
+/// with no recovery path, which is worse than not checking it (the refresh call returns the
+/// fresh schedule precisely so the platform can re-display and re-echo it). `ids`/`amounts`/
+/// `expiry_heights` are pinned at commit and never silently rewritten under an unchanged run.
 ///
 /// `estimated_duration_hours` (returned alongside these rows, not a field of this struct — see
 /// [`expected_rows_from_state`]) has the SAME problem since #1806 and is excluded from the
@@ -3776,9 +3773,9 @@ mod tests {
         assert!(err.to_string().starts_with(PLAN_STALE_PREFIX));
     }
 
-    /// Regression test for the false-fail the review caught: `propose_immediate_transfers`
-    /// previews `next_executable_after_height` as the tip AT PREVIEW TIME, but the immediate
-    /// lane's commit rewrites the STORED `scheduled_height` to the tip AT COMMIT TIME — these
+    /// Regression test for the false-fail the review caught: the platform's display copy carries
+    /// the `next_executable_after_height` it last saw, but a stored transfer's `scheduled_height`
+    /// legitimately moves (a refresh rebuild reschedules from the current tip) — these
     /// legitimately differ whenever a block lands during the user's review window (ordinary
     /// ~75s Zcash block times, not a rare race). An honest, unmodified echo of the displayed
     /// preview must still succeed against the stored state even though this one field "drifted";
