@@ -40,10 +40,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builds N preparation transactions rather than one split transaction, and one signing ceremony
   covers them all. The schedule/note-split echo parameters on `signAndStoreSchedule`,
   `createUnsignedTransferPczts`, and `signNoteSplit` are verified consent echoes, not inert
-  display values: each is checked against the previewed plan (or, once committed, the stored
+  display values: they are checked against the previewed plan (or, once committed, the stored
   state) and a mismatch throws `migrationPlanStale` — the same "re-propose and re-display"
   recovery as an actually stale plan — so a stale or tampered display can never sign different
-  values than the ones the user approved. `migrationRefreshStaleTransfers(usk:for:)` rebuilds every expired transfer of
+  values than the ones the user approved. Ids, amounts, expiry heights, and the estimated
+  duration are always compared; `nextExecutableAfterHeight` is compared only against the
+  previewed plan, never post-commit (the immediate lane's commit-time reschedule legitimately
+  moves it away from an honest echo), and `anchorHeight` is display-only, never compared. `migrationRefreshStaleTransfers(usk:for:)` rebuilds every expired transfer of
   the stored run in place through the engine's rebuild-on-expiry — the same funding note
   (recovered by nullifier identity from the expired PCZT, never an equal-value substitute),
   rescheduled from the current tip with a fresh canonical expiry and a freshly drawn boundary

@@ -436,8 +436,13 @@ protocol ZcashRustBackendWelding {
     func migrationPrepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
 
     /// Builds, signs, and persists the note-split transaction; returns the broadcastable prepared
-    /// transfer.
-    /// - Throws: `rustMigrationSignNoteSplit` if the rust layer returns an error.
+    /// transfer. `proposal` is a VERIFIED consent echo, not an inert display value: its output
+    /// values and fee are checked against the previewed note split when one is cached for the
+    /// account, so a stale or tampered display cannot sign different values than the ones the
+    /// user approved.
+    /// - Throws: `migrationPlanStale` when the echo mismatches the previewed plan, or when no
+    ///   previewed plan is cached and no resumable run is stored — re-propose and re-display;
+    ///   `rustMigrationSignNoteSplit` for other rust-layer errors.
     func migrationSignNoteSplit(
         proposal: NoteSplitProposal,
         usk: UnifiedSpendingKey,
@@ -489,8 +494,18 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationProposeImmediateTransfers` if the rust layer returns an error.
     func migrationProposeImmediateTransfers(for account: AccountUUID) async throws -> MigrationSchedule
 
-    /// Pre-signs and persists every transfer in `schedule`.
-    /// - Throws: `rustMigrationSignAndStoreSchedule` if the rust layer returns an error.
+    /// Pre-signs and persists every transfer in `schedule` (a no-op when a matching non-terminal
+    /// run is already stored — the normal case, since the note-split submission commits the run).
+    /// `schedule` is a VERIFIED consent echo of what the user approved, not an inert display
+    /// value: ids, amounts, expiry heights, and the estimated duration are checked against the
+    /// previewed plan (or, once a run is committed, against the stored run itself);
+    /// `nextExecutableAfterHeight` is additionally checked against the preview before commit but
+    /// never post-commit (the immediate lane's commit-time reschedule can legitimately move it
+    /// away from an honest echo), and `anchorHeight` is display-only, never compared.
+    /// - Throws: `migrationPlanStale` when the echo mismatches, or when nothing is committed and
+    ///   no previewed plan is cached — recover by re-proposing and re-displaying (pre-commit) or
+    ///   re-reading the stored schedule (post-commit); `rustMigrationSignAndStoreSchedule` for
+    ///   other rust-layer errors.
     func migrationSignAndStoreSchedule(
         _ schedule: MigrationSchedule,
         usk: UnifiedSpendingKey,
@@ -577,10 +592,18 @@ protocol ZcashRustBackendWelding {
     ) async throws -> PreparedMigrationTransfer
 
     /// Serves the TRANSFER subset of the unsigned build for the signing ceremony (see
-    /// `migrationCreateUnsignedNoteSplitPczts` — the schedule echo is accepted and ignored; the
-    /// engine signs the stored build, not a caller echo).
-    /// - Throws: `migrationPlanStale` when nothing is committed and no previewed plan is cached;
-    ///   `rustMigrationCreateUnsignedTransferPczts` for other rust-layer errors.
+    /// `migrationCreateUnsignedNoteSplitPczts`). `schedule` is a VERIFIED consent echo, not an
+    /// inert display value: its ids, amounts, expiry heights, and estimated duration are checked
+    /// against the STORED committed run this call serves from, so a stale or tampered display
+    /// cannot route different values than the ones the user approved into the ceremony.
+    /// `nextExecutableAfterHeight` is accepted but not compared post-commit (the immediate
+    /// lane's commit-time reschedule can legitimately move it away from an honest echo, with no
+    /// way to converge by re-proposing), and `anchorHeight` is display-only, never compared.
+    /// - Throws: `migrationPlanStale` when the echoed schedule does not match the stored run —
+    ///   recover by re-reading the run's stored schedule (`migrationRefreshStaleTransfers`
+    ///   returns exactly that) and re-displaying it — or when nothing is committed and no
+    ///   previewed plan is cached; `rustMigrationCreateUnsignedTransferPczts` for other
+    ///   rust-layer errors.
     func migrationCreateUnsignedTransferPczts(
         for schedule: MigrationSchedule,
         for account: AccountUUID
