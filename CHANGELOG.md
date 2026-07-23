@@ -74,8 +74,12 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   (`executeNextPendingMigrationTransfer` — migration members work without `prepare()`, so a
   background session can broadcast without starting sync; the delivery lane serves preparation
   transactions and transfers alike, proving each at broadcast time per ZIP 374), overdue/invalid
-  detection with the stored-run reschedule accessor and cancel-and-replan restart recovery
-  (`refreshStaleMigrationTransfers` always throws: rebuild-on-expiry is an upstream later-slice),
+  detection with the stored-run reschedule accessor, cancel-and-replan restart recovery
+  (`restartCurrentMigrationStep`), and rebuild-on-expiry recovery
+  (`refreshStaleMigrationTransfers(accountUUID:usk:)` rebuilds every EXPIRED transfer of the stored
+  run in place — the same funding note on a fresh schedule/expiry/boundary — with an optional `usk`
+  selecting the in-process-sign or external-signer (Keystone) lane; a funding note spent outside the
+  migration surfaces an error naming `restartCurrentMigrationStep` as the remedy),
   the per-run `complete` + fresh-propose sequential-runs contract, and an external-signer (PCZT)
   path for hardware wallets (`createUnsignedNoteSplitPCZTs` / `storeSignedNoteSplitPCZTs` — plural:
   the engine builds N preparation transactions, and one ceremony signs them together with
