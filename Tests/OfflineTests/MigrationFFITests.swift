@@ -259,33 +259,44 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertEqual(first, second)
     }
 
-    /// The final engine does not support rebuild-on-expiry (an explicit upstream later-slice), so
-    /// `refreshStaleTransfers` deterministically throws its member case, sync-independent.
-    func testRefreshStaleTransfersAlwaysThrowsUnsupported() async throws {
-        do {
-            _ = try await rustBackend.migrationRefreshStaleTransfers(usk: usk, includeResidual: false, for: account)
-            XCTFail("Expected migrationRefreshStaleTransfers to throw (unsupported by the final engine)")
-        } catch ZcashError.rustMigrationRefreshStaleTransfers {
-            // expected
-        } catch {
-            XCTFail("Expected rustMigrationRefreshStaleTransfers but got \(error)")
-        }
+    /// Rebuild-on-expiry is live in the engine: on a fresh wallet with NO stored migration run
+    /// there is nothing to refresh, so `refreshStaleTransfers` returns the legitimate count `0`
+    /// — not a throw. The in-process lane (a real spending key selects sign-anew rebuilds).
+    func testRefreshStaleTransfersOnFreshWalletReturnsZeroWithSpendingKey() async throws {
+        let refreshed = try await rustBackend.migrationRefreshStaleTransfers(usk: usk, for: account)
+        XCTAssertEqual(refreshed, 0)
     }
 
-    /// Guards against last-error-channel pollution across calls: a throwing call
-    /// (`refreshStaleTransfers`, which deterministically errors — see above) must not corrupt the
-    /// next legitimate `false` answer from an ambiguous-bool-sentinel call (`hasOverdueTransfers`,
-    /// which reads only the empty migration store on a fresh db) sandwiched around it.
-    func testHasOverdueTransfersIsUnaffectedByAPrecedingThrowFromRefreshStaleTransfers() async throws {
+    /// The external-signer lane of the same nothing-to-refresh answer: a `nil` spending key
+    /// (NULL over the FFI) selects the unsigned rebuild and must be a legitimate input — an
+    /// imported hardware-wallet account has no in-process spend authority — so it too returns
+    /// `0` on a fresh wallet rather than throwing.
+    func testRefreshStaleTransfersOnFreshWalletReturnsZeroWithNilSpendingKey() async throws {
+        let refreshed = try await rustBackend.migrationRefreshStaleTransfers(usk: nil, for: account)
+        XCTAssertEqual(refreshed, 0)
+    }
+
+    /// Guards against last-error-channel pollution across calls: a throwing call must not corrupt
+    /// the next legitimate `false` answer from an ambiguous-bool-sentinel call
+    /// (`hasOverdueTransfers`, which reads only the empty migration store on a fresh db)
+    /// sandwiched around it. The throwing predecessor is `recordTransferResult` with no active
+    /// run — deterministic and sync-independent (see
+    /// `testRecordTransferResultWithNoActiveRunThrows`) — now that `refreshStaleTransfers`
+    /// legitimately returns `0` on this fixture instead of throwing.
+    func testHasOverdueTransfersIsUnaffectedByAPrecedingThrowingMigrationCall() async throws {
         let before = try await rustBackend.migrationHasOverdueTransfers(for: account)
         XCTAssertFalse(before)
 
         do {
-            _ = try await rustBackend.migrationRefreshStaleTransfers(usk: usk, includeResidual: false, for: account)
-            XCTFail("Expected migrationRefreshStaleTransfers to throw")
+            try await rustBackend.migrationRecordTransferResult(
+                transferId: "does-not-exist",
+                result: MigrationTransferResult.networkError(retryable: true),
+                for: account
+            )
+            XCTFail("Expected recording a result with no active migration run to throw")
         } catch {
             // Expected; the specific case is asserted by
-            // testRefreshStaleTransfersAlwaysThrowsUnsupported above.
+            // testRecordTransferResultWithNoActiveRunThrows above.
         }
 
         let after = try await rustBackend.migrationHasOverdueTransfers(for: account)

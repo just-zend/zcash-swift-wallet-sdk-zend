@@ -50,8 +50,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `zcashlc_migration_extract_broadcast_tx`,
     `zcashlc_migration_record_transfer_result`,
     `zcashlc_migration_is_sync_required`.
-  - Recovery: `zcashlc_migration_restart_step`,
-    `zcashlc_migration_refresh_stale_transfers`.
+  - Recovery: `zcashlc_migration_restart_step` (cancel and re-plan), and
+    `zcashlc_migration_refresh_stale_transfers` — rebuilds every expired
+    transfer of the stored run in place through the engine's
+    rebuild-on-expiry (`rebuild_expired_transfer` /
+    `rebuild_expired_transfer_unsigned`): the same funding note, recovered
+    by nullifier identity from the expired PCZT, rescheduled from the tip
+    with a fresh memoryless delay, a fresh canonical expiry, and a freshly
+    drawn boundary anchor. The optional spending key selects the lane —
+    with a usk the rebuilt transfer is signed anew in-process; a NULL usk
+    (external signer) leaves it awaiting its signature for the unsigned
+    PCZT ceremony to re-serve and complete. Returns the number rebuilt
+    (`0` when nothing is stored or nothing expired), persisted
+    all-or-nothing; a funding note spent outside the migration is a hard
+    error naming the restart remedy.
   - External signer: `zcashlc_migration_create_unsigned_note_split_pczts`,
     `zcashlc_migration_store_signed_note_split_pczts`,
     `zcashlc_migration_create_unsigned_transfer_pczts`,
