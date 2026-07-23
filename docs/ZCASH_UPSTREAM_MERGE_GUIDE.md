@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-20
+Last reviewed: 2026-07-22
 
 ## Remote and branch invariants
 
@@ -10,22 +10,26 @@ Last reviewed: 2026-07-20
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current monitor status (2026-07-20)
+## Current monitor status (2026-07-22)
 
-- After fetching both remotes, `origin/main` is `ee3abea2` and `upstream/main` is
-  `89d85c49` (upstream PR `#1815`). The default-branch count is `160 4`; PR `#26`
-  is the sole parity vehicle and its head contains all four upstream commits.
-- The parity merge adopted the copyright-holder update and required-build-path change without
-  altering Zend artifacts, private-engine provenance, branding, or Ironwood behavior. Local
-  `swift build` and `swift test --filter OfflineTests` both pass (546 offline tests, 0 failures).
-- Upstream PRs `#1813` and `#1812` are now clean and green but remain one 90-file
-  Orchard-to-Ironwood protocol/FFI/persistence/API stack. Keep them out of Zend until upstream
-  merges them and a Zend artifact/reconciliation plan is reviewed.
-- `michal/slipstream-support` is 37 commits ahead and 4 behind `upstream/main`, has no scoped
-  upstream PR, and still changes 114 files. It is not a reviewable low-risk early carry.
-- All other active upstream PRs remain in the existing wait-for-upstream classes:
-  draft, blocked/review-required, dirty, failed, or broad protocol/FFI/release work.
-  No early-carry candidate currently satisfies ready, useful, and low-risk.
+- Both defaults remain `main`. `origin/main` is `faef1a52`; upstream advanced from `89d85c49` to
+  `74cdbbc0` through upstream PR `#1816` / MOB-1512. The new public
+  `InitializationResult.seedNotRelevant` result prevents an existing database with a mismatched
+  seed from being silently treated as prepared. The Zend parity branch
+  `codex/zcash-upstream-sync-2026-07-22` merges all four upstream commits.
+- Merge conflicts were documentation-only (`CHANGELOG.md`, `MIGRATING.md`). Keep Zend's Ironwood,
+  artifact, and release notes, and add the upstream breaking-result migration note. The Swift
+  implementation and its OfflineTests merged without manual source changes.
+- Fresh Ironwood branches are still not low-risk early carries. The integrated Synchronizer line is
+  43 commits / 94 files, FFI line 29 commits / 80 files, QA2 line 45 commits / 94 files, and
+  Slipstream 59 commits / 118 files ahead of upstream main. They jointly alter public API, Rust/FFI,
+  persistence, privacy gates, mocks, and the engine graph. The new bug-fix branch is 38 commits /
+  93 files and depends on that same stack. Wait for upstream merge plus Zend artifact/provenance
+  reconciliation and funded-wallet validation.
+- The remaining unmerged branches remain wait-for-upstream: dependabot updates await upstream
+  dependency review; network-privacy, release-workflow, and legacy Ironwood work are broader than
+  Zend's safe early-carry boundary. No active upstream PR or branch currently meets the ready,
+  useful, and low-risk gates.
 
 ## Parity sync workflow (upstream default branch)
 
@@ -116,6 +120,20 @@ environment protections and WarpBuild GitHub App controls above are verified.
 - Verification on the parity branch passed: `git diff --check origin/main...HEAD`, `swift build`,
   and `swift test --filter OfflineTests` (546 tests, 0 failures). The shared workspace has about
   9 GiB free; the prior SwiftPM dependency-resolution failure was caused by disk exhaustion.
+
+### Upstream refresh (2026-07-21)
+
+- Zend PR `#26` merged at `8f85838b`, so `origin/main` now contains upstream `main` through
+  `89d85c49` / upstream PR `#1815`; fetched parity is `168 0` and no default-branch merge is due.
+- The only fresh upstream branch activity is a force-pushed final-engine migration stack:
+  `michal/MOB-1455/MOB-1495-sdk-pool-migration` is 36 commits ahead / 93 files,
+  `...-ffi` is 26 commits ahead / 79 files, and the unscoped `michal/slipstream-support` is
+  45 commits ahead / 117 files. None is a low-risk early Zend carry because it replaces the
+  protocol-facing migration, FFI, persistence, and generated-test surface that Zend currently
+  validates against committed, provenance-locked artifacts.
+- This documentation-only monitor update did not rerun local Swift commands. Reuse the successful
+  PR `#26` build and OfflineTests result above; run the full artifact/provenance and funded-wallet
+  validation before considering any future migration-stack adoption.
 
 Current relationship after Zend PRs `#18`, `#17`, `#20`, and `#21` merged into `origin/main`:
 

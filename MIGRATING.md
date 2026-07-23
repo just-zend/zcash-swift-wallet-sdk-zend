@@ -49,6 +49,14 @@ let outcome = await synchronizer.broadcaster.submit(
 - The retry plan is recorded before any network attempt and stays recorded when `submit` returns `.cancelled` or `.timedOut`: background resubmission may still broadcast the transaction later. Treat those outcomes as "outcome unknown", not as "not sent".
 - `LightWalletEndpoint` now conforms to `Equatable`. If your app declared that conformance retroactively, remove your declaration.
 
+## `Initializer.InitializationResult` gained `.seedNotRelevant`
+
+`Initializer.initialize` and `Synchronizer.prepare` can now return `.seedNotRelevant` when the
+provided seed does not match accounts already present in the wallet database. Previously this
+condition was indistinguishable from `.success`, which could let a restored `data.db` be used with
+an unrelated keychain seed. Add the case to every exhaustive `InitializationResult` switch and
+handle it the same way as `.seedRequired`.
+
 ## Orchard → Ironwood migration API on `Synchronizer`
 
 The early anchored, pre-sign-all migration API has been replaced. Remove calls to
