@@ -480,10 +480,9 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationEstimateRuns` if the rust layer returns an error.
     func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate
 
-    /// The full migration schedule for the spendable Orchard balance. When `includeResidual` is
-    /// `true` and a worthwhile residual exists, one extra transfer for it is appended.
+    /// The full migration schedule for the spendable Orchard balance.
     /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
-    func migrationProposeTransfers(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule
+    func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule
 
     /// Proposes the immediate (single-transaction) migration: sweeps the whole spendable Orchard
     /// balance into one Ironwood output, executable now.
@@ -526,16 +525,11 @@ protocol ZcashRustBackendWelding {
         for account: AccountUUID
     ) async throws
 
-    /// Whether a sync is required before the next transfer.
-    /// - Throws: `rustMigrationIsSyncRequired` if the rust layer returns an error.
-    func migrationIsSyncRequired(for account: AccountUUID) async throws -> Bool
-
     /// Cancels the stored run (its pre-signed transactions are abandoned; already-broadcast ones
     /// are unaffected on-chain), clears the invalid marks, and previews a fresh schedule against
-    /// the live balance for the re-confirm lane. `includeResidual` is accepted and ignored
-    /// (documented-inert — the engine plans canonically).
+    /// the live balance for the re-confirm lane.
     /// - Throws: `rustMigrationRestartStep` if the rust layer returns an error.
-    func migrationRestartStep(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule
+    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule
 
     /// Rebuilds every EXPIRED transfer of the stored migration run in place through the engine:
     /// each rebuilt transfer re-spends the SAME funding note (recovered from the expired PCZT by
