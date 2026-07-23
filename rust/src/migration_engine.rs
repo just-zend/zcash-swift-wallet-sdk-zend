@@ -11,11 +11,12 @@
 //! hosting several accounts (a seed-derived software account next to a UFVK-imported Keystone
 //! account) migrates them independently.
 //!
-//! Engine-driven proving (`MigrationCrypto::prove_transfer`) is deliberately NOT used by this FFI:
-//! resolving witnesses needs mutable access to the wallet's note commitment tree, which the shared
-//! borrow this adapter holds cannot provide. Proving lives in [`crate::migration_finalize`]
-//! instead, which is also where the migration's anchor policy (and its current ZIP 318 deviation)
-//! is isolated.
+//! Proving (`engine::MigrationProver`) is deliberately NOT implemented on this adapter: resolving
+//! witnesses needs mutable access to the wallet's note commitment tree, which the shared borrow
+//! this adapter holds cannot provide. The proving entry points instead construct the upstream
+//! `wallet::WalletMigrationProver` over a separate mutable wallet borrow, dispatched per
+//! transaction kind (boundary anchor for transfers, natural anchor for preparations) in
+//! [`crate::migration_finalize`].
 
 use anyhow::anyhow;
 use incrementalmerkletree::Position;

@@ -21,11 +21,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the actionable conditions. The engine plans previews (`plan_migration`,
   carried propose→commit by an in-process plan cache), commits the note split and
   the transfer schedule atomically (pre-signing every transaction), defers anchors
-  and witnesses to proving time (ZIP 374) — proving currently targets the wallet's
-  natural anchor for transfers too, an approved stopgap; the merged upstream
-  retention (librustzcash #2700/#2710) now sits on the matching 144-block
-  boundary draw grid, so the boundary flip is pending, no longer blocked — and
-  leaves broadcasting,
+  and witnesses to proving time (ZIP 374) — proving runs through the upstream
+  prover (`engine::prove_transfer` / `engine::prove_preparation` driving
+  `wallet::WalletMigrationProver`): transfers prove against the boundary anchor
+  their schedule drew and persisted (ZIP 318 anchor cohorts; upstream retention,
+  librustzcash #2700/#2710, keeps the matching 144-block boundary grid durably
+  witnessable from NU6.3 activation), preparations against the wallet's natural
+  anchor, and a boundary the wallet has not scanned or retained yet surfaces as
+  the transient nothing-due, not an error — and leaves broadcasting,
   mined-reconciliation, rejection classification (the `sdk_invalid_marks` side
   table), and the platform's 6-state derivation to this layer. `Complete` is
   per-run; sequential runs commit over a terminal predecessor. The external-signer
