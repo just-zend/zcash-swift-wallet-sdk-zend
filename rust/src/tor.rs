@@ -93,8 +93,11 @@ impl TorRuntime {
     pub(crate) fn connect_to_lightwalletd(&self, endpoint: Uri) -> anyhow::Result<LwdConn> {
         let Self { runtime, client } = self.isolated_client();
 
+        // `allow_onion_services: true` preserves the pre-parameter behavior: the old client had no
+        // onion gate, so any endpoint the caller configured (hidden services included) connected.
+        // Restricting onion endpoints would be a product decision, not a pin-bump side effect.
         let conn =
-            runtime.block_on(async { client.connect_to_lightwalletd(endpoint, false).await })?;
+            runtime.block_on(async { client.connect_to_lightwalletd(endpoint, true).await })?;
 
         Ok(LwdConn {
             runtime,

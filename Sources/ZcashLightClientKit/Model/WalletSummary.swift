@@ -11,11 +11,33 @@ public struct PoolBalance: Equatable {
     public let spendableValue: Zatoshi
     public let changePendingConfirmation: Zatoshi
     public let valuePendingSpendability: Zatoshi
+    /// The value currently locked by an explicit output lock (e.g. the Orchard migration residual
+    /// locked via the "Lock balance" choice) and therefore excluded from `spendableValue`. Locked
+    /// value still belongs to the account — it is part of `total()` — it just cannot be selected
+    /// for spending until it is unlocked.
+    public let lockedValue: Zatoshi
 
-    static let zero = PoolBalance(spendableValue: .zero, changePendingConfirmation: .zero, valuePendingSpendability: .zero)
+    static let zero = PoolBalance(
+        spendableValue: .zero,
+        changePendingConfirmation: .zero,
+        valuePendingSpendability: .zero,
+        lockedValue: .zero
+    )
+
+    init(
+        spendableValue: Zatoshi,
+        changePendingConfirmation: Zatoshi,
+        valuePendingSpendability: Zatoshi,
+        lockedValue: Zatoshi = .zero
+    ) {
+        self.spendableValue = spendableValue
+        self.changePendingConfirmation = changePendingConfirmation
+        self.valuePendingSpendability = valuePendingSpendability
+        self.lockedValue = lockedValue
+    }
 
     public func total() -> Zatoshi {
-        self.spendableValue + self.changePendingConfirmation + self.valuePendingSpendability
+        self.spendableValue + self.changePendingConfirmation + self.valuePendingSpendability + self.lockedValue
     }
 }
 
@@ -63,7 +85,7 @@ public struct AccountBalance: Equatable {
         saplingBalance.spendableValue + orchardBalance.spendableValue + ironwoodBalance.spendableValue
     }
 
-    /// The total value (spendable + pending change + pending spendability) summed
+    /// The total value (spendable + pending change + pending spendability + locked) summed
     /// across every shielded pool.
     public func shieldedTotal() -> Zatoshi {
         saplingBalance.total() + orchardBalance.total() + ironwoodBalance.total()

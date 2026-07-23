@@ -1,9 +1,9 @@
 [package]
 name = "libzcashlc"
-version = "2.6.0-alpha.4"
+version = "2.6.0"
 authors = [
     "Jack Grigg <thestr4d@gmail.com>",
-    "Lukas Korba <lukas@tangiblecodes.com>",
+    "Lukas Korba <lukas@zodl.com>",
     "Kris Nuttycombe<kris@nutty.land>",
     "Francisco Gindre",
 ]
@@ -34,9 +34,15 @@ zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.29"
 zcash_proofs = "0.29"
 zcash_protocol = { version = "0.10", features = ["local-consensus"] }
+# Not on crates.io yet — the final pool-migration engine lives on librustzcash
+# main (its SQLite store moved into `zcash_client_sqlite::pool_migration`, so the
+# old separate store crate is gone). Direct git dependency at the same rev as the
+# [patch.crates-io] family below so the whole graph stays one family instance.
+zcash_pool_migration_backend = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb", features = ["wallet"] }
 zcash_script = "0.4"
 zip32 = "0.2"
 pczt = { version = "0.8.0-rc.1", features = ["prover"] }
+shardtree = "0.7"
 
 # EIP-681
 eip681 = "0.1.0"
@@ -104,20 +110,14 @@ crate-type = ["staticlib"]
 [profile.release]
 lto = true
 
-# The Ironwood-era librustzcash family is not on crates.io yet; unreleased
-# sources ride [patch.crates-io] against the canonical repo — never direct
-# git+branch dependencies. The rev is current zcash/librustzcash main — the
-# same rev the zcash_voting workspace rides, so the whole graph resolves to a
-# single family instance. Bump it deliberately (build + OfflineTests green),
-# and delete the whole block at the 0.24-era crates.io release.
 [patch.crates-io]
 zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting.git", rev = "a4daaf77f793b35a98a3d811b920a01b95fbfa7a" }
 
-# Pin the whole librustzcash stack to a single git rev carrying the merged Ironwood
-# historical selector, pending a crates.io release. zcash_voting no longer hard-pins
-# librustzcash (it declares crates.io versions and patches from its own root), so this
-# workspace's patch governs the rev for the entire graph and everything resolves to one
-# copy. Bump this rev in one place to advance the stack.
+# The Ironwood-era librustzcash family is not on crates.io yet. Keep the direct
+# pool-migration dependency and every family patch on one reviewed commit so the
+# graph resolves to one implementation. This is current librustzcash main; the
+# final Zend integration commit repins the block to the reviewed just-zend fork
+# head after its additive safety changes land.
 equihash = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
 f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
 pczt = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }

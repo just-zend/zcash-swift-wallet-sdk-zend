@@ -7,6 +7,155 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 # Unreleased
 
 ## Added
+- Orchard→Ironwood pool-migration engine, exposed as a 26-member migration group on the
+  `Synchronizer` protocol, built over the pool-migration FFI/welding layer introduced in the entry
+  below: the app talks only to `Synchronizer` — the per-account migration engine, broadcaster, and
+  privacy gate behind it are internal. Account-scoped members take an `AccountUUID`, and two
+  migrations can run concurrently (for example a software account and a hardware-wallet account):
+  all engine state is account-keyed, per-account broadcasts stay single-flight without
+  cross-account serialization, and every account shares one dedicated migration Tor runtime. The
+  group covers the migration state machine and progress, note-split propose/sign/submit, a gradual
+  (randomized-cadence) schedule proposal with one-confirmation `signAndStoreMigrationSchedule`,
+  height-gated background delivery
+  (`executeNextPendingMigrationTransfer` — migration members work without `prepare()`, so a
+  background session can broadcast without starting sync; the delivery lane serves preparation
+  transactions and transfers alike, proving each at broadcast time per ZIP 374), overdue/invalid
+  detection with the stored-run reschedule accessor, cancel-and-replan restart recovery
+  (`restartCurrentMigrationStep`), and rebuild-on-expiry recovery
+  (`refreshStaleMigrationTransfers(accountUUID:usk:)` rebuilds every EXPIRED transfer of the stored
+  run in place — the same funding note on a fresh schedule/expiry/boundary — with an optional `usk`
+  selecting the in-process-sign or external-signer (Keystone) lane, persisted ALL-OR-NOTHING (a
+  mid-refresh failure persists none of the batch); a funding note spent outside the migration
+  surfaces an error naming `restartCurrentMigrationStep` as the remedy),
+  the per-run `complete` + fresh-propose sequential-runs contract, and an external-signer (PCZT)
+  path for hardware wallets (`createUnsignedNoteSplitPCZTs` / `storeSignedNoteSplitPCZTs` — plural:
+  the engine builds N preparation transactions, and one ceremony signs them together with
+  `createUnsignedMigrationTransferPCZTs` / `storeSignedMigrationSchedulePCZTs`). Migration broadcasts run over a dedicated Tor runtime (own
+  state directory `<torDir>/migration_tor`, fresh isolated circuit per submission, one bootstrap
+  shared across accounts, independent of the global `tor(enabled:)` toggle) with fail-closed
+  semantics — Tor requested but unavailable throws `ZcashError.migrationTorUnavailable`, never a
+  silent clearnet fallback — to exactly one submission endpoint per attempt
+  (`MigrationNetworkPrivacyOptions.submissionEndpoint` is required: the host picks the submission
+  server explicitly per broadcast, and the SDK never falls back to the sync server), with no
+  multi-endpoint fan-out and no post-broadcast txid polling: confirmation comes from block
+  scanning alone. Session separation is SDK-enforced in both directions: `start()` throws
+  `ZcashError.migrationSyncBlocked` (ZRUST0125) while the wallet-scope 10-minute broadcast→sync
+  privacy gate is active (`isMigrationSyncBlocked()` / `migrationSyncBlockedStream` /
+  `migrationPrivacySyncBufferDuration`, aggregated across every account including dormant ones),
+  and the broadcast-performing migration methods throw `ZcashError.migrationBroadcastDuringSync`
+  (ZRUST0126) while a sync runs — an advisory point-in-time check, not a hard lock.
+  `ZcashNetwork.ironwoodActivationHeight` exposes the NU6.3 activation height so hosts can stop
+  hardcoding it. Schedule persistence after commit is the host's responsibility: the SDK
+  deliberately keeps no local copy of the committed proposal list. The Closure/Combine wrapper
+  synchronizers deliberately do not mirror the migration group.
+  - Duplicate re-submissions self-heal: a submit rejection identifying the transaction as already
+    known (zcashd's already-in-chain code −27, or the already-in-block-chain/mempool-duplicate
+    reject messages) is recorded as success, so a retried broadcast whose first attempt actually
+    landed completes the transfer instead of parking the migration on a bogus failure.
+  - A record failure after a successful broadcast no longer skips the 10-minute privacy buffer:
+    the sync gate marks the moment the submit outcome is a success, before the engine records the
+    result, and the call then throws the distinguishable
+    `ZcashError.migrationRecordFailedAfterBroadcast` (ZRUST0124) — transient, since a later
+    execution window self-heals via the duplicate-rejection→success mapping.
+  - Migration works on custom (regtest-style) networks without a prior `Initializer`: the internal
+    engine registers the configured custom activation heights itself.
+  - Hardened per the adversarial review: sync-gate emissions are serialized behind a
+    re-entrancy-safe two-lock design, concurrent migration broadcasts share a single-flight Tor
+    bootstrap, the sync-gate ticker runs only while the blocked stream has subscribers, and the
+    migration gate state file is excluded from device backups.
+- Orchard→Ironwood pool-migration FFI, welding, models, and error codes — the layer beneath the
+  `Synchronizer` migration surface that lands in the follow-up PR, wired to the FINAL migration
+  engine (`zcash_pool_migration_backend` plus the account-keyed store that now lives inside
+  `zcash_client_sqlite::pool_migration` — both on librustzcash main since PR #2712 merged — so
+  several accounts of one wallet database — a software account next to an imported
+  hardware-wallet account — migrate independently, concurrently or one after another; the
+  family pin targets a plain librustzcash main rev, with note locking #2716 and boundary-anchor
+  proving #2710 both merged). The
+  engine is bound through 24 `zcashlc_migration_*` FFI functions plus the
+  `zcashlc_ironwood_activation_height` helper (house conventions throughout: catch_panic,
+  thread-local last-error channel, paired free functions), welded as `@DBActor` methods on the
+  internal `ZcashRustBackendWelding` surface. The public migration model types ship here
+  (`MigrationState`, `MigrationProgress`, `NoteSplitProposal`, `MigrationTransferProposal`,
+  `MigrationSchedule`, `PreparedMigrationTransfer`, `MigrationTransferResult`,
+  `MigrationAttentionReason`, `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`),
+  together with the complete migration error vocabulary — new error codes ZRUST0098–ZRUST0106,
+  ZRUST0108, and ZRUST0111–ZRUST0131 (ZRUST0107 was retired with `migrationProposeImmediateTransfers`;
+  ZRUST0129–ZRUST0131 arrived with the immediate-migration lane change below) — including the codes
+  whose throwing call sites arrive with the Synchronizer
+  surface (`migrationTorUnavailable`, `migrationRecordFailedAfterBroadcast` ZRUST0124,
+  `migrationSyncBlocked` ZRUST0125, `migrationBroadcastDuringSync` ZRUST0126) and the final
+  engine's actionable conditions (`migrationProvingUnavailable` ZRUST0127, `migrationPlanStale`
+  ZRUST0128 — the "propose again" signal: proposals re-randomize per ZIP 318, so the SDK never
+  silently signs a plan the user did not see). Final-engine semantics surfaced by this layer:
+  `MigrationState.complete` is PER-RUN (ask `proposeMigrationTransfers` whether anything remains —
+  an empty schedule means no; sequential runs are first-class); the v1-era `readyToPropose` state,
+  `syncRequiredBeforeNext` attention reason, `includeResidual` parameter (on `proposeTransfers` and
+  `restartCurrentMigrationStep`), `retryable` parameter (on `recordTransferResult`), and
+  `isSyncRequired` query are removed entirely — the engine's atomic commit of the note split and
+  the schedule means they never had a use, and the result tag alone always drove
+  `recordTransferResult`'s behavior — and the external-signer note-split pair went plural
+  (`migrationCreateUnsignedNoteSplitPczts` / `migrationStoreSignedNoteSplitPczts`): the engine
+  builds N preparation transactions rather than one split transaction, and one signing ceremony
+  covers them all. The schedule/note-split echo parameters on `signAndStoreSchedule`,
+  `createUnsignedTransferPczts`, and `signNoteSplit` are verified consent echoes, not inert
+  display values: they are checked against the previewed plan (or, once committed, the stored
+  state) and a mismatch throws `migrationPlanStale` — the same "re-propose and re-display"
+  recovery as an actually stale plan — so a stale or tampered display can never sign different
+  values than the ones the user approved. Ids, amounts, expiry heights, and the estimated
+  duration are always compared; `nextExecutableAfterHeight` is compared only against the
+  previewed plan, never post-commit (the immediate lane's commit-time reschedule legitimately
+  moves it away from an honest echo), and `anchorHeight` is display-only, never compared. `migrationRefreshStaleTransfers(usk:for:)` rebuilds every expired transfer of
+  the stored run in place through the engine's rebuild-on-expiry — the same funding note
+  (recovered by nullifier identity from the expired PCZT, never an equal-value substitute),
+  rescheduled from the current tip with a fresh canonical expiry and a freshly drawn boundary
+  anchor — returning the run's full `MigrationSchedule` as stored after the refresh (empty when
+  no run is stored or the stored run is terminal; unchanged when nothing had expired): a rebuilt
+  transfer's fresh scheduled/expiry heights exist nowhere else, so the host re-displays the
+  returned schedule and echoes it on the consent-verified calls. The now-optional spending key
+  selects the lane (a usk signs each rebuilt transfer anew in-process; `nil`, the external-signer
+  account, leaves it awaiting its signature so the unsigned-transfer PCZT ceremony re-serves and
+  completes it), and a funding note spent outside the migration surfaces as a hard error naming
+  `restartCurrentMigrationStep` (cancel and re-plan) as the remedy. Transfers prove against the
+  boundary anchor their schedule drew (ZIP 318
+  anchor cohorts), through the upstream prover: proving reads each transfer's persisted boundary
+  and resolves its anchors and witnesses at that checkpoint, which upstream anchor-checkpoint
+  retention (librustzcash #2700/#2710) keeps durably witnessable on the matching 144-block
+  boundary grid from NU6.3 activation; preparation transactions prove against the wallet's
+  natural anchor, and a boundary the wallet has not scanned or retained yet surfaces as the
+  transient "nothing due", not an error. Hardened
+  per the adversarial review: the FFI last-error channel is cleared before every
+  sentinel read (stale errors can no longer surface as spurious throws elsewhere) and one-time
+  rust initialization is race-free. No `Synchronizer` API changes in this PR.
+- Migration residual locking and locked balance. `ZcashRustBackendWelding` gains
+  `lockMigrationResidual(accountUUID:)` — locks every currently-spendable, not-already-locked
+  legacy-Orchard note of the account until explicit unlock and returns the total value locked
+  (the "Lock balance" choice at migration `Complete`; the lock never expires on its own, and
+  repeating the call locks only notes that became spendable since) — and
+  `unlockMigrationResidual(accountUUID:)`, the release half (clears all of the account's output
+  locks and returns the cleared count). New error codes `rustMigrationLockResidual` ZRUST0132
+  and `rustMigrationUnlockResidual` ZRUST0133. The public `PoolBalance` gains `lockedValue`:
+  locked value leaves `spendableValue` but stays in the account — `total()` now includes it —
+  marshaled from the rust balance so locked funds never vanish from app-visible sums. Both are
+  surfaced on the `Synchronizer` protocol under the same names — account-scoped thin forwards
+  through the per-account migration actor, with throwing "unimplemented" protocol-extension
+  defaults like the rest of the group: the app's "Lock balance" choice calls
+  `lockMigrationResidual(accountUUID:)`, and "Migrate anyway" over a locked residual composes as
+  `unlockMigrationResidual(accountUUID:)` followed by `proposeImmediateMigration(accountUUID:)`
+  (locked notes are excluded from note selection, so the unlock must come first).
+- Migration run-count estimate. `ZcashRustBackendWelding` gains
+  `estimateMigrationRuns(accountUUID:)`, returning the new public `MigrationRunEstimate` model:
+  how many migration RUNS ("rounds") migrating the whole spendable Orchard balance takes, and
+  per run BOTH what it migrates (`migratable`, `crossings`) and what preparing it costs
+  (`preparationLayers`, `preparationTransactions`), with cross-run totals and external-signer
+  session math (`Run.signingSessions(maxTransactionsPerSession:)` and
+  `totalSigningSessions(maxTransactionsPerSession:)` — the latter deliberately sums per-run
+  sessions rather than pooling transactions across runs, because a later run's transactions
+  spend notes an earlier run must mine first). A zero balance yields the zero-run estimate, not
+  an error. New error code `rustMigrationEstimateRuns` ZRUST0134. Surfaced on the `Synchronizer`
+  protocol under the same name — the rounds preview behind the multi-round migration UI, an
+  account-scoped thin forward through the per-account migration actor that hands the engine's
+  estimate through unchanged, with a throwing "unimplemented" protocol-extension default like the
+  rest of the group.
 - Ironwood (NU6.3) receive/sync readiness. The lightwalletd protocol gains the Ironwood fields
   (`CompactTx.ironwoodActions`, `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
   `ShieldedProtocol.ironwood`); `UpdateSubtreeRootsAction` fetches and stores Ironwood subtree roots
@@ -34,9 +183,30 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 - `Initializer.initialize` / `Synchronizer.prepare` now return `InitializationResult.seedNotRelevant` instead of silently proceeding when the rust layer reports the provided seed is not relevant to the wallet database (breaking change: `InitializationResult` gained a new case, so exhaustive switches over it must add a case; see MIGRATING.md). Previously this case was indistinguishable from `.success`: account creation was skipped (accounts already existed) and callers proceeded as if they had prepared the wallet they expected, even when the database on disk belonged to a different wallet than the provided seed (e.g. a device-backup restore that brings back `data.db` without the matching keychain seed). Callers must now handle `.seedNotRelevant` the same way they already handle `.seedRequired`. (MOB-1512)
-- The Rust core builds against `zcash/librustzcash` main (Ironwood is merged and ungated upstream),
-  pinned via `[patch.crates-io]` until the 0.24-era crates.io release; `orchard` 0.15.0 and
-  `shardtree` 0.7.0 resolve from crates.io.
+- The immediate (single-transaction) migration lane leaves the engine:
+  `proposeImmediateMigration(accountUUID:)` now returns an ordinary `ImmediateMigrationProposal` (a
+  `Proposal` plus its decoded `amount`/`fee`) instead of a `MigrationSchedule`, executed through the
+  normal transfer pipeline (`createProposedTransactions` / `createPCZTFromProposal`) rather than the
+  engine's schedule/commit machinery; a new `recordImmediateMigration(accountUUID:txid:)` folds a
+  successful broadcast into the same platform state machine (`InProgress` while unmined, then quiet
+  once mined — see the immediate-aftermath entry below). The welding
+  `migrationProposeImmediateTransfers` and its FFI
+  `zcashlc_migration_propose_immediate_transfers` are removed, replaced by the general-purpose
+  `proposeSendMaxTransfer(accountUUID:recipient:memo:orchardOnly:)` (an ordinary send-max primitive
+  the migration engine itself never touches). See `MIGRATING.md`.
+- The immediate-migration aftermath goes quiet, and `MigrationProgress` gains `isImmediate: Bool`:
+  once an immediate (send-max) sweep recorded via `recordImmediateMigration(accountUUID:txid:)`
+  mines, the migration state machine no longer reports `.complete` for it — the mined run is consumed
+  and the state falls back to `.notStarted` (nothing to acknowledge; the balance-gated "Migration
+  Required" prompt re-offers only if new Orchard funds arrive later). `MigrationProgress.isImmediate`
+  is `true` only for an in-progress immediate sweep and `false` for engine-tracked runs, so the app
+  can suppress per-transfer progress UI during the immediate lane; the public initializer defaults
+  `isImmediate` to `false`, so it is source-compatible. (MOB-1513)
+- The Rust core builds against the `michal/ironwood-migration` line of `zcash/librustzcash`
+  (its base of main plus the cherry-picked Ironwood historical note selector, carrying the
+  unreleased `zcash_pool_migration` crate), pinned via `[patch.crates-io]` until the 0.24-era
+  crates.io release; `orchard` 0.15.0 and `shardtree` 0.7.0 resolve from crates.io. The pin
+  returns to a main rev in one move once the migration crate lands upstream.
 - Voting rides upstream `zcash_voting` (a pinned rev of its repository's main, aligned to the same
   librustzcash rev and orchard 0.15; the published 0.11 release pins `orchard ^0.14` and cannot
   coexist with the Ironwood graph) with **real implementations across the FFI**. Behavioral changes

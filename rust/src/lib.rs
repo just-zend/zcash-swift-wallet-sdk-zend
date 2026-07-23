@@ -92,6 +92,10 @@ use zip32::fingerprint::SeedFingerprint;
 mod derivation;
 mod eip681;
 mod ffi;
+mod migration;
+mod migration_engine;
+mod migration_finalize;
+mod migration_plan_cache;
 mod tor;
 // Voting stays UNGATED: the module compiles as honest-error stubs (15 C symbols preserved —
 // Zodl macOS links them; a cargo feature gate would drop them from the staticlib and break
@@ -1034,7 +1038,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance(
                 target,
                 confirmations_policy,
                 CoinbaseFilter::AllTransparentOutputs,
-                LockFilter::Unfiltered,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map_err(|e| anyhow!("Error while fetching verified transparent balance: {}", e))?;
         let amount = utxos
@@ -1099,7 +1103,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
                         target,
                         confirmations_policy,
                         CoinbaseFilter::AllTransparentOutputs,
-                        LockFilter::Unfiltered,
+                        LockFilter::Policy(&LockedInputPolicy::Exclude),
                     )
                     .map_err(|e| {
                         anyhow!("Error while fetching verified transparent balance: {}", e)
@@ -1151,7 +1155,7 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance(
                 target,
                 wallet::ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
                 CoinbaseFilter::AllTransparentOutputs,
-                LockFilter::Unfiltered,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map_err(|e| anyhow!("Error while fetching total transparent balance: {}", e))?
             .iter()
@@ -2310,7 +2314,7 @@ mod ordinary_spend_pool_tests {
 
     #[test]
     fn send_max_entrypoint_is_wired_through_the_shared_policy() {
-        assert_ordinary_entrypoint_wiring("zcashlc_propose_send_max_transfer", "&spend_pools,");
+        assert_ordinary_entrypoint_wiring("zcashlc_propose_send_max_transfer", "&spend_pools[..]");
     }
 
     #[test]
@@ -2433,6 +2437,9 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
 /// - `to` must be non-null and must point to a null-terminated UTF-8 string.
 /// - `memo` must either be null (indicating an empty memo or a transparent recipient) or point to a
 ///   512-byte array.
+/// - `orchard_only`: when `true`, restricts the spendable pools to Orchard alone (the Orchard→
+///   Ironwood immediate migration lane's sweep, which must not draw on Sapling funds); when
+///   `false`, spends from both Sapling and Orchard (pre-existing behavior).
 /// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
 ///   pointer when done using it.
 #[unsafe(no_mangle)]
@@ -2445,6 +2452,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
     memo: *const u8,
     mode: ffi::MaxSpendMode,
     confirmations_policy: ffi::ConfirmationsPolicy,
+    orchard_only: bool,
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
@@ -2473,11 +2481,17 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         let confirmation_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
         let spend_pools = ordinary_spend_pools(&db_data, &network, confirmation_policy)?;
 
+        let pools: &[ShieldedPool] = if orchard_only {
+            &[ShieldedPool::Orchard]
+        } else {
+            &spend_pools[..]
+        };
+
         let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
             &mut db_data,
             &network,
             account_uuid,
-            &spend_pools,
+            pools,
             &StandardFeeRule::Zip317,
             to,
             memo,
@@ -2488,11 +2502,13 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
-        ensure_ordinary_spend_pools_match_target(
-            &network,
-            spend_pools,
-            proposal.min_target_height(),
-        )?;
+        if !orchard_only {
+            ensure_ordinary_spend_pools_match_target(
+                &network,
+                spend_pools,
+                proposal.min_target_height(),
+            )?;
+        }
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -2874,6 +2890,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             &SpendingKeys::from_unified_spending_key(usk),
             OvkPolicy::Sender,
             &proposal,
+            // No expiry override: keep the builder-derived expiry the SDK has always used.
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
