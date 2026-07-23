@@ -22,7 +22,10 @@ use incrementalmerkletree::Position;
 use orchard::keys::{FullViewingKey, SpendAuthorizingKey};
 use orchard::note::Note as OrchardNote;
 use rand::rngs::OsRng;
-use zcash_client_backend::data_api::wallet::TargetHeight;
+use zcash_client_backend::data_api::wallet::{
+    TargetHeight,
+    input_selection::{LockFilter, LockedInputPolicy},
+};
 use zcash_client_backend::data_api::{Account, InputSource, WalletRead};
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::pool_migration::orchard_ironwood::PoolMigrations;
@@ -64,13 +67,14 @@ impl<'a> Backend<'a> {
         account: AccountUuid,
         usk: Option<UnifiedSpendingKey>,
         store_conn: &'a mut rusqlite::Connection,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             wallet,
             account,
             usk,
-            store: PoolMigrations::for_account(store_conn, account),
-        }
+            store: PoolMigrations::for_account(store_conn, account)
+                .map_err(|e| anyhow!("opening the account-scoped migration store failed: {e}"))?,
+        })
     }
 
     /// The target height for note selection (the chain tip plus one).
@@ -90,7 +94,13 @@ impl<'a> Backend<'a> {
         let target = self.selection_target()?;
         let received = self
             .wallet
-            .select_unspent_notes(self.account, &[ShieldedPool::Orchard], target, &[], false)
+            .select_unspent_notes(
+                self.account,
+                &[ShieldedPool::Orchard],
+                target,
+                &[],
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
+            )
             .map_err(|e| anyhow!("spendable-note selection failed: {e}"))?;
         let mut notes: Vec<SpendableNote> = received
             .orchard()

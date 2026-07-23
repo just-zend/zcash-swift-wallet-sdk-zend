@@ -45,9 +45,12 @@ use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use rand::rngs::OsRng;
 use rusqlite::Connection;
-use zcash_client_backend::data_api::wallet::TargetHeight;
+use zcash_client_backend::data_api::wallet::{
+    TargetHeight,
+    input_selection::{LockFilter, LockedInputPolicy},
+};
 use zcash_client_backend::data_api::{InputSource, WalletRead, WalletWrite};
-use zcash_client_backend::wallet::OutputRef;
+use zcash_client_backend::wallet::{LockOwner, OutputRef};
 use zcash_client_sqlite::AccountUuid;
 use zcash_protocol::consensus::{
     BLOCKS_PER_HOUR, BlockHeight, Network, NetworkUpgrade, Parameters,
@@ -247,7 +250,7 @@ fn clear_invalid_marks(conn: &Connection, account: &[u8; 16]) -> rusqlite::Resul
 /// only way transactions advance `Broadcast -> Mined` (and therefore the only way a run reaches
 /// `Complete`).
 fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> {
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
     let Some(mut state) = backend.get_migration()? else {
         return Ok(None);
     };
@@ -289,7 +292,7 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
 /// Returns `Ok(None)` when there is nothing to migrate (the balance is zero, or entirely below the
 /// dust floor) — the "ask rust whether anything remains" answer after a completed run.
 fn plan_and_cache(ctx: &mut CallCtx, immediate: bool) -> anyhow::Result<Option<MigrationPlan>> {
-    let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+    let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
     let mut rng = OsRng;
     match engine::plan_migration(&ctx.network, &backend, &mut rng) {
         Ok(plan) => {
@@ -444,7 +447,7 @@ fn commit_or_resume(
     unsigned_out: bool,
 ) -> anyhow::Result<(MigrationState, Vec<(MigrationTxId, Vec<u8>)>)> {
     {
-        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         if let Some(state) = backend.get_migration()? {
             if !state.is_terminal() {
                 let unsigned = state
@@ -466,7 +469,7 @@ fn commit_or_resume(
 
     let target = BlockHeight::from(u32::from(ctx.tip()?) + 1);
     let mut rng = OsRng;
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, usk, &mut ctx.store_conn);
+    let mut backend = Backend::new(&ctx.wallet, ctx.account, usk, &mut ctx.store_conn)?;
     let (mut state, unsigned) = if unsigned_out {
         let (state, unsigned) = engine::build_preparation_unsigned(
             &ctx.network,
@@ -508,6 +511,7 @@ fn commit_or_resume(
                     t.expiry_height(),
                     t.anchor_boundary(),
                     t.state(),
+                    t.lock_owner(),
                 )
             })
             .collect();
@@ -517,7 +521,7 @@ fn commit_or_resume(
             state.preparation().clone(),
             transactions,
         );
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         backend.replace_migration(&state)?;
     }
 
@@ -564,7 +568,7 @@ fn prove_if_needed(
         MigrationTxState::Signed => {
             let anchor = migration_finalize::resolve_proving_anchor(&ctx.wallet, tx)?;
             let (fvk, spendable) = {
-                let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+                let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
                 (
                     backend.stored_orchard_fvk()?,
                     backend.spendable_orchard_notes()?,
@@ -583,7 +587,7 @@ fn prove_if_needed(
                 Some((proven, txid)) => {
                     state.set_transaction_proved(id, proven.clone());
                     let mut backend =
-                        Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+                        Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
                     backend.replace_migration(state)?;
                     Ok(Some((proven, txid)))
                 }
@@ -1105,7 +1109,7 @@ fn marshal_state(
 
 /// The account's live spendable Orchard balance (what is still in the old pool).
 fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
-    let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+    let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
     use zcash_pool_migration_backend::engine::MigrationBackend;
     let values = backend.spendable_orchard_note_values()?;
     values
@@ -1407,7 +1411,7 @@ pub unsafe extern "C" fn zcashlc_migration_residual_after_migration(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         {
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
             if let Some(state) = backend.get_migration()? {
                 if !state.is_terminal() {
                     return Ok(state.note_split().change().map_or(-1, zat_to_i64));
@@ -1432,8 +1436,10 @@ pub unsafe extern "C" fn zcashlc_migration_residual_after_migration(
 /// (`u32::MAX`), so no chain height ever releases it — only an explicit
 /// `zcashlc_migration_unlock_residual` does. Note selection excludes already-locked notes, so
 /// repeating the call is idempotent-additive: it locks only notes that became spendable since
-/// (and returns only their value). A concurrent-lock race (another caller locked one of the
-/// selected notes between selection and locking) surfaces as an error
+/// (and returns only their value). Locks are keyed to the deterministic per-account
+/// [`residual_lock_owner`], so a retry after a crash between selection and locking re-locks
+/// under the same owner instead of conflicting with itself. A concurrent-lock race (another
+/// caller locked one of the selected notes between selection and locking) surfaces as an error
 /// (`LockError::LockFailure`); nothing is partially locked and the caller may retry.
 ///
 /// # Safety
@@ -1451,7 +1457,13 @@ pub unsafe extern "C" fn zcashlc_migration_lock_residual(
         let target = TargetHeight::from(u32::from(ctx.tip()?) + 1);
         let received = ctx
             .wallet
-            .select_unspent_notes(ctx.account, &[ShieldedPool::Orchard], target, &[], false)
+            .select_unspent_notes(
+                ctx.account,
+                &[ShieldedPool::Orchard],
+                target,
+                &[],
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
+            )
             .map_err(|e| anyhow!("spendable-note selection failed: {e}"))?;
         let mut refs = Vec::new();
         let mut total = Zatoshis::ZERO;
@@ -1469,20 +1481,39 @@ pub unsafe extern "C" fn zcashlc_migration_lock_residual(
             return Ok(0);
         }
         ctx.wallet
-            .lock_outputs(refs.into_iter(), BlockHeight::from(u32::MAX))
+            .lock_outputs(
+                &refs,
+                residual_lock_owner(ctx.account),
+                BlockHeight::from(u32::MAX),
+            )
             .map_err(|e| anyhow!("locking the migration residual failed: {e}"))?;
         Ok(zat_to_i64(total))
     });
     unwrap_exc_or(res, -1)
 }
 
+/// The deterministic [`LockOwner`] under which [`zcashlc_migration_lock_residual`] locks the
+/// account's residual notes: the 16 account-UUID bytes followed by a fixed 16-byte tag. A
+/// stable owner keeps re-locking idempotent across retries (a same-owner re-lock refreshes the
+/// permanent expiry instead of failing as a conflict), and cannot collide with a txid-derived
+/// owner, which occupies all 32 bytes with a transaction hash.
+fn residual_lock_owner(account: AccountUuid) -> LockOwner {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(&account.expose_uuid().into_bytes());
+    bytes[16..].copy_from_slice(b"zodl.residual.lk");
+    LockOwner::new(bytes)
+}
+
 /// Unlocks the account's locked outputs — the release half of
 /// `zcashlc_migration_lock_residual` — and returns the number of outputs unlocked (`0` when
 /// nothing was locked; `-1` signals an error, see `zcashlc_last_error_message`).
 ///
-/// Clears ALL locks held for the account, regardless of expiry. That blanket clear is safe here
-/// because this SDK never creates proposal-scoped output locks: the only locks an account can
-/// hold are the permanent residual locks placed by `zcashlc_migration_lock_residual`.
+/// Clears ALL locks held for the account, regardless of expiry or owner. That blanket clear is
+/// safe here because this SDK still creates no proposal- or transfer-scoped output locks (every
+/// propose path here runs with locking off, and engine-built migration transactions carry no
+/// lock owner): the only locks an account can hold are the permanent residual locks placed by
+/// `zcashlc_migration_lock_residual`. Revisit this if any propose path ever starts passing a
+/// lock request — a blanket clear would then release in-flight proposal locks too.
 ///
 /// # Safety
 /// See [`open`].
@@ -1529,7 +1560,7 @@ pub unsafe extern "C" fn zcashlc_migration_estimate_runs(
 ) -> *mut FfiMigrationRunEstimate {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         let mut rng = OsRng;
         let estimate = match engine::estimate_migration_runs(&ctx.network, &backend, &mut rng) {
             Ok(estimate) => Some(estimate),
@@ -1824,7 +1855,8 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
                 let txid: [u8; 32] = unsafe { slice::from_raw_parts(txid_bytes, 32) }
                     .try_into()
                     .expect("length 32 by construction");
-                let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+                let mut backend =
+                    Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
                 let mut state = backend
                     .get_migration()?
                     .ok_or_else(|| anyhow!("no migration is stored"))?;
@@ -1889,7 +1921,7 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
         let _ = include_residual;
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         {
-            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
             if let Some(state) = backend.get_migration()? {
                 if !state.is_terminal() {
                     let cancelled = MigrationState::from_parts(
@@ -1998,7 +2030,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         let mut state = backend
             .get_migration()?
             .ok_or_else(|| anyhow!("no migration is committed yet"))?;
@@ -2093,7 +2125,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn);
+        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         let mut state = backend
             .get_migration()?
             .ok_or_else(|| anyhow!("no migration is committed yet"))?;
@@ -2176,6 +2208,38 @@ mod tests {
         BlockHeight::from_u32(v)
     }
 
+    /// Creates a real account in the initialized wallet database at `path` and returns its uuid
+    /// bytes. The account-keyed migration store resolves the account row up front
+    /// (`PoolMigrations::for_account` errors on an unknown uuid), so fixtures must register the
+    /// account they query — exactly like a real caller, where the uuid always comes from a
+    /// previously created account.
+    fn create_fixture_account(path: &std::path::Path) -> [u8; 16] {
+        use secrecy::SecretVec;
+        use zcash_client_backend::data_api::AccountBirthday;
+        use zcash_client_backend::proto::service::TreeState;
+        use zcash_client_sqlite::WalletDb;
+        use zcash_client_sqlite::util::SystemClock;
+        use zcash_protocol::consensus::MAIN_NETWORK;
+
+        let mut db = WalletDb::for_path(path, MAIN_NETWORK, SystemClock, OsRng)
+            .expect("the wallet database must open");
+        let seed = SecretVec::new(vec![7u8; 32]);
+        let treestate = TreeState {
+            // `to_chain_state` requires a valid 32-byte block hash; everything else can stay
+            // at the proto defaults (height 0, empty tree frontiers).
+            hash: "00".repeat(32),
+            ..TreeState::default()
+        };
+        let birthday = match AccountBirthday::from_treestate(treestate, None) {
+            Ok(birthday) => birthday,
+            Err(_) => panic!("the fixture treestate must convert to a birthday"),
+        };
+        let (account, _usk) = db
+            .create_account("fixture", &seed, &birthday, None)
+            .expect("account creation must succeed");
+        account.expose_uuid().into_bytes()
+    }
+
     /// A minimal stored migration: `n_preps` preparation transactions then `n_transfers`
     /// transfers, all ids engine-ordered (preps first), with the given lifecycle states.
     fn test_state(
@@ -2196,6 +2260,7 @@ mod tests {
                 h(expiry),
                 None,
                 s.clone(),
+                None,
             ));
         }
         let offset = prep_states.len() as u32;
@@ -2209,6 +2274,7 @@ mod tests {
                 h(expiry),
                 Some(h(scheduled)),
                 s.clone(),
+                None,
             ));
         }
         let funding: Vec<Zatoshis> = transfer_states.iter().map(|_| zat(100_000_000)).collect();
@@ -2480,7 +2546,7 @@ mod tests {
             },
             "chain-tip update must succeed"
         );
-        let account = [7u8; 16];
+        let account = create_fixture_account(&path);
         let ptr = unsafe {
             zcashlc_migration_estimate_runs(
                 path_bytes.as_ptr(),
@@ -2535,8 +2601,9 @@ mod tests {
     /// A freshly initialized wallet database has no stored migration, so its state marshals as
     /// `NotStarted`. The store tables come from the wallet schema migrations (they are no longer
     /// created by `open`), so the fixture runs `zcashlc_init_data_database` first, exactly like a
-    /// real caller. This exercises `open` (path decode, `parse_network`, store read) end to end
-    /// over the FFI.
+    /// real caller — and creates the account it queries, since the account-keyed store resolves
+    /// the account row up front. This exercises `open` (path decode, `parse_network`, store read)
+    /// end to end over the FFI.
     #[test]
     fn migration_state_on_fresh_db_is_not_started() {
         let path = std::env::temp_dir().join(format!(
@@ -2555,7 +2622,7 @@ mod tests {
             )
         };
         assert!(init >= 0, "wallet-db initialization must succeed");
-        let account = [7u8; 16];
+        let account = create_fixture_account(&path);
         let ptr = unsafe {
             zcashlc_migration_state(
                 path_bytes.as_ptr(),
