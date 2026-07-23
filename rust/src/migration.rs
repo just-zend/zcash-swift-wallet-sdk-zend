@@ -844,7 +844,18 @@ fn prove_if_needed(
             Ok(Some((bytes, txid)))
         }
         MigrationTxState::Signed => {
-            let natural_anchor = migration_finalize::natural_anchor_height(&ctx.wallet)?;
+            // The natural anchor is resolved LAZILY, only for the kind that proves against it: a
+            // transfer proves against its persisted boundary and must not fail just because the
+            // natural anchor is not resolvable yet (a wallet with a chain tip but no scanned
+            // blocks — e.g. a restored wallet whose delivery lane wakes before its first scan —
+            // has none, and `natural_anchor_height` hard-errors there, without the
+            // proving-unavailable prefix).
+            let natural_anchor = match tx.kind() {
+                MigrationTxKind::Preparation { .. } => {
+                    Some(migration_finalize::natural_anchor_height(&ctx.wallet)?)
+                }
+                MigrationTxKind::Transfer { .. } => None,
+            };
             let fvk = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?
                 .stored_orchard_fvk()?;
             let mut prover = WalletMigrationProver::new(&mut ctx.wallet, ctx.account, fvk);
@@ -874,6 +885,81 @@ fn prove_if_needed(
             other.as_ref()
         )),
     }
+}
+
+/// The delivery lane's drive-and-serve: returns the next broadcastable transaction as
+/// `(id, txid, proven pczt bytes)`, or `None` when nothing is due.
+///
+/// Commit stores every in-process-signed transaction `Signed` (and the external-signer ceremony
+/// lands its rows `Signed` too), while `next_broadcastable` serves only `Proved` rows — so before
+/// answering "nothing due", this drives the prove-ready `Signed` rows through `prove`
+/// (`Signed -> Proved`, persisted per prove by the caller's `prove`), looping until a row becomes
+/// broadcastable or neither selector advances. Each iteration flips one `Signed` row to `Proved`,
+/// so the loop terminates. Proving is decoupled from the broadcast schedule (upstream
+/// `next_provable`'s contract), so the drive may prove a not-yet-due transfer on the way to
+/// serving a due one behind it. Aside from `zcashlc_migration_sign_note_split`'s explicit
+/// first-preparation prove, this drive is the only place proving is initiated.
+///
+/// A transient prove outcome (`prove` returning `Ok(None)`: the wallet has not scanned/retained
+/// the needed anchor yet) means "nothing due yet", not an error — the row stays `Signed` and a
+/// later call retries.
+///
+/// `prove` is [`prove_if_needed`] in production; tests substitute a closure driving
+/// [`migration_finalize::prove_due_transaction`] with a recording/failing test prover (that seam
+/// is generic over `impl MigrationProver`) plus a fixture-store persist.
+fn drive_and_serve_next_due(
+    state: &mut MigrationState,
+    tip: BlockHeight,
+    mut prove: impl FnMut(
+        &mut MigrationState,
+        MigrationTxId,
+    ) -> anyhow::Result<Option<(Vec<u8>, [u8; 32])>>,
+) -> anyhow::Result<Option<(MigrationTxId, [u8; 32], Vec<u8>)>> {
+    while state.next_broadcastable(tip).is_none() {
+        let Some(provable) = state.next_provable(tip) else {
+            return Ok(None);
+        };
+        if prove(state, provable)?.is_none() {
+            return Ok(None);
+        }
+    }
+    let id = state
+        .next_broadcastable(tip)
+        .expect("the drive loop exits with a broadcastable row");
+    Ok(prove(state, id)?.map(|(proven, txid)| (id, txid, proven)))
+}
+
+/// The id [`zcashlc_migration_next_due_transfer`] WOULD serve at `tip`, assuming every due proof
+/// succeeds: the next broadcastable row after virtually proving every prove-ready `Signed` row
+/// over a scratch copy — no prover runs and nothing persists (`set_transaction_proved` with the
+/// row's own bytes only flips the lifecycle state, mirroring [`drive_and_serve_next_due`]'s loop
+/// without its side effects). `None` when the delivery lane has nothing actionable: nothing
+/// schedule-due yet, dependencies unmined, rows awaiting an external signature (the signing
+/// ceremony, not the delivery lane, advances those), or everything already broadcast/mined.
+///
+/// The queries built on this ([`zcashlc_migration_has_overdue_transfers`],
+/// [`zcashlc_migration_pending_transfer_proposal`]) deliberately assume proofs succeed: a
+/// transiently unwitnessable anchor (a restored wallet mid-sync) defers the actual delivery, not
+/// the report — the due work exists either way, and the delivery call stays the one place that
+/// consults the prover.
+fn due_assuming_proving(state: &MigrationState, tip: BlockHeight) -> Option<MigrationTxId> {
+    if let Some(id) = state.next_broadcastable(tip) {
+        return Some(id);
+    }
+    if state.next_provable(tip).is_none() {
+        return None;
+    }
+    let mut scratch = state.clone();
+    while let Some(id) = scratch.next_provable(tip) {
+        let bytes = scratch
+            .transactions()
+            .iter()
+            .find(|t| t.id() == id)
+            .map(|t| t.pczt().clone())
+            .unwrap_or_default();
+        scratch.set_transaction_proved(id, bytes);
+    }
+    scratch.next_broadcastable(tip)
 }
 
 // ----- public-state derivation (pure; unit-tested) -----
@@ -1477,8 +1563,14 @@ pub unsafe extern "C" fn zcashlc_migration_is_note_split_needed(
     unwrap_exc_or(res, false)
 }
 
-/// Whether any transaction of the stored run is due-and-unbroadcast at the current tip. Returns
-/// `false` on error (see `zcashlc_last_error_message`).
+/// Whether any transaction of the stored run is due-and-unbroadcast at the current tip — that
+/// is, whether the delivery lane has actionable work: an already-`Proved` transaction due for
+/// broadcast, or a due, dependency-satisfied, prove-ready `Signed` one that
+/// [`zcashlc_migration_next_due_transfer`] would drive through proving and serve (proofs are
+/// assumed to succeed — a transiently unwitnessable anchor defers the delivery, not this
+/// report; see [`due_assuming_proving`]). A row awaiting an EXTERNAL signature is not delivery
+/// work (the signing ceremony advances it). Returns `false` on error (see
+/// `zcashlc_last_error_message`).
 ///
 /// # Safety
 /// See [`open`].
@@ -1498,7 +1590,7 @@ pub unsafe extern "C" fn zcashlc_migration_has_overdue_transfers(
             return Ok(false);
         }
         let tip = ctx.tip()?;
-        Ok(state.next_broadcastable(tip).is_some())
+        Ok(due_assuming_proving(&state, tip).is_some())
     });
     unwrap_exc_or(res, false)
 }
@@ -2022,8 +2114,12 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
 
 /// The next due transaction of the stored run, proven and ready to broadcast — or the
 /// "nothing due" sentinel (null id/pczt) when nothing qualifies yet (nothing scheduled, deps
-/// unmined, or the due transaction's funding note is not yet witnessable). Reconciles mined
-/// transactions first. Serves preparation transactions and transfers alike, in scheduled order.
+/// unmined, or a due transaction's anchor is not yet witnessable). Reconciles mined
+/// transactions first, then DRIVES the run's prove-ready `Signed` rows through proving
+/// (`Signed -> Proved`, each persisted) before serving — commit stores every transaction
+/// `Signed`, so without this drive nothing would ever become broadcastable (see
+/// [`drive_and_serve_next_due`]). Serves preparation transactions and transfers alike, in
+/// scheduled order.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_prepared_transfer`].
@@ -2043,12 +2139,12 @@ pub unsafe extern "C" fn zcashlc_migration_next_due_transfer(
             return Ok(FfiPreparedTransfer::none());
         }
         let tip = ctx.tip()?;
-        let Some(id) = state.next_broadcastable(tip) else {
-            return Ok(FfiPreparedTransfer::none());
-        };
-        match prove_if_needed(&mut ctx, &mut state, id)? {
-            Some((proven, txid)) => FfiPreparedTransfer::from_parts(id, txid, proven),
-            // Due but not yet finalizable (funding note not witnessable yet) — "nothing due".
+        let served = drive_and_serve_next_due(&mut state, tip, |state, id| {
+            prove_if_needed(&mut ctx, state, id)
+        })?;
+        match served {
+            Some((id, txid, proven)) => FfiPreparedTransfer::from_parts(id, txid, proven),
+            // Nothing due, or due but not yet finalizable (anchor not witnessable yet).
             None => Ok(FfiPreparedTransfer::none()),
         }
     });
@@ -2058,6 +2154,13 @@ pub unsafe extern "C" fn zcashlc_migration_next_due_transfer(
 /// The next due-and-unbroadcast TRANSFER of the stored run as a proposal row (id, amount, its
 /// scheduled and expiry heights), or NULL with no error when there is none. Distinguish the two
 /// NULL meanings via `zcashlc_last_error_length`.
+///
+/// "Due-and-unbroadcast" matches what [`zcashlc_migration_next_due_transfer`] would serve: an
+/// already-`Proved` due transfer, or a due, prove-ready `Signed` one the delivery call would
+/// first drive through proving (see [`due_assuming_proving`] — this query itself never proves;
+/// it reports the row the delivery lane is being driven toward, assuming its proof succeeds).
+/// NULL when the would-be-served transaction is a preparation, when due rows still await an
+/// external signature, or when nothing is due.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_transfer_proposal`].
@@ -2077,8 +2180,7 @@ pub unsafe extern "C" fn zcashlc_migration_pending_transfer_proposal(
             return Ok(ptr::null_mut());
         }
         let tip = ctx.tip()?;
-        let next_transfer = state
-            .next_broadcastable(tip)
+        let next_transfer = due_assuming_proving(&state, tip)
             .and_then(|id| state.transactions().iter().find(|t| t.id() == id))
             .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }));
         match next_transfer {
@@ -3705,8 +3807,9 @@ mod tests {
     }
 
     /// A TRANSFER proves via `prove_transfer` with EXACTLY the boundary persisted on its row —
-    /// not the natural anchor passed alongside — and the proven bytes persist through the
-    /// engine's `Proved` state.
+    /// the caller resolves NO natural anchor for it (`None`, the lazy per-kind contract: a wallet
+    /// whose natural anchor is not resolvable yet must still prove transfers) — and the proven
+    /// bytes persist through the engine's `Proved` state.
     #[test]
     fn prove_dispatch_routes_a_transfer_to_its_stored_boundary() {
         let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
@@ -3715,7 +3818,7 @@ mod tests {
             &mut prover,
             &mut state,
             MigrationTxId::new(1),
-            h(999),
+            None,
         )
         .expect("a boundary-carrying transfer proves");
         assert_eq!(res, Some(()), "the transfer must prove, not defer");
@@ -3758,7 +3861,7 @@ mod tests {
             &mut prover,
             &mut state,
             MigrationTxId::new(0),
-            h(777),
+            Some(h(777)),
         )
         .expect("a signed preparation proves");
         assert_eq!(res, Some(()), "the preparation must prove, not defer");
@@ -3789,7 +3892,7 @@ mod tests {
             &mut prover,
             &mut state,
             MigrationTxId::new(1),
-            h(999),
+            None,
         )
         .expect_err("a boundary-less transfer must not prove");
         assert!(
@@ -3831,7 +3934,7 @@ mod tests {
                 &mut prover,
                 &mut state,
                 MigrationTxId::new(1),
-                h(999),
+                None,
             )
             .unwrap_or_else(|e| panic!("{label} must be transient, got hard error: {e}"));
             assert_eq!(res, None, "{label} must map to the nothing-due lane");
@@ -3869,7 +3972,7 @@ mod tests {
                 &mut prover,
                 &mut state,
                 MigrationTxId::new(1),
-                h(999),
+                None,
             )
             .expect_err(&format!("{label} must be a hard error"));
             assert!(
@@ -3877,5 +3980,370 @@ mod tests {
                 "{label} must carry the proving-unavailable prefix, got: {err}"
             );
         }
+    }
+
+    /// A PREPARATION reaching the dispatch WITHOUT a resolved natural anchor is a caller bug and
+    /// a hard proving-unavailable error — never a silent prove against a wrong anchor (the prover
+    /// is not consulted at all). This is the guard behind the lazy per-kind resolution: only the
+    /// preparation arm may demand the natural anchor.
+    #[test]
+    fn prove_dispatch_preparation_without_a_natural_anchor_is_a_hard_error() {
+        let mut state = provable_state(
+            &[MigrationTxState::Signed],
+            &[MigrationTxState::Signed],
+            Some(h(1440)),
+        );
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let err = migration_finalize::prove_due_transaction(
+            &mut prover,
+            &mut state,
+            MigrationTxId::new(0),
+            None,
+        )
+        .expect_err("a preparation without a natural anchor must not prove");
+        assert!(
+            err.to_string().starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "the missing anchor must surface on the proving-unavailable route, got: {err}"
+        );
+        assert!(
+            prover.calls.is_empty(),
+            "the prover must never be consulted without an anchor"
+        );
+    }
+
+    // ----- the delivery lane's Signed -> Proved drive (C1) -----
+
+    use crate::migration_finalize::ProveErrorClass;
+
+    /// A [`provable_state`]-style row set with EXPLICIT per-transfer scheduling: each transfer is
+    /// `(state, scheduled, boundary)` with parseable PCZT bytes and expiry 10_000. Preparation
+    /// rows keep [`provable_state`]'s shape (scheduled 50, no boundary).
+    fn scheduled_state(
+        prep_states: &[MigrationTxState],
+        transfers: &[(MigrationTxState, u32, Option<BlockHeight>)],
+    ) -> MigrationState {
+        let transfer_states: Vec<MigrationTxState> =
+            transfers.iter().map(|(s, _, _)| s.clone()).collect();
+        let base = test_state(
+            MigrationStatus::InProgress,
+            prep_states,
+            &transfer_states,
+            50,
+            10_000,
+        );
+        let bytes = minimal_pczt_bytes();
+        let offset = prep_states.len();
+        let transactions = base
+            .transactions()
+            .iter()
+            .map(|t| {
+                let (scheduled, boundary) = match t.kind() {
+                    MigrationTxKind::Transfer { .. } => {
+                        let (_, scheduled, boundary) =
+                            &transfers[u32::from(t.id()) as usize - offset];
+                        (h(*scheduled), *boundary)
+                    }
+                    MigrationTxKind::Preparation { .. } => (t.scheduled_height(), None),
+                };
+                MigrationTransaction::from_parts(
+                    t.id(),
+                    t.kind(),
+                    bytes.clone(),
+                    t.depends_on().clone(),
+                    scheduled,
+                    t.expiry_height(),
+                    boundary,
+                    t.state(),
+                    t.lock_owner(),
+                )
+            })
+            .collect();
+        MigrationState::from_parts(
+            base.status(),
+            base.note_split().clone(),
+            base.preparation().clone(),
+            transactions,
+        )
+    }
+
+    /// The test-side counterpart of [`prove_if_needed`] for [`drive_and_serve_next_due`]: proves
+    /// through the same generic [`migration_finalize::prove_due_transaction`] seam with the given
+    /// test prover instead of the production `WalletMigrationProver`, persists through the same
+    /// account-keyed store, and serves the stored bytes. The txid is zeroed (these fixture PCZTs
+    /// carry no extractable transaction) and the natural anchor is never resolved (these fixtures
+    /// drive transfers only, which prove against their persisted boundary).
+    fn prove_with_test_prover<P>(
+        path: &std::path::Path,
+        account: &[u8; 16],
+        prover: &mut P,
+        state: &mut MigrationState,
+        id: MigrationTxId,
+    ) -> anyhow::Result<Option<(Vec<u8>, [u8; 32])>>
+    where
+        P: MigrationProver,
+        P::Error: ProveErrorClass + std::fmt::Display,
+    {
+        let tx_state = state
+            .transactions()
+            .iter()
+            .find(|t| t.id() == id)
+            .map(|t| t.state())
+            .expect("the driven id exists in the fixture state");
+        match tx_state {
+            MigrationTxState::Proved => {
+                let bytes = state
+                    .transactions()
+                    .iter()
+                    .find(|t| t.id() == id)
+                    .expect("the driven id exists in the fixture state")
+                    .pczt()
+                    .clone();
+                Ok(Some((bytes, [0u8; 32])))
+            }
+            MigrationTxState::Signed => {
+                if migration_finalize::prove_due_transaction(prover, state, id, None)?.is_none() {
+                    return Ok(None);
+                }
+                store_fixture_state(path, account, state);
+                let bytes = state
+                    .transactions()
+                    .iter()
+                    .find(|t| t.id() == id)
+                    .expect("the driven id exists in the fixture state")
+                    .pczt()
+                    .clone();
+                Ok(Some((bytes, [0u8; 32])))
+            }
+            other => panic!("the drive must not prove a row in state {}", other.as_ref()),
+        }
+    }
+
+    /// Re-reads the stored migration for `account`, for asserting what the drive persisted.
+    fn read_fixture_state(path: &std::path::Path, account: &[u8; 16]) -> MigrationState {
+        let mut conn = Connection::open(path).expect("the verification connection opens");
+        let account_id = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
+        let store = PoolMigrations::for_account(&mut conn, account_id)
+            .expect("the account-keyed store resolves the fixture account");
+        store
+            .get_migration()
+            .expect("the store reads")
+            .expect("a migration is stored")
+    }
+
+    /// The delivery serving path drives a due `Signed` transfer through proving — `Signed ->
+    /// Proved`, PERSISTED — and serves it, instead of answering "nothing due" forever: commit
+    /// stores every transaction `Signed` (never `Proved`), and aside from the note-split
+    /// submission's explicit first-preparation prove, this path is the only prover driver.
+    #[test]
+    fn delivery_serving_proves_a_due_signed_transfer_and_serves_it() {
+        let path = init_fixture_db("zcashlc_delivery_serves_signed");
+        let account = create_fixture_account(&path);
+        let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
+        store_fixture_state(&path, &account, &state);
+
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let served = drive_and_serve_next_due(&mut state, h(5_000), |state, id| {
+            prove_with_test_prover(&path, &account, &mut prover, state, id)
+        })
+        .expect("driving a provable, due transfer must not fail");
+
+        let (id, _txid, bytes) = served.expect("the due Signed transfer must be served");
+        assert_eq!(id, MigrationTxId::new(1), "the transfer row must be served");
+        assert_eq!(
+            prover.calls,
+            vec![ProveCall::Transfer(h(1440))],
+            "the drive must prove exactly once, against the row's persisted boundary"
+        );
+        let stored = read_fixture_state(&path, &account);
+        let tx = stored
+            .transactions()
+            .iter()
+            .find(|t| t.id() == MigrationTxId::new(1))
+            .expect("the transfer row remains stored");
+        assert!(
+            matches!(tx.state(), MigrationTxState::Proved),
+            "the drive must persist Signed -> Proved"
+        );
+        assert_eq!(
+            tx.pczt(),
+            &bytes,
+            "the served bytes must be the persisted proven artifact"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A transient prover outcome (the anchor not scanned/retained yet) on the due `Signed`
+    /// transfer maps to "nothing due" — not an error — with the row left `Signed` for a later
+    /// retry, and the prover consulted exactly once (the drive DID attempt the prove).
+    #[test]
+    fn delivery_serving_maps_a_transient_prove_to_nothing_due_leaving_the_row_signed() {
+        let path = init_fixture_db("zcashlc_delivery_transient");
+        let account = create_fixture_account(&path);
+        let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
+        store_fixture_state(&path, &account, &state);
+
+        let mut prover = FailingProver {
+            error: Some(WalletProveError::AnchorNotFound(h(1440))),
+        };
+        let served = drive_and_serve_next_due(&mut state, h(5_000), |state, id| {
+            prove_with_test_prover(&path, &account, &mut prover, state, id)
+        })
+        .expect("a transient prove outcome must not be an error");
+
+        assert!(
+            served.is_none(),
+            "a transient prove means nothing is due yet"
+        );
+        assert!(
+            prover.error.is_none(),
+            "the drive must have consulted the prover for the due Signed row"
+        );
+        let stored = read_fixture_state(&path, &account);
+        let tx = stored
+            .transactions()
+            .iter()
+            .find(|t| t.id() == MigrationTxId::new(1))
+            .expect("the transfer row remains stored");
+        assert!(
+            matches!(tx.state(), MigrationTxState::Signed),
+            "a transient prove must leave the row Signed for a retry"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The drive proves PAST a provable-but-not-yet-due transfer to serve a later one that is
+    /// due: each successful prove persists `Proved` and the loop re-consults both selectors, so
+    /// one blocked-on-schedule row cannot hide due work behind it.
+    #[test]
+    fn delivery_serving_proves_past_an_undue_transfer_to_serve_a_due_one() {
+        let path = init_fixture_db("zcashlc_delivery_past_undue");
+        let account = create_fixture_account(&path);
+        // Transfer 1: provable (boundary settled) but scheduled ABOVE the tip; transfer 2:
+        // provable and due. Both Signed.
+        let mut state = scheduled_state(
+            &[MINED],
+            &[
+                (MigrationTxState::Signed, 9_000, Some(h(40))),
+                (MigrationTxState::Signed, 90, Some(h(40))),
+            ],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let served = drive_and_serve_next_due(&mut state, h(100), |state, id| {
+            prove_with_test_prover(&path, &account, &mut prover, state, id)
+        })
+        .expect("the drive must not fail");
+
+        let (id, _, _) = served.expect("the due transfer behind the undue one must be served");
+        assert_eq!(
+            id,
+            MigrationTxId::new(2),
+            "the schedule-due transfer must be the one served"
+        );
+        let stored = read_fixture_state(&path, &account);
+        for expect_id in [1u32, 2u32] {
+            let tx = stored
+                .transactions()
+                .iter()
+                .find(|t| t.id() == MigrationTxId::new(expect_id))
+                .expect("the transfer row remains stored");
+            assert!(
+                matches!(tx.state(), MigrationTxState::Proved),
+                "the drive must persist every prove it performed (row {expect_id})"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// [`due_assuming_proving`] mirrors the drive without a prover: a due `Signed` transfer
+    /// behind an undue one IS reported, an undue-only schedule is NOT, and a row awaiting an
+    /// external signature never is (the signing ceremony, not the delivery lane, advances it).
+    #[test]
+    fn due_assuming_proving_reports_due_signed_rows_and_only_those() {
+        // A due Signed transfer behind an undue one: reported (the drive would serve it).
+        let state = scheduled_state(
+            &[MINED],
+            &[
+                (MigrationTxState::Signed, 9_000, Some(h(40))),
+                (MigrationTxState::Signed, 90, Some(h(40))),
+            ],
+        );
+        assert_eq!(
+            due_assuming_proving(&state, h(100)),
+            Some(MigrationTxId::new(2)),
+            "a due-but-unproved transfer is due delivery work"
+        );
+        assert!(
+            state
+                .transactions()
+                .iter()
+                .all(|t| !matches!(t.state(), MigrationTxState::Proved)),
+            "the virtual drive must not mutate the caller's state"
+        );
+
+        // Provable but nothing schedule-due: not reported (proving alone is not overdue work).
+        let undue = scheduled_state(&[MINED], &[(MigrationTxState::Signed, 9_000, Some(h(40)))]);
+        assert_eq!(due_assuming_proving(&undue, h(100)), None);
+
+        // Awaiting an external signature, schedule-due: not delivery work.
+        let awaiting = scheduled_state(
+            &[MINED],
+            &[(MigrationTxState::AwaitingSignature, 90, Some(h(40)))],
+        );
+        assert_eq!(due_assuming_proving(&awaiting, h(100)), None);
+
+        // Already Proved and due: reported exactly as before the drive existed.
+        let proved = scheduled_state(&[MINED], &[(MigrationTxState::Proved, 90, Some(h(40)))]);
+        assert_eq!(
+            due_assuming_proving(&proved, h(100)),
+            Some(MigrationTxId::new(1))
+        );
+    }
+
+    /// A stored run whose next transaction is `Signed`, schedule-due, dependency-satisfied, and
+    /// prove-ready is OVERDUE WORK over the real FFI: commit stores rows `Signed`, and proving is
+    /// the delivery lane's own job, so answering only for already-`Proved` rows would report
+    /// "nothing to do" forever on a run whose transfers were never proved.
+    #[test]
+    fn has_overdue_transfers_reports_a_due_signed_transfer() {
+        let path = init_fixture_db("zcashlc_migration_overdue_signed");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        // Signed, scheduled below the tip (due), expiry above the target (valid), boundary
+        // settled (`test_state` draws the boundary at the scheduled height, strictly below the
+        // tip).
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            3_499_000,
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &state);
+        let overdue = unsafe {
+            zcashlc_migration_has_overdue_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(
+            overdue,
+            "a due-but-unproved Signed transfer is overdue delivery work"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

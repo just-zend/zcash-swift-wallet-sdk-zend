@@ -95,6 +95,12 @@ impl<TE, NE, RE> ProveErrorClass for WalletProveError<TE, NE, RE> {
 /// success the engine has stored the proven bytes into `state` (`Signed -> Proved` via
 /// `set_transaction_proved`); the caller persists `state` and re-reads the proven PCZT from it.
 ///
+/// `natural_anchor` is `Option`al because only a PREPARATION uses it — the caller resolves it
+/// lazily, per kind, so proving a transfer never depends on the natural anchor being resolvable
+/// (a wallet with a chain tip but no scanned blocks yet has none, and must still prove transfers
+/// against their persisted boundaries). A preparation reaching this function without one is a
+/// caller bug, surfaced as a hard error rather than a silent wrong anchor.
+///
 /// Returns `Ok(None)` — not an error — when the prover reports a transient "the wallet has not
 /// scanned/retained that anchor yet" condition (see [`ProveErrorClass`]): the ordinary
 /// nothing-due state the caller maps to "retry on a later call", exactly like a transaction whose
@@ -107,7 +113,7 @@ pub(crate) fn prove_due_transaction<P>(
     prover: &mut P,
     state: &mut MigrationState,
     id: MigrationTxId,
-    natural_anchor: BlockHeight,
+    natural_anchor: Option<BlockHeight>,
 ) -> anyhow::Result<Option<()>>
 where
     P: MigrationProver,
@@ -127,7 +133,13 @@ where
     let result = match kind {
         MigrationTxKind::Transfer { .. } => engine::prove_transfer(prover, state, id),
         MigrationTxKind::Preparation { .. } => {
-            engine::prove_preparation(prover, state, id, natural_anchor)
+            let anchor = natural_anchor.ok_or_else(|| {
+                proving_unavailable(format!(
+                    "internal error: no natural anchor was resolved for preparation transaction {}",
+                    u32::from(id)
+                ))
+            })?;
+            engine::prove_preparation(prover, state, id, anchor)
         }
     };
     match result {
