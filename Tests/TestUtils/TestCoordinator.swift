@@ -247,23 +247,38 @@ extension TestCoordinator {
     }
 }
 
-struct TemporaryTestDatabases {
+final class TemporaryTestDatabases {
+    let rootURL: URL
     var fsCacheDbRoot: URL
     let generalStorageURL: URL
     var torDir: URL
     var dataDB: URL
+
+    init(rootURL: URL, fsCacheDbRoot: URL, generalStorageURL: URL, torDir: URL, dataDB: URL) {
+        self.rootURL = rootURL
+        self.fsCacheDbRoot = fsCacheDbRoot
+        self.generalStorageURL = generalStorageURL
+        self.torDir = torDir
+        self.dataDB = dataDB
+    }
+
+    deinit {
+        try? FileManager.default.removeItem(at: rootURL)
+    }
 }
 
 enum TemporaryDbBuilder {
     static func build() -> TemporaryTestDatabases {
-        let tempUrl = try! __documentsDirectory()
-        let timestamp = String(Int(Date().timeIntervalSince1970))
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zcash-swift-wallet-sdk-tests-\(UUID().uuidString)", isDirectory: true)
+        try! FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
 
         return TemporaryTestDatabases(
-            fsCacheDbRoot: tempUrl.appendingPathComponent("fs_cache_\(timestamp)"),
-            generalStorageURL: tempUrl.appendingPathComponent("general_storage_\(timestamp)"),
-            torDir: tempUrl.appendingPathComponent("tor_\(timestamp)"),
-            dataDB: tempUrl.appendingPathComponent("data_db_\(timestamp).db")
+            rootURL: rootURL,
+            fsCacheDbRoot: rootURL.appendingPathComponent("fs_cache"),
+            generalStorageURL: rootURL.appendingPathComponent("general_storage"),
+            torDir: rootURL.appendingPathComponent("tor"),
+            dataDB: rootURL.appendingPathComponent("data.db")
         )
     }
 }
