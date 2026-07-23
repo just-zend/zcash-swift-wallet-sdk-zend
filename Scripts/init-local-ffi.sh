@@ -28,14 +28,6 @@ if [[ -f "$HOME/.cargo/env" ]]; then
     source "$HOME/.cargo/env"
 fi
 
-# shellcheck source=rust-build-env.sh
-source Scripts/rust-build-env.sh
-RUST_TOOLCHAIN=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
-if [[ -z "$RUST_TOOLCHAIN" ]]; then
-    echo "Error: rust-toolchain.toml must pin an exact toolchain" >&2
-    exit 1
-fi
-
 XCFRAMEWORK_DIR="LocalPackages/libzcashlc.xcframework"
 
 usage() {
@@ -62,17 +54,9 @@ USAGEEOF
 # Build an arm64-only xcframework containing exactly the requested slices, then
 # atomically swap it into place. Each argument is one of: ios-sim, ios-device, macos.
 #
-# Slice LibraryIdentifiers name exactly the architectures the slice contains
-# (e.g. ios-arm64-simulator) — only the full 5-arch build may use the fat
-# identifiers (ios-arm64_x86_64-simulator, macos-arm64_x86_64), because its
-# slices really are universal. This build is what gets committed in-tree on the
-# fork line, and an identifier advertising an x86_64 that isn't in the binary
-# turns every multi-arch build (generic simulator destinations, Intel Macs)
-# into a late "symbol(s) not found for architecture x86_64" link failure
-# instead of an up-front unsupported-architecture error. A fat committed slice
-# is not an option: one arch is ~52MB, two would cross GitHub's 100MB file
-# limit. rebuild-local-ffi.sh names its single-arch slices the same way, so
-# the two tools stay interchangeable.
+# The slices reuse the same LibraryIdentifiers as the full build (e.g.
+# macos-arm64_x86_64) but declare only arm64 in SupportedArchitectures, matching
+# what rebuild-local-ffi.sh produces, so the two tools stay interchangeable.
 build_arm_xcframework() {
     local targets=("$@")
 
@@ -90,7 +74,7 @@ build_arm_xcframework() {
         case "$target" in
             ios-sim)
                 rust_target="aarch64-apple-ios-sim"
-                slice="ios-arm64-simulator"
+                slice="ios-arm64_x86_64-simulator"
                 platform="ios"
                 variant="simulator"
                 ;;
@@ -102,7 +86,7 @@ build_arm_xcframework() {
                 ;;
             macos)
                 rust_target="aarch64-apple-darwin"
-                slice="macos-arm64"
+                slice="macos-arm64_x86_64"
                 platform="macos"
                 variant=""
                 ;;
@@ -116,8 +100,8 @@ build_arm_xcframework() {
 
         # Ensure the Rust target is available (idempotent), then build it.
         # cargo is incremental, so repeat builds after small edits are fast.
-        rustup target add --toolchain "$RUST_TOOLCHAIN" "$rust_target"
-        cargo "+$RUST_TOOLCHAIN" build --locked --target "$rust_target" --release
+        rustup target add "$rust_target"
+        cargo build --target "$rust_target" --release
 
         # Populate the framework for this slice.
         local framework="$temp_xcfw/$slice/libzcashlc.framework"
@@ -152,6 +136,14 @@ build_arm_xcframework() {
     rm -rf "$XCFRAMEWORK_DIR"
     mv "$temp_xcfw" "$XCFRAMEWORK_DIR"
     rm -rf "$temp_dir"
+
+    # The slices above are assembled shallow (iOS layout). macOS embedded
+    # frameworks require the VERSIONED bundle layout, else the app build fails
+    # ("expected Versions/Current/Resources/Info.plist"). Same fix as the full
+    # make path below and rebuild-local-ffi.sh; guarded for iOS-only subsets.
+    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework" ]]; then
+        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    fi
 }
 
 # Parse the single optional flag.
@@ -190,14 +182,23 @@ if [[ "$BUILD_MODE" == "arm" ]]; then
     build_arm_xcframework "${ARM_TARGETS[@]}"
 elif [[ "$BUILD_MODE" == "cached" ]]; then
     echo "Downloading pre-built xcframework..."
-    REPO="just-zend/zcash-swift-wallet-sdk-zend"
 
-    # Extract the version from the download URL in Package.swift
-    SDK_VERSION=$(grep -oE 'releases/download/[^/"]+' Package.swift | head -1 | sed 's|releases/download/||')
-    if [[ -z "$SDK_VERSION" ]]; then
-        echo "Error: Could not determine SDK version from Package.swift"
+    # Derive BOTH the repo (owner/name — releases may live on a fork) and the full
+    # release tag (including any pre-release suffix like 2.6.0-alpha.6) from the
+    # binary-target download URL in Package.swift, so --cached always fetches the
+    # exact release the manifest pins.
+    DOWNLOAD_URL=$(grep -oE 'https://github.com/[^"]+/releases/download/[^"]+/libzcashlc\.xcframework\.zip' Package.swift | head -1)
+    if [[ -z "$DOWNLOAD_URL" ]]; then
+        echo "Error: Could not find the libzcashlc.xcframework.zip download URL in Package.swift"
         exit 1
     fi
+    REPO=$(echo "$DOWNLOAD_URL" | sed -E 's|https://github.com/([^/]+/[^/]+)/releases/download/.*|\1|')
+    SDK_VERSION=$(echo "$DOWNLOAD_URL" | sed -E 's|.*/releases/download/([^/]+)/.*|\1|')
+    if [[ -z "$REPO" || -z "$SDK_VERSION" ]]; then
+        echo "Error: Could not parse repo/version from download URL: $DOWNLOAD_URL"
+        exit 1
+    fi
+    echo "  release $SDK_VERSION from $REPO"
 
     # Extract the expected checksum from Package.swift
     EXPECTED_CHECKSUM=$(grep -A1 'libzcashlc.xcframework.zip' Package.swift | grep 'checksum:' | sed -E 's/.*checksum: "([a-f0-9]+)".*/\1/')
@@ -224,8 +225,19 @@ elif [[ "$BUILD_MODE" == "cached" ]]; then
     fi
     echo "Checksum verified."
 
+    # Remove any existing framework first: extracting/copying onto an existing
+    # directory leaves stale files (or, for cp -R, nests the new framework inside
+    # the old one), so installs must always start from a clean target.
+    rm -rf "$XCFRAMEWORK_DIR"
     unzip -o LocalPackages/libzcashlc.xcframework.zip -d LocalPackages/
     rm LocalPackages/libzcashlc.xcframework.zip
+
+    # Release zips ship every slice shallow (iOS layout); macOS embedding requires
+    # the versioned bundle layout, same as the build paths above. Idempotent — a
+    # future zip that ships versioned is left untouched.
+    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework" ]]; then
+        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    fi
     echo ""
     echo "Note: Downloaded pre-built xcframework may not match your local source."
     echo "      Run './Scripts/rebuild-local-ffi.sh' to rebuild for your target platform."
@@ -235,7 +247,15 @@ else
     make xcframework
     cd ..
     mkdir -p LocalPackages
+    # cp -R into an EXISTING directory copies the source INSIDE it (nested
+    # libzcashlc.xcframework/libzcashlc.xcframework with stale slices at the top
+    # level — device builds silently run old code). Always replace, never merge.
+    rm -rf "$XCFRAMEWORK_DIR"
     cp -R BuildSupport/products/libzcashlc.xcframework "$XCFRAMEWORK_DIR"
+    # The Makefile assembles every slice shallow (iOS layout). macOS embedded
+    # frameworks require the versioned bundle layout, else Xcode rejects the app
+    # ("expected Versions/Current/Resources/Info.plist"). Fix the macOS slice.
+    ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
 fi
 
 # Create local SPM package wrapper

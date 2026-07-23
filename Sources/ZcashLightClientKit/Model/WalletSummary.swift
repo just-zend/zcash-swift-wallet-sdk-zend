@@ -23,8 +23,8 @@ public struct AccountBalance: Equatable {
     public let saplingBalance: PoolBalance
     public let orchardBalance: PoolBalance
     /// The Ironwood (Orchard note-version V3 / NU6.3) balance. Ironwood is received at the account's
-    /// Orchard receiver. This is `.zero` for every wallet until NU6.3 activates and a lightwalletd
-    /// serves Ironwood compact blocks.
+    /// Orchard receiver. Non-zero only on NU6.3-active networks served by an Ironwood-aware
+    /// lightwalletd (live on the public Ironwood testnet).
     public let ironwoodBalance: PoolBalance
     public let unshielded: Zatoshi
 
@@ -54,6 +54,31 @@ public struct AccountBalance: Equatable {
         self.ironwoodBalance = ironwoodBalance
         self.unshielded = unshielded
         self.awaitingResolution = awaitingResolution
+    }
+
+    /// The spendable value summed across every shielded pool (Sapling, Orchard,
+    /// Ironwood). Prefer this over summing pools at call sites — a new shielded
+    /// pool then flows through automatically.
+    public var shieldedSpendableValue: Zatoshi {
+        saplingBalance.spendableValue + orchardBalance.spendableValue + ironwoodBalance.spendableValue
+    }
+
+    /// The total value (spendable + pending change + pending spendability) summed
+    /// across every shielded pool.
+    public func shieldedTotal() -> Zatoshi {
+        saplingBalance.total() + orchardBalance.total() + ironwoodBalance.total()
+    }
+
+    /// The change pending confirmation, summed across every shielded pool.
+    public var shieldedChangePendingConfirmation: Zatoshi {
+        saplingBalance.changePendingConfirmation + orchardBalance.changePendingConfirmation
+            + ironwoodBalance.changePendingConfirmation
+    }
+
+    /// The value pending spendability, summed across every shielded pool.
+    public var shieldedValuePendingSpendability: Zatoshi {
+        saplingBalance.valuePendingSpendability + orchardBalance.valuePendingSpendability
+            + ironwoodBalance.valuePendingSpendability
     }
 }
 

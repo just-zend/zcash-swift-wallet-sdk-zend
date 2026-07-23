@@ -6,13 +6,9 @@ use zcash_voting as voting;
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
-use super::constants::{CANONICAL_FIELD_LEN, MIN_SEED_LEN, VOTE_ROUND_ID_HEX_LEN};
 use super::db::VotingDatabaseHandle;
 use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
-use super::json::{
-    JsonCastVoteSignature, JsonSharePayload, JsonVoteCommitmentBundle, JsonWireEncryptedShare,
-};
-use super::progress::ProgressBridge;
+use super::json::{JsonSharePayload, JsonVoteCommitmentBundle, JsonWireEncryptedShare};
 
 /// Encrypt voting shares for a round.
 ///
@@ -34,21 +30,15 @@ pub unsafe extern "C" fn zcashlc_voting_encrypt_shares(
     shares_json_len: usize,
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let shares_bytes = unsafe { bytes_from_ptr(shares_json, shares_json_len) }?;
-        let shares: Vec<u64> = serde_json::from_slice(shares_bytes)?;
-
-        let encrypted = handle
-            .db
-            .encrypt_shares(&round_id_str, &shares)
-            .map_err(|e| anyhow!("encrypt_shares failed: {}", e))?;
-
-        let json_shares: Vec<JsonWireEncryptedShare> =
-            encrypted.into_iter().map(Into::into).collect();
-        json_to_boxed_slice(&json_shares)
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // Superseded: shares are split and encrypted inside the vote commit
+        // flow so the ciphertexts always match the proof; externally encrypted
+        // shares can no longer be injected. The commit result carries the
+        // encrypted shares (`enc_shares`) and helper payloads.
+        let _ = (&db, round_id, round_id_len, shares_json, shares_json_len);
+        Err(anyhow!(
+            "voting: encrypt_shares is superseded — shares are encrypted inside the vote commit flow"
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -99,48 +89,56 @@ pub unsafe extern "C" fn zcashlc_voting_build_vote_commitment(
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let seed = unsafe { bytes_from_ptr(hotkey_seed, hotkey_seed_len) }?;
-        require_min_seed_len(seed, "hotkey_seed")?;
+        // The network rides the database handle since 1.0; the parameter stays
+        // for ABI compatibility.
+        let _ = network_id;
+        let secret = unsafe { bytes_from_ptr(hotkey_seed, hotkey_seed_len) }?;
         let auth_path_bytes =
             unsafe { bytes_from_ptr(van_auth_path_json, van_auth_path_json_len) }?;
         let auth_path_vecs: Vec<Vec<u8>> = serde_json::from_slice(auth_path_bytes)?;
-        let auth_path: Vec<[u8; CANONICAL_FIELD_LEN]> = auth_path_vecs
-            .into_iter()
-            .map(|v| {
-                v.try_into().map_err(|_| {
-                    anyhow!("each auth_path sibling must be {CANONICAL_FIELD_LEN} bytes")
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let reporter: Box<dyn voting::ProofProgressReporter> = match progress_callback {
-            Some(cb) => Box::new(ProgressBridge {
+        let hotkey = voting::types::VotingHotkey::from_stored_secret(secret, handle.network)
+            .map_err(|e| anyhow!("invalid voting hotkey material: {}", e))?;
+        let witness =
+            voting::vote::VanWitness::from_wire(&auth_path_vecs, van_position, anchor_height)
+                .map_err(|e| anyhow!("invalid VAN witness: {}", e))?;
+        let draft = voting::wire::DraftVote {
+            proposal_id,
+            choice,
+            num_options,
+            vc_tree_position: 0,
+            single_share: single_share != 0,
+        };
+
+        let stages: Box<dyn voting::types::VoteCommitStageReporter> = match progress_callback {
+            Some(cb) => Box::new(VoteStageBridge {
                 callback: cb,
                 context: *progress_context,
             }),
-            None => Box::new(voting::NoopProgressReporter),
+            None => Box::new(NoopVoteStages),
         };
 
-        let bundle = handle
-            .db
-            .build_vote_commitment(
-                &round_id_str,
-                bundle_index,
-                seed,
-                network_id,
-                proposal_id,
-                choice,
-                num_options,
-                &auth_path,
-                van_position,
-                anchor_height,
-                single_share != 0,
-                reporter.as_ref(),
-            )
-            .map_err(|e| anyhow!("build_vote_commitment failed: {}", e))?;
+        // One-shot in zcash_voting 1.0: builds ZKP #2 (share split + encryption
+        // happen inside so ciphertexts match the proof), signs the cast vote
+        // with the hotkey, builds helper-share payloads, and persists recovery
+        // state. The legacy JSON contract is preserved, enriched with the
+        // signature and share payloads the old multi-step flow fetched
+        // separately.
+        let committed = voting::vote::CommittedVote::commit(
+            &handle.db,
+            &round_id_str,
+            bundle_index,
+            &draft,
+            &witness,
+            voting::vote::VoteSigner::hotkey(&hotkey),
+            stages.as_ref(),
+        )
+        .map_err(|e| anyhow!("build_vote_commitment failed: {}", e))?;
+        let signed = committed
+            .signed_commitment(&handle.db)
+            .map_err(|e| anyhow!("failed to read committed vote: {}", e))?;
 
-        let json_bundle: JsonVoteCommitmentBundle = bundle.into();
-        json_to_boxed_slice(&json_bundle)
+        json_to_boxed_slice(&committed_vote_json(&signed))
     });
     unwrap_exc_or_null(res)
 }
@@ -229,9 +227,22 @@ pub unsafe extern "C" fn zcashlc_voting_mark_vote_submitted(
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
 
+        // zcash_voting 1.0 records submission and tx hash atomically; re-mark
+        // with the stored hash (idempotent, conflicting hashes rejected).
+        // Propagate lookup failures (missing vote row, locked/corrupt DB) with
+        // their real cause instead of collapsing every non-`Some` outcome into
+        // the "call store_vote_tx_hash first" message; that guidance only holds
+        // when the vote exists but has no stored hash yet (`Ok(None)`).
+        let tx_hash = handle
+            .db
+            .get_vote_tx_hash(&round_id_str, bundle_index, proposal_id)
+            .map_err(|e| anyhow!("failed to look up stored vote tx hash: {}", e))?
+            .ok_or_else(|| {
+                anyhow!("mark_vote_submitted requires a stored vote tx hash — call store_vote_tx_hash first")
+            })?;
         handle
             .db
-            .mark_vote_submitted(&round_id_str, bundle_index, proposal_id)
+            .mark_vote_submitted(&round_id_str, bundle_index, proposal_id, &tx_hash)
             .map_err(|e| anyhow!("mark_vote_submitted failed: {}", e))?;
         Ok(0)
     });
@@ -272,609 +283,108 @@ pub unsafe extern "C" fn zcashlc_voting_sign_cast_vote(
     alpha_v: *const u8,
     alpha_v_len: usize,
 ) -> *mut crate::ffi::BoxedSlice {
-    let res = catch_panic(|| {
-        let seed = unsafe { bytes_from_ptr(hotkey_seed, hotkey_seed_len) }?;
-        require_min_seed_len(seed, "hotkey_seed")?;
-        let round_id = unsafe { str_from_ptr(vote_round_id_hex, vote_round_id_hex_len) }?;
-        let r_vpk = unsafe { bytes_from_ptr(r_vpk_bytes, r_vpk_bytes_len) }?;
-        let van_nf = unsafe { bytes_from_ptr(van_nullifier, van_nullifier_len) }?;
-        let van_new =
-            unsafe { bytes_from_ptr(vote_authority_note_new, vote_authority_note_new_len) }?;
-        let vc = unsafe { bytes_from_ptr(vote_commitment, vote_commitment_len) }?;
-        let alpha = unsafe { bytes_from_ptr(alpha_v, alpha_v_len) }?;
-
-        if round_id.len() != VOTE_ROUND_ID_HEX_LEN {
-            return Err(anyhow!(
-                "vote_round_id_hex must be {} hex characters, got {}",
-                VOTE_ROUND_ID_HEX_LEN,
-                round_id.len()
-            ));
-        }
-        require_ascii_hex(&round_id, "vote_round_id_hex")?;
-        require_32_bytes(r_vpk, "r_vpk_bytes")?;
-        require_32_bytes(van_nf, "van_nullifier")?;
-        require_32_bytes(van_new, "vote_authority_note_new")?;
-        require_32_bytes(vc, "vote_commitment")?;
-        require_32_bytes(alpha, "alpha_v")?;
-
-        let sig = voting::vote_commitment::sign_cast_vote(
-            seed,
+    let res = catch_panic(|| -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
+        // Superseded: the cast-vote spend-authorization signature is produced
+        // inside the vote commit flow (VoteSigner) and returned with the
+        // commitment bundle (`vote_auth_sig`); a detached signing entry point
+        // no longer exists in zcash_voting.
+        let _ = (
+            hotkey_seed,
+            hotkey_seed_len,
             network_id,
-            &round_id,
-            r_vpk,
-            van_nf,
-            van_new,
-            vc,
+            vote_round_id_hex,
+            vote_round_id_hex_len,
+            r_vpk_bytes,
+            r_vpk_bytes_len,
+            van_nullifier,
+            van_nullifier_len,
+            vote_authority_note_new,
+            vote_authority_note_new_len,
+            vote_commitment,
+            vote_commitment_len,
             proposal_id,
             anchor_height,
-            alpha,
-        )
-        .map_err(|e| anyhow!("sign_cast_vote failed: {}", e))?;
-
-        let json_sig: JsonCastVoteSignature = sig.into();
-        json_to_boxed_slice(&json_sig)
+            alpha_v,
+            alpha_v_len,
+        );
+        Err(anyhow!(
+            "voting: sign_cast_vote is superseded — the signature is produced by the vote commit flow and returned as vote_auth_sig"
+        ))
     });
     unwrap_exc_or_null(res)
 }
 
-fn require_32_bytes(bytes: &[u8], name: &str) -> anyhow::Result<()> {
-    if bytes.len() != CANONICAL_FIELD_LEN {
-        return Err(anyhow!(
-            "{} must be {} bytes, got {}",
-            name,
-            CANONICAL_FIELD_LEN,
-            bytes.len()
-        ));
-    }
-    Ok(())
+/// Bridges the C progress callback onto the crate's vote-commit stage reporter.
+struct VoteStageBridge {
+    callback: unsafe extern "C" fn(f64, *mut std::ffi::c_void),
+    context: *mut std::ffi::c_void,
 }
 
-fn require_min_seed_len(bytes: &[u8], name: &str) -> anyhow::Result<()> {
-    if bytes.len() < MIN_SEED_LEN {
-        return Err(anyhow!(
-            "{} must be at least {} bytes, got {}",
-            name,
-            MIN_SEED_LEN,
-            bytes.len()
-        ));
-    }
-    Ok(())
-}
+unsafe impl Send for VoteStageBridge {}
+unsafe impl Sync for VoteStageBridge {}
 
-fn require_ascii_hex(value: &str, name: &str) -> anyhow::Result<()> {
-    if value.len() % 2 != 0 {
-        return Err(anyhow!(
-            "{name} must contain an even number of hex characters"
-        ));
-    }
-    if !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(anyhow!("{name} must contain only ASCII hex characters"));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::ffi::zcashlc_free_boxed_slice;
-    use crate::voting::db::zcashlc_voting_db_free;
-    use crate::voting::test_helpers::{insert_round_and_bundle, open_memory_db};
-    use pasta_curves::{
-        group::{Group, GroupEncoding},
-        pallas,
-    };
-    use serde::de::DeserializeOwned;
-
-    fn decode_boxed_json<T: DeserializeOwned>(ptr: *mut crate::ffi::BoxedSlice) -> T {
-        assert!(!ptr.is_null());
-        let json = unsafe { (*ptr).as_slice() }.to_vec();
-        let value = serde_json::from_slice(&json).expect("decode boxed JSON");
-        unsafe { zcashlc_free_boxed_slice(ptr) };
-        value
-    }
-
-    fn insert_round_with_valid_ea_pk(db: *mut VotingDatabaseHandle, round_id: &str) {
-        let handle = unsafe { db.as_ref() }.expect("voting db handle");
-        let params = voting::VotingRoundParams {
-            vote_round_id: round_id.to_string(),
-            snapshot_height: 123,
-            ea_pk: pallas::Point::generator().to_bytes().to_vec(),
-            nc_root: vec![8u8; 32],
-            nullifier_imt_root: vec![9u8; 32],
-        };
-        handle.db.init_round(&params, None).expect("insert round");
-    }
-
-    #[test]
-    fn vote_database_ffi_rejects_null_db() {
-        let round = b"round";
-        let json = b"[]";
-        let bytes = [0u8; CANONICAL_FIELD_LEN];
-
-        assert!(
-            unsafe {
-                zcashlc_voting_encrypt_shares(
-                    std::ptr::null_mut(),
-                    round.as_ptr(),
-                    round.len(),
-                    json.as_ptr(),
-                    json.len(),
-                )
-            }
-            .is_null()
-        );
-
-        assert!(
-            unsafe {
-                zcashlc_voting_build_vote_commitment(
-                    std::ptr::null_mut(),
-                    round.as_ptr(),
-                    round.len(),
-                    0,
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    0,
-                    1,
-                    0,
-                    2,
-                    json.as_ptr(),
-                    json.len(),
-                    0,
-                    0,
-                    None,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            }
-            .is_null()
-        );
-
-        assert!(
-            unsafe {
-                zcashlc_voting_build_share_payloads(
-                    std::ptr::null_mut(),
-                    json.as_ptr(),
-                    json.len(),
-                    0,
-                    2,
-                    0,
-                    0,
-                )
-            }
-            .is_null()
-        );
-
-        assert_eq!(
-            unsafe {
-                zcashlc_voting_mark_vote_submitted(
-                    std::ptr::null_mut(),
-                    round.as_ptr(),
-                    round.len(),
-                    0,
-                    1,
-                )
-            },
-            -1
-        );
-    }
-
-    #[test]
-    fn vote_database_ffi_rejects_malformed_json_inputs() {
-        let db = open_memory_db();
-        let round = b"round";
-        let invalid_json = b"not json";
-        let seed = [0x42u8; 64];
-
-        let malformed_shares_result = unsafe {
-            zcashlc_voting_encrypt_shares(
-                db,
-                round.as_ptr(),
-                round.len(),
-                invalid_json.as_ptr(),
-                invalid_json.len(),
-            )
-        };
-
-        let malformed_auth_path_result = unsafe {
-            zcashlc_voting_build_vote_commitment(
-                db,
-                round.as_ptr(),
-                round.len(),
-                0,
-                seed.as_ptr(),
-                seed.len(),
-                0,
-                1,
-                0,
-                2,
-                invalid_json.as_ptr(),
-                invalid_json.len(),
-                0,
-                0,
-                None,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-
-        let malformed_commitment_result = unsafe {
-            zcashlc_voting_build_share_payloads(
-                db,
-                invalid_json.as_ptr(),
-                invalid_json.len(),
-                0,
-                2,
-                0,
-                0,
-            )
-        };
-
-        unsafe { zcashlc_voting_db_free(db) };
-        assert!(
-            malformed_shares_result.is_null(),
-            "malformed shares_json must be rejected"
-        );
-        assert!(
-            malformed_auth_path_result.is_null(),
-            "malformed van_auth_path_json must be rejected"
-        );
-        assert!(
-            malformed_commitment_result.is_null(),
-            "malformed commitment_json must be rejected"
-        );
-    }
-
-    #[test]
-    fn encrypt_shares_returns_encrypted_shares() {
-        let db = open_memory_db();
-        let round = b"round";
-        insert_round_with_valid_ea_pk(db, "round");
-        let shares_json = serde_json::to_vec(&vec![1u64, 4]).expect("serialize shares");
-
-        let result = unsafe {
-            zcashlc_voting_encrypt_shares(
-                db,
-                round.as_ptr(),
-                round.len(),
-                shares_json.as_ptr(),
-                shares_json.len(),
-            )
-        };
-        let shares: Vec<JsonWireEncryptedShare> = decode_boxed_json(result);
-
-        unsafe { zcashlc_voting_db_free(db) };
-        assert_eq!(shares.len(), 2);
-        assert_eq!(shares[0].share_index, 0);
-        assert_eq!(shares[1].share_index, 1);
-        assert_eq!(shares[0].c1.len(), CANONICAL_FIELD_LEN);
-        assert_eq!(shares[0].c2.len(), CANONICAL_FIELD_LEN);
-        assert_eq!(shares[1].c1.len(), CANONICAL_FIELD_LEN);
-        assert_eq!(shares[1].c2.len(), CANONICAL_FIELD_LEN);
-    }
-
-    #[test]
-    fn mark_vote_submitted_rejects_missing_vote_row() {
-        let db = open_memory_db();
-        let round = b"round";
-
-        let result =
-            unsafe { zcashlc_voting_mark_vote_submitted(db, round.as_ptr(), round.len(), 0, 1) };
-
-        unsafe { zcashlc_voting_db_free(db) };
-        assert_eq!(result, -1);
-    }
-
-    #[test]
-    fn mark_vote_submitted_marks_existing_vote_row() {
-        let db = open_memory_db();
-        let round = b"round";
-        insert_round_and_bundle(db, "round");
-        let handle = unsafe { db.as_ref() }.expect("voting db handle");
-        handle
-            .db
-            .insert_vote_fixture("round", 0, 1, 2, &[0xaa; 32])
-            .expect("insert vote");
-
-        let result =
-            unsafe { zcashlc_voting_mark_vote_submitted(db, round.as_ptr(), round.len(), 0, 1) };
-        let votes = handle.db.get_votes("round").expect("get votes");
-
-        unsafe { zcashlc_voting_db_free(db) };
-        assert_eq!(result, 0);
-        assert_eq!(votes.len(), 1);
-        assert_eq!(votes[0].bundle_index, 0);
-        assert_eq!(votes[0].proposal_id, 1);
-        assert_eq!(votes[0].choice, 2);
-        assert!(votes[0].submitted);
-    }
-
-    #[test]
-    fn build_vote_commitment_rejects_wrong_sized_auth_path_sibling() {
-        let db = open_memory_db();
-        let round = b"round";
-        let seed = [0x42u8; 64];
-        let auth_path_json =
-            serde_json::to_vec(&vec![vec![0u8; CANONICAL_FIELD_LEN - 1]]).expect("auth path json");
-
-        let result = unsafe {
-            zcashlc_voting_build_vote_commitment(
-                db,
-                round.as_ptr(),
-                round.len(),
-                0,
-                seed.as_ptr(),
-                seed.len(),
-                0,
-                1,
-                0,
-                2,
-                auth_path_json.as_ptr(),
-                auth_path_json.len(),
-                0,
-                0,
-                None,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-
-        unsafe { zcashlc_voting_db_free(db) };
-        assert!(result.is_null());
-    }
-
-    #[test]
-    fn build_vote_commitment_rejects_short_seed() {
-        let db = open_memory_db();
-        let round = b"round";
-        let seed = b"short";
-        let auth_path_json = b"[]";
-
-        let result = unsafe {
-            zcashlc_voting_build_vote_commitment(
-                db,
-                round.as_ptr(),
-                round.len(),
-                0,
-                seed.as_ptr(),
-                seed.len(),
-                0,
-                1,
-                0,
-                2,
-                auth_path_json.as_ptr(),
-                auth_path_json.len(),
-                0,
-                0,
-                None,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-
-        unsafe { zcashlc_voting_db_free(db) };
-        assert!(result.is_null());
-    }
-
-    #[test]
-    fn sign_cast_vote_rejects_short_seed() {
-        let seed = b"short";
-        let round_id_hex = b"0000000000000000000000000000000000000000000000000000000000000000";
-        let bytes = [0u8; CANONICAL_FIELD_LEN];
-
-        let result = unsafe {
-            zcashlc_voting_sign_cast_vote(
-                seed.as_ptr(),
-                seed.len(),
-                0,
-                round_id_hex.as_ptr(),
-                round_id_hex.len(),
-                bytes.as_ptr(),
-                bytes.len(),
-                bytes.as_ptr(),
-                bytes.len(),
-                bytes.as_ptr(),
-                bytes.len(),
-                bytes.as_ptr(),
-                bytes.len(),
-                1,
-                0,
-                bytes.as_ptr(),
-                bytes.len(),
-            )
-        };
-
-        assert!(result.is_null());
-    }
-
-    fn call_sign_cast_vote(
-        round_id_hex: &[u8],
-        r_vpk: &[u8],
-        van_nullifier: &[u8],
-        vote_authority_note_new: &[u8],
-        vote_commitment: &[u8],
-        alpha_v: &[u8],
-    ) -> *mut crate::ffi::BoxedSlice {
-        let seed = [0x42u8; 64];
-        unsafe {
-            zcashlc_voting_sign_cast_vote(
-                seed.as_ptr(),
-                seed.len(),
-                0,
-                round_id_hex.as_ptr(),
-                round_id_hex.len(),
-                r_vpk.as_ptr(),
-                r_vpk.len(),
-                van_nullifier.as_ptr(),
-                van_nullifier.len(),
-                vote_authority_note_new.as_ptr(),
-                vote_authority_note_new.len(),
-                vote_commitment.as_ptr(),
-                vote_commitment.len(),
-                1,
-                0,
-                alpha_v.as_ptr(),
-                alpha_v.len(),
-            )
+impl voting::types::VoteCommitStageReporter for VoteStageBridge {
+    fn on_stage(&self, stage: voting::vote::VoteCommitStage) {
+        if let voting::vote::VoteCommitStage::ProofProgress { progress, .. } = stage {
+            unsafe { (self.callback)(progress, self.context) }
         }
     }
+}
 
-    #[test]
-    fn sign_cast_vote_returns_signature_for_valid_inputs() {
-        let round_id_hex = b"0000000000000000000000000000000000000000000000000000000000000000";
-        let bytes = [0u8; CANONICAL_FIELD_LEN];
+struct NoopVoteStages;
 
-        let result = call_sign_cast_vote(round_id_hex, &bytes, &bytes, &bytes, &bytes, &bytes);
-        let signature: JsonCastVoteSignature = decode_boxed_json(result);
+impl voting::types::VoteCommitStageReporter for NoopVoteStages {
+    fn on_stage(&self, _stage: voting::vote::VoteCommitStage) {}
+}
 
-        assert_eq!(signature.vote_auth_sig.len(), 64);
-    }
+/// The legacy commitment-bundle JSON enriched with the fields the one-shot
+/// commit flow now produces up front (old decoders ignore the additions).
+#[derive(serde::Serialize)]
+pub(super) struct JsonCommittedVoteBundle {
+    #[serde(flatten)]
+    bundle: JsonVoteCommitmentBundle,
+    vote_auth_sig: Vec<u8>,
+    share_payloads: Vec<JsonSharePayload>,
+}
 
-    #[test]
-    fn sign_cast_vote_rejects_short_canonical_fields() {
-        let round_id_hex = b"0000000000000000000000000000000000000000000000000000000000000000";
-        let bytes = [0u8; CANONICAL_FIELD_LEN];
-        let short = [0u8; CANONICAL_FIELD_LEN - 1];
-
-        assert!(
-            call_sign_cast_vote(b"00", &bytes, &bytes, &bytes, &bytes, &bytes).is_null(),
-            "short round_id_hex must be rejected"
-        );
-        assert!(
-            call_sign_cast_vote(round_id_hex, &short, &bytes, &bytes, &bytes, &bytes).is_null(),
-            "short r_vpk_bytes must be rejected"
-        );
-        assert!(
-            call_sign_cast_vote(round_id_hex, &bytes, &short, &bytes, &bytes, &bytes).is_null(),
-            "short van_nullifier must be rejected"
-        );
-        assert!(
-            call_sign_cast_vote(round_id_hex, &bytes, &bytes, &short, &bytes, &bytes).is_null(),
-            "short vote_authority_note_new must be rejected"
-        );
-        assert!(
-            call_sign_cast_vote(round_id_hex, &bytes, &bytes, &bytes, &short, &bytes).is_null(),
-            "short vote_commitment must be rejected"
-        );
-        assert!(
-            call_sign_cast_vote(round_id_hex, &bytes, &bytes, &bytes, &bytes, &short).is_null(),
-            "short alpha_v must be rejected"
-        );
-    }
-
-    #[test]
-    fn sign_cast_vote_rejects_long_canonical_fields() {
-        let round_id_hex = b"0000000000000000000000000000000000000000000000000000000000000000";
-        let bytes = [0u8; CANONICAL_FIELD_LEN];
-        let long = [0u8; CANONICAL_FIELD_LEN + 1];
-
-        assert!(
-            call_sign_cast_vote(
-                b"000000000000000000000000000000000000000000000000000000000000000000",
-                &bytes,
-                &bytes,
-                &bytes,
-                &bytes,
-                &bytes,
-            )
-            .is_null(),
-            "long round_id_hex must be rejected"
-        );
-        assert!(
-            call_sign_cast_vote(round_id_hex, &bytes, &bytes, &bytes, &long, &bytes).is_null(),
-            "long vote_commitment must be rejected"
-        );
-    }
-
-    #[test]
-    fn sign_cast_vote_rejects_non_hex_round_id() {
-        let round_id_hex = b"000000000000000000000000000000000000000000000000000000000000000g";
-        let bytes = [0u8; CANONICAL_FIELD_LEN];
-
-        assert!(
-            call_sign_cast_vote(round_id_hex, &bytes, &bytes, &bytes, &bytes, &bytes).is_null(),
-            "non-hex round_id_hex must be rejected"
-        );
-    }
-
-    #[test]
-    fn require_ascii_hex_rejects_odd_length() {
-        assert!(require_ascii_hex("abc", "test_hex").is_err());
-    }
-
-    #[test]
-    fn build_share_payloads_rejects_commitment_without_bound_shares() {
-        let db = open_memory_db();
-        let commitment = JsonVoteCommitmentBundle {
-            van_nullifier: vec![0u8; 32],
-            vote_authority_note_new: vec![1u8; 32],
-            vote_commitment: vec![2u8; 32],
-            proposal_id: 1,
-            proof: vec![3u8; 32],
-            enc_shares: Vec::new(),
-            anchor_height: 10,
-            vote_round_id: "round".to_string(),
-            shares_hash: vec![4u8; 32],
-            share_blinds: vec![vec![5u8; 32]],
-            share_comms: vec![vec![6u8; 32]],
-            r_vpk_bytes: vec![7u8; 32],
-            alpha_v: vec![8u8; 32],
-        };
-        let json = serde_json::to_vec(&commitment).expect("serialize commitment");
-
-        let result = unsafe {
-            zcashlc_voting_build_share_payloads(db, json.as_ptr(), json.len(), 0, 2, 0, 0)
-        };
-
-        unsafe { zcashlc_voting_db_free(db) };
-        assert!(result.is_null());
-    }
-
-    #[test]
-    fn build_share_payloads_returns_payloads_for_bound_shares() {
-        let db = open_memory_db();
-        let commitment = JsonVoteCommitmentBundle {
-            van_nullifier: vec![0u8; 32],
-            vote_authority_note_new: vec![1u8; 32],
-            vote_commitment: vec![2u8; 32],
-            proposal_id: 1,
-            proof: vec![3u8; 32],
-            enc_shares: vec![
-                JsonWireEncryptedShare {
-                    c1: vec![0xc1; 32],
-                    c2: vec![0xc2; 32],
-                    share_index: 0,
-                },
-                JsonWireEncryptedShare {
-                    c1: vec![0xd1; 32],
-                    c2: vec![0xd2; 32],
-                    share_index: 1,
-                },
-            ],
-            anchor_height: 10,
-            vote_round_id: "round".to_string(),
-            shares_hash: vec![4u8; 32],
-            share_blinds: vec![vec![5u8; 32], vec![6u8; 32]],
-            share_comms: vec![vec![7u8; 32], vec![8u8; 32]],
-            r_vpk_bytes: vec![9u8; 32],
-            alpha_v: vec![10u8; 32],
-        };
-        let json = serde_json::to_vec(&commitment).expect("serialize commitment");
-
-        let result = unsafe {
-            zcashlc_voting_build_share_payloads(db, json.as_ptr(), json.len(), 1, 2, 42, 0)
-        };
-        let payloads: Vec<JsonSharePayload> = decode_boxed_json(result);
-
-        unsafe { zcashlc_voting_db_free(db) };
-        assert_eq!(payloads.len(), 2);
-        assert_eq!(payloads[0].proposal_id, 1);
-        assert_eq!(payloads[0].vote_decision, 1);
-        assert_eq!(payloads[0].tree_position, 42);
-        assert_eq!(payloads[0].enc_share.share_index, 0);
-        assert_eq!(payloads[1].enc_share.share_index, 1);
-        assert_eq!(payloads[0].all_enc_shares.len(), 2);
-        assert_eq!(payloads[0].primary_blind, vec![5u8; 32]);
-        assert_eq!(payloads[1].primary_blind, vec![6u8; 32]);
+/// Build the enriched committed-vote JSON from a signed commitment.
+///
+/// The share blinds and alpha_v secrets stay inside the crate in 1.0 (they
+/// only served the superseded detached share/sign entry points), so the
+/// legacy fields are emitted empty.
+pub(super) fn committed_vote_json(
+    signed: &voting::vote::SignedVoteCommitment,
+) -> JsonCommittedVoteBundle {
+    JsonCommittedVoteBundle {
+        bundle: JsonVoteCommitmentBundle {
+            van_nullifier: signed.van_nullifier.to_vec(),
+            vote_authority_note_new: signed.vote_authority_note_new.to_vec(),
+            vote_commitment: signed.vote_commitment.to_vec(),
+            proposal_id: signed.proposal_id,
+            proof: signed.proof.clone(),
+            enc_shares: signed
+                .encrypted_shares
+                .iter()
+                .map(|w| JsonWireEncryptedShare {
+                    c1: w.c1.to_vec(),
+                    c2: w.c2.to_vec(),
+                    share_index: w.share_index,
+                })
+                .collect(),
+            anchor_height: signed.anchor_height,
+            vote_round_id: signed.vote_round_id.clone(),
+            shares_hash: signed.shares_hash.to_vec(),
+            share_blinds: Vec::new(),
+            share_comms: signed.share_comms.iter().map(|c| c.to_vec()).collect(),
+            r_vpk_bytes: signed.r_vpk.to_vec(),
+            alpha_v: Vec::new(),
+        },
+        vote_auth_sig: signed.vote_auth_sig.to_vec(),
+        share_payloads: signed
+            .share_payloads
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect(),
     }
 }

@@ -6,7 +6,7 @@ use zcash_voting as voting;
 pub type VotingProgressCallback =
     unsafe extern "C" fn(progress: f64, context: *mut std::ffi::c_void);
 
-/// Bridges a C function pointer to the `ProofProgressReporter` trait.
+/// Bridges a C function pointer to the `ProgressReporter` trait.
 pub(super) struct ProgressBridge {
     pub(super) callback: VotingProgressCallback,
     pub(super) context: *mut std::ffi::c_void,
@@ -17,7 +17,7 @@ pub(super) struct ProgressBridge {
 unsafe impl Send for ProgressBridge {}
 unsafe impl Sync for ProgressBridge {}
 
-impl voting::ProofProgressReporter for ProgressBridge {
+impl voting::ProgressReporter for ProgressBridge {
     fn on_progress(&self, progress: f64) {
         // Progress reporting is best-effort; do not let callback panics unwind
         // through zcash_voting or across the FFI boundary.
