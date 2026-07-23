@@ -116,6 +116,38 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
+    /// Registers the custom network used for the regtest network id (`NetworkType.regtest`) with the
+    /// Rust core: its `base` identity (address encoding / `chainName`) plus its per-NU activation
+    /// heights, so subsequent FFI calls made with that network id resolve to it instead of failing.
+    /// Process-global and idempotent; call once before using a custom network (see `MIGRATING.md`).
+    /// A `nil` height means "not activated on this network".
+    ///
+    /// Returns `true` on a fresh registration or an identical re-registration. Returns `false` when
+    /// the call replaced a **different** existing configuration (the replacement is still applied,
+    /// last writer wins) — a host configuration bug, since the parameters are process-global and two
+    /// live instances with different custom networks cannot both be honored.
+    @discardableResult
+    static func setCustomNetwork(base: NetworkType, _ heights: NetworkActivationHeights) -> Bool {
+        func height(_ value: BlockHeight?) -> Int64 {
+            guard let value else { return -1 }
+            return Int64(value)
+        }
+
+        return zcashlc_set_custom_network(
+            base.networkId,
+            height(heights.overwinter),
+            height(heights.sapling),
+            height(heights.blossom),
+            height(heights.heartwood),
+            height(heights.canopy),
+            height(heights.nu5),
+            height(heights.nu6),
+            height(heights.nu6_1),
+            height(heights.nu6_2),
+            height(heights.nu6_3)
+        )
+    }
+
     @DBActor
     func listAccounts() async throws -> [Account] {
         let accountsPtr = zcashlc_list_accounts(
@@ -827,11 +859,21 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
                 throw ZcashError.rustPutSaplingSubtreeRootsAllocationProblem
             }
 
+            guard let completingBlockHeight = UInt32(exactly: root.completingBlockHeight) else {
+                defer {
+                    hashPtr.deallocate()
+                    ffiSubtreeRootsVec.deallocateElements()
+                }
+                throw ZcashError.rustPutSaplingSubtreeRoots(
+                    "server-supplied completing block height \(root.completingBlockHeight) does not fit in UInt32"
+                )
+            }
+
             ffiSubtreeRootsVec.append(
                 FfiSubtreeRoot(
                     root_hash_ptr: hashPtr,
                     root_hash_ptr_len: UInt(contiguousHashBytes.count),
-                    completing_block_height: UInt32(root.completingBlockHeight)
+                    completing_block_height: completingBlockHeight
                 )
             )
         }
@@ -884,11 +926,21 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
                 throw ZcashError.rustPutOrchardSubtreeRootsAllocationProblem
             }
 
+            guard let completingBlockHeight = UInt32(exactly: root.completingBlockHeight) else {
+                defer {
+                    hashPtr.deallocate()
+                    ffiSubtreeRootsVec.deallocateElements()
+                }
+                throw ZcashError.rustPutOrchardSubtreeRoots(
+                    "server-supplied completing block height \(root.completingBlockHeight) does not fit in UInt32"
+                )
+            }
+
             ffiSubtreeRootsVec.append(
                 FfiSubtreeRoot(
                     root_hash_ptr: hashPtr,
                     root_hash_ptr_len: UInt(contiguousHashBytes.count),
-                    completing_block_height: UInt32(root.completingBlockHeight)
+                    completing_block_height: completingBlockHeight
                 )
             )
         }
@@ -915,6 +967,73 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
             guard res else {
                 throw ZcashError.rustPutOrchardSubtreeRoots(lastErrorMessage(fallback: "`putOrchardSubtreeRoots` failed with unknown error"))
+            }
+        }
+    }
+
+    @DBActor
+    func putIronwoodSubtreeRoots(startIndex: UInt64, roots: [SubtreeRoot]) async throws {
+        var ffiSubtreeRootsVec: [FfiSubtreeRoot] = []
+
+        for root in roots {
+            let hashPtr = UnsafeMutablePointer<UInt8>.allocate(capacity: root.rootHash.count)
+
+            let contiguousHashBytes = ContiguousArray(root.rootHash.bytes)
+
+            let result: Void? = contiguousHashBytes.withContiguousStorageIfAvailable { hashBytesPtr in
+                // swiftlint:disable:next force_unwrapping
+                hashPtr.initialize(from: hashBytesPtr.baseAddress!, count: hashBytesPtr.count)
+            }
+
+            guard result != nil else {
+                defer {
+                    hashPtr.deallocate()
+                    ffiSubtreeRootsVec.deallocateElements()
+                }
+                throw ZcashError.rustPutIronwoodSubtreeRootsAllocationProblem
+            }
+
+            guard let completingBlockHeight = UInt32(exactly: root.completingBlockHeight) else {
+                defer {
+                    hashPtr.deallocate()
+                    ffiSubtreeRootsVec.deallocateElements()
+                }
+                throw ZcashError.rustPutIronwoodSubtreeRoots(
+                    "server-supplied completing block height \(root.completingBlockHeight) does not fit in UInt32"
+                )
+            }
+
+            ffiSubtreeRootsVec.append(
+                FfiSubtreeRoot(
+                    root_hash_ptr: hashPtr,
+                    root_hash_ptr_len: UInt(contiguousHashBytes.count),
+                    completing_block_height: completingBlockHeight
+                )
+            )
+        }
+
+        var contiguousFfiRoots = ContiguousArray(ffiSubtreeRootsVec)
+
+        let len = UInt(contiguousFfiRoots.count)
+
+        let rootsPtr = UnsafeMutablePointer<FfiSubtreeRoots>.allocate(capacity: 1)
+
+        defer {
+            ffiSubtreeRootsVec.deallocateElements()
+            rootsPtr.deallocate()
+        }
+
+        try contiguousFfiRoots.withContiguousMutableStorageIfAvailable { ptr in
+            var roots = FfiSubtreeRoots()
+            roots.ptr = ptr.baseAddress
+            roots.len = len
+
+            rootsPtr.initialize(to: roots)
+
+            let res = zcashlc_put_ironwood_subtree_roots(dbData.0, dbData.1, startIndex, rootsPtr, networkType.networkId)
+
+            guard res else {
+                throw ZcashError.rustPutIronwoodSubtreeRoots(lastErrorMessage(fallback: "`putIronwoodSubtreeRoots` failed with unknown error"))
             }
         }
     }
@@ -964,50 +1083,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         defer { zcashlc_free_wallet_summary(summaryPtr) }
 
-        if summaryPtr.pointee.fully_scanned_height < 0 {
-            return nil
-        }
+        // C → Swift mapping shared with the unified wallet-summary path (WalletSummary+FFI.swift).
+        guard let summary = WalletSummary.fromFFI(summaryPtr) else { return nil }
 
-        var accountBalances: [AccountUUID: AccountBalance] = [:]
-
-        for i in (0 ..< Int(summaryPtr.pointee.account_balances_len)) {
-            let accountBalance = summaryPtr.pointee.account_balances.advanced(by: i).pointee
-            accountBalances[AccountUUID(id: accountBalance.uuidArray)] = accountBalance.toAccountBalance()
-        }
-
-        // Modify spendable `accountBalances` if chainTip hasn't been updated yet
+        // Mask spendable `accountBalances` while chainTip hasn't been updated yet ([#1591]).
         if await !sdkFlags.chainTipUpdated {
-            accountBalances.forEach { key, _ in
-                if let accountBalance = accountBalances[key] {
-                    accountBalances[key] = AccountBalance(
-                        saplingBalance: PoolBalance(
-                            spendableValue: .zero,
-                            changePendingConfirmation: accountBalance.saplingBalance.changePendingConfirmation,
-                            valuePendingSpendability: accountBalance.saplingBalance.valuePendingSpendability
-                            + accountBalance.saplingBalance.spendableValue
-                        ),
-                        orchardBalance: PoolBalance(
-                            spendableValue: .zero,
-                            changePendingConfirmation: accountBalance.orchardBalance.changePendingConfirmation,
-                            valuePendingSpendability: accountBalance.orchardBalance.valuePendingSpendability
-                            + accountBalance.orchardBalance.spendableValue
-                        ),
-                        unshielded: .zero,
-                        awaitingResolution: accountBalance.unshielded
-                    )
-                }
-            }
+            return summary.withSpendableMasked()
         }
 
-        return WalletSummary(
-            accountBalances: accountBalances,
-            chainTipHeight: BlockHeight(summaryPtr.pointee.chain_tip_height),
-            fullyScannedHeight: BlockHeight(summaryPtr.pointee.fully_scanned_height),
-            recoveryProgress: summaryPtr.pointee.recovery_progress?.pointee.toScanProgress(),
-            scanProgress: summaryPtr.pointee.scan_progress?.pointee.toScanProgress(),
-            nextSaplingSubtreeIndex: UInt32(summaryPtr.pointee.next_sapling_subtree_index),
-            nextOrchardSubtreeIndex: UInt32(summaryPtr.pointee.next_orchard_subtree_index)
-        )
+        return summary
     }
 
     @DBActor
@@ -1512,6 +1596,7 @@ extension FfiAccountBalance {
         .init(
             saplingBalance: self.sapling_balance.toPoolBalance(),
             orchardBalance: self.orchard_balance.toPoolBalance(),
+            ironwoodBalance: self.ironwood_balance.toPoolBalance(),
             unshielded: Zatoshi(self.unshielded)
         )
     }

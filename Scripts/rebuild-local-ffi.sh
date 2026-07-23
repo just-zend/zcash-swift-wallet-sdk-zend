@@ -20,7 +20,24 @@ if [[ -f "$HOME/.cargo/env" ]]; then
     source "$HOME/.cargo/env"
 fi
 
-TARGET="${1:-ios-sim}"
+# Parse a target (ios-sim|ios-device|macos) + optional --universal.
+# --universal (macos, ios-sim): build BOTH archs of the slice and lipo them — REQUIRED
+# before an Xcode ARCHIVE (Release links arm64+x86_64; a host-arch-only macOS slice
+# fails with hundreds of undefined _zcashlc_* symbols — bit the Beta5 archive
+# 2026-07-07) and before any `generic/platform=iOS Simulator` build (links both sim
+# archs; an arm64-only sim slice fails the x86_64 link — bit Zodl iOS 2026-07-08).
+TARGET="ios-sim"
+UNIVERSAL=false
+for arg in "$@"; do
+    case "$arg" in
+        --universal) UNIVERSAL=true ;;
+        ios-sim|ios-device|macos) TARGET="$arg" ;;
+        *) echo "Unknown arg: $arg"; echo "Usage: rebuild-local-ffi.sh [ios-sim|ios-device|macos] [--universal]"; exit 1 ;;
+    esac
+done
+if [[ "$UNIVERSAL" == "true" && "$TARGET" != "macos" && "$TARGET" != "ios-sim" ]]; then
+    echo "--universal is only meaningful for the macos and ios-sim targets"; exit 1
+fi
 XCFRAMEWORK_DIR="LocalPackages/libzcashlc.xcframework"
 
 # Check if initialized
@@ -93,15 +110,58 @@ if ! rustup target list --installed | grep -q "^${RUST_TARGET}$"; then
 fi
 
 # Incremental cargo build (fast for small changes!)
-# Cargo.toml is at the repo root, so we run cargo from there
-cargo build --target "$RUST_TARGET" --release
+# Cargo.toml is at the repo root, so we run cargo from there.
+if [[ "$TARGET" == "macos" && "$UNIVERSAL" == "true" ]]; then
+    echo "Universal macOS build (arm64 + x86_64)..."
+    for t in aarch64-apple-darwin x86_64-apple-darwin; do
+        if ! rustup target list --installed | grep -q "^${t}$"; then
+            rustup target add "$t"
+        fi
+        cargo build --target "$t" --release
+    done
+    BUILT_LIB="target/libzcashlc-macos-universal.a"
+    lipo -create \
+        target/aarch64-apple-darwin/release/libzcashlc.a \
+        target/x86_64-apple-darwin/release/libzcashlc.a \
+        -output "$BUILT_LIB"
+elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
+    echo "Universal iOS Simulator build (arm64 + x86_64)..."
+    for t in aarch64-apple-ios-sim x86_64-apple-ios; do
+        if ! rustup target list --installed | grep -q "^${t}$"; then
+            rustup target add "$t"
+        fi
+        cargo build --target "$t" --release
+    done
+    BUILT_LIB="target/libzcashlc-ios-sim-universal.a"
+    lipo -create \
+        target/aarch64-apple-ios-sim/release/libzcashlc.a \
+        target/x86_64-apple-ios/release/libzcashlc.a \
+        -output "$BUILT_LIB"
+else
+    cargo build --target "$RUST_TARGET" --release
+    # Path to built static library (target/ is at repo root)
+    BUILT_LIB="target/$RUST_TARGET/release/libzcashlc.a"
+fi
 
-# Path to built static library (target/ is at repo root)
-BUILT_LIB="target/$RUST_TARGET/release/libzcashlc.a"
+# Downgrade guard: replacing a previously-universal slice with a host-arch-only binary
+# silently breaks builds that link both archs (macOS: Xcode ARCHIVE; iOS Simulator:
+# any `generic/platform=iOS Simulator` destination).
+if [[ ( "$TARGET" == "macos" || "$TARGET" == "ios-sim" ) && "$UNIVERSAL" != "true" ]]; then
+    OLD_BIN="$XCFRAMEWORK_DIR/$XCFRAMEWORK_SLICE/libzcashlc.framework/libzcashlc"
+    if [[ -e "$OLD_BIN" ]] && lipo -archs "$OLD_BIN" 2>/dev/null | grep -q "x86_64"; then
+        echo "⚠️  DOWNGRADE: the existing $TARGET slice was universal (arm64+x86_64); this"
+        echo "    rebuild replaces it with ${ARCH}-only. Builds that link both archs"
+        echo "    (macOS ARCHIVE / generic iOS-Simulator destinations) will fail with"
+        echo "    undefined _zcashlc_* symbols. To restore:"
+        echo "      ./Scripts/rebuild-local-ffi.sh $TARGET --universal"
+    fi
+fi
 
-# Atomically rebuild the xcframework with only this single slice.
-# This prevents stale binaries from remaining for other targets,
-# which could silently use outdated code if Xcode switches platforms.
+# Atomically rebuild the xcframework, PRESERVING the other platforms' slices.
+# (This script used to keep only the rebuilt slice to avoid staleness — but
+# that silently destroyed the other platforms' builds, breaking e.g. Zodl iOS
+# after a macOS-only rebuild, three times. The ENGINE_BUILD log tag is the
+# definitive per-slice freshness check; preserved slices get a loud warning.)
 TEMP_DIR=$(mktemp -d)
 TEMP_XCFW="$TEMP_DIR/libzcashlc.xcframework"
 TEMP_FRAMEWORK="$TEMP_XCFW/$XCFRAMEWORK_SLICE/libzcashlc.framework"
@@ -118,33 +178,89 @@ if [[ -d "target/Headers" ]]; then
     cp -R target/Headers/* "$TEMP_FRAMEWORK/Headers/"
 fi
 
-# Generate xcframework Info.plist describing only this slice
-VARIANT_ENTRY=""
-if [[ -n "$PLATFORM_VARIANT" ]]; then
-    VARIANT_ENTRY="			<key>SupportedPlatformVariant</key>
-			<string>${PLATFORM_VARIANT}</string>"
+# Carry over every OTHER slice from the existing xcframework, with a loud
+# staleness reminder (they contain whatever Rust they were last built with).
+if [[ -d "$XCFRAMEWORK_DIR" ]]; then
+    for slice_path in "$XCFRAMEWORK_DIR"/*/; do
+        [[ -d "$slice_path" ]] || continue
+        slice_name="$(basename "$slice_path")"
+        if [[ "$slice_name" != "$XCFRAMEWORK_SLICE" ]]; then
+            # -P: keep symlinks as symlinks (the versioned macOS framework
+            # layout relies on Versions/Current links).
+            cp -RP "$slice_path" "$TEMP_XCFW/$slice_name"
+            echo "⚠️  preserved existing slice '$slice_name' — it is NOT rebuilt by this run;"
+            echo "    check its ENGINE_BUILD tag before trusting it on that platform."
+        fi
+    done
 fi
 
-cat > "$TEMP_XCFW/Info.plist" << PLISTEOF
+# Generate the xcframework Info.plist from the slices ACTUALLY PRESENT in
+# the assembled bundle (deterministic slice-name → platform mapping).
+{
+    cat << 'PLISTHEAD'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 	<key>AvailableLibraries</key>
 	<array>
+PLISTHEAD
+    for slice_path in "$TEMP_XCFW"/*/; do
+        [[ -d "$slice_path" ]] || continue
+        slice_name="$(basename "$slice_path")"
+        entry_variant=""
+        case "$slice_name" in
+            ios-arm64)
+                entry_platform="ios"
+                entry_archs="<string>arm64</string>" ;;
+            ios-arm64_x86_64-simulator)
+                entry_platform="ios"
+                entry_archs="<string>arm64</string><string>x86_64</string>"
+                entry_variant="			<key>SupportedPlatformVariant</key>
+			<string>simulator</string>" ;;
+            ios-arm64-simulator)
+                entry_platform="ios"
+                entry_archs="<string>arm64</string>"
+                entry_variant="			<key>SupportedPlatformVariant</key>
+			<string>simulator</string>" ;;
+            macos-arm64_x86_64)
+                entry_platform="macos"
+                entry_archs="<string>arm64</string><string>x86_64</string>" ;;
+            macos-arm64)
+                entry_platform="macos"
+                entry_archs="<string>arm64</string>" ;;
+            *)
+                echo "warning: unknown slice '$slice_name' — no plist entry emitted" >&2
+                continue ;;
+        esac
+        # Honesty pass: claim ONLY the archs actually inside the slice binary.
+        # (The name-derived defaults above lie after a host-arch-only macos rebuild
+        # of a formerly-universal slice — Xcode then selects the slice for x86_64
+        # and dies at link with undefined symbols instead of failing early.)
+        slice_bin="$slice_path/libzcashlc.framework/libzcashlc"
+        if actual_archs=$(lipo -archs "$slice_bin" 2>/dev/null) && [[ -n "$actual_archs" ]]; then
+            entry_archs=""
+            for a in $actual_archs; do
+                entry_archs+="<string>${a}</string>"
+            done
+        fi
+        cat << ENTRYEOF
 		<dict>
 			<key>LibraryIdentifier</key>
-			<string>${XCFRAMEWORK_SLICE}</string>
+			<string>${slice_name}</string>
 			<key>LibraryPath</key>
 			<string>libzcashlc.framework</string>
 			<key>SupportedArchitectures</key>
 			<array>
-				<string>${ARCH}</string>
+				${entry_archs}
 			</array>
 			<key>SupportedPlatform</key>
-			<string>${PLATFORM}</string>
-${VARIANT_ENTRY}
+			<string>${entry_platform}</string>
+${entry_variant}
 		</dict>
+ENTRYEOF
+    done
+    cat << 'PLISTTAIL'
 	</array>
 	<key>CFBundlePackageType</key>
 	<string>XFWK</string>
@@ -152,18 +268,25 @@ ${VARIANT_ENTRY}
 	<string>1.0</string>
 </dict>
 </plist>
-PLISTEOF
+PLISTTAIL
+} > "$TEMP_XCFW/Info.plist"
 
 # Atomic swap
 rm -rf "$XCFRAMEWORK_DIR"
 mv "$TEMP_XCFW" "$XCFRAMEWORK_DIR"
 rm -rf "$TEMP_DIR"
 
+# macOS embedded frameworks need the versioned bundle layout (the slice is built
+# shallow like iOS); without this Xcode rejects the embedded framework.
+if [[ "$TARGET" == "macos" ]]; then
+    ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/$XCFRAMEWORK_SLICE/libzcashlc.framework"
+fi
+
 echo ""
 echo "Rebuilt $TARGET ($ARCH) in $XCFRAMEWORK_DIR"
 echo ""
-echo "The xcframework now contains ONLY $RUST_TARGET."
-echo "Building for a different platform will fail until you rebuild for that target."
-echo "Run 'init-local-ffi.sh' to rebuild all architectures."
+echo "Other platforms' slices were preserved as-is (NOT rebuilt) — check their"
+echo "ENGINE_BUILD log tag before trusting them after Rust changes."
+echo "Run 'init-local-ffi.sh --arm-all' to rebuild every slice fresh."
 echo ""
 echo "Xcode should automatically pick up the changes. If not, clean build folder (Cmd+Shift+K)."

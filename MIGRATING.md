@@ -1,10 +1,72 @@
 # Migrating from previous versions to _Unreleased_
+
+## `prepare` now validates the seed against the existing wallet
+
+If the wallet database already contains seed-derived account(s) and the seed passed to `prepare`
+does not match them, `prepare` throws `ZcashError.initializerSeedMismatch` (`ZINIT0006`) instead of
+silently opening the old wallet (which desynced the app's stored seed from the on-disk account).
+Restoring a different wallet requires `wipe()` first. Wallets whose only accounts are imported
+(hardware-wallet UFVKs) are exempt — there is no seed-derived account to compare.
+
 PendingDb is no longer used. Wallet developers should take care about deleting
 the database file since the SDK will no longer require it or any of the
 information stored. 
 
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
 track failures on its own. Wallet developers would have to account for those.
+
+## Custom (regtest-style) networks and `NetworkType.regtest`
+
+`NetworkType` gained a third case, `regtest`. **This is a source-breaking change for exhaustive
+`switch` statements over `NetworkType`** — add a `.regtest` arm (or a `default`) when updating.
+
+Custom networks let the SDK talk to a custom-parameter chain (for example a modified-mainnet
+Ironwood testing backend) whose network upgrades activate at arbitrary heights:
+
+- `ZcashNetworkBuilder.regtest(activationHeights:)` builds a regtest-identity network with the given
+  `NetworkActivationHeights` (a `nil` height means "not activated"; the heights are not validated —
+  mirror the `nuparams` of the node/`lightwalletd` you connect to).
+- `ZcashNetworkBuilder.custom(base:activationHeights:)` combines a chosen base identity (address
+  encoding + expected `chainName`, e.g. `.mainnet` for a modified-mainnet backend) with custom
+  heights. On-disk databases still use the `regtest`-slot name prefix, so a custom network never
+  collides with a real mainnet/testnet wallet in the same container.
+- Server validation relaxes for custom networks: `ValidateServerAction` and
+  `evaluateBestOf(endpoints:...)` skip the chain-name and consensus-branch-ID checks (the server of a
+  modified chain may identify with its base chain's name and a nonstandard branch id). The
+  Sapling-activation-height check still applies.
+
+**Process-global registration and ordering.** The custom network's parameters are registered with
+the Rust core **once per process** (the first `Initializer` created with a custom network does this).
+Anything that resolves the custom network id before that registration — e.g. a
+`DerivationTool(networkType: .regtest)` created before any `Initializer` — fails with
+"custom network (id 2) used before it was configured", and key validators return `false`. Create the
+`Initializer` first, or call `ZcashRustBackend.setCustomNetwork` yourself at startup. Registering a
+**different** custom network later in the same process is a configuration bug: the newest values win
+process-globally while earlier instances keep their own per-instance state (checkpoint sources,
+constants), so the two desynchronize — the registration call reports this (and asserts in debug).
+
+## Voting: submission contract and pre-1.0 database reset
+
+The voting stack now rides upstream `zcash_voting` 1.0 (see the CHANGELOG for the full surface).
+Two changes affect callers of the voting API directly:
+
+- **`storeVoteTxHash` is what records submission.** Persisting the on-chain transaction hash now
+  marks the vote submitted (submission state is derived from the stored hash and written atomically).
+  Call `storeVoteTxHash` once the vote transaction is broadcast. `markVoteSubmitted` no longer stands
+  alone — it re-applies that state idempotently (rejecting a conflicting hash) and throws if no hash
+  has been stored yet. Any flow that previously called `markVoteSubmitted` as the submission mark must
+  call `storeVoteTxHash` first.
+- **Alpha-era voting databases are reset on open.** The voting database schema was rebuilt for 1.0;
+  opening a voting database created by a 2.6.0-alpha build drops and recreates every voting table
+  (rounds, votes, bundles, proofs, witnesses, share delegations, …). In-progress votes from an alpha
+  build do not survive the upgrade and must be re-cast. This is the separate voting database only —
+  wallet balances and the main wallet database are unaffected.
+
+The voting hotkey contract also changed: `generateHotkey` takes `storedSecret:` (an app-owned
+opaque secret) instead of `seed:`. Passing an empty array mints a fresh random hotkey; passing a
+previously stored 64-byte secret deterministically reconstructs the same hotkey. Persisting that
+secret is the only way to recover the same hotkey — the pre-1.0 seed-derived derivation is not
+reproducible under 1.0.
 
 ## `Broadcaster` redesign (multi-server submission)
 
@@ -25,6 +87,10 @@ let outcome = await synchronizer.broadcaster.submit(
 - Retry semantics: the endpoint list passed to `submit` is persisted as the transaction's retry plan. The SDK's background resubmission retries pending transactions through those endpoints (sequentially) instead of the synchronizer's default endpoint, and never auto-submits transactions created through `Broadcaster` that the app hasn't submitted yet. If the plan store cannot be read, background resubmission skips the affected transactions rather than falling back to the default endpoint. Plans are kept until the transaction expires (so a chain reorg cannot detach a transaction from its recorded endpoints), and `Synchronizer.wipe()` deletes the plan database file.
 - The retry plan is recorded before any network attempt and stays recorded when `submit` returns `.cancelled` or `.timedOut`: background resubmission may still broadcast the transaction later. Treat those outcomes as "outcome unknown", not as "not sent".
 - `LightWalletEndpoint` now conforms to `Equatable`. If your app declared that conformance retroactively, remove your declaration.
+
+## `Initializer.InitializationResult` gained `.seedNotRelevant`
+
+`Initializer.InitializationResult` (returned by `Initializer.initialize` and `Synchronizer.prepare`) gained a new case, `.seedNotRelevant`, returned when the rust layer reports that the provided seed does not match the accounts already present in the wallet database. Any exhaustive `switch` over `InitializationResult` must add a case for it. `prepare`/`initialize` can now return `.seedNotRelevant` in situations where they previously returned `.success` over a mismatched database — handle it the same way you already handle `.seedRequired`.
 
 # Migrating from previous versions to 0.20.0-beta
 The `SDKSynchronizer` no longer uses `NotificationCenter` to send notifications.

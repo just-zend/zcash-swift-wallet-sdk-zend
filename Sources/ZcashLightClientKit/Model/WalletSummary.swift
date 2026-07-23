@@ -22,6 +22,10 @@ public struct PoolBalance: Equatable {
 public struct AccountBalance: Equatable {
     public let saplingBalance: PoolBalance
     public let orchardBalance: PoolBalance
+    /// The Ironwood (Orchard note-version V3 / NU6.3) balance. Ironwood is received at the account's
+    /// Orchard receiver. Non-zero only on NU6.3-active networks served by an Ironwood-aware
+    /// lightwalletd (live on the public Ironwood testnet).
+    public let ironwoodBalance: PoolBalance
     public let unshielded: Zatoshi
 
     /// This field is reserved for special operations.
@@ -30,13 +34,51 @@ public struct AccountBalance: Equatable {
     /// The goal is to report the total amount along with the expected value.
     public let awaitingResolution: Zatoshi
 
-    static let zero = AccountBalance(saplingBalance: .zero, orchardBalance: .zero, unshielded: .zero, awaitingResolution: .zero)
+    static let zero = AccountBalance(
+        saplingBalance: .zero,
+        orchardBalance: .zero,
+        ironwoodBalance: .zero,
+        unshielded: .zero,
+        awaitingResolution: .zero
+    )
 
-    init(saplingBalance: PoolBalance, orchardBalance: PoolBalance, unshielded: Zatoshi, awaitingResolution: Zatoshi = .zero) {
+    init(
+        saplingBalance: PoolBalance,
+        orchardBalance: PoolBalance,
+        ironwoodBalance: PoolBalance = .zero,
+        unshielded: Zatoshi,
+        awaitingResolution: Zatoshi = .zero
+    ) {
         self.saplingBalance = saplingBalance
         self.orchardBalance = orchardBalance
+        self.ironwoodBalance = ironwoodBalance
         self.unshielded = unshielded
         self.awaitingResolution = awaitingResolution
+    }
+
+    /// The spendable value summed across every shielded pool (Sapling, Orchard,
+    /// Ironwood). Prefer this over summing pools at call sites — a new shielded
+    /// pool then flows through automatically.
+    public var shieldedSpendableValue: Zatoshi {
+        saplingBalance.spendableValue + orchardBalance.spendableValue + ironwoodBalance.spendableValue
+    }
+
+    /// The total value (spendable + pending change + pending spendability) summed
+    /// across every shielded pool.
+    public func shieldedTotal() -> Zatoshi {
+        saplingBalance.total() + orchardBalance.total() + ironwoodBalance.total()
+    }
+
+    /// The change pending confirmation, summed across every shielded pool.
+    public var shieldedChangePendingConfirmation: Zatoshi {
+        saplingBalance.changePendingConfirmation + orchardBalance.changePendingConfirmation
+            + ironwoodBalance.changePendingConfirmation
+    }
+
+    /// The value pending spendability, summed across every shielded pool.
+    public var shieldedValuePendingSpendability: Zatoshi {
+        saplingBalance.valuePendingSpendability + orchardBalance.valuePendingSpendability
+            + ironwoodBalance.valuePendingSpendability
     }
 }
 
@@ -72,4 +114,5 @@ struct WalletSummary: Equatable {
     let scanProgress: ScanProgress?
     let nextSaplingSubtreeIndex: UInt32
     let nextOrchardSubtreeIndex: UInt32
+    let nextIronwoodSubtreeIndex: UInt32
 }
