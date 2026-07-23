@@ -10,8 +10,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pool-migration (Orchard→Ironwood) FFI surface over the final engine
   (`zcash_pool_migration_backend` + the account-keyed store inside
   `zcash_client_sqlite::pool_migration`, both on librustzcash main; the family pin
-  targets the standing aggregation branch = main + note locking (#2716) +
-  boundary-anchor proving (#2710)):
+  targets a plain main rev — boundary-anchor proving (#2710) and owner-keyed
+  note locking (#2716) are both merged, nothing unmerged remains):
   23 entry points plus their `#[repr(C)]` return types and
   `zcashlc_free_migration_*` destructors. Each call opens the wallet database and
   the account-keyed migration store (a second connection into the same file) from
@@ -22,9 +22,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carried propose→commit by an in-process plan cache), commits the note split and
   the transfer schedule atomically (pre-signing every transaction), defers anchors
   and witnesses to proving time (ZIP 374) — proving currently targets the wallet's
-  natural anchor for transfers too, an approved stopgap: upstream retention
-  (librustzcash #2700/#2710) landed but on the 288-block grid, missing half of
-  the 144-block boundary draw grid — and leaves broadcasting,
+  natural anchor for transfers too, an approved stopgap; the merged upstream
+  retention (librustzcash #2700/#2710) now sits on the matching 144-block
+  boundary draw grid, so the boundary flip is pending, no longer blocked — and
+  leaves broadcasting,
   mined-reconciliation, rejection classification (the `sdk_invalid_marks` side
   table), and the platform's 6-state derivation to this layer. `Complete` is
   per-run; sequential runs commit over a terminal predecessor. The external-signer
@@ -73,6 +74,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`runs_len == 0`), not an error; NULL = error. Signer per-session capacity
   is deliberately NOT a parameter: the platform evaluates signing sessions
   from the per-run transaction counts.
+
+### Changed
+- The librustzcash family pin advanced to current main, which now carries both
+  the boundary-anchor proving of #2710 (on the 144-block retention grid) and
+  the merged owner-keyed note locking of #2716 — nothing unmerged remains, so
+  the pin targets a plain main rev and the former michal/* aggregation
+  branches are retired. Note locks are owner-keyed at this rev: the residual
+  lock placed by `zcashlc_migration_lock_residual` is keyed to a deterministic
+  per-account owner (making re-locking idempotent), every selection path keeps
+  excluding locked notes, and `zcashlc_migration_unlock_residual` still clears
+  the account's locks wholesale.
 
 ## 2.6.0-alpha.6 - 2026-06-26
 

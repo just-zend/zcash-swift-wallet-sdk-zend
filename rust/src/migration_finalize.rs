@@ -18,18 +18,15 @@
 //! - Transfers DO carry a drawn ZIP 318 boundary anchor (`anchor_boundary()`), and per ZIP 318
 //!   MUST prove against that boundary's tree state so transfers cluster into anchor cohorts.
 //!   **This module currently ignores the drawn boundary and proves transfers against the natural
-//!   anchor too — a deliberate, explicitly approved stopgap.** Upstream anchor-checkpoint
-//!   retention (librustzcash issue #2700) has landed but on a MISALIGNED GRID: scanning retains
-//!   checkpoints every `ANCHOR_RETENTION_INTERVAL = 288` blocks, while the engine draws transfer
-//!   boundaries on the `BOUNDARY_MODULUS = 144` grid — so odd multiples of 144 (about half of all
-//!   draws, and always 144–2304 blocks below tip, far outside the ~100-checkpoint regular window)
-//!   are pruned and never retained, and nothing retains a drawn boundary at commit time either.
-//!   Flipping now would leave roughly half the transfers permanently unwitnessable (stalled
-//!   `Signed`, retried forever). The flip is blocked until upstream aligns the grids (e.g.
-//!   `ANCHOR_RETENTION_INTERVAL` 288 -> 144) or retains drawn boundaries explicitly. The
-//!   deviation weakens the anchor-cohort privacy property (the anchor timestamps the wallet's
-//!   recent activity) and MUST be flipped to the boundary path once the grids align — see the
-//!   "Proving flip to boundary anchors" handoff document.
+//!   anchor too — a deliberate, explicitly approved stopgap.** The former grid blocker is gone:
+//!   the merged upstream anchor-checkpoint retention (librustzcash issue #2700, PR #2710)
+//!   retains checkpoints every `ANCHOR_RETENTION_INTERVAL = 144` blocks, matching the engine's
+//!   `BOUNDARY_MODULUS = 144` transfer-boundary draw grid, so drawn boundaries stay durably
+//!   witnessable at the current family pin. The flip to the boundary path is therefore
+//!   UNBLOCKED and pending as its own deliberate change with its own gates — see the "Proving
+//!   flip to boundary anchors" handoff document. Until it lands, the deviation still weakens
+//!   the anchor-cohort privacy property (the anchor timestamps the wallet's recent activity)
+//!   and MUST be flipped to the boundary path.
 //!
 //! Ported from the Android SDK's equivalent bridge (`migration_finalize.rs` @ `9d93b4de`), itself
 //! ported from the historical v1 crate's `backend::finalize_self_funding_transfer`/`prove_pczt`;
@@ -58,8 +55,8 @@ pub(crate) fn natural_anchor_height(wallet: &MigrationWallet) -> anyhow::Result<
 /// The anchor height a migration transaction proves against. THE seam for the migration's anchor
 /// policy: preparation transactions correctly use the natural anchor; transfers currently use it
 /// too as the approved stopgap (see the module doc — `tx.anchor_boundary()` is deliberately
-/// unused while the upstream retention grid, 288 blocks, misses half the 144-block boundary draw
-/// grid; flipping now would stall those transfers forever).
+/// unused; the upstream retention grid matches the 144-block boundary draw grid at the current
+/// pin, so the boundary flip is pending as its own change rather than blocked).
 pub(crate) fn resolve_proving_anchor(
     wallet: &MigrationWallet,
     _tx: &MigrationTransaction,
