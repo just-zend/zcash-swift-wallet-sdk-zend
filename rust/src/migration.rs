@@ -543,6 +543,23 @@ fn map_commit_err(e: engine::CommitError<anyhow::Error>) -> anyhow::Error {
     }
 }
 
+/// Map a rebuild-on-expiry error. `FundingNoteUnavailable` gets the actionable message: the
+/// expired transfer's EXACT funding note (matched by nullifier identity — the engine deliberately
+/// never substitutes an equal-value note, which could be a sibling transfer's) was spent outside
+/// the migration, so the remaining balance must be re-planned via the restart lane. Everything
+/// else is a hard error carrying the engine's detail.
+fn map_rebuild_err(e: engine::RebuildError<anyhow::Error>) -> anyhow::Error {
+    match e {
+        engine::RebuildError::FundingNoteUnavailable(value) => anyhow!(
+            "the expired transfer's funding note ({} zatoshi) is gone — it was spent outside the \
+             migration, so the rebuilt transfer cannot re-spend it; cancel and re-plan the \
+             remaining balance via restartCurrentMigrationStep (zcashlc_migration_restart_step)",
+            u64::from(value)
+        ),
+        other => anyhow!("Error rebuilding expired migration transfer: {other}"),
+    }
+}
+
 /// Proves a due transaction if it is still `Signed`, dispatching through the upstream engine
 /// prover ([`migration_finalize::prove_due_transaction`] driving a `WalletMigrationProver`): a
 /// transfer against the boundary anchor persisted on its row, a preparation against the wallet's
@@ -1945,11 +1962,36 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
     unwrap_exc_or_null(res)
 }
 
-/// Unsupported by the final engine: rebuild-on-expiry is an explicit upstream later-slice, and no
-/// app call sites exist. Always errors (returns `-1` with the error message set).
+/// Rebuilds every EXPIRED migration transfer of the stored run in place through the engine
+/// (`rebuild_expired_transfer` / `rebuild_expired_transfer_unsigned`): each rebuilt transfer
+/// re-spends exactly the SAME funding note — recovered from the expired PCZT by nullifier
+/// identity, never an equal-value substitute — rescheduled from the current tip with a fresh
+/// memoryless delay, a fresh canonical expiry, and a freshly drawn ZIP 318 boundary anchor
+/// (anchors and witnesses stay deferred and are installed at proving time, ZIP 374). This is
+/// ZIP 318's expired-transaction handling: a new transaction for the affected part, denomination
+/// unchanged.
+///
+/// The spending key selects the signing lane. With `usk_ptr`/`usk_len` the rebuilt transfer is
+/// signed anew in-process (back to `Signed`, served by the normal proving/delivery lane).
+/// `usk_ptr == NULL` with `usk_len == 0` is the legitimate external-signer lane: the rebuilt
+/// transfer is left `AwaitingSignature`, so the resume path of
+/// `zcashlc_migration_create_unsigned_transfer_pczts` re-serves it to the signing ceremony and
+/// `zcashlc_migration_store_signed_schedule_pczts` completes it (`apply_signature`), exactly like
+/// an originally committed transfer.
+///
+/// Returns the number of transfers rebuilt — `0` when no migration is stored, the stored run is
+/// terminal (a completed or cancelled run has nothing to refresh), or nothing has expired at the
+/// current tip. The rebuilt state persists once, all-or-nothing: on any rebuild error nothing is
+/// persisted and `-1` is returned (see `zcashlc_last_error_message`). A gone funding note (spent
+/// outside the migration) is a hard error naming `restartCurrentMigrationStep`
+/// (`zcashlc_migration_restart_step`) as the remedy — the remaining balance must be re-planned.
+/// An expired PREPARATION transaction also surfaces as a hard error: the engine rebuilds only
+/// transfers (leaves of the dependency graph; an expired preparation invalidates its dependents'
+/// pre-signatures), and its remediation is the same restart.
 ///
 /// # Safety
-/// See [`open`]; `usk_ptr` must be valid for reads of `usk_len` bytes.
+/// See [`open`]; `usk_ptr` must be null (with `usk_len == 0`) or valid for reads of `usk_len`
+/// bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
     db_data: *const u8,
@@ -1958,17 +2000,56 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
     network_id: u32,
     usk_ptr: *const u8,
     usk_len: usize,
-    include_residual: bool,
 ) -> i64 {
     let res = catch_panic(|| {
-        let _ = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let _ = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
-        let _ = include_residual;
-        Err::<i64, _>(anyhow!(
-            "refreshing stale transfers is not supported by the final migration engine \
-             (rebuild-on-expiry is tracked upstream); cancel and re-plan via \
-             zcashlc_migration_restart_step instead"
-        ))
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let usk = if usk_ptr.is_null() {
+            if usk_len != 0 {
+                return Err(anyhow!("usk_len must be 0 when usk_ptr is null"));
+            }
+            None
+        } else {
+            Some(unsafe { crate::decode_usk(usk_ptr, usk_len)? })
+        };
+
+        // Reconcile before judging expiry: a Broadcast transfer the wallet has since observed
+        // on-chain must count as Mined here, or it would look expired and be rebuilt into a
+        // double spend of its own mined copy.
+        let Some(mut state) = reconcile_mined(&mut ctx)? else {
+            return Ok(0);
+        };
+        if state.is_terminal() {
+            return Ok(0);
+        }
+        let target = BlockHeight::from(u32::from(ctx.tip()?) + 1);
+        let expired = state.expired_transactions(target);
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let sign_in_process = usk.is_some();
+        let mut rng = OsRng;
+        let mut backend = Backend::new(&ctx.wallet, ctx.account, usk, &mut ctx.store_conn)?;
+        for id in &expired {
+            if sign_in_process {
+                engine::rebuild_expired_transfer(&ctx.network, &backend, &mut state, *id, &mut rng)
+                    .map_err(map_rebuild_err)?;
+            } else {
+                // The returned UnsignedMigrationTx is deliberately dropped: the rebuilt transfer
+                // is persisted `AwaitingSignature` below, and the ceremony re-serves those bytes
+                // through `zcashlc_migration_create_unsigned_transfer_pczts`.
+                engine::rebuild_expired_transfer_unsigned(
+                    &ctx.network,
+                    &backend,
+                    &mut state,
+                    *id,
+                    &mut rng,
+                )
+                .map_err(map_rebuild_err)?;
+            }
+        }
+        backend.replace_migration(&state)?;
+        count_to_u32(expired.len(), "rebuilt transfer").map(i64::from)
     });
     unwrap_exc_or(res, -1)
 }
@@ -2210,16 +2291,18 @@ mod tests {
     }
 
     /// Creates a real account in the initialized wallet database at `path` and returns its uuid
-    /// bytes. The account-keyed migration store resolves the account row up front
+    /// bytes plus its unified spending key encoded for the FFI (`Era::Orchard`, the encoding
+    /// `decode_usk` expects). The account-keyed migration store resolves the account row up front
     /// (`PoolMigrations::for_account` errors on an unknown uuid), so fixtures must register the
     /// account they query — exactly like a real caller, where the uuid always comes from a
     /// previously created account.
-    fn create_fixture_account(path: &std::path::Path) -> [u8; 16] {
+    fn create_fixture_account_with_usk(path: &std::path::Path) -> ([u8; 16], Vec<u8>) {
         use secrecy::SecretVec;
         use zcash_client_backend::data_api::AccountBirthday;
         use zcash_client_backend::proto::service::TreeState;
         use zcash_client_sqlite::WalletDb;
         use zcash_client_sqlite::util::SystemClock;
+        use zcash_keys::keys::Era;
         use zcash_protocol::consensus::MAIN_NETWORK;
 
         let mut db = WalletDb::for_path(path, MAIN_NETWORK, SystemClock, OsRng)
@@ -2235,10 +2318,18 @@ mod tests {
             Ok(birthday) => birthday,
             Err(_) => panic!("the fixture treestate must convert to a birthday"),
         };
-        let (account, _usk) = db
+        let (account, usk) = db
             .create_account("fixture", &seed, &birthday, None)
             .expect("account creation must succeed");
-        account.expose_uuid().into_bytes()
+        (
+            account.expose_uuid().into_bytes(),
+            usk.to_bytes(Era::Orchard),
+        )
+    }
+
+    /// [`create_fixture_account_with_usk`] for the fixtures that never sign.
+    fn create_fixture_account(path: &std::path::Path) -> [u8; 16] {
+        create_fixture_account_with_usk(path).0
     }
 
     /// A minimal stored migration: `n_preps` preparation transactions then `n_transfers`
@@ -2638,6 +2729,274 @@ mod tests {
             "a fresh database must report NotStarted"
         );
         unsafe { zcashlc_free_migration_state(ptr) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- refresh stale transfers (rebuild-on-expiry lanes over the FFI) -----
+
+    use zcash_client_sqlite::pool_migration::orchard_ironwood::PoolMigrations;
+
+    /// Initializes a wallet database at a unique temp path (removing any leftover), returning the
+    /// path. The refresh fixtures all start here, mirroring a real caller's `init_data_db`.
+    fn init_fixture_db(prefix: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{prefix}_{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let init = unsafe {
+            crate::zcashlc_init_data_database(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                std::ptr::null(),
+                0,
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(init >= 0, "wallet-db initialization must succeed");
+        path
+    }
+
+    /// Stores `state` for `account` through the same account-keyed store the FFI reads — the
+    /// fixture-side counterpart of the entry points' `replace_migration` write path.
+    fn store_fixture_state(path: &std::path::Path, account: &[u8; 16], state: &MigrationState) {
+        let mut conn = Connection::open(path).expect("the fixture store connection opens");
+        let account = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
+        let mut store = PoolMigrations::for_account(&mut conn, account)
+            .expect("the account-keyed store resolves the fixture account");
+        store
+            .replace_migration(state)
+            .expect("the fixture state stores");
+    }
+
+    /// A REAL unsigned transfer PCZT (2 Orchard actions + 1 Ironwood action, anchors and
+    /// witnesses deferred per ZIP 374) for the stored-state fixtures: the rebuild path parses the
+    /// stored PCZT and recovers the funding note by the nullifier of its ONE unwitnessed spend,
+    /// so neither the `vec![0u8]` placeholder nor the actionless [`minimal_pczt_bytes`] can reach
+    /// the funding-note resolution under test. The key and note are throwaway (seeded rng): the
+    /// wallet under test holds no notes at all, so only the SHAPE matters. Heights must be past
+    /// the mainnet NU6.3 activation for the builder to emit the Ironwood crossing output.
+    fn fixture_transfer_pczt_bytes(target_height: u32, expiry_height: u32) -> Vec<u8> {
+        use orchard::keys::{FullViewingKey, Scope, SpendingKey};
+        use orchard::note::{Note, NoteVersion, RandomSeed, Rho};
+        use orchard::value::NoteValue;
+        use rand::RngCore;
+        use zcash_primitives::transaction::fees::zip317::MARGINAL_FEE;
+        use zcash_protocol::consensus::MAIN_NETWORK;
+
+        let mut rng = StdRng::seed_from_u64(1806);
+        let mut draw = [0u8; 32];
+        let sk: SpendingKey = loop {
+            rng.fill_bytes(&mut draw);
+            if let Some(sk) = SpendingKey::from_bytes(draw).into_option() {
+                break sk;
+            }
+        };
+        let fvk = FullViewingKey::from(&sk);
+        let rho = loop {
+            rng.fill_bytes(&mut draw);
+            if let Some(rho) = Rho::from_bytes(&draw).into_option() {
+                break rho;
+            }
+        };
+        let rseed = loop {
+            rng.fill_bytes(&mut draw);
+            if let Some(rseed) = RandomSeed::from_bytes(draw, &rho).into_option() {
+                break rseed;
+            }
+        };
+        // The builder enforces exact balance: the spent note carries the crossing value plus the
+        // canonical ZIP 317 fee of the 3-logical-action transfer shape.
+        let crossing = 100_000_000u64;
+        let fee = 3 * u64::from(MARGINAL_FEE);
+        let note = Note::from_parts(
+            fvk.address_at(0u32, Scope::External),
+            NoteValue::from_raw(crossing + fee),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .expect("valid fixture note parts");
+        zcash_pool_migration_backend::build::build_transfer_pczt(
+            &MAIN_NETWORK,
+            target_height,
+            expiry_height,
+            &fvk,
+            note,
+            zat(crossing),
+            &mut rng,
+        )
+        .expect("the fixture transfer builds")
+        .serialize()
+        .expect("the fixture transfer serializes")
+    }
+
+    /// On a freshly initialized wallet database with a created account but NO stored migration,
+    /// refreshing stale transfers is the benign zero — nothing to refresh — not an error, on the
+    /// NULL-usk (external-signer) lane pinned here (the usk lane rides the welding offline
+    /// tests). The stored state is read before any tip lookup, so the answer holds even before
+    /// the wallet ever saw a chain tip.
+    #[test]
+    fn migration_refresh_stale_transfers_on_fresh_db_returns_zero() {
+        let path = init_fixture_db("zcashlc_migration_refresh_fresh");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        let refreshed = unsafe {
+            zcashlc_migration_refresh_stale_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(refreshed, 0, "no stored migration means nothing to refresh");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stored run whose transfer has NOT expired at the tip refreshes nothing: `0`, with the
+    /// stored state untouched. This lane decodes a REAL spending key (the in-process signing
+    /// selector), pinning that the usk input form is accepted even when no rebuild runs.
+    #[test]
+    fn migration_refresh_stale_transfers_with_nothing_expired_returns_zero() {
+        let path = init_fixture_db("zcashlc_migration_refresh_unexpired");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let (account, usk) = create_fixture_account_with_usk(&path);
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        // Expiry 4_000_000 is above the 3_600_001 target: still valid, nothing to rebuild.
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            3_499_000,
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &state);
+        let refreshed = unsafe {
+            zcashlc_migration_refresh_stale_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                usk.as_ptr(),
+                usk.len(),
+            )
+        };
+        assert_eq!(refreshed, 0, "an unexpired schedule refreshes nothing");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// With a stored run holding an EXPIRED transfer (row expiry below the tip) whose PCZT is a
+    /// real built transfer — one unwitnessed spend revealing the funding nullifier — the refresh
+    /// path attempts the rebuild, and on this otherwise-empty wallet (the funding note is not
+    /// among the spendable notes) surfaces the `FundingNoteUnavailable` HARD error naming the
+    /// restart remedy: `-1`, with NOTHING persisted (the expired artifact stays stored
+    /// untouched). This pins expired-detection plus the error routing end to end over the FFI.
+    #[test]
+    fn migration_refresh_stale_transfers_surfaces_funding_note_unavailable() {
+        let path = init_fixture_db("zcashlc_migration_refresh_expired");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        // The stored transfer: expired at the tip (3_500_040 < 3_600_001), holding real
+        // transfer-PCZT bytes so the rebuild reaches the funding-note resolution.
+        let pczt_bytes = fixture_transfer_pczt_bytes(3_500_000, 3_500_040);
+        let base = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            3_499_000,
+            3_500_040,
+        );
+        let transactions = base
+            .transactions()
+            .iter()
+            .map(|t| {
+                MigrationTransaction::from_parts(
+                    t.id(),
+                    t.kind(),
+                    pczt_bytes.clone(),
+                    t.depends_on().clone(),
+                    t.scheduled_height(),
+                    t.expiry_height(),
+                    t.anchor_boundary(),
+                    t.state(),
+                    t.lock_owner(),
+                )
+            })
+            .collect();
+        let state = MigrationState::from_parts(
+            base.status(),
+            base.note_split().clone(),
+            base.preparation().clone(),
+            transactions,
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let refreshed = unsafe {
+            zcashlc_migration_refresh_stale_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(refreshed, -1, "a gone funding note must be a hard error");
+        let message = ffi_helpers::error_handling::error_message()
+            .expect("the last-error channel must carry the failure");
+        assert!(
+            message.contains("funding note"),
+            "the error must tell the caller the funding note is gone, got: {message}"
+        );
+        assert!(
+            message.contains("restartCurrentMigrationStep"),
+            "the error must name the restart remedy, got: {message}"
+        );
+
+        // Nothing was persisted: the expired transfer still holds the old bytes, still Signed.
+        let mut conn = Connection::open(&path).expect("the verification connection opens");
+        let account_id = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
+        let store = PoolMigrations::for_account(&mut conn, account_id)
+            .expect("the account-keyed store resolves the fixture account");
+        let stored = store
+            .get_migration()
+            .expect("the store reads")
+            .expect("the fixture state is still stored");
+        let tx = stored
+            .transactions()
+            .first()
+            .expect("the transfer row remains");
+        assert_eq!(
+            tx.pczt(),
+            &pczt_bytes,
+            "the expired artifact must be untouched"
+        );
+        assert!(
+            matches!(tx.state(), MigrationTxState::Signed),
+            "the expired transfer must stay Signed"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

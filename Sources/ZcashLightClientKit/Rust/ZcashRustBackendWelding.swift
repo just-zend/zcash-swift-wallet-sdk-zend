@@ -537,12 +537,21 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationRestartStep` if the rust layer returns an error.
     func migrationRestartStep(includeResidual: Bool, for account: AccountUUID) async throws -> MigrationSchedule
 
-    /// Unsupported by the final migration engine (rebuild-on-expiry is an explicit upstream
-    /// later-slice): always throws. Cancel and re-plan via `migrationRestartStep` instead.
-    /// - Throws: `rustMigrationRefreshStaleTransfers` always.
+    /// Rebuilds every EXPIRED transfer of the stored migration run in place through the engine:
+    /// each rebuilt transfer re-spends the SAME funding note (recovered from the expired PCZT by
+    /// nullifier identity, never an equal-value substitute) on a fresh schedule — a fresh
+    /// memoryless delay from the current tip, a fresh canonical expiry, and a freshly drawn
+    /// boundary anchor. Passing a spending key signs each rebuilt transfer anew in-process;
+    /// passing `nil` (an external-signer account, whose spend authority never exists on this
+    /// device) leaves it awaiting its signature, so the `migrationCreateUnsignedTransferPczts` /
+    /// `migrationStoreSignedSchedulePczts` ceremony re-serves and completes it. Returns the
+    /// number of transfers rebuilt (`0` when no run is stored, the run is terminal, or nothing
+    /// has expired), persisted all-or-nothing.
+    /// - Throws: `rustMigrationRefreshStaleTransfers` if the rust layer returns an error —
+    ///   notably when an expired transfer's funding note was spent outside the migration, where
+    ///   the message names `restartCurrentMigrationStep` (cancel and re-plan) as the remedy.
     func migrationRefreshStaleTransfers(
-        usk: UnifiedSpendingKey,
-        includeResidual: Bool,
+        usk: UnifiedSpendingKey?,
         for account: AccountUUID
     ) async throws -> UInt32
 

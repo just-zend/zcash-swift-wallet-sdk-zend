@@ -1946,19 +1946,31 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationRefreshStaleTransfers(
-        usk: UnifiedSpendingKey,
-        includeResidual: Bool,
+        usk: UnifiedSpendingKey?,
         for account: AccountUUID
     ) async throws -> UInt32 {
-        let refreshed = zcashlc_migration_refresh_stale_transfers(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId,
-            usk.bytes,
-            UInt(usk.bytes.count),
-            includeResidual
-        )
+        // A `nil` spending key is the external-signer lane: NULL/0 selects the unsigned rebuild
+        // (the rebuilt transfer awaits its signature for the PCZT ceremony to complete).
+        let refreshed: Int64
+        if let usk {
+            refreshed = zcashlc_migration_refresh_stale_transfers(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                usk.bytes,
+                UInt(usk.bytes.count)
+            )
+        } else {
+            refreshed = zcashlc_migration_refresh_stale_transfers(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                nil,
+                0
+            )
+        }
 
         // Unlike the bool/`-1`-overloaded query calls above, `-1` here is an unambiguous error
         // sentinel: a refreshed-transfer count can never legitimately be negative.

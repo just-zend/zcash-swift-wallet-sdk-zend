@@ -36,7 +36,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the residual stays in Orchard per ZIP 318), and the external-signer note-split pair went plural
   (`migrationCreateUnsignedNoteSplitPczts` / `migrationStoreSignedNoteSplitPczts`): the engine
   builds N preparation transactions rather than one split transaction, and one signing ceremony
-  covers them all. Transfers prove against the boundary anchor their schedule drew (ZIP 318
+  covers them all. `migrationRefreshStaleTransfers(usk:for:)` rebuilds every expired transfer of
+  the stored run in place through the engine's rebuild-on-expiry — the same funding note
+  (recovered by nullifier identity from the expired PCZT, never an equal-value substitute),
+  rescheduled from the current tip with a fresh canonical expiry and a freshly drawn boundary
+  anchor — returning the number rebuilt; the now-optional spending key selects the lane (a usk
+  signs each rebuilt transfer anew in-process; `nil`, the external-signer account, leaves it
+  awaiting its signature so the unsigned-transfer PCZT ceremony re-serves and completes it), and
+  a funding note spent outside the migration surfaces as a hard error naming
+  `restartCurrentMigrationStep` (cancel and re-plan) as the remedy. Transfers prove against the
+  boundary anchor their schedule drew (ZIP 318
   anchor cohorts), through the upstream prover: proving reads each transfer's persisted boundary
   and resolves its anchors and witnesses at that checkpoint, which upstream anchor-checkpoint
   retention (librustzcash #2700/#2710) keeps durably witnessable on the matching 144-block

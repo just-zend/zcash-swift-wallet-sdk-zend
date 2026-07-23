@@ -4591,25 +4591,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     // MARK: - migrationRefreshStaleTransfers
 
-    var migrationRefreshStaleTransfersUskIncludeResidualForThrowableError: Error?
-    var migrationRefreshStaleTransfersUskIncludeResidualForCallsCount = 0
-    var migrationRefreshStaleTransfersUskIncludeResidualForCalled: Bool {
-        return migrationRefreshStaleTransfersUskIncludeResidualForCallsCount > 0
+    var migrationRefreshStaleTransfersUskForThrowableError: Error?
+    var migrationRefreshStaleTransfersUskForCallsCount = 0
+    var migrationRefreshStaleTransfersUskForCalled: Bool {
+        return migrationRefreshStaleTransfersUskForCallsCount > 0
     }
-    var migrationRefreshStaleTransfersUskIncludeResidualForReceivedArguments: (usk: UnifiedSpendingKey, includeResidual: Bool, account: AccountUUID)?
-    var migrationRefreshStaleTransfersUskIncludeResidualForReturnValue: UInt32!
-    var migrationRefreshStaleTransfersUskIncludeResidualForClosure: ((UnifiedSpendingKey, Bool, AccountUUID) async throws -> UInt32)?
+    var migrationRefreshStaleTransfersUskForReceivedArguments: (usk: UnifiedSpendingKey?, account: AccountUUID)?
+    var migrationRefreshStaleTransfersUskForReturnValue: UInt32!
+    var migrationRefreshStaleTransfersUskForClosure: ((UnifiedSpendingKey?, AccountUUID) async throws -> UInt32)?
 
-    func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey, includeResidual: Bool, for account: AccountUUID) async throws -> UInt32 {
-        if let error = migrationRefreshStaleTransfersUskIncludeResidualForThrowableError {
+    func migrationRefreshStaleTransfers(usk: UnifiedSpendingKey?, for account: AccountUUID) async throws -> UInt32 {
+        if let error = migrationRefreshStaleTransfersUskForThrowableError {
             throw error
         }
-        migrationRefreshStaleTransfersUskIncludeResidualForCallsCount += 1
-        migrationRefreshStaleTransfersUskIncludeResidualForReceivedArguments = (usk: usk, includeResidual: includeResidual, account: account)
-        if let closure = migrationRefreshStaleTransfersUskIncludeResidualForClosure {
-            return try await closure(usk, includeResidual, account)
+        migrationRefreshStaleTransfersUskForCallsCount += 1
+        migrationRefreshStaleTransfersUskForReceivedArguments = (usk: usk, account: account)
+        if let closure = migrationRefreshStaleTransfersUskForClosure {
+            return try await closure(usk, account)
         } else {
-            return migrationRefreshStaleTransfersUskIncludeResidualForReturnValue
+            return migrationRefreshStaleTransfersUskForReturnValue
         }
     }
 
