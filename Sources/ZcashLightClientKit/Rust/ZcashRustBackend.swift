@@ -1742,6 +1742,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         usk: UnifiedSpendingKey,
         for account: AccountUUID
     ) async throws {
+        // Swift-side range guard: reuses this call's generic error case, never reaches rust.
         guard let estimatedDurationHours = UInt32(exactly: schedule.estimatedDurationHours) else {
             throw ZcashError.rustMigrationSignAndStoreSchedule(
                 "`estimatedDurationHours` \(schedule.estimatedDurationHours) does not fit in UInt32"
@@ -2091,6 +2092,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         for schedule: MigrationSchedule,
         for account: AccountUUID
     ) async throws -> [MigrationUnsignedTransferPczt] {
+        // Swift-side range guard: reuses this call's generic error case, never reaches rust.
         guard let estimatedDurationHours = UInt32(exactly: schedule.estimatedDurationHours) else {
             throw ZcashError.rustMigrationCreateUnsignedTransferPczts(
                 "`estimatedDurationHours` \(schedule.estimatedDurationHours) does not fit in UInt32"

@@ -125,13 +125,13 @@ zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting.git", rev = "46
 # [MOB-1495 / #1806] The pinned rev is a librustzcash MAIN commit. Nothing
 # unmerged remains — main carries the pool-migration engine, the account-keyed
 # store inside `zcash_client_sqlite::pool_migration`, the run-count estimate
-# of PR #2714, the boundary-anchor proving of PR #2710 (merged 2026-07-22, on
-# the 144-block retention grid), and the owner-keyed note locking of PR #2716
-# (merged 2026-07-23) — so the former michal/* aggregation branches are
-# retired. The rev also serves `zcash_pool_migration_backend` (the direct git
-# dependency declared above in [dependencies]). Bump the rev deliberately
-# (build + OfflineTests green); delete the librustzcash-family patch entries
-# below once the family reaches a crates.io release.
+# of PR #2714, the boundary-anchor proving of PR #2710 (merged 2026-07-22;
+# retention rides the 144-block grid of PR #2729), and the owner-keyed note
+# locking of PR #2716 (merged 2026-07-23) — so the former michal/* aggregation
+# branches are retired. The rev also serves `zcash_pool_migration_backend`
+# (the direct git dependency declared above in [dependencies]). Bump the rev
+# deliberately (build + OfflineTests green); delete the librustzcash-family
+# patch entries below once the family reaches a crates.io release.
 #
 # `orchard` rides the same story: the pinned librustzcash patches it to an
 # orchard main rev (ZIP 374 deferred-anchor builder + PCZT `Updater` setters),

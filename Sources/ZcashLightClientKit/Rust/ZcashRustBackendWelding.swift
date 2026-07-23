@@ -442,6 +442,7 @@ protocol ZcashRustBackendWelding {
     /// user approved.
     /// - Throws: `migrationPlanStale` when the echo mismatches the previewed plan, or when no
     ///   previewed plan is cached and no resumable run is stored — re-propose and re-display;
+    ///   `migrationProvingUnavailable` when proving the returned transfer fails hard;
     ///   `rustMigrationSignNoteSplit` for other rust-layer errors.
     func migrationSignNoteSplit(
         proposal: NoteSplitProposal,
@@ -521,7 +522,8 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `migrationPlanStale` when the echo mismatches, or when nothing is committed and
     ///   no previewed plan is cached — recover by re-proposing and re-displaying (pre-commit) or
     ///   re-reading the stored schedule (post-commit); `rustMigrationSignAndStoreSchedule` for
-    ///   other rust-layer errors.
+    ///   other rust-layer errors (also thrown Swift-side if the echoed duration exceeds
+    ///   UInt32.max, without reaching the rust layer).
     func migrationSignAndStoreSchedule(
         _ schedule: MigrationSchedule,
         usk: UnifiedSpendingKey,
@@ -529,7 +531,9 @@ protocol ZcashRustBackendWelding {
     ) async throws
 
     /// The next height-due pre-signed transfer, or `nil` when nothing is currently due.
-    /// - Throws: `rustMigrationNextDueTransfer` if the rust layer returns an error.
+    /// - Throws: `migrationProvingUnavailable` when proving the due transfer fails hard (the
+    ///   transient not-scanned-yet case surfaces as `nil` above, not an error);
+    ///   `rustMigrationNextDueTransfer` for other rust-layer errors.
     func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedMigrationTransfer?
 
     /// The next height-due scheduled transfer's full proposal (amount, anchor, timing) for the
@@ -632,7 +636,8 @@ protocol ZcashRustBackendWelding {
     ///   recover by re-reading the run's stored schedule (`migrationRefreshStaleTransfers`
     ///   returns exactly that) and re-displaying it — or when nothing is committed and no
     ///   previewed plan is cached; `rustMigrationCreateUnsignedTransferPczts` for other
-    ///   rust-layer errors.
+    ///   rust-layer errors (also thrown Swift-side if the echoed duration exceeds UInt32.max,
+    ///   without reaching the rust layer).
     func migrationCreateUnsignedTransferPczts(
         for schedule: MigrationSchedule,
         for account: AccountUUID
