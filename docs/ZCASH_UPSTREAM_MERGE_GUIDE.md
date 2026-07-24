@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-22
+Last reviewed: 2026-07-23
 
 ## Remote and branch invariants
 
@@ -10,7 +10,7 @@ Last reviewed: 2026-07-22
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current monitor status (2026-07-22)
+## Current monitor status (2026-07-23)
 
 - Both defaults remain `main`. `origin/main` is `faef1a52`; upstream advanced from `89d85c49` to
   `74cdbbc0` through upstream PR `#1816` / MOB-1512. The new public
@@ -20,12 +20,17 @@ Last reviewed: 2026-07-22
 - Merge conflicts were documentation-only (`CHANGELOG.md`, `MIGRATING.md`). Keep Zend's Ironwood,
   artifact, and release notes, and add the upstream breaking-result migration note. The Swift
   implementation and its OfflineTests merged without manual source changes.
-- Fresh Ironwood branches are still not low-risk early carries. The integrated Synchronizer line is
-  43 commits / 94 files, FFI line 29 commits / 80 files, QA2 line 45 commits / 94 files, and
-  Slipstream 59 commits / 118 files ahead of upstream main. They jointly alter public API, Rust/FFI,
-  persistence, privacy gates, mocks, and the engine graph. The new bug-fix branch is 38 commits /
-  93 files and depends on that same stack. Wait for upstream merge plus Zend artifact/provenance
-  reconciliation and funded-wallet validation.
+- Fresh force-pushes make the Ironwood stack still less suitable for an early Zend carry. The
+  integrated Synchronizer line is 69 commits / 93 files, FFI line 41 commits / 79 files, QA3 line
+  39 commits / 80 files, and Slipstream 90 commits / 116 files ahead of upstream main. They jointly
+  alter public API, Rust/FFI, persistence, privacy gates, mocks, and the engine graph. The migration
+  bug-fix branch is 38 commits / 93 files and 8 commits behind upstream main, so it cannot be safely
+  isolated from that stack. Wait for upstream merge plus Zend artifact/provenance reconciliation and
+  funded-wallet validation.
+- The stack's upstream PR state reinforces that decision: `#1818` is draft and unstable with failed
+  build and SwiftLint checks; `#1812` is unstable with a failed SwiftLint check; and `#1813` remains
+  blocked awaiting review. No early-carry candidate currently satisfies the ready, useful, and
+  low-risk gates.
 - The remaining unmerged branches remain wait-for-upstream: dependabot updates await upstream
   dependency review; network-privacy, release-workflow, and legacy Ironwood work are broader than
   Zend's safe early-carry boundary. No active upstream PR or branch currently meets the ready,
