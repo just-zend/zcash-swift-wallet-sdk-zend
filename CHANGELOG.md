@@ -62,7 +62,7 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
 
 ### Orchard → Ironwood migration (`Synchronizer` surface)
 
-- Orchard→Ironwood pool-migration engine, exposed as a 31-member migration group on the
+- Orchard→Ironwood pool-migration engine, exposed as a 32-member migration group on the
   `Synchronizer` protocol, built over the pool-migration FFI/welding layer whose model types
   are listed above: the app talks only to `Synchronizer` — the per-account migration engine,
   broadcaster, and privacy gate behind it are internal. Account-scoped members take an
@@ -119,6 +119,8 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
     a MINED row's txid is NOT carried by the engine's own state model, so it is available only
     while a transaction is `broadcast` (in flight), not once mined. An empty array means no stored
     run or no transactions, not an error.
+  - DEBUG/QA-only `debugRescheduleMigrationTransfers(accountUUID:)` compresses a committed
+    migration schedule for fast broadcast testing (Android parity).
   - The Keystone batch-signing bridge carries the external-signer ceremony's PCZTs to a hardware
     signer over an animated multi-part QR UR, as four DB-free members:
     `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)` redacts every PCZT for the
