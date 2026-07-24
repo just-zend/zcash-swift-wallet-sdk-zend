@@ -67,7 +67,7 @@ use zcash_client_sqlite::{
     chain::{BlockMeta, init::init_blockmeta_db},
     error::SqliteClientError,
     util::SystemClock,
-    wallet::init::{WalletMigrationError, init_wallet_db},
+    wallet::init::{WalletMigrationError, WalletMigrator},
 };
 use zcash_primitives::{
     block::BlockHash,
@@ -91,6 +91,7 @@ use zip32::fingerprint::SeedFingerprint;
 
 mod derivation;
 mod eip681;
+mod ext_schema;
 mod ffi;
 mod migration;
 mod migration_engine;
@@ -315,7 +316,13 @@ pub unsafe extern "C" fn zcashlc_init_data_database(
             ))
         };
 
-        match init_wallet_db(&mut db_data, seed) {
+        let migrator =
+            WalletMigrator::new().with_external_migrations(ext_schema::external_migrations());
+        let migrator = match seed {
+            Some(seed) => migrator.with_seed(seed),
+            None => migrator,
+        };
+        match migrator.init_or_migrate(&mut db_data) {
             Ok(_) => Ok(0),
             Err(e)
                 if matches!(
