@@ -20,8 +20,10 @@
 //!   completion the platform asks `zcashlc_migration_propose_transfers` whether anything remains
 //!   (an empty schedule means no).
 //! - Mined-transaction reconciliation ([`reconcile_mined`]) runs at the head of every read.
-//! - Rejection classification is recorded in the SDK-owned `sdk_invalid_marks` side table (the
-//!   engine has no failure states).
+//! - Rejection classification is recorded in the SDK-owned
+//!   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table (the engine has no
+//!   failure states), created by the wallet schema migrations via [`crate::ext_schema`] and
+//!   written through the wallet's extension-transaction API.
 //!
 //! Consent contract: plan details never cross the FFI boundary inward. Each propose/prepare call
 //! caches its plan under an opaque [`migration_plan_cache::PlanHandle`] (returned to the platform
@@ -162,9 +164,10 @@ struct CallCtx {
 }
 
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
-/// drops it at the end (no persistent handle). The engine's store tables are created by the wallet
-/// schema migrations during `init_data_db` (`zcash_client_sqlite::pool_migration` registers them);
-/// only the SDK's own side tables are ensured idempotently here.
+/// drops it at the end (no persistent handle). All tables are created by the wallet schema
+/// migrations during `init_data_db`: the engine's store tables by `zcash_client_sqlite`'s own
+/// migration graph (`zcash_client_sqlite::pool_migration` registers them), and the SDK's extension
+/// tables by the external migrations in [`crate::ext_schema`].
 ///
 /// # Safety
 /// - `db_data` must be valid for reads of `db_data_len` bytes and encode a filesystem path.
@@ -182,8 +185,6 @@ unsafe fn open(
     let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network.clone())? };
     let store_conn = Connection::open(&db_path)
         .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
-    init_invalid_marks(&store_conn)
-        .map_err(|e| anyhow!("Error initializing migration marks table: {e}"))?;
     let account = account_uuid_from_bytes(account_uuid_bytes)
         .map_err(|e| anyhow!("account uuid must be 16 bytes: {e}"))?;
     let account_bytes = *account.expose_uuid().as_bytes();
@@ -211,48 +212,68 @@ impl CallCtx {
 //
 // The engine has no failure states: a rejected broadcast leaves the transaction `Signed`/`Proved`
 // and re-offered. The platform's rejection classifier distinguishes terminal rejections
-// (invalid-note, expired) from retryable ones; the terminal ones are recorded here so
+// (invalid-note, expired) from retryable ones; the terminal ones are recorded in the
+// `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table so
 // `zcashlc_migration_has_invalid_transfers` / the `RequiresAttention` derivation can surface
 // them. Cleared when the run is cancelled (`zcashlc_migration_restart_step`).
-
-fn init_invalid_marks(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS sdk_invalid_marks (
-            account_uuid BLOB NOT NULL,
-            tx_id INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            PRIMARY KEY (account_uuid, tx_id)
-        )",
-    )
-}
+//
+// The table is created by the wallet schema migrations (see [`crate::ext_schema`]); access goes
+// through `WalletDb::transactionally_with_extension`, whose authorizer restricts writes to the
+// `ext_` namespace.
 
 fn insert_invalid_mark(
-    conn: &Connection,
+    wallet: &mut MigrationWallet,
     account: &[u8; 16],
     id: MigrationTxId,
     reason: &str,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO sdk_invalid_marks (account_uuid, tx_id, reason) VALUES (?1, ?2, ?3)
-         ON CONFLICT(account_uuid, tx_id) DO UPDATE SET reason = excluded.reason",
-        rusqlite::params![&account[..], u32::from(id), reason],
-    )?;
-    Ok(())
+) -> anyhow::Result<()> {
+    wallet.transactionally_with_extension(|_wdb, ext| {
+        ext.execute(
+            "INSERT INTO ext_zcashlc_orchard_ironwood_migration_invalid_marks
+                (account_uuid, tx_id, reason)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_uuid, tx_id) DO UPDATE SET reason = excluded.reason",
+            rusqlite::params![&account[..], u32::from(id), reason],
+        )?;
+        Ok(())
+    })
 }
 
-fn invalid_marks(conn: &Connection, account: &[u8; 16]) -> rusqlite::Result<Vec<u32>> {
-    let mut stmt =
-        conn.prepare("SELECT tx_id FROM sdk_invalid_marks WHERE account_uuid = ?1 ORDER BY tx_id")?;
-    let rows = stmt.query_map(rusqlite::params![&account[..]], |row| row.get::<_, u32>(0))?;
-    rows.collect()
+/// The account's marked transaction ids, sorted ascending. The extension-transaction API exposes
+/// single-row queries only, so the ids arrive as one aggregated row and are split here.
+fn invalid_marks(wallet: &mut MigrationWallet, account: &[u8; 16]) -> anyhow::Result<Vec<u32>> {
+    let joined: Option<String> = wallet.transactionally_with_extension(|_wdb, ext| {
+        ext.query_row(
+            "SELECT group_concat(tx_id)
+             FROM ext_zcashlc_orchard_ironwood_migration_invalid_marks
+             WHERE account_uuid = ?1",
+            rusqlite::params![&account[..]],
+            |row| row.get(0),
+        )
+        .map_err(anyhow::Error::from)
+    })?;
+    let mut ids = joined
+        .as_deref()
+        .unwrap_or("")
+        .split_terminator(',')
+        .map(|id| {
+            id.parse::<u32>()
+                .map_err(|e| anyhow!("invalid mark id {id}: {e}"))
+        })
+        .collect::<anyhow::Result<Vec<u32>>>()?;
+    ids.sort_unstable();
+    Ok(ids)
 }
 
-fn clear_invalid_marks(conn: &Connection, account: &[u8; 16]) -> rusqlite::Result<()> {
-    conn.execute(
-        "DELETE FROM sdk_invalid_marks WHERE account_uuid = ?1",
-        rusqlite::params![&account[..]],
-    )?;
-    Ok(())
+fn clear_invalid_marks(wallet: &mut MigrationWallet, account: &[u8; 16]) -> anyhow::Result<()> {
+    wallet.transactionally_with_extension(|_wdb, ext| {
+        ext.execute(
+            "DELETE FROM ext_zcashlc_orchard_ironwood_migration_invalid_marks
+             WHERE account_uuid = ?1",
+            rusqlite::params![&account[..]],
+        )?;
+        Ok(())
+    })
 }
 
 // ----- reconciliation, planning, committing -----
@@ -1444,7 +1465,7 @@ pub unsafe extern "C" fn zcashlc_migration_state(
         let Some(state) = reconcile_mined(&mut ctx)? else {
             return marshal_state(DerivedState::NotStarted, Zatoshis::ZERO);
         };
-        let marks = invalid_marks(&ctx.store_conn, &ctx.account_bytes)
+        let marks = invalid_marks(&mut ctx.wallet, &ctx.account_bytes)
             .map_err(|e| anyhow!("marks read failed: {e}"))?;
         let tip = ctx.tip()?;
         let derived = derive_state(Some(&state), tip, &marks);
@@ -1475,7 +1496,7 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
         let Some(state) = reconcile_mined(&mut ctx)? else {
             return Ok(Box::into_raw(Box::new(FfiMigrationProgress::absent())));
         };
-        let marks = invalid_marks(&ctx.store_conn, &ctx.account_bytes)
+        let marks = invalid_marks(&mut ctx.wallet, &ctx.account_bytes)
             .map_err(|e| anyhow!("marks read failed: {e}"))?;
         let tip = ctx.tip()?;
         let value = match derive_state(Some(&state), tip, &marks) {
@@ -1576,7 +1597,7 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
         if matches!(state.status(), MigrationStatus::Complete) {
             return Ok(false);
         }
-        let marks = invalid_marks(&ctx.store_conn, &ctx.account_bytes)
+        let marks = invalid_marks(&mut ctx.wallet, &ctx.account_bytes)
             .map_err(|e| anyhow!("marks read failed: {e}"))?;
         if !marks.is_empty() {
             return Ok(true);
@@ -2157,7 +2178,7 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
                 } else {
                     "expired"
                 };
-                insert_invalid_mark(&ctx.store_conn, &ctx.account_bytes, id, reason)
+                insert_invalid_mark(&mut ctx.wallet, &ctx.account_bytes, id, reason)
                     .map_err(|e| anyhow!("marks write failed: {e}"))?;
                 Ok(true)
             }
@@ -2196,7 +2217,7 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
                 }
             }
         }
-        clear_invalid_marks(&ctx.store_conn, &ctx.account_bytes)
+        clear_invalid_marks(&mut ctx.wallet, &ctx.account_bytes)
             .map_err(|e| anyhow!("marks clear failed: {e}"))?;
         match plan_and_cache(&mut ctx, false)? {
             Some((plan, reference_height, handle)) => {
@@ -3195,20 +3216,28 @@ mod tests {
         );
     }
 
+    /// Round-trips the invalid-transfer marks through the extension table that
+    /// `zcashlc_init_data_database`'s external migrations create (exercising the whole chain:
+    /// the `ext_zcashlc_*` schema migration, then the mediated extension-transaction access).
     #[test]
     fn invalid_marks_round_trip() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_invalid_marks(&conn).unwrap();
+        use zcash_client_sqlite::WalletDb;
+        use zcash_client_sqlite::util::SystemClock;
+
+        let path = init_fixture_db("zcashlc_migration_invalid_marks_round_trip");
+        let network = parse_network(NETWORK_ID_MAINNET).expect("mainnet parses");
+        let mut wallet = WalletDb::for_path(&path, network, SystemClock, OsRng)
+            .expect("the fixture wallet opens");
         let account = [9u8; 16];
         let other = [8u8; 16];
-        assert!(invalid_marks(&conn, &account).unwrap().is_empty());
-        insert_invalid_mark(&conn, &account, MigrationTxId::new(4), "invalid_note").unwrap();
-        insert_invalid_mark(&conn, &account, MigrationTxId::new(2), "expired").unwrap();
-        insert_invalid_mark(&conn, &other, MigrationTxId::new(7), "invalid_note").unwrap();
-        assert_eq!(invalid_marks(&conn, &account).unwrap(), vec![2, 4]);
-        clear_invalid_marks(&conn, &account).unwrap();
-        assert!(invalid_marks(&conn, &account).unwrap().is_empty());
-        assert_eq!(invalid_marks(&conn, &other).unwrap(), vec![7]);
+        assert!(invalid_marks(&mut wallet, &account).unwrap().is_empty());
+        insert_invalid_mark(&mut wallet, &account, MigrationTxId::new(4), "invalid_note").unwrap();
+        insert_invalid_mark(&mut wallet, &account, MigrationTxId::new(2), "expired").unwrap();
+        insert_invalid_mark(&mut wallet, &other, MigrationTxId::new(7), "invalid_note").unwrap();
+        assert_eq!(invalid_marks(&mut wallet, &account).unwrap(), vec![2, 4]);
+        clear_invalid_marks(&mut wallet, &account).unwrap();
+        assert!(invalid_marks(&mut wallet, &account).unwrap().is_empty());
+        assert_eq!(invalid_marks(&mut wallet, &other).unwrap(), vec![7]);
     }
 
     /// On a freshly initialized wallet database with a chain tip but no spendable notes, locking

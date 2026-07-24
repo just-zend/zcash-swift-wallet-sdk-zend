@@ -2753,6 +2753,8 @@ dependencies = [
  "rusqlite",
  "rust_decimal",
  "sapling-crypto",
+ "schemerz",
+ "schemerz-rusqlite",
  "secrecy",
  "serde",
  "serde_json",

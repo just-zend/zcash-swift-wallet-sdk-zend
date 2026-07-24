@@ -29,8 +29,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   witnessable from NU6.3 activation), preparations against the wallet's natural
   anchor, and a boundary the wallet has not scanned or retained yet surfaces as
   the transient nothing-due, not an error — and leaves broadcasting,
-  mined-reconciliation, rejection classification (the `sdk_invalid_marks` side
-  table), and the platform's 5-state derivation to this layer (the v1 crate's
+  mined-reconciliation, rejection classification (the
+  `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table, created
+  by the wallet schema migrations via `WalletMigrator::with_external_migrations`
+  and accessed through the wallet's authorizer-guarded extension-transaction API),
+  and the platform's 5-state derivation to this layer (the v1 crate's
   `ReadyToPropose` state and `SyncRequiredBeforeNext` attention reason are gone
   entirely — the engine's atomic split+schedule commit means that intermediate
   moment cannot occur). `Complete` is
