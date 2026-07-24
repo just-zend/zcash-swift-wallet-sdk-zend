@@ -313,8 +313,14 @@ public enum ZcashErrorCode: String {
     case rustMigrationEstimateRuns = "ZRUST0134"
     /// Error from rust layer when calling ZcashRustBackend.migrationTransactionStatuses
     case rustMigrationTransactionStatuses = "ZRUST0135"
+    /// Error from rust layer when calling ZcashRustBackend.migrationKeystoneBuildSignBatchQrParts
+    case rustMigrationKeystoneBuildSignBatchQrParts = "ZRUST0136"
+    /// Error from rust layer when calling ZcashRustBackend.migrationKeystoneDecodeSignBatchPart
+    case rustMigrationKeystoneDecodeSignBatchPart = "ZRUST0137"
+    /// Error from rust layer when calling ZcashRustBackend.migrationKeystoneApplyBatchSignatures
+    case rustMigrationKeystoneApplyBatchSignatures = "ZRUST0138"
     /// Error from the Rust-owned migration delivery runtime or one of its opaque capabilities.
-    case rustMigrationDelivery = "ZRUST0136"
+    case rustMigrationDelivery = "ZRUST0139"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.

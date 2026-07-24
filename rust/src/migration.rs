@@ -1050,7 +1050,6 @@ impl FfiUnsignedTransferPczts {
         })))
     }
 }
-
 /// A set of animated multi-part QR frame strings for a Keystone batch-signing request. Element
 /// order is the wire fragment order — display/scan them in that order.
 ///
@@ -5865,7 +5864,6 @@ pub unsafe extern "C" fn zcashlc_migration_keystone_build_sign_batch_qr_parts_v2
     });
     unwrap_exc_or_null(res)
 }
-
 /// Discards any in-flight multi-part Keystone sign-batch-response scan session. Callers should
 /// invoke this on scan-screen entry so a new attempt always starts from a clean slate regardless
 /// of how a previous attempt ended (cancel, back button, mid-stream error). Void and infallible.

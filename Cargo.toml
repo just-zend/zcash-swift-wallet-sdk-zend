@@ -38,7 +38,7 @@ zcash_protocol = { version = "0.10", features = ["local-consensus"] }
 # SQLite store moved into `zcash_client_sqlite::pool_migration`, so the old separate
 # store crate is gone). Direct git dependency at the same rev as the
 # [patch.crates-io] family below so the whole graph stays one family instance.
-zcash_pool_migration = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7", features = ["wallet"] }
+zcash_pool_migration = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01", features = ["wallet"] }
 zcash_script = "0.4"
 zip32 = "0.2"
 pczt = { version = "0.8.0", features = ["prover", "orchard", "sapling", "signer"] }
@@ -145,16 +145,16 @@ zcash_voting = { git = "https://github.com/just-zend/zcash_voting.git", rev = "0
 # librustzcash (it declares crates.io versions and patches from its own root), so this
 # workspace's patch governs the rev for the entire graph and everything resolves to one
 # copy. Bump this rev in one place to advance the stack.
-equihash = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-f4jumble = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-pczt = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zcash_address = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zcash_client_backend = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zcash_client_sqlite = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zcash_encoding = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zcash_keys = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zcash_primitives = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zcash_proofs = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zcash_protocol = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zcash_transparent = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
-zip321 = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+equihash = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+f4jumble = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+pczt = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zcash_address = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zcash_client_backend = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zcash_client_sqlite = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zcash_encoding = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zcash_keys = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zcash_primitives = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zcash_proofs = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zcash_protocol = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zcash_transparent = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
+zip321 = { git = "https://github.com/just-zend/librustzcash", rev = "1d63c9c07b0b40b3de633c8396008ff543464a01" }
