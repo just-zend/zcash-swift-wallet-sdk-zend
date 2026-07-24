@@ -18,6 +18,8 @@ upstream_1807_merge_revision="ef6c31420cf861d459b5fe41a47997fe255ffa4b"
 included_upstream_1813_revision="adfe9ca7a989f7a7197f8b10138519f8a02f790f"
 included_upstream_1821_revision="eb219e2f86f5725377ebdf3985815c809a954450"
 included_upstream_1822_revision="5aa8b4b4bb1ff4075a670b56de268295cff45589"
+included_upstream_1825_revision="93ed4ed957df3c1962bad283cd588dc385f955a0"
+sdk_pr1825_semantic_port_revision="641e8f6ee7f998cd6810fe4ce231419a1e933a01"
 zcash_voting_revision="04d255628f1d56de0479e3fb6963409dbe44ec1f"
 orchard_version="0.15.4"
 orchard_checksum="793e2e8c2323f35f082d1b3467ca8f576d646f9c93aef8c5168809d099245af8"
@@ -259,10 +261,11 @@ if [[ "$(git rev-parse "$upstream_1807_merge_revision^2")" != "$expected_sdk_iro
     || ! git merge-base --is-ancestor "$included_upstream_1813_revision" "$expected_sdk_pr1812_upstream_revision" \
     || ! git merge-base --is-ancestor "$included_upstream_1821_revision" HEAD \
     || ! git merge-base --is-ancestor "$included_upstream_1822_revision" HEAD \
+    || ! git merge-base --is-ancestor "$sdk_pr1825_semantic_port_revision" HEAD \
     || ! git merge-base --is-ancestor "$expected_sdk_pool_migration_merge_revision" HEAD \
     || ! git merge-base --is-ancestor "$expected_sdk_pr1812_merge_revision" HEAD
 then
-    echo "Error: SDK checkout does not contain the reviewed #1807/#1812 source graph" >&2
+    echo "Error: SDK checkout does not contain the reviewed #1807/#1812/#1825 source graph" >&2
     exit 1
 fi
 
@@ -362,6 +365,8 @@ printf '%s\n' \
     "INCLUDED_UPSTREAM_1813_REVISION=$included_upstream_1813_revision" \
     "INCLUDED_UPSTREAM_1821_REVISION=$included_upstream_1821_revision" \
     "INCLUDED_UPSTREAM_1822_REVISION=$included_upstream_1822_revision" \
+    "INCLUDED_UPSTREAM_1825_REVISION=$included_upstream_1825_revision" \
+    "SDK_PR_1825_SEMANTIC_PORT_REVISION=$sdk_pr1825_semantic_port_revision" \
     "UPSTREAM_1821_MERGE_REVISION=$upstream_1821_merge_revision" \
     "UPSTREAM_1822_MERGE_REVISION=$upstream_1822_merge_revision" \
     "LIBRUSTZCASH_REPOSITORY=$expected_librustzcash_repository" \

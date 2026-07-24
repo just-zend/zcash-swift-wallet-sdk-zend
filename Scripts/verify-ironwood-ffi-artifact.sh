@@ -311,6 +311,8 @@ upstream_1807_merge_revision=$(read_field UPSTREAM_1807_MERGE_REVISION)
 included_1813_revision=$(read_field INCLUDED_UPSTREAM_1813_REVISION)
 included_1821_revision=$(read_field INCLUDED_UPSTREAM_1821_REVISION)
 included_1822_revision=$(read_field INCLUDED_UPSTREAM_1822_REVISION)
+included_1825_revision=$(read_field INCLUDED_UPSTREAM_1825_REVISION)
+sdk_pr1825_semantic_port_revision=$(read_field SDK_PR_1825_SEMANTIC_PORT_REVISION)
 upstream_1821_merge_revision=$(read_field UPSTREAM_1821_MERGE_REVISION)
 upstream_1822_merge_revision=$(read_field UPSTREAM_1822_MERGE_REVISION)
 
@@ -321,6 +323,7 @@ for revision in \
     "$sdk_pr1812_upstream_revision" "$sdk_pr1812_merge_revision" \
     "$upstream_1807_merge_revision" \
     "$included_1813_revision" "$included_1821_revision" "$included_1822_revision" \
+    "$included_1825_revision" "$sdk_pr1825_semantic_port_revision" \
     "$upstream_1821_merge_revision" "$upstream_1822_merge_revision"
 do
     if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
@@ -346,6 +349,7 @@ verify_exact_merge SDK_PR_1812 \
     "$sdk_pr1812_merge_revision" "$upstream_1822_merge_revision" "$sdk_pr1812_upstream_revision"
 if ! git merge-base --is-ancestor "$included_1813_revision" "$sdk_pr1812_upstream_revision" \
     || ! git merge-base --is-ancestor "$implementation_revision" "$source_revision" \
+    || ! git merge-base --is-ancestor "$sdk_pr1825_semantic_port_revision" "$source_revision" \
     || ! git merge-base --is-ancestor "$sdk_pr1812_merge_revision" "$source_revision" \
     || ! git merge-base --is-ancestor "$source_revision" HEAD
 then
@@ -492,6 +496,7 @@ recipe_fields=(
     SDK_PR_1812_UPSTREAM_REVISION SDK_PR_1812_MERGE_REVISION
     UPSTREAM_1807_MERGE_REVISION INCLUDED_UPSTREAM_1813_REVISION
     INCLUDED_UPSTREAM_1821_REVISION INCLUDED_UPSTREAM_1822_REVISION
+    INCLUDED_UPSTREAM_1825_REVISION SDK_PR_1825_SEMANTIC_PORT_REVISION
     UPSTREAM_1821_MERGE_REVISION UPSTREAM_1822_MERGE_REVISION
     LIBRUSTZCASH_REPOSITORY LIBRUSTZCASH_REVISION LIBRUSTZCASH_TREE
     ZCASH_VOTING_REVISION ORCHARD_VERSION ORCHARD_CHECKSUM
@@ -521,6 +526,8 @@ if [[ "$(read_field SDK_BASE_REVISION)" != "9476ced615d90407270d3d741823d5797ef0
     || "$(read_field INCLUDED_UPSTREAM_1813_REVISION)" != "adfe9ca7a989f7a7197f8b10138519f8a02f790f" \
     || "$(read_field INCLUDED_UPSTREAM_1821_REVISION)" != "eb219e2f86f5725377ebdf3985815c809a954450" \
     || "$(read_field INCLUDED_UPSTREAM_1822_REVISION)" != "5aa8b4b4bb1ff4075a670b56de268295cff45589" \
+    || "$(read_field INCLUDED_UPSTREAM_1825_REVISION)" != "93ed4ed957df3c1962bad283cd588dc385f955a0" \
+    || "$(read_field SDK_PR_1825_SEMANTIC_PORT_REVISION)" != "641e8f6ee7f998cd6810fe4ce231419a1e933a01" \
     || "$(read_field LIBRUSTZCASH_REPOSITORY)" != "https://github.com/just-zend/librustzcash" \
     || "$(read_field ZCASH_VOTING_REVISION)" != "04d255628f1d56de0479e3fb6963409dbe44ec1f" \
     || "$(read_field ORCHARD_VERSION)" != "0.15.4" \
@@ -532,6 +539,7 @@ then
 fi
 for field in \
     SDK_FFI_SOURCE_REVISION SDK_FFI_SOURCE_TREE SDK_IRONWOOD_IMPLEMENTATION_REVISION \
+    SDK_PR_1825_SEMANTIC_PORT_REVISION \
     UPSTREAM_1821_MERGE_REVISION UPSTREAM_1822_MERGE_REVISION
 do
     if [[ ! "$(read_field "$field")" =~ ^[0-9a-f]{40}$ ]]; then

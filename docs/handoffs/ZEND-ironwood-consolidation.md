@@ -139,8 +139,9 @@ lifecycle schema.
    with duplicate simulator slices.
 4. Record the canonical Rust repository/commit/tree (without branch coupling), exact SDK source
    revision/tree and merge-or-semantic-port implementation revision, reviewed SDK lineage,
-   exact included upstream `#1821`/`#1822`/`#1825` heads and Zend merge revisions, toolchain, hermetic
-   environment policy, targets, per-slice checksums, and the complete
+   exact included upstream `#1821`/`#1822`/`#1825` heads and Zend merge or semantic-port revisions,
+   including `INCLUDED_UPSTREAM_1825_REVISION` and `SDK_PR_1825_SEMANTIC_PORT_REVISION`,
+   toolchain, hermetic environment policy, targets, per-slice checksums, and the complete
    XCFramework file/symlink manifest in provenance. Before packaging a release, require that Rust
    commit/tree on `just-zend/librustzcash` `main` and bind the release tag to the exact SDK workflow
    SHA; pin the reviewed SDK commit in the app branch based on Zend iOS PR #132.

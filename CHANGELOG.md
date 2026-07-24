@@ -88,7 +88,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A missing or superseded handle maps to `migrationPlanStale` (ZRUST0128). Zend additionally omits
   this pre-commit authority from `MigrationSchedule` persistence and resets it to the zero sentinel
   on every decode, so a restored display can never become commit authority. Durable post-commit
-  authority remains the separate Rust run/claim capability layer. Proving failures remain typed
+  authority remains the separate Rust run/claim capability layer. Artifact provenance freezes both
+  the exact upstream #1825 head and Zend semantic-port commit. Proving failures remain typed
   (`migrationProvingUnavailable`, ZRUST0127). Boundary-anchor proving follows the persisted ZIP 318
   cohort while preparation transactions use the wallet's natural anchor. FFI calls retain the SDK's
   panic boundary, thread-local last-error discipline, paired free functions, and `@DBActor`

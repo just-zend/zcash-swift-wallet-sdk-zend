@@ -226,6 +226,17 @@ replace_field "$wrong_lineage_recipe" SDK_PR_1812_MERGE_REVISION \
 expect_failure "wrong SDK merge lineage" ./Scripts/verify-ironwood-ffi-artifact.sh \
     "$pristine" "$wrong_lineage_provenance" "$wrong_lineage_recipe"
 
+wrong_1825_provenance="$temp_root/wrong-1825-provenance.env"
+wrong_1825_recipe="$temp_root/wrong-1825-recipe.env"
+cp LocalPackages/IRONWOOD_FFI_PROVENANCE.env "$wrong_1825_provenance"
+cp BuildSupport/IRONWOOD_FFI_BUILD.env "$wrong_1825_recipe"
+replace_field "$wrong_1825_provenance" SDK_PR_1825_SEMANTIC_PORT_REVISION \
+    0000000000000000000000000000000000000000
+replace_field "$wrong_1825_recipe" SDK_PR_1825_SEMANTIC_PORT_REVISION \
+    0000000000000000000000000000000000000000
+expect_failure "wrong SDK PR 1825 semantic-port lineage" ./Scripts/verify-ironwood-ffi-artifact.sh \
+    "$pristine" "$wrong_1825_provenance" "$wrong_1825_recipe"
+
 extra_git_manifest="$temp_root/Cargo-extra.toml"
 cp Cargo.toml "$extra_git_manifest"
 printf '\nunreviewed = { git = "https://example.invalid/unreviewed", rev = "0000000000000000000000000000000000000000" }\n' \
