@@ -2,9 +2,9 @@
 //  SDKSynchronizerMigrationTests.swift
 //  OfflineTests
 //
-//  Tests `SDKSynchronizer`'s migration group (R4-B): the 27 protocol requirements as thin forwards
+//  Tests `SDKSynchronizer`'s migration group as thin forwards
 //  to a seamed `OrchardMigrationHost`, and the two SDK-enforced session-separation behaviors --
-//  the start() privacy gate and the submitNoteSplit/executeNextPendingMigrationTransfer broadcast
+//  the start() privacy gate and the claim-backed submission broadcast
 //  guard. Driven through the host's injecting initializer + a scripted actor factory, mirroring
 //  R4-A's `OrchardMigrationHostTests` seam, with the host substituted into a real `SDKSynchronizer`
 //  via the container-mock seam (`container.mock(type: OrchardMigrationHost.self, ...)`) that
@@ -42,6 +42,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
     func testMigrationStateForwardsToTheAccountsActor() async throws {
         let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeRuntimeSnapshot(account: accountUUID)
         welding.migrationStateForReturnValue = .notStarted
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
 
@@ -51,9 +52,25 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(welding.migrationStateForReceivedAccount, accountUUID)
     }
 
+    func testMigrationRuntimeSnapshotForwardsToTheAccountsActor() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let expected = Self.makeRuntimeSnapshot(account: accountUUID)
+        welding.migrationRuntimeSnapshotForReturnValue = expected
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+
+        let snapshot = try await synchronizer.migrationRuntimeSnapshot(accountUUID: accountUUID)
+
+        XCTAssertEqual(snapshot, expected)
+        XCTAssertEqual(welding.migrationRuntimeSnapshotForReceivedAccount, accountUUID)
+    }
+
     func testPrepareNoteSplitForwardsToTheAccountsActor() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        let expected = NoteSplitProposal(outputNotes: [Zatoshi(500), Zatoshi(500)], fee: Zatoshi(100))
+        let expected = NoteSplitProposal(
+            outputNotes: [Zatoshi(500), Zatoshi(500)],
+            fee: Zatoshi(100),
+            proposalHandle: 7
+        )
         welding.migrationPrepareNoteSplitForReturnValue = expected
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
 
@@ -65,7 +82,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
     func testProposeMigrationTransfersForwardsToTheAccountsActor() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        let expected = MigrationSchedule(transfers: [], estimatedDurationHours: 3)
+        let expected = MigrationSchedule(transfers: [], estimatedDurationHours: 3, proposalHandle: 11)
         welding.migrationProposeTransfersForReturnValue = expected
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
 
@@ -90,6 +107,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     /// forwards to the per-account actor and returns the engine's rows untouched.
     func testMigrationTransactionStatusesForwardsToTheAccountsActor() async throws {
         let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeRuntimeSnapshot(account: accountUUID)
         let expected = [
             MigrationTransactionStatus(
                 id: 3,
@@ -111,64 +129,19 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(welding.migrationTransactionStatusesForReceivedAccount, accountUUID)
     }
 
-    /// `refreshStaleMigrationTransfers`'s external-signer (Keystone) lane: a `nil` usk must reach
-    /// the welding call as `nil`, not be coerced into some non-optional stand-in -- the engine
-    /// itself branches on nilness to select the unsigned-rebuild path (see
-    /// `OrchardMigration.refreshStaleTransfers(usk:)`) -- and the welding's post-refresh stored
-    /// schedule must flow back to the caller unmodified (it is the truth the host re-displays and
-    /// echoes on the consent-verified calls).
-    func testRefreshStaleMigrationTransfersForwardsNilUskForTheExternalSignerLane() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        let expected = MigrationSchedule(
-            transfers: [
-                MigrationTransferProposal(
-                    id: "3",
-                    amount: Zatoshi(100_000_000),
-                    anchorHeight: 3_600_000,
-                    nextExecutableAfterHeight: 3_600_100,
-                    expiryHeight: 3_640_000
-                )
-            ],
-            estimatedDurationHours: 2
-        )
-        welding.migrationRefreshStaleTransfersUskForReturnValue = expected
-        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-
-        let refreshed = try await synchronizer.refreshStaleMigrationTransfers(accountUUID: accountUUID, usk: nil)
-
-        XCTAssertEqual(refreshed, expected)
-        let received = welding.migrationRefreshStaleTransfersUskForReceivedArguments
-        XCTAssertEqual(received?.account, accountUUID)
-        XCTAssertNil(received?.usk, "a nil usk must forward as nil, selecting the external-signer lane")
-    }
-
-    /// The sibling of the nil-usk test above: a real spending key must forward untouched, selecting
-    /// the in-process sign-anew lane, with the returned schedule again round-tripping unmodified.
-    func testRefreshStaleMigrationTransfersForwardsARealUskForTheInProcessLane() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        let expected = MigrationSchedule(transfers: [], estimatedDurationHours: 0)
-        welding.migrationRefreshStaleTransfersUskForReturnValue = expected
-        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-        let usk = TestsData(networkType: .testnet).spendingKey
-
-        let refreshed = try await synchronizer.refreshStaleMigrationTransfers(accountUUID: accountUUID, usk: usk)
-
-        XCTAssertEqual(refreshed, expected)
-        let received = welding.migrationRefreshStaleTransfersUskForReceivedArguments
-        XCTAssertEqual(received?.account, accountUUID)
-        XCTAssertEqual(received?.usk, usk)
-    }
-
-    /// The sequential-runs contract at the API level: `.complete` is per-run, and the authority
-    /// for "does anything remain to migrate" is a fresh propose — an empty schedule means no, a
-    /// non-empty one is the next run's proposal. Hosts must not latch "never migrate again" off
-    /// the state machine alone.
+    /// The sequential-runs contract at the API level: `.complete` is the sole strict/reversible
+    /// completion value supplied by Rust (there is no second host Boolean), but it remains per-run.
+    /// The authority for "does anything remain to migrate" is a fresh propose — an empty schedule
+    /// means no, a non-empty one is the next run's proposal. Hosts must not latch "never migrate
+    /// again" off the state machine alone.
     func testAfterCompleteProposeMigrationTransfersAnswersWhetherAnythingRemains() async throws {
         let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeRuntimeSnapshot(account: accountUUID)
         welding.migrationStateForReturnValue = .complete
         welding.migrationProposeTransfersForReturnValue = MigrationSchedule(
             transfers: [],
-            estimatedDurationHours: 0
+            estimatedDurationHours: 0,
+            proposalHandle: 0
         )
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
 
@@ -190,74 +163,47 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
                     expiryHeight: BlockHeight(70_000)
                 )
             ],
-            estimatedDurationHours: 1
+            estimatedDurationHours: 1,
+            proposalHandle: 12
         )
         welding.migrationProposeTransfersForReturnValue = nextRun
         let proposed = try await synchronizer.proposeMigrationTransfers(accountUUID: accountUUID)
         XCTAssertEqual(proposed, nextRun, "a non-empty schedule is the next run's proposal")
     }
 
-    func testCreateUnsignedNoteSplitPCZTsForwards() async throws {
+    func testPrepareImmediateMigrationForExternalSigningUsesTheOpaqueClaimLane() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        let expected = [MigrationUnsignedTransferPczt(id: "0", pczt: Data([0xAA, 0xBB]))]
-        welding.migrationCreateUnsignedNoteSplitPcztsForReturnValue = expected
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeRuntimeSnapshot(account: accountUUID)
+        welding.migrationReserveImmediateSignerSubmissionForReturnValue = Self.makeClaimHandle(1)
+        welding.migrationPrepareImmediateExternalSigningClaimForReturnValue = Self.makeClaimHandle(2)
+        let expectedPCZT = Data([0x50, 0x43, 0x5A, 0x54])
+        welding.migrationClaimExternalSigningPCZTReturnValue = expectedPCZT
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+        let options = MigrationNetworkPrivacyOptions(
+            useTor: false,
+            submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067, secure: true)
+        )
 
-        let pczts = try await synchronizer.createUnsignedNoteSplitPCZTs(accountUUID: accountUUID)
+        let request = try await synchronizer.prepareImmediateMigrationForExternalSigning(
+            accountUUID: accountUUID,
+            options: options
+        )
 
-        XCTAssertEqual(pczts, expected)
-        XCTAssertEqual(welding.migrationCreateUnsignedNoteSplitPcztsForReceivedAccount, accountUUID)
-    }
-
-    /// MOB-1513: the immediate lane's `proposeImmediateMigration` forwards to the per-account actor
-    /// and returns its `ImmediateMigrationProposal` untouched -- unlike `proposeMigrationTransfers`,
-    /// there is no engine schedule involved, so this is a plain one-hop forward like every other
-    /// member in this group.
-    func testProposeImmediateMigrationForwardsToTheAccountsActor() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        let ownAddress = UnifiedAddress(validatedEncoding: Self.uaString, networkType: .testnet)
-        welding.getCurrentAddressAccountUUIDReturnValue = ownAddress
-        var proposal = FfiProposal()
-        var step = FfiProposalStep()
-        var input = FfiProposedInput()
-        var receivedOutput = FfiReceivedOutput()
-        receivedOutput.value = 500_000
-        input.receivedOutput = receivedOutput
-        step.inputs = [input]
-        var balance = FfiTransactionBalance()
-        balance.feeRequired = 10_000
-        step.balance = balance
-        proposal.steps = [step]
-        welding.proposeSendMaxTransferAccountUUIDRecipientMemoOrchardOnlyReturnValue = proposal
-        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-
-        let immediateProposal = try await synchronizer.proposeImmediateMigration(accountUUID: accountUUID)
-
-        XCTAssertEqual(immediateProposal.fee, Zatoshi(10_000))
-        XCTAssertEqual(immediateProposal.amount, Zatoshi(500_000 - 10_000))
-        XCTAssertEqual(welding.getCurrentAddressAccountUUIDReceivedAccountUUID, accountUUID)
-        XCTAssertEqual(welding.proposeSendMaxTransferAccountUUIDRecipientMemoOrchardOnlyReceivedArguments?.recipient, ownAddress.stringEncoded)
-    }
-
-    /// `recordImmediateMigration` forwards the account and txid to the per-account actor, which in
-    /// turn forwards to the welding record call -- this is NOT broadcast-sensitive (no
-    /// `throwIfSyncingForMigrationBroadcast()` guard), matching the contract that only the two
-    /// actual broadcasting members are guarded.
-    func testRecordImmediateMigrationForwardsToTheAccountsActor() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        var receivedTxid: Data?
-        var receivedAccount: AccountUUID?
-        welding.migrationRecordImmediateRunTxidForClosure = { txid, account in
-            receivedTxid = txid
-            receivedAccount = account
-        }
-        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-        let txid = Data(repeating: 0xEF, count: 32)
-
-        try await synchronizer.recordImmediateMigration(accountUUID: accountUUID, txid: txid)
-
-        XCTAssertEqual(receivedTxid, txid)
-        XCTAssertEqual(receivedAccount, accountUUID)
+        XCTAssertEqual(request.pczt, expectedPCZT)
+        XCTAssertEqual(
+            welding.migrationReserveImmediateSignerSubmissionForReceivedArguments?.signer,
+            .external
+        )
+        XCTAssertEqual(
+            welding.migrationReserveImmediateSignerSubmissionForReceivedArguments?.account,
+            accountUUID
+        )
+        XCTAssertEqual(
+            welding.migrationReserveImmediateSignerSubmissionForReceivedArguments?.submission,
+            MigrationSubmissionIntent(transport: .directTLS, endpoint: "https://submit.example:9067")
+        )
+        XCTAssertEqual(welding.migrationPrepareImmediateExternalSigningClaimForCallsCount, 1)
+        XCTAssertEqual(welding.migrationClaimExternalSigningPCZTCallsCount, 1)
     }
 
     /// `lockMigrationResidual` — the "Lock balance" choice at migration `Complete` — forwards to
@@ -293,7 +239,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     }
 
     /// `unlockMigrationResidual` — the release half; "Migrate anyway" composes as this call
-    /// followed by `proposeImmediateMigration` — forwards to the per-account actor and returns the
+    /// followed by `submitImmediateMigration` — forwards to the per-account actor and returns the
     /// cleared-lock count untouched.
     func testUnlockMigrationResidualForwardsToTheAccountsActor() async throws {
         let welding = ZcashRustBackendWeldingMock()
@@ -435,18 +381,24 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
     // MARK: - Enforcement: broadcast guard
 
-    func testSubmitNoteSplitThrowsDuringSyncWithoutTouchingTheHost() async throws {
+    func testSubmitExternallySignedMigrationTransactionThrowsDuringSyncWithoutTouchingTheHost() async throws {
         let welding = ZcashRustBackendWeldingMock()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
         await synchronizer.updateStatus(.syncing(0.5, false))
 
-        let proposal = NoteSplitProposal(outputNotes: [Zatoshi(1_000)], fee: Zatoshi(100))
-        let usk = TestsData(networkType: .testnet).spendingKey
-        let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint)
+        let request = ScheduledMigrationExternalSigningRequest(
+            transactionID: 7,
+            pczt: Data([0x50, 0x43, 0x5A, 0x54]),
+            claim: Self.makeClaimHandle(7)
+        )
 
         do {
-            _ = try await synchronizer.submitNoteSplit(accountUUID: accountUUID, proposal: proposal, usk: usk, options: options)
+            _ = try await synchronizer.submitExternallySignedMigrationTransaction(
+                accountUUID: accountUUID,
+                request: request,
+                signedPCZT: Data([0x53, 0x49, 0x47])
+            )
             XCTFail("expected migrationBroadcastDuringSync")
         } catch let error as ZcashError {
             guard case .migrationBroadcastDuringSync = error else {
@@ -459,7 +411,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         }
 
         XCTAssertEqual(recorder.callCount, 0, "the guard must throw before the host is ever consulted")
-        XCTAssertFalse(welding.migrationSignNoteSplitProposalUskForCalled, "the engine must never see a during-sync submission")
+        XCTAssertFalse(welding.migrationResumeClaimClaimForCalled, "the engine must never see a during-sync submission")
     }
 
     func testExecuteNextPendingMigrationTransferThrowsDuringSyncWithoutTouchingTheHost() async throws {
@@ -484,48 +436,46 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         }
 
         XCTAssertEqual(recorder.callCount, 0, "the guard must throw before the host is ever consulted")
-        XCTAssertFalse(welding.migrationNextDueTransferForCalled, "the engine must never see a during-sync execution attempt")
+        XCTAssertFalse(welding.migrationRuntimeSnapshotForCalled, "the engine must never see a during-sync execution attempt")
     }
 
-    /// Not-syncing companion: proves the guard does NOT trip outside the syncing case, and the call
-    /// really does reach the per-account actor's engine call -- by stubbing the engine's first
-    /// broadcast-flow step to throw a distinctive, non-`ZcashError` failure and observing it
-    /// propagate untouched (rather than seeing `migrationBroadcastDuringSync`, or a crash from an
-    /// unconfigured mock return value).
-    func testSubmitNoteSplitForwardsWhenNotSyncing() async throws {
-        struct StubSigningFailure: Error, Equatable {}
+    /// Not-syncing companion: the exact-request route reaches the claim-resume boundary.
+    func testSubmitExternallySignedMigrationTransactionForwardsWhenNotSyncing() async throws {
+        struct StubClaimFailure: Error, Equatable {}
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationSignNoteSplitProposalUskForThrowableError = StubSigningFailure()
+        welding.migrationResumeClaimClaimForThrowableError = StubClaimFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
         await synchronizer.updateStatus(.stopped)
 
-        let proposal = NoteSplitProposal(outputNotes: [Zatoshi(1_000)], fee: Zatoshi(100))
-        let usk = TestsData(networkType: .testnet).spendingKey
-        let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint)
+        let request = ScheduledMigrationExternalSigningRequest(
+            transactionID: 7,
+            pczt: Data([0x50, 0x43, 0x5A, 0x54]),
+            claim: Self.makeClaimHandle(7)
+        )
 
         do {
-            _ = try await synchronizer.submitNoteSplit(accountUUID: accountUUID, proposal: proposal, usk: usk, options: options)
-            XCTFail("expected the stubbed signing failure to propagate")
-        } catch let error as StubSigningFailure {
-            XCTAssertEqual(error, StubSigningFailure())
+            _ = try await synchronizer.submitExternallySignedMigrationTransaction(
+                accountUUID: accountUUID,
+                request: request,
+                signedPCZT: Data([0x53, 0x49, 0x47])
+            )
+            XCTFail("expected the stubbed claim failure to propagate")
+        } catch let error as StubClaimFailure {
+            XCTAssertEqual(error, StubClaimFailure())
         } catch {
-            XCTFail("expected StubSigningFailure, got \(error)")
+            XCTFail("expected StubClaimFailure, got \(error)")
         }
 
-        // Note: the mock's generated body checks `...ThrowableError` before bumping `...CallsCount`,
-        // so `migrationSignNoteSplitProposalUskForCalled` stays false on this path -- catching the
-        // exact stub type above (which can only originate from that one call site) plus the
-        // recorder count already prove the call reached the engine.
         XCTAssertEqual(recorder.callCount, 1, "the host must be consulted when the synchronizer is not syncing")
     }
 
     /// Not-syncing companion for `executeNextPendingMigrationTransfer`, mirroring
     /// `testSubmitNoteSplitForwardsWhenNotSyncing()`.
     func testExecuteNextPendingMigrationTransferForwardsWhenNotSyncing() async throws {
-        struct StubNextDueTransferFailure: Error, Equatable {}
+        struct StubRuntimeSnapshotFailure: Error, Equatable {}
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationNextDueTransferForThrowableError = StubNextDueTransferFailure()
+        welding.migrationRuntimeSnapshotForThrowableError = StubRuntimeSnapshotFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
         await synchronizer.updateStatus(.stopped)
@@ -534,11 +484,11 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
         do {
             _ = try await synchronizer.executeNextPendingMigrationTransfer(accountUUID: accountUUID, options: options)
-            XCTFail("expected the stubbed next-due-transfer failure to propagate")
-        } catch let error as StubNextDueTransferFailure {
-            XCTAssertEqual(error, StubNextDueTransferFailure())
+            XCTFail("expected the stubbed runtime-snapshot failure to propagate")
+        } catch let error as StubRuntimeSnapshotFailure {
+            XCTAssertEqual(error, StubRuntimeSnapshotFailure())
         } catch {
-            XCTFail("expected StubNextDueTransferFailure, got \(error)")
+            XCTFail("expected StubRuntimeSnapshotFailure, got \(error)")
         }
 
         // See the note in `testSubmitNoteSplitForwardsWhenNotSyncing()`: `...ThrowableError` bypasses
@@ -693,6 +643,32 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
                     logger: logger
                 )
             }
+        )
+    }
+
+    private static func makeClaimHandle(_ identity: Int) -> MigrationClaimHandle {
+        MigrationClaimHandle(
+            storage: MigrationOpaqueHandleStorage(
+                pointer: OpaquePointer(bitPattern: identity)!,
+                release: { _ in }
+            )
+        )
+    }
+
+    private static func makeRuntimeSnapshot(account: AccountUUID) -> MigrationRuntimeSnapshot {
+        MigrationRuntimeSnapshot(
+            account: account,
+            canonical: MigrationCanonicalSummary(status: nil, transactionCount: 0),
+            schemaProvenance: .compatible(version: 1),
+            legacyCutover: .fresh,
+            destinationSpendability: .notApplicable,
+            availability: .available,
+            ordinarySpendAuthorization: .unrestricted,
+            accountDeletionAuthorization: .allowed,
+            canonicalMutationAuthorization: .allowed,
+            aggregateStorageFinality: .noRun,
+            delivery: nil,
+            retainedRuns: []
         )
     }
 

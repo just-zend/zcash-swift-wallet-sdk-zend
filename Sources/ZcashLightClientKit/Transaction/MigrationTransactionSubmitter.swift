@@ -6,16 +6,11 @@
 import Foundation
 
 enum MigrationBroadcastError: Error, Equatable {
-    case migrationSnapshotChanged
-    case invalidTransactionID
-    case transactionIDMismatch
     case invalidSubmissionEndpoint
-    case submissionPolicyMismatch
     case selectedEndpointChainMismatch
     case selectedEndpointConsensusBranchMismatch
     case transactionConsensusBranchMismatch
     case selectedEndpointInfoBehindSampledTip(infoTip: BlockHeight, sampledTip: BlockHeight)
-    case missingExpiryHeight
     case selectedTransportTipWithinExpirySafetyMargin(
         tip: BlockHeight,
         expiry: BlockHeight,
@@ -28,8 +23,8 @@ struct MigrationTransport {
     let mode: ServiceMode
 }
 
-/// Creates exactly the transport requested for one migration broadcast. Tor is deliberately
-/// independent of the SDK-wide Tor flag: a migration privacy choice is authoritative per call.
+/// Creates exactly the transport sealed into a Rust-owned migration run. Tor is deliberately
+/// independent of the SDK-wide Tor flag and never falls back to a clear channel.
 protocol MigrationTransportCreating {
     func makeTransport(endpoint: LightWalletEndpoint, useTor: Bool) async throws -> MigrationTransport
 }
@@ -43,8 +38,6 @@ final class LiveMigrationTransportFactory: MigrationTransportCreating {
 
     func makeTransport(endpoint: LightWalletEndpoint, useTor: Bool) async throws -> MigrationTransport {
         if useTor {
-            // The isolated client owns this migration attempt even when global Tor is disabled.
-            // Failure to create it propagates; privacy requests never fall back to a clear channel.
             let isolatedTorClient = try await torClient.isolatedClient()
             return MigrationTransport(
                 service: LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: isolatedTorClient),
@@ -59,38 +52,43 @@ final class LiveMigrationTransportFactory: MigrationTransportCreating {
     }
 }
 
+/// Network-only submission of exact bytes held by a Rust claim. Policy validation, endpoint
+/// normalization, revision binding, and claim authority stay in Rust; Swift receives only the
+/// normalized target required to construct the transport.
 protocol MigrationTransactionSubmitting {
-    func validateSubmissionPolicy(
-        options: NetworkPrivacyOptions,
-        defaultEndpoint: LightWalletEndpoint,
-        networkType: NetworkType,
-        expectedChainName: String,
-        consensusFingerprint: String,
-        branchIdForHeight: @escaping (Int32) throws -> Int32
-    ) async throws -> SubmissionPolicy
-
-    // Engine claim, immutable policy, and lease renewal are one atomic submission contract.
     // swiftlint:disable:next function_parameter_count
     func submit(
         transaction: EncodedTransaction,
-        displayTransactionID: String,
         expiryHeight: BlockHeight,
-        options: NetworkPrivacyOptions,
-        defaultEndpoint: LightWalletEndpoint,
-        networkType: NetworkType,
+        target: MigrationBoundSubmissionTarget,
         expectedChainName: String,
-        boundPolicy: BoundSubmissionPolicy,
         transactionConsensusBranchId: UInt32,
         branchIdForHeight: @escaping (Int32) throws -> Int32,
         renewLease: @escaping () async throws -> Void
-    ) async throws -> TransferResult
+    ) async throws -> MigrationSubmissionOutcome
 }
 
-/// One-shot migration submission with explicit transport selection and exact-tx reconciliation.
+/// Fail-closed fallback used only by injected test compositions whose legacy broadcaster cannot
+/// create a claim-bound transport. Production always installs ``LiveMigrationTransactionSubmitter``.
+final class UnavailableMigrationTransactionSubmitter: MigrationTransactionSubmitting {
+    // swiftlint:disable:next function_parameter_count
+    func submit(
+        transaction: EncodedTransaction,
+        expiryHeight: BlockHeight,
+        target: MigrationBoundSubmissionTarget,
+        expectedChainName: String,
+        transactionConsensusBranchId: UInt32,
+        branchIdForHeight: @escaping (Int32) throws -> Int32,
+        renewLease: @escaping () async throws -> Void
+    ) async throws -> MigrationSubmissionOutcome {
+        throw MigrationDeliveryError.submissionTransportUnavailable
+    }
+}
+
 final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
     private static let preflightTipSampleCount = 3
     /// zcashd accepts when `nextBlockHeight + 3 <= expiry`; with tip H this requires
-    /// `expiry - H >= 4`. Apply that exact boundary before submission.
+    /// `expiry - H >= 4`.
     private static let expirySafetyMargin: BlockHeight = 4
 
     private let transportFactory: MigrationTransportCreating
@@ -108,110 +106,42 @@ final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
         )
     }
 
-    func validateSubmissionPolicy(
-        options: NetworkPrivacyOptions,
-        defaultEndpoint: LightWalletEndpoint,
-        networkType: NetworkType,
-        expectedChainName: String,
-        consensusFingerprint: String,
-        branchIdForHeight: @escaping (Int32) throws -> Int32
-    ) async throws -> SubmissionPolicy {
-        let endpoint = try Self.resolveEndpoint(
-            options.submissionEndpoint,
-            fallback: defaultEndpoint,
-            networkType: networkType
-        )
-        let transport = try await transportFactory.makeTransport(endpoint: endpoint, useTor: options.useTor)
-        do {
-            _ = try await validateSelectedEndpoint(
-                transport: transport,
-                expectedChainName: expectedChainName,
-                expectedTransactionBranchId: nil,
-                branchIdForHeight: branchIdForHeight
-            )
-            await transport.service.closeConnections()
-            return SubmissionPolicy(
-                transport: options.useTor ? .tor : .direct,
-                endpointIdentity: Self.endpointIdentity(endpoint),
-                consensusFingerprint: consensusFingerprint
-            )
-        } catch {
-            await transport.service.closeConnections()
-            throw error
+    /// Converts app input into raw intent only. Rust remains responsible for validating and
+    /// binding this endpoint to the wallet's network and consensus fingerprint.
+    static func submissionIntent(
+        options: MigrationNetworkPrivacyOptions,
+        networkType: NetworkType
+    ) -> MigrationSubmissionIntent {
+        let transport: MigrationSubmissionTransport
+        if options.useTor {
+            transport = .torOnion
+        } else if !options.submissionEndpoint.secure && networkType == .regtest {
+            transport = .loopbackDevelopment
+        } else {
+            transport = .directTLS
         }
-    }
-
-    /// Compatibility overload retained for focused submitter tests and internal callers that do
-    /// not own an engine claim. Production migration execution uses the policy-bound overload.
-    func submit(
-        transaction: EncodedTransaction,
-        displayTransactionID: String,
-        expiryHeight: BlockHeight,
-        options: NetworkPrivacyOptions,
-        defaultEndpoint: LightWalletEndpoint,
-        networkType: NetworkType = .testnet
-    ) async throws -> TransferResult {
-        let endpoint = try Self.resolveEndpoint(
-            options.submissionEndpoint,
-            fallback: defaultEndpoint,
-            networkType: networkType
-        )
-        let policy = SubmissionPolicy(
-            transport: options.useTor ? .tor : .direct,
-            endpointIdentity: Self.endpointIdentity(endpoint),
-            consensusFingerprint: String(repeating: "0", count: 64)
-        )
-        let branch = UInt32(bitPattern: Int32(bitPattern: 0xc2d6d0b4))
-        return try await submit(
-            transaction: transaction,
-            displayTransactionID: displayTransactionID,
-            expiryHeight: expiryHeight,
-            options: options,
-            defaultEndpoint: defaultEndpoint,
-            networkType: networkType,
-            expectedChainName: networkType.chainName,
-            boundPolicy: BoundSubmissionPolicy(
-                policy: policy,
-                policyFingerprint: String(repeating: "0", count: 64),
-                revision: 1
-            ),
-            transactionConsensusBranchId: branch,
-            branchIdForHeight: { _ in Int32(bitPattern: branch) },
-            renewLease: {}
+        return MigrationSubmissionIntent(
+            transport: transport,
+            endpoint: endpointIdentity(options.submissionEndpoint)
         )
     }
 
-    // Mirrors the atomic protocol contract above; grouping these values would obscure ownership.
     // swiftlint:disable:next function_parameter_count
     func submit(
         transaction: EncodedTransaction,
-        displayTransactionID: String,
         expiryHeight: BlockHeight,
-        options: NetworkPrivacyOptions,
-        defaultEndpoint: LightWalletEndpoint,
-        networkType: NetworkType,
+        target: MigrationBoundSubmissionTarget,
         expectedChainName: String,
-        boundPolicy: BoundSubmissionPolicy,
         transactionConsensusBranchId: UInt32,
         branchIdForHeight: @escaping (Int32) throws -> Int32,
         renewLease: @escaping () async throws -> Void
-    ) async throws -> TransferResult {
-        let endpoint = try Self.resolveEndpoint(
-            options.submissionEndpoint,
-            fallback: defaultEndpoint,
-            networkType: networkType
-        )
-        let requestedPolicy = SubmissionPolicy(
-            transport: options.useTor ? .tor : .direct,
-            endpointIdentity: Self.endpointIdentity(endpoint),
-            consensusFingerprint: boundPolicy.policy.consensusFingerprint
-        )
-        guard requestedPolicy == boundPolicy.policy else {
-            throw MigrationBroadcastError.submissionPolicyMismatch
-        }
-        // Transport creation happens before submission. A setup failure is known not to have
-        // broadcast anything, so it propagates instead of being mislabeled outcome-unknown.
-        let transport = try await transportFactory.makeTransport(endpoint: endpoint, useTor: options.useTor)
+    ) async throws -> MigrationSubmissionOutcome {
+        let endpoint = try Self.endpoint(for: target)
+        let useTor = target.transport == .torOnion
+
+        // Transport construction and every preflight operation occur before submit begins. A
+        // failure here is known-unsent and is reported to Rust by the claim-owning caller.
+        let transport = try await transportFactory.makeTransport(endpoint: endpoint, useTor: useTor)
         do {
             try await renewLease()
             try Task.checkCancellation()
@@ -230,8 +160,6 @@ final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
                     minimumRemainingBlocks: Self.expirySafetyMargin
                 )
             }
-            // This is the last known-unsent boundary. Cancellation after `submit` begins is
-            // outcome-unknown and must retain the exact engine claim.
             try await renewLease()
             try Task.checkCancellation()
         } catch {
@@ -239,32 +167,30 @@ final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
             throw error
         }
 
-        let result: TransferResult
+        let outcome: MigrationSubmissionOutcome
         do {
             let response = try await transport.service.submit(
                 spendTransaction: transaction.raw,
                 mode: transport.mode
             )
-
             if response.errorCode == 0 {
-                result = .success(txid: displayTransactionID)
+                outcome = .accepted
             } else {
-                result = await reconcileRejectedSubmission(
+                outcome = await reconcileRejectedSubmission(
                     response: response,
                     transaction: transaction,
-                    displayTransactionID: displayTransactionID,
                     transport: transport
                 )
             }
         } catch {
-            // Once submit has started, a timeout/disconnect cannot prove that the server did not
-            // receive the transaction. Retain the engine claim instead of immediately retrying.
+            // Once submit starts, timeout, cancellation, and disconnect are all ambiguous. The
+            // exact claim remains durable for Rust-owned chain reconciliation.
             logger.error("migration_submit outcome=unknown code=transport_exception")
-            result = .outcomeUnknown
+            outcome = .unknown
         }
 
         await transport.service.closeConnections()
-        return result
+        return outcome
     }
 
     private func sampledTip(
@@ -337,101 +263,67 @@ final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
     private func reconcileRejectedSubmission(
         response: LightWalletServiceResponse,
         transaction: EncodedTransaction,
-        displayTransactionID: String,
         transport: MigrationTransport
-    ) async -> TransferResult {
+    ) async -> MigrationSubmissionOutcome {
         do {
             let fetched = try await transport.service.fetchTransaction(
                 txId: transaction.transactionId,
                 mode: transport.mode
             )
             if fetched.status != .txidNotRecognized {
-                // A rejection such as "already in mempool" is acceptance when this exact txid is
-                // present at the selected endpoint.
-                return .success(txid: displayTransactionID)
+                return .accepted
             }
 
-            logger.error("migration_submit outcome=rejected code=server_rejected")
-            return .networkError(retryable: false)
+            logger.error("migration_submit outcome=known_unsent code=server_rejected_\(response.errorCode)")
+            return .knownUnsent
         } catch {
-            // The submit response was negative but reconciliation itself failed. We cannot tell
-            // whether this was an already-known response, so preserve the lease and reconcile later.
             logger.error("migration_submit outcome=unknown code=reconciliation_failed")
-            return .outcomeUnknown
+            return .unknown
         }
     }
 
-    static func resolveEndpoint(
-        _ submissionEndpoint: String?,
-        fallback: LightWalletEndpoint,
-        networkType: NetworkType
-    ) throws -> LightWalletEndpoint {
-        guard let submissionEndpoint else {
-            try validateTransportSecurity(fallback, networkType: networkType)
-            return fallback
-        }
-        guard
-            let components = URLComponents(string: submissionEndpoint),
-            let scheme = components.scheme?.lowercased(),
-            scheme == "https" || scheme == "http",
-            let host = components.host,
-            !host.isEmpty,
-            components.user == nil,
-            components.password == nil,
-            components.query == nil,
-            components.fragment == nil,
-            components.path.isEmpty || components.path == "/"
-        else {
+    /// Rehydrates only a Rust-validated target. This parser cannot create policy or authority.
+    static func endpoint(for target: MigrationBoundSubmissionTarget) throws -> LightWalletEndpoint {
+        guard let components = URLComponents(string: target.endpoint),
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.path.isEmpty || components.path == "/",
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased(),
+              !host.isEmpty else {
             throw MigrationBroadcastError.invalidSubmissionEndpoint
         }
 
-        let secure = scheme == "https"
+        let secure: Bool
+        switch target.transport {
+        case .directTLS:
+            guard scheme == "https" else {
+                throw MigrationBroadcastError.invalidSubmissionEndpoint
+            }
+            secure = true
+        case .torOnion:
+            guard (scheme == "http" || scheme == "https"), host.hasSuffix(".onion") else {
+                throw MigrationBroadcastError.invalidSubmissionEndpoint
+            }
+            secure = scheme == "https"
+        case .loopbackDevelopment:
+            guard scheme == "http", Self.isExplicitLoopback(host) else {
+                throw MigrationBroadcastError.invalidSubmissionEndpoint
+            }
+            secure = false
+        }
+
         let port = components.port ?? (secure ? 443 : 80)
-        guard (1 ... 65_535).contains(port) else {
+        guard (1 ... Int(UInt16.max)).contains(port) else {
             throw MigrationBroadcastError.invalidSubmissionEndpoint
         }
-        let endpoint = LightWalletEndpoint(
-            address: host,
-            port: port,
-            secure: secure,
-            singleCallTimeoutInMillis: fallback.singleCallTimeoutInMillis,
-            streamingCallTimeoutInMillis: fallback.streamingCallTimeoutInMillis
-        )
-        try validateTransportSecurity(endpoint, networkType: networkType)
-        return endpoint
+        return LightWalletEndpoint(address: host, port: port, secure: secure)
     }
 
-    private static func validateTransportSecurity(
-        _ endpoint: LightWalletEndpoint,
-        networkType: NetworkType
-    ) throws {
-        guard endpoint.secure || (networkType == .regtest && isLoopback(endpoint.host)) else {
-            throw MigrationBroadcastError.invalidSubmissionEndpoint
-        }
-    }
-
-    private static func isLoopback(_ host: String) -> Bool {
-        let lowercased = host.lowercased()
-        let normalized = lowercased.hasPrefix("[") && lowercased.hasSuffix("]")
-            ? String(lowercased.dropFirst().dropLast())
-            : lowercased
-        if normalized == "localhost" || normalized == "::1" {
-            return true
-        }
-        let octets = normalized.split(separator: ".", omittingEmptySubsequences: false)
-        guard octets.count == 4,
-              octets.first == "127",
-              octets.allSatisfy({ octet in
-                  guard !octet.isEmpty,
-                        octet.utf8.allSatisfy({ (48 ... 57).contains($0) }),
-                        let value = UInt8(octet) else {
-                      return false
-                  }
-                  return String(value) == String(octet)
-              }) else {
-            return false
-        }
-        return true
+    private static func isExplicitLoopback(_ host: String) -> Bool {
+        host == "localhost" || host == "127.0.0.1" || host == "::1"
     }
 
     static func endpointIdentity(_ endpoint: LightWalletEndpoint) -> String {

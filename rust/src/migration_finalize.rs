@@ -1,6 +1,6 @@
 //! Prove-at-broadcast-time support for the migration engine (ZIP 374 deferred anchor/witness).
 //!
-//! The engine (`zcash_pool_migration_backend`) commits every migration transaction fully built and
+//! The engine (`zcash_pool_migration`) commits every migration transaction fully built and
 //! signed, with its Orchard spend witnesses and anchors left unset — the durable artifact in
 //! `MigrationTransaction::pczt()` never changes after commit. At proving time this module routes
 //! each due transaction through the UPSTREAM prover: [`prove_due_transaction`] dispatches on the
@@ -36,10 +36,10 @@
 
 use anyhow::anyhow;
 use zcash_client_backend::data_api::WalletRead;
-use zcash_pool_migration_backend::engine::{
+use zcash_pool_migration::engine::{
     self, MigrationProver, MigrationState, MigrationTxId, MigrationTxKind,
 };
-use zcash_pool_migration_backend::wallet::WalletProveError;
+use zcash_pool_migration::wallet::WalletProveError;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::migration::proving_unavailable;
@@ -147,17 +147,4 @@ where
         Err(engine::ProveError::Prover(e)) if e.is_transient() => Ok(None),
         Err(e) => Err(proving_unavailable(e)),
     }
-}
-
-/// Extracts the consensus transaction bytes and txid (raw internal order) from a fully proven and
-/// finalized PCZT.
-pub(crate) fn extract_tx(pczt: pczt::Pczt) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
-    let tx = pczt::roles::tx_extractor::TransactionExtractor::new(pczt)
-        .extract()
-        .map_err(|e| anyhow!("finalize: extract tx: {e:?}"))?;
-    let txid: [u8; 32] = *tx.txid().as_ref();
-    let mut raw = Vec::new();
-    tx.write(&mut raw)
-        .map_err(|e| anyhow!("finalize: encode tx: {e}"))?;
-    Ok((raw, txid))
 }

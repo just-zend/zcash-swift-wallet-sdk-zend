@@ -104,11 +104,6 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertTrue(statuses.isEmpty)
     }
 
-    func testFreshWalletHasNoNextDueTransfer() async throws {
-        let nextDue = try await rustBackend.migrationNextDueTransfer(for: account)
-        XCTAssertNil(nextDue)
-    }
-
     /// Unlike `isNoteSplitNeeded`/`residualAfterMigration` (which read the spendable Orchard balance
     /// and so throw `NotSynced` on this never-synced fixture), `pendingTransferProposal` short-
     /// circuits to `Ok(None)` as soon as it sees no active migration run -- it never reaches the
@@ -139,14 +134,18 @@ final class MigrationFFITests: XCTestCase {
 
     // MARK: - Residual locking
 
-    /// On a fresh wallet with no spendable Orchard notes, locking the residual locks nothing:
-    /// `Zatoshi(0)` is the legitimate "nothing was spendable" answer, not an error. (The
-    /// account-creation fixture gives the wallet a chain tip via the checkpoint birthday, which
-    /// the lock path's note selection targets — the same reason `isNoteSplitNeeded` plans
-    /// benignly above.)
-    func testFreshWalletLockResidualLocksNothing() async throws {
-        let locked = try await rustBackend.lockMigrationResidual(accountUUID: account)
-        XCTAssertEqual(locked, Zatoshi(0))
+    /// Residual locking is available only after the strict public migration `Complete` state. A
+    /// fresh wallet has no migration at all, so even its empty spendable set must not bypass the
+    /// ordering gate and acquire the permanent residual owner.
+    func testFreshWalletLockResidualRequiresStrictComplete() async throws {
+        do {
+            _ = try await rustBackend.lockMigrationResidual(accountUUID: account)
+            XCTFail("Expected residual locking before strict Complete to throw")
+        } catch ZcashError.rustMigrationLockResidual {
+            // expected
+        } catch {
+            XCTFail("Expected rustMigrationLockResidual but got \(error)")
+        }
     }
 
     /// The release half on a fresh wallet: no locks exist, so the cleared-output count is `0`.
@@ -155,12 +154,14 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertEqual(unlocked, 0)
     }
 
-    /// Lock-then-unlock on the empty wallet is a stable round trip (both legs `0`), pinning that
-    /// a no-op lock leaves no stray lock state behind for unlock to find.
-    func testLockThenUnlockResidualOnFreshWalletIsAZeroRoundTrip() async throws {
-        let locked = try await rustBackend.lockMigrationResidual(accountUUID: account)
-        XCTAssertEqual(locked, Zatoshi(0))
-
+    /// A rejected pre-completion lock attempt leaves no residual-owned lock behind.
+    func testRejectedResidualLockLeavesNothingToUnlock() async throws {
+        do {
+            _ = try await rustBackend.lockMigrationResidual(accountUUID: account)
+            XCTFail("Expected residual locking before strict Complete to throw")
+        } catch ZcashError.rustMigrationLockResidual {
+            // expected
+        }
         let unlocked = try await rustBackend.unlockMigrationResidual(accountUUID: account)
         XCTAssertEqual(unlocked, 0)
     }
@@ -187,7 +188,7 @@ final class MigrationFFITests: XCTestCase {
     /// randomness on every proposal), so committing with nothing cached must surface
     /// `migrationPlanStale` — the actionable "propose again" signal — not a generic failure.
     func testSignAndStoreWithoutAPreviewedPlanThrowsPlanStale() async throws {
-        let emptySchedule = MigrationSchedule(transfers: [], estimatedDurationHours: 0)
+        let emptySchedule = MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 0)
         do {
             try await rustBackend.migrationSignAndStoreSchedule(emptySchedule, usk: usk, for: account)
             XCTFail("Expected committing without a previewed plan to throw")
@@ -198,86 +199,22 @@ final class MigrationFFITests: XCTestCase {
         }
     }
 
-    /// Ported from the prototype's `testRecordTransferResultWithNoActiveRunThrows`: recording a
-    /// result against a transfer id with no active migration run throws
-    /// `MigrationError::InvalidState(NoActiveRun)` -- a deterministic, sync-independent throw (this
-    /// path never touches the wallet schema at all). Uses `.networkError` rather than `.success` to
-    /// keep the test focused on the "no active run" contract, sidestepping the unrelated txid-hex
-    /// validation `.success` carries (see `TxIdTests.testTxIdStringRoundTripsThroughRawBytesForAnAsymmetricFixture`
-    /// / `testTxIdRawBytesRoundTripThroughDisplayHexStringForAnAsymmetricFixture` for the conversion
-    /// helpers themselves, and
-    /// `OrchardMigrationCompositionTests.testExecuteNextPendingTransferRecordsTheDocumentedByteOrderForAnAsymmetricTxId`
-    /// for that validation exercised through this same welding record path).
-    func testRecordTransferResultWithNoActiveRunThrows() async throws {
-        do {
-            try await rustBackend.migrationRecordTransferResult(
-                transferId: "does-not-exist",
-                result: MigrationTransferResult.networkError(retryable: true),
-                for: account
-            )
-            XCTFail("Expected recording a result with no active migration run to throw")
-        } catch ZcashError.rustMigrationRecordTransferResult {
-            // expected
-        } catch {
-            XCTFail("Expected rustMigrationRecordTransferResult but got \(error)")
-        }
-    }
-
-    /// Ported from the prototype's `testExtractBroadcastTxWithInvalidPcztThrows`: garbage PCZT bytes
-    /// fail the crate's deserialization before any wallet-state check, so this is deterministic
-    /// regardless of sync state.
-    func testExtractBroadcastTxWithInvalidPcztThrows() async throws {
-        do {
-            _ = try await rustBackend.migrationExtractBroadcastTx(pczt: Data([0, 1, 2, 3]), for: account)
-            XCTFail("Expected extracting a tx from invalid PCZT bytes to throw")
-        } catch ZcashError.rustMigrationExtractBroadcastTx {
-            // expected
-        } catch {
-            XCTFail("Expected rustMigrationExtractBroadcastTx but got \(error)")
-        }
-    }
-
-    // MARK: - Immediate migration (send-max lane)
-
-    /// MOB-1513: `migrationRecordImmediateRun` validates `txid.count == 32` in Swift before making
-    /// any FFI call (the C side reads it as a fixed 32-byte buffer with no length parameter, so this
-    /// guard is load-bearing, not defensive-only). A short txid must never reach the FFI.
-    func testMigrationRecordImmediateRunRejectsNon32ByteTxid() async throws {
-        do {
-            try await rustBackend.migrationRecordImmediateRun(txid: Data([0x01, 0x02, 0x03]), for: account)
-            XCTFail("Expected a non-32-byte txid to be rejected before any FFI call")
-        } catch ZcashError.migrationRecordImmediateRunInvalidTxId(let length) {
-            XCTAssertEqual(length, 3)
-        } catch {
-            XCTFail("Expected migrationRecordImmediateRunInvalidTxId but got \(error)")
-        }
-    }
-
-    /// This fixture's `createAccount` call installs a checkpoint `treeState` (mirroring every other
-    /// test in this file), which already gives `chain_height()` a height to report -- so unlike the
-    /// balance-bearing paths, recording an immediate run does NOT require a real sync to succeed
-    /// (the documented "no chain tip yet" failure mode applies before any account has been created
-    /// at all, which this offline suite's setup always provides). This exercises the real FFI
-    /// marshaling end-to-end (db/account bytes, the fixed 32-byte txid buffer, the boolean success
-    /// mapping) and the `derive_state` fold reading it straight back: an unmined, unrecognized txid
-    /// falls into the documented fallback-pending bucket (`recorded_at_height + 40`, not yet
-    /// elapsed), so the state machine reports `InProgress(0 of 1)`, not a re-offer.
-    func testMigrationRecordImmediateRunThenMigrationStateReportsInProgress() async throws {
-        let txid = Data(repeating: 0xAB, count: 32)
-
-        try await rustBackend.migrationRecordImmediateRun(txid: txid, for: account)
-
-        let state = try await rustBackend.migrationState(for: account)
-        guard case .inProgress(let progress) = state else {
-            XCTFail("Expected .inProgress after recording an immediate run with an unmined txid, got \(state)")
-            return
-        }
-        XCTAssertEqual(progress.completedTransfers, 0)
-        XCTAssertEqual(progress.totalTransfers, 1)
-        XCTAssertTrue(
-            progress.isImmediate,
-            "a recorded immediate-lane run must map to isImmediate = true through the real FFI"
+    /// A nonzero handle is not authority by itself: if it does not identify a live Rust-cached
+    /// plan (for example after relaunch or supersession), the same re-propose signal is returned.
+    func testSignAndStoreWithAStaleNonzeroHandleThrowsPlanStale() async throws {
+        let staleSchedule = MigrationSchedule(
+            transfers: [],
+            estimatedDurationHours: 0,
+            proposalHandle: 0xDEAD_BEEF
         )
+        do {
+            try await rustBackend.migrationSignAndStoreSchedule(staleSchedule, usk: usk, for: account)
+            XCTFail("Expected committing with a stale handle to throw")
+        } catch ZcashError.migrationPlanStale {
+            // expected
+        } catch {
+            XCTFail("Expected migrationPlanStale but got \(error)")
+        }
     }
 
     /// MOB-1513 R2: the FFI→model mapping (`FfiMigrationProgress.unsafeToMigrationProgress()`) must
@@ -285,9 +222,7 @@ final class MigrationFFITests: XCTestCase {
     /// the boundary and the model's defaulted `isImmediate` can never silently swallow it. Both
     /// paths are exercised on the mapping directly (constructing the `#[repr(C)]` struct) because an
     /// engine-tracked InProgress — the only real-FFI `is_immediate == false` source — needs a
-    /// seeded, synced Orchard balance this offline suite does not have. The `true` path is
-    /// additionally covered end-to-end over the real FFI by
-    /// `testMigrationRecordImmediateRunThenMigrationStateReportsInProgress` above.
+    /// seeded, synced Orchard balance this offline suite does not have.
     func testMigrationProgressMappingCarriesIsImmediateBothWays() throws {
         let immediate = FfiMigrationProgress(
             is_present: true,
@@ -385,13 +320,6 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertEqual(first, second)
     }
 
-    func testMigrationNextDueTransferNilIsStableAcrossRepeatedCalls() async throws {
-        let first = try await rustBackend.migrationNextDueTransfer(for: account)
-        let second = try await rustBackend.migrationNextDueTransfer(for: account)
-        XCTAssertNil(first)
-        XCTAssertEqual(first, second)
-    }
-
     func testMigrationPendingTransferProposalNilIsStableAcrossRepeatedCalls() async throws {
         let first = try await rustBackend.migrationPendingTransferProposal(for: account)
         let second = try await rustBackend.migrationPendingTransferProposal(for: account)
@@ -406,48 +334,24 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertEqual(first, second)
     }
 
-    /// Rebuild-on-expiry is live in the engine: on a fresh wallet with NO stored migration run
-    /// there is nothing to refresh and nothing to re-display, so `refreshStaleTransfers` returns
-    /// the legitimate EMPTY schedule — not a throw. (The call returns the run's stored schedule
-    /// so a host can re-display and echo the post-refresh truth; with no run stored that truth
-    /// is empty.) The in-process lane (a real spending key selects sign-anew rebuilds).
-    func testRefreshStaleTransfersOnFreshWalletReturnsAnEmptyScheduleWithSpendingKey() async throws {
-        let refreshed = try await rustBackend.migrationRefreshStaleTransfers(usk: usk, for: account)
-        XCTAssertTrue(refreshed.transfers.isEmpty)
-        XCTAssertEqual(refreshed.estimatedDurationHours, 0)
-    }
-
-    /// The external-signer lane of the same nothing-to-refresh answer: a `nil` spending key
-    /// (NULL over the FFI) selects the unsigned rebuild and must be a legitimate input — an
-    /// imported hardware-wallet account has no in-process spend authority — so it too returns
-    /// the empty schedule on a fresh wallet rather than throwing.
-    func testRefreshStaleTransfersOnFreshWalletReturnsAnEmptyScheduleWithNilSpendingKey() async throws {
-        let refreshed = try await rustBackend.migrationRefreshStaleTransfers(usk: nil, for: account)
-        XCTAssertTrue(refreshed.transfers.isEmpty)
-        XCTAssertEqual(refreshed.estimatedDurationHours, 0)
-    }
-
     /// Guards against last-error-channel pollution across calls: a throwing call must not corrupt
     /// the next legitimate `false` answer from an ambiguous-bool-sentinel call
     /// (`hasOverdueTransfers`, which reads only the empty migration store on a fresh db)
-    /// sandwiched around it. The throwing predecessor is `recordTransferResult` with no active
-    /// run — deterministic and sync-independent (see
-    /// `testRecordTransferResultWithNoActiveRunThrows`) — now that `refreshStaleTransfers`
-    /// legitimately returns the empty schedule on this fixture instead of throwing.
+    /// sandwiched around it. The throwing predecessor is a supported handle-gated schedule commit
+    /// without a cached preview.
     func testHasOverdueTransfersIsUnaffectedByAPrecedingThrowingMigrationCall() async throws {
         let before = try await rustBackend.migrationHasOverdueTransfers(for: account)
         XCTAssertFalse(before)
 
         do {
-            try await rustBackend.migrationRecordTransferResult(
-                transferId: "does-not-exist",
-                result: MigrationTransferResult.networkError(retryable: true),
+            try await rustBackend.migrationSignAndStoreSchedule(
+                MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 0),
+                usk: usk,
                 for: account
             )
-            XCTFail("Expected recording a result with no active migration run to throw")
+            XCTFail("Expected committing without a preview to throw")
         } catch {
-            // Expected; the specific case is asserted by
-            // testRecordTransferResultWithNoActiveRunThrows above.
+            // Expected; the specific plan-stale case is asserted above.
         }
 
         let after = try await rustBackend.migrationHasOverdueTransfers(for: account)
@@ -637,8 +541,8 @@ final class MigrationFFITests: XCTestCase {
 
     /// Constructs a real `OrchardMigration` via the injecting initializer, wired to the SAME
     /// real-FFI-backed welding as the rest of this file (not a mock) plus a real, temp-file-backed
-    /// `MigrationSyncGate`. On this fresh wallet `migrationNextDueTransfer` legitimately returns
-    /// `nil`, so `executeNextPendingTransfer` must short-circuit before ever reaching the broadcaster
+    /// `MigrationSyncGate`. On this fresh wallet the runtime has no delivery run, so
+    /// `executeNextPendingTransfer` must short-circuit before ever reaching the submitter
     /// -- proven here with a fake that fails the assertion (via a non-zero call count) rather than
     /// the test itself if that contract regresses. `rescheduleOverdueTransfer` likewise resolves
     /// `nil` (no active run), exercising the engine-backed pending-proposal accessor over real FFI.

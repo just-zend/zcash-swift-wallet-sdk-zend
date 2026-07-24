@@ -28,6 +28,7 @@ use super::progress::ProgressBridge;
 /// notes from the wallet database itself (the crate owns note selection and
 /// key material shaping), so the delegation lanes take the wallet DB path and
 /// account UUID instead of caller-supplied note/key blobs.
+#[allow(clippy::too_many_arguments)]
 unsafe fn gather_ffi_delegation_inputs(
     handle: &VotingDatabaseHandle,
     round_id: &str,

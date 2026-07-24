@@ -1,5 +1,5 @@
 //! FFI over the final Orchard→Ironwood pool-migration engine
-//! ([`zcash_pool_migration_backend`] + the `zcash_client_sqlite::pool_migration` store).
+//! ([`zcash_pool_migration`] + the `zcash_client_sqlite::pool_migration` store).
 //!
 //! The engine is a set of free functions over traits — [`crate::migration_engine::Backend`] wires
 //! this SDK's wallet database (and the account-keyed migration store living inside it) into them;
@@ -15,18 +15,16 @@
 //! Semantics that moved into this layer (the v1 crate did them internally):
 //! - The public 5-state machine is DERIVED (see [`derive_state`]): the v1 crate's `ReadyToPropose`
 //!   state and `SyncRequiredBeforeNext` attention reason are gone entirely (the engine commits the
-//!   split and the schedule atomically, so that intermediate moment cannot occur), and `Complete`
-//!   is PER-RUN — "the stored run is fully mined", never "nothing left to migrate". After
-//!   completion the platform asks `zcashlc_migration_propose_transfers` whether anything remains
-//!   (an empty schedule means no).
-//! - Mined-transaction reconciliation ([`reconcile_mined`]) runs at the head of every read.
-//! - Rejection classification is recorded in the SDK-owned `sdk_invalid_marks` side table (the
-//!   engine has no failure states).
-//! - The immediate lane (an ordinary send-max sweep, entirely outside the engine) is tracked in
-//!   its own SDK-owned `sdk_immediate_runs` side table and folded into [`derive_state`]: while
-//!   unmined it derives `InProgress` (flagged `is_immediate`); once mined it is CONSUMED — it
-//!   derives nothing and masks any stale engine `Complete`, so the aftermath stays quiet — and past
-//!   its expiry it is ignored. See that function's precedence rule.
+//!   split and the schedule atomically, so that intermediate moment cannot occur). Canonical
+//!   engine `Complete` is PER-RUN — "the stored run is fully mined", never "nothing left to
+//!   migrate" — while the public projection additionally requires every exact resulting Ironwood
+//!   output to be spendable or current-main-chain spent. After completion the platform asks
+//!   `zcashlc_migration_propose_transfers` whether anything remains (an empty schedule means no).
+//! - Legacy state/progress/status reads are pure projections. Canonical chain reconciliation is a
+//!   separate delivery CAS that requires the Rust-owned opaque scheduled-run capability.
+//! - Durable rejection, exact-artifact delivery, and immediate-lane state are owned by the
+//!   additive delivery-control schema in `zcash_client_sqlite`. This shim never creates SDK-local
+//!   shadow tables or records a broadcast after the fact.
 //!
 //! Error channel: failures land in the thread-local last-error message. Two stable prefixes let
 //! the Swift layer surface dedicated errors: `MIGRATION_PLAN_STALE:` (commit without a matching
@@ -38,44 +36,73 @@
 //! ownership to the caller, who must free it with the matching `zcashlc_free_migration_*` (or
 //! `zcashlc_free_boxed_slice`) function.
 
-use std::collections::HashSet;
+use std::convert::Infallible;
 use std::ffi::{CStr, CString, OsStr};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
+use pczt::{Pczt, roles::prover::Prover};
+use prost::Message;
 use rand::rngs::OsRng;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use zcash_client_backend::data_api::wallet::{
-    TargetHeight,
+    SpendingKeys, TargetHeight, create_pczt_from_proposal, create_proposed_transactions,
+    extract_and_store_transaction_from_pczt,
     input_selection::{LockFilter, LockedInputPolicy},
 };
 use zcash_client_backend::data_api::{InputSource, WalletRead, WalletWrite};
-use zcash_client_backend::wallet::{LockOwner, OutputRef};
+use zcash_client_backend::proto::proposal::Proposal as ProtoProposal;
+use zcash_client_backend::wallet::{LockOwner, OutputRef, OvkPolicy};
 use zcash_client_sqlite::AccountUuid;
+use zcash_client_sqlite::pool_migration::orchard_ironwood::PoolMigrations;
+use zcash_primitives::transaction::builder::{BundlePadding, cached_orchard_proving_key};
+use zcash_proofs::prover::LocalTxProver;
+#[cfg(test)]
+use zcash_protocol::TxId;
 use zcash_protocol::consensus::{
-    BLOCKS_PER_HOUR, BlockHeight, Network, NetworkUpgrade, Parameters,
+    BLOCKS_PER_HOUR, BlockHeight, BranchId, Network, NetworkUpgrade, Parameters,
 };
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::{PoolType, ShieldedPool, TxId};
+use zcash_protocol::{PoolType, ShieldedPool};
 
-use zcash_pool_migration_backend::engine::{
-    self, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction, MigrationTxId,
-    MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
+use zcash_pool_migration::delivery::{
+    AccountDeletionAuthorization, AccountDeletionBlockReason, CanonicalMaterializationTransition,
+    CanonicalMutationAuthorization, CanonicalMutationBlockReason, ClaimKind, ClaimStatus,
+    ClaimToken, DeliveryArtifactEvidence, DeliveryArtifactIdentity, DeliveryFailureReason,
+    DeliveryLane, DeliveryPhase, DeliveryRevision, DeliverySnapshot, DestinationSpendability,
+    DirectTlsEndpoint, ExpiredTransferRebuild, ExternalSigningPczt,
+    ImmediateMigrationDeliveryStore, ImmediateMigrationIntent, ImmediateProposal, LeaseDuration,
+    LegacyCutoverStatus, LoopbackDevelopmentEndpoint, MigrationDeliveryStore, MigrationRunIdentity,
+    MigrationRuntimeAvailability, MigrationRuntimeSnapshot, MigrationRuntimeStore,
+    OrdinarySpendAuthorization, OrdinarySpendBlockReason, OrdinarySpendScope, PolicyFingerprint,
+    PolicyValidationFailure, ReservationRollover, ReservedImmediateArtifact, RetainedMigrationRun,
+    RuntimeUnavailableReason, SignerOwnership, SourceReservationOwner, StorageFinality,
+    StorageRecoveryReason, SubmissionContext, SubmissionOutcome, SubmissionPolicy,
+    SubmissionPolicyRequest, SubmissionTransport, TorOnionEndpoint, exact_immediate_transaction,
+    scheduled_artifact_evidence,
 };
-use zcash_pool_migration_backend::state::{Blocker, NextAction, TransactionStatus};
-use zcash_pool_migration_backend::wallet::WalletMigrationProver;
+#[cfg(test)]
+use zcash_pool_migration::engine::PoolMigrationWrite;
+use zcash_pool_migration::engine::{
+    self, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction, MigrationTxId,
+    MigrationTxKind, MigrationTxState, PoolMigrationRead,
+};
+use zcash_pool_migration::state::{Blocker, NextAction, TransactionStatus};
+use zcash_pool_migration::wallet::{
+    ActiveOrchardLock, PcztLockValidationSource, WalletMigrationProver,
+};
 
-use crate::migration_engine::{Backend, MigrationWallet};
+use crate::migration_engine::{Backend, MigrationWallet, SuccessorCandidateBackend};
 use crate::migration_finalize;
 use crate::migration_plan_cache;
 use crate::{
-    NETWORK_ID_MAINNET, NETWORK_ID_TESTNET, NetworkParams, account_uuid_from_bytes, ffi,
-    free_ptr_from_vec, free_ptr_from_vec_with, parse_network, ptr_from_vec, unwrap_exc_or,
+    NETWORK_ID_MAINNET, NETWORK_ID_TESTNET, NetworkParams, account_uuid_from_bytes, decode_usk,
+    ffi, free_ptr_from_vec, free_ptr_from_vec_with, parse_network, ptr_from_vec, unwrap_exc_or,
     unwrap_exc_or_null, zcashlc_string_free,
 };
 
@@ -85,6 +112,8 @@ use crate::{
 const PLAN_STALE_PREFIX: &str = "MIGRATION_PLAN_STALE";
 /// The stable prefix the Swift layer maps to `ZcashError.migrationProvingUnavailable` (ZRUST0127).
 const PROVING_UNAVAILABLE_PREFIX: &str = "MIGRATION_PROVING_UNAVAILABLE";
+
+type UnsignedMigrationPczts = Vec<(MigrationTxId, Vec<u8>)>;
 
 /// A commit was requested without a matching previewed plan (process restart between propose and
 /// confirm, or the wallet changed underneath the preview). The platform re-proposes.
@@ -97,6 +126,12 @@ fn plan_stale(detail: &str) -> anyhow::Error {
 /// the prove dispatch classifies prover failures onto the two lanes.
 pub(crate) fn proving_unavailable(detail: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("{PROVING_UNAVAILABLE_PREFIX}: {detail}")
+}
+
+fn legacy_delivery_api_disabled(api: &str) -> anyhow::Error {
+    anyhow!(
+        "{api} is disabled because it lacks a Rust-owned delivery capability; use the migration delivery v1 handle API"
+    )
 }
 
 /// A spendable-value amount as a signed 64-bit integer (zatoshi). Every migration amount is a
@@ -130,20 +165,6 @@ unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
     }
 }
 
-/// Decode a decimal transaction-id string (`MigrationTxId` raw value) from a C string.
-fn transfer_id_from_c(id: *const c_char) -> anyhow::Result<MigrationTxId> {
-    if id.is_null() {
-        return Err(anyhow!("transfer_id is null"));
-    }
-    let raw = unsafe { CStr::from_ptr(id) }
-        .to_str()
-        .map_err(|e| anyhow!("transfer id is not valid UTF-8: {e}"))?;
-    let idx: u32 = raw
-        .parse()
-        .map_err(|e| anyhow!("invalid transfer id {raw}: {e}"))?;
-    Ok(MigrationTxId::new(idx))
-}
-
 /// The engine's target height for a given chain tip: `tip + 1`, the height of the next block.
 /// Every [`MigrationState`] query (`next_provable`, `next_broadcastable`, `expired_transactions`)
 /// is defined over this height, never the raw tip — see [`CallCtx::target`], the primary way
@@ -168,7 +189,7 @@ struct CallCtx {
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
 /// drops it at the end (no persistent handle). The engine's store tables are created by the wallet
 /// schema migrations during `init_data_db` (`zcash_client_sqlite::pool_migration` registers them);
-/// only the SDK's own side tables are ensured idempotently here.
+/// no SDK-owned migration side tables are created here.
 ///
 /// # Safety
 /// - `db_data` must be valid for reads of `db_data_len` bytes and encode a filesystem path.
@@ -183,13 +204,9 @@ unsafe fn open(
     let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
-    let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network.clone())? };
+    let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network)? };
     let store_conn = Connection::open(&db_path)
         .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
-    init_invalid_marks(&store_conn)
-        .map_err(|e| anyhow!("Error initializing migration marks table: {e}"))?;
-    init_immediate_runs(&store_conn)
-        .map_err(|e| anyhow!("Error initializing immediate-run table: {e}"))?;
     let account = account_uuid_from_bytes(account_uuid_bytes)
         .map_err(|e| anyhow!("account uuid must be 16 bytes: {e}"))?;
     let account_bytes = *account.expose_uuid().as_bytes();
@@ -225,221 +242,51 @@ impl CallCtx {
     }
 }
 
-// ----- SDK-owned invalid-transfer marks -----
-//
-// The engine has no failure states: a rejected broadcast leaves the transaction `Signed`/`Proved`
-// and re-offered. The platform's rejection classifier distinguishes terminal rejections
-// (invalid-note, expired) from retryable ones; the terminal ones are recorded here so
-// `zcashlc_migration_has_invalid_transfers` / the `RequiresAttention` derivation can surface
-// them. Cleared when the run is cancelled (`zcashlc_migration_restart_step`).
-
-fn init_invalid_marks(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS sdk_invalid_marks (
-            account_uuid BLOB NOT NULL,
-            tx_id INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            PRIMARY KEY (account_uuid, tx_id)
-        )",
-    )
-}
-
-fn insert_invalid_mark(
-    conn: &Connection,
-    account: &[u8; 16],
-    id: MigrationTxId,
-    reason: &str,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO sdk_invalid_marks (account_uuid, tx_id, reason) VALUES (?1, ?2, ?3)
-         ON CONFLICT(account_uuid, tx_id) DO UPDATE SET reason = excluded.reason",
-        rusqlite::params![&account[..], u32::from(id), reason],
-    )?;
-    Ok(())
-}
-
-fn invalid_marks(conn: &Connection, account: &[u8; 16]) -> rusqlite::Result<Vec<u32>> {
-    let mut stmt =
-        conn.prepare("SELECT tx_id FROM sdk_invalid_marks WHERE account_uuid = ?1 ORDER BY tx_id")?;
-    let rows = stmt.query_map(rusqlite::params![&account[..]], |row| row.get::<_, u32>(0))?;
-    rows.collect()
-}
-
-fn clear_invalid_marks(conn: &Connection, account: &[u8; 16]) -> rusqlite::Result<()> {
-    conn.execute(
-        "DELETE FROM sdk_invalid_marks WHERE account_uuid = ?1",
-        rusqlite::params![&account[..]],
-    )?;
-    Ok(())
-}
-
-// ----- SDK-owned immediate-migration-run record -----
-//
-// The immediate lane (an ordinary send-max sweep to the account's own unified address, built
-// entirely outside the engine — see `zcashlc_propose_send_max_transfer`) has no engine-tracked
-// plan, preparation, or schedule at all: from the engine's point of view nothing happened. This
-// one-row-per-account table is the SDK's own record that a sweep was broadcast, so `derive_state`
-// can still report its progress the way an engine-tracked transfer would: the stored txid is
-// resolved against the wallet database's own transaction history by `resolve_immediate_run`
-// (mined -> `Complete`, unmined -> `InProgress`) — the same kind of wallet-DB access
-// `reconcile_mined` uses to advance an engine-tracked transaction from `Broadcast` to `Mined`, here
-// extended to also read the expiry height that `WalletRead` does not expose on its own. See the
-// precedence rule documented on `derive_state` for how this interacts with an engine-tracked run.
-
-fn init_immediate_runs(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS sdk_immediate_runs (
-            account_uuid BLOB NOT NULL PRIMARY KEY,
-            txid BLOB NOT NULL,
-            recorded_at_height INTEGER NOT NULL
-        )",
-    )
-}
-
-/// One stored immediate-run record: the account's swept txid and the wallet's tip height at
-/// record time (the fallback expiry bound `derive_state` uses when the wallet database does not
-/// know, or no longer knows, the transaction's real expiry height).
-struct ImmediateRunRow {
-    txid: [u8; 32],
-    recorded_at_height: BlockHeight,
-}
-
-/// Persists the account's immediate-run record, replacing any previous one: only the most
-/// recently broadcast immediate sweep is ever tracked (one row per account).
-fn record_immediate_run(
-    conn: &Connection,
-    account: &[u8; 16],
-    txid: [u8; 32],
-    recorded_at_height: BlockHeight,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO sdk_immediate_runs (account_uuid, txid, recorded_at_height)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![&account[..], &txid[..], u32::from(recorded_at_height)],
-    )?;
-    Ok(())
-}
-
-/// The account's raw immediate-run row, if any. Cheap (touches only this SDK-owned table), so
-/// callers can check for a row's existence before paying for a wallet-database chain-tip lookup
-/// (which errors on a not-yet-synced wallet — see the callers in `zcashlc_migration_state` /
-/// `zcashlc_migration_progress`).
-fn immediate_run_row(
-    conn: &Connection,
-    account: &[u8; 16],
-) -> rusqlite::Result<Option<ImmediateRunRow>> {
-    conn.query_row(
-        "SELECT txid, recorded_at_height FROM sdk_immediate_runs WHERE account_uuid = ?1",
-        rusqlite::params![&account[..]],
-        |row| {
-            Ok(ImmediateRunRow {
-                txid: row.get(0)?,
-                recorded_at_height: BlockHeight::from(row.get::<_, u32>(1)?),
-            })
-        },
-    )
-    .optional()
-}
-
-/// Resolves an immediate-run row against the wallet database's own `transactions` table: the same
-/// underlying table [`reconcile_mined`] reads (via `WalletRead::get_tx_height`) to advance
-/// engine-tracked transactions from `Broadcast` to `Mined`, queried directly here because
-/// `WalletRead` does not expose the expiry height the immediate-run derivation also needs. A
-/// mined height beyond the current tip is filtered out (a stale/optimistic row), mirroring
-/// `zcash_client_sqlite::wallet::get_tx_height`'s own guard; an `expiry_height` of exactly zero
-/// (the wire convention for "no real expiry") is treated the same as a missing one, so it falls
-/// back to the recorded-height bound below rather than reading as "expired since block zero".
-fn resolve_immediate_run(
-    conn: &Connection,
-    row: ImmediateRunRow,
-    tip: BlockHeight,
-) -> rusqlite::Result<ImmediateRunLookup> {
-    let found = conn
-        .query_row(
-            "SELECT mined_height, expiry_height FROM transactions WHERE txid = ?1",
-            rusqlite::params![&row.txid[..]],
-            |r| {
-                let mined: Option<u32> = r.get(0)?;
-                let expiry: Option<u32> = r.get(1)?;
-                Ok((mined.map(BlockHeight::from), expiry.map(BlockHeight::from)))
-            },
-        )
-        .optional()?;
-    let (mined_height, expiry_height) = found.unwrap_or((None, None));
-    Ok(ImmediateRunLookup {
-        recorded_at_height: row.recorded_at_height,
-        mined_height: mined_height.filter(|h| *h <= tip),
-        expiry_height: expiry_height.filter(|h| u32::from(*h) > 0),
-    })
-}
-
 // ----- reconciliation, planning, committing -----
 
-/// Marks as mined every `Broadcast` transaction whose txid the wallet has since observed on-chain,
-/// persisting once if anything changed, and returns the freshest state (or `None` when no
-/// migration is stored). This is the v1 crate's internal reconciliation, now SDK-owned: it is the
-/// only way transactions advance `Broadcast -> Mined` (and therefore the only way a run reaches
-/// `Complete`).
-fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> {
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-    let Some(mut state) = backend.get_migration()? else {
-        return Ok(None);
-    };
-    if state.is_terminal() {
-        return Ok(Some(state));
-    }
-    let broadcast: Vec<(MigrationTxId, [u8; 32])> = state
-        .transactions()
-        .iter()
-        .filter_map(|t| match t.state() {
-            MigrationTxState::Broadcast { .. } => {
-                t.state().broadcast_txid().map(|txid| (t.id(), txid))
-            }
-            _ => None,
-        })
-        .collect();
-    let mut changed = false;
-    for (id, txid) in broadcast {
-        if let Some(height) = ctx
-            .wallet
-            .get_tx_height(TxId::from_bytes(txid))
-            .map_err(|e| anyhow!("mined-height lookup failed: {e}"))?
-        {
-            state.mark_mined(id, height);
-            changed = true;
-        }
-    }
-    if changed {
-        backend.replace_migration(&state)?;
-    }
-    Ok(Some(state))
+/// Reads canonical scheduled state for legacy projections without mutating delivery-owned state.
+///
+/// Historical SDK reads reconciled mined rows here through a generic whole-state replacement. A
+/// delivery run makes that an authority bypass: chain reconciliation now requires the opaque run
+/// capability and [`zcashlc_migration_reconcile_canonical_chain_v1`], whose store CAS owns both
+/// canonical lifecycle and delivery evidence. Legacy projections therefore see the latest already
+/// reconciled state and never write as a side effect of reading.
+fn read_canonical_migration(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> {
+    scheduled_store(ctx)?
+        .get_migration()
+        .map_err(|e| anyhow!("reading canonical migration state failed: {e}"))
 }
 
-/// Computes a fresh preview plan against the account's live balance and caches it (a later commit
-/// signs exactly this plan, not an independently re-randomized one).
-///
-/// Returns the plan alongside the SAME reference height that got cached with it — every caller
-/// that encodes a schedule from this plan must reuse THIS height rather than reading `ctx.tip()`
-/// again: a block landing between an internal re-read and the cached value can flip an hour
-/// bucket and make an honest pre-commit echo fail with `MIGRATION_PLAN_STALE`.
+/// Computes a fresh preview plan against the account's live balance and caches it under a fresh
+/// opaque [`migration_plan_cache::PlanHandle`]. A later commit passes that handle back and uses
+/// exactly this plan, not an independently re-randomized one.
 ///
 /// Returns `Ok(None)` when there is nothing to migrate (the balance is zero, or entirely below the
 /// dust floor) — the "ask rust whether anything remains" answer after a completed run.
-fn plan_and_cache(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, BlockHeight)>> {
+fn plan_and_cache(
+    ctx: &mut CallCtx,
+) -> anyhow::Result<Option<(MigrationPlan, BlockHeight, migration_plan_cache::PlanHandle)>> {
+    match compute_plan(ctx)? {
+        Some((plan, reference_height)) => {
+            let handle =
+                migration_plan_cache::set(ctx.db_path.clone(), ctx.account_bytes, plan.clone());
+            Ok(Some((plan, reference_height, handle)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Computes a fresh preview plan without caching it. Pure queries use this path so they cannot
+/// silently supersede the handle of a proposal the user is currently reviewing.
+fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, BlockHeight)>> {
     let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
     let mut rng = OsRng;
     match engine::plan_migration(&ctx.network, &backend, &mut rng) {
         Ok(plan) => {
             // `plan_migration` itself just resolved the tip internally (`chain_tip_height`) to
             // plan against, so this can't newly fail here; it just makes the same value available
-            // to cache alongside the plan and to every caller that encodes from it.
+            // to every caller that encodes from it.
             let reference_height = ctx.tip()?;
-            migration_plan_cache::set(
-                ctx.db_path.clone(),
-                ctx.account_bytes,
-                plan.clone(),
-                reference_height,
-            );
             Ok(Some((plan, reference_height)))
         }
         Err(engine::MigrationError::NothingToMigrate) => Ok(None),
@@ -464,7 +311,7 @@ fn plan_and_cache(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bl
 ///   funding-note order differ from broadcast order.
 fn schedule_rows(
     crossing_values: &[Zatoshis],
-    schedule: &[zcash_pool_migration_backend::scheduling::Schedule],
+    schedule: &[zcash_pool_migration::scheduling::Schedule],
     prep_tx_count: u32,
 ) -> anyhow::Result<Vec<(MigrationTxId, Zatoshis, BlockHeight, BlockHeight)>> {
     if crossing_values.len() != schedule.len() {
@@ -524,6 +371,7 @@ fn prep_tx_count(plan: &MigrationPlan) -> u32 {
 fn encode_schedule_from_plan(
     plan: &MigrationPlan,
     now_reference: BlockHeight,
+    plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
     let rows = schedule_rows(
         plan.note_split().crossing_values(),
@@ -551,6 +399,7 @@ fn encode_schedule_from_plan(
         transfers,
         transfers_len,
         estimated_duration_hours: estimated,
+        proposal_handle: plan_handle,
     })))
 }
 
@@ -561,363 +410,25 @@ fn encode_empty_schedule() -> *mut FfiMigrationSchedule {
         transfers: ptr::null_mut(),
         transfers_len: 0,
         estimated_duration_hours: 0,
+        proposal_handle: 0,
     }))
-}
-
-// ----- verified consent echoes (F4) -----
-//
-// `zcashlc_migration_sign_and_store_schedule` and `zcashlc_migration_create_unsigned_transfer_pczts`
-// take back the transfer schedule the platform displayed and got the user's consent for — the same
-// shape `zcashlc_migration_propose_transfers`/`_immediate_transfers` returned. These are verified
-// consent echoes: the values the user approved must match what is about to be signed, or the call
-// fails with the `MIGRATION_PLAN_STALE:` prefix (the app's existing recovery — re-propose/re-read
-// and re-display — reused rather than adding a new error route).
-
-/// One transfer's consent-echo fields, checked against the CACHED preview plan (before commit —
-/// see [`validate_schedule_echo_against_cache`]). `anchor_height` is deliberately excluded from
-/// this comparison: it is a display-only "now" reference at encode time (see
-/// `FfiTransferProposal::anchor_height`'s doc — "callers must not treat it as one"), not a value
-/// any transaction commits to, and the stored (post-commit) state has no durable record of it to
-/// compare against. For the POST-COMMIT comparison against stored state, see [`StoredEchoRow`],
-/// which additionally excludes `next_executable_after_height`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct EchoRow {
-    id: u32,
-    amount: i64,
-    next_executable_after_height: i64,
-    expiry_height: i64,
-}
-
-/// One transfer's consent-echo fields, checked against the STORED (post-commit) migration state
-/// (see [`validate_schedule_echo_against_state`]). Unlike [`EchoRow`], `next_executable_after_height`
-/// is absent here — not just unchecked, structurally not part of the comparison — because a
-/// stored transfer's scheduled height can legitimately move after the platform captured its
-/// display copy: `zcashlc_migration_refresh_stale_transfers` rebuilds an expired transfer with a
-/// FRESH scheduled height drawn from the current tip (the whole point of the rebuild). An honest,
-/// unmodified echo of what the platform last displayed would then mismatch the stored state on
-/// this field alone — and unlike a genuinely stale plan, re-proposing can never converge here:
-/// the STORED value is already fixed by the committed run, and re-proposing never re-touches it.
-/// So comparing this field post-commit would surface `MIGRATION_PLAN_STALE` on a correct echo
-/// with no recovery path, which is worse than not checking it (the refresh call returns the
-/// fresh schedule precisely so the platform can re-display and re-echo it). `ids`/`amounts`/
-/// `expiry_heights` are pinned at commit and never silently rewritten under an unchanged run.
-///
-/// `estimated_duration_hours` (returned alongside these rows, not a field of this struct — see
-/// [`expected_rows_from_state`]) has the SAME problem since #1806 and is excluded from the
-/// STATE-side comparison for the same reason: measured as `max(scheduled) - now` (see
-/// [`stored_duration_hours`]), it is derived, serve-time-relative DISPLAY metadata, not a value an
-/// honest echo can be expected to reproduce exactly — the `now` behind whatever value the platform
-/// is echoing back can differ (in either direction) from `now` at validation time, and unlike
-/// [`expected_rows_from_cached_plan`]'s PRE-commit path (where `cached.reference_height` survives
-/// to reproduce the original value byte-for-byte, so duration is still checked there exactly — see
-/// [`schedule_echo_matches`]'s `_detects_wrong_duration` test), there is no reference height
-/// surviving a commit to reconstruct here. The consent-stable surface once a run is stored is
-/// `ids`/`amounts`/`expiry_heights`; display-drift detection on duration stays at the pre-commit
-/// consent moment, where a stable reference actually exists to detect it against.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct StoredEchoRow {
-    id: u32,
-    amount: i64,
-    expiry_height: i64,
-}
-
-/// The consent-echo rows and duration `zcashlc_migration_propose_transfers` returned for the
-/// cached plan, reconstructed byte-for-byte from the cache: the plan is deterministic — ids,
-/// net amounts, drawn broadcast heights, and expiries never move between propose and commit for
-/// the scheduled lane, so no row-level tip re-read is involved. (The immediate lane is an
-/// ordinary send-max sweep outside the engine and never touches the plan cache — see the module
-/// doc.) The duration is, since #1806, measured from `cached.reference_height` (the ORIGINAL
-/// propose-time `now`, see [`estimated_duration_hours`]) rather than a freshly re-read tip: it is
-/// exactly what `encode_schedule_from_plan` used to compute the value this call reproduces, byte
-/// for byte. This PRE-commit path is also, since #1806, the ONLY place
-/// `estimated_duration_hours` is still checked as a verified consent echo — see
-/// [`StoredEchoRow`]'s doc for why the POST-commit (STORED-state) path deliberately excludes it
-/// instead of re-deriving a value that could disagree here.
-fn expected_rows_from_cached_plan(
-    cached: &migration_plan_cache::CachedPlan,
-) -> anyhow::Result<(Vec<EchoRow>, u32)> {
-    let rows = schedule_rows(
-        cached.plan.note_split().crossing_values(),
-        cached.plan.schedule(),
-        prep_tx_count(&cached.plan),
-    )?;
-    let duration = estimated_duration_hours(
-        cached.plan.schedule().iter().map(|e| e.broadcast_height()),
-        cached.reference_height,
-    );
-    let rows = rows
-        .into_iter()
-        .map(|(id, amount, broadcast, expiry)| EchoRow {
-            id: u32::from(id),
-            amount: zat_to_i64(amount),
-            next_executable_after_height: i64::from(u32::from(broadcast)),
-            expiry_height: i64::from(u32::from(expiry)),
-        })
-        .collect();
-    Ok((rows, duration))
-}
-
-/// The stored run's TRANSFER subset, in engine order.
-fn stored_transfers(state: &MigrationState) -> Vec<&MigrationTransaction> {
-    state
-        .transactions()
-        .iter()
-        .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }))
-        .collect()
-}
-
-/// The schedule-duration estimate derived from STORED transfer rows, in hours, measured from
-/// `now` to the LATEST stored `scheduled_height` — the state-side counterpart of
-/// [`estimated_duration_hours`], used by the state-encoded schedule DTO
-/// ([`encode_schedule_from_state`]) to compute the value the platform displays. NOT used by the
-/// consent-echo expectation ([`expected_rows_from_state`]) — see [`StoredEchoRow`]'s doc for why
-/// duration is excluded from that comparison entirely, post-#1806. Empty, or every height
-/// at/behind `now`, is `0` (saturating, never underflows).
-fn stored_duration_hours(transfers: &[&MigrationTransaction], now: BlockHeight) -> u32 {
-    let now = u32::from(now);
-    transfers
-        .iter()
-        .map(|t| u32::from(t.scheduled_height()))
-        .max()
-        .map_or(0, |max| max.saturating_sub(now) / BLOCKS_PER_HOUR)
-}
-
-/// The consent-echo rows for the stored run's TRANSFER subset — the values a commit call
-/// validates the platform's echo against once a run is committed (there is no cache to consult
-/// post-commit; this is ALWAYS the ground truth of what is about to be signed, whether the run
-/// was just now committed fresh or is being resumed). Returns [`StoredEchoRow`]s (no
-/// `next_executable_after_height`, and no duration — see [`StoredEchoRow`]'s doc for why both are
-/// excluded from this comparison entirely).
-fn expected_rows_from_state(state: &MigrationState) -> Vec<StoredEchoRow> {
-    let transfers = stored_transfers(state);
-    transfers
-        .iter()
-        .filter_map(|t| {
-            transfer_amount(state, t).map(|amount| StoredEchoRow {
-                id: u32::from(t.id()),
-                amount: zat_to_i64(amount),
-                expiry_height: i64::from(u32::from(t.expiry_height())),
-            })
-        })
-        .collect()
-}
-
-/// Marshal the STORED run's full transfer subset into the platform's schedule DTO — the
-/// post-commit counterpart of [`encode_schedule_from_plan`], read from persisted state instead of
-/// a previewed plan. Every transfer of the run is included (mined ones too: the state-side
-/// consent echo, [`validate_schedule_echo_against_state`], compares the FULL subset, and this DTO
-/// is what the host re-displays and later echoes), sorted chronologically by stored scheduled
-/// height; `anchor_height` carries the same display-only "now" reference as the plan-side
-/// encoding, and the duration is derived from `now_reference` and the stored scheduled heights via
-/// [`stored_duration_hours`] — re-serving later naturally reports a smaller duration; that is
-/// intended (see [`stored_duration_hours`]'s doc). `estimated_duration_hours` is display-only here:
-/// the consent-echo validation this DTO is later checked against does NOT re-derive or compare it
-/// (see [`StoredEchoRow`]'s doc for why).
-fn encode_schedule_from_state(
-    state: &MigrationState,
-    now_reference: BlockHeight,
-) -> anyhow::Result<*mut FfiMigrationSchedule> {
-    let mut transfers = stored_transfers(state);
-    let estimated = stored_duration_hours(&transfers, now_reference);
-    transfers.sort_by_key(|t| t.scheduled_height());
-    let rows = transfers
-        .into_iter()
-        .map(|t| {
-            let amount = transfer_amount(state, t)
-                .ok_or_else(|| anyhow!("stored transfer has no funding-note amount"))?;
-            Ok(FfiTransferProposal {
-                id: cstring_raw(&u32::from(t.id()).to_string(), "transfer proposal id")?,
-                amount: zat_to_i64(amount),
-                anchor_height: i64::from(u32::from(now_reference)),
-                next_executable_after_height: i64::from(u32::from(t.scheduled_height())),
-                expiry_height: i64::from(u32::from(t.expiry_height())),
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let (transfers, transfers_len) = ptr_from_vec(rows);
-    Ok(Box::into_raw(Box::new(FfiMigrationSchedule {
-        transfers,
-        transfers_len,
-        estimated_duration_hours: estimated,
-    })))
-}
-
-/// Decode the platform's parallel echo arrays into [`EchoRow`]s (the CACHE-side shape, including
-/// `next_executable_after_height`). A decode failure (e.g. a non-UTF8 or non-numeric id string)
-/// propagates as a plain error — a malformed echo, not a semantic mismatch, so it is deliberately
-/// NOT routed through the `MIGRATION_PLAN_STALE` prefix.
-fn decode_echo_rows(
-    ids: &[*const c_char],
-    amounts: &[i64],
-    next_executable_after_heights: &[i64],
-    expiry_heights: &[i64],
-) -> anyhow::Result<Vec<EchoRow>> {
-    ids.iter()
-        .enumerate()
-        .map(|(i, &id_ptr)| {
-            Ok(EchoRow {
-                id: u32::from(transfer_id_from_c(id_ptr)?),
-                amount: amounts[i],
-                next_executable_after_height: next_executable_after_heights[i],
-                expiry_height: expiry_heights[i],
-            })
-        })
-        .collect()
-}
-
-/// Decode the platform's parallel echo arrays into [`StoredEchoRow`]s (the STORED-state shape —
-/// no `next_executable_after_height`; see its doc). Same decode-failure handling as
-/// [`decode_echo_rows`].
-fn decode_stored_echo_rows(
-    ids: &[*const c_char],
-    amounts: &[i64],
-    expiry_heights: &[i64],
-) -> anyhow::Result<Vec<StoredEchoRow>> {
-    ids.iter()
-        .enumerate()
-        .map(|(i, &id_ptr)| {
-            Ok(StoredEchoRow {
-                id: u32::from(transfer_id_from_c(id_ptr)?),
-                amount: amounts[i],
-                expiry_height: expiry_heights[i],
-            })
-        })
-        .collect()
-}
-
-/// Whether the platform's echoed transfer-schedule consent values match `expected`,
-/// order-independent (both sides are sorted by id — the platform's own display order never
-/// matters here). CACHE-side (see [`EchoRow`]).
-fn schedule_echo_matches(
-    mut expected: Vec<EchoRow>,
-    expected_duration_hours: u32,
-    mut got: Vec<EchoRow>,
-    estimated_duration_hours: u32,
-) -> bool {
-    expected.sort();
-    got.sort();
-    expected == got && expected_duration_hours == estimated_duration_hours
-}
-
-/// Whether the platform's echoed transfer-schedule consent values match `expected`,
-/// order-independent. STORED-state side (see [`StoredEchoRow`] — neither
-/// `next_executable_after_height` nor a duration is part of either side's row, by construction:
-/// see [`StoredEchoRow`]'s doc for why both are excluded from the STATE-side comparison).
-fn stored_schedule_echo_matches(
-    mut expected: Vec<StoredEchoRow>,
-    mut got: Vec<StoredEchoRow>,
-) -> bool {
-    expected.sort();
-    got.sort();
-    expected == got
-}
-
-/// Whether the platform's echoed note-split consent values (`zcashlc_migration_sign_note_split`'s
-/// `output_values`/`fee`) match the previewed plan's note split: the output values
-/// order-independent (the platform may display them in any order), the fee exactly.
-fn note_split_echo_matches(
-    expected_outputs: &[i64],
-    expected_fee: i64,
-    mut got_outputs: Vec<i64>,
-    got_fee: i64,
-) -> bool {
-    let mut expected_outputs = expected_outputs.to_vec();
-    expected_outputs.sort_unstable();
-    got_outputs.sort_unstable();
-    expected_outputs == got_outputs && expected_fee == got_fee
-}
-
-/// Validates the platform's echoed transfer-schedule values against the plan cached for this
-/// account — the values `zcashlc_migration_propose_transfers`/`_immediate_transfers` returned.
-/// `Ok(())` when nothing is cached: that is the resume case (a run is already stored, so there is
-/// nothing "about to commit" to check the echo against here); `commit_or_resume`'s own cache
-/// lookup handles the "neither a cache nor a stored run" case.
-#[allow(clippy::too_many_arguments)]
-fn validate_schedule_echo_against_cache(
-    db_path: &PathBuf,
-    account_bytes: [u8; 16],
-    ids: &[*const c_char],
-    amounts: &[i64],
-    next_executable_after_heights: &[i64],
-    expiry_heights: &[i64],
-    estimated_duration_hours: u32,
-) -> anyhow::Result<()> {
-    let Some(cached) = migration_plan_cache::get(db_path, account_bytes) else {
-        return Ok(());
-    };
-    let (expected, expected_duration) = expected_rows_from_cached_plan(&cached)?;
-    if ids.len() != expected.len() {
-        return Err(plan_stale(&format!(
-            "the echoed schedule has {} transfer(s) but the previewed plan has {} — propose again",
-            ids.len(),
-            expected.len()
-        )));
-    }
-    let got = decode_echo_rows(ids, amounts, next_executable_after_heights, expiry_heights)?;
-    if !schedule_echo_matches(expected, expected_duration, got, estimated_duration_hours) {
-        return Err(plan_stale(
-            "the echoed schedule does not match the previewed plan — propose again",
-        ));
-    }
-    Ok(())
-}
-
-/// Validates the platform's echoed transfer-schedule values against the run's STORED, already
-/// committed transfer subset — the source of truth once a run exists (there is no cache to consult
-/// post-commit). Two of the five echoed values are accepted but deliberately NOT compared here —
-/// see [`StoredEchoRow`]'s doc for why both are structurally excluded, not just unchecked:
-/// - `next_executable_after_heights`: the immediate lane's commit-time reschedule can legitimately
-///   move this value away from what the platform honestly previewed and is echoing back, and
-///   unlike an actually stale plan there is no way to converge on a match by re-proposing (the
-///   stored value is already fixed by the completed commit).
-/// - `estimated_duration_hours` (#1806): post-fix it is derived, serve-time-relative display
-///   metadata (`max(scheduled) - now`), not a value with a stable pre-commit reference surviving
-///   here to reproduce byte-for-byte the way [`expected_rows_from_cached_plan`]'s cached
-///   `reference_height` still does PRE-commit.
-///
-/// `ids`/`amounts`/`expiry_heights` are still checked exactly — the consent-stable surface once a
-/// run is stored.
-fn validate_schedule_echo_against_state(
-    state: &MigrationState,
-    ids: &[*const c_char],
-    amounts: &[i64],
-    next_executable_after_heights: &[i64],
-    expiry_heights: &[i64],
-    estimated_duration_hours: u32,
-) -> anyhow::Result<()> {
-    let _ = next_executable_after_heights;
-    let _ = estimated_duration_hours;
-    let expected = expected_rows_from_state(state);
-    if ids.len() != expected.len() {
-        return Err(plan_stale(&format!(
-            "the echoed schedule has {} transfer(s) but the committed migration has {} — \
-             re-read the current state",
-            ids.len(),
-            expected.len()
-        )));
-    }
-    let got = decode_stored_echo_rows(ids, amounts, expiry_heights)?;
-    if !stored_schedule_echo_matches(expected, got) {
-        return Err(plan_stale(
-            "the echoed schedule does not match the committed migration — re-read the current state",
-        ));
-    }
-    Ok(())
 }
 
 /// Returns the already-committed migration state if a non-terminal one exists (resume — never
 /// rebuild over pre-signed, possibly broadcast transactions), otherwise commits the plan cached by
 /// the most recent propose/prepare call: `sign` picks the `commit_preparation` /
-/// `build_preparation_unsigned` variant. A terminal stored run (a completed or cancelled previous
-/// migration) is REPLACED — that is the sequential-runs path.
+/// `build_preparation_unsigned` variant. A terminal stored run is never replaced here: sequential
+/// runs require an opaque predecessor capability and the typed atomic reservation-rollover API.
 ///
-/// `validate_amounts`: the platform-echoed transfer amounts to check against the cached plan
-/// (`None` skips validation — the Keystone build path has no echo).
+/// `plan_handle` identifies the exact cached plan the platform reviewed. A fresh commit fails
+/// closed when it is missing or superseded. Resuming a non-terminal stored run does not consult
+/// the handle because the durable run is already handle-verified state.
 fn commit_or_resume(
     ctx: &mut CallCtx,
     usk: Option<zcash_keys::keys::UnifiedSpendingKey>,
     unsigned_out: bool,
-) -> anyhow::Result<(MigrationState, Vec<(MigrationTxId, Vec<u8>)>)> {
+    plan_handle: migration_plan_cache::PlanHandle,
+) -> anyhow::Result<(MigrationState, UnsignedMigrationPczts)> {
     {
         let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         if let Some(state) = backend.get_migration()? {
@@ -930,11 +441,14 @@ fn commit_or_resume(
                     .collect();
                 return Ok((state, unsigned));
             }
+            return Err(anyhow!(
+                "a terminal migration can only be replaced through the successor-rollover v1 API"
+            ));
         }
     }
 
-    let cached = migration_plan_cache::get(&ctx.db_path, ctx.account_bytes)
-        .ok_or_else(|| plan_stale("no previewed migration plan for this account"))?;
+    let cached = migration_plan_cache::get(&ctx.db_path, ctx.account_bytes, plan_handle)
+        .map_err(|e| plan_stale(&e.to_string()))?;
 
     let target = ctx.target()?;
     let mut rng = OsRng;
@@ -963,6 +477,93 @@ fn commit_or_resume(
     Ok((state, unsigned))
 }
 
+/// Builds and atomically installs one post-terminal scheduled successor.
+///
+/// The upstream engine writes only to [`SuccessorCandidateBackend`]'s in-memory sink. The exact
+/// predecessor state and opaque run/source-owner authority, successor state, bound policy, and
+/// retained predecessor evidence reach durable storage together through `ReservationRollover`.
+/// The cached plan is cleared only after that CAS commits.
+fn rollover_scheduled_successor(
+    ctx: &mut CallCtx,
+    predecessor: &FfiMigrationRunHandle,
+    cached: &migration_plan_cache::CachedPlan,
+    usk: Option<zcash_keys::keys::UnifiedSpendingKey>,
+    external_signer: bool,
+) -> anyhow::Result<DeliverySnapshot> {
+    let policy = policy_from_run_handle(&ctx.network, predecessor)?;
+    let (predecessor_state, delivery) = {
+        let mut store = scheduled_store(ctx)?;
+        let state = scheduled_state(&store)?;
+        let delivery = store
+            .delivery_snapshot()
+            .map_err(|e| anyhow!("reading rollover predecessor delivery failed: {e}"))?
+            .ok_or_else(|| anyhow!("terminal rollover predecessor has no delivery run"))?;
+        (state, delivery)
+    };
+    if !predecessor_state.is_terminal() {
+        return Err(anyhow!(
+            "successor rollover requires a terminal canonical predecessor"
+        ));
+    }
+    if delivery.lane() != DeliveryLane::Scheduled
+        || delivery.revision() != predecessor.revision
+        || delivery.run_identity() != predecessor.run_identity
+        || delivery.source_reservation_owner() != predecessor.source_reservation_owner
+        || delivery
+            .submission_policy()
+            .map(SubmissionPolicy::fingerprint)
+            != predecessor.policy_fingerprint
+    {
+        return Err(anyhow!(
+            "the successor-rollover handle is stale or does not own the current predecessor"
+        ));
+    }
+
+    let target = ctx.target()?;
+    let successor = {
+        let mut backend = SuccessorCandidateBackend::new(
+            &ctx.wallet,
+            ctx.account,
+            usk,
+            &mut ctx.store_conn,
+            &predecessor_state,
+        )?;
+        let mut rng = OsRng;
+        if external_signer {
+            let (state, _unsigned_not_exposed) = engine::build_preparation_unsigned(
+                &ctx.network,
+                target,
+                &mut backend,
+                &cached.plan,
+                &mut rng,
+            )
+            .map_err(map_commit_err)?;
+            state
+        } else {
+            engine::commit_preparation(&ctx.network, target, &mut backend, &cached.plan, &mut rng)
+                .map_err(map_commit_err)?
+        }
+    };
+
+    let rollover = ReservationRollover::replace_terminal(
+        predecessor.revision,
+        predecessor.run_identity,
+        predecessor.source_reservation_owner,
+        &predecessor_state,
+        successor,
+    )
+    .map_err(|e| anyhow!("invalid terminal migration successor: {e:?}"))?;
+    let receipt = MigrationRuntimeStore::rollover_source_reservations(
+        &mut ctx.wallet,
+        &ctx.account,
+        rollover,
+        &policy,
+    )
+    .map_err(|e| anyhow!("committing migration successor rollover failed: {e}"))?;
+    migration_plan_cache::clear(&ctx.db_path, ctx.account_bytes);
+    Ok(receipt.successor().clone())
+}
+
 /// Map a commit error, routing `StalePlan` through the stable plan-stale prefix (the actionable
 /// "re-propose" signal).
 fn map_commit_err(e: engine::CommitError<anyhow::Error>) -> anyhow::Error {
@@ -977,142 +578,31 @@ fn map_commit_err(e: engine::CommitError<anyhow::Error>) -> anyhow::Error {
 /// Map a rebuild-on-expiry error. `FundingNoteUnavailable` gets the actionable message: the
 /// expired transfer's EXACT funding note (matched by nullifier identity — the engine deliberately
 /// never substitutes an equal-value note, which could be a sibling transfer's) was spent outside
-/// the migration, so the remaining balance must be re-planned via the restart lane. Everything
-/// else is a hard error carrying the engine's detail.
+/// the migration, so the caller must use the typed two-phase abandonment flow before re-proposing
+/// and atomically rolling over to a successor. Everything else is a hard error carrying the
+/// engine's detail.
 fn map_rebuild_err(e: engine::RebuildError<anyhow::Error>) -> anyhow::Error {
     match e {
         engine::RebuildError::FundingNoteUnavailable(value) => anyhow!(
             "the expired transfer's funding note ({} zatoshi) is gone — it was spent outside the \
-             migration, so the rebuilt transfer cannot re-spend it; cancel and re-plan the \
-             remaining balance via restartCurrentMigrationStep (zcashlc_migration_restart_step)",
+             migration, so the rebuilt transfer cannot re-spend it; begin and finish typed \
+             abandonment with zcashlc_migration_begin_abandonment_v1 and \
+             zcashlc_migration_finish_abandonment_v1 using the current run handle, then \
+             re-propose and commit the remaining balance through the typed successor-rollover \
+             API",
             u64::from(value)
         ),
         other => anyhow!("Error rebuilding expired migration transfer: {other}"),
     }
 }
 
-/// Proves a due transaction if it is still `Signed`, dispatching through the upstream engine
-/// prover ([`migration_finalize::prove_due_transaction`] driving a `WalletMigrationProver`): a
-/// transfer against the boundary anchor persisted on its row, a preparation against the wallet's
-/// natural anchor. The engine persists the proven bytes through its own `Proved` state. Returns
-/// the broadcastable `(proven pczt bytes, txid)` — or `None` when the wallet has not
-/// scanned/retained the needed anchor yet (a restored wallet mid-sync, a boundary not yet
-/// checkpointed), the ordinary transient state the caller maps to "nothing due".
-fn prove_if_needed(
-    ctx: &mut CallCtx,
-    state: &mut MigrationState,
-    id: MigrationTxId,
-) -> anyhow::Result<Option<(Vec<u8>, [u8; 32])>> {
-    let tx = state
-        .transactions()
-        .iter()
-        .find(|t| t.id() == id)
-        .ok_or_else(|| anyhow!("no migration transaction with id {}", u32::from(id)))?;
-
-    match tx.state() {
-        MigrationTxState::Proved => {
-            // Re-serve the stored proven bytes (a retry after a failed broadcast attempt).
-            let bytes = tx.pczt().clone();
-            let pczt = pczt::Pczt::parse(&bytes)
-                .map_err(|e| proving_unavailable(format!("re-parse proven pczt: {e:?}")))?;
-            let (_, txid) = migration_finalize::extract_tx(pczt).map_err(proving_unavailable)?;
-            Ok(Some((bytes, txid)))
-        }
-        MigrationTxState::Signed => {
-            // The natural anchor is resolved LAZILY, only for the kind that proves against it: a
-            // transfer proves against its persisted boundary and must not fail just because the
-            // natural anchor is not resolvable yet (a wallet with a chain tip but no scanned
-            // blocks — e.g. a restored wallet whose delivery lane wakes before its first scan —
-            // has none, and `natural_anchor_height` hard-errors there, without the
-            // proving-unavailable prefix).
-            let natural_anchor = match tx.kind() {
-                MigrationTxKind::Preparation { .. } => {
-                    Some(migration_finalize::natural_anchor_height(&ctx.wallet)?)
-                }
-                MigrationTxKind::Transfer { .. } => None,
-            };
-            let fvk = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?
-                .stored_orchard_fvk()?;
-            let mut prover = WalletMigrationProver::new(&mut ctx.wallet, ctx.account, fvk);
-            if migration_finalize::prove_due_transaction(&mut prover, state, id, natural_anchor)?
-                .is_none()
-            {
-                // Not scanned/retained yet — transient, retry on a later call.
-                return Ok(None);
-            }
-            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.replace_migration(state)?;
-            // Re-read the engine-stored proven bytes and extract the txid to serve alongside.
-            let tx = state
-                .transactions()
-                .iter()
-                .find(|t| t.id() == id)
-                .ok_or_else(|| anyhow!("no migration transaction with id {}", u32::from(id)))?;
-            let bytes = tx.pczt().clone();
-            let pczt = pczt::Pczt::parse(&bytes)
-                .map_err(|e| proving_unavailable(format!("re-parse proven pczt: {e:?}")))?;
-            let (_, txid) = migration_finalize::extract_tx(pczt).map_err(proving_unavailable)?;
-            Ok(Some((bytes, txid)))
-        }
-        other => Err(anyhow!(
-            "migration transaction {} is not broadcastable (state {})",
-            u32::from(id),
-            other.as_ref()
-        )),
-    }
-}
-
-/// The delivery lane's drive-and-serve: returns the next broadcastable transaction as
-/// `(id, txid, proven pczt bytes)` due at `target` (the engine's `chain tip + 1` — see
-/// [`CallCtx::target`]), or `None` when nothing is due.
-///
-/// Commit stores every in-process-signed transaction `Signed` (and the external-signer ceremony
-/// lands its rows `Signed` too), while `next_broadcastable` serves only `Proved` rows — so before
-/// answering "nothing due", this drives the prove-ready `Signed` rows through `prove`
-/// (`Signed -> Proved`, persisted per prove by the caller's `prove`), looping until a row becomes
-/// broadcastable or neither selector advances. Each iteration flips one `Signed` row to `Proved`,
-/// so the loop terminates. Proving is decoupled from the broadcast schedule (upstream
-/// `next_provable`'s contract), so the drive may prove a not-yet-due transfer on the way to
-/// serving a due one behind it. Aside from `zcashlc_migration_sign_note_split`'s explicit
-/// first-preparation prove, this drive is the only place proving is initiated.
-///
-/// A transient prove outcome (`prove` returning `Ok(None)`: the wallet has not scanned/retained
-/// the needed anchor yet) means "nothing due yet", not an error — the row stays `Signed` and a
-/// later call retries.
-///
-/// `prove` is [`prove_if_needed`] in production; tests substitute a closure driving
-/// [`migration_finalize::prove_due_transaction`] with a recording/failing test prover (that seam
-/// is generic over `impl MigrationProver`) plus a fixture-store persist.
-fn drive_and_serve_next_due(
-    state: &mut MigrationState,
-    target: BlockHeight,
-    mut prove: impl FnMut(
-        &mut MigrationState,
-        MigrationTxId,
-    ) -> anyhow::Result<Option<(Vec<u8>, [u8; 32])>>,
-) -> anyhow::Result<Option<(MigrationTxId, [u8; 32], Vec<u8>)>> {
-    while state.next_broadcastable(target).is_none() {
-        let Some(provable) = state.next_provable(target) else {
-            return Ok(None);
-        };
-        if prove(state, provable)?.is_none() {
-            return Ok(None);
-        }
-    }
-    let id = state
-        .next_broadcastable(target)
-        .expect("the drive loop exits with a broadcastable row");
-    Ok(prove(state, id)?.map(|(proven, txid)| (id, txid, proven)))
-}
-
-/// The id [`zcashlc_migration_next_due_transfer`] WOULD serve at `target` (the engine's `chain
-/// tip + 1` — see [`CallCtx::target`]), assuming every due proof succeeds: the next broadcastable
-/// row after virtually proving every prove-ready `Signed` row over a scratch copy — no prover
-/// runs and nothing persists (`set_transaction_proved` with the row's own bytes only flips the
-/// lifecycle state, mirroring [`drive_and_serve_next_due`]'s loop without its side effects).
-/// `None` when the delivery lane has nothing actionable: nothing schedule-due yet, dependencies
-/// unmined, rows awaiting an external signature (the signing ceremony, not the delivery lane,
-/// advances those), or everything already broadcast/mined.
+/// The id the opaque delivery lane would next claim at `target` (the engine's `chain tip + 1` —
+/// see [`CallCtx::target`]), assuming every due proof succeeds: the next broadcastable row after
+/// virtually proving every prove-ready `Signed` row over a scratch copy — no prover runs and
+/// nothing persists (`set_transaction_proved` with the row's own bytes only flips the lifecycle
+/// state). `None` when the delivery lane has nothing actionable: nothing schedule-due yet,
+/// dependencies unmined, rows awaiting an external signature (the signing ceremony, not the
+/// delivery lane, advances those), or everything already broadcast/mined.
 ///
 /// The queries built on this ([`zcashlc_migration_has_overdue_transfers`],
 /// [`zcashlc_migration_pending_transfer_proposal`]) deliberately assume proofs succeed: a
@@ -1123,9 +613,7 @@ fn due_assuming_proving(state: &MigrationState, target: BlockHeight) -> Option<M
     if let Some(id) = state.next_broadcastable(target) {
         return Some(id);
     }
-    if state.next_provable(target).is_none() {
-        return None;
-    }
+    state.next_provable(target)?;
     let mut scratch = state.clone();
     while let Some(id) = scratch.next_provable(target) {
         let bytes = scratch
@@ -1149,102 +637,33 @@ enum DerivedState {
         completed_transfers: u32,
         total_transfers: u32,
         next_transfer_ready_at_height: Option<BlockHeight>,
-        /// Whether this run is the immediate (single-transaction) send-max sweep rather than an
-        /// engine-tracked schedule. `true` only for the immediate lane; engine runs carry `false`.
+        /// Legacy public projection field. Immediate migration is now represented only by the
+        /// authoritative delivery runtime; scheduled engine runs always carry `false` here.
         is_immediate: bool,
     },
-    InvalidTransfer(u32),
     TransferExpired,
     Complete,
 }
 
-/// The fallback bound (blocks past `recorded_at_height`) an unmined immediate run is treated as
-/// pending until, when the wallet database does not know (or no longer knows) the transaction's
-/// real expiry height: the typical wallet transaction-expiry delta, so a run that the wallet's own
-/// history never corroborates does not linger forever before the banner re-offers.
-const IMMEDIATE_RUN_FALLBACK_EXPIRY_DELTA: u32 = 40;
-
-/// An immediate-run row resolved against the wallet database (see [`resolve_immediate_run`]),
-/// pre-computed by the caller so [`derive_state`] stays pure and unit-testable without a wallet
-/// database.
-struct ImmediateRunLookup {
-    /// The tip height at which the run was recorded — the fallback expiry bound used when the
-    /// wallet database does not know the transaction's real expiry height.
-    recorded_at_height: BlockHeight,
-    /// The txid's mined height, if the wallet has observed it mined.
-    mined_height: Option<BlockHeight>,
-    /// The txid's expiry height, as recorded by the wallet (`None` when the wallet has never
-    /// observed the transaction, or recorded no real expiry for it).
-    expiry_height: Option<BlockHeight>,
-}
-
-impl ImmediateRunLookup {
-    /// The height beyond which this run, if still unmined, is treated as expired: the wallet's own
-    /// recorded expiry when known, otherwise the fallback delta past the record height.
-    fn expiry_bound(&self) -> BlockHeight {
-        self.expiry_height.unwrap_or_else(|| {
-            BlockHeight::from(
-                u32::from(self.recorded_at_height) + IMMEDIATE_RUN_FALLBACK_EXPIRY_DELTA,
-            )
-        })
-    }
-}
-
-/// The immediate-run row's derivation:
-/// - mined -> `NotStarted`: the sweep is CONSUMED (its swept balance is zero, nothing to
-///   acknowledge). Returning a state here — rather than `None` — masks any stale engine `Complete`
-///   the caller would otherwise fall back to, keeping the aftermath quiet.
-/// - unmined and not past its expiry bound -> `InProgress` of one, flagged `is_immediate`.
-/// - `None` when the row should be ignored (expired unmined, or vanished) so the caller falls
-///   through to the engine's own terminal/absent verdict.
-fn derive_immediate_run(run: &ImmediateRunLookup, tip: BlockHeight) -> Option<DerivedState> {
-    if run.mined_height.is_some() {
-        // A mined immediate sweep is CONSUMED: it swept the whole spendable Orchard balance to
-        // zero, so there is nothing for the app to acknowledge and no `Complete` screen to show.
-        // It derives `NotStarted` — which, returned here (the caller only consults an immediate run
-        // once no engine run is active), also MASKS any stale engine `Complete` left by an earlier
-        // engine-tracked run, keeping the immediate aftermath fully quiet. If new Orchard funds
-        // arrive later, the ordinary balance-gated re-offer path applies afresh.
-        return Some(DerivedState::NotStarted);
-    }
-    if tip <= run.expiry_bound() {
-        return Some(DerivedState::InProgress {
-            completed_transfers: 0,
-            total_transfers: 1,
-            next_transfer_ready_at_height: None,
-            is_immediate: true,
-        });
-    }
-    None
-}
-
-/// Derive the platform's migration state from the persisted engine state and, when the engine has
-/// nothing active to report, the account's immediate-run row.
+/// Derive the legacy platform migration state from persisted canonical scheduled state.
 ///
 /// - No stored migration -> `NotStarted`.
 /// - A stored `Failed` run (our cancel) -> `NotStarted` (the platform re-plans).
-/// - `Complete` is PER-RUN: the stored run is fully mined. Whether anything REMAINS to migrate is
-///   answered by a fresh propose, never by this state.
+/// - Canonical engine `Complete` is PER-RUN and means fully mined. The public SDK projection stays
+///   `InProgress` until every exact resulting Ironwood output is either spendable under the normal
+///   wallet policy or current-main-chain spent; whether anything REMAINS to migrate is answered by
+///   a fresh propose.
 /// - The v1 crate's "split confirmed, schedule pending" intermediate state and its matching
 ///   attention reason are gone: the engine commits the note split and the transfer schedule
 ///   atomically, so that moment cannot occur anymore.
 ///
-/// Precedence: an engine run counts as ACTIVE — and wins outright, exactly as before the immediate
-/// lane existed — whenever one is stored and has not reached a terminal status. A `Failed` or
-/// `Complete` engine run, or no stored engine run at all, instead defers to `immediate_run` (mined
-/// -> consumed: `NotStarted`, masking any stale engine `Complete`; unmined and not expired ->
-/// `InProgress` of one, flagged `is_immediate`; expired or vanished -> ignored) before falling back
-/// to the engine's own terminal/absent verdict.
-///
-/// `tip` carries two distinct meanings inside: it feeds `immediate_run`'s SDK-owned, tip-based
-/// fallback-expiry policy unchanged (see [`ImmediateRunLookup::expiry_bound`]), while the
-/// engine-mirroring expiry check on an ACTIVE run is computed from `target_from_tip(tip)` — the
-/// engine's `chain tip + 1` contract (see [`CallCtx::target`]).
+/// Immediate migration and exact delivery failures are deliberately absent from this compatibility
+/// projection. They are surfaced only by the revision-consistent delivery runtime, so this helper
+/// cannot reconstruct a second state machine from SDK-local rows.
 fn derive_state(
     persisted: Option<&MigrationState>,
     tip: BlockHeight,
-    invalid_marks: &[u32],
-    immediate_run: Option<&ImmediateRunLookup>,
+    completed_run_outputs_available: bool,
 ) -> DerivedState {
     let active = persisted.filter(|state| {
         !matches!(
@@ -1253,18 +672,34 @@ fn derive_state(
         )
     });
     let Some(state) = active else {
-        if let Some(derived) = immediate_run.and_then(|run| derive_immediate_run(run, tip)) {
-            return derived;
-        }
-        return match persisted.map(MigrationState::status) {
-            Some(MigrationStatus::Complete) => DerivedState::Complete,
+        return match persisted {
+            Some(state)
+                if matches!(state.status(), MigrationStatus::Complete)
+                    && completed_run_outputs_available =>
+            {
+                DerivedState::Complete
+            }
+            Some(state) if matches!(state.status(), MigrationStatus::Complete) => {
+                let total_transfers = state
+                    .transactions()
+                    .iter()
+                    .filter(|tx| matches!(tx.kind(), MigrationTxKind::Transfer { .. }))
+                    .count() as u32;
+                // The canonical engine is complete once every transaction is mined. Keep the
+                // public SDK projection in progress until the exact resulting Ironwood outputs
+                // are spendable or current-main-chain spent. This is derived live; it does not
+                // create a second persisted state machine.
+                DerivedState::InProgress {
+                    completed_transfers: total_transfers,
+                    total_transfers,
+                    next_transfer_ready_at_height: None,
+                    is_immediate: false,
+                }
+            }
             _ => DerivedState::NotStarted,
         };
     };
 
-    if let Some(&id) = invalid_marks.first() {
-        return DerivedState::InvalidTransfer(id);
-    }
     // The engine's expiry predicate is defined over `target = tip + 1` (see `target_from_tip`),
     // not the raw tip — membership in `expired_transactions` already excludes `Mined` rows and
     // treats `expiry_height == 0` as "never expires" (see `MigrationState::is_expired`'s doc).
@@ -1311,20 +746,6 @@ fn derive_state(
         total_transfers: transfers.len() as u32,
         next_transfer_ready_at_height: next_ready,
         is_immediate: false,
-    }
-}
-
-/// The NET amount a stored transfer crosses the turnstile: the engine's authoritative crossing
-/// value at `tx`'s crossing index (F3) — `note_split().crossing_values()[crossing]`, read directly
-/// rather than re-derived as `funding_notes()[crossing] - note_fee_buffer` (the two are identical
-/// by construction; see `schedule_rows`'s doc). `None` when `tx` is not a transfer, or its crossing
-/// index is out of range.
-fn transfer_amount(state: &MigrationState, tx: &MigrationTransaction) -> Option<Zatoshis> {
-    match tx.kind() {
-        MigrationTxKind::Transfer { crossing } => {
-            state.note_split().crossing_values().get(crossing).copied()
-        }
-        _ => None,
     }
 }
 
@@ -1380,6 +801,8 @@ pub enum FfiAttentionReason {
     /// The transfer identified by `transfer_id` was terminally rejected at broadcast (its input
     /// note was spent externally, or the network refused it as invalid). `transfer_id` is an owned
     /// C string, freed by [`zcashlc_free_migration_state`].
+    #[allow(dead_code)]
+    // Retained as part of the published C/Swift ABI even though legacy recording is disabled.
     InvalidTransfer { transfer_id: *mut c_char },
     /// A transaction's expiry elapsed before it could be broadcast (or mined).
     TransferExpired,
@@ -1413,48 +836,23 @@ pub struct FfiNoteSplitProposal {
     pub output_values_len: usize,
     /// The total fees (zatoshi) paid by the preparation (note-split) transactions.
     pub fee: i64,
+    /// Opaque identifier of the cached plan this proposal was rendered from. `0` means no live
+    /// cached plan backs the proposal.
+    pub proposal_handle: u64,
 }
 
-/// A fully proven, signed transaction persisted as a PCZT, ready for the platform to broadcast.
-/// When returned by `zcashlc_migration_next_due_transfer`, an all-null/zeroed value (`id` and
-/// `pczt` null) means "nothing is due" (as opposed to a NULL return, which signals an error).
+/// Legacy prepared-transfer DTO retained for C ABI compatibility with disabled unscoped migration
+/// entry points. Current delivery APIs expose artifacts only through opaque claim handles.
 #[repr(C)]
 pub struct FfiPreparedTransfer {
-    /// The transaction's id (the engine's decimal id), as an owned C string (null only in the
-    /// "nothing due" sentinel).
+    /// The transaction's id (the engine's decimal id), as an owned C string when populated by a
+    /// pre-capability implementation.
     pub id: *mut c_char,
-    /// The finalized transaction's id, as raw (internal-order) 32-byte value (zeroed when the
-    /// value is a storage receipt whose transaction has not been proven yet).
+    /// The finalized transaction's id, as raw (internal-order) 32-byte value.
     pub txid: [u8; 32],
-    /// Heap `pczt_len`-byte serialized PCZT (null only in the "nothing due" sentinel).
+    /// Heap `pczt_len`-byte serialized PCZT when populated by a pre-capability implementation.
     pub pczt: *mut u8,
     pub pczt_len: usize,
-}
-
-impl FfiPreparedTransfer {
-    fn from_parts(
-        id: MigrationTxId,
-        txid: [u8; 32],
-        pczt_bytes: Vec<u8>,
-    ) -> anyhow::Result<*mut Self> {
-        let id = cstring_raw(&u32::from(id).to_string(), "prepared transfer id")?;
-        let (pczt, pczt_len) = ptr_from_vec(pczt_bytes);
-        Ok(Box::into_raw(Box::new(FfiPreparedTransfer {
-            id,
-            txid,
-            pczt,
-            pczt_len,
-        })))
-    }
-
-    fn none() -> *mut Self {
-        Box::into_raw(Box::new(FfiPreparedTransfer {
-            id: ptr::null_mut(),
-            txid: [0u8; 32],
-            pczt: ptr::null_mut(),
-            pczt_len: 0,
-        }))
-    }
 }
 
 /// A single scheduled Orchard→Ironwood transfer (element of [`FfiMigrationSchedule`]).
@@ -1502,6 +900,9 @@ pub struct FfiMigrationSchedule {
     /// A rough estimate of how long the schedule takes to fully execute, in hours — measured
     /// from the encode-time chain tip to the last scheduled broadcast (#1806).
     pub estimated_duration_hours: u32,
+    /// Opaque identifier of the cached plan this schedule was rendered from. Display fields are
+    /// never accepted back as commit authority. `0` means no live cached plan backs the schedule.
+    pub proposal_handle: u64,
 }
 
 /// A single run's estimate (element of [`FfiMigrationRunEstimate`]): what one migration run
@@ -1552,27 +953,9 @@ pub struct FfiUnsignedTransferPczts {
     pub len: usize,
 }
 
-impl FfiUnsignedTransferPczts {
-    fn from_pairs(pairs: Vec<(MigrationTxId, Vec<u8>)>) -> anyhow::Result<*mut Self> {
-        let items = pairs
-            .into_iter()
-            .map(|(id, bytes)| {
-                let id = cstring_raw(&u32::from(id).to_string(), "unsigned transfer pczt id")?;
-                let (pczt, pczt_len) = ptr_from_vec(bytes);
-                Ok(FfiUnsignedTransferPczt { id, pczt, pczt_len })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let (ptr, len) = ptr_from_vec(items);
-        Ok(Box::into_raw(Box::new(FfiUnsignedTransferPczts {
-            ptr,
-            len,
-        })))
-    }
-}
-
 /// One migration transaction's LIVE status, as the engine computes it — an element of
 /// [`FfiMigrationTransactionStatuses`]. Mirrors
-/// [`zcash_pool_migration_backend::state::TransactionStatus`] field-for-field — minus its
+/// [`zcash_pool_migration::state::TransactionStatus`] field-for-field — minus its
 /// `depends_on` edge list, deliberately not marshaled so every row stays heap-pointer-free (a
 /// `blocked_on = dependencies` row reports THAT it waits, not on which ids) — and nothing here
 /// is derived independently of the engine's own view (see
@@ -1629,6 +1012,3017 @@ pub struct FfiMigrationTransactionStatuses {
     /// order: preparation layers first, then transfers).
     pub ptr: *mut FfiMigrationTransactionStatus,
     pub len: usize,
+}
+
+// ============================================================================================
+// Delivery runtime ABI (v1)
+//
+// The DTOs below are sanitized read projections. All mutation authority stays in opaque,
+// Rust-owned handles whose fields are intentionally private to cbindgen. A host may borrow an
+// input handle for one call; every successful mutation returns a fresh owned handle. No host
+// supplies a delivery revision, run identity, policy fingerprint, claim token, lease instant, or
+// lease duration.
+// ============================================================================================
+
+/// Version of the delivery/runtime C ABI and every opaque capability handle it creates.
+pub const ZCASHLC_MIGRATION_DELIVERY_ABI_VERSION: u32 = 1;
+
+/// Bounded Rust-owned lease duration for proving, signing, and exact-byte materialization.
+const MATERIALIZATION_LEASE_MILLIS: u64 = 15 * 60 * 1_000;
+/// Bounded Rust-owned lease duration for one transport submission attempt.
+const SUBMISSION_LEASE_MILLIS: u64 = 2 * 60 * 1_000;
+/// Bounded Rust-owned lease duration for resolution of an ambiguous transport outcome.
+const OUTCOME_RESOLUTION_LEASE_MILLIS: u64 = 2 * 60 * 1_000;
+
+fn lease_duration(kind: ClaimKind) -> LeaseDuration {
+    let millis = match kind {
+        ClaimKind::Materialization => MATERIALIZATION_LEASE_MILLIS,
+        ClaimKind::Submission => SUBMISSION_LEASE_MILLIS,
+        ClaimKind::OutcomeResolution => OUTCOME_RESOLUTION_LEASE_MILLIS,
+    };
+    LeaseDuration::from_millis(millis).expect("delivery lease constants are non-zero")
+}
+
+/// Opaque immutable capability identifying one revision-consistent delivery run.
+///
+/// The private fields are never part of the generated C layout. Obtain a pointer only from this
+/// module and free each owned pointer once with [`zcashlc_migration_free_run_handle_v1`].
+#[derive(Clone)]
+pub struct FfiMigrationRunHandle {
+    abi_version: u32,
+    account_uuid: [u8; 16],
+    lane: DeliveryLane,
+    revision: DeliveryRevision,
+    run_identity: MigrationRunIdentity,
+    source_reservation_owner: SourceReservationOwner,
+    policy_fingerprint: Option<PolicyFingerprint>,
+    policy_validation_failure: Option<PolicyValidationFailure>,
+    submission_transport: Option<u8>,
+    submission_endpoint: Option<String>,
+}
+
+/// Opaque immutable capability for one exact delivery artifact and, when present, its live
+/// Rust-generated claim token. Exact proposal/PCZT/transaction bytes remain private and are copied
+/// out only through owned accessors.
+#[derive(Clone)]
+pub struct FfiMigrationClaimHandle {
+    abi_version: u32,
+    run: FfiMigrationRunHandle,
+    artifact_identity: DeliveryArtifactIdentity,
+    evidence: zcash_pool_migration::delivery::DeliveryArtifactEvidence,
+    signer_ownership: SignerOwnership,
+    status: ClaimStatus,
+    claim_kind: Option<ClaimKind>,
+    token: Option<ClaimToken>,
+    expiry_height: BlockHeight,
+    proposal: Option<Vec<u8>>,
+    external_signing_pczt: Option<Vec<u8>>,
+    signed_pczt: Option<Vec<u8>>,
+    exact_transaction: Option<Vec<u8>>,
+    txid: Option<[u8; 32]>,
+}
+
+/// Sanitized summary of one exact artifact. It deliberately excludes capability tokens, exact
+/// proposal/PCZT/transaction bytes, policy fingerprints, and clock-session identities.
+#[repr(C)]
+pub struct FfiMigrationClaimSummaryV1 {
+    /// `0` = scheduled, `1` = immediate.
+    pub artifact_lane: u8,
+    /// Scheduled canonical transaction id, or `-1` for the immediate lane.
+    pub scheduled_transaction_id: i64,
+    /// Immediate artifact identity; all-zero for the scheduled lane.
+    pub immediate_artifact_identity: [u8; 32],
+    /// `0` = SDK signer, `1` = external signer.
+    pub signer_ownership: u8,
+    /// `0` materializing, `1` materializationFailed, `2` awaitingExternalSignature, `3` staged,
+    /// `4` submitting, `5` outcomeUnknown, `6` broadcasted, `7` confirmed,
+    /// `8` expiredUnmined, `9` externalSigningExpiredUnmined.
+    pub status: u8,
+    /// `-1` = no live claim, `0` = materialization, `1` = submission,
+    /// `2` = outcome resolution.
+    pub claim_kind: i8,
+    /// Exact external-signing bytes have crossed the cancellation-unsafe exposure boundary.
+    pub externally_exposed: bool,
+    pub has_signed_pczt: bool,
+    pub has_exact_transaction: bool,
+    pub expiry_height: u32,
+    pub has_txid: bool,
+    pub txid: [u8; 32],
+    /// `-1` = none; otherwise the `DeliveryFailureReason` ordering documented by
+    /// `delivery_failure_tag` below.
+    pub last_error: i8,
+    /// Opaque Rust-owned capability for this exact reconstructed claim.
+    pub claim_handle: *mut FfiMigrationClaimHandle,
+}
+
+/// Sanitized owning projection of one retained predecessor. Rollover does not erase old ambiguous
+/// or externally exposed artifacts; each retained entry therefore carries its own opaque run
+/// handle and claim summaries so that exact predecessor remains resumable and reconcilable.
+#[repr(C)]
+pub struct FfiRetainedMigrationRunV1 {
+    pub has_canonical_state: bool,
+    pub canonical_status: i8,
+    pub canonical_transaction_count: u32,
+    pub destination_spendability: u8,
+    pub delivery_revision: u64,
+    pub delivery_lane: u8,
+    pub delivery_phase: u8,
+    pub storage_finality: u8,
+    pub storage_recovery_reason: i8,
+    pub delivery_release_height: i64,
+    pub active_source_reservation_count: u64,
+    pub has_submission_policy: bool,
+    pub policy_validation_failure: i8,
+    pub safe_to_cancel: bool,
+    pub claims: *mut FfiMigrationClaimSummaryV1,
+    pub claims_len: usize,
+    pub run_handle: *mut FfiMigrationRunHandle,
+}
+
+/// One owning, revision-consistent account runtime projection.
+#[repr(C)]
+pub struct FfiMigrationRuntimeSnapshotV1 {
+    pub abi_version: u32,
+    pub account_uuid: [u8; 16],
+    /// `-1` none, `0` planning, `1` committed, `2` inProgress, `3` complete, `4` failed.
+    pub canonical_status: i8,
+    pub canonical_transaction_count: u32,
+    /// `0` compatible, `1` unavailable, `2` future, `3` corrupt.
+    pub schema_provenance: u8,
+    /// Compatible/future schema version, otherwise zero.
+    pub schema_version: u32,
+    /// `0` fresh, `1` recovery required.
+    pub legacy_cutover: u8,
+    pub legacy_object_count: u32,
+    /// `0` not spendable, `1` spendable, `2` already spent, `3` not applicable (no run).
+    pub destination_spendability: u8,
+    /// `0` available, `1` unavailable.
+    pub availability: u8,
+    /// `-1` none; otherwise `runtime_unavailable_tag`.
+    pub unavailable_reason: i8,
+    /// Schema version, legacy object count, or storage-recovery tag carried by the reason.
+    pub unavailable_detail: u32,
+    /// `0` unrestricted, `1` excluding migration sources, `2` blocked.
+    pub ordinary_spend_authorization: u8,
+    /// `-1` for allowed; `0` migration active, `1` destination not spendable,
+    /// `2` runtime unavailable, `3` finality recovery.
+    pub ordinary_spend_block_reason: i8,
+    /// Release height for `excluding migration sources`, otherwise `-1`.
+    pub ordinary_spend_release_height: i64,
+    /// `0` allowed, `1` blocked.
+    pub account_deletion_authorization: u8,
+    /// `-1` allowed, `0` runtime unavailable, `1` unresolved delivery.
+    pub account_deletion_block_reason: i8,
+    /// `0` allowed, `1` blocked.
+    pub canonical_mutation_authorization: u8,
+    /// `-1` allowed, `0` runtime unavailable, `1` delivery owned.
+    pub canonical_mutation_block_reason: i8,
+    pub has_delivery: bool,
+    pub delivery_revision: u64,
+    /// `-1` no delivery, `0` scheduled, `1` immediate.
+    pub delivery_lane: i8,
+    /// `-1` no delivery, `0` active, `1` paused, `2` abandoning, `3` abandoned.
+    pub delivery_phase: i8,
+    /// `-1` no delivery, `0` noRun, `1` active, `2` completePendingFinality,
+    /// `3` finalized, `4` recoveryRequired.
+    pub storage_finality: i8,
+    /// `-1` none; otherwise `storage_recovery_tag`.
+    pub storage_recovery_reason: i8,
+    pub delivery_release_height: i64,
+    /// Aggregate finality across the current run and every retained predecessor. Uses the same
+    /// tags as `storage_finality`, but remains meaningful when `has_delivery` is false.
+    pub aggregate_storage_finality: i8,
+    /// Aggregate recovery reason across current and retained runs, or `-1`.
+    pub aggregate_storage_recovery_reason: i8,
+    /// Aggregate release height across current and retained runs, or `-1`.
+    pub aggregate_delivery_release_height: i64,
+    /// Exact live source-reservation rows owned by the current run.
+    pub active_source_reservation_count: u64,
+    pub has_submission_policy: bool,
+    /// `-1` none; otherwise `policy_failure_tag`.
+    pub policy_validation_failure: i8,
+    /// Rust-derived cancellation verdict, including external-PCZT exposure.
+    pub safe_to_cancel: bool,
+    pub claims: *mut FfiMigrationClaimSummaryV1,
+    pub claims_len: usize,
+    /// Opaque immutable run capability owned by this DTO; null when no delivery run exists.
+    pub run_handle: *mut FfiMigrationRunHandle,
+    /// Every predecessor whose reservations, finality, or exposed evidence remain authoritative.
+    pub retained_runs: *mut FfiRetainedMigrationRunV1,
+    pub retained_runs_len: usize,
+}
+
+/// One atomic all-account runtime read.
+#[repr(C)]
+pub struct FfiMigrationRuntimeBatchV1 {
+    pub abi_version: u32,
+    pub accounts: *mut FfiMigrationRuntimeSnapshotV1,
+    pub accounts_len: usize,
+}
+
+fn delivery_lane_tag(lane: DeliveryLane) -> u8 {
+    match lane {
+        DeliveryLane::Scheduled => 0,
+        DeliveryLane::Immediate => 1,
+    }
+}
+
+fn signer_ownership_tag(signer: SignerOwnership) -> u8 {
+    match signer {
+        SignerOwnership::Sdk => 0,
+        SignerOwnership::External => 1,
+    }
+}
+
+fn claim_status_tag(status: ClaimStatus) -> u8 {
+    match status {
+        ClaimStatus::Materializing => 0,
+        ClaimStatus::MaterializationFailed => 1,
+        ClaimStatus::AwaitingExternalSignature => 2,
+        ClaimStatus::Staged => 3,
+        ClaimStatus::Submitting => 4,
+        ClaimStatus::OutcomeUnknown => 5,
+        ClaimStatus::Broadcasted => 6,
+        ClaimStatus::Confirmed => 7,
+        ClaimStatus::ExpiredUnmined => 8,
+        ClaimStatus::ExternalSigningExpiredUnmined => 9,
+    }
+}
+
+fn claim_kind_tag(kind: Option<ClaimKind>) -> i8 {
+    match kind {
+        None => -1,
+        Some(ClaimKind::Materialization) => 0,
+        Some(ClaimKind::Submission) => 1,
+        Some(ClaimKind::OutcomeResolution) => 2,
+    }
+}
+
+fn delivery_failure_tag(reason: Option<DeliveryFailureReason>) -> i8 {
+    match reason {
+        None => -1,
+        Some(DeliveryFailureReason::MaterializationFailed) => 0,
+        Some(DeliveryFailureReason::MaterializationLeaseExpired) => 1,
+        Some(DeliveryFailureReason::SigningCancelled) => 2,
+        Some(DeliveryFailureReason::TransportSetupFailed) => 3,
+        Some(DeliveryFailureReason::TransportDidNotBegin) => 4,
+        Some(DeliveryFailureReason::SubmissionLeaseExpired) => 5,
+        Some(DeliveryFailureReason::TransportOutcomeUnknown) => 6,
+    }
+}
+
+fn storage_recovery_tag(reason: StorageRecoveryReason) -> i8 {
+    match reason {
+        StorageRecoveryReason::TransferEvidenceLost => 0,
+        StorageRecoveryReason::RewoundBeyondFinalityHorizon => 1,
+        StorageRecoveryReason::CorruptFinalityEvidence => 2,
+        StorageRecoveryReason::ExternalSigningExposureUnresolved => 3,
+    }
+}
+
+fn runtime_unavailable_tag(reason: RuntimeUnavailableReason) -> (i8, u32) {
+    match reason {
+        RuntimeUnavailableReason::SchemaUnavailable => (0, 0),
+        RuntimeUnavailableReason::FutureSchema(version) => (1, version.as_u32()),
+        RuntimeUnavailableReason::CorruptDeliveryState => (2, 0),
+        RuntimeUnavailableReason::LegacyCutoverRecovery(objects) => (3, objects.as_u32()),
+        RuntimeUnavailableReason::SubmissionPolicyMissing => (4, 0),
+        RuntimeUnavailableReason::SubmissionPolicyMismatch => (5, 0),
+        RuntimeUnavailableReason::DeliveryInconsistent => (6, 0),
+        RuntimeUnavailableReason::FinalityRecovery(reason) => {
+            (7, u32::try_from(storage_recovery_tag(reason)).unwrap_or(0))
+        }
+    }
+}
+
+fn policy_failure_tag(failure: Option<PolicyValidationFailure>) -> i8 {
+    match failure {
+        None => -1,
+        Some(PolicyValidationFailure::InvalidEncoding) => 0,
+        Some(PolicyValidationFailure::PolicyTooLarge) => 1,
+        Some(PolicyValidationFailure::NetworkMismatch) => 2,
+        Some(PolicyValidationFailure::ConsensusMismatch) => 3,
+        Some(_) => 4,
+    }
+}
+
+fn run_handle(account_uuid: [u8; 16], snapshot: &DeliverySnapshot) -> FfiMigrationRunHandle {
+    let (submission_transport, submission_endpoint) = snapshot
+        .submission_policy()
+        .map(|policy| {
+            let transport = policy.request().transport();
+            let tag = match transport {
+                SubmissionTransport::DirectTls(_) => 0,
+                SubmissionTransport::TorOnion(_) => 1,
+                SubmissionTransport::LoopbackDevelopment(_) => 2,
+            };
+            (Some(tag), Some(transport.endpoint().to_owned()))
+        })
+        .unwrap_or((None, None));
+    FfiMigrationRunHandle {
+        abi_version: ZCASHLC_MIGRATION_DELIVERY_ABI_VERSION,
+        account_uuid,
+        lane: snapshot.lane(),
+        revision: snapshot.revision(),
+        run_identity: snapshot.run_identity(),
+        source_reservation_owner: snapshot.source_reservation_owner(),
+        policy_fingerprint: snapshot
+            .submission_policy()
+            .map(SubmissionPolicy::fingerprint),
+        policy_validation_failure: snapshot.policy_validation_failure(),
+        submission_transport,
+        submission_endpoint,
+    }
+}
+
+fn claim_summary(
+    account_uuid: [u8; 16],
+    snapshot: &DeliverySnapshot,
+    claim: &zcash_pool_migration::delivery::DeliveryClaim,
+) -> anyhow::Result<FfiMigrationClaimSummaryV1> {
+    let (scheduled_transaction_id, immediate_artifact_identity) = match claim.artifact_identity() {
+        DeliveryArtifactIdentity::Scheduled(identity) => {
+            (i64::from(u32::from(identity.transaction_id())), [0; 32])
+        }
+        DeliveryArtifactIdentity::Immediate(id) => (-1, *id.as_bytes()),
+    };
+    let txid = claim.txid().map_or([0; 32], |txid| *txid.as_ref());
+    Ok(FfiMigrationClaimSummaryV1 {
+        artifact_lane: delivery_lane_tag(claim.lane()),
+        scheduled_transaction_id,
+        immediate_artifact_identity,
+        signer_ownership: signer_ownership_tag(claim.signer_ownership()),
+        status: claim_status_tag(claim.status()),
+        claim_kind: claim_kind_tag(claim.claim_kind()),
+        externally_exposed: claim.external_signing_pczt().is_some(),
+        has_signed_pczt: claim.signed_pczt().is_some(),
+        has_exact_transaction: claim.exact_transaction().is_some(),
+        expiry_height: u32::from(claim.expiry_height()),
+        has_txid: claim.txid().is_some(),
+        txid,
+        last_error: delivery_failure_tag(claim.last_error()),
+        claim_handle: Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            snapshot,
+            claim.artifact_identity(),
+        )?)),
+    })
+}
+
+fn claim_handle(
+    account_uuid: [u8; 16],
+    snapshot: &DeliverySnapshot,
+    artifact_identity: DeliveryArtifactIdentity,
+) -> anyhow::Result<FfiMigrationClaimHandle> {
+    let claim = snapshot
+        .claims()
+        .iter()
+        .find(|claim| claim.artifact_identity() == artifact_identity)
+        .ok_or_else(|| anyhow!("delivery snapshot omitted the requested artifact"))?;
+    let proposal = match claim.evidence() {
+        DeliveryArtifactEvidence::Scheduled(_) => None,
+        DeliveryArtifactEvidence::Immediate(evidence) => {
+            let proposal = ImmediateProposal::decode(evidence.canonical_proposal())
+                .map_err(|e| anyhow!("persisted immediate proposal evidence is corrupt: {e}"))?;
+            Some(proposal.payload().as_bytes().to_vec())
+        }
+    };
+    Ok(FfiMigrationClaimHandle {
+        abi_version: ZCASHLC_MIGRATION_DELIVERY_ABI_VERSION,
+        run: run_handle(account_uuid, snapshot),
+        artifact_identity,
+        evidence: claim.evidence().clone(),
+        signer_ownership: claim.signer_ownership(),
+        status: claim.status(),
+        claim_kind: claim.claim_kind(),
+        token: claim.token(),
+        expiry_height: claim.expiry_height(),
+        proposal,
+        external_signing_pczt: claim
+            .external_signing_pczt()
+            .map(|pczt| pczt.bytes().to_vec()),
+        signed_pczt: claim.signed_pczt().map(|pczt| pczt.bytes().to_vec()),
+        exact_transaction: claim
+            .exact_transaction()
+            .map(|transaction| transaction.bytes().to_vec()),
+        txid: claim.txid().map(|txid| *txid.as_ref()),
+    })
+}
+
+fn free_claim_summary_fields(claim: &mut FfiMigrationClaimSummaryV1) {
+    if !claim.claim_handle.is_null() {
+        drop(unsafe { Box::from_raw(claim.claim_handle) });
+        claim.claim_handle = ptr::null_mut();
+    }
+}
+
+fn claim_summaries_ffi(
+    account_uuid: [u8; 16],
+    delivery: &DeliverySnapshot,
+) -> anyhow::Result<(*mut FfiMigrationClaimSummaryV1, usize)> {
+    let mut claims = Vec::with_capacity(delivery.claims().len());
+    for claim in delivery.claims() {
+        match claim_summary(account_uuid, delivery, claim) {
+            Ok(claim) => claims.push(claim),
+            Err(error) => {
+                for claim in &mut claims {
+                    free_claim_summary_fields(claim);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(ptr_from_vec(claims))
+}
+
+fn retained_run_ffi(
+    account_uuid: [u8; 16],
+    retained: &RetainedMigrationRun,
+) -> anyhow::Result<FfiRetainedMigrationRunV1> {
+    let (has_canonical_state, canonical_status, canonical_transaction_count) =
+        match retained.canonical_state() {
+            None => (false, -1, 0),
+            Some(state) => {
+                let status = match state.status() {
+                    MigrationStatus::Planning => 0,
+                    MigrationStatus::Committed => 1,
+                    MigrationStatus::InProgress => 2,
+                    MigrationStatus::Complete => 3,
+                    MigrationStatus::Failed => 4,
+                };
+                (
+                    true,
+                    status,
+                    count_to_u32(state.transactions().len(), "retained canonical transaction")?,
+                )
+            }
+        };
+    let destination_spendability = match retained.destination_spendability() {
+        DestinationSpendability::NotSpendable => 0,
+        DestinationSpendability::Spendable => 1,
+        DestinationSpendability::AlreadySpent => 2,
+        DestinationSpendability::NotApplicable => 3,
+    };
+    let delivery = retained.delivery();
+    let delivery_phase = match delivery.phase() {
+        DeliveryPhase::Active => 0,
+        DeliveryPhase::Paused => 1,
+        DeliveryPhase::Abandoning => 2,
+        DeliveryPhase::Abandoned => 3,
+    };
+    let (storage_finality, storage_recovery_reason, delivery_release_height) = match delivery
+        .storage_finality()
+    {
+        StorageFinality::NoRun => (0, -1, -1),
+        StorageFinality::Active => (1, -1, -1),
+        StorageFinality::CompletePendingFinality(release) => {
+            (2, -1, i64::from(u32::from(release.release_at())))
+        }
+        StorageFinality::Finalized(release) => (3, -1, i64::from(u32::from(release.release_at()))),
+        StorageFinality::RecoveryRequired(reason) => (4, storage_recovery_tag(reason), -1),
+    };
+    let (claims, claims_len) = claim_summaries_ffi(account_uuid, delivery)?;
+    Ok(FfiRetainedMigrationRunV1 {
+        has_canonical_state,
+        canonical_status,
+        canonical_transaction_count,
+        destination_spendability,
+        delivery_revision: delivery.revision().as_u64(),
+        delivery_lane: delivery_lane_tag(delivery.lane()),
+        delivery_phase,
+        storage_finality,
+        storage_recovery_reason,
+        delivery_release_height,
+        active_source_reservation_count: delivery.active_source_reservation_count(),
+        has_submission_policy: delivery.submission_policy().is_some(),
+        policy_validation_failure: policy_failure_tag(delivery.policy_validation_failure()),
+        safe_to_cancel: delivery.safe_to_cancel(),
+        claims,
+        claims_len,
+        run_handle: Box::into_raw(Box::new(run_handle(account_uuid, delivery))),
+    })
+}
+
+fn free_retained_run_fields(retained: &mut FfiRetainedMigrationRunV1) {
+    free_ptr_from_vec_with(retained.claims, retained.claims_len, |claim| {
+        free_claim_summary_fields(claim)
+    });
+    retained.claims = ptr::null_mut();
+    retained.claims_len = 0;
+    if !retained.run_handle.is_null() {
+        drop(unsafe { Box::from_raw(retained.run_handle) });
+        retained.run_handle = ptr::null_mut();
+    }
+}
+
+fn runtime_snapshot_ffi(
+    account_uuid: [u8; 16],
+    runtime: &MigrationRuntimeSnapshot,
+) -> anyhow::Result<FfiMigrationRuntimeSnapshotV1> {
+    let (canonical_status, canonical_transaction_count) = match runtime.canonical_state() {
+        None => (-1, 0),
+        Some(state) => {
+            let status = match state.status() {
+                MigrationStatus::Planning => 0,
+                MigrationStatus::Committed => 1,
+                MigrationStatus::InProgress => 2,
+                MigrationStatus::Complete => 3,
+                MigrationStatus::Failed => 4,
+            };
+            (
+                status,
+                count_to_u32(state.transactions().len(), "canonical transaction")?,
+            )
+        }
+    };
+    let (schema_provenance, schema_version) = match runtime.schema_provenance() {
+        zcash_pool_migration::delivery::DeliverySchemaProvenance::Compatible(version) => {
+            (0, version.as_u32())
+        }
+        zcash_pool_migration::delivery::DeliverySchemaProvenance::Unavailable => (1, 0),
+        zcash_pool_migration::delivery::DeliverySchemaProvenance::Future(version) => {
+            (2, version.as_u32())
+        }
+        zcash_pool_migration::delivery::DeliverySchemaProvenance::Corrupt => (3, 0),
+    };
+    let (legacy_cutover, legacy_object_count) = match runtime.legacy_cutover() {
+        LegacyCutoverStatus::Fresh => (0, 0),
+        LegacyCutoverStatus::RecoveryRequired(objects) => (1, objects.as_u32()),
+    };
+    let destination_spendability = match runtime.destination_spendability() {
+        DestinationSpendability::NotSpendable => 0,
+        DestinationSpendability::Spendable => 1,
+        DestinationSpendability::AlreadySpent => 2,
+        DestinationSpendability::NotApplicable => 3,
+    };
+    let (availability, unavailable_reason, unavailable_detail) = match runtime.availability() {
+        MigrationRuntimeAvailability::Available => (0, -1, 0),
+        MigrationRuntimeAvailability::Unavailable(reason) => {
+            let (tag, detail) = runtime_unavailable_tag(reason);
+            (1, tag, detail)
+        }
+    };
+    let (ordinary_spend_authorization, ordinary_spend_block_reason, ordinary_spend_release_height) =
+        match runtime.ordinary_spend_authorization() {
+            OrdinarySpendAuthorization::Allowed(OrdinarySpendScope::Unrestricted) => (0, -1, -1),
+            OrdinarySpendAuthorization::Allowed(OrdinarySpendScope::ExcludingMigrationSources(
+                release,
+            )) => (1, -1, i64::from(u32::from(release.release_at()))),
+            OrdinarySpendAuthorization::Blocked(reason) => {
+                let tag = match reason {
+                    OrdinarySpendBlockReason::MigrationActive => 0,
+                    OrdinarySpendBlockReason::DestinationNotSpendable => 1,
+                    OrdinarySpendBlockReason::RuntimeUnavailable(_) => 2,
+                    OrdinarySpendBlockReason::FinalityRecovery(_) => 3,
+                };
+                (2, tag, -1)
+            }
+        };
+    let (account_deletion_authorization, account_deletion_block_reason) =
+        match runtime.account_deletion_authorization() {
+            AccountDeletionAuthorization::Allowed => (0, -1),
+            AccountDeletionAuthorization::Blocked(reason) => (
+                1,
+                match reason {
+                    AccountDeletionBlockReason::RuntimeUnavailable(_) => 0,
+                    AccountDeletionBlockReason::UnresolvedDelivery(_) => 1,
+                },
+            ),
+        };
+    let (canonical_mutation_authorization, canonical_mutation_block_reason) =
+        match runtime.canonical_mutation_authorization() {
+            CanonicalMutationAuthorization::Allowed => (0, -1),
+            CanonicalMutationAuthorization::Blocked(reason) => (
+                1,
+                match reason {
+                    CanonicalMutationBlockReason::RuntimeUnavailable(_) => 0,
+                    CanonicalMutationBlockReason::DeliveryOwned(_) => 1,
+                },
+            ),
+        };
+
+    let mut result = FfiMigrationRuntimeSnapshotV1 {
+        abi_version: ZCASHLC_MIGRATION_DELIVERY_ABI_VERSION,
+        account_uuid,
+        canonical_status,
+        canonical_transaction_count,
+        schema_provenance,
+        schema_version,
+        legacy_cutover,
+        legacy_object_count,
+        destination_spendability,
+        availability,
+        unavailable_reason,
+        unavailable_detail,
+        ordinary_spend_authorization,
+        ordinary_spend_block_reason,
+        ordinary_spend_release_height,
+        account_deletion_authorization,
+        account_deletion_block_reason,
+        canonical_mutation_authorization,
+        canonical_mutation_block_reason,
+        has_delivery: false,
+        delivery_revision: 0,
+        delivery_lane: -1,
+        delivery_phase: -1,
+        storage_finality: -1,
+        storage_recovery_reason: -1,
+        delivery_release_height: -1,
+        aggregate_storage_finality: -1,
+        aggregate_storage_recovery_reason: -1,
+        aggregate_delivery_release_height: -1,
+        active_source_reservation_count: 0,
+        has_submission_policy: false,
+        policy_validation_failure: -1,
+        safe_to_cancel: true,
+        claims: ptr::null_mut(),
+        claims_len: 0,
+        run_handle: ptr::null_mut(),
+        retained_runs: ptr::null_mut(),
+        retained_runs_len: 0,
+    };
+
+    if let Some(delivery) = runtime.delivery() {
+        result.has_delivery = true;
+        result.delivery_revision = delivery.revision().as_u64();
+        result.delivery_lane = i8::try_from(delivery_lane_tag(delivery.lane())).unwrap();
+        result.delivery_phase = match delivery.phase() {
+            DeliveryPhase::Active => 0,
+            DeliveryPhase::Paused => 1,
+            DeliveryPhase::Abandoning => 2,
+            DeliveryPhase::Abandoned => 3,
+        };
+        let (storage_finality, recovery, release) = match delivery.storage_finality() {
+            StorageFinality::NoRun => (0, -1, -1),
+            StorageFinality::Active => (1, -1, -1),
+            StorageFinality::CompletePendingFinality(release) => {
+                (2, -1, i64::from(u32::from(release.release_at())))
+            }
+            StorageFinality::Finalized(release) => {
+                (3, -1, i64::from(u32::from(release.release_at())))
+            }
+            StorageFinality::RecoveryRequired(reason) => (4, storage_recovery_tag(reason), -1),
+        };
+        result.storage_finality = storage_finality;
+        result.storage_recovery_reason = recovery;
+        result.delivery_release_height = release;
+        result.active_source_reservation_count = delivery.active_source_reservation_count();
+        result.has_submission_policy = delivery.submission_policy().is_some();
+        result.policy_validation_failure = policy_failure_tag(delivery.policy_validation_failure());
+        result.safe_to_cancel = runtime.safe_to_cancel();
+        (result.claims, result.claims_len) = claim_summaries_ffi(account_uuid, delivery)?;
+        result.run_handle = Box::into_raw(Box::new(run_handle(account_uuid, delivery)));
+    }
+    let (storage_finality, recovery, release) = match runtime.aggregate_storage_finality() {
+        StorageFinality::NoRun => (0, -1, -1),
+        StorageFinality::Active => (1, -1, -1),
+        StorageFinality::CompletePendingFinality(release) => {
+            (2, -1, i64::from(u32::from(release.release_at())))
+        }
+        StorageFinality::Finalized(release) => (3, -1, i64::from(u32::from(release.release_at()))),
+        StorageFinality::RecoveryRequired(reason) => (4, storage_recovery_tag(reason), -1),
+    };
+    result.aggregate_storage_finality = storage_finality;
+    result.aggregate_storage_recovery_reason = recovery;
+    result.aggregate_delivery_release_height = release;
+    result.safe_to_cancel = runtime.safe_to_cancel();
+    let mut retained_runs = Vec::with_capacity(runtime.retained_predecessors().len());
+    for retained in runtime.retained_predecessors() {
+        match retained_run_ffi(account_uuid, retained) {
+            Ok(retained) => retained_runs.push(retained),
+            Err(error) => {
+                for retained in &mut retained_runs {
+                    free_retained_run_fields(retained);
+                }
+                free_runtime_snapshot_fields(&mut result);
+                return Err(error);
+            }
+        }
+    }
+    (result.retained_runs, result.retained_runs_len) = ptr_from_vec(retained_runs);
+    Ok(result)
+}
+
+/// Returns one account's canonical-plus-delivery runtime from a single atomic wallet-store read.
+///
+/// # Safety
+/// Common database/account pointer rules apply. Free the returned DTO with
+/// [`zcashlc_free_migration_runtime_snapshot_v1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_runtime_snapshot_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> *mut FfiMigrationRuntimeSnapshotV1 {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let account =
+            MigrationRuntimeStore::account_migration_runtime(&mut ctx.wallet, &ctx.account)
+                .map_err(|e| anyhow!("reading atomic migration runtime failed: {e}"))?
+                .ok_or_else(|| anyhow!("wallet account has no migration runtime"))?;
+        let snapshot = runtime_snapshot_ffi(ctx.account_bytes, account.runtime())?;
+        Ok(Box::into_raw(Box::new(snapshot)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Returns exactly one owning runtime per wallet account from one SQLite read transaction.
+///
+/// # Safety
+/// Common database-path pointer rules apply. Free the result with
+/// [`zcashlc_free_migration_runtime_batch_v1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_runtime_batch_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+) -> *mut FfiMigrationRuntimeBatchV1 {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let mut wallet = unsafe { crate::wallet_db(db_data, db_data_len, network)? };
+        let batch = MigrationRuntimeStore::all_account_migration_runtimes(&mut wallet)
+            .map_err(|e| anyhow!("reading atomic all-account migration runtime failed: {e:?}"))?;
+        let mut accounts = Vec::with_capacity(batch.accounts().len());
+        for account in batch.accounts() {
+            match runtime_snapshot_ffi(
+                *account.account_id().expose_uuid().as_bytes(),
+                account.runtime(),
+            ) {
+                Ok(account) => accounts.push(account),
+                Err(error) => {
+                    for account in &mut accounts {
+                        free_runtime_snapshot_fields(account);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let (accounts, accounts_len) = ptr_from_vec(accounts);
+        Ok(Box::into_raw(Box::new(FfiMigrationRuntimeBatchV1 {
+            abi_version: ZCASHLC_MIGRATION_DELIVERY_ABI_VERSION,
+            accounts,
+            accounts_len,
+        })))
+    });
+    unwrap_exc_or_null(res)
+}
+
+fn free_runtime_snapshot_fields(snapshot: &mut FfiMigrationRuntimeSnapshotV1) {
+    free_ptr_from_vec_with(snapshot.claims, snapshot.claims_len, |claim| {
+        free_claim_summary_fields(claim)
+    });
+    snapshot.claims = ptr::null_mut();
+    snapshot.claims_len = 0;
+    if !snapshot.run_handle.is_null() {
+        drop(unsafe { Box::from_raw(snapshot.run_handle) });
+        snapshot.run_handle = ptr::null_mut();
+    }
+    free_ptr_from_vec_with(
+        snapshot.retained_runs,
+        snapshot.retained_runs_len,
+        free_retained_run_fields,
+    );
+    snapshot.retained_runs = ptr::null_mut();
+    snapshot.retained_runs_len = 0;
+}
+
+/// Frees one owning runtime DTO and its sanitized claims/run handle.
+///
+/// # Safety
+/// `snapshot` must be null or one pointer returned by `zcashlc_migration_runtime_snapshot_v1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_migration_runtime_snapshot_v1(
+    snapshot: *mut FfiMigrationRuntimeSnapshotV1,
+) {
+    if !snapshot.is_null() {
+        let mut snapshot = unsafe { Box::from_raw(snapshot) };
+        free_runtime_snapshot_fields(&mut snapshot);
+    }
+}
+
+/// Frees one atomic batch and every nested runtime allocation.
+///
+/// # Safety
+/// `batch` must be null or one pointer returned by `zcashlc_migration_runtime_batch_v1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_migration_runtime_batch_v1(
+    batch: *mut FfiMigrationRuntimeBatchV1,
+) {
+    if !batch.is_null() {
+        let batch = unsafe { Box::from_raw(batch) };
+        free_ptr_from_vec_with(batch.accounts, batch.accounts_len, |snapshot| {
+            free_runtime_snapshot_fields(snapshot)
+        });
+    }
+}
+
+/// Returns a fresh owned clone of an immutable run capability.
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by this module.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_clone_run_handle_v1(
+    handle: *const FfiMigrationRunHandle,
+) -> *mut FfiMigrationRunHandle {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(handle.clone()))
+}
+
+/// Frees one opaque run capability. Null is a no-op.
+///
+/// # Safety
+/// A non-null pointer must have been returned by this module and not already freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_free_run_handle_v1(handle: *mut FfiMigrationRunHandle) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+unsafe fn checked_run_handle<'a>(
+    handle: *const FfiMigrationRunHandle,
+) -> anyhow::Result<&'a FfiMigrationRunHandle> {
+    let handle = unsafe { handle.as_ref() }.ok_or_else(|| anyhow!("run handle is null"))?;
+    if handle.abi_version != ZCASHLC_MIGRATION_DELIVERY_ABI_VERSION {
+        return Err(anyhow!("unsupported migration run handle version"));
+    }
+    Ok(handle)
+}
+
+/// Returns `-1` when the run has a validated bound policy; otherwise returns the stable typed
+/// policy-validation-failure tag. Returns `-2` for an invalid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_run_policy_validation_failure_v1(
+    handle: *const FfiMigrationRunHandle,
+) -> i32 {
+    let res = catch_panic(|| {
+        let handle = unsafe { checked_run_handle(handle)? };
+        Ok(i32::from(policy_failure_tag(
+            handle.policy_validation_failure,
+        )))
+    });
+    unwrap_exc_or(res, -2)
+}
+
+/// Returns the validated transport tag (`0` direct TLS, `1` Tor onion, `2` loopback development),
+/// or `-1` when no policy is bound / the handle is invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_run_submission_transport_v1(
+    handle: *const FfiMigrationRunHandle,
+) -> i32 {
+    let res = catch_panic(|| {
+        let handle = unsafe { checked_run_handle(handle)? };
+        Ok(handle.submission_transport.map(i32::from).unwrap_or(-1))
+    });
+    unwrap_exc_or(res, -1)
+}
+
+/// Copies the exact Rust-normalized submission endpoint, or returns an empty optional slice when
+/// no validated policy is bound.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_run_submission_endpoint_v1(
+    handle: *const FfiMigrationRunHandle,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let handle = unsafe { checked_run_handle(handle)? };
+        Ok(match handle.submission_endpoint.as_ref() {
+            Some(endpoint) => ffi::BoxedSlice::some(endpoint.as_bytes().to_vec()),
+            None => ffi::BoxedSlice::none(),
+        })
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Returns a fresh owned clone of an exact immutable claim capability.
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by this module.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_clone_claim_handle_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let handle = unsafe { checked_claim_handle(handle)? };
+        Ok(Box::into_raw(Box::new(handle.clone())))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Frees one opaque claim capability. Null is a no-op.
+///
+/// # Safety
+/// A non-null pointer must have been returned by this module and not already freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_free_claim_handle_v1(
+    handle: *mut FfiMigrationClaimHandle,
+) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+unsafe fn checked_claim_handle<'a>(
+    handle: *const FfiMigrationClaimHandle,
+) -> anyhow::Result<&'a FfiMigrationClaimHandle> {
+    let handle = unsafe { handle.as_ref() }.ok_or_else(|| anyhow!("claim handle is null"))?;
+    if handle.abi_version != ZCASHLC_MIGRATION_DELIVERY_ABI_VERSION {
+        return Err(anyhow!("unsupported migration claim handle version"));
+    }
+    Ok(handle)
+}
+
+/// Returns a fresh owned run capability carrying the claim's latest revision.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_run_handle_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| {
+        let handle = unsafe { checked_claim_handle(handle)? };
+        Ok(Box::into_raw(Box::new(handle.run.clone())))
+    });
+    unwrap_exc_or_null(res)
+}
+
+unsafe fn claim_bytes(
+    handle: *const FfiMigrationClaimHandle,
+    select: impl FnOnce(&FfiMigrationClaimHandle) -> Option<&[u8]> + std::panic::UnwindSafe,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let handle = unsafe { checked_claim_handle(handle)? };
+        Ok(match select(handle) {
+            Some(bytes) => ffi::BoxedSlice::some(bytes.to_vec()),
+            None => ffi::BoxedSlice::none(),
+        })
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Copies the post-commit canonical immediate wallet proposal, if this handle owns one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_proposal_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> *mut ffi::BoxedSlice {
+    unsafe { claim_bytes(handle, |handle| handle.proposal.as_deref()) }
+}
+
+/// Copies exact PCZT bytes already staged before external exposure, if present.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_external_signing_pczt_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> *mut ffi::BoxedSlice {
+    unsafe { claim_bytes(handle, |handle| handle.external_signing_pczt.as_deref()) }
+}
+
+/// Copies exact canonical merged signed-PCZT bytes, if present.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_signed_pczt_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> *mut ffi::BoxedSlice {
+    unsafe { claim_bytes(handle, |handle| handle.signed_pczt.as_deref()) }
+}
+
+/// Copies exact network transaction bytes, if materialization is complete.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_exact_transaction_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> *mut ffi::BoxedSlice {
+    unsafe { claim_bytes(handle, |handle| handle.exact_transaction.as_deref()) }
+}
+
+/// Copies the exact transaction id, if materialization is complete.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_txid_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> *mut ffi::BoxedSlice {
+    unsafe {
+        claim_bytes(handle, |handle| {
+            handle.txid.as_ref().map(<[u8; 32]>::as_slice)
+        })
+    }
+}
+
+/// Returns the stable claim-status tag, or `-1` on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_status_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> i32 {
+    let res = catch_panic(|| {
+        let handle = unsafe { checked_claim_handle(handle)? };
+        Ok(i32::from(claim_status_tag(handle.status)))
+    });
+    unwrap_exc_or(res, -1)
+}
+
+/// Returns the consensus expiry height, or `-1` on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_expiry_height_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> i64 {
+    let res = catch_panic(|| {
+        let handle = unsafe { checked_claim_handle(handle)? };
+        Ok(i64::from(u32::from(handle.expiry_height)))
+    });
+    unwrap_exc_or(res, -1)
+}
+
+/// Returns the consensus branch id sealed into the claim's canonical Rust evidence, or `-1` when
+/// the handle or its evidence is invalid.
+///
+/// Swift uses this typed projection only for selected-endpoint preflight. It never infers the
+/// transaction branch from the expiry height (an upgrade can activate inside the expiry window),
+/// and it never parses or accepts caller-authored proposal or transaction bytes. Scheduled claims
+/// read the branch from their canonical PCZT; immediate claims read it from their sealed proposal.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_consensus_branch_id_v1(
+    handle: *const FfiMigrationClaimHandle,
+) -> i64 {
+    let res = catch_panic(|| {
+        let handle = unsafe { checked_claim_handle(handle)? };
+        let branch_id = match &handle.evidence {
+            DeliveryArtifactEvidence::Scheduled(evidence) => {
+                let pczt = Pczt::parse(evidence.canonical_pczt())
+                    .map_err(|e| anyhow!("decoding sealed scheduled PCZT failed: {e:?}"))?;
+                BranchId::try_from(*pczt.global().consensus_branch_id()).map_err(|_| {
+                    anyhow!("sealed scheduled PCZT has an invalid consensus branch id")
+                })?
+            }
+            DeliveryArtifactEvidence::Immediate(evidence) => {
+                let proposal = ImmediateProposal::decode(evidence.canonical_proposal())
+                    .map_err(|e| anyhow!("decoding sealed immediate proposal failed: {e}"))?;
+                proposal.branch_id()
+            }
+        };
+        Ok(i64::from(u32::from(branch_id)))
+    });
+    unwrap_exc_or(res, -1)
+}
+
+fn ensure_handle_account(expected: &[u8; 16], actual: &[u8; 16]) -> anyhow::Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "migration capability belongs to a different account"
+        ))
+    }
+}
+
+fn scheduled_store(ctx: &mut CallCtx) -> anyhow::Result<PoolMigrations<&mut Connection>> {
+    PoolMigrations::for_account(&mut ctx.store_conn, ctx.account)
+        .map_err(|e| anyhow!("opening the account delivery store failed: {e}"))
+}
+
+fn scheduled_state<S: PoolMigrationRead>(store: &S) -> anyhow::Result<MigrationState>
+where
+    S::Error: std::fmt::Display,
+{
+    store
+        .get_migration()
+        .map_err(|e| anyhow!("reading canonical migration state failed: {e}"))?
+        .ok_or_else(|| anyhow!("no canonical scheduled migration is stored"))
+}
+
+fn policy_from_transport_intent(
+    network: &NetworkParams,
+    transport_tag: u8,
+    endpoint: &str,
+) -> Result<SubmissionPolicy, PolicyValidationFailure> {
+    let transport = match transport_tag {
+        0 => DirectTlsEndpoint::try_from(endpoint.to_owned()).map(SubmissionTransport::DirectTls),
+        1 => TorOnionEndpoint::try_from(endpoint.to_owned()).map(SubmissionTransport::TorOnion),
+        2 => LoopbackDevelopmentEndpoint::try_from(endpoint.to_owned())
+            .map(SubmissionTransport::LoopbackDevelopment),
+        _ => return Err(PolicyValidationFailure::InvalidEncoding),
+    }
+    .map_err(|_| PolicyValidationFailure::InvalidEncoding)?;
+    let context = SubmissionContext::from_parameters(network);
+    SubmissionPolicy::validate(SubmissionPolicyRequest::new(context, transport), context)
+}
+
+fn policy_from_run_handle(
+    network: &NetworkParams,
+    handle: &FfiMigrationRunHandle,
+) -> anyhow::Result<SubmissionPolicy> {
+    let transport = handle
+        .submission_transport
+        .ok_or_else(|| anyhow!("the migration run has no validated submission transport"))?;
+    let endpoint = handle
+        .submission_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow!("the migration run has no validated submission endpoint"))?;
+    let policy = policy_from_transport_intent(network, transport, endpoint).map_err(|failure| {
+        anyhow!("the persisted migration submission policy is invalid: {failure:?}")
+    })?;
+    if handle.policy_fingerprint != Some(policy.fingerprint()) {
+        return Err(anyhow!(
+            "the migration run handle carries inconsistent submission-policy evidence"
+        ));
+    }
+    Ok(policy)
+}
+
+fn signer_ownership(tag: u8) -> anyhow::Result<SignerOwnership> {
+    match tag {
+        0 => Ok(SignerOwnership::Sdk),
+        1 => Ok(SignerOwnership::External),
+        _ => Err(anyhow!("unknown migration signer ownership tag {tag}")),
+    }
+}
+
+fn submission_outcome(tag: u8) -> anyhow::Result<SubmissionOutcome> {
+    match tag {
+        0 => Ok(SubmissionOutcome::Accepted),
+        1 => Ok(SubmissionOutcome::KnownUnsent),
+        2 => Ok(SubmissionOutcome::Unknown),
+        _ => Err(anyhow!("unknown migration submission outcome tag {tag}")),
+    }
+}
+
+fn delivery_failure(tag: u8) -> anyhow::Result<DeliveryFailureReason> {
+    match tag {
+        0 => Ok(DeliveryFailureReason::MaterializationFailed),
+        1 => Ok(DeliveryFailureReason::MaterializationLeaseExpired),
+        2 => Ok(DeliveryFailureReason::SigningCancelled),
+        3 => Ok(DeliveryFailureReason::TransportSetupFailed),
+        4 => Ok(DeliveryFailureReason::TransportDidNotBegin),
+        5 => Ok(DeliveryFailureReason::SubmissionLeaseExpired),
+        6 => Ok(DeliveryFailureReason::TransportOutcomeUnknown),
+        _ => Err(anyhow!("unknown migration delivery failure tag {tag}")),
+    }
+}
+
+fn required_policy_fingerprint(
+    handle: &FfiMigrationRunHandle,
+) -> anyhow::Result<PolicyFingerprint> {
+    handle
+        .policy_fingerprint
+        .ok_or_else(|| anyhow!("the migration run has no validated submission policy"))
+}
+
+fn required_claim_token(handle: &FfiMigrationClaimHandle) -> anyhow::Result<ClaimToken> {
+    handle
+        .token
+        .ok_or_else(|| anyhow!("the migration artifact has no live claim token"))
+}
+
+unsafe fn require_run<'a>(
+    ctx: &CallCtx,
+    handle: *const FfiMigrationRunHandle,
+) -> anyhow::Result<&'a FfiMigrationRunHandle> {
+    let handle = unsafe { checked_run_handle(handle)? };
+    ensure_handle_account(&ctx.account_bytes, &handle.account_uuid)?;
+    Ok(handle)
+}
+
+unsafe fn require_scheduled_run<'a>(
+    ctx: &CallCtx,
+    handle: *const FfiMigrationRunHandle,
+) -> anyhow::Result<&'a FfiMigrationRunHandle> {
+    let handle = unsafe { require_run(ctx, handle)? };
+    if handle.lane != DeliveryLane::Scheduled {
+        return Err(anyhow!(
+            "a scheduled delivery operation received an immediate run handle"
+        ));
+    }
+    Ok(handle)
+}
+
+unsafe fn require_claim<'a>(
+    ctx: &CallCtx,
+    handle: *const FfiMigrationClaimHandle,
+) -> anyhow::Result<&'a FfiMigrationClaimHandle> {
+    let handle = unsafe { checked_claim_handle(handle)? };
+    ensure_handle_account(&ctx.account_bytes, &handle.run.account_uuid)?;
+    Ok(handle)
+}
+
+/// Validates and binds raw transport intent entirely in Rust. A typed validation failure is
+/// persisted and returned as a fresh run handle with no bound policy; only storage/ABI errors
+/// return null. The input capability is borrowed and remains caller-owned.
+///
+/// # Safety
+/// Common database/account pointer rules apply; `run_handle` must be a live borrowed handle and
+/// `endpoint` must be a non-null UTF-8 C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_bind_submission_policy_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    run_handle_ptr: *const FfiMigrationRunHandle,
+    transport_tag: u8,
+    endpoint: *const c_char,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| {
+        if endpoint.is_null() {
+            return Err(anyhow!("submission endpoint is null"));
+        }
+        let endpoint = unsafe { CStr::from_ptr(endpoint) }
+            .to_str()
+            .map_err(|e| anyhow!("submission endpoint is not UTF-8: {e}"))?;
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_scheduled_run(&ctx, run_handle_ptr)? };
+        let expected_revision = handle.revision;
+        let run_identity = handle.run_identity;
+        let policy = policy_from_transport_intent(&ctx.network, transport_tag, endpoint);
+        let account_uuid = ctx.account_bytes;
+        let mut store = scheduled_store(&mut ctx)?;
+        let state = scheduled_state(&store)?;
+        let snapshot = match policy {
+            Ok(policy) => store
+                .bind_submission_policy(&state, expected_revision, run_identity, &policy)
+                .map_err(|e| anyhow!("binding migration submission policy failed: {e}"))?,
+            Err(failure) => store
+                .record_policy_validation_failure(&state, expected_revision, run_identity, failure)
+                .map_err(|e| anyhow!("recording migration policy failure failed: {e}"))?,
+        };
+        Ok(Box::into_raw(Box::new(run_handle(account_uuid, &snapshot))))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Atomically derives and reserves an immediate Orchard-to-Ironwood proposal, binds its validated
+/// submission policy, and acquires the initial bounded materialization claim. Proposal bytes are
+/// unavailable to the host until this call commits successfully.
+///
+/// # Safety
+/// Common database/account pointer rules apply; `endpoint` must be a non-null UTF-8 C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_reserve_immediate_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    signer_tag: u8,
+    transport_tag: u8,
+    endpoint: *const c_char,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        if endpoint.is_null() {
+            return Err(anyhow!("submission endpoint is null"));
+        }
+        let endpoint = unsafe { CStr::from_ptr(endpoint) }
+            .to_str()
+            .map_err(|e| anyhow!("submission endpoint is not UTF-8: {e}"))?;
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let signer = signer_ownership(signer_tag)?;
+        let policy = policy_from_transport_intent(&ctx.network, transport_tag, endpoint)
+            .map_err(|failure| anyhow!("immediate submission policy is invalid: {failure:?}"))?;
+        let artifact = ImmediateMigrationDeliveryStore::reserve_immediate_delivery(
+            &mut ctx.wallet,
+            ImmediateMigrationIntent::new(ctx.account, signer),
+            &policy,
+            lease_duration(ClaimKind::Materialization),
+        )
+        .map_err(|e| anyhow!("reserving immediate migration delivery failed: {e}"))?;
+        let artifact_identity = DeliveryArtifactIdentity::Immediate(artifact.evidence().identity());
+        let handle = claim_handle(ctx.account_bytes, artifact.snapshot(), artifact_identity)?;
+        Ok(Box::into_raw(Box::new(handle)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Acquires bounded materialization authority for one canonical scheduled transaction.
+///
+/// A null return with no last error means no claim was eligible. Lease duration is selected by
+/// Rust and never crosses the ABI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_materialization_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    run_handle_ptr: *const FfiMigrationRunHandle,
+    transaction_id: u32,
+    signer_tag: u8,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_scheduled_run(&ctx, run_handle_ptr)? };
+        let policy_fingerprint = required_policy_fingerprint(handle)?;
+        let signer = signer_ownership(signer_tag)?;
+        let account_uuid = ctx.account_bytes;
+        let mut store = scheduled_store(&mut ctx)?;
+        let state = scheduled_state(&store)?;
+        let id = MigrationTxId::new(transaction_id);
+        let evidence = scheduled_artifact_evidence(&state, id)
+            .map(DeliveryArtifactEvidence::Scheduled)
+            .ok_or_else(|| anyhow!("scheduled migration transaction {transaction_id} not found"))?;
+        let artifact_identity = evidence.identity();
+        let Some(snapshot) = store
+            .claim_materialization(
+                &state,
+                handle.revision,
+                handle.run_identity,
+                &evidence,
+                signer,
+                lease_duration(ClaimKind::Materialization),
+                policy_fingerprint,
+            )
+            .map_err(|e| anyhow!("claiming migration materialization failed: {e}"))?
+        else {
+            return Ok(ptr::null_mut());
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+fn prove_immediate_pczt(pczt: Pczt, expected_branch_id: BranchId) -> anyhow::Result<Pczt> {
+    let branch_id = BranchId::try_from(*pczt.global().consensus_branch_id())
+        .map_err(|_| anyhow!("immediate PCZT has an invalid consensus branch id"))?;
+    if branch_id != expected_branch_id {
+        return Err(anyhow!(
+            "immediate PCZT consensus branch differs from sealed proposal evidence"
+        ));
+    }
+
+    let mut prover = Prover::new(pczt);
+    if prover.requires_orchard_proof() {
+        let circuit_version =
+            zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
+                branch_id,
+                orchard::ValuePool::Orchard,
+            )
+            .ok_or_else(|| anyhow!("immediate PCZT branch does not support Orchard"))?
+            .circuit_version();
+        prover = prover
+            .create_orchard_proof(cached_orchard_proving_key(circuit_version))
+            .map_err(|e| anyhow!("creating immediate Orchard proof failed: {e:?}"))?;
+    }
+    if prover.requires_ironwood_proof() {
+        prover = prover
+            .create_ironwood_proof(cached_orchard_proving_key(
+                orchard::circuit::OrchardCircuitVersion::PostNu6_3,
+            ))
+            .map_err(|e| anyhow!("creating immediate Ironwood proof failed: {e:?}"))?;
+    }
+    if prover.requires_sapling_proofs() {
+        return Err(anyhow!(
+            "reserved Orchard-to-Ironwood proposal unexpectedly requires Sapling proofs"
+        ));
+    }
+    Ok(prover.finish())
+}
+
+/// Builds and proves the exact PCZT sealed by an immediate external-signer claim, then stages it
+/// durably before returning a handle that can expose those bytes to the signer.
+///
+/// Swift supplies no proposal or PCZT. The proposal target, consensus branch, expiry, sources,
+/// destination, amount, and fee all come from the post-reservation Rust evidence. The returned
+/// handle is the first point at which external-signing bytes are accessible.
+///
+/// # Safety
+/// Common database/account pointer rules apply. `claim_handle_ptr` must be a live borrowed claim
+/// handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_prepare_immediate_external_signing_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        if handle.signer_ownership != SignerOwnership::External {
+            return Err(anyhow!(
+                "immediate external preparation requires an external-signer claim"
+            ));
+        }
+        if handle.claim_kind != Some(ClaimKind::Materialization) {
+            return Err(anyhow!(
+                "immediate external preparation requires a materialization claim"
+            ));
+        }
+        let evidence = match &handle.evidence {
+            DeliveryArtifactEvidence::Immediate(evidence) => evidence.clone(),
+            DeliveryArtifactEvidence::Scheduled(_) => {
+                return Err(anyhow!(
+                    "immediate external preparation received a scheduled claim"
+                ));
+            }
+        };
+        let envelope = ImmediateProposal::decode(evidence.canonical_proposal())
+            .map_err(|e| anyhow!("decoding sealed immediate proposal envelope failed: {e}"))?;
+        let artifact_identity = DeliveryArtifactIdentity::Immediate(evidence.identity());
+        if handle.artifact_identity != artifact_identity
+            || handle.expiry_height != envelope.expiry_height()
+            || BranchId::for_height(&ctx.network, envelope.target_height()) != envelope.branch_id()
+        {
+            return Err(anyhow!(
+                "immediate claim identity, expiry, or branch does not match sealed evidence"
+            ));
+        }
+        let proposal_bytes = handle
+            .proposal
+            .clone()
+            .ok_or_else(|| anyhow!("immediate claim omitted its post-commit wallet proposal"))?;
+        if proposal_bytes != envelope.payload().as_bytes() {
+            return Err(anyhow!(
+                "immediate claim proposal payload differs from sealed evidence"
+            ));
+        }
+        let token = required_claim_token(handle)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let expected_revision = handle.run.revision;
+        let run_identity = handle.run.run_identity;
+        let account = ctx.account;
+        let account_uuid = ctx.account_bytes;
+        let network = ctx.network;
+        let target_height = envelope.target_height();
+        let expiry_height = envelope.expiry_height();
+        let branch_id = envelope.branch_id();
+
+        let snapshot = ctx.wallet.transactionally(|wallet| -> anyhow::Result<_> {
+            let proposal = ProtoProposal::decode(proposal_bytes.as_slice())
+                .map_err(|e| anyhow!("decoding reserved immediate proposal failed: {e}"))?
+                .try_into_standard_proposal(&network, wallet)
+                .map_err(|e| anyhow!("reconstructing reserved immediate proposal failed: {e:?}"))?;
+            if proposal.steps().len() != 1
+                || BlockHeight::from(proposal.min_target_height()) != target_height
+                || ProtoProposal::from_standard_proposal(&proposal).encode_to_vec()
+                    != proposal_bytes
+            {
+                return Err(anyhow!(
+                    "reserved immediate proposal differs from its canonical sealed payload"
+                ));
+            }
+            let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
+                wallet,
+                &network,
+                account,
+                OvkPolicy::Sender,
+                &proposal,
+                Some(expiry_height),
+                BundlePadding::DEFAULT,
+            )
+            .map_err(|e| anyhow!("building reserved immediate PCZT failed: {e}"))?;
+            let pczt = prove_immediate_pczt(pczt, branch_id)?;
+            let pczt = ExternalSigningPczt::parse(
+                pczt.serialize()
+                    .map_err(|e| anyhow!("serializing immediate PCZT failed: {e:?}"))?,
+            )
+            .map_err(|e| anyhow!("validating immediate external-signing PCZT failed: {e}"))?;
+            ImmediateMigrationDeliveryStore::stage_immediate_external_signing_pczt(
+                wallet,
+                &account,
+                expected_revision,
+                run_identity,
+                evidence.identity(),
+                token,
+                &pczt,
+                policy_fingerprint,
+            )
+            .map_err(|e| anyhow!("staging immediate external-signing PCZT failed: {e}"))
+        })?;
+
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Stages exact PCZT bytes durably before an external signer can observe them.
+///
+/// For scheduled migration artifacts, `pczt_ptr` must be null and `pczt_len` zero: Rust derives
+/// the exact canonical unsigned PCZT from the claimed generation and persists it under the live
+/// token before the returned handle can expose bytes. Immediate claims are rejected before the
+/// pointer is read; they use [`zcashlc_migration_prepare_immediate_external_signing_v1`] so no
+/// host-authored PCZT can cross the reservation boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_stage_external_signing_pczt_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+    pczt_ptr: *const u8,
+    pczt_len: usize,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        if handle.signer_ownership != SignerOwnership::External {
+            return Err(anyhow!("external PCZT requires an external-signer claim"));
+        }
+        let token = required_claim_token(handle)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(identity) => {
+                if !pczt_ptr.is_null() || pczt_len != 0 {
+                    return Err(anyhow!(
+                        "scheduled external signing rejects caller-supplied PCZT bytes"
+                    ));
+                }
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                let evidence = scheduled_artifact_evidence(&state, identity.transaction_id())
+                    .ok_or_else(|| anyhow!("the claimed scheduled transaction is absent"))?;
+                if DeliveryArtifactIdentity::Scheduled(evidence.identity()) != artifact_identity {
+                    return Err(anyhow!(
+                        "the external-signing claim belongs to an archived transaction attempt"
+                    ));
+                }
+                let pczt = ExternalSigningPczt::parse(evidence.canonical_pczt().to_vec())
+                    .map_err(|e| anyhow!("canonical external-signing PCZT is invalid: {e}"))?;
+                store
+                    .stage_external_signing_pczt(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        artifact_identity,
+                        token,
+                        &pczt,
+                        policy_fingerprint,
+                    )
+                    .map_err(|e| anyhow!("staging external-signing PCZT failed: {e}"))?
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                let _ = identity;
+                return Err(anyhow!(
+                    "immediate external signing must use zcashlc_migration_prepare_immediate_external_signing_v1; caller-supplied PCZT bytes are not authorized"
+                ));
+            }
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Validates a signer response as the canonical merge of the exact staged PCZT, then stages that
+/// merge durably. A late response never creates a replacement artifact.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_stage_signed_pczt_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+    signer_pczt_ptr: *const u8,
+    signer_pczt_len: usize,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        let staged = handle
+            .external_signing_pczt
+            .as_ref()
+            .ok_or_else(|| anyhow!("no exact external-signing PCZT is staged"))?;
+        let staged = ExternalSigningPczt::parse(staged.clone())
+            .map_err(|e| anyhow!("staged external-signing PCZT is corrupt: {e}"))?;
+        let signed = staged
+            .merge_signed(unsafe { slice_or_empty(signer_pczt_ptr, signer_pczt_len) }.to_vec())
+            .map_err(|e| {
+                anyhow!("external signer response is not bound to the staged PCZT: {e}")
+            })?;
+        let token = required_claim_token(handle)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(_) => {
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                store
+                    .stage_signed_pczt(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        artifact_identity,
+                        token,
+                        &signed,
+                        policy_fingerprint,
+                    )
+                    .map_err(|e| anyhow!("staging signed migration PCZT failed: {e}"))?
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                ImmediateMigrationDeliveryStore::stage_immediate_signed_pczt(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    identity,
+                    token,
+                    &signed,
+                    policy_fingerprint,
+                )
+                .map_err(|e| anyhow!("staging immediate signed PCZT failed: {e}"))?
+            }
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Finalizes the exact signed PCZT bound to an immediate external-signer claim, stores the
+/// resulting wallet transaction, and stages exact delivery evidence in one SQLite transaction.
+///
+/// The signer response must first pass [`zcashlc_migration_stage_signed_pczt_v1`], which persists
+/// the canonical merge against the Rust-built PCZT. This call accepts no PCZT or transaction bytes
+/// from Swift; it consumes only that opaque claim and exposes exact network bytes only through the
+/// fresh post-commit handle.
+///
+/// # Safety
+/// Common database/account pointer rules apply. `claim_handle_ptr` must be a live borrowed claim
+/// handle returned after staging a signer response.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_finalize_immediate_external_signing_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        if handle.signer_ownership != SignerOwnership::External {
+            return Err(anyhow!(
+                "immediate external finalization requires an external-signer claim"
+            ));
+        }
+        if handle.claim_kind != Some(ClaimKind::Materialization) {
+            return Err(anyhow!(
+                "immediate external finalization requires a materialization claim"
+            ));
+        }
+        let evidence = match &handle.evidence {
+            DeliveryArtifactEvidence::Immediate(evidence) => evidence.clone(),
+            DeliveryArtifactEvidence::Scheduled(_) => {
+                return Err(anyhow!(
+                    "immediate external finalization received a scheduled claim"
+                ));
+            }
+        };
+        let envelope = ImmediateProposal::decode(evidence.canonical_proposal())
+            .map_err(|e| anyhow!("decoding sealed immediate proposal envelope failed: {e}"))?;
+        let artifact_identity = DeliveryArtifactIdentity::Immediate(evidence.identity());
+        if handle.artifact_identity != artifact_identity
+            || handle.expiry_height != envelope.expiry_height()
+            || BranchId::for_height(&ctx.network, envelope.target_height()) != envelope.branch_id()
+        {
+            return Err(anyhow!(
+                "immediate claim identity, expiry, or branch does not match sealed evidence"
+            ));
+        }
+        let proposal_bytes = handle
+            .proposal
+            .clone()
+            .ok_or_else(|| anyhow!("immediate claim omitted its post-commit wallet proposal"))?;
+        if proposal_bytes != envelope.payload().as_bytes() {
+            return Err(anyhow!(
+                "immediate claim proposal payload differs from sealed evidence"
+            ));
+        }
+        let signed_pczt = handle
+            .signed_pczt
+            .as_ref()
+            .ok_or_else(|| anyhow!("immediate claim has no staged signer merge"))?;
+        let pczt = Pczt::parse(signed_pczt)
+            .map_err(|e| anyhow!("staged immediate signed PCZT is corrupt: {e:?}"))?;
+        let pczt_branch_id = BranchId::try_from(*pczt.global().consensus_branch_id())
+            .map_err(|_| anyhow!("signed immediate PCZT has an invalid consensus branch id"))?;
+        if pczt_branch_id != envelope.branch_id() {
+            return Err(anyhow!(
+                "signed immediate PCZT branch differs from sealed proposal evidence"
+            ));
+        }
+        let prover = Prover::new(pczt);
+        if prover.requires_orchard_proof()
+            || prover.requires_ironwood_proof()
+            || prover.requires_sapling_proofs()
+        {
+            return Err(anyhow!(
+                "signed immediate PCZT lost proofs that were staged before signer exposure"
+            ));
+        }
+        let pczt = prover.finish();
+        let token = required_claim_token(handle)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let expected_revision = handle.run.revision;
+        let run_identity = handle.run.run_identity;
+        let account = ctx.account;
+        let account_uuid = ctx.account_bytes;
+        let network = ctx.network;
+        let target_height = envelope.target_height();
+
+        let snapshot = ctx.wallet.transactionally(|wallet| -> anyhow::Result<_> {
+            let proposal = ProtoProposal::decode(proposal_bytes.as_slice())
+                .map_err(|e| anyhow!("decoding reserved immediate proposal failed: {e}"))?
+                .try_into_standard_proposal(&network, wallet)
+                .map_err(|e| anyhow!("reconstructing reserved immediate proposal failed: {e:?}"))?;
+            if proposal.steps().len() != 1
+                || BlockHeight::from(proposal.min_target_height()) != target_height
+                || ProtoProposal::from_standard_proposal(&proposal).encode_to_vec()
+                    != proposal_bytes
+            {
+                return Err(anyhow!(
+                    "reserved immediate proposal differs from its canonical sealed payload"
+                ));
+            }
+            let txid = extract_and_store_transaction_from_pczt::<_, ()>(wallet, pczt, None, None)
+                .map_err(|e| anyhow!("extracting signed immediate PCZT failed: {e:?}"))?;
+            let transaction = wallet
+                .get_transaction(txid)
+                .map_err(|e| anyhow!("reading finalized immediate transaction failed: {e}"))?
+                .ok_or_else(|| {
+                    anyhow!("finalized immediate transaction was not stored atomically")
+                })?;
+            let exact = exact_immediate_transaction(&evidence, &transaction).map_err(|e| {
+                anyhow!("binding finalized transaction to reserved evidence failed: {e}")
+            })?;
+            ImmediateMigrationDeliveryStore::stage_immediate_transaction(
+                wallet,
+                &account,
+                expected_revision,
+                run_identity,
+                token,
+                &exact,
+                policy_fingerprint,
+            )
+            .map_err(|e| anyhow!("staging finalized immediate transaction failed: {e}"))
+        })?;
+
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+fn scheduled_identity_in_state(
+    state: &MigrationState,
+    transaction_id: MigrationTxId,
+) -> anyhow::Result<DeliveryArtifactIdentity> {
+    scheduled_artifact_evidence(state, transaction_id)
+        .map(|evidence| DeliveryArtifactIdentity::Scheduled(evidence.identity()))
+        .ok_or_else(|| {
+            anyhow!(
+                "scheduled migration transaction {} is absent from canonical state",
+                u32::from(transaction_id)
+            )
+        })
+}
+
+/// Validates the durable generation authority carried by an expired-transfer handle.
+///
+/// Lease tokens are deliberately irrelevant: they are cleared when an attempt terminalizes. The
+/// immutable `(row id, attempt fingerprint)` must still identify the current canonical attempt,
+/// and the handle itself must have observed a positively expired terminal claim status. This
+/// rejects both a formerly-live handle and a terminal handle replayed after a same-row rebuild.
+fn validate_expired_rebuild_generation(
+    artifact_identity: DeliveryArtifactIdentity,
+    status: ClaimStatus,
+    state: &MigrationState,
+) -> anyhow::Result<zcash_pool_migration::delivery::ScheduledArtifactIdentity> {
+    let DeliveryArtifactIdentity::Scheduled(prior_artifact) = artifact_identity else {
+        return Err(anyhow!(
+            "expired-transfer rebuild requires a scheduled claim"
+        ));
+    };
+    if !matches!(
+        status,
+        ClaimStatus::ExpiredUnmined | ClaimStatus::ExternalSigningExpiredUnmined
+    ) {
+        return Err(anyhow!(
+            "expired-transfer rebuild requires a positively expired unmined claim"
+        ));
+    }
+    if scheduled_identity_in_state(state, prior_artifact.transaction_id())? != artifact_identity {
+        return Err(anyhow!(
+            "the expired claim belongs to an archived or replaced transaction attempt"
+        ));
+    }
+    Ok(prior_artifact)
+}
+
+/// Applies the exact already-staged external signer merge to scheduled canonical state under the
+/// same live materialization token. Swift supplies no successor state, revision, row identity, or
+/// PCZT bytes; Rust derives the sole AwaitingSignature -> Signed successor from the opaque claim.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_advance_external_signature_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        let DeliveryArtifactIdentity::Scheduled(identity) = handle.artifact_identity else {
+            return Err(anyhow!(
+                "canonical signature advancement requires a scheduled claim"
+            ));
+        };
+        if handle.claim_kind != Some(ClaimKind::Materialization) {
+            return Err(anyhow!(
+                "canonical signature advancement requires a materialization claim"
+            ));
+        }
+        let signed_pczt = handle
+            .signed_pczt
+            .as_ref()
+            .ok_or_else(|| anyhow!("the claim has no exact staged signed PCZT"))?;
+        let token = required_claim_token(handle)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let account_uuid = ctx.account_bytes;
+        let mut store = scheduled_store(&mut ctx)?;
+        let state = scheduled_state(&store)?;
+        if scheduled_identity_in_state(&state, identity.transaction_id())?
+            != handle.artifact_identity
+        {
+            return Err(anyhow!(
+                "the scheduled signer callback belongs to a replaced transaction attempt"
+            ));
+        }
+        let mut successor = state.clone();
+        if !successor.apply_signature(identity.transaction_id(), signed_pczt.clone()) {
+            return Err(anyhow!(
+                "the scheduled transaction is not awaiting this external signature"
+            ));
+        }
+        let transition = CanonicalMaterializationTransition::new(
+            handle.run.revision,
+            handle.run.run_identity,
+            &state,
+            handle.artifact_identity,
+            token,
+            policy_fingerprint,
+            successor,
+        )
+        .map_err(|e| anyhow!("invalid canonical signature transition: {e:?}"))?;
+        let receipt = store
+            .advance_canonical_materialization(transition)
+            .map_err(|e| anyhow!("advancing canonical external signature failed: {e}"))?;
+        let artifact_identity =
+            scheduled_identity_in_state(receipt.canonical_state(), identity.transaction_id())?;
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            receipt.delivery(),
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Proves one exact scheduled materialization claim with the wallet-owned prover, advances the
+/// sole Signed -> Proved canonical successor under CAS, derives the exact network transaction, and
+/// stages those bytes before returning them through the fresh claim handle. A restored Proved
+/// claim resumes at exact-byte staging without reproving or replanning.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_prove_claim_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        let DeliveryArtifactIdentity::Scheduled(identity) = handle.artifact_identity else {
+            return Err(anyhow!("wallet proving requires a scheduled claim"));
+        };
+        if handle.claim_kind != Some(ClaimKind::Materialization) {
+            return Err(anyhow!("wallet proving requires a materialization claim"));
+        }
+        let token = required_claim_token(handle)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let transaction_id = identity.transaction_id();
+        let state = {
+            let store = scheduled_store(&mut ctx)?;
+            scheduled_state(&store)?
+        };
+        if scheduled_identity_in_state(&state, transaction_id)? != handle.artifact_identity {
+            return Err(anyhow!(
+                "the proving claim belongs to a replaced scheduled transaction attempt"
+            ));
+        }
+
+        let (canonical_state, delivery) = match state
+            .transactions()
+            .iter()
+            .find(|transaction| transaction.id() == transaction_id)
+            .map(MigrationTransaction::state)
+        {
+            Some(MigrationTxState::Signed) => {
+                let mut successor = state.clone();
+                let transaction = successor
+                    .transactions()
+                    .iter()
+                    .find(|transaction| transaction.id() == transaction_id)
+                    .expect("identity validation found the scheduled transaction");
+                let natural_anchor = match transaction.kind() {
+                    MigrationTxKind::Preparation { .. } => {
+                        Some(migration_finalize::natural_anchor_height(&ctx.wallet)?)
+                    }
+                    MigrationTxKind::Transfer { .. } => None,
+                };
+                let fvk = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?
+                    .stored_orchard_fvk()?;
+                let mut prover = WalletMigrationProver::new(&mut ctx.wallet, ctx.account, fvk);
+                if migration_finalize::prove_due_transaction(
+                    &mut prover,
+                    &mut successor,
+                    transaction_id,
+                    natural_anchor,
+                )?
+                .is_none()
+                {
+                    return Ok(ptr::null_mut());
+                }
+                let transition = CanonicalMaterializationTransition::new(
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    &state,
+                    handle.artifact_identity,
+                    token,
+                    policy_fingerprint,
+                    successor,
+                )
+                .map_err(|e| anyhow!("invalid canonical proof transition: {e:?}"))?;
+                let receipt = scheduled_store(&mut ctx)?
+                    .advance_canonical_materialization(transition)
+                    .map_err(|e| anyhow!("advancing canonical migration proof failed: {e}"))?;
+                (
+                    receipt.canonical_state().clone(),
+                    receipt.delivery().clone(),
+                )
+            }
+            Some(MigrationTxState::Proved) => {
+                let snapshot = scheduled_store(&mut ctx)?
+                    .delivery_snapshot()
+                    .map_err(|e| anyhow!("reading proved delivery snapshot failed: {e}"))?
+                    .ok_or_else(|| anyhow!("proved canonical state has no delivery snapshot"))?;
+                if snapshot.revision() != handle.run.revision
+                    || snapshot.run_identity() != handle.run.run_identity
+                {
+                    return Err(anyhow!("the proved materialization handle is stale"));
+                }
+                let staged = snapshot
+                    .claims()
+                    .iter()
+                    .find(|claim| claim.artifact_identity() == handle.artifact_identity)
+                    .is_some_and(|claim| {
+                        claim.status() == ClaimStatus::Staged
+                            && claim.exact_transaction().is_some()
+                            && claim.txid().is_some()
+                    });
+                if !staged {
+                    return Err(anyhow!(
+                        "canonical migration is proved without atomically staged exact bytes; recovery is required"
+                    ));
+                }
+                (state, snapshot)
+            }
+            Some(other) => {
+                return Err(anyhow!(
+                    "scheduled transaction {} cannot be proved from state {}",
+                    u32::from(transaction_id),
+                    other.as_ref()
+                ));
+            }
+            None => return Err(anyhow!("scheduled proving transaction is absent")),
+        };
+
+        let artifact_identity = scheduled_identity_in_state(&canonical_state, transaction_id)?;
+        Ok(Box::into_raw(Box::new(claim_handle(
+            ctx.account_bytes,
+            &delivery,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Materializes the exact proposal already sealed by an immediate SDK-signer claim, stores the
+/// resulting wallet transaction, and stages its exact delivery evidence in one SQLite transaction.
+///
+/// The host supplies no proposal, sources, destination, amount, expiry, transaction bytes, or
+/// delivery identity. Rust reconstructs the post-reservation proposal from the opaque claim,
+/// applies the claim's immutable expiry, builds exactly one transaction with the wallet key, and
+/// asks the wallet store to validate the complete proposal/transaction binding before either the
+/// wallet transaction or delivery state can commit. Exact bytes become visible only through the
+/// fresh returned claim handle after that commit.
+///
+/// # Safety
+/// Common database/account pointer rules apply. `claim_handle_ptr` must be a live borrowed claim
+/// handle. `usk_ptr`, `spend_params`, and `output_params` must be non-null and valid for reads of
+/// their respective lengths for the duration of this call.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_materialize_immediate_sdk_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+    usk_ptr: *const u8,
+    usk_len: usize,
+    spend_params: *const u8,
+    spend_params_len: usize,
+    output_params: *const u8,
+    output_params_len: usize,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        if usk_ptr.is_null() {
+            return Err(anyhow!(
+                "immediate SDK materialization requires a spending key"
+            ));
+        }
+        if spend_params.is_null() || output_params.is_null() {
+            return Err(anyhow!(
+                "immediate SDK materialization requires Sapling parameter paths"
+            ));
+        }
+
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        if handle.signer_ownership != SignerOwnership::Sdk {
+            return Err(anyhow!(
+                "immediate SDK materialization requires an SDK-signer claim"
+            ));
+        }
+        if handle.claim_kind != Some(ClaimKind::Materialization) {
+            return Err(anyhow!(
+                "immediate SDK materialization requires a materialization claim"
+            ));
+        }
+        let evidence = match &handle.evidence {
+            DeliveryArtifactEvidence::Immediate(evidence) => evidence.clone(),
+            DeliveryArtifactEvidence::Scheduled(_) => {
+                return Err(anyhow!(
+                    "immediate SDK materialization received a scheduled claim"
+                ));
+            }
+        };
+        let envelope = ImmediateProposal::decode(evidence.canonical_proposal())
+            .map_err(|e| anyhow!("decoding sealed immediate proposal envelope failed: {e}"))?;
+        let artifact_identity = DeliveryArtifactIdentity::Immediate(evidence.identity());
+        if handle.artifact_identity != artifact_identity
+            || handle.expiry_height != envelope.expiry_height()
+            || BranchId::for_height(&ctx.network, envelope.target_height()) != envelope.branch_id()
+        {
+            return Err(anyhow!(
+                "immediate claim identity, expiry, or branch does not match sealed evidence"
+            ));
+        }
+        let proposal_bytes = handle
+            .proposal
+            .clone()
+            .ok_or_else(|| anyhow!("immediate claim omitted its post-commit wallet proposal"))?;
+        if proposal_bytes != envelope.payload().as_bytes() {
+            return Err(anyhow!(
+                "immediate claim proposal payload differs from sealed evidence"
+            ));
+        }
+        let token = required_claim_token(handle)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let expected_revision = handle.run.revision;
+        let run_identity = handle.run.run_identity;
+        let target_height = envelope.target_height();
+        let expiry_height = envelope.expiry_height();
+        let account = ctx.account;
+        let account_uuid = ctx.account_bytes;
+        let network = ctx.network;
+        let usk = unsafe { decode_usk(usk_ptr, usk_len)? };
+        let spend_params = Path::new(OsStr::from_bytes(unsafe {
+            slice::from_raw_parts(spend_params, spend_params_len)
+        }));
+        let output_params = Path::new(OsStr::from_bytes(unsafe {
+            slice::from_raw_parts(output_params, output_params_len)
+        }));
+        let prover = LocalTxProver::new(spend_params, output_params);
+
+        let snapshot = ctx.wallet.transactionally(|wallet| -> anyhow::Result<_> {
+            let proposal = ProtoProposal::decode(proposal_bytes.as_slice())
+                .map_err(|e| anyhow!("decoding reserved immediate proposal failed: {e}"))?
+                .try_into_standard_proposal(&network, wallet)
+                .map_err(|e| anyhow!("reconstructing reserved immediate proposal failed: {e:?}"))?;
+            if proposal.steps().len() != 1
+                || BlockHeight::from(proposal.min_target_height()) != target_height
+                || ProtoProposal::from_standard_proposal(&proposal).encode_to_vec()
+                    != proposal_bytes
+            {
+                return Err(anyhow!(
+                    "reserved immediate proposal differs from its canonical sealed payload"
+                ));
+            }
+
+            let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                wallet,
+                &network,
+                &prover,
+                &prover,
+                &SpendingKeys::from_unified_spending_key(usk),
+                OvkPolicy::Sender,
+                &proposal,
+                Some(expiry_height),
+            )
+            .map_err(|e| anyhow!("materializing reserved immediate proposal failed: {e}"))?;
+            if txids.len() != 1 {
+                return Err(anyhow!(
+                    "reserved immediate proposal materialized more than one transaction"
+                ));
+            }
+            let txid = *txids.first();
+            let transaction = wallet
+                .get_transaction(txid)
+                .map_err(|e| anyhow!("reading materialized immediate transaction failed: {e}"))?
+                .ok_or_else(|| {
+                    anyhow!("materialized immediate transaction was not stored atomically")
+                })?;
+            let exact = exact_immediate_transaction(&evidence, &transaction).map_err(|e| {
+                anyhow!("binding materialized transaction to reserved evidence failed: {e}")
+            })?;
+            ImmediateMigrationDeliveryStore::stage_immediate_transaction(
+                wallet,
+                &account,
+                expected_revision,
+                run_identity,
+                token,
+                &exact,
+                policy_fingerprint,
+            )
+            .map_err(|e| anyhow!("staging exact immediate transaction failed: {e}"))
+        })?;
+
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Retired raw-byte staging ABI retained only for binary compatibility.
+///
+/// Exact scheduled bytes are staged by [`zcashlc_migration_prove_claim_v1`], while exact immediate
+/// bytes are built, stored, and staged atomically by
+/// [`zcashlc_migration_materialize_immediate_sdk_v1`]. Accepting host-authored transaction bytes
+/// here would reopen a post-reservation mutation seam, so every call fails before reading caller
+/// memory or opening storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_stage_materialized_transaction_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+    transaction_ptr: *const u8,
+    transaction_len: usize,
+) -> *mut FfiMigrationClaimHandle {
+    let _ = (
+        db_data,
+        db_data_len,
+        account_uuid_bytes,
+        network_id,
+        claim_handle_ptr,
+        transaction_ptr,
+        transaction_len,
+    );
+    let res = catch_panic(|| {
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_stage_materialized_transaction_v1",
+        ))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Acquires the one-shot bounded submission capability for exact staged bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_submission_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(_) => {
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                store
+                    .claim_submission(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        artifact_identity,
+                        lease_duration(ClaimKind::Submission),
+                        policy_fingerprint,
+                    )
+                    .map_err(|e| anyhow!("claiming migration submission failed: {e}"))?
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                ImmediateMigrationDeliveryStore::claim_immediate_submission(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    identity,
+                    lease_duration(ClaimKind::Submission),
+                    policy_fingerprint,
+                )
+                .map_err(|e| anyhow!("claiming immediate migration submission failed: {e}"))?
+            }
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(ptr::null_mut());
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Acquires bounded resolution-only authority for an outcome-unknown artifact. The returned handle
+/// cannot authorize resubmission.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_claim_outcome_resolution_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(_) => {
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                store
+                    .claim_outcome_resolution(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        artifact_identity,
+                        lease_duration(ClaimKind::OutcomeResolution),
+                        policy_fingerprint,
+                    )
+                    .map_err(|e| anyhow!("claiming migration outcome resolution failed: {e}"))?
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                ImmediateMigrationDeliveryStore::claim_immediate_outcome_resolution(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    identity,
+                    lease_duration(ClaimKind::OutcomeResolution),
+                    policy_fingerprint,
+                )
+                .map_err(|e| {
+                    anyhow!("claiming immediate migration outcome resolution failed: {e}")
+                })?
+            }
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(ptr::null_mut());
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Resumes the same still-live Rust-generated claim. It never mints a replacement token.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_resume_claim_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        let token = required_claim_token(handle)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(_) => {
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                store
+                    .resume_claim(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        artifact_identity,
+                        token,
+                        policy_fingerprint,
+                    )
+                    .map_err(|e| anyhow!("resuming migration claim failed: {e}"))?
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                ImmediateMigrationDeliveryStore::resume_immediate_claim(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    identity,
+                    token,
+                    policy_fingerprint,
+                )
+                .map_err(|e| anyhow!("resuming immediate migration claim failed: {e}"))?
+            }
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(ptr::null_mut());
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Reacquires a fresh bounded materialization token for the same externally staged artifact after
+/// expiry/relaunch. Exact staged PCZT bytes, source reservations, and artifact identity are
+/// retained; this operation never replans.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_reacquire_external_signing_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        if handle.signer_ownership != SignerOwnership::External
+            || handle.external_signing_pczt.is_none()
+        {
+            return Err(anyhow!(
+                "external-signing reacquisition requires the same staged external artifact"
+            ));
+        }
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(_) => {
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                store
+                    .claim_materialization(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        &handle.evidence,
+                        SignerOwnership::External,
+                        lease_duration(ClaimKind::Materialization),
+                        policy_fingerprint,
+                    )
+                    .map_err(|e| {
+                        anyhow!("reacquiring scheduled external-signing claim failed: {e}")
+                    })?
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                ImmediateMigrationDeliveryStore::reacquire_immediate_external_signing(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    identity,
+                    lease_duration(ClaimKind::Materialization),
+                    policy_fingerprint,
+                )
+                .map_err(|e| anyhow!("reacquiring immediate external-signing claim failed: {e}"))?
+            }
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(ptr::null_mut());
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Renews a live claim using the bounded Rust-owned duration selected by its exact claim kind.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_renew_claim_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        let kind = handle
+            .claim_kind
+            .ok_or_else(|| anyhow!("the migration artifact has no renewable live claim"))?;
+        let token = required_claim_token(handle)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(_) => {
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                store
+                    .renew_claim(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        artifact_identity,
+                        token,
+                        lease_duration(kind),
+                        policy_fingerprint,
+                    )
+                    .map_err(|e| anyhow!("renewing migration claim failed: {e}"))?
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                ImmediateMigrationDeliveryStore::renew_immediate_claim(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    identity,
+                    token,
+                    lease_duration(kind),
+                    policy_fingerprint,
+                )
+                .map_err(|e| anyhow!("renewing immediate migration claim failed: {e}"))?
+            }
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(ptr::null_mut());
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Records exactly one typed transport outcome under a live submission capability.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_record_submission_outcome_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+    outcome_tag: u8,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        if handle.claim_kind != Some(ClaimKind::Submission) {
+            return Err(anyhow!("submission outcome requires a submission claim"));
+        }
+        let token = required_claim_token(handle)?;
+        let outcome = submission_outcome(outcome_tag)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(_) => {
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                store
+                    .record_submission_outcome(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        artifact_identity,
+                        token,
+                        outcome,
+                        policy_fingerprint,
+                    )
+                    .map_err(|e| anyhow!("recording migration submission outcome failed: {e}"))?
+                    .delivery()
+                    .clone()
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                ImmediateMigrationDeliveryStore::record_immediate_submission_outcome(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    identity,
+                    token,
+                    outcome,
+                    policy_fingerprint,
+                )
+                .map_err(|e| anyhow!("recording immediate submission outcome failed: {e}"))?
+            }
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Resolves chain evidence under an outcome-resolution claim without granting resubmission.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_reconcile_submission_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        if handle.claim_kind != Some(ClaimKind::OutcomeResolution) {
+            return Err(anyhow!(
+                "submission reconciliation requires an outcome-resolution claim"
+            ));
+        }
+        let token = required_claim_token(handle)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(_) => {
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                store
+                    .reconcile_submission(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        artifact_identity,
+                        token,
+                    )
+                    .map_err(|e| anyhow!("reconciling migration submission failed: {e}"))?
+                    .delivery()
+                    .clone()
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                ImmediateMigrationDeliveryStore::reconcile_immediate_submission(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    identity,
+                    token,
+                )
+                .map_err(|e| anyhow!("reconciling immediate submission failed: {e}"))?
+            }
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Atomically reconciles every scheduled canonical artifact against the store-owned fully scanned
+/// active-chain view. No lifecycle, height, txid, or clock input crosses the ABI. A no-op still
+/// returns a fresh equivalent owned handle; a committed reconciliation returns the next-revision
+/// handle from the canonical-plus-delivery receipt.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_reconcile_canonical_chain_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    run_handle_ptr: *const FfiMigrationRunHandle,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_scheduled_run(&ctx, run_handle_ptr)? };
+        let expected_revision = handle.revision;
+        let run_identity = handle.run_identity;
+        let unchanged = handle.clone();
+        let account_uuid = ctx.account_bytes;
+        let mut store = scheduled_store(&mut ctx)?;
+        let state = scheduled_state(&store)?;
+        let reconciled = store
+            .reconcile_canonical_chain(&state, expected_revision, run_identity)
+            .map_err(|e| anyhow!("reconciling canonical migration chain state failed: {e}"))?;
+        Ok(Box::into_raw(Box::new(match reconciled {
+            Some(receipt) => run_handle(account_uuid, receipt.delivery()),
+            None => unchanged,
+        })))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Atomically replaces one positively expired scheduled transfer attempt inside its existing run.
+///
+/// Rust derives the complete successor from the exact generation-safe claim, current canonical
+/// state, wallet chain view, and a CSPRNG. The host chooses only the signer lane and, for the SDK
+/// lane, supplies the account spending key. No schedule, height, revision, fingerprint, owner, or
+/// token is accepted from the host. The store CAS archives the old attempt's durable fingerprint
+/// and revision; its expired lease token is intentionally absent and is never reconstructed or
+/// treated as generation authority. The returned handle owns the fresh replacement identity and
+/// materialization token.
+///
+/// # Safety
+/// See [`open`]. `claim_handle_ptr` must be a live handle returned by this module. For signer tag
+/// `0` (SDK), `usk_ptr` must be valid for `usk_len` bytes. For tag `1` (external), `usk_ptr` must be
+/// null and `usk_len` zero. Free the returned handle with
+/// [`zcashlc_migration_free_claim_handle_v1`].
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_rebuild_expired_transfer_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+    signer_ownership_tag: u8,
+    usk_ptr: *const u8,
+    usk_len: usize,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        let DeliveryArtifactIdentity::Scheduled(prior_artifact) = handle.artifact_identity else {
+            return Err(anyhow!(
+                "expired-transfer rebuild requires a scheduled claim"
+            ));
+        };
+        if !matches!(
+            handle.status,
+            ClaimStatus::ExpiredUnmined | ClaimStatus::ExternalSigningExpiredUnmined
+        ) {
+            return Err(anyhow!(
+                "expired-transfer rebuild requires a positively expired unmined claim"
+            ));
+        }
+        let signer = signer_ownership(signer_ownership_tag)?;
+        let usk = match signer {
+            SignerOwnership::Sdk => {
+                if usk_ptr.is_null() {
+                    return Err(anyhow!(
+                        "SDK-signed expired-transfer rebuild requires a spending key"
+                    ));
+                }
+                Some(unsafe { crate::decode_usk(usk_ptr, usk_len)? })
+            }
+            SignerOwnership::External => {
+                if !usk_ptr.is_null() || usk_len != 0 {
+                    return Err(anyhow!(
+                        "external-signer expired-transfer rebuild must not receive a spending key"
+                    ));
+                }
+                None
+            }
+        };
+        let policy = policy_from_run_handle(&ctx.network, &handle.run)?;
+        let state = {
+            let store = scheduled_store(&mut ctx)?;
+            scheduled_state(&store)?
+        };
+        let validated_artifact =
+            validate_expired_rebuild_generation(handle.artifact_identity, handle.status, &state)?;
+        debug_assert_eq!(validated_artifact, prior_artifact);
+
+        let mut successor = state.clone();
+        let rebuilt_successor = {
+            // This adapter only derives the upstream successor. It deliberately performs no
+            // generic canonical write; the typed store operation below owns the sole mutation.
+            let backend = Backend::for_delivery_rebuild(
+                &ctx.wallet,
+                ctx.account,
+                usk,
+                &mut ctx.store_conn,
+                &state,
+            )?;
+            let mut rng = OsRng;
+            match signer {
+                SignerOwnership::Sdk => engine::rebuild_expired_transfer_with_successor(
+                    &ctx.network,
+                    &backend,
+                    &mut successor,
+                    prior_artifact.transaction_id(),
+                    &mut rng,
+                )
+                .map_err(map_rebuild_err)?,
+                SignerOwnership::External => {
+                    let (_unsigned, rebuilt_successor) =
+                        engine::rebuild_expired_transfer_unsigned_with_successor(
+                            &ctx.network,
+                            &backend,
+                            &mut successor,
+                            prior_artifact.transaction_id(),
+                            &mut rng,
+                        )
+                        .map_err(map_rebuild_err)?;
+                    rebuilt_successor
+                }
+            }
+        };
+
+        let request = ExpiredTransferRebuild::new(
+            handle.run.revision,
+            handle.run.run_identity,
+            handle.run.source_reservation_owner,
+            &state,
+            prior_artifact,
+            signer,
+            rebuilt_successor,
+        )
+        .map_err(|e| anyhow!("invalid expired-transfer rebuild successor: {e:?}"))?;
+        let receipt = MigrationRuntimeStore::rebuild_expired_transfer_attempt(
+            &mut ctx.wallet,
+            &ctx.account,
+            request,
+            &policy,
+        )
+        .map_err(|e| anyhow!("committing expired-transfer rebuild failed: {e}"))?;
+        Ok(Box::into_raw(Box::new(claim_handle(
+            ctx.account_bytes,
+            receipt.delivery(),
+            DeliveryArtifactIdentity::Scheduled(receipt.replacement_attempt()),
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Releases a claim only for a Rust-validated known-unsent failure. Once exact external-signing
+/// bytes have been staged, the artifact is cancellation-unsafe and this wrapper rejects release
+/// before consulting storage; the same artifact must be resumed through its terminal resolution.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_release_claim_known_unsent_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+    failure_tag: u8,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        if handle.external_signing_pczt.is_some() {
+            return Err(anyhow!(
+                "an externally exposed PCZT cannot be released or replanned; resume the same artifact"
+            ));
+        }
+        let token = required_claim_token(handle)?;
+        let failure = delivery_failure(failure_tag)?;
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let artifact_identity = handle.artifact_identity;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = match artifact_identity {
+            DeliveryArtifactIdentity::Scheduled(_) => {
+                let mut store = scheduled_store(&mut ctx)?;
+                let state = scheduled_state(&store)?;
+                store
+                    .release_claim_known_unsent(
+                        &state,
+                        handle.run.revision,
+                        handle.run.run_identity,
+                        artifact_identity,
+                        token,
+                        failure,
+                        policy_fingerprint,
+                    )
+                    .map_err(|e| anyhow!("releasing known-unsent migration claim failed: {e}"))?
+            }
+            DeliveryArtifactIdentity::Immediate(identity) => {
+                ImmediateMigrationDeliveryStore::release_immediate_claim_known_unsent(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    handle.run.revision,
+                    handle.run.run_identity,
+                    identity,
+                    token,
+                    failure,
+                    policy_fingerprint,
+                )
+                .map_err(|e| anyhow!("releasing immediate known-unsent claim failed: {e}"))?
+            }
+        };
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+#[derive(Clone, Copy)]
+enum RunTransition {
+    Pause,
+    Resume,
+    BeginAbandonment,
+    FinishAbandonment,
+}
+
+unsafe fn transition_delivery_run(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    run_handle_ptr: *const FfiMigrationRunHandle,
+    transition: RunTransition,
+) -> anyhow::Result<*mut FfiMigrationRunHandle> {
+    let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+    let handle = unsafe { require_run(&ctx, run_handle_ptr)? };
+    let lane = handle.lane;
+    let expected_revision = handle.revision;
+    let run_identity = handle.run_identity;
+    let account_uuid = ctx.account_bytes;
+    let snapshot = match lane {
+        DeliveryLane::Scheduled => {
+            let mut store = scheduled_store(&mut ctx)?;
+            let state = scheduled_state(&store)?;
+            match transition {
+                RunTransition::Pause => {
+                    store.pause_delivery(&state, expected_revision, run_identity)
+                }
+                RunTransition::Resume => {
+                    store.resume_delivery(&state, expected_revision, run_identity)
+                }
+                RunTransition::BeginAbandonment => {
+                    store.begin_abandonment(&state, expected_revision, run_identity)
+                }
+                RunTransition::FinishAbandonment => {
+                    store.finish_abandonment(&state, expected_revision, run_identity)
+                }
+            }
+            .map_err(|e| anyhow!("scheduled migration delivery transition failed: {e}"))?
+        }
+        DeliveryLane::Immediate => match transition {
+            RunTransition::Pause => ImmediateMigrationDeliveryStore::pause_immediate_delivery(
+                &mut ctx.wallet,
+                &ctx.account,
+                expected_revision,
+                run_identity,
+            ),
+            RunTransition::Resume => ImmediateMigrationDeliveryStore::resume_immediate_delivery(
+                &mut ctx.wallet,
+                &ctx.account,
+                expected_revision,
+                run_identity,
+            ),
+            RunTransition::BeginAbandonment => {
+                ImmediateMigrationDeliveryStore::begin_immediate_abandonment(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    expected_revision,
+                    run_identity,
+                )
+            }
+            RunTransition::FinishAbandonment => {
+                ImmediateMigrationDeliveryStore::finish_immediate_abandonment(
+                    &mut ctx.wallet,
+                    &ctx.account,
+                    expected_revision,
+                    run_identity,
+                )
+            }
+        }
+        .map_err(|e| anyhow!("immediate migration delivery transition failed: {e}"))?,
+    };
+    Ok(Box::into_raw(Box::new(run_handle(account_uuid, &snapshot))))
+}
+
+/// Pauses delivery without releasing source reservations or exposed evidence.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_pause_delivery_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    run_handle_ptr: *const FfiMigrationRunHandle,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| unsafe {
+        transition_delivery_run(
+            db_data,
+            db_data_len,
+            account_uuid_bytes,
+            network_id,
+            run_handle_ptr,
+            RunTransition::Pause,
+        )
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Resumes a paused delivery run.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_resume_delivery_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    run_handle_ptr: *const FfiMigrationRunHandle,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| unsafe {
+        transition_delivery_run(
+            db_data,
+            db_data_len,
+            account_uuid_bytes,
+            network_id,
+            run_handle_ptr,
+            RunTransition::Resume,
+        )
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Begins abandonment while retaining every possibly exposed artifact and source reservation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_begin_abandonment_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    run_handle_ptr: *const FfiMigrationRunHandle,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| unsafe {
+        transition_delivery_run(
+            db_data,
+            db_data_len,
+            account_uuid_bytes,
+            network_id,
+            run_handle_ptr,
+            RunTransition::BeginAbandonment,
+        )
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Finishes abandonment only after Rust proves every exposed artifact terminally safe.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_finish_abandonment_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    run_handle_ptr: *const FfiMigrationRunHandle,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| unsafe {
+        transition_delivery_run(
+            db_data,
+            db_data_len,
+            account_uuid_bytes,
+            network_id,
+            run_handle_ptr,
+            RunTransition::FinishAbandonment,
+        )
+    });
+    unwrap_exc_or_null(res)
 }
 
 /// Build an owned C string from `s`, erroring (rather than panicking across the FFI) if it
@@ -1811,11 +4205,6 @@ fn marshal_state(
             next_transfer_ready_at_height: height_opt_to_i64(next_transfer_ready_at_height),
             is_immediate,
         }),
-        DerivedState::InvalidTransfer(id) => {
-            FfiMigrationState::RequiresAttention(FfiAttentionReason::InvalidTransfer {
-                transfer_id: cstring_raw(&id.to_string(), "attention transfer id")?,
-            })
-        }
         DerivedState::TransferExpired => {
             FfiMigrationState::RequiresAttention(FfiAttentionReason::TransferExpired)
         }
@@ -1827,17 +4216,57 @@ fn marshal_state(
 /// The account's live spendable Orchard balance (what is still in the old pool).
 fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
     let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-    use zcash_pool_migration_backend::engine::MigrationBackend;
-    let values = backend.spendable_orchard_note_values()?;
+    let values = backend.ordinarily_spendable_orchard_note_values()?;
     values
         .into_iter()
         .try_fold(Zatoshis::ZERO, |acc, v| acc + v)
         .ok_or_else(|| anyhow!("spendable Orchard balance overflows"))
 }
 
-/// The current migration state. The app calls this on launch and after every operation; it is
-/// also the reconciliation hub (advancing broadcast transactions to mined as the wallet scans).
-/// `Complete` is PER-RUN (see the module doc).
+fn completion_availability_for_derivation(
+    ctx: &mut CallCtx,
+    state: Option<&MigrationState>,
+    tip: BlockHeight,
+) -> anyhow::Result<bool> {
+    // Exact tuple derivation, availability classification, and provisional-owner release all live
+    // in the canonical Rust finalizer. Call it even when an immediate run masks the engine state;
+    // otherwise a provisional Complete run could retain its owner and locks indefinitely.
+    let outputs_available = match state {
+        Some(state) if matches!(state.status(), MigrationStatus::Complete) => {
+            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend.finalize_completed_migration(TargetHeight::from(u32::from(tip) + 1))?
+        }
+        _ => true,
+    };
+
+    Ok(outputs_available)
+}
+
+/// Requires the same strict, derived `Complete` state that the public Swift API exposes.
+///
+/// This deliberately reads canonical state and runs the exact-output finalizer before checking the
+/// public projection. In particular, an engine `Complete` that still retains
+/// its provisional migration owner or has unavailable exact outputs is not sufficient. The finalizer clears the provisional
+/// migration owner before residual locking can acquire its distinct permanent owner.
+fn require_strict_public_complete(ctx: &mut CallCtx) -> anyhow::Result<()> {
+    let engine_state = read_canonical_migration(ctx)?;
+    let tip = ctx.tip()?;
+    let outputs_available =
+        completion_availability_for_derivation(ctx, engine_state.as_ref(), tip)?;
+    if matches!(
+        derive_state(engine_state.as_ref(), tip, outputs_available),
+        DerivedState::Complete
+    ) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "the migration residual can be locked only after strict migration completion"
+        ))
+    }
+}
+
+/// The current migration-state projection. Canonical chain reconciliation is a separate typed CAS
+/// requiring an opaque scheduled-run capability. `Complete` is PER-RUN (see the module doc).
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_state`].
@@ -1850,22 +4279,17 @@ pub unsafe extern "C" fn zcashlc_migration_state(
 ) -> *mut FfiMigrationState {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let engine_state = reconcile_mined(&mut ctx)?;
-        let immediate_row = immediate_run_row(&ctx.store_conn, &ctx.account_bytes)
-            .map_err(|e| anyhow!("immediate run read failed: {e}"))?;
-        if engine_state.is_none() && immediate_row.is_none() {
-            // Neither an engine-tracked run nor an immediate-run row: nothing to derive, and
-            // (crucially) no need to touch the chain tip, which a not-yet-synced wallet lacks.
+        let engine_state = read_canonical_migration(&mut ctx)?;
+        if engine_state.is_none() {
+            // No scheduled run: nothing to derive, and (crucially) no need to touch the chain tip,
+            // which a not-yet-synced wallet lacks. Immediate state is read through the delivery
+            // runtime rather than reconstructed here.
             return marshal_state(DerivedState::NotStarted, Zatoshis::ZERO);
         }
-        let marks = invalid_marks(&ctx.store_conn, &ctx.account_bytes)
-            .map_err(|e| anyhow!("marks read failed: {e}"))?;
         let tip = ctx.tip()?;
-        let immediate = immediate_row
-            .map(|row| resolve_immediate_run(&ctx.store_conn, row, tip))
-            .transpose()
-            .map_err(|e| anyhow!("wallet transaction lookup failed: {e}"))?;
-        let derived = derive_state(engine_state.as_ref(), tip, &marks, immediate.as_ref());
+        let outputs_available =
+            completion_availability_for_derivation(&mut ctx, engine_state.as_ref(), tip)?;
+        let derived = derive_state(engine_state.as_ref(), tip, outputs_available);
         let remaining = match derived {
             DerivedState::InProgress { .. } => remaining_orchard(&mut ctx)?,
             _ => Zatoshis::ZERO,
@@ -1890,22 +4314,15 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
 ) -> *mut FfiMigrationProgress {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let engine_state = reconcile_mined(&mut ctx)?;
-        let immediate_row = immediate_run_row(&ctx.store_conn, &ctx.account_bytes)
-            .map_err(|e| anyhow!("immediate run read failed: {e}"))?;
-        if engine_state.is_none() && immediate_row.is_none() {
-            // Neither an engine-tracked run nor an immediate-run row: nothing to derive, and
-            // (crucially) no need to touch the chain tip, which a not-yet-synced wallet lacks.
+        let engine_state = read_canonical_migration(&mut ctx)?;
+        if engine_state.is_none() {
+            // No scheduled run. Immediate progress is read through the delivery runtime.
             return Ok(Box::into_raw(Box::new(FfiMigrationProgress::absent())));
         }
-        let marks = invalid_marks(&ctx.store_conn, &ctx.account_bytes)
-            .map_err(|e| anyhow!("marks read failed: {e}"))?;
         let tip = ctx.tip()?;
-        let immediate = immediate_row
-            .map(|row| resolve_immediate_run(&ctx.store_conn, row, tip))
-            .transpose()
-            .map_err(|e| anyhow!("wallet transaction lookup failed: {e}"))?;
-        let value = match derive_state(engine_state.as_ref(), tip, &marks, immediate.as_ref()) {
+        let outputs_available =
+            completion_availability_for_derivation(&mut ctx, engine_state.as_ref(), tip)?;
+        let value = match derive_state(engine_state.as_ref(), tip, outputs_available) {
             DerivedState::InProgress {
                 completed_transfers,
                 total_transfers,
@@ -1987,15 +4404,14 @@ fn encode_transaction_status(ts: &TransactionStatus) -> FfiMigrationTransactionS
 /// The LIVE status of every committed migration transaction, keyed by its stable id — a verbatim
 /// marshal of `MigrationState::transaction_statuses(target)` at `target = tip + 1` (see
 /// [`CallCtx::target`]), the engine's own per-transaction view a wallet renders progress from and
-/// decides what to sign/prove/broadcast next. Reconciles mined transactions first (the same
-/// read-path convention as [`zcashlc_migration_state`]), so a `Broadcast` row the wallet's own
-/// scan has since observed mined is reported `Mined` here too. No stored run, or a stored run
-/// with no transactions, returns an EMPTY container (`len == 0`) — not an error, the same
+/// decides what to sign/prove/broadcast next. The read is side-effect free: callers must reconcile
+/// canonical chain evidence first through the opaque-run delivery CAS. No stored run, or a stored
+/// run with no transactions, returns an EMPTY container (`len == 0`) — not an error, the same
 /// convention as [`encode_empty_schedule`].
 ///
-/// This is a pure read: unlike [`zcashlc_migration_next_due_transfer`] it never drives a
-/// prove-ready `Signed` row through proving — a `Signed` row ready to prove is reported via
-/// `ready`/`action` (`action == 1`), not silently advanced to `Proved`.
+/// This is a pure read: it never claims an artifact or drives a prove-ready `Signed` row through
+/// proving — a `Signed` row ready to prove is reported via `ready`/`action` (`action == 1`), not
+/// silently advanced to `Proved`.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_transaction_statuses`].
@@ -2008,7 +4424,7 @@ pub unsafe extern "C" fn zcashlc_migration_transaction_statuses(
 ) -> *mut FfiMigrationTransactionStatuses {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
+        let Some(state) = read_canonical_migration(&mut ctx)? else {
             return Ok(encode_empty_transaction_statuses());
         };
         if state.transactions().is_empty() {
@@ -2030,7 +4446,8 @@ pub unsafe extern "C" fn zcashlc_migration_transaction_statuses(
 }
 
 /// Whether the account's balance needs preparation (note-split) transactions before it can
-/// migrate. Plans fresh against the live balance (and caches the preview). Returns `false` both
+/// migrate. Plans fresh against the live balance without changing any reviewed proposal's cache
+/// handle. Returns `false` both
 /// when no split is needed and when there is nothing to migrate at all; returns `false` on error
 /// too (see `zcashlc_last_error_message` — the Swift layer disambiguates).
 ///
@@ -2045,7 +4462,7 @@ pub unsafe extern "C" fn zcashlc_migration_is_note_split_needed(
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        Ok(match plan_and_cache(&mut ctx)? {
+        Ok(match compute_plan(&mut ctx)? {
             Some((plan, _)) => plan.preparation().transaction_count() > 0,
             None => false,
         })
@@ -2055,12 +4472,11 @@ pub unsafe extern "C" fn zcashlc_migration_is_note_split_needed(
 
 /// Whether any transaction of the stored run is due-and-unbroadcast at the current tip — that
 /// is, whether the delivery lane has actionable work: an already-`Proved` transaction due for
-/// broadcast, or a due, dependency-satisfied, prove-ready `Signed` one that
-/// [`zcashlc_migration_next_due_transfer`] would drive through proving and serve (proofs are
-/// assumed to succeed — a transiently unwitnessable anchor defers the delivery, not this
-/// report; see [`due_assuming_proving`]). A row awaiting an EXTERNAL signature is not delivery
-/// work (the signing ceremony advances it). Returns `false` on error (see
-/// `zcashlc_last_error_message`).
+/// broadcast, or a due, dependency-satisfied, prove-ready `Signed` one the opaque claim lane can
+/// drive through proving (proofs are assumed to succeed — a transiently unwitnessable anchor
+/// defers the delivery, not this report; see [`due_assuming_proving`]). A row awaiting an EXTERNAL
+/// signature is not delivery work (the signing ceremony advances it). Returns `false` on error
+/// (see `zcashlc_last_error_message`).
 ///
 /// # Safety
 /// See [`open`].
@@ -2073,7 +4489,7 @@ pub unsafe extern "C" fn zcashlc_migration_has_overdue_transfers(
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
+        let Some(state) = read_canonical_migration(&mut ctx)? else {
             return Ok(false);
         };
         if state.is_terminal() {
@@ -2085,9 +4501,9 @@ pub unsafe extern "C" fn zcashlc_migration_has_overdue_transfers(
     unwrap_exc_or(res, false)
 }
 
-/// Whether the stored run has a transfer that cannot proceed: a terminally-rejected transfer (per
-/// the platform's recorded classification) or an expired, unmined transaction. Returns `false` on
-/// error (see `zcashlc_last_error_message`).
+/// Whether the stored canonical run has an expired, unmined transaction. Durable local and
+/// transport failure classification belongs to the delivery-control runtime and is intentionally
+/// not reconstructed by this compatibility query.
 ///
 /// # Safety
 /// See [`open`].
@@ -2100,16 +4516,11 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
+        let Some(state) = read_canonical_migration(&mut ctx)? else {
             return Ok(false);
         };
         if matches!(state.status(), MigrationStatus::Complete) {
             return Ok(false);
-        }
-        let marks = invalid_marks(&ctx.store_conn, &ctx.account_bytes)
-            .map_err(|e| anyhow!("marks read failed: {e}"))?;
-        if !marks.is_empty() {
-            return Ok(true);
         }
         // The engine's expiry predicate is defined over `target = tip + 1`, not the raw tip (see
         // `CallCtx::target`); membership in `expired_transactions` already excludes `Mined` rows
@@ -2135,41 +4546,37 @@ pub unsafe extern "C" fn zcashlc_migration_prepare_note_split(
 ) -> *mut FfiNoteSplitProposal {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let (values, fee) = match plan_and_cache(&mut ctx)? {
-            Some((plan, _)) => {
+        let (values, fee, proposal_handle) = match plan_and_cache(&mut ctx)? {
+            Some((plan, _, handle)) => {
                 let split = plan.note_split();
                 let values: Vec<i64> = split
                     .migration_outputs()
                     .iter()
                     .map(|v| zat_to_i64(*v))
                     .collect();
-                (values, zat_to_i64(split.prep_fees()))
+                (values, zat_to_i64(split.prep_fees()), handle)
             }
-            None => (Vec::new(), 0),
+            None => (Vec::new(), 0, 0),
         };
         let (output_values, output_values_len) = ptr_from_vec(values);
         Ok(Box::into_raw(Box::new(FfiNoteSplitProposal {
             output_values,
             output_values_len,
             fee,
+            proposal_handle,
         })))
     });
     unwrap_exc_or_null(res)
 }
 
-/// Commits the previewed migration (signing EVERY transaction — preparation and transfers — in
-/// one pass with the spending key), then proves and returns the first preparation transaction for
-/// immediate broadcast. If a matching non-terminal run is already stored, resumes it instead of
-/// recommitting (the retry path); a terminal stored run is replaced (the sequential-runs path).
-///
-/// `output_values`/`fee` are verified consent echoes — the values the user approved must match
-/// what will be signed — checked against the previewed plan's note split when one is cached for
-/// this account (`MIGRATION_PLAN_STALE` on mismatch; a missing cache falls through to
-/// `commit_or_resume`, which either resumes a stored non-terminal run or reports the same error).
+/// Retained only as a disabled C ABI compatibility symbol. This entry point always fails closed
+/// before reading caller data or opening wallet state because it cannot bind the returned
+/// transaction to a Rust-owned delivery capability. Callers must use the current typed migration
+/// scheduling and opaque delivery-v1 handle APIs.
 ///
 /// # Safety
-/// See [`open`]; `output_values`/`usk_ptr` must be valid for reads of their lengths.
-/// Free the returned pointer with [`zcashlc_free_migration_prepared_transfer`].
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// NULL and sets the last-error channel.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
@@ -2183,60 +4590,21 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
     usk_ptr: *const u8,
     usk_len: usize,
 ) -> *mut FfiPreparedTransfer {
+    let _ = (
+        db_data,
+        db_data_len,
+        account_uuid_bytes,
+        network_id,
+        output_values,
+        output_values_len,
+        fee,
+        usk_ptr,
+        usk_len,
+    );
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
-        let echoed: Vec<i64> = unsafe { slice_or_empty(output_values, output_values_len) }.to_vec();
-
-        // The echoed values are the note-split outputs and fee; validation happens against the
-        // funding notes inside `commit_or_resume` only for the schedule echo. For the split echo,
-        // validate against the previewed split outputs/fee here.
-        {
-            let cached = migration_plan_cache::get(&ctx.db_path, ctx.account_bytes);
-            if let Some(cached) = &cached {
-                let expected: Vec<i64> = cached
-                    .plan
-                    .note_split()
-                    .migration_outputs()
-                    .iter()
-                    .map(|z| zat_to_i64(*z))
-                    .collect();
-                let expected_fee = zat_to_i64(cached.plan.note_split().prep_fees());
-                if !note_split_echo_matches(&expected, expected_fee, echoed.clone(), fee) {
-                    return Err(plan_stale(
-                        "the echoed note split does not match the previewed plan — propose again",
-                    ));
-                }
-            }
-            // A missing cache falls through to `commit_or_resume`, which either resumes a stored
-            // non-terminal run (no cache needed) or reports MIGRATION_PLAN_STALE.
-        }
-
-        let (mut state, _) = commit_or_resume(&mut ctx, Some(usk), false)?;
-
-        // The first broadcastable preparation transaction (lowest scheduled height not yet
-        // broadcast): proven now, against the wallet's natural anchor, and returned for the
-        // platform's immediate broadcast. Remaining preparation transactions ride the normal
-        // delivery lane as they come due.
-        let first_prep = state
-            .transactions()
-            .iter()
-            .filter(|t| {
-                matches!(t.kind(), MigrationTxKind::Preparation { .. })
-                    && matches!(
-                        t.state(),
-                        MigrationTxState::Signed | MigrationTxState::Proved
-                    )
-            })
-            .min_by_key(|t| t.scheduled_height())
-            .map(|t| t.id())
-            .ok_or_else(|| {
-                anyhow!("the committed migration has no broadcastable preparation transaction")
-            })?;
-        let (proven, txid) = prove_if_needed(&mut ctx, &mut state, first_prep)?.ok_or_else(|| {
-            anyhow!("the note split is not yet finalizable — its funding note is not witnessable; sync first")
-        })?;
-        FfiPreparedTransfer::from_parts(first_prep, txid, proven)
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_sign_note_split",
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -2259,13 +4627,13 @@ pub unsafe extern "C" fn zcashlc_migration_residual_after_migration(
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         {
             let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            if let Some(state) = backend.get_migration()? {
-                if !state.is_terminal() {
-                    return Ok(state.note_split().change().map_or(-1, zat_to_i64));
-                }
+            if let Some(state) = backend.get_migration()?
+                && !state.is_terminal()
+            {
+                return Ok(state.note_split().change().map_or(-1, zat_to_i64));
             }
         }
-        Ok(match plan_and_cache(&mut ctx)? {
+        Ok(match compute_plan(&mut ctx)? {
             Some((plan, _)) => plan.note_split().change().map_or(-1, zat_to_i64),
             None => -1,
         })
@@ -2273,21 +4641,21 @@ pub unsafe extern "C" fn zcashlc_migration_residual_after_migration(
     unwrap_exc_or(res, -1)
 }
 
-/// Locks EVERY currently-spendable, not-already-locked legacy-Orchard note of the account until
-/// explicit unlock, and returns the TOTAL LOCKED VALUE in zatoshi. `0` is a legitimate result
-/// (nothing was spendable, or everything spendable is already locked); `-1` signals an error (see
-/// `zcashlc_last_error_message`).
+/// After strict public migration `Complete`, locks EVERY currently-spendable,
+/// not-already-locked legacy-Orchard note of the account until explicit unlock, and returns the
+/// TOTAL LOCKED VALUE in zatoshi. `0` is a legitimate result (nothing was spendable, or everything
+/// spendable is already locked); `-1` signals an error (see `zcashlc_last_error_message`).
 ///
-/// Intended to be called when a migration run reaches `Complete` to lock the sub-threshold
-/// residual that stays in Orchard (the "Lock balance" choice): the lock expiry is permanent
-/// (`u32::MAX`), so no chain height ever releases it — only an explicit
+/// The strict-completion gate first reconciles reorgs and invokes the centralized exact-output
+/// finalizer. This ensures the provisional migration owner is gone before the distinct residual
+/// owner is acquired; an engine-only/provisional `Complete` is rejected. The lock expiry is
+/// permanent (`u32::MAX`), so no chain height ever releases it — only an explicit
 /// `zcashlc_migration_unlock_residual` does. Note selection excludes already-locked notes, so
 /// repeating the call is idempotent-additive: it locks only notes that became spendable since
 /// (and returns only their value). Locks are keyed to the deterministic per-account
-/// [`residual_lock_owner`], so a retry after a crash between selection and locking re-locks
-/// under the same owner instead of conflicting with itself. A concurrent-lock race (another
-/// caller locked one of the selected notes between selection and locking) surfaces as an error
-/// (`LockError::LockFailure`); nothing is partially locked and the caller may retry.
+/// [`residual_lock_owner`], so a retry re-locks under the same owner instead of conflicting with
+/// itself. Selection and locking share one wallet transaction, so another database writer cannot
+/// interleave between them; an already-conflicting foreign lock fails the whole transaction.
 ///
 /// # Safety
 /// See [`open`].
@@ -2300,41 +4668,43 @@ pub unsafe extern "C" fn zcashlc_migration_lock_residual(
 ) -> i64 {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        require_strict_public_complete(&mut ctx)?;
+
         // Selection targets the next block, mirroring `Backend::selection_target`.
         let target = TargetHeight::from(u32::from(ctx.tip()?) + 1);
-        let received = ctx
-            .wallet
-            .select_unspent_notes(
-                ctx.account,
-                &[ShieldedPool::Orchard],
-                target,
-                &[],
-                LockFilter::Policy(&LockedInputPolicy::Exclude),
-            )
-            .map_err(|e| anyhow!("spendable-note selection failed: {e}"))?;
-        let mut refs = Vec::new();
-        let mut total = Zatoshis::ZERO;
-        for rn in received.orchard() {
-            refs.push(OutputRef::new(
-                *rn.txid(),
-                PoolType::Shielded(ShieldedPool::Orchard),
-                u32::from(rn.output_index()),
-            ));
-            let value = Zatoshis::from_u64(rn.note().value().inner())
-                .map_err(|_| anyhow!("a spendable note has an out-of-range value"))?;
-            total = (total + value).ok_or_else(|| anyhow!("locked Orchard balance overflows"))?;
-        }
-        if refs.is_empty() {
-            return Ok(0);
-        }
-        ctx.wallet
-            .lock_outputs(
-                &refs,
-                residual_lock_owner(ctx.account),
-                BlockHeight::from(u32::MAX),
-            )
-            .map_err(|e| anyhow!("locking the migration residual failed: {e}"))?;
-        Ok(zat_to_i64(total))
+        let account = ctx.account;
+        let owner = residual_lock_owner(account);
+        ctx.wallet.transactionally(|wallet| -> anyhow::Result<i64> {
+            let received = wallet
+                .select_unspent_notes(
+                    account,
+                    &[ShieldedPool::Orchard],
+                    target,
+                    &[],
+                    LockFilter::Policy(&LockedInputPolicy::Exclude),
+                )
+                .map_err(|e| anyhow!("spendable-note selection failed: {e}"))?;
+            let mut refs = Vec::new();
+            let mut total = Zatoshis::ZERO;
+            for rn in received.orchard() {
+                refs.push(OutputRef::new(
+                    *rn.txid(),
+                    PoolType::Shielded(ShieldedPool::Orchard),
+                    u32::from(rn.output_index()),
+                ));
+                let value = Zatoshis::from_u64(rn.note().value().inner())
+                    .map_err(|_| anyhow!("a spendable note has an out-of-range value"))?;
+                total =
+                    (total + value).ok_or_else(|| anyhow!("locked Orchard balance overflows"))?;
+            }
+            if refs.is_empty() {
+                return Ok(0);
+            }
+            wallet
+                .lock_outputs(&refs, owner, BlockHeight::from(u32::MAX))
+                .map_err(|e| anyhow!("locking the migration residual failed: {e}"))?;
+            Ok(zat_to_i64(total))
+        })
     });
     unwrap_exc_or(res, -1)
 }
@@ -2342,8 +4712,9 @@ pub unsafe extern "C" fn zcashlc_migration_lock_residual(
 /// The deterministic [`LockOwner`] under which [`zcashlc_migration_lock_residual`] locks the
 /// account's residual notes: the 16 account-UUID bytes followed by a fixed 16-byte tag. A
 /// stable owner keeps re-locking idempotent across retries (a same-owner re-lock refreshes the
-/// permanent expiry instead of failing as a conflict), and cannot collide with a txid-derived
-/// owner, which occupies all 32 bytes with a transaction hash.
+/// permanent expiry instead of failing as a conflict). Migration owners are independent random
+/// durable tokens; ordinary proposal owners may use other schemes, but owner-checked storage
+/// mutations ensure this residual path never releases either kind.
 fn residual_lock_owner(account: AccountUuid) -> LockOwner {
     let mut bytes = [0u8; 32];
     bytes[..16].copy_from_slice(&account.expose_uuid().into_bytes());
@@ -2351,16 +4722,34 @@ fn residual_lock_owner(account: AccountUuid) -> LockOwner {
     LockOwner::new(bytes)
 }
 
-/// Unlocks the account's locked outputs — the release half of
-/// `zcashlc_migration_lock_residual` — and returns the number of outputs unlocked (`0` when
-/// nothing was locked; `-1` signals an error, see `zcashlc_last_error_message`).
-///
-/// Clears ALL locks held for the account, regardless of expiry or owner. That blanket clear is
-/// safe here because this SDK still creates no proposal- or transfer-scoped output locks (every
-/// propose path here runs with locking off, and engine-built migration transactions carry no
-/// lock owner): the only locks an account can hold are the permanent residual locks placed by
-/// `zcashlc_migration_lock_residual`. Revisit this if any propose path ever starts passing a
-/// lock request — a blanket clear would then release in-flight proposal locks too.
+/// Unlocks only active locks held by `owner`, invoking `unlock` with each exact output reference.
+/// Keeping the owner predicate in this small helper makes the isolation contract directly
+/// testable: migration, ordinary-PCZT, and other accounts' lock owners are never passed to the
+/// storage mutation at all.
+fn unlock_owned_active_locks<E>(
+    locks: &[ActiveOrchardLock],
+    owner: LockOwner,
+    mut unlock: impl FnMut(&OutputRef, LockOwner) -> Result<bool, E>,
+) -> Result<usize, E> {
+    let mut count = 0;
+    for output in locks
+        .iter()
+        .filter(|lock| lock.owner() == owner)
+        .map(ActiveOrchardLock::output)
+    {
+        if unlock(&output, owner)? {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Unlocks only the exact active Orchard outputs held by this account's deterministic
+/// [`residual_lock_owner`] — the release half of `zcashlc_migration_lock_residual` — and returns
+/// the number of outputs unlocked (`0` when nothing was locked; `-1` signals an error, see
+/// `zcashlc_last_error_message`). Migration locks, ordinary-PCZT locks, and every foreign owner
+/// are deliberately preserved. The active-lock query and every exact owner-checked unlock share
+/// one wallet transaction.
 ///
 /// # Safety
 /// See [`open`].
@@ -2373,10 +4762,19 @@ pub unsafe extern "C" fn zcashlc_migration_unlock_residual(
 ) -> i64 {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let owner = residual_lock_owner(ctx.account);
         let cleared = ctx
             .wallet
-            .clear_locked_outputs(ctx.account)
-            .map_err(|e| anyhow!("unlocking the migration residual failed: {e}"))?;
+            .transactionally(|wallet| -> anyhow::Result<usize> {
+                let locks = wallet
+                    .active_orchard_locks()
+                    .map_err(|e| anyhow!("reading active Orchard locks failed: {e}"))?;
+                unlock_owned_active_locks(&locks, owner, |output, owner| {
+                    wallet
+                        .unlock_output(output, owner)
+                        .map_err(|e| anyhow!("unlocking the migration residual failed: {e}"))
+                })
+            })?;
         Ok(cleared as i64)
     });
     unwrap_exc_or(res, -1)
@@ -2464,114 +4862,156 @@ pub unsafe extern "C" fn zcashlc_migration_propose_transfers(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         match plan_and_cache(&mut ctx)? {
-            Some((plan, reference_height)) => encode_schedule_from_plan(&plan, reference_height),
+            Some((plan, reference_height, handle)) => {
+                encode_schedule_from_plan(&plan, reference_height, handle)
+            }
             None => Ok(encode_empty_schedule()),
         }
     });
     unwrap_exc_or_null(res)
 }
 
-/// Commits the previewed migration with the spending key if nothing is committed yet (covering
-/// the no-split lane); when a matching non-terminal run is already stored (the normal case — the
-/// note-split submission committed it), succeeds as a no-op.
+/// Commits the previewed migration with the spending key if nothing is committed yet. A matching
+/// non-terminal run resumes as a no-op; a terminal run must use the typed successor-rollover API.
 ///
-/// `ids`/`amounts`/`next_executable_after_heights`/`expiry_heights`/`estimated_duration_hours` are
-/// verified consent echoes — the values the user approved must match what will be signed. When
-/// nothing is committed yet (a fresh commit is about to happen), all five are checked against the
-/// previewed plan cached for this account. When a matching non-terminal run already exists (the
-/// resume/no-op case — there is no cache to consult, and the stored state is the actual thing
-/// about to be (re-)signed), only `ids`/`amounts`/`expiry_heights` are checked, against the
-/// STORED state; `next_executable_after_heights` and `estimated_duration_hours` are NOT:
-/// - `next_executable_after_heights`: the immediate lane's commit legitimately reschedules every
-///   transfer to the commit-time tip, which can differ from the preview-time tip the platform is
-///   honestly echoing back (e.g. a block landed during user review).
-/// - `estimated_duration_hours` (#1806): once committed, duration is re-serve-time-relative
-///   display metadata (see `stored_duration_hours`'s doc) with no stable pre-commit reference
-///   surviving here to check an echo against byte-for-byte.
-///
-/// Both are cases where the platform cannot converge on a match by re-proposing (the stored value
-/// is already fixed by the completed commit — see `StoredEchoRow`'s doc). Mismatch on a checked
-/// field — including a length mismatch — errors with the `MIGRATION_PLAN_STALE:` prefix (the
-/// app's existing recovery: re-propose/re-read and re-display). `anchor_heights` is never checked,
-/// in either branch: it is a display-only "now" reference the schedule DTO carries for duration
-/// math, not a value any transaction commits to.
+/// `proposal_handle` is the only proposal authority accepted from the caller. It identifies the
+/// exact Rust-cached plan the user reviewed. A fresh commit fails with `MIGRATION_PLAN_STALE` when
+/// the plan is missing or superseded; a durable resume does not consult the handle.
 ///
 /// # Safety
-/// See [`open`]; array pointers must be valid for reads of `ids_len` elements; `usk_ptr` for
-/// `usk_len` bytes.
-#[allow(clippy::too_many_arguments)]
+/// See [`open`]; `usk_ptr` must be valid for reads of `usk_len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
     db_data: *const u8,
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    ids: *const *const c_char,
-    ids_len: usize,
-    amounts: *const i64,
-    anchor_heights: *const i64,
-    next_executable_after_heights: *const i64,
-    expiry_heights: *const i64,
-    estimated_duration_hours: u32,
+    proposal_handle: u64,
     usk_ptr: *const u8,
     usk_len: usize,
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
-        let _ = anchor_heights;
-        let ids_slice = unsafe { slice_or_empty(ids, ids_len) };
-        let amounts = unsafe { slice_or_empty(amounts, ids_len) };
-        let next_executable_after_heights =
-            unsafe { slice_or_empty(next_executable_after_heights, ids_len) };
-        let expiry_heights = unsafe { slice_or_empty(expiry_heights, ids_len) };
-
-        // A matching non-terminal stored run means this call resumes/no-ops (no fresh commit
-        // happens): the echo is checked against the actual stored state. Otherwise it is checked
-        // against the cached preview this call is about to commit.
-        let stored = {
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend
-                .get_migration()?
-                .filter(|state| !state.is_terminal())
-        };
-        match &stored {
-            Some(state) => validate_schedule_echo_against_state(
-                state,
-                ids_slice,
-                amounts,
-                next_executable_after_heights,
-                expiry_heights,
-                estimated_duration_hours,
-            )?,
-            None => validate_schedule_echo_against_cache(
-                &ctx.db_path,
-                ctx.account_bytes,
-                ids_slice,
-                amounts,
-                next_executable_after_heights,
-                expiry_heights,
-                estimated_duration_hours,
-            )?,
-        }
-
-        commit_or_resume(&mut ctx, Some(usk), false)?;
+        commit_or_resume(&mut ctx, Some(usk), false, proposal_handle)?;
         Ok(true)
     });
     unwrap_exc_or(res, false)
 }
 
-/// The next due transaction of the stored run, proven and ready to broadcast — or the
-/// "nothing due" sentinel (null id/pczt) when nothing qualifies yet (nothing scheduled, deps
-/// unmined, or a due transaction's anchor is not yet witnessable). Reconciles mined
-/// transactions first, then DRIVES the run's prove-ready `Signed` rows through proving
-/// (`Signed -> Proved`, each persisted) before serving — commit stores every transaction
-/// `Signed`, so without this drive nothing would ever become broadcastable (see
-/// [`drive_and_serve_next_due`]). Serves preparation transactions and transfers alike, in
-/// scheduled order.
+/// Commits the reviewed schedule for external signing without exposing unsigned PCZT bytes.
+/// `proposal_handle` is the only proposal authority accepted from the caller; Rust builds and
+/// atomically locks the exact cached plan it identifies, initializes delivery, and returns only
+/// an opaque run handle. A non-terminal durable run resumes without consulting the handle.
 ///
 /// # Safety
-/// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_prepared_transfer`].
+/// See [`open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_commit_external_schedule_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    proposal_handle: u64,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let (_state, _unsigned_not_exposed) =
+            commit_or_resume(&mut ctx, None, true, proposal_handle)?;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = scheduled_store(&mut ctx)?
+            .delivery_snapshot()
+            .map_err(|e| anyhow!("reading committed external delivery run failed: {e}"))?
+            .ok_or_else(|| anyhow!("external schedule commit did not create a delivery run"))?;
+        Ok(Box::into_raw(Box::new(run_handle(account_uuid, &snapshot))))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Atomically replaces a terminal scheduled predecessor with a fresh SDK-signed successor.
+///
+/// The host supplies only an opaque current predecessor capability, the opaque handle from the
+/// most recent Rust preview, and the account spending key. Rust rebuilds the successor with
+/// the unchanged upstream engine and generates every successor identity in the wallet-store CAS;
+/// the predecessor archive and its source reservations remain retained.
+///
+/// # Safety
+/// See [`open`]. `predecessor_run_handle` must be a live borrowed handle, and `usk_ptr` must be
+/// valid for `usk_len` bytes.
+/// Free the returned handle with [`zcashlc_migration_free_run_handle_v1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_rollover_internal_schedule_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    predecessor_run_handle: *const FfiMigrationRunHandle,
+    proposal_handle: u64,
+    usk_ptr: *const u8,
+    usk_len: usize,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| {
+        if usk_ptr.is_null() {
+            return Err(anyhow!(
+                "SDK-signed successor rollover requires a spending key"
+            ));
+        }
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let predecessor = unsafe { require_scheduled_run(&ctx, predecessor_run_handle)? };
+        let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
+        let cached = migration_plan_cache::get(&ctx.db_path, ctx.account_bytes, proposal_handle)
+            .map_err(|e| plan_stale(&e.to_string()))?;
+        let account_uuid = ctx.account_bytes;
+        let successor =
+            rollover_scheduled_successor(&mut ctx, predecessor, &cached, Some(usk), false)?;
+        Ok(Box::into_raw(Box::new(run_handle(
+            account_uuid,
+            &successor,
+        ))))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Atomically replaces a terminal scheduled predecessor with a fresh externally-signed successor.
+///
+/// No spending key or caller-built successor crosses this ABI. Rust uses the account's stored
+/// UFVK and the unchanged upstream unsigned builder, discards the unsigned output before return,
+/// and exposes canonical PCZT bytes only after a later delivery claim atomically stages them.
+///
+/// # Safety
+/// See [`open`]. `predecessor_run_handle` must be a live borrowed handle. Free the returned handle
+/// with [`zcashlc_migration_free_run_handle_v1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_rollover_external_schedule_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    predecessor_run_handle: *const FfiMigrationRunHandle,
+    proposal_handle: u64,
+) -> *mut FfiMigrationRunHandle {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let predecessor = unsafe { require_scheduled_run(&ctx, predecessor_run_handle)? };
+        let cached = migration_plan_cache::get(&ctx.db_path, ctx.account_bytes, proposal_handle)
+            .map_err(|e| plan_stale(&e.to_string()))?;
+        let account_uuid = ctx.account_bytes;
+        let successor = rollover_scheduled_successor(&mut ctx, predecessor, &cached, None, true)?;
+        Ok(Box::into_raw(Box::new(run_handle(
+            account_uuid,
+            &successor,
+        ))))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Retained only as a disabled C ABI compatibility symbol. Standalone delivery cannot prove that
+/// the caller owns the exact artifact, so this entry point always fails closed before reading
+/// caller data or opening wallet state. Callers must use the opaque delivery-v1 claim APIs.
+///
+/// # Safety
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// NULL and sets the last-error channel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_next_due_transfer(
     db_data: *const u8,
@@ -2579,23 +5019,11 @@ pub unsafe extern "C" fn zcashlc_migration_next_due_transfer(
     account_uuid_bytes: *const u8,
     network_id: u32,
 ) -> *mut FfiPreparedTransfer {
+    let _ = (db_data, db_data_len, account_uuid_bytes, network_id);
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(mut state) = reconcile_mined(&mut ctx)? else {
-            return Ok(FfiPreparedTransfer::none());
-        };
-        if state.is_terminal() {
-            return Ok(FfiPreparedTransfer::none());
-        }
-        let target = ctx.target()?;
-        let served = drive_and_serve_next_due(&mut state, target, |state, id| {
-            prove_if_needed(&mut ctx, state, id)
-        })?;
-        match served {
-            Some((id, txid, proven)) => FfiPreparedTransfer::from_parts(id, txid, proven),
-            // Nothing due, or due but not yet finalizable (anchor not witnessable yet).
-            None => Ok(FfiPreparedTransfer::none()),
-        }
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_next_due_transfer",
+        ))
     });
     unwrap_exc_or_null(res)
 }
@@ -2604,12 +5032,11 @@ pub unsafe extern "C" fn zcashlc_migration_next_due_transfer(
 /// scheduled and expiry heights), or NULL with no error when there is none. Distinguish the two
 /// NULL meanings via `zcashlc_last_error_length`.
 ///
-/// "Due-and-unbroadcast" matches what [`zcashlc_migration_next_due_transfer`] would serve: an
-/// already-`Proved` due transfer, or a due, prove-ready `Signed` one the delivery call would
-/// first drive through proving (see [`due_assuming_proving`] — this query itself never proves;
-/// it reports the row the delivery lane is being driven toward, assuming its proof succeeds).
-/// NULL when the would-be-served transaction is a preparation, when due rows still await an
-/// external signature, or when nothing is due.
+/// "Due-and-unbroadcast" matches what the opaque delivery claim lane is being driven toward: an
+/// already-`Proved` due transfer, or a due, prove-ready `Signed` one the delivery flow first proves
+/// (see [`due_assuming_proving`] — this query itself never proves and assumes the later proof
+/// succeeds). NULL when the next claimable transaction is a preparation, when due rows still
+/// await an external signature, or when nothing is due.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_transfer_proposal`].
@@ -2622,7 +5049,7 @@ pub unsafe extern "C" fn zcashlc_migration_pending_transfer_proposal(
 ) -> *mut FfiTransferProposal {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
+        let Some(state) = read_canonical_migration(&mut ctx)? else {
             return Ok(ptr::null_mut());
         };
         if state.is_terminal() {
@@ -2638,7 +5065,8 @@ pub unsafe extern "C" fn zcashlc_migration_pending_transfer_proposal(
             .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }));
         match next_transfer {
             Some(tx) => {
-                let amount = transfer_amount(&state, tx)
+                let amount = state
+                    .transfer_amount(tx)
                     .ok_or_else(|| anyhow!("stored transfer has no valid net crossing amount"))?;
                 FfiTransferProposal::boxed(
                     tx.id(),
@@ -2654,40 +5082,39 @@ pub unsafe extern "C" fn zcashlc_migration_pending_transfer_proposal(
     unwrap_exc_or_null(res)
 }
 
-/// Extracts the consensus transaction bytes from a proven, finalized migration PCZT.
+/// Retained only as a disabled C ABI compatibility symbol. This unscoped extraction entry point
+/// predates delivery ownership and carries neither the exact source-reservation owner nor the
+/// canonical wallet-lock owner required to authorize migration inputs, so it always fails closed.
+/// Callers must use the token-bound materialization flow under the owning run and claim.
 ///
 /// # Safety
-/// See [`open`]; `pczt_ptr` must be valid for reads of `pczt_len` bytes. Free the returned
-/// pointer with `zcashlc_free_boxed_slice`.
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// NULL and sets the last-error channel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_extract_broadcast_tx(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-    pczt_ptr: *const u8,
-    pczt_len: usize,
+    _db_data: *const u8,
+    _db_data_len: usize,
+    _account_uuid_bytes: *const u8,
+    _network_id: u32,
+    _pczt_ptr: *const u8,
+    _pczt_len: usize,
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
-        let _ = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let pczt_bytes = unsafe { slice_or_empty(pczt_ptr, pczt_len) };
-        let pczt =
-            pczt::Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Error parsing PCZT: {e:?}"))?;
-        let (raw, _) = migration_finalize::extract_tx(pczt)?;
-        Ok(ffi::BoxedSlice::some(raw))
+        Err(anyhow!(
+            "legacy migration PCZT extraction is unauthorized; use the token-bound migration materialization API"
+        ))
     });
     unwrap_exc_or_null(res)
 }
 
-/// Records a broadcast outcome for the identified transaction. `result_tag`: 0 = success (with
-/// `txid_bytes`, 32 raw bytes) — the transaction is marked broadcast, to be reconciled to mined
-/// as the wallet scans; 1 = network error (retryable — nothing is recorded, the transaction stays
-/// offered); 2 = invalid note, 3 = expired — recorded in the SDK's invalid marks so the run
-/// surfaces `RequiresAttention`.
+/// Retained only as a disabled C ABI compatibility symbol. This unscoped callback cannot prove
+/// ownership of the canonical artifact or delivery claim, so it always fails closed before
+/// reading caller data or opening wallet state. Callers must record exact transport outcomes and
+/// failures through the token-bound delivery-v1 API.
 ///
 /// # Safety
-/// See [`open`]; `transfer_id` must be a valid C string; for tag 0, `txid_bytes` must be valid
-/// for reads of 32 bytes.
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// `false` and sets the last-error channel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
     db_data: *const u8,
@@ -2698,82 +5125,32 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
     result_tag: i32,
     txid_bytes: *const u8,
 ) -> bool {
+    let _ = (
+        db_data,
+        db_data_len,
+        account_uuid_bytes,
+        network_id,
+        transfer_id,
+        result_tag,
+        txid_bytes,
+    );
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let id = transfer_id_from_c(transfer_id)?;
-        match result_tag {
-            0 => {
-                if txid_bytes.is_null() {
-                    return Err(anyhow!("txid_bytes is null for a success result"));
-                }
-                let txid: [u8; 32] = unsafe { slice::from_raw_parts(txid_bytes, 32) }
-                    .try_into()
-                    .expect("length 32 by construction");
-                let mut backend =
-                    Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-                let mut state = backend
-                    .get_migration()?
-                    .ok_or_else(|| anyhow!("no migration is stored"))?;
-                state.mark_broadcast(id, TxId::from_bytes(txid));
-                backend.replace_migration(&state)?;
-                Ok(true)
-            }
-            1 => Ok(true),
-            2 | 3 => {
-                let reason = if result_tag == 2 {
-                    "invalid_note"
-                } else {
-                    "expired"
-                };
-                insert_invalid_mark(&ctx.store_conn, &ctx.account_bytes, id, reason)
-                    .map_err(|e| anyhow!("marks write failed: {e}"))?;
-                Ok(true)
-            }
-            other => Err(anyhow!("unknown TransferResult tag: {other}")),
-        }
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_record_transfer_result",
+        ))
     });
     unwrap_exc_or(res, false)
 }
 
-/// Records a broadcast immediate-migration sweep (an ordinary send-max transaction proposed via
-/// `zcashlc_propose_send_max_transfer(orchard_only: true)`, built entirely outside the engine's
-/// plan cache) so the platform's migration state machine reports it: `InProgress` (0 of 1) while
-/// unmined, `Complete` once mined, or a re-offer (`NotStarted`) if it expires unmined — see the
-/// precedence rule on [`derive_state`]. One row per account: a new record supersedes any previous
-/// one (INSERT OR REPLACE).
+/// Retained only as a disabled C ABI compatibility symbol. This entry point cannot safely release
+/// delivery-owned source reservations, so it always fails closed before opening wallet state.
+/// Callers must use [`zcashlc_migration_begin_abandonment_v1`] followed by
+/// [`zcashlc_migration_finish_abandonment_v1`], re-propose, and commit through the appropriate
+/// typed successor-rollover API.
 ///
 /// # Safety
-/// See [`open`]; `txid_bytes` must be valid for reads of 32 bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_record_immediate_run(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-    txid_bytes: *const u8,
-) -> bool {
-    let res = catch_panic(|| {
-        let ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        if txid_bytes.is_null() {
-            return Err(anyhow!("txid_bytes is null"));
-        }
-        let txid: [u8; 32] = unsafe { slice::from_raw_parts(txid_bytes, 32) }
-            .try_into()
-            .expect("length 32 by construction");
-        let tip = ctx.tip()?;
-        record_immediate_run(&ctx.store_conn, &ctx.account_bytes, txid, tip)
-            .map_err(|e| anyhow!("immediate run record failed: {e}"))?;
-        Ok(true)
-    });
-    unwrap_exc_or(res, false)
-}
-
-/// Cancels the stored run (persisting it as `Failed` — its pre-signed transactions are abandoned;
-/// already-broadcast ones are unaffected on-chain), clears the invalid marks, and previews a
-/// fresh plan against the live balance for the platform's re-confirm lane.
-///
-/// # Safety
-/// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// NULL and sets the last-error channel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_restart_step(
     db_data: *const u8,
@@ -2781,68 +5158,23 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
     account_uuid_bytes: *const u8,
     network_id: u32,
 ) -> *mut FfiMigrationSchedule {
+    let _ = (db_data, db_data_len, account_uuid_bytes, network_id);
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        {
-            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            if let Some(state) = backend.get_migration()? {
-                if !state.is_terminal() {
-                    let cancelled = MigrationState::from_parts(
-                        MigrationStatus::Failed,
-                        state.note_split().clone(),
-                        state.preparation().clone(),
-                        state.transactions().clone(),
-                    );
-                    backend.replace_migration(&cancelled)?;
-                }
-            }
-        }
-        clear_invalid_marks(&ctx.store_conn, &ctx.account_bytes)
-            .map_err(|e| anyhow!("marks clear failed: {e}"))?;
-        match plan_and_cache(&mut ctx)? {
-            Some((plan, reference_height)) => encode_schedule_from_plan(&plan, reference_height),
-            None => Ok(encode_empty_schedule()),
-        }
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_restart_step",
+        ))
     });
     unwrap_exc_or_null(res)
 }
 
-/// Rebuilds every EXPIRED migration transfer of the stored run in place through the engine
-/// (`rebuild_expired_transfer` / `rebuild_expired_transfer_unsigned`): each rebuilt transfer
-/// re-spends exactly the SAME funding note — recovered from the expired PCZT by nullifier
-/// identity, never an equal-value substitute — rescheduled from the current tip with a fresh
-/// memoryless delay, a fresh canonical expiry, and a freshly drawn ZIP 318 boundary anchor
-/// (anchors and witnesses stay deferred and are installed at proving time, ZIP 374). This is
-/// ZIP 318's expired-transaction handling: a new transaction for the affected part, denomination
-/// unchanged.
-///
-/// The spending key selects the signing lane. With `usk_ptr`/`usk_len` the rebuilt transfer is
-/// signed anew in-process (back to `Signed`, served by the normal proving/delivery lane).
-/// `usk_ptr == NULL` with `usk_len == 0` is the legitimate external-signer lane: the rebuilt
-/// transfer is left `AwaitingSignature`, so the resume path of
-/// `zcashlc_migration_create_unsigned_transfer_pczts` re-serves it to the signing ceremony and
-/// `zcashlc_migration_store_signed_schedule_pczts` completes it (`apply_signature`), exactly like
-/// an originally committed transfer.
-///
-/// Returns the stored run's FULL, freshly persisted transfer schedule (the same DTO
-/// `zcashlc_migration_restart_step` returns, here encoded from the post-refresh STORED state):
-/// after a rebuild the host has no other way to learn the fresh scheduled/expiry values, and its
-/// stale copy would fail the state-side consent echo forever — the returned schedule is the
-/// atomically-persisted truth to re-display and echo. With nothing rebuilt the CURRENT stored
-/// schedule is returned unchanged; with no stored migration, or a terminal stored run (a
-/// completed or cancelled run has nothing to refresh and nothing the echo lane compares
-/// against), the EMPTY schedule. The rebuilt state persists once, all-or-nothing: on any rebuild
-/// error nothing is persisted and NULL is returned (see `zcashlc_last_error_message`). A gone
-/// funding note (spent outside the migration) is a hard error naming
-/// `restartCurrentMigrationStep` (`zcashlc_migration_restart_step`) as the remedy — the
-/// remaining balance must be re-planned. An expired PREPARATION transaction also surfaces as a
-/// hard error: the engine rebuilds only transfers (leaves of the dependency graph; an expired
-/// preparation invalidates its dependents' pre-signatures), and its remediation is the same
-/// restart.
+/// Retained only as a disabled C ABI compatibility symbol. This bulk, unscoped refresh entry point
+/// cannot bind a rebuild to the exact current artifact and claim, so it always fails closed before
+/// reading caller data or opening wallet state. Callers must use
+/// [`zcashlc_migration_rebuild_expired_transfer_v1`] with the current opaque claim handle.
 ///
 /// # Safety
-/// See [`open`]; `usk_ptr` must be null (with `usk_len == 0`) or valid for reads of `usk_len`
-/// bytes. Free the returned pointer with [`zcashlc_free_migration_schedule`].
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// NULL and sets the last-error channel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
     db_data: *const u8,
@@ -2852,71 +5184,31 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
     usk_ptr: *const u8,
     usk_len: usize,
 ) -> *mut FfiMigrationSchedule {
+    let _ = (
+        db_data,
+        db_data_len,
+        account_uuid_bytes,
+        network_id,
+        usk_ptr,
+        usk_len,
+    );
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let usk = if usk_ptr.is_null() {
-            if usk_len != 0 {
-                return Err(anyhow!("usk_len must be 0 when usk_ptr is null"));
-            }
-            None
-        } else {
-            Some(unsafe { crate::decode_usk(usk_ptr, usk_len)? })
-        };
-
-        // Reconcile before judging expiry: a Broadcast transfer the wallet has since observed
-        // on-chain must count as Mined here, or it would look expired and be rebuilt into a
-        // double spend of its own mined copy. The no-run and terminal answers come before any
-        // tip lookup, so they hold even before the wallet ever saw a chain tip.
-        let Some(mut state) = reconcile_mined(&mut ctx)? else {
-            return Ok(encode_empty_schedule());
-        };
-        if state.is_terminal() {
-            return Ok(encode_empty_schedule());
-        }
-        let tip = ctx.tip()?;
-        let target = target_from_tip(tip);
-        let expired = state.expired_transactions(target);
-        if expired.is_empty() {
-            // Nothing to rebuild: the stored schedule IS current — serve it for re-display.
-            return encode_schedule_from_state(&state, tip);
-        }
-
-        let sign_in_process = usk.is_some();
-        let mut rng = OsRng;
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, usk, &mut ctx.store_conn)?;
-        for id in &expired {
-            if sign_in_process {
-                engine::rebuild_expired_transfer(&ctx.network, &backend, &mut state, *id, &mut rng)
-                    .map_err(map_rebuild_err)?;
-            } else {
-                // The returned UnsignedMigrationTx is deliberately dropped: the rebuilt transfer
-                // is persisted `AwaitingSignature` below, and the ceremony re-serves those bytes
-                // through `zcashlc_migration_create_unsigned_transfer_pczts`.
-                engine::rebuild_expired_transfer_unsigned(
-                    &ctx.network,
-                    &backend,
-                    &mut state,
-                    *id,
-                    &mut rng,
-                )
-                .map_err(map_rebuild_err)?;
-            }
-        }
-        backend.replace_migration(&state)?;
-        encode_schedule_from_state(&state, tip)
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_refresh_stale_transfers",
+        ))
     });
     unwrap_exc_or_null(res)
 }
 
-/// Builds the whole migration UNSIGNED (external-signer lane): every transaction is persisted
-/// `AwaitingSignature`, and the preparation (note-split) subset is returned for the signing
-/// ceremony. The run is created HERE; the transfer subset of the same build is served by
-/// `zcashlc_migration_create_unsigned_transfer_pczts`. Resumes a stored non-terminal run
-/// (re-serving its still-unsigned preparation transactions); replaces a terminal one.
+/// Retained only as a disabled C ABI compatibility symbol. This entry point would expose unsigned
+/// transactions without a Rust-owned delivery claim, so it always fails closed before opening
+/// wallet state. Callers must commit an external schedule with
+/// [`zcashlc_migration_commit_external_schedule_v1`] and expose canonical bytes only through the
+/// typed external-signing claim flow.
 ///
 /// # Safety
-/// See [`open`]. Free the returned pointer with
-/// [`zcashlc_free_migration_unsigned_transfer_pczts`].
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// NULL and sets the last-error channel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczts(
     db_data: *const u8,
@@ -2924,34 +5216,23 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczts(
     account_uuid_bytes: *const u8,
     network_id: u32,
 ) -> *mut FfiUnsignedTransferPczts {
+    let _ = (db_data, db_data_len, account_uuid_bytes, network_id);
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let (state, unsigned) = commit_or_resume(&mut ctx, None, true)?;
-        let prep_ids: HashSet<MigrationTxId> = state
-            .transactions()
-            .iter()
-            .filter(|t| matches!(t.kind(), MigrationTxKind::Preparation { .. }))
-            .map(|t| t.id())
-            .collect();
-        let preps: Vec<_> = unsigned
-            .into_iter()
-            .filter(|(id, _)| prep_ids.contains(id))
-            .collect();
-        FfiUnsignedTransferPczts::from_pairs(preps)
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_create_unsigned_note_split_pczts",
+        ))
     });
     unwrap_exc_or_null(res)
 }
 
-/// Applies the ceremony's signatures to the run's preparation (note-split) transactions,
-/// all-or-nothing: every `(id, pczt)` pair must land on a stored transaction awaiting its
-/// signature, or nothing is persisted. Returns a STORAGE RECEIPT for the first preparation
-/// transaction (its id and signed bytes; the txid is zeroed — the broadcastable, proven value is
-/// served by the delivery lane).
+/// Retained only as a disabled C ABI compatibility symbol. This entry point accepts signed bytes
+/// without an owning Rust delivery claim, so it always fails closed before reading caller data or
+/// opening wallet state. Callers must advance the exact staged external-signing claim with
+/// [`zcashlc_migration_advance_external_signature_v1`].
 ///
 /// # Safety
-/// See [`open`]; `ids`/`pczts`/`pczt_lens` must be valid for reads of `ids_len` elements, and
-/// each `pczts[i]` for `pczt_lens[i]` bytes. Free the returned pointer with
-/// [`zcashlc_free_migration_prepared_transfer`].
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// NULL and sets the last-error channel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
     db_data: *const u8,
@@ -2963,51 +5244,31 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
     pczts: *const *const u8,
     pczt_lens: *const usize,
 ) -> *mut FfiPreparedTransfer {
+    let _ = (
+        db_data,
+        db_data_len,
+        account_uuid_bytes,
+        network_id,
+        ids,
+        ids_len,
+        pczts,
+        pczt_lens,
+    );
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        let mut state = backend
-            .get_migration()?
-            .ok_or_else(|| anyhow!("no migration is committed yet"))?;
-        let mut first: Option<(MigrationTxId, Vec<u8>)> = None;
-        for (id, bytes) in signed {
-            if first.is_none() {
-                first = Some((id, bytes.clone()));
-            }
-            if !state.apply_signature(id, bytes) {
-                return Err(anyhow!(
-                    "signature for transaction {} does not match a stored transaction awaiting \
-                     one; nothing was persisted",
-                    u32::from(id)
-                ));
-            }
-        }
-        let (first_id, first_bytes) =
-            first.ok_or_else(|| anyhow!("no signed note-split PCZTs were provided"))?;
-        backend.replace_migration(&state)?;
-        FfiPreparedTransfer::from_parts(first_id, [0u8; 32], first_bytes)
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_store_signed_note_split_pczts",
+        ))
     });
     unwrap_exc_or_null(res)
 }
 
-/// Serves the TRANSFER subset of the unsigned build for the signing ceremony (see
-/// `zcashlc_migration_create_unsigned_note_split_pczts` — the run and every unsigned transaction
-/// already exist).
-///
-/// `ids`/`amounts`/`expiry_heights` are verified consent echoes, checked against the STORED
-/// committed state this call serves from (there is no cache to consult post-commit): mismatch —
-/// including a length mismatch — errors with the `MIGRATION_PLAN_STALE:` prefix (the app re-reads
-/// the current state). `next_executable_after_heights`/`anchor_heights`/`estimated_duration_hours`
-/// are accepted but NOT checked — see `zcashlc_migration_sign_and_store_schedule`'s doc for why
-/// (the first's immediate-lane commit-time reschedule can legitimately move it away from an
-/// honest echo, with no way to converge by re-proposing; the second is never consent-critical;
-/// the third (#1806) is re-serve-time-relative display metadata post-commit, with no stable
-/// pre-commit reference surviving here to check it against).
+/// Retained only as a disabled C ABI compatibility symbol. This entry point would expose unsigned
+/// transfer PCZTs without an owning Rust delivery claim, so it always fails closed before reading
+/// caller data or opening wallet state. Callers must use the typed external-signing claim flow.
 ///
 /// # Safety
-/// See [`open`]; array pointers must be valid for reads of `ids_len` elements. Free the returned
-/// pointer with [`zcashlc_free_migration_unsigned_transfer_pczts`].
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// NULL and sets the last-error channel.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_create_unsigned_transfer_pczts(
@@ -3023,44 +5284,35 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_transfer_pczts(
     expiry_heights: *const i64,
     estimated_duration_hours: u32,
 ) -> *mut FfiUnsignedTransferPczts {
+    let _ = (
+        db_data,
+        db_data_len,
+        account_uuid_bytes,
+        network_id,
+        ids,
+        ids_len,
+        amounts,
+        anchor_heights,
+        next_executable_after_heights,
+        expiry_heights,
+        estimated_duration_hours,
+    );
     let res = catch_panic(|| {
-        let _ = anchor_heights;
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let (state, unsigned) = commit_or_resume(&mut ctx, None, true)?;
-        let ids_slice = unsafe { slice_or_empty(ids, ids_len) };
-        let amounts = unsafe { slice_or_empty(amounts, ids_len) };
-        let next_executable_after_heights =
-            unsafe { slice_or_empty(next_executable_after_heights, ids_len) };
-        let expiry_heights = unsafe { slice_or_empty(expiry_heights, ids_len) };
-        validate_schedule_echo_against_state(
-            &state,
-            ids_slice,
-            amounts,
-            next_executable_after_heights,
-            expiry_heights,
-            estimated_duration_hours,
-        )?;
-        let transfer_ids: HashSet<MigrationTxId> = state
-            .transactions()
-            .iter()
-            .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }))
-            .map(|t| t.id())
-            .collect();
-        let transfers: Vec<_> = unsigned
-            .into_iter()
-            .filter(|(id, _)| transfer_ids.contains(id))
-            .collect();
-        FfiUnsignedTransferPczts::from_pairs(transfers)
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_create_unsigned_transfer_pczts",
+        ))
     });
     unwrap_exc_or_null(res)
 }
 
-/// Applies the ceremony's signatures to the run's transfer transactions, all-or-nothing (see
-/// `zcashlc_migration_store_signed_note_split_pczts`).
+/// Retained only as a disabled C ABI compatibility symbol. This entry point accepts signed bytes
+/// without an owning Rust delivery claim, so it always fails closed before reading caller data or
+/// opening wallet state. Callers must advance the exact staged external-signing claim with
+/// [`zcashlc_migration_advance_external_signature_v1`].
 ///
 /// # Safety
-/// See [`open`]; `ids`/`pczts`/`pczt_lens` must be valid for reads of `ids_len` elements, and
-/// each `pczts[i]` for `pczt_lens[i]` bytes.
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// `false` and sets the last-error channel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
     db_data: *const u8,
@@ -3072,52 +5324,22 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
     pczts: *const *const u8,
     pczt_lens: *const usize,
 ) -> bool {
+    let _ = (
+        db_data,
+        db_data_len,
+        account_uuid_bytes,
+        network_id,
+        ids,
+        ids_len,
+        pczts,
+        pczt_lens,
+    );
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        let mut state = backend
-            .get_migration()?
-            .ok_or_else(|| anyhow!("no migration is committed yet"))?;
-        for (id, bytes) in signed {
-            if !state.apply_signature(id, bytes) {
-                return Err(anyhow!(
-                    "signature for transaction {} does not match a stored transaction awaiting \
-                     one; nothing was persisted",
-                    u32::from(id)
-                ));
-            }
-        }
-        backend.replace_migration(&state)?;
-        Ok(true)
+        Err(legacy_delivery_api_disabled(
+            "zcashlc_migration_store_signed_schedule_pczts",
+        ))
     });
     unwrap_exc_or(res, false)
-}
-
-/// Decode the platform's parallel `(id, pczt)` arrays into owned pairs.
-///
-/// # Safety
-/// `ids`/`pczts`/`pczt_lens` must be valid for reads of `len` elements; every `ids[i]` must be a
-/// valid C string and every `pczts[i]` valid for `pczt_lens[i]` bytes.
-unsafe fn decode_signed_pairs(
-    ids: *const *const c_char,
-    len: usize,
-    pczts: *const *const u8,
-    pczt_lens: *const usize,
-) -> anyhow::Result<Vec<(MigrationTxId, Vec<u8>)>> {
-    let id_ptrs = unsafe { slice_or_empty(ids, len) };
-    let pczt_ptrs = unsafe { slice_or_empty(pczts, len) };
-    let lens = unsafe { slice_or_empty(pczt_lens, len) };
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let id = transfer_id_from_c(id_ptrs[i])?;
-        if pczt_ptrs[i].is_null() {
-            return Err(anyhow!("signed pczt at index {i} is null"));
-        }
-        let bytes = unsafe { slice::from_raw_parts(pczt_ptrs[i], lens[i]) }.to_vec();
-        out.push((id, bytes));
-    }
-    Ok(out)
 }
 
 /// The Ironwood (NU6.3) activation height for a standard network, or `-1` when unset/unknown (and
@@ -3146,9 +5368,9 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use zcash_pool_migration_backend::note_splitting::NoteSplitPlan;
-    use zcash_pool_migration_backend::preparation::PreparationPlan;
-    use zcash_pool_migration_backend::scheduling;
+    use zcash_pool_migration::note_splitting::NoteSplitPlan;
+    use zcash_pool_migration::preparation::PreparationPlan;
+    use zcash_pool_migration::scheduling;
 
     fn zat(v: u64) -> Zatoshis {
         Zatoshis::from_u64(v).unwrap()
@@ -3219,7 +5441,7 @@ mod tests {
                 h(scheduled),
                 h(expiry),
                 None,
-                s.clone(),
+                *s,
                 None,
             ));
         }
@@ -3233,7 +5455,7 @@ mod tests {
                 h(scheduled),
                 h(expiry),
                 Some(h(scheduled)),
-                s.clone(),
+                *s,
                 None,
             ));
         }
@@ -3259,9 +5481,86 @@ mod tests {
     };
 
     #[test]
+    fn expired_rebuild_rejects_old_live_and_terminal_handles_after_same_row_rebuild() {
+        let prior = test_state(
+            MigrationStatus::Committed,
+            &[],
+            &[MigrationTxState::Signed],
+            50,
+            10_000,
+        );
+        let prior_tx = &prior.transactions()[0];
+        let prior_identity = DeliveryArtifactIdentity::Scheduled(
+            scheduled_artifact_evidence(&prior, prior_tx.id())
+                .expect("prior artifact evidence")
+                .identity(),
+        );
+        let replacement_tx = MigrationTransaction::from_parts(
+            prior_tx.id(),
+            prior_tx.kind(),
+            vec![0x7a],
+            prior_tx.depends_on().clone(),
+            h(100),
+            h(20_000),
+            prior_tx.anchor_boundary(),
+            MigrationTxState::Signed,
+            prior_tx.lock_owner(),
+        );
+        let current = MigrationState::from_parts(
+            prior.status(),
+            prior.note_split().clone(),
+            prior.preparation().clone(),
+            vec![replacement_tx],
+        );
+        let current_identity = DeliveryArtifactIdentity::Scheduled(
+            scheduled_artifact_evidence(&current, prior_tx.id())
+                .expect("replacement artifact evidence")
+                .identity(),
+        );
+        assert_ne!(prior_identity, current_identity);
+
+        let live_error = validate_expired_rebuild_generation(
+            prior_identity,
+            ClaimStatus::Materializing,
+            &current,
+        )
+        .unwrap_err();
+        assert!(
+            live_error
+                .to_string()
+                .contains("positively expired unmined")
+        );
+
+        let terminal_error = validate_expired_rebuild_generation(
+            prior_identity,
+            ClaimStatus::ExpiredUnmined,
+            &current,
+        )
+        .unwrap_err();
+        assert!(
+            terminal_error
+                .to_string()
+                .contains("archived or replaced transaction attempt")
+        );
+
+        assert_eq!(
+            validate_expired_rebuild_generation(
+                current_identity,
+                ClaimStatus::ExpiredUnmined,
+                &current,
+            )
+            .unwrap(),
+            match current_identity {
+                DeliveryArtifactIdentity::Scheduled(identity) => identity,
+                DeliveryArtifactIdentity::Immediate(_) => unreachable!(),
+            }
+        );
+    }
+
+    #[test]
     fn derive_no_migration_is_not_started() {
         assert!(matches!(
-            derive_state(None, h(100), &[], None),
+            derive_state(None, h(100), true),
             DerivedState::NotStarted
         ));
     }
@@ -3276,7 +5575,7 @@ mod tests {
             10_000,
         );
         assert!(matches!(
-            derive_state(Some(&state), h(100), &[], None),
+            derive_state(Some(&state), h(100), true),
             DerivedState::NotStarted
         ));
     }
@@ -3285,7 +5584,31 @@ mod tests {
     fn derive_complete_is_per_run_complete() {
         let state = test_state(MigrationStatus::Complete, &[MINED], &[MINED], 50, 10_000);
         assert!(matches!(
-            derive_state(Some(&state), h(100), &[], None),
+            derive_state(Some(&state), h(100), true),
+            DerivedState::Complete
+        ));
+    }
+
+    #[test]
+    fn derive_mined_run_waits_for_exact_resulting_outputs_to_be_available() {
+        let state = test_state(
+            MigrationStatus::Complete,
+            &[MINED],
+            &[MINED, MINED],
+            50,
+            10_000,
+        );
+        assert!(matches!(
+            derive_state(Some(&state), h(100), false),
+            DerivedState::InProgress {
+                completed_transfers: 2,
+                total_transfers: 2,
+                next_transfer_ready_at_height: None,
+                is_immediate: false,
+            }
+        ));
+        assert!(matches!(
+            derive_state(Some(&state), h(100), true),
             DerivedState::Complete
         ));
     }
@@ -3300,7 +5623,7 @@ mod tests {
             10_000,
         );
         assert!(matches!(
-            derive_state(Some(&state), h(100), &[], None),
+            derive_state(Some(&state), h(100), true),
             DerivedState::SplitPendingConfirmation
         ));
     }
@@ -3314,7 +5637,7 @@ mod tests {
             50,
             10_000,
         );
-        match derive_state(Some(&state), h(100), &[], None) {
+        match derive_state(Some(&state), h(100), true) {
             DerivedState::InProgress {
                 completed_transfers,
                 total_transfers,
@@ -3384,7 +5707,7 @@ mod tests {
             PreparationPlan::from_parts(Vec::new(), Vec::new()),
             transactions,
         );
-        match derive_state(Some(&state), h(200), &[], None) {
+        match derive_state(Some(&state), h(200), true) {
             DerivedState::InProgress {
                 next_transfer_ready_at_height,
                 ..
@@ -3445,7 +5768,7 @@ mod tests {
             PreparationPlan::from_parts(Vec::new(), Vec::new()),
             transactions,
         );
-        match derive_state(Some(&state), h(200), &[], None) {
+        match derive_state(Some(&state), h(200), true) {
             DerivedState::InProgress {
                 next_transfer_ready_at_height,
                 ..
@@ -3454,21 +5777,6 @@ mod tests {
             }
             _ => panic!("expected InProgress"),
         }
-    }
-
-    #[test]
-    fn derive_invalid_mark_wins() {
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[MINED],
-            &[MigrationTxState::Signed],
-            50,
-            10_000,
-        );
-        assert!(matches!(
-            derive_state(Some(&state), h(100), &[1], None),
-            DerivedState::InvalidTransfer(1)
-        ));
     }
 
     #[test]
@@ -3481,12 +5789,12 @@ mod tests {
             90,
         );
         assert!(matches!(
-            derive_state(Some(&state), h(100), &[], None),
+            derive_state(Some(&state), h(100), true),
             DerivedState::TransferExpired
         ));
     }
 
-    /// ZIP 203 / engine semantics (`zcash_pool_migration_backend::state::MigrationState::is_expired`):
+    /// ZIP 203 / engine semantics (`zcash_pool_migration::state::MigrationState::is_expired`):
     /// a transaction may be mined only in a block at or below its `expiry_height`, so it is
     /// expired as soon as the NEXT block (`target = tip + 1`) would exceed that height — i.e.
     /// exactly when `tip == expiry_height`, one block EARLIER than a naive `tip > expiry_height`
@@ -3503,7 +5811,7 @@ mod tests {
         );
         assert!(
             matches!(
-                derive_state(Some(&state), h(100), &[], None),
+                derive_state(Some(&state), h(100), true),
                 DerivedState::TransferExpired
             ),
             "expiry_height == tip can no longer be mined in the next block and must derive \
@@ -3525,148 +5833,15 @@ mod tests {
         );
         assert!(
             matches!(
-                derive_state(Some(&state), h(1_000_000), &[], None),
+                derive_state(Some(&state), h(1_000_000), true),
                 DerivedState::InProgress { .. }
             ),
             "expiry_height == 0 must never expire, even at a huge tip"
         );
     }
 
-    /// Builds an [`ImmediateRunLookup`] directly (bypassing the wallet-DB lookup), for exercising
-    /// `derive_state`'s immediate-run precedence rule in isolation.
-    fn immediate_lookup(
-        recorded_at: u32,
-        mined: Option<u32>,
-        expiry: Option<u32>,
-    ) -> ImmediateRunLookup {
-        ImmediateRunLookup {
-            recorded_at_height: h(recorded_at),
-            mined_height: mined.map(h),
-            expiry_height: expiry.map(h),
-        }
-    }
-
     #[test]
-    fn derive_immediate_run_pending_is_in_progress_of_one() {
-        let run = immediate_lookup(100, None, Some(500));
-        match derive_state(None, h(300), &[], Some(&run)) {
-            DerivedState::InProgress {
-                completed_transfers,
-                total_transfers,
-                next_transfer_ready_at_height,
-                is_immediate,
-            } => {
-                assert_eq!(completed_transfers, 0);
-                assert_eq!(total_transfers, 1);
-                assert_eq!(next_transfer_ready_at_height, None);
-                assert!(
-                    is_immediate,
-                    "an immediate-lane run must carry is_immediate = true"
-                );
-            }
-            _ => panic!("expected InProgress"),
-        }
-    }
-
-    #[test]
-    fn derive_immediate_run_mined_is_consumed() {
-        // R2: a mined immediate sweep is CONSUMED — the swept balance is zero and there is nothing
-        // for the app to acknowledge, so it derives no migration UI (NotStarted), not a `Complete`
-        // screen. If new Orchard funds arrive later, the ordinary balance-gated re-offer applies.
-        let run = immediate_lookup(100, Some(250), Some(500));
-        assert!(matches!(
-            derive_state(None, h(300), &[], Some(&run)),
-            DerivedState::NotStarted
-        ));
-    }
-
-    #[test]
-    fn derive_mined_immediate_run_masks_stale_complete_engine_state() {
-        // R2 masking rule: a consumed (mined) immediate run must suppress a stale engine `Complete`
-        // left by an earlier engine-tracked run, so the user sees NO migration UI at all — neither
-        // the immediate run's own screen (a mined immediate run has none) nor the stale Complete.
-        // Net: NotStarted.
-        let state = test_state(MigrationStatus::Complete, &[MINED], &[MINED], 50, 10_000);
-        let run = immediate_lookup(1_000, Some(1_050), Some(1_500));
-        assert!(matches!(
-            derive_state(Some(&state), h(1_100), &[], Some(&run)),
-            DerivedState::NotStarted
-        ));
-    }
-
-    #[test]
-    fn derive_immediate_run_expired_unmined_falls_through_to_not_started() {
-        let run = immediate_lookup(100, None, Some(200));
-        assert!(matches!(
-            derive_state(None, h(300), &[], Some(&run)),
-            DerivedState::NotStarted
-        ));
-    }
-
-    #[test]
-    fn derive_immediate_run_unknown_expiry_uses_fallback_bound() {
-        let run = immediate_lookup(100, None, None);
-        // Still within the fallback bound (100 + 40 = 140).
-        assert!(matches!(
-            derive_state(None, h(140), &[], Some(&run)),
-            DerivedState::InProgress { .. }
-        ));
-        // Past the fallback bound: expired, falls through.
-        assert!(matches!(
-            derive_state(None, h(141), &[], Some(&run)),
-            DerivedState::NotStarted
-        ));
-    }
-
-    #[test]
-    fn derive_engine_active_run_wins_over_immediate_run() {
-        // An active (unmined-prep) engine run derives to SplitPendingConfirmation on its own.
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[MigrationTxState::Signed],
-            &[MigrationTxState::Signed],
-            50,
-            10_000,
-        );
-        // This immediate run is mined, so on its own it would be consumed (NotStarted) — but the
-        // active engine run wins regardless.
-        let run = immediate_lookup(100, Some(250), Some(500));
-        assert!(matches!(
-            derive_state(Some(&state), h(300), &[], Some(&run)),
-            DerivedState::SplitPendingConfirmation
-        ));
-    }
-
-    #[test]
-    fn derive_unmined_immediate_run_overrides_stale_complete_engine_state() {
-        // A `Complete` engine run is terminal (not "active"), so a separate, later UNMINED (still
-        // live) immediate run still gets a say instead of being masked by the stale Complete
-        // verdict: it derives its own `InProgress`. (A MINED immediate run instead masks the stale
-        // Complete to NotStarted — see `derive_mined_immediate_run_masks_stale_complete_engine_state`.)
-        let state = test_state(MigrationStatus::Complete, &[MINED], &[MINED], 50, 10_000);
-        let run = immediate_lookup(1_000, None, Some(1_500));
-        match derive_state(Some(&state), h(1_100), &[], Some(&run)) {
-            DerivedState::InProgress {
-                completed_transfers,
-                total_transfers,
-                is_immediate,
-                ..
-            } => {
-                assert_eq!(completed_transfers, 0);
-                assert_eq!(total_transfers, 1);
-                assert!(
-                    is_immediate,
-                    "the immediate run that wins is an immediate-lane run"
-                );
-            }
-            _ => panic!(
-                "expected the immediate run's InProgress to win over the stale Complete engine state"
-            ),
-        }
-    }
-
-    #[test]
-    fn transfer_amount_is_net_of_fee_buffer() {
+    fn canonical_transfer_amount_is_net_of_fee_buffer() {
         let state = test_state(
             MigrationStatus::InProgress,
             &[MINED],
@@ -3682,7 +5857,7 @@ mod tests {
         // test_state's note split stores zat(100_000_000) CROSSING (net) values against a
         // zat(10_000) fee buffer; `funding_notes()` derives the gross 100_010_000 note and
         // `transfer_amount` nets the buffer back off, landing on the stored crossing value.
-        assert_eq!(transfer_amount(&state, tx), Some(zat(100_000_000)));
+        assert_eq!(state.transfer_amount(tx), Some(zat(100_000_000)));
     }
 
     #[test]
@@ -3828,517 +6003,346 @@ mod tests {
         );
     }
 
-    /// The state-side counterpart, over hand-built `MigrationTransaction` rows: only
-    /// `scheduled_height()` is read, so a minimal Transfer-kind row with placeholder PCZT bytes
-    /// suffices.
-    fn transfer_at(id: u32, scheduled: u32) -> MigrationTransaction {
-        MigrationTransaction::from_parts(
-            MigrationTxId::new(id),
-            MigrationTxKind::Transfer { crossing: 0 },
-            vec![0u8],
-            Vec::new(),
-            h(scheduled),
-            h(scheduled + 10_000),
-            Some(h(scheduled)),
-            MigrationTxState::Signed,
-            None,
-        )
-    }
-
-    #[test]
-    fn stored_duration_hours_is_measured_from_now_to_the_last_scheduled_height() {
-        let a = transfer_at(0, 1_000_336);
-        let b = transfer_at(1, 1_000_432);
-        assert_eq!(stored_duration_hours(&[&a, &b], h(1_000_000)), 9);
-    }
-
-    #[test]
-    fn stored_duration_hours_empty_is_zero() {
-        assert_eq!(stored_duration_hours(&[], h(1_000_000)), 0);
-    }
-
-    #[test]
-    fn stored_duration_hours_all_overdue_is_zero() {
-        let a = transfer_at(0, 900_000);
-        let b = transfer_at(1, 950_000);
-        assert_eq!(stored_duration_hours(&[&a, &b], h(1_000_000)), 0);
-    }
-
-    /// The DTO-constructing encode path end to end: `encode_schedule_from_state` must thread its
-    /// `now_reference` into the SAME `max - now` math as the pure helper above, not silently keep
-    /// the old first-to-last span (old math here would have said `2`, not `9`).
-    #[test]
-    fn encode_schedule_from_state_measures_duration_from_now_reference() {
-        let transactions = vec![
-            MigrationTransaction::from_parts(
-                MigrationTxId::new(0),
-                MigrationTxKind::Transfer { crossing: 0 },
-                vec![0u8],
-                Vec::new(),
-                h(1_000_336),
-                h(1_100_000),
-                Some(h(1_000_336)),
-                MigrationTxState::Signed,
-                None,
-            ),
-            MigrationTransaction::from_parts(
-                MigrationTxId::new(1),
-                MigrationTxKind::Transfer { crossing: 1 },
-                vec![0u8],
-                Vec::new(),
-                h(1_000_432),
-                h(1_100_000),
-                Some(h(1_000_432)),
-                MigrationTxState::Signed,
-                None,
-            ),
-        ];
-        let state = MigrationState::from_parts(
-            MigrationStatus::InProgress,
-            NoteSplitPlan::from_stored_parts(
-                vec![zat(100_000_000), zat(100_000_000)],
-                zat(0),
-                None,
-                zat(20_000),
-                zat(1_000_000_000),
-                zat(999_000_000),
-            )
-            .unwrap(),
-            PreparationPlan::from_parts(Vec::new(), Vec::new()),
-            transactions,
-        );
-
-        let schedule_ptr =
-            encode_schedule_from_state(&state, h(1_000_000)).expect("encoding must succeed");
-        let schedule = unsafe { &*schedule_ptr };
-        assert_eq!(schedule.estimated_duration_hours, 9);
-        unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
-    }
-
-    // ----- verified consent echoes (F4) -----
-
-    fn row(id: u32, amount: i64, next_executable_after_height: i64, expiry_height: i64) -> EchoRow {
-        EchoRow {
-            id,
-            amount,
-            next_executable_after_height,
-            expiry_height,
-        }
-    }
-
-    fn stored_row(id: u32, amount: i64, expiry_height: i64) -> StoredEchoRow {
-        StoredEchoRow {
-            id,
-            amount,
-            expiry_height,
-        }
-    }
-
-    #[test]
-    fn schedule_echo_matches_accepts_a_matching_echo_regardless_of_order() {
-        let expected = vec![row(1, 100, 50, 5_000), row(2, 200, 60, 6_000)];
-        // The platform's echo is in the OPPOSITE order — order must not matter.
-        let got = vec![row(2, 200, 60, 6_000), row(1, 100, 50, 5_000)];
-        assert!(schedule_echo_matches(expected, 10, got, 10));
-    }
-
-    #[test]
-    fn schedule_echo_matches_detects_wrong_amount() {
-        let expected = vec![row(1, 100, 50, 5_000), row(2, 200, 60, 6_000)];
-        // Id 2's amount is echoed wrong (201 instead of 200).
-        let got = vec![row(1, 100, 50, 5_000), row(2, 201, 60, 6_000)];
-        assert!(!schedule_echo_matches(expected, 10, got, 10));
-    }
-
-    #[test]
-    fn schedule_echo_matches_detects_a_length_mismatch() {
-        let expected = vec![row(1, 100, 50, 5_000), row(2, 200, 60, 6_000)];
-        // Only one of the two expected transfers is echoed back (a wrong id COUNT).
-        let got = vec![row(1, 100, 50, 5_000)];
-        assert!(!schedule_echo_matches(expected, 10, got, 10));
-    }
-
-    #[test]
-    fn schedule_echo_matches_detects_wrong_duration() {
-        let expected = vec![row(1, 100, 50, 5_000)];
-        let got = vec![row(1, 100, 50, 5_000)];
-        assert!(!schedule_echo_matches(expected, 10, got, 11));
-    }
-
-    #[test]
-    fn note_split_echo_matches_accepts_a_matching_echo_regardless_of_order() {
-        assert!(note_split_echo_matches(&[100, 200], 50, vec![200, 100], 50));
-    }
-
-    #[test]
-    fn note_split_echo_matches_detects_wrong_fee() {
-        assert!(!note_split_echo_matches(
-            &[100, 200],
-            50,
-            vec![100, 200],
-            51
-        ));
-    }
-
-    #[test]
-    fn note_split_echo_matches_detects_wrong_outputs() {
-        assert!(!note_split_echo_matches(
-            &[100, 200],
-            50,
-            vec![100, 201],
-            50
-        ));
-    }
-
-    /// [`expected_rows_from_state`] pins the state-derived echo used to validate
-    /// `zcashlc_migration_create_unsigned_transfer_pczts`'s echo: only the TRANSFER subset
-    /// appears (the preparation transaction is excluded), amounts pair via `funding_notes()`
-    /// (crossing-indexed, not declaration order). No duration is returned at all (post-#1806 —
-    /// see [`StoredEchoRow`]'s doc for why it is excluded from the STATE-side comparison
-    /// entirely); [`validate_schedule_echo_against_state_ignores_estimated_duration_hours`] pins
-    /// that exclusion end to end.
-    #[test]
-    fn expected_rows_from_state_pins_transfer_subset() {
-        let transactions = vec![
-            MigrationTransaction::from_parts(
-                MigrationTxId::new(0),
-                MigrationTxKind::Preparation { layer: 0, index: 0 },
-                vec![0u8],
-                Vec::new(),
-                h(50),
-                h(10_000),
-                None,
-                MigrationTxState::Mined { height: h(60) },
-                None,
-            ),
-            MigrationTransaction::from_parts(
-                MigrationTxId::new(1),
-                MigrationTxKind::Transfer { crossing: 0 },
-                vec![0u8],
-                Vec::new(),
-                h(100),
-                h(5_000),
-                Some(h(100)),
-                MigrationTxState::Signed,
-                None,
-            ),
-            MigrationTransaction::from_parts(
-                MigrationTxId::new(2),
-                MigrationTxKind::Transfer { crossing: 1 },
-                vec![0u8],
-                Vec::new(),
-                h(220),
-                h(6_000),
-                Some(h(220)),
-                MigrationTxState::Signed,
-                None,
-            ),
-        ];
-        // Crossing values, a zero fee buffer (so `funding_notes()` == these values exactly,
-        // keeping the amounts under test free of extra fee-buffer arithmetic).
-        let crossing_values = vec![zat(100_000_000), zat(250_000_000)];
-        let state = MigrationState::from_parts(
-            MigrationStatus::InProgress,
-            NoteSplitPlan::from_stored_parts(
-                crossing_values,
-                zat(0),
-                None,
-                zat(20_000),
-                zat(1_000_000_000),
-                zat(999_000_000),
-            )
-            .unwrap(),
-            PreparationPlan::from_parts(Vec::new(), Vec::new()),
-            transactions,
-        );
-
-        let mut rows = expected_rows_from_state(&state);
-        rows.sort();
-        // No `next_executable_after_height` field: the state-side echo excludes it (see
-        // `StoredEchoRow`'s doc) even though the two transfers here have DIFFERENT scheduled
-        // heights (100, 220).
-        assert_eq!(
-            rows,
-            vec![
-                stored_row(1, zat_to_i64(zat(100_000_000)), 5_000),
-                stored_row(2, zat_to_i64(zat(250_000_000)), 6_000),
-            ]
-        );
-    }
-
-    /// Builds real, null-terminated C strings for `ids` (matching what the FFI layer decodes) and
-    /// hands back both the owning `CString`s (keep them alive for the duration of the call) and
-    /// the `*const c_char` pointers to pass.
-    fn c_ids(ids: &[u32]) -> (Vec<CString>, Vec<*const c_char>) {
-        let owned: Vec<CString> = ids
-            .iter()
-            .map(|id| CString::new(id.to_string()).unwrap())
-            .collect();
-        let ptrs = owned.iter().map(|s| s.as_ptr()).collect();
-        (owned, ptrs)
-    }
-
-    #[test]
-    fn validate_schedule_echo_against_state_accepts_a_matching_echo() {
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed, MigrationTxState::Signed],
-            50,
-            10_000,
-        );
-        // `test_state`'s two transfers (ids 0, 1) both cross 100_000_000 zatoshi NET (the stored
-        // funding note is gross of the fixed 10_000-zatoshi fee buffer; `transfer_amount` nets it
-        // back out), at height 50, expiring at 10_000; the echoed duration (`0` below) is
-        // excluded from the state-side comparison entirely (see `StoredEchoRow`), so its value
-        // is arbitrary here.
-        let (_owned, ids) = c_ids(&[0, 1]);
-        let amounts = [100_000_000i64, 100_000_000i64];
-        let next_executable_after_heights = [50i64, 50i64];
-        let expiry_heights = [10_000i64, 10_000i64];
-        assert!(
-            validate_schedule_echo_against_state(
-                &state,
-                &ids,
-                &amounts,
-                &next_executable_after_heights,
-                &expiry_heights,
-                0,
-            )
-            .is_ok()
-        );
-    }
-
-    /// Pins Part B's "wrong id count" lane (`zcashlc_migration_create_unsigned_transfer_pczts`):
-    /// the stored run has two transfers, but only one is echoed back — a real
-    /// [`MigrationState`] (built the same way the real production code reads one, via
-    /// `test_state`), driven through the exact function the FFI entry point calls.
-    #[test]
-    fn validate_schedule_echo_against_state_detects_wrong_id_count() {
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed, MigrationTxState::Signed],
-            50,
-            10_000,
-        );
-        let (_owned, ids) = c_ids(&[0]);
-        let amounts = [100_000_000i64];
-        let next_executable_after_heights = [50i64];
-        let expiry_heights = [10_000i64];
-        let err = validate_schedule_echo_against_state(
-            &state,
-            &ids,
-            &amounts,
-            &next_executable_after_heights,
-            &expiry_heights,
-            0,
-        )
-        .unwrap_err();
-        assert!(err.to_string().starts_with(PLAN_STALE_PREFIX));
-    }
-
-    #[test]
-    fn validate_schedule_echo_against_state_detects_wrong_amount() {
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
-            50,
-            10_000,
-        );
-        let (_owned, ids) = c_ids(&[0]);
-        // The stored transfer crosses 100_000_000 zatoshi net; the echo claims one more.
-        let amounts = [100_000_001i64];
-        let next_executable_after_heights = [50i64];
-        let expiry_heights = [10_000i64];
-        let err = validate_schedule_echo_against_state(
-            &state,
-            &ids,
-            &amounts,
-            &next_executable_after_heights,
-            &expiry_heights,
-            0,
-        )
-        .unwrap_err();
-        assert!(err.to_string().starts_with(PLAN_STALE_PREFIX));
-    }
-
-    #[test]
-    fn validate_schedule_echo_against_state_detects_wrong_expiry() {
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
-            50,
-            10_000,
-        );
-        let (_owned, ids) = c_ids(&[0]);
-        let amounts = [100_000_000i64];
-        let next_executable_after_heights = [50i64];
-        // The stored transfer expires at 10_000; the echo claims 10_001.
-        let expiry_heights = [10_001i64];
-        let err = validate_schedule_echo_against_state(
-            &state,
-            &ids,
-            &amounts,
-            &next_executable_after_heights,
-            &expiry_heights,
-            0,
-        )
-        .unwrap_err();
-        assert!(err.to_string().starts_with(PLAN_STALE_PREFIX));
-    }
-
-    /// Regression test for the false-fail the review caught: the platform's display copy carries
-    /// the `next_executable_after_height` it last saw, but a stored transfer's `scheduled_height`
-    /// legitimately moves (a refresh rebuild reschedules from the current tip) — these
-    /// legitimately differ whenever a block lands during the user's review window (ordinary
-    /// ~75s Zcash block times, not a rare race). An honest, unmodified echo of the displayed
-    /// preview must still succeed against the stored state even though this one field "drifted";
-    /// unlike a genuinely stale plan, re-proposing could never make it converge (the stored value
-    /// is already fixed by the completed commit), so the only correct behavior is to not compare
-    /// it at all here (`ids`/`amounts`/`expiry_heights` are unaffected and still pinned by the
-    /// other tests in this group; `estimated_duration_hours` has its own dedicated exclusion test,
-    /// [`validate_schedule_echo_against_state_ignores_estimated_duration_hours`], immediately
-    /// below).
-    #[test]
-    fn validate_schedule_echo_against_state_ignores_drifted_next_executable_after_height() {
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
-            50,
-            10_000,
-        );
-        let (_owned, ids) = c_ids(&[0]);
-        let amounts = [100_000_000i64];
-        // Drifted far from the stored transfer's actual scheduled height (50) — as if a block (or
-        // several) landed between the immediate-lane preview and the commit that rescheduled it.
-        let next_executable_after_heights = [999_999i64];
-        let expiry_heights = [10_000i64];
-        assert!(
-            validate_schedule_echo_against_state(
-                &state,
-                &ids,
-                &amounts,
-                &next_executable_after_heights,
-                &expiry_heights,
-                0,
-            )
-            .is_ok()
-        );
-    }
-
-    /// Fix-wave 1 (#1806 follow-up): the STATE-side echo accepts ANY `estimated_duration_hours`
-    /// once `ids`/`amounts`/`expiry_heights` match — post-fix, duration is derived,
-    /// serve-time-relative display metadata (see [`StoredEchoRow`]'s doc), not a value the
-    /// STATE-side echo can hold the platform to. Two transfers at DIFFERENT scheduled heights
-    /// (100, 220) so a naive re-derivation would depend on which tip you read at; the echoed
-    /// duration here (`999_999`) is one no computation over this state could ever produce at any
-    /// real tip — proving it genuinely is not compared, not just coincidentally matching.
-    ///
-    /// Contrast [`schedule_echo_matches_detects_wrong_duration`]: the PRE-commit CACHE-side echo
-    /// still rejects a wrong duration exactly, because `cached.reference_height` makes it
-    /// byte-for-byte reproducible with zero drift (see [`expected_rows_from_cached_plan`]'s doc).
-    /// That asymmetry — checked before commit, not after — is deliberate.
-    #[test]
-    fn validate_schedule_echo_against_state_ignores_estimated_duration_hours() {
-        let transactions = vec![
-            MigrationTransaction::from_parts(
-                MigrationTxId::new(0),
-                MigrationTxKind::Transfer { crossing: 0 },
-                vec![0u8],
-                Vec::new(),
-                h(100),
-                h(5_000),
-                Some(h(100)),
-                MigrationTxState::Signed,
-                None,
-            ),
-            MigrationTransaction::from_parts(
-                MigrationTxId::new(1),
-                MigrationTxKind::Transfer { crossing: 1 },
-                vec![0u8],
-                Vec::new(),
-                h(220),
-                h(6_000),
-                Some(h(220)),
-                MigrationTxState::Signed,
-                None,
-            ),
-        ];
-        // Zero fee buffer, as in `expected_rows_from_state_pins_transfer_subset`, so
-        // `funding_notes()` equals the crossing values exactly.
-        let state = MigrationState::from_parts(
-            MigrationStatus::InProgress,
-            NoteSplitPlan::from_stored_parts(
-                vec![zat(100_000_000), zat(250_000_000)],
-                zat(0),
-                None,
-                zat(20_000),
-                zat(1_000_000_000),
-                zat(999_000_000),
-            )
-            .unwrap(),
-            PreparationPlan::from_parts(Vec::new(), Vec::new()),
-            transactions,
-        );
-        let (_owned, ids) = c_ids(&[0, 1]);
-        let amounts = [zat_to_i64(zat(100_000_000)), zat_to_i64(zat(250_000_000))];
-        // Unchecked either way here, but filled in with the rows' real scheduled heights for
-        // realism.
-        let next_executable_after_heights = [100i64, 220i64];
-        let expiry_heights = [5_000i64, 6_000i64];
-        assert!(
-            validate_schedule_echo_against_state(
-                &state,
-                &ids,
-                &amounts,
-                &next_executable_after_heights,
-                &expiry_heights,
-                999_999,
-            )
-            .is_ok(),
-            "estimated_duration_hours must not be part of the STATE-side exact match"
-        );
-    }
-
     #[test]
     fn plan_cache_round_trip_and_clear() {
         let path = PathBuf::from("/tmp/zcashlc-plan-cache-test");
         let account = [3u8; 16];
-        assert!(migration_plan_cache::get(&path, account).is_none());
+        assert!(matches!(
+            migration_plan_cache::get(&path, account, 1),
+            Err(migration_plan_cache::PlanLookupError::Missing),
+        ));
         // A real plan is unconstructible here; the cache API is exercised end-to-end by the
         // welding offline tests. This pins the miss behavior only.
         migration_plan_cache::clear(&path, account);
-        assert!(migration_plan_cache::get(&path, account).is_none());
+        assert!(matches!(
+            migration_plan_cache::get(&path, account, 0),
+            Err(migration_plan_cache::PlanLookupError::Missing),
+        ));
     }
 
     #[test]
-    fn invalid_marks_round_trip() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_invalid_marks(&conn).unwrap();
-        let account = [9u8; 16];
-        let other = [8u8; 16];
-        assert!(invalid_marks(&conn, &account).unwrap().is_empty());
-        insert_invalid_mark(&conn, &account, MigrationTxId::new(4), "invalid_note").unwrap();
-        insert_invalid_mark(&conn, &account, MigrationTxId::new(2), "expired").unwrap();
-        insert_invalid_mark(&conn, &other, MigrationTxId::new(7), "invalid_note").unwrap();
-        assert_eq!(invalid_marks(&conn, &account).unwrap(), vec![2, 4]);
-        clear_invalid_marks(&conn, &account).unwrap();
-        assert!(invalid_marks(&conn, &account).unwrap().is_empty());
-        assert_eq!(invalid_marks(&conn, &other).unwrap(), vec![7]);
+    fn residual_unlock_preserves_migration_and_foreign_locks() {
+        fn nullifier(low_byte: u8) -> orchard::note::Nullifier {
+            let mut bytes = [0; 32];
+            bytes[0] = low_byte;
+            Option::from(orchard::note::Nullifier::from_bytes(&bytes))
+                .expect("small canonical field element is a valid Orchard nullifier")
+        }
+
+        let account = AccountUuid::from_uuid(uuid::Uuid::from_bytes([0x11; 16]));
+        let residual_owner = residual_lock_owner(account);
+        let migration_owner = LockOwner::new([0x22; 32]);
+        let foreign_owner = LockOwner::new([0x33; 32]);
+        let residual_output = OutputRef::new(
+            TxId::from_bytes([0x44; 32]),
+            PoolType::Shielded(ShieldedPool::Orchard),
+            0,
+        );
+        let migration_output = OutputRef::new(
+            TxId::from_bytes([0x55; 32]),
+            PoolType::Shielded(ShieldedPool::Orchard),
+            1,
+        );
+        let foreign_output = OutputRef::new(
+            TxId::from_bytes([0x66; 32]),
+            PoolType::Shielded(ShieldedPool::Orchard),
+            2,
+        );
+        let locks = vec![
+            ActiveOrchardLock::new(residual_output, Some(nullifier(0x71)), residual_owner),
+            ActiveOrchardLock::new(migration_output, Some(nullifier(0x72)), migration_owner),
+            ActiveOrchardLock::new(foreign_output, Some(nullifier(0x73)), foreign_owner),
+        ];
+        let mut held = vec![
+            (residual_output, residual_owner),
+            (migration_output, migration_owner),
+            (foreign_output, foreign_owner),
+        ];
+
+        let cleared = unlock_owned_active_locks(
+            &locks,
+            residual_owner,
+            |output, requested_owner| -> Result<bool, ()> {
+                let Some(index) = held.iter().position(|(held_output, held_owner)| {
+                    held_output == output && *held_owner == requested_owner
+                }) else {
+                    return Ok(false);
+                };
+                held.remove(index);
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cleared, 1);
+        assert_eq!(
+            held,
+            vec![
+                (migration_output, migration_owner),
+                (foreign_output, foreign_owner)
+            ],
+            "owner-scoped residual unlock must leave migration and foreign locks untouched"
+        );
     }
 
-    /// On a freshly initialized wallet database with a chain tip but no spendable notes, locking
-    /// the residual locks nothing (returns `0`, not an error) and unlocking clears nothing
-    /// (returns `0`). The fixture mirrors `migration_state_on_fresh_db_is_not_started`
-    /// (`zcashlc_init_data_database` first), plus `zcashlc_update_chain_tip` — the lock path
-    /// selects notes against the tip + 1, so it needs a chain tip to exist, exactly like a real
-    /// post-sync caller.
     #[test]
-    fn migration_lock_and_unlock_residual_on_fresh_db_are_zero() {
+    fn legacy_migration_pczt_extraction_fails_before_touching_caller_data_or_storage() {
+        // This symbol predates typed delivery ownership, so it cannot safely authorize a migration
+        // reservation. It remains ABI-compatible but must never parse caller bytes, open the
+        // wallet, or expose consensus bytes. The token-bound materialization API is the sole path.
+        let source = include_str!("migration.rs");
+        let body = source
+            .split_once("pub unsafe extern \"C\" fn zcashlc_migration_extract_broadcast_tx(")
+            .expect("migration extraction FFI must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("migration extraction FFI must be isolatable");
+        assert!(body.contains("legacy migration PCZT extraction is unauthorized"));
+        for forbidden in ["open(", "slice_or_empty(", "Pczt::parse", "extract_tx("] {
+            assert!(
+                !body.contains(forbidden),
+                "legacy extraction must not invoke {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_legacy_delivery_mutator_is_fail_closed_before_data_or_storage() {
+        let source = include_str!("migration.rs");
+        for name in [
+            "zcashlc_migration_sign_note_split",
+            "zcashlc_migration_next_due_transfer",
+            "zcashlc_migration_extract_broadcast_tx",
+            "zcashlc_migration_record_transfer_result",
+            "zcashlc_migration_restart_step",
+            "zcashlc_migration_refresh_stale_transfers",
+            "zcashlc_migration_create_unsigned_note_split_pczts",
+            "zcashlc_migration_store_signed_note_split_pczts",
+            "zcashlc_migration_create_unsigned_transfer_pczts",
+            "zcashlc_migration_store_signed_schedule_pczts",
+        ] {
+            let marker = format!("fn {name}(");
+            let body = source
+                .split_once(&marker)
+                .unwrap_or_else(|| panic!("{name} must remain exported"))
+                .1
+                .split_once("\n#[unsafe(no_mangle)]")
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{name} must be isolatable"));
+            assert!(
+                body.contains("legacy_delivery_api_disabled(")
+                    || body.contains("legacy migration PCZT extraction is unauthorized"),
+                "{name} must fail closed"
+            );
+            for forbidden in [
+                "open(",
+                "slice_or_empty(",
+                "Pczt::parse",
+                "replace_migration(",
+                "stage_materialized_transaction(",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{name} must not invoke {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scheduled_proof_is_one_atomic_canonical_and_exact_byte_transition() {
+        let source = include_str!("migration.rs");
+        let body = source
+            .split_once("fn zcashlc_migration_prove_claim_v1(")
+            .expect("proof FFI must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("proof FFI must be isolatable");
+        assert!(body.contains("advance_canonical_materialization(transition)"));
+        assert!(!body.contains("stage_materialized_transaction("));
+
+        let legacy_stage = source
+            .split_once("fn zcashlc_migration_stage_materialized_transaction_v1(")
+            .expect("legacy shared staging symbol must remain ABI-compatible")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("legacy stage FFI must be isolatable");
+        assert!(legacy_stage.contains("legacy_delivery_api_disabled("));
+        for forbidden in [
+            "open(",
+            "slice_or_empty(",
+            "Transaction::read",
+            "stage_immediate_transaction(",
+        ] {
+            assert!(
+                !legacy_stage.contains(forbidden),
+                "retired raw staging must not invoke {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn immediate_materialization_is_claim_consuming_and_atomic() {
+        let source = include_str!("migration.rs");
+        let sdk = source
+            .split_once("fn zcashlc_migration_materialize_immediate_sdk_v1(")
+            .expect("SDK immediate materializer must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("SDK immediate materializer must be isolatable");
+        for required in [
+            "require_claim(",
+            "ImmediateProposal::decode(",
+            "transactionally(",
+            "create_proposed_transactions",
+            "get_transaction(",
+            "exact_immediate_transaction(",
+            "stage_immediate_transaction(",
+        ] {
+            assert!(
+                sdk.contains(required),
+                "SDK materializer must invoke {required}"
+            );
+        }
+        for forbidden in [
+            "transaction_ptr",
+            "proposal_ptr",
+            "destination_output_index",
+            "amount:",
+        ] {
+            assert!(
+                !sdk.contains(forbidden),
+                "SDK materializer must not accept host authority via {forbidden}"
+            );
+        }
+
+        let external_prepare = source
+            .split_once("fn zcashlc_migration_prepare_immediate_external_signing_v1(")
+            .expect("external immediate preparation must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("external preparation must be isolatable");
+        for required in [
+            "require_claim(",
+            "transactionally(",
+            "create_pczt_from_proposal",
+            "prove_immediate_pczt(",
+            "stage_immediate_external_signing_pczt(",
+        ] {
+            assert!(
+                external_prepare.contains(required),
+                "external preparation must invoke {required}"
+            );
+        }
+        let external_prepare_signature = external_prepare
+            .split_once('{')
+            .map(|(signature, _)| signature)
+            .expect("external preparation signature must be isolatable");
+        assert!(!external_prepare_signature.contains("pczt_ptr"));
+
+        let external_finalize = source
+            .split_once("fn zcashlc_migration_finalize_immediate_external_signing_v1(")
+            .expect("external immediate finalizer must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("external finalizer must be isolatable");
+        for required in [
+            "signed_pczt",
+            "transactionally(",
+            "extract_and_store_transaction_from_pczt",
+            "get_transaction(",
+            "exact_immediate_transaction(",
+            "stage_immediate_transaction(",
+        ] {
+            assert!(
+                external_finalize.contains(required),
+                "external finalizer must invoke {required}"
+            );
+        }
+        for forbidden in ["pczt_ptr", "transaction_ptr", "destination_output_index"] {
+            assert!(
+                !external_finalize.contains(forbidden),
+                "external finalizer must not accept host authority via {forbidden}"
+            );
+        }
+
+        let generic_external_stage = source
+            .split_once("fn zcashlc_migration_stage_external_signing_pczt_v1(")
+            .expect("generic external staging ABI must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("generic external staging must be isolatable");
+        assert!(generic_external_stage.contains("caller-supplied PCZT bytes are not authorized"));
+    }
+
+    #[test]
+    fn successor_rollover_uses_only_opaque_predecessor_and_typed_atomic_store_seam() {
+        let source = include_str!("migration.rs");
+        let helper = source
+            .split_once("fn rollover_scheduled_successor(")
+            .expect("rollover helper must exist")
+            .1
+            .split_once("\n/// Map a commit error")
+            .map(|(body, _)| body)
+            .expect("rollover helper must be isolatable");
+        assert!(helper.contains("SuccessorCandidateBackend::new("));
+        assert!(helper.contains("ReservationRollover::replace_terminal("));
+        assert!(helper.contains("MigrationRuntimeStore::rollover_source_reservations("));
+        assert!(!helper.contains("replace_migration("));
+        assert!(
+            helper.find("rollover_source_reservations(")
+                < helper.find("migration_plan_cache::clear(")
+        );
+
+        for name in [
+            "zcashlc_migration_rollover_internal_schedule_v1",
+            "zcashlc_migration_rollover_external_schedule_v1",
+        ] {
+            let marker = format!("fn {name}(");
+            let body = source
+                .split_once(&marker)
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n#[unsafe(no_mangle)]")
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{name} must be isolatable"));
+            assert!(body.contains("require_scheduled_run"));
+            assert!(body.contains("proposal_handle: u64"));
+            assert!(body.contains("migration_plan_cache::get("));
+            assert!(body.contains("rollover_scheduled_successor"));
+            for forbidden in [
+                "ids: *const",
+                "amounts: *const",
+                "estimated_duration_hours",
+                "validate_schedule_echo",
+                "DeliveryRevision",
+                "MigrationRunIdentity",
+                "SourceReservationOwner",
+                "PolicyFingerprint",
+                "MigrationState",
+                "ClaimToken",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{name} must not accept caller-provided {forbidden}"
+                );
+            }
+        }
+    }
+
+    /// On a freshly initialized wallet database with a chain tip but no completed migration,
+    /// residual locking is rejected even though no spendable notes exist: the residual owner may
+    /// be acquired only after the same strict `Complete` projection exposed to Swift. Unlocking
+    /// remains an idempotent no-op (`0`).
+    #[test]
+    fn migration_lock_residual_requires_strict_complete_on_fresh_db() {
         let path = std::env::temp_dir().join(format!(
             "zcashlc_migration_lock_residual_{}.sqlite",
             std::process::id()
@@ -4375,7 +6379,10 @@ mod tests {
                 NETWORK_ID_MAINNET,
             )
         };
-        assert_eq!(locked, 0, "no spendable notes exist, so nothing locks");
+        assert_eq!(
+            locked, -1,
+            "an engine-less fresh wallet is not strict migration Complete"
+        );
         let unlocked = unsafe {
             zcashlc_migration_unlock_residual(
                 path_bytes.as_ptr(),
@@ -4384,7 +6391,7 @@ mod tests {
                 NETWORK_ID_MAINNET,
             )
         };
-        assert_eq!(unlocked, 0, "no locks exist, so nothing clears");
+        assert_eq!(unlocked, 0, "the rejected lock attempt must leave no lock");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4474,169 +6481,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn immediate_run_row_round_trip() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_immediate_runs(&conn).unwrap();
-        let account = [9u8; 16];
-        assert!(immediate_run_row(&conn, &account).unwrap().is_none());
-        record_immediate_run(&conn, &account, [1u8; 32], h(100)).unwrap();
-        let row = immediate_run_row(&conn, &account).unwrap().unwrap();
-        assert_eq!(row.txid, [1u8; 32]);
-        assert_eq!(row.recorded_at_height, h(100));
-    }
-
-    #[test]
-    fn immediate_run_record_replaces_the_previous_one() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_immediate_runs(&conn).unwrap();
-        let account = [9u8; 16];
-        record_immediate_run(&conn, &account, [1u8; 32], h(100)).unwrap();
-        record_immediate_run(&conn, &account, [2u8; 32], h(150)).unwrap();
-        // One row per account: the second record supersedes the first entirely.
-        let row = immediate_run_row(&conn, &account).unwrap().unwrap();
-        assert_eq!(row.txid, [2u8; 32]);
-        assert_eq!(row.recorded_at_height, h(150));
-    }
-
-    #[test]
-    fn immediate_run_rows_are_isolated_per_account() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_immediate_runs(&conn).unwrap();
-        let account = [9u8; 16];
-        let other = [8u8; 16];
-        record_immediate_run(&conn, &account, [1u8; 32], h(100)).unwrap();
-        record_immediate_run(&conn, &other, [2u8; 32], h(200)).unwrap();
-        assert_eq!(
-            immediate_run_row(&conn, &account).unwrap().unwrap().txid,
-            [1u8; 32]
-        );
-        assert_eq!(
-            immediate_run_row(&conn, &other).unwrap().unwrap().txid,
-            [2u8; 32]
-        );
-        // Replacing one account's row must not disturb the other's.
-        record_immediate_run(&conn, &account, [3u8; 32], h(300)).unwrap();
-        assert_eq!(
-            immediate_run_row(&conn, &account).unwrap().unwrap().txid,
-            [3u8; 32]
-        );
-        assert_eq!(
-            immediate_run_row(&conn, &other).unwrap().unwrap().txid,
-            [2u8; 32]
-        );
-    }
-
-    #[test]
-    fn resolve_immediate_run_reads_mined_and_expiry_from_transactions_table() {
-        let conn = Connection::open_in_memory().unwrap();
-        // A minimal stand-in for zcash_client_sqlite's `transactions` table: just the two columns
-        // `resolve_immediate_run`'s query reads (see `zcash_client_sqlite::wallet::get_tx_height`
-        // for the upstream query this mirrors and extends).
-        conn.execute_batch(
-            "CREATE TABLE transactions (txid BLOB PRIMARY KEY, mined_height INTEGER, expiry_height INTEGER)",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO transactions (txid, mined_height, expiry_height) VALUES (?1, ?2, ?3)",
-            rusqlite::params![&[1u8; 32][..], 150u32, 200u32],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO transactions (txid, mined_height, expiry_height) VALUES (?1, NULL, ?2)",
-            rusqlite::params![&[2u8; 32][..], 500u32],
-        )
-        .unwrap();
-
-        let mined = resolve_immediate_run(
-            &conn,
-            ImmediateRunRow {
-                txid: [1u8; 32],
-                recorded_at_height: h(100),
-            },
-            h(300),
-        )
-        .unwrap();
-        assert_eq!(mined.mined_height, Some(h(150)));
-        assert_eq!(mined.expiry_height, Some(h(200)));
-
-        let unmined = resolve_immediate_run(
-            &conn,
-            ImmediateRunRow {
-                txid: [2u8; 32],
-                recorded_at_height: h(100),
-            },
-            h(300),
-        )
-        .unwrap();
-        assert_eq!(unmined.mined_height, None);
-        assert_eq!(unmined.expiry_height, Some(h(500)));
-
-        // A txid the wallet has never observed at all: both columns resolve to None.
-        let unknown = resolve_immediate_run(
-            &conn,
-            ImmediateRunRow {
-                txid: [9u8; 32],
-                recorded_at_height: h(100),
-            },
-            h(300),
-        )
-        .unwrap();
-        assert_eq!(unknown.mined_height, None);
-        assert_eq!(unknown.expiry_height, None);
-    }
-
-    #[test]
-    fn resolve_immediate_run_filters_future_mined_height_and_zero_expiry_sentinel() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE transactions (txid BLOB PRIMARY KEY, mined_height INTEGER, expiry_height INTEGER)",
-        )
-        .unwrap();
-        // A mined_height beyond the current tip is a stale/optimistic row (mirrors
-        // `zcash_client_sqlite::wallet::get_tx_height`'s own guard) and must not report Complete.
-        conn.execute(
-            "INSERT INTO transactions (txid, mined_height, expiry_height) VALUES (?1, ?2, ?3)",
-            rusqlite::params![&[1u8; 32][..], 500u32, 600u32],
-        )
-        .unwrap();
-        // expiry_height = 0 is the wire "no real expiry" sentinel; treated the same as missing so
-        // it does not fool the expiry check into firing immediately.
-        conn.execute(
-            "INSERT INTO transactions (txid, mined_height, expiry_height) VALUES (?1, NULL, 0)",
-            rusqlite::params![&[2u8; 32][..]],
-        )
-        .unwrap();
-
-        let future_mined = resolve_immediate_run(
-            &conn,
-            ImmediateRunRow {
-                txid: [1u8; 32],
-                recorded_at_height: h(100),
-            },
-            h(300),
-        )
-        .unwrap();
-        assert_eq!(
-            future_mined.mined_height, None,
-            "a mined height beyond tip must be filtered out"
-        );
-
-        let zero_expiry = resolve_immediate_run(
-            &conn,
-            ImmediateRunRow {
-                txid: [2u8; 32],
-                recorded_at_height: h(100),
-            },
-            h(300),
-        )
-        .unwrap();
-        assert_eq!(
-            zero_expiry.expiry_height, None,
-            "expiry_height=0 must read as missing"
-        );
-    }
-
     /// A freshly initialized wallet database has no stored migration, so its state marshals as
     /// `NotStarted`. The store tables come from the wallet schema migrations (they are no longer
     /// created by `open`), so the fixture runs `zcashlc_init_data_database` first, exactly like a
@@ -4714,331 +6558,223 @@ mod tests {
             .expect("the fixture state stores");
     }
 
-    /// A REAL unsigned transfer PCZT (2 Orchard actions + 1 Ironwood action, anchors and
-    /// witnesses deferred per ZIP 374) for the stored-state fixtures: the rebuild path parses the
-    /// stored PCZT and recovers the funding note by the nullifier of its ONE unwitnessed spend,
-    /// so neither the `vec![0u8]` placeholder nor the actionless [`minimal_pczt_bytes`] can reach
-    /// the funding-note resolution under test. The key and note are throwaway (seeded rng): the
-    /// wallet under test holds no notes at all, so only the SHAPE matters. Heights must be past
-    /// the mainnet NU6.3 activation for the builder to emit the Ironwood crossing output.
-    fn fixture_transfer_pczt_bytes(target_height: u32, expiry_height: u32) -> Vec<u8> {
+    /// Persists one live transfer through the same source-bound atomic start seam production uses.
+    /// The PCZT spends a real fixture-owned Orchard note whose nullifier is stored in the wallet,
+    /// every canonical row carries one owner, and the exact source is locked and reserved together
+    /// with the state. This intentionally refuses the old shortcut of writing an unowned live row
+    /// through `replace_migration`, which delivery-enabled stores reject.
+    fn store_source_bound_transfer_fixture(
+        path: &std::path::Path,
+        account: &[u8; 16],
+        transaction_state: MigrationTxState,
+        scheduled: u32,
+        expiry: u32,
+        marker: u8,
+    ) -> MigrationState {
         use orchard::keys::{FullViewingKey, Scope, SpendingKey};
         use orchard::note::{Note, NoteVersion, RandomSeed, Rho};
         use orchard::value::NoteValue;
         use rand::RngCore;
+        use zcash_pool_migration::build::build_transfer_pczt;
+        use zcash_pool_migration::note_splitting::RESIDUAL_MIGRATION_MIN;
+        use zcash_pool_migration::wallet::PoolMigrationLockStore;
         use zcash_primitives::transaction::fees::zip317::MARGINAL_FEE;
         use zcash_protocol::consensus::MAIN_NETWORK;
 
-        let mut rng = StdRng::seed_from_u64(1806);
-        let mut draw = [0u8; 32];
-        let sk: SpendingKey = loop {
-            rng.fill_bytes(&mut draw);
-            if let Some(sk) = SpendingKey::from_bytes(draw).into_option() {
-                break sk;
+        fn draw_bytes(rng: &mut StdRng) -> [u8; 32] {
+            let mut bytes = [0u8; 32];
+            rng.fill_bytes(&mut bytes);
+            bytes
+        }
+
+        let mut rng = StdRng::seed_from_u64(u64::from(marker));
+        let spending_key = loop {
+            if let Some(key) = SpendingKey::from_bytes(draw_bytes(&mut rng)).into_option() {
+                break key;
             }
         };
-        let fvk = FullViewingKey::from(&sk);
+        let fvk = FullViewingKey::from(&spending_key);
+        let recipient = fvk.address_at(0u32, Scope::External);
         let rho = loop {
-            rng.fill_bytes(&mut draw);
-            if let Some(rho) = Rho::from_bytes(&draw).into_option() {
+            if let Some(rho) = Rho::from_bytes(&draw_bytes(&mut rng)).into_option() {
                 break rho;
             }
         };
         let rseed = loop {
-            rng.fill_bytes(&mut draw);
-            if let Some(rseed) = RandomSeed::from_bytes(draw, &rho).into_option() {
+            if let Some(rseed) = RandomSeed::from_bytes(draw_bytes(&mut rng), &rho).into_option() {
                 break rseed;
             }
         };
-        // The builder enforces exact balance: the spent note carries the crossing value plus the
-        // canonical ZIP 317 fee of the 3-logical-action transfer shape.
-        let crossing = 100_000_000u64;
-        let fee = 3 * u64::from(MARGINAL_FEE);
+        let crossing = RESIDUAL_MIGRATION_MIN;
+        let note_fee_buffer = Zatoshis::from_u64(3 * MARGINAL_FEE.into_u64()).unwrap();
+        let source_value = u64::from(crossing) + u64::from(note_fee_buffer);
         let note = Note::from_parts(
-            fvk.address_at(0u32, Scope::External),
-            NoteValue::from_raw(crossing + fee),
+            recipient,
+            NoteValue::from_raw(source_value),
             rho,
             rseed,
             NoteVersion::V2,
         )
         .into_option()
-        .expect("valid fixture note parts");
-        zcash_pool_migration_backend::build::build_transfer_pczt(
+        .expect("fixture note parts are valid");
+        let nullifier = note.nullifier(&fvk);
+        let pczt = build_transfer_pczt(
             &MAIN_NETWORK,
-            target_height,
-            expiry_height,
+            3_500_000,
+            expiry,
             &fvk,
             note,
-            zat(crossing),
-            &mut rng,
+            crossing,
+            StdRng::seed_from_u64(u64::from(marker) ^ 0x5a5a),
         )
-        .expect("the fixture transfer builds")
+        .expect("build source-bound transfer PCZT")
         .serialize()
-        .expect("the fixture transfer serializes")
-    }
+        .expect("serialize source-bound transfer PCZT");
 
-    /// On a freshly initialized wallet database with a created account but NO stored migration,
-    /// refreshing stale transfers returns the benign EMPTY schedule — nothing to refresh and
-    /// nothing to re-display — not an error, on the NULL-usk (external-signer) lane pinned here
-    /// (the usk lane rides the welding offline tests). The stored state is read before any tip
-    /// lookup, so the answer holds even before the wallet ever saw a chain tip.
-    #[test]
-    fn migration_refresh_stale_transfers_on_fresh_db_returns_an_empty_schedule() {
-        let path = init_fixture_db("zcashlc_migration_refresh_fresh");
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let account = create_fixture_account(&path);
-        let schedule_ptr = unsafe {
-            zcashlc_migration_refresh_stale_transfers(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
-                std::ptr::null(),
-                0,
+        let owner = LockOwner::new([marker.wrapping_add(0x40); 32]);
+        let txid = TxId::from_bytes([marker; 32]);
+        let mut conn = Connection::open(path).expect("the fixture store connection opens");
+        let account_uuid = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
+        let account_id: i64 = conn
+            .query_row(
+                "SELECT id FROM accounts WHERE uuid = ?",
+                rusqlite::params![account_uuid.expose_uuid()],
+                |row| row.get(0),
             )
-        };
-        assert!(
-            !schedule_ptr.is_null(),
-            "no stored migration means nothing to refresh, not an error"
-        );
-        let schedule = unsafe { &*schedule_ptr };
-        assert_eq!(
-            schedule.transfers_len, 0,
-            "no stored migration yields the empty schedule"
-        );
-        assert_eq!(schedule.estimated_duration_hours, 0);
-        unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A stored TERMINAL run (completed or cancelled) has nothing to refresh and nothing the
-    /// consent-echo lane would ever compare against: the EMPTY schedule, again read before any
-    /// tip lookup (no chain tip is set in this fixture).
-    #[test]
-    fn migration_refresh_stale_transfers_on_a_terminal_run_returns_an_empty_schedule() {
-        let path = init_fixture_db("zcashlc_migration_refresh_terminal");
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let account = create_fixture_account(&path);
-        let state = test_state(MigrationStatus::Complete, &[MINED], &[MINED], 50, 10_000);
-        store_fixture_state(&path, &account, &state);
-        let schedule_ptr = unsafe {
-            zcashlc_migration_refresh_stale_transfers(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
-                std::ptr::null(),
-                0,
-            )
-        };
-        assert!(!schedule_ptr.is_null(), "a terminal run is not an error");
-        let schedule = unsafe { &*schedule_ptr };
-        assert_eq!(
-            schedule.transfers_len, 0,
-            "a terminal run yields the empty schedule"
-        );
-        unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A stored run whose transfer has NOT expired at the tip rebuilds nothing and returns the
-    /// CURRENT stored schedule — the atomically-persisted truth the host re-displays and later
-    /// echoes — with the stored state untouched. This lane decodes a REAL spending key (the
-    /// in-process signing selector), pinning that the usk input form is accepted even when no
-    /// rebuild runs.
-    #[test]
-    fn migration_refresh_stale_transfers_with_nothing_expired_returns_the_current_schedule() {
-        let path = init_fixture_db("zcashlc_migration_refresh_unexpired");
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let (account, usk) = create_fixture_account_with_usk(&path);
-        assert!(
-            unsafe {
-                crate::zcashlc_update_chain_tip(
-                    path_bytes.as_ptr(),
-                    path_bytes.len(),
-                    3_600_000,
-                    NETWORK_ID_MAINNET,
-                )
-            },
-            "chain-tip update must succeed"
-        );
-        // Expiry 4_000_000 is above the 3_600_001 target: still valid, nothing to rebuild.
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
-            3_499_000,
-            4_000_000,
-        );
-        store_fixture_state(&path, &account, &state);
-        let schedule_ptr = unsafe {
-            zcashlc_migration_refresh_stale_transfers(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
-                usk.as_ptr(),
-                usk.len(),
-            )
-        };
-        assert!(
-            !schedule_ptr.is_null(),
-            "an unexpired schedule refreshes nothing, not an error"
-        );
-        let schedule = unsafe { &*schedule_ptr };
-        assert_eq!(
-            schedule.transfers_len, 1,
-            "the current stored schedule has its one transfer row"
-        );
-        assert_eq!(schedule.estimated_duration_hours, 0);
-        let row = unsafe { &*schedule.transfers };
-        let row_id = unsafe { CStr::from_ptr(row.id) }
-            .to_str()
-            .expect("the row id is UTF-8");
-        assert_eq!(row_id, "0", "the stored transfer's engine id");
-        // The state-side amount is the NET crossing (funding note minus the fee buffer), exactly
-        // what the consent echo compares (`expected_rows_from_state` uses the same
-        // `transfer_amount`, which nets the buffer on this branch).
-        assert_eq!(row.amount, 100_000_000);
-        assert_eq!(
-            row.next_executable_after_height, 3_499_000,
-            "the stored scheduled height is served unchanged"
-        );
-        assert_eq!(
-            row.expiry_height, 4_000_000,
-            "the stored expiry is served unchanged"
-        );
-        assert_eq!(
-            row.anchor_height, 3_600_000,
-            "the display-only now reference is the tip at encode time"
-        );
-        unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
-
-        // Nothing was rebuilt: the stored transfer still holds its fixture bytes, still Signed.
-        let stored = read_fixture_state(&path, &account);
-        let tx = stored
-            .transactions()
-            .first()
-            .expect("the transfer row remains");
-        assert!(
-            matches!(tx.state(), MigrationTxState::Signed),
-            "an unexpired transfer must stay untouched"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// With a stored run holding an EXPIRED transfer (row expiry below the tip) whose PCZT is a
-    /// real built transfer — one unwitnessed spend revealing the funding nullifier — the refresh
-    /// path attempts the rebuild, and on this otherwise-empty wallet (the funding note is not
-    /// among the spendable notes) surfaces the `FundingNoteUnavailable` HARD error naming the
-    /// restart remedy: NULL with the last-error channel set, and NOTHING persisted (the expired
-    /// artifact stays stored untouched). This pins expired-detection plus the error routing end
-    /// to end over the FFI.
-    #[test]
-    fn migration_refresh_stale_transfers_surfaces_funding_note_unavailable() {
-        let path = init_fixture_db("zcashlc_migration_refresh_expired");
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let account = create_fixture_account(&path);
-        assert!(
-            unsafe {
-                crate::zcashlc_update_chain_tip(
-                    path_bytes.as_ptr(),
-                    path_bytes.len(),
-                    3_600_000,
-                    NETWORK_ID_MAINNET,
-                )
-            },
-            "chain-tip update must succeed"
-        );
-        // The stored transfer: expired at the tip (3_500_040 < 3_600_001), holding real
-        // transfer-PCZT bytes so the rebuild reaches the funding-note resolution.
-        let pczt_bytes = fixture_transfer_pczt_bytes(3_500_000, 3_500_040);
-        let base = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
-            3_499_000,
-            3_500_040,
-        );
-        let transactions = base
-            .transactions()
-            .iter()
-            .map(|t| {
-                MigrationTransaction::from_parts(
-                    t.id(),
-                    t.kind(),
-                    pczt_bytes.clone(),
-                    t.depends_on().clone(),
-                    t.scheduled_height(),
-                    t.expiry_height(),
-                    t.anchor_boundary(),
-                    t.state(),
-                    t.lock_owner(),
-                )
-            })
-            .collect();
+            .expect("fixture account row exists");
+        conn.execute(
+            "INSERT INTO transactions (txid, min_observed_height) VALUES (?1, 0)",
+            rusqlite::params![txid.as_ref()],
+        )
+        .expect("insert fixture source transaction");
+        let transaction_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO orchard_received_notes (
+                 transaction_id, action_index, account_id, diversifier, value, rho, rseed, nf,
+                 is_change, recipient_key_scope, note_version
+             ) VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 2)",
+            rusqlite::params![
+                transaction_id,
+                account_id,
+                recipient.diversifier().as_array(),
+                source_value,
+                rho.to_bytes(),
+                rseed.as_bytes(),
+                nullifier.to_bytes(),
+            ],
+        )
+        .expect("insert fixture-owned Orchard source");
+        let output = OutputRef::new(txid, PoolType::Shielded(ShieldedPool::Orchard), 0);
         let state = MigrationState::from_parts(
-            base.status(),
-            base.note_split().clone(),
-            base.preparation().clone(),
-            transactions,
+            MigrationStatus::Committed,
+            NoteSplitPlan::from_stored_parts(
+                vec![crossing],
+                note_fee_buffer,
+                None,
+                Zatoshis::ZERO,
+                Zatoshis::from_u64(source_value).unwrap(),
+                crossing,
+            )
+            .expect("one-crossing fixture plan is valid"),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            vec![MigrationTransaction::from_parts(
+                MigrationTxId::new(0),
+                MigrationTxKind::Transfer { crossing: 0 },
+                pczt,
+                Vec::new(),
+                h(scheduled),
+                h(expiry),
+                Some(h(scheduled.saturating_sub(1))),
+                transaction_state,
+                Some(*owner.as_bytes()),
+            )],
         );
-        store_fixture_state(&path, &account, &state);
+        let mut store =
+            PoolMigrations::for_account_with_parameters(&mut conn, account_uuid, &MAIN_NETWORK)
+                .expect("the account-keyed delivery store resolves the fixture account");
+        store
+            .lock_outputs_and_replace_migration(
+                None,
+                &state,
+                &[output],
+                owner,
+                BlockHeight::from_u32(u32::MAX),
+            )
+            .expect("the source-bound fixture delivery starts atomically");
+        state
+    }
 
+    /// Reads the account-scoped migration row through the same typed store used by the FFI.
+    fn read_fixture_state(path: &std::path::Path, account: &[u8; 16]) -> MigrationState {
+        let mut conn = Connection::open(path).expect("the verification connection opens");
+        let account = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
+        let store = PoolMigrations::for_account(&mut conn, account)
+            .expect("the account-keyed store resolves the fixture account");
+        store
+            .get_migration()
+            .expect("the store reads")
+            .expect("a migration is stored")
+    }
+
+    /// The old bulk refresh entry point no longer performs any database-dependent special cases;
+    /// even null caller pointers are safe because it fails closed before reading them.
+    #[test]
+    fn legacy_refresh_stale_transfers_is_disabled_before_reading_arguments() {
         let schedule_ptr = unsafe {
             zcashlc_migration_refresh_stale_transfers(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
                 std::ptr::null(),
-                0,
+                usize::MAX,
+                std::ptr::null(),
+                u32::MAX,
+                std::ptr::null(),
+                usize::MAX,
             )
         };
-        assert!(
-            schedule_ptr.is_null(),
-            "a gone funding note must be a hard error"
-        );
+        assert!(schedule_ptr.is_null(), "the disabled API must fail closed");
         let message = ffi_helpers::error_handling::error_message()
-            .expect("the last-error channel must carry the failure");
+            .expect("the disabled API must set the last-error channel");
+        assert!(
+            message.contains("zcashlc_migration_refresh_stale_transfers")
+                && message.contains("is disabled"),
+            "the error must identify the disabled compatibility symbol, got: {message}"
+        );
+    }
+
+    /// A rebuild that cannot recover the exact funding note names only the current typed recovery
+    /// sequence. The retired unscoped restart symbol must never return as actionable guidance.
+    #[test]
+    fn funding_note_unavailable_names_typed_abandonment_and_successor_rollover() {
+        let message = map_rebuild_err(
+            engine::RebuildError::<anyhow::Error>::FundingNoteUnavailable(zat(100_000_000)),
+        )
+        .to_string();
         assert!(
             message.contains("funding note"),
             "the error must tell the caller the funding note is gone, got: {message}"
         );
         assert!(
-            message.contains("restartCurrentMigrationStep"),
-            "the error must name the restart remedy, got: {message}"
-        );
-
-        // Nothing was persisted: the expired transfer still holds the old bytes, still Signed.
-        let mut conn = Connection::open(&path).expect("the verification connection opens");
-        let account_id = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
-        let store = PoolMigrations::for_account(&mut conn, account_id)
-            .expect("the account-keyed store resolves the fixture account");
-        let stored = store
-            .get_migration()
-            .expect("the store reads")
-            .expect("the fixture state is still stored");
-        let tx = stored
-            .transactions()
-            .first()
-            .expect("the transfer row remains");
-        assert_eq!(
-            tx.pczt(),
-            &pczt_bytes,
-            "the expired artifact must be untouched"
+            message.contains("zcashlc_migration_begin_abandonment_v1"),
+            "the error must name the first typed abandonment phase, got: {message}"
         );
         assert!(
-            matches!(tx.state(), MigrationTxState::Signed),
-            "the expired transfer must stay Signed"
+            message.contains("zcashlc_migration_finish_abandonment_v1"),
+            "the error must name the second typed abandonment phase, got: {message}"
         );
-        let _ = std::fs::remove_file(&path);
+        assert!(
+            message.contains("typed successor-rollover API"),
+            "the error must direct replanning through typed rollover, got: {message}"
+        );
+        assert!(
+            !message.contains("restartCurrentMigrationStep")
+                && !message.contains("zcashlc_migration_restart_step"),
+            "the disabled restart API must not be recommended, got: {message}"
+        );
     }
 
     // ----- prove dispatch (kind routing + transient/hard error mapping) -----
 
-    use zcash_pool_migration_backend::engine::MigrationProver;
-    use zcash_pool_migration_backend::wallet::WalletProveError;
+    use zcash_pool_migration::engine::MigrationProver;
+    use zcash_pool_migration::wallet::WalletProveError;
     use zcash_protocol::consensus::BranchId;
 
     /// The prover error type the dispatch tests fail with: the REAL upstream
@@ -5366,9 +7102,7 @@ mod tests {
         );
     }
 
-    // ----- the delivery lane's Signed -> Proved drive (C1) -----
-
-    use crate::migration_finalize::ProveErrorClass;
+    // ----- due-work projection over scheduled rows -----
 
     /// A [`provable_state`]-style row set with EXPLICIT per-transfer scheduling: each transfer is
     /// `(state, scheduled, boundary)` with parseable PCZT bytes and expiry 10_000. Preparation
@@ -5377,8 +7111,7 @@ mod tests {
         prep_states: &[MigrationTxState],
         transfers: &[(MigrationTxState, u32, Option<BlockHeight>)],
     ) -> MigrationState {
-        let transfer_states: Vec<MigrationTxState> =
-            transfers.iter().map(|(s, _, _)| s.clone()).collect();
+        let transfer_states: Vec<MigrationTxState> = transfers.iter().map(|(s, _, _)| *s).collect();
         let base = test_state(
             MigrationStatus::InProgress,
             prep_states,
@@ -5419,196 +7152,6 @@ mod tests {
             base.preparation().clone(),
             transactions,
         )
-    }
-
-    /// The test-side counterpart of [`prove_if_needed`] for [`drive_and_serve_next_due`]: proves
-    /// through the same generic [`migration_finalize::prove_due_transaction`] seam with the given
-    /// test prover instead of the production `WalletMigrationProver`, persists through the same
-    /// account-keyed store, and serves the stored bytes. The txid is zeroed (these fixture PCZTs
-    /// carry no extractable transaction) and the natural anchor is never resolved (these fixtures
-    /// drive transfers only, which prove against their persisted boundary).
-    fn prove_with_test_prover<P>(
-        path: &std::path::Path,
-        account: &[u8; 16],
-        prover: &mut P,
-        state: &mut MigrationState,
-        id: MigrationTxId,
-    ) -> anyhow::Result<Option<(Vec<u8>, [u8; 32])>>
-    where
-        P: MigrationProver,
-        P::Error: ProveErrorClass + std::fmt::Display,
-    {
-        let tx_state = state
-            .transactions()
-            .iter()
-            .find(|t| t.id() == id)
-            .map(|t| t.state())
-            .expect("the driven id exists in the fixture state");
-        match tx_state {
-            MigrationTxState::Proved => {
-                let bytes = state
-                    .transactions()
-                    .iter()
-                    .find(|t| t.id() == id)
-                    .expect("the driven id exists in the fixture state")
-                    .pczt()
-                    .clone();
-                Ok(Some((bytes, [0u8; 32])))
-            }
-            MigrationTxState::Signed => {
-                if migration_finalize::prove_due_transaction(prover, state, id, None)?.is_none() {
-                    return Ok(None);
-                }
-                store_fixture_state(path, account, state);
-                let bytes = state
-                    .transactions()
-                    .iter()
-                    .find(|t| t.id() == id)
-                    .expect("the driven id exists in the fixture state")
-                    .pczt()
-                    .clone();
-                Ok(Some((bytes, [0u8; 32])))
-            }
-            other => panic!("the drive must not prove a row in state {}", other.as_ref()),
-        }
-    }
-
-    /// Re-reads the stored migration for `account`, for asserting what the drive persisted.
-    fn read_fixture_state(path: &std::path::Path, account: &[u8; 16]) -> MigrationState {
-        let mut conn = Connection::open(path).expect("the verification connection opens");
-        let account_id = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
-        let store = PoolMigrations::for_account(&mut conn, account_id)
-            .expect("the account-keyed store resolves the fixture account");
-        store
-            .get_migration()
-            .expect("the store reads")
-            .expect("a migration is stored")
-    }
-
-    /// The delivery serving path drives a due `Signed` transfer through proving — `Signed ->
-    /// Proved`, PERSISTED — and serves it, instead of answering "nothing due" forever: commit
-    /// stores every transaction `Signed` (never `Proved`), and aside from the note-split
-    /// submission's explicit first-preparation prove, this path is the only prover driver.
-    #[test]
-    fn delivery_serving_proves_a_due_signed_transfer_and_serves_it() {
-        let path = init_fixture_db("zcashlc_delivery_serves_signed");
-        let account = create_fixture_account(&path);
-        let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
-        store_fixture_state(&path, &account, &state);
-
-        let mut prover = RecordingProver { calls: Vec::new() };
-        let served = drive_and_serve_next_due(&mut state, h(5_000), |state, id| {
-            prove_with_test_prover(&path, &account, &mut prover, state, id)
-        })
-        .expect("driving a provable, due transfer must not fail");
-
-        let (id, _txid, bytes) = served.expect("the due Signed transfer must be served");
-        assert_eq!(id, MigrationTxId::new(1), "the transfer row must be served");
-        assert_eq!(
-            prover.calls,
-            vec![ProveCall::Transfer(h(1440))],
-            "the drive must prove exactly once, against the row's persisted boundary"
-        );
-        let stored = read_fixture_state(&path, &account);
-        let tx = stored
-            .transactions()
-            .iter()
-            .find(|t| t.id() == MigrationTxId::new(1))
-            .expect("the transfer row remains stored");
-        assert!(
-            matches!(tx.state(), MigrationTxState::Proved),
-            "the drive must persist Signed -> Proved"
-        );
-        assert_eq!(
-            tx.pczt(),
-            &bytes,
-            "the served bytes must be the persisted proven artifact"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A transient prover outcome (the anchor not scanned/retained yet) on the due `Signed`
-    /// transfer maps to "nothing due" — not an error — with the row left `Signed` for a later
-    /// retry, and the prover consulted exactly once (the drive DID attempt the prove).
-    #[test]
-    fn delivery_serving_maps_a_transient_prove_to_nothing_due_leaving_the_row_signed() {
-        let path = init_fixture_db("zcashlc_delivery_transient");
-        let account = create_fixture_account(&path);
-        let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
-        store_fixture_state(&path, &account, &state);
-
-        let mut prover = FailingProver {
-            error: Some(WalletProveError::AnchorNotFound(h(1440))),
-        };
-        let served = drive_and_serve_next_due(&mut state, h(5_000), |state, id| {
-            prove_with_test_prover(&path, &account, &mut prover, state, id)
-        })
-        .expect("a transient prove outcome must not be an error");
-
-        assert!(
-            served.is_none(),
-            "a transient prove means nothing is due yet"
-        );
-        assert!(
-            prover.error.is_none(),
-            "the drive must have consulted the prover for the due Signed row"
-        );
-        let stored = read_fixture_state(&path, &account);
-        let tx = stored
-            .transactions()
-            .iter()
-            .find(|t| t.id() == MigrationTxId::new(1))
-            .expect("the transfer row remains stored");
-        assert!(
-            matches!(tx.state(), MigrationTxState::Signed),
-            "a transient prove must leave the row Signed for a retry"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The drive proves PAST a provable-but-not-yet-due transfer to serve a later one that is
-    /// due: each successful prove persists `Proved` and the loop re-consults both selectors, so
-    /// one blocked-on-schedule row cannot hide due work behind it.
-    #[test]
-    fn delivery_serving_proves_past_an_undue_transfer_to_serve_a_due_one() {
-        let path = init_fixture_db("zcashlc_delivery_past_undue");
-        let account = create_fixture_account(&path);
-        // Transfer 1: provable (boundary settled) but scheduled ABOVE the tip; transfer 2:
-        // provable and due. Both Signed.
-        let mut state = scheduled_state(
-            &[MINED],
-            &[
-                (MigrationTxState::Signed, 9_000, Some(h(40))),
-                (MigrationTxState::Signed, 90, Some(h(40))),
-            ],
-        );
-        store_fixture_state(&path, &account, &state);
-
-        let mut prover = RecordingProver { calls: Vec::new() };
-        let served = drive_and_serve_next_due(&mut state, h(100), |state, id| {
-            prove_with_test_prover(&path, &account, &mut prover, state, id)
-        })
-        .expect("the drive must not fail");
-
-        let (id, _, _) = served.expect("the due transfer behind the undue one must be served");
-        assert_eq!(
-            id,
-            MigrationTxId::new(2),
-            "the schedule-due transfer must be the one served"
-        );
-        let stored = read_fixture_state(&path, &account);
-        for expect_id in [1u32, 2u32] {
-            let tx = stored
-                .transactions()
-                .iter()
-                .find(|t| t.id() == MigrationTxId::new(expect_id))
-                .expect("the transfer row remains stored");
-            assert!(
-                matches!(tx.state(), MigrationTxState::Proved),
-                "the drive must persist every prove it performed (row {expect_id})"
-            );
-        }
-        let _ = std::fs::remove_file(&path);
     }
 
     /// [`due_assuming_proving`] mirrors the drive without a prover: a due `Signed` transfer
@@ -5679,14 +7222,14 @@ mod tests {
         // Signed, scheduled below the tip (due), expiry above the target (valid), boundary
         // settled (`test_state` draws the boundary at the scheduled height, strictly below the
         // tip).
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
+        store_source_bound_transfer_fixture(
+            &path,
+            &account,
+            MigrationTxState::Signed,
             3_499_000,
             4_000_000,
+            0x11,
         );
-        store_fixture_state(&path, &account, &state);
         let overdue = unsafe {
             zcashlc_migration_has_overdue_transfers(
                 path_bytes.as_ptr(),
@@ -5726,14 +7269,14 @@ mod tests {
             "chain-tip update must succeed"
         );
         // Proved, scheduled at exactly tip + 1 (the target height), expiry comfortably above.
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Proved],
+        store_source_bound_transfer_fixture(
+            &path,
+            &account,
+            MigrationTxState::Proved,
             3_600_001, // scheduled_height == tip + 1
             4_000_000,
+            0x12,
         );
-        store_fixture_state(&path, &account, &state);
         let overdue = unsafe {
             zcashlc_migration_has_overdue_transfers(
                 path_bytes.as_ptr(),
@@ -5772,14 +7315,14 @@ mod tests {
         );
         // Proved, schedule-due, but expiry == tip: expired per the engine, and must not be
         // offered for broadcast even though it is otherwise ready.
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Proved],
+        store_source_bound_transfer_fixture(
+            &path,
+            &account,
+            MigrationTxState::Proved,
             3_499_000,
             3_600_000, // expiry_height == tip
+            0x13,
         );
-        store_fixture_state(&path, &account, &state);
         let overdue = unsafe {
             zcashlc_migration_has_overdue_transfers(
                 path_bytes.as_ptr(),
@@ -5815,14 +7358,14 @@ mod tests {
             },
             "chain-tip update must succeed"
         );
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
+        store_source_bound_transfer_fixture(
+            &path,
+            &account,
+            MigrationTxState::Signed,
             3_499_000,
             3_600_000, // expiry_height == tip
+            0x14,
         );
-        store_fixture_state(&path, &account, &state);
         let invalid = unsafe {
             zcashlc_migration_has_invalid_transfers(
                 path_bytes.as_ptr(),
@@ -5857,14 +7400,14 @@ mod tests {
             },
             "chain-tip update must succeed"
         );
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
+        store_source_bound_transfer_fixture(
+            &path,
+            &account,
+            MigrationTxState::Signed,
             3_499_000,
             0, // expiry_height == 0: never expires
+            0x15,
         );
-        store_fixture_state(&path, &account, &state);
         let invalid = unsafe {
             zcashlc_migration_has_invalid_transfers(
                 path_bytes.as_ptr(),
@@ -5937,9 +7480,7 @@ mod tests {
     }
 
     /// 1. No stored migration at all: an empty container, not an error — the same convention as
-    /// [`encode_empty_schedule`], and (like
-    /// [`migration_refresh_stale_transfers_on_fresh_db_returns_an_empty_schedule`]) answerable
-    /// before any chain-tip lookup.
+    ///    [`encode_empty_schedule`] and answerable before any chain-tip lookup.
     #[test]
     fn migration_transaction_statuses_on_fresh_db_is_an_empty_container() {
         let path = init_fixture_db("zcashlc_migration_tx_statuses_fresh");
@@ -5965,12 +7506,12 @@ mod tests {
     }
 
     /// 2. A mixed stored run — a MINED preparation, a BROADCAST transfer, a READY (prove) SIGNED
-    /// transfer, and a SIGNED transfer blocked on its anchor boundary — marshaled verbatim from
-    /// the engine. Every field is checked against `MigrationState::transaction_statuses` computed
-    /// directly on the SAME state object, not a second hand-derivation.
+    ///    transfer, and a SIGNED transfer blocked on its anchor boundary — marshaled verbatim from
+    ///    the engine. Every field is checked against `MigrationState::transaction_statuses` computed
+    ///    directly on the SAME state object, not a second hand-derivation.
     ///
     /// The task sketch that seeded this test named the fourth row "blocked on schedule"; the
-    /// pinned engine (`zcash_pool_migration_backend::state`) makes that unreachable for a
+    /// pinned engine (`zcash_pool_migration::state`) makes that unreachable for a
     /// TRANSFER — `anchor_boundary` is always `Some` for a transfer (only a preparation's is
     /// `None`), so a not-yet-prove-ready `Signed` transfer is always `Blocker::AnchorBoundary`,
     /// never `Blocker::Schedule` (`Schedule` is reported for a `Proved` row awaiting its
@@ -6036,7 +7577,10 @@ mod tests {
                 MigrationTxState::Signed,
             ),
         ];
-        let state = custom_state(MigrationStatus::InProgress, rows);
+        // This is a pure DTO-marshaling fixture, so keep it terminal. Live rows must be created
+        // through the source-bound delivery start seam; transaction status projection itself does
+        // not depend on the aggregate terminal marker.
+        let state = custom_state(MigrationStatus::Failed, rows);
         store_fixture_state(&path, &account, &state);
 
         // The expectation: computed directly from the engine, on the very same state.
@@ -6173,17 +7717,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 3. Reconciliation runs at the head of this read too (the same convention as
-    /// [`zcashlc_migration_state`]): a stored `Broadcast` transfer whose txid the WALLET's own
-    /// `transactions` table now shows mined is reported — and PERSISTED — as `Mined`, not
-    /// `Broadcast`. Mirrors
-    /// [`resolve_immediate_run_reads_mined_and_expiry_from_transactions_table`]'s technique of
-    /// inserting directly into a `transactions` table, but against the REAL wallet schema (that
-    /// test's table is a hand-rolled two-column stand-in; `ctx.wallet.get_tx_height` reads the
-    /// real `zcash_client_sqlite` schema, so this fixture inserts the columns that schema
-    /// requires: `txid`, `mined_height`, and the `NOT NULL` `min_observed_height`).
+    /// 3. The low-level status read is a pure projection: wallet chain evidence cannot mutate a
+    ///    delivery-owned canonical row without the opaque run capability. The high-level Swift API
+    ///    performs the typed reconciliation CAS before calling this projection.
     #[test]
-    fn migration_transaction_statuses_reconciles_a_mined_broadcast_transfer() {
+    fn migration_transaction_statuses_is_pure_until_opaque_reconciliation() {
         let path = init_fixture_db("zcashlc_migration_tx_statuses_reconcile");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
@@ -6224,7 +7762,7 @@ mod tests {
                 txid: TxId::from_bytes(txid),
             },
         )];
-        let state = custom_state(MigrationStatus::InProgress, rows);
+        let state = custom_state(MigrationStatus::Failed, rows);
         store_fixture_state(&path, &account, &state);
 
         let statuses_ptr = unsafe {
@@ -6239,23 +7777,20 @@ mod tests {
         let statuses = unsafe { &*statuses_ptr };
         assert_eq!(statuses.len, 1);
         let row = unsafe { &*statuses.ptr };
+        assert_eq!(row.state, 3, "the pure read must preserve Broadcast");
         assert_eq!(
-            row.state, 4,
-            "the row must report Mined once the wallet shows it mined"
-        );
-        assert_eq!(
-            row.mined_height,
-            i64::from(mined_at),
-            "the reported mined height must be the wallet's"
+            row.mined_height, -1,
+            "the pure projection has no mined height before typed reconciliation"
         );
         assert!(
-            !row.has_txid,
-            "reconciled to Mined, the engine's own state no longer carries a txid"
+            row.has_txid,
+            "the Broadcast projection must retain its canonical txid"
         );
+        assert_eq!(row.txid, txid);
         unsafe { zcashlc_free_migration_transaction_statuses(statuses_ptr) };
 
-        // The reconciliation must be PERSISTED, not just reported for this one read — the
-        // read-path convention every sibling read follows.
+        // Most importantly, the read cannot persist a lifecycle transition without delivery CAS
+        // authority. The opaque-run reconciliation path is covered at the high-level Swift seam.
         let stored = read_fixture_state(&path, &account);
         let stored_tx = stored
             .transactions()
@@ -6263,22 +7798,19 @@ mod tests {
             .find(|t| t.id() == MigrationTxId::new(0))
             .expect("the row remains stored");
         assert!(
-            matches!(
-                stored_tx.state(),
-                MigrationTxState::Mined { height } if height == h(mined_at)
-            ),
-            "reconciliation must persist Broadcast -> Mined"
+            matches!(stored_tx.state(), MigrationTxState::Broadcast { txid: stored } if stored == TxId::from_bytes(txid)),
+            "the pure read must not persist Broadcast -> Mined"
         );
 
         let _ = std::fs::remove_file(&path);
     }
 
     /// 4. ZIP 203 / engine semantics: `expiry_height == tip` can no longer be mined in the next
-    /// block (`target = tip + 1`), so the engine reports `Blocker::Expired` ahead of any other
-    /// blocker. Ties the DTO to the same target-height semantics already pinned elsewhere in
-    /// this file (F2: `has_overdue_transfers_does_not_report_an_expired_proved_transfer_at_the_tip`,
-    /// `has_invalid_transfers_reports_expiry_equal_to_tip_as_expired`). A second row with
-    /// `expiry_height == 0` (the engine's "never expires" sentinel) pins the contrast.
+    ///    block (`target = tip + 1`), so the engine reports `Blocker::Expired` ahead of any other
+    ///    blocker. Ties the DTO to the same target-height semantics already pinned elsewhere in
+    ///    this file (F2: `has_overdue_transfers_does_not_report_an_expired_proved_transfer_at_the_tip`,
+    ///    `has_invalid_transfers_reports_expiry_equal_to_tip_as_expired`). A second row with
+    ///    `expiry_height == 0` (the engine's "never expires" sentinel) pins the contrast.
     #[test]
     fn migration_transaction_statuses_reports_expired_at_the_tip_boundary() {
         let path = init_fixture_db("zcashlc_migration_tx_statuses_expired");
@@ -6316,7 +7848,7 @@ mod tests {
                 MigrationTxState::Signed,
             ),
         ];
-        let state = custom_state(MigrationStatus::InProgress, rows);
+        let state = custom_state(MigrationStatus::Failed, rows);
         store_fixture_state(&path, &account, &state);
 
         let statuses_ptr = unsafe {

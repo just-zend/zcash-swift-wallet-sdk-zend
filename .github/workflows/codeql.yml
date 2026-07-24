@@ -90,17 +90,28 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
+        fetch-depth: 0
         persist-credentials: false
 
     # --- Swift manual build steps (mirrors swift.yml) ---
     #
-    # Swift does not support build-mode: none. The private migration engine is built and tested in
-    # its own repository; public SDK CodeQL consumes the reviewed, committed FFI artifact without
-    # requiring private-repository credentials.
+    # Swift does not support build-mode: none. Public SDK CodeQL consumes the reviewed, committed
+    # FFI artifact from the exact public Rust graph.
 
     - name: Select Xcode version
       if: matrix.language == 'swift'
       run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
+
+    - name: Run network-free retired-engine and dependency gate
+      if: matrix.language == 'swift'
+      run: ./Scripts/verify-ironwood-static-release-inputs.sh
+
+    - name: Install pinned Rust verification tools
+      if: matrix.language == 'swift'
+      run: |
+        rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+        rustup toolchain install "$rust_toolchain" --profile minimal
+        rustup component add --toolchain "$rust_toolchain" llvm-tools-preview
 
     - name: Verify committed XCFramework
       if: matrix.language == 'swift'

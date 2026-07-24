@@ -406,8 +406,8 @@ protocol ZcashRustBackendWelding {
 
     // MARK: - Ironwood migration
 
-    /// Current Orchard -> Ironwood migration state for `account`. This is also the reconciliation
-    /// hub: call it on launch and after every migration-related operation.
+    /// Current Orchard -> Ironwood migration state for `account`. This low-level projection is
+    /// side-effect free; the public migration actor performs opaque-run chain reconciliation first.
     /// - Throws: `rustMigrationState` if the rust layer returns an error.
     func migrationState(for account: AccountUUID) async throws -> MigrationState
 
@@ -418,10 +418,10 @@ protocol ZcashRustBackendWelding {
     /// The LIVE status of every committed migration transaction for `account`, keyed by its
     /// stable id. A verbatim marshal of the engine's own `MigrationState::transaction_statuses`:
     /// nothing here is derived independently of the engine's view, and each row's `id` is STABLE
-    /// across reads and across a stale-transfer rebuild (a rebuilt transfer keeps its id; only
-    /// its state and heights change). Reconciles mined transactions first (the same read-path
-    /// convention as `migrationState(for:)`), so a transaction the wallet's own scan has since
-    /// observed mined is reported `.mined` here even if the stored run still marks it broadcast.
+    /// across reads and across an exact expired-attempt rebuild (a rebuilt transfer keeps its id;
+    /// only its state and heights change). This welding read is a pure projection; public state,
+    /// progress, and status calls first reconcile canonical chain evidence with the Rust-owned
+    /// opaque scheduled-run capability.
     /// No stored run, or a stored run with no transactions, returns an EMPTY array — not an error.
     /// - Throws: `rustMigrationTransactionStatuses` if the rust layer returns an error.
     func migrationTransactionStatuses(for account: AccountUUID) async throws -> [MigrationTransactionStatus]
@@ -446,21 +446,6 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationPrepareNoteSplit` if the rust layer returns an error.
     func migrationPrepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
 
-    /// Builds, signs, and persists the note-split transaction; returns the broadcastable prepared
-    /// transfer. `proposal` is a VERIFIED consent echo, not an inert display value: its output
-    /// values and fee are checked against the previewed note split when one is cached for the
-    /// account, so a stale or tampered display cannot sign different values than the ones the
-    /// user approved.
-    /// - Throws: `migrationPlanStale` when the echo mismatches the previewed plan, or when no
-    ///   previewed plan is cached and no resumable run is stored — re-propose and re-display;
-    ///   `migrationProvingUnavailable` when proving the returned transfer fails hard;
-    ///   `rustMigrationSignNoteSplit` for other rust-layer errors.
-    func migrationSignNoteSplit(
-        proposal: NoteSplitProposal,
-        usk: UnifiedSpendingKey,
-        for account: AccountUUID
-    ) async throws -> PreparedMigrationTransfer
-
     /// The leftover Orchard balance a migration would not cross, when it is large enough to be
     /// worth offering the user a choice about; `nil` when there is no such residual.
     ///
@@ -481,10 +466,9 @@ protocol ZcashRustBackendWelding {
     ///   concurrent-lock race, which the caller may retry).
     func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi
 
-    /// Unlocks the account's locked outputs — the release half of `lockMigrationResidual` — and
-    /// returns the number of outputs unlocked (`0` when nothing was locked). Clears ALL locks
-    /// held for the account; that blanket clear is safe because the SDK never creates
-    /// proposal-scoped output locks.
+    /// Unlocks only the exact Orchard outputs held by the account's deterministic residual owner —
+    /// the release half of `lockMigrationResidual` — and returns the number unlocked (`0` when no
+    /// residual lock is active). Migration, ordinary-PCZT, and foreign-owner locks are preserved.
     /// - Throws: `rustMigrationUnlockResidual` if the rust layer returns an error.
     func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int
 
@@ -501,12 +485,212 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
     func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule
 
+    // MARK: Rust-owned delivery runtime
+
+    /// Returns the complete canonical-plus-delivery projection from one Rust-owned database read.
+    func migrationRuntimeSnapshot(for account: AccountUUID) async throws -> MigrationRuntimeSnapshot
+
+    /// Returns exactly one runtime per wallet account from one Rust-owned database transaction.
+    func migrationRuntimeSnapshots() async throws -> [MigrationRuntimeSnapshot]
+
+    /// Validates and binds raw transport intent in Rust, returning a fresh immutable run handle.
+    func migrationBindSubmissionPolicy(
+        _ intent: MigrationSubmissionIntent,
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle
+
+    /// Returns Rust-normalized transport details for network-client construction only.
+    func migrationBoundSubmissionTarget(for run: MigrationRunHandle) async throws -> MigrationBoundSubmissionTarget?
+
+    /// Atomically reserves a wallet-derived immediate proposal and its initial claim.
+    func migrationReserveImmediate(
+        signer: MigrationSignerOwnership,
+        submission: MigrationSubmissionIntent,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Consumes an immediate SDK-signer claim and atomically builds, stores, and stages its exact
+    /// Rust-sealed transaction. Swift supplies no proposal or transaction bytes.
+    func migrationMaterializeImmediateSDK(
+        claim: MigrationClaimHandle,
+        usk: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Consumes an immediate external-signer claim and atomically builds, proves, validates, and
+    /// stages the Rust-sealed PCZT before its bytes can be exposed.
+    func migrationPrepareImmediateExternalSigning(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Consumes the staged signer merge and atomically extracts, stores, and stages the exact
+    /// immediate transaction. Swift supplies no finalized PCZT or transaction bytes.
+    func migrationFinalizeImmediateExternalSigning(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Commits an externally signed schedule without exposing PCZT bytes and returns its run.
+    func migrationCommitExternalSchedule(
+        _ schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle
+
+    /// Replaces a terminal scheduled predecessor with the exact previewed SDK-signed successor.
+    /// The opaque predecessor capability and proposal handle are both verified by Rust.
+    func migrationRolloverInternalSchedule(
+        _ schedule: MigrationSchedule,
+        predecessor: MigrationRunHandle,
+        usk: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle
+
+    /// Replaces a terminal scheduled predecessor with the exact previewed external-signer
+    /// successor. Canonical PCZT bytes remain hidden until claimed and durably staged.
+    func migrationRolloverExternalSchedule(
+        _ schedule: MigrationSchedule,
+        predecessor: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle
+
+    /// Acquires bounded materialization authority for one scheduled transaction attempt.
+    func migrationClaimMaterialization(
+        transactionID: UInt32,
+        signer: MigrationSignerOwnership,
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle?
+
+    /// Stages canonical scheduled external-signing bytes before returning them to Swift. Swift
+    /// cannot supply PCZT bytes; immediate claims use
+    /// ``migrationPrepareImmediateExternalSigning(claim:for:)``.
+    func migrationStageExternalSigningPCZT(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Stages bytes returned by the external signer under the same exact claim.
+    func migrationStageSignedPCZT(
+        _ signedPCZT: Data,
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Advances the sole AwaitingSignature -> Signed canonical transition.
+    func migrationAdvanceExternalSignature(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Proves a scheduled Signed transaction and atomically stages exact network bytes.
+    func migrationProveClaim(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Acquires the one-shot submission capability for already-staged exact bytes.
+    func migrationClaimSubmission(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle?
+
+    /// Acquires resolution-only authority for an ambiguous submission.
+    func migrationClaimOutcomeResolution(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle?
+
+    /// Resumes the same still-live Rust claim without minting replacement authority.
+    func migrationResumeClaim(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle?
+
+    /// Reacquires external-signing authority for the same staged artifact after expiry/relaunch.
+    func migrationReacquireExternalSigning(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle?
+
+    /// Renews a live claim using Rust's bounded duration for its sealed kind.
+    func migrationRenewClaim(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle?
+
+    /// Records one typed transport outcome and returns the next immutable claim handle.
+    func migrationRecordSubmissionOutcome(
+        _ outcome: MigrationSubmissionOutcome,
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Reconciles an ambiguous outcome from Rust-owned wallet chain evidence only.
+    func migrationReconcileSubmission(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Reconciles scheduled canonical chain state without host-authored heights or lifecycle data.
+    func migrationReconcileCanonicalChain(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle
+
+    /// Releases only a Rust-validated known-unsent claim failure.
+    func migrationReleaseKnownUnsentClaim(
+        claim: MigrationClaimHandle,
+        failure: MigrationDeliveryFailureReason,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    /// Rebuilds one positively expired transfer under the same run/reservation owner and returns
+    /// the fresh generation-bound materialization claim.
+    func migrationRebuildExpiredTransfer(
+        claim: MigrationClaimHandle,
+        signer: MigrationSignerOwnership,
+        usk: UnifiedSpendingKey?,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
+
+    func migrationPauseDelivery(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle
+
+    func migrationResumeDelivery(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle
+
+    func migrationBeginAbandonment(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle
+
+    func migrationFinishAbandonment(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle
+
+    /// Exact payload accessors copy bytes from Rust; they never grant mutation authority.
+    func migrationClaimRun(_ claim: MigrationClaimHandle) async throws -> MigrationRunHandle
+    func migrationClaimProposal(_ claim: MigrationClaimHandle) async throws -> Data?
+    func migrationClaimExternalSigningPCZT(_ claim: MigrationClaimHandle) async throws -> Data?
+    func migrationClaimSignedPCZT(_ claim: MigrationClaimHandle) async throws -> Data?
+    func migrationClaimExactTransaction(_ claim: MigrationClaimHandle) async throws -> Data?
+    func migrationClaimTransactionID(_ claim: MigrationClaimHandle) async throws -> Data?
+    func migrationClaimStatus(_ claim: MigrationClaimHandle) async throws -> MigrationDeliveryClaimStatus
+    func migrationClaimExpiryHeight(_ claim: MigrationClaimHandle) async throws -> BlockHeight
+    /// Returns the consensus branch sealed into a claim's canonical Rust-owned evidence.
+    func migrationClaimConsensusBranchID(_ claim: MigrationClaimHandle) async throws -> UInt32
+
     /// Proposes a "send everything" transaction that sweeps the account's whole spendable balance
     /// (minus the ZIP-317 fee) to a single recipient, restricted to the given shielded-pool scope.
-    /// Used by the Orchard -> Ironwood immediate migration lane (``OrchardMigration/proposeImmediateMigration()``,
-    /// `orchardOnly: true`) to sweep the account's spendable Orchard notes to its own address,
-    /// entirely outside the migration engine -- the returned proposal is an ORDINARY proposal, held
-    /// by the caller like any other transfer.
+    /// The migration delivery runtime does not use this API: immediate Orchard -> Ironwood
+    /// migration is reserved and materialized atomically from an opaque Rust claim.
     ///
     /// - Parameter accountUUID: index of the given account.
     /// - Parameter recipient: recipient address.
@@ -522,148 +706,25 @@ protocol ZcashRustBackendWelding {
         orchardOnly: Bool
     ) async throws -> FfiProposal
 
-    /// Pre-signs and persists every transfer in `schedule` (a no-op when a matching non-terminal
-    /// run is already stored — the normal case, since the note-split submission commits the run).
-    /// `schedule` is a VERIFIED consent echo of what the user approved, not an inert display
-    /// value: ids, amounts, and expiry heights are checked against the previewed plan (or, once a
-    /// run is committed, against the stored run itself). `nextExecutableAfterHeight` is
-    /// additionally checked against the preview before commit but never post-commit (the
-    /// immediate lane's commit-time reschedule can legitimately move it away from an honest
-    /// echo), and the estimated duration is likewise checked pre-commit only: a refresh rebuilds
-    /// an expired transfer with a fresh scheduled height, and the duration is measured from serve
-    /// time, so an honest echo of an earlier serve can legitimately disagree with a later
-    /// re-derivation, with no way to converge by re-proposing. `anchorHeight` is display-only,
-    /// never compared.
-    /// - Throws: `migrationPlanStale` when the echo mismatches, or when nothing is committed and
-    ///   no previewed plan is cached — recover by re-proposing and re-displaying (pre-commit) or
-    ///   re-reading the stored schedule (post-commit); `rustMigrationSignAndStoreSchedule` for
-    ///   other rust-layer errors (also thrown Swift-side if the echoed duration exceeds
-    ///   UInt32.max, without reaching the rust layer).
+    /// Pre-signs and persists the exact Rust-cached plan identified by `schedule.proposalHandle`.
+    /// No caller-authored schedule field crosses the FFI boundary inward. A matching non-terminal
+    /// stored run resumes without consulting the handle because it is already durable,
+    /// handle-verified state.
+    /// - Throws: `migrationPlanStale` when a fresh commit's handle is missing after relaunch or
+    ///   superseded by a later proposal — recover by re-proposing and re-displaying;
+    ///   `rustMigrationSignAndStoreSchedule` for other rust-layer errors.
     func migrationSignAndStoreSchedule(
         _ schedule: MigrationSchedule,
         usk: UnifiedSpendingKey,
         for account: AccountUUID
     ) async throws
 
-    /// The next height-due pre-signed transfer, or `nil` when nothing is currently due.
-    /// - Throws: `migrationProvingUnavailable` when proving the due transfer fails hard (the
-    ///   transient not-scanned-yet case surfaces as `nil` above, not an error);
-    ///   `rustMigrationNextDueTransfer` for other rust-layer errors.
-    func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedMigrationTransfer?
-
     /// The next height-due scheduled transfer's full proposal (amount, anchor, timing) for the
     /// active run, or `nil` when nothing is currently pending (no active run, or only the note-split
-    /// prep is pending). The proposal-level counterpart of `migrationNextDueTransfer`: it exposes the
-    /// heights (notably `nextExecutableAfterHeight`) so a host can re-arm its own background window
-    /// without parsing the signed PCZT.
+    /// preparation is pending). It exposes the heights (notably `nextExecutableAfterHeight`) so a
+    /// host can re-arm its own background window without inspecting any claim-owned transaction
+    /// material.
     /// - Throws: `rustMigrationPendingTransferProposal` if the rust layer returns an error.
     func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal?
 
-    /// Extracts the broadcast-ready consensus transaction bytes from a signed PCZT (the
-    /// `PreparedMigrationTransfer.pczt` returned by `migrationNextDueTransfer` or
-    /// `migrationSignNoteSplit`).
-    /// - Throws: `rustMigrationExtractBroadcastTx` if the rust layer returns an error.
-    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data
-
-    /// Records the platform's broadcast outcome for `transferId`, advancing the engine's state.
-    /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error;
-    ///           `migrationInvalidTxId` if `result` is `.success` and its `txId` does not decode
-    ///           to a 32-byte transaction id.
-    func migrationRecordTransferResult(
-        transferId: String,
-        result: MigrationTransferResult,
-        for account: AccountUUID
-    ) async throws
-
-    /// Records a broadcast immediate-migration sweep (an ordinary send-max transaction proposed via
-    /// ``proposeSendMaxTransfer(accountUUID:recipient:memo:orchardOnly:)`` with `orchardOnly: true`,
-    /// built entirely outside the migration engine) so the platform's migration state machine
-    /// reports it: `InProgress` (0 of 1) while unmined, `Complete` once mined, or a re-offer
-    /// (`NotStarted`) if it expires unmined. One row per account: a new record supersedes any
-    /// previous one.
-    /// - Parameter txid: the swept transaction's id, in the SDK's raw/internal byte order (32 bytes).
-    /// - Throws: `migrationRecordImmediateRunInvalidTxId` if `txid` is not exactly 32 bytes (checked
-    ///   before any FFI call, since the C side reads it as a fixed 32-byte buffer). Otherwise
-    ///   `rustMigrationRecordImmediateRun` if the rust layer returns an error (including "no chain
-    ///   tip yet" on a wallet that has never completed a sync).
-    func migrationRecordImmediateRun(txid: Data, for account: AccountUUID) async throws
-
-    /// Cancels the stored run (its pre-signed transactions are abandoned; already-broadcast ones
-    /// are unaffected on-chain), clears the invalid marks, and previews a fresh schedule against
-    /// the live balance for the re-confirm lane.
-    /// - Throws: `rustMigrationRestartStep` if the rust layer returns an error.
-    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule
-
-    /// Rebuilds every EXPIRED transfer of the stored migration run in place through the engine:
-    /// each rebuilt transfer re-spends the SAME funding note (recovered from the expired PCZT by
-    /// nullifier identity, never an equal-value substitute) on a fresh schedule — a fresh
-    /// memoryless delay from the current tip, a fresh canonical expiry, and a freshly drawn
-    /// boundary anchor. Passing a spending key signs each rebuilt transfer anew in-process;
-    /// passing `nil` (an external-signer account, whose spend authority never exists on this
-    /// device) leaves it awaiting its signature, so the `migrationCreateUnsignedTransferPczts` /
-    /// `migrationStoreSignedSchedulePczts` ceremony re-serves and completes it.
-    ///
-    /// Returns the run's FULL transfer schedule as stored AFTER the refresh — the same shape
-    /// `migrationRestartStep` returns, here read from the persisted run. The rebuilt state
-    /// persists all-or-nothing, and the returned schedule is that atomically-persisted truth:
-    /// the host must re-display it and echo it on the consent-verified calls (a rebuilt
-    /// transfer's fresh scheduled/expiry heights exist nowhere else, so holding on to the
-    /// pre-refresh copy would fail the schedule echo with `migrationPlanStale` from then on).
-    /// With nothing expired the current stored schedule comes back unchanged; with no stored
-    /// run, or a terminal (completed or cancelled) one, the schedule is empty.
-    /// - Throws: `rustMigrationRefreshStaleTransfers` if the rust layer returns an error —
-    ///   notably when an expired transfer's funding note was spent outside the migration, where
-    ///   the message names `restartCurrentMigrationStep` (cancel and re-plan) as the remedy. On
-    ///   any throw nothing was persisted.
-    func migrationRefreshStaleTransfers(
-        usk: UnifiedSpendingKey?,
-        for account: AccountUUID
-    ) async throws -> MigrationSchedule
-
-    /// Builds the whole previewed migration UNSIGNED for an external signer — the run is created
-    /// by this call, with every transaction persisted awaiting its signature — and returns the
-    /// preparation (note-split) subset of the PCZTs for the signing ceremony. The transfer subset
-    /// of the same build is served by `migrationCreateUnsignedTransferPczts`. Resumes a stored
-    /// non-terminal run; replaces a terminal one (the sequential-runs path).
-    /// - Throws: `migrationPlanStale` when no previewed plan is cached for the account;
-    ///   `rustMigrationCreateUnsignedNoteSplitPczt` for other rust-layer errors.
-    func migrationCreateUnsignedNoteSplitPczts(for account: AccountUUID) async throws -> [MigrationUnsignedTransferPczt]
-
-    /// Applies the ceremony's signatures to the run's preparation (note-split) transactions,
-    /// all-or-nothing: every element must match a stored transaction awaiting its signature or
-    /// nothing is persisted. Returns a STORAGE RECEIPT for the first preparation transaction (its
-    /// `txid` is zeroed — the broadcastable, proven value is served by the delivery lane).
-    /// - Throws: `rustMigrationStoreSignedNoteSplitPczt` if the rust layer returns an error.
-    func migrationStoreSignedNoteSplitPczts(
-        _ signed: [MigrationSignedTransferPczt],
-        for account: AccountUUID
-    ) async throws -> PreparedMigrationTransfer
-
-    /// Serves the TRANSFER subset of the unsigned build for the signing ceremony (see
-    /// `migrationCreateUnsignedNoteSplitPczts`). `schedule` is a VERIFIED consent echo, not an
-    /// inert display value: its ids, amounts, and expiry heights are checked against the STORED
-    /// committed run this call serves from, so a stale or tampered display cannot route
-    /// different values than the ones the user approved into the ceremony.
-    /// `nextExecutableAfterHeight` is accepted but not compared post-commit (the immediate
-    /// lane's commit-time reschedule can legitimately move it away from an honest echo, with no
-    /// way to converge by re-proposing), and the estimated duration is likewise accepted but not
-    /// compared post-commit (a refresh rebuilds expired transfers with fresh scheduled heights,
-    /// and the duration is measured from serve time — an honest echo of an earlier serve can
-    /// legitimately disagree with a later re-derivation, with no way to converge by
-    /// re-proposing); `anchorHeight` is display-only, never compared.
-    /// - Throws: `migrationPlanStale` when the echoed schedule does not match the stored run —
-    ///   recover by re-reading the run's stored schedule (`migrationRefreshStaleTransfers`
-    ///   returns exactly that) and re-displaying it — or when nothing is committed and no
-    ///   previewed plan is cached; `rustMigrationCreateUnsignedTransferPczts` for other
-    ///   rust-layer errors (also thrown Swift-side if the echoed duration exceeds UInt32.max,
-    ///   without reaching the rust layer).
-    func migrationCreateUnsignedTransferPczts(
-        for schedule: MigrationSchedule,
-        for account: AccountUUID
-    ) async throws -> [MigrationUnsignedTransferPczt]
-
-    /// Accepts the full set of externally signed transfer PCZTs (all-or-nothing) and, if every
-    /// staged transfer is matched exactly, persists the committed schedule.
-    /// - Throws: `rustMigrationStoreSignedSchedulePczts` if the rust layer returns an error.
-    func migrationStoreSignedSchedulePczts(_ signed: [MigrationSignedTransferPczt], for account: AccountUUID) async throws
 }

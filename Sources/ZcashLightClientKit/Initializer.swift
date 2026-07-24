@@ -332,26 +332,7 @@ public class Initializer {
 
         // It's not possible to fail from constructor. Technically it's possible but it can be pain for the client apps to handle errors thrown
         // from constructor. So `parsingError` is just stored in initializer and `SDKSynchronizer.prepare()` throw this error if it exists.
-        let (updatedURLs, urlParsingError) = Self.tryToUpdateURLs(with: alias, urls: urls)
-        var parsingError = urlParsingError
-
-        // A custom network carries a base identity + custom NU activation heights; register them with
-        // the Rust core before any FFI call resolves the custom (regtest-slot) network id.
-        // Process-global (see MIGRATING.md).
-        if let activationHeights = network.customActivationHeights {
-            let configured = ZcashRustBackend.setCustomNetwork(
-                base: network.customNetworkBase ?? network.networkType,
-                chainName: network.chainName,
-                activationHeights
-            )
-            if !configured, parsingError == nil {
-                parsingError = .unknown(
-                    ConsensusParametersError.unavailable(
-                        "Custom consensus parameters are invalid or conflict with an existing process-wide configuration"
-                    )
-                )
-            }
-        }
+        let (updatedURLs, parsingError) = Self.tryToUpdateURLs(with: alias, urls: urls)
 
         // A custom network carries a base identity + custom NU activation heights; register them with
         // the Rust core before any FFI call resolves the custom (regtest-slot) network id.

@@ -292,96 +292,53 @@ final class StubTransactionEncoder: TransactionEncoder {
 final class MigrationTransactionSubmitterMock: MigrationTransactionSubmitting {
     struct ReceivedArguments {
         let transaction: EncodedTransaction
-        let displayTransactionID: String
         let expiryHeight: BlockHeight
-        let options: NetworkPrivacyOptions
-        let defaultEndpoint: LightWalletEndpoint
-        let networkType: NetworkType
+        let target: MigrationBoundSubmissionTarget
         let expectedChainName: String
-        let boundPolicy: BoundSubmissionPolicy
         let transactionConsensusBranchId: UInt32
     }
 
-    private let transactionEncoder: TransactionEncoder?
     private(set) var receivedArguments: ReceivedArguments?
-    private(set) var validationCallsCount = 0
-    var result: TransferResult?
+    private(set) var callsCount = 0
+    private(set) var renewalCallsCount = 0
+    var result: MigrationSubmissionOutcome?
     var throwableError: Error?
-    var validationPolicy: SubmissionPolicy?
-    var validationThrowableError: Error?
-    var closure: ((EncodedTransaction, String, BlockHeight, NetworkPrivacyOptions, LightWalletEndpoint, NetworkType) async throws -> TransferResult)?
-
-    init(transactionEncoder: TransactionEncoder? = nil) {
-        self.transactionEncoder = transactionEncoder
-    }
-
-    func validateSubmissionPolicy(
-        options: NetworkPrivacyOptions,
-        defaultEndpoint: LightWalletEndpoint,
-        networkType: NetworkType,
-        expectedChainName: String,
-        consensusFingerprint: String,
-        branchIdForHeight: @escaping (Int32) throws -> Int32
-    ) async throws -> SubmissionPolicy {
-        validationCallsCount += 1
-        if let validationThrowableError { throw validationThrowableError }
-        if let validationPolicy { return validationPolicy }
-        return SubmissionPolicy(
-            transport: options.useTor ? .tor : .direct,
-            endpointIdentity: "\(defaultEndpoint.secure ? "https" : "http")://\(defaultEndpoint.host.lowercased()):\(defaultEndpoint.port)",
-            consensusFingerprint: consensusFingerprint
-        )
-    }
+    var renewBeforeReturning = false
+    var closure: ((ReceivedArguments) async throws -> MigrationSubmissionOutcome)?
 
     func submit(
         transaction: EncodedTransaction,
-        displayTransactionID: String,
         expiryHeight: BlockHeight,
-        options: NetworkPrivacyOptions,
-        defaultEndpoint: LightWalletEndpoint,
-        networkType: NetworkType,
+        target: MigrationBoundSubmissionTarget,
         expectedChainName: String,
-        boundPolicy: BoundSubmissionPolicy,
         transactionConsensusBranchId: UInt32,
         branchIdForHeight: @escaping (Int32) throws -> Int32,
         renewLease: @escaping () async throws -> Void
-    ) async throws -> TransferResult {
-        receivedArguments = ReceivedArguments(
+    ) async throws -> MigrationSubmissionOutcome {
+        callsCount += 1
+        let arguments = ReceivedArguments(
             transaction: transaction,
-            displayTransactionID: displayTransactionID,
             expiryHeight: expiryHeight,
-            options: options,
-            defaultEndpoint: defaultEndpoint,
-            networkType: networkType,
+            target: target,
             expectedChainName: expectedChainName,
-            boundPolicy: boundPolicy,
             transactionConsensusBranchId: transactionConsensusBranchId
         )
+        receivedArguments = arguments
 
         if let throwableError {
             throw throwableError
         }
+        if renewBeforeReturning {
+            try await renewLease()
+            renewalCallsCount += 1
+        }
         if let closure {
-            return try await closure(transaction, displayTransactionID, expiryHeight, options, defaultEndpoint, networkType)
+            return try await closure(arguments)
         }
         if let result {
             return result
         }
-        guard let transactionEncoder else {
-            fatalError("Configure a result, throwableError, or transactionEncoder")
-        }
-
-        do {
-            try await transactionEncoder.submit(transaction: transaction)
-            return .success(txid: displayTransactionID)
-        } catch TransactionEncoderError.submitError {
-            if await transactionEncoder.isTransactionKnownToServer(txId: transaction.transactionId) {
-                return .success(txid: displayTransactionID)
-            }
-            return .networkError(retryable: false)
-        } catch {
-            return .outcomeUnknown
-        }
+        fatalError("Configure result, throwableError, or closure")
     }
 }
 

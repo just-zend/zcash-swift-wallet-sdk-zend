@@ -1582,44 +1582,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationSignNoteSplit(
-        proposal: NoteSplitProposal,
-        usk: UnifiedSpendingKey,
-        for account: AccountUUID
-    ) async throws -> PreparedMigrationTransfer {
-        let outputValues = proposal.outputNotes.map { $0.amount }
-
-        let preparedPtr = zcashlc_migration_sign_note_split(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId,
-            outputValues,
-            UInt(outputValues.count),
-            proposal.fee.amount,
-            usk.bytes,
-            UInt(usk.bytes.count)
-        )
-
-        guard let preparedPtr else {
-            throw migrationRoutedError(
-                lastErrorMessage(fallback: "`migrationSignNoteSplit` failed with unknown error"),
-                fallback: ZcashError.rustMigrationSignNoteSplit
-            )
-        }
-
-        defer { zcashlc_free_migration_prepared_transfer(preparedPtr) }
-
-        guard let prepared = preparedPtr.pointee.unsafeToPreparedMigrationTransfer() else {
-            throw ZcashError.rustMigrationSignNoteSplit(
-                lastErrorMessage(fallback: "`migrationSignNoteSplit` returned a malformed prepared transfer")
-            )
-        }
-
-        return prepared
-    }
-
-    @DBActor
     func migrationResidualAfterMigration(for account: AccountUUID) async throws -> Zatoshi? {
         // Clear any stale, unconsumed last-error before this sentinel read (see
         // `migrationIsNoteSplitNeeded` above).
@@ -1731,6 +1693,671 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return schedule
     }
 
+    // MARK: - Rust-owned migration delivery runtime
+
+    @DBActor
+    func migrationRuntimeSnapshot(for account: AccountUUID) async throws -> MigrationRuntimeSnapshot {
+        let snapshotPtr = zcashlc_migration_runtime_snapshot_v1(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId
+        )
+        guard let snapshotPtr else {
+            throw migrationDeliveryError("migrationRuntimeSnapshot")
+        }
+        defer { zcashlc_free_migration_runtime_snapshot_v1(snapshotPtr) }
+        return try decodeMigrationRuntimeSnapshot(snapshotPtr.pointee)
+    }
+
+    @DBActor
+    func migrationRuntimeSnapshots() async throws -> [MigrationRuntimeSnapshot] {
+        let batchPtr = zcashlc_migration_runtime_batch_v1(dbData.0, dbData.1, networkType.networkId)
+        guard let batchPtr else {
+            throw migrationDeliveryError("migrationRuntimeSnapshots")
+        }
+        defer { zcashlc_free_migration_runtime_batch_v1(batchPtr) }
+
+        let batch = batchPtr.pointee
+        guard batch.abi_version == 1 else {
+            throw malformedMigrationDelivery("unsupported runtime ABI version \(batch.abi_version)")
+        }
+        if batch.accounts_len == 0 {
+            return []
+        }
+        guard let accounts = batch.accounts else {
+            throw malformedMigrationDelivery("runtime batch omitted its account array")
+        }
+        return try (0 ..< Int(batch.accounts_len)).map {
+            try decodeMigrationRuntimeSnapshot(accounts.advanced(by: $0).pointee)
+        }
+    }
+
+    @DBActor
+    func migrationBindSubmissionPolicy(
+        _ intent: MigrationSubmissionIntent,
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle {
+        let endpoint = intent.endpoint.utf8CString
+        let pointer = endpoint.withUnsafeBufferPointer { endpoint in
+            zcashlc_migration_bind_submission_policy_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                run.pointer,
+                migrationTransportTag(intent.transport),
+                endpoint.baseAddress
+            )
+        }
+        return try ownedMigrationRun(pointer, operation: "migrationBindSubmissionPolicy")
+    }
+
+    func migrationBoundSubmissionTarget(for run: MigrationRunHandle) async throws -> MigrationBoundSubmissionTarget? {
+        zcashlc_clear_last_error()
+        let transportTag = zcashlc_migration_run_submission_transport_v1(run.pointer)
+        guard transportTag >= 0 else {
+            if zcashlc_last_error_length() > 0 {
+                throw migrationDeliveryError("migrationBoundSubmissionTarget")
+            }
+            return nil
+        }
+        guard let transport = migrationTransport(tag: transportTag) else {
+            throw malformedMigrationDelivery("unknown bound submission transport tag \(transportTag)")
+        }
+
+        let endpointPtr = zcashlc_migration_run_submission_endpoint_v1(run.pointer)
+        guard let endpointPtr else {
+            throw migrationDeliveryError("migrationBoundSubmissionTarget")
+        }
+        defer { zcashlc_free_boxed_slice(endpointPtr) }
+        guard let bytes = endpointPtr.pointee.ptr, endpointPtr.pointee.len > 0 else {
+            throw malformedMigrationDelivery("bound submission policy omitted its endpoint")
+        }
+        let endpointData = Data(bytes: bytes, count: Int(endpointPtr.pointee.len))
+        guard let endpoint = String(data: endpointData, encoding: .utf8) else {
+            throw malformedMigrationDelivery("bound submission endpoint was not UTF-8")
+        }
+        return MigrationBoundSubmissionTarget(transport: transport, endpoint: endpoint)
+    }
+
+    @DBActor
+    func migrationReserveImmediate(
+        signer: MigrationSignerOwnership,
+        submission: MigrationSubmissionIntent,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        let endpoint = submission.endpoint.utf8CString
+        let pointer = endpoint.withUnsafeBufferPointer { endpoint in
+            zcashlc_migration_reserve_immediate_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                migrationSignerTag(signer),
+                migrationTransportTag(submission.transport),
+                endpoint.baseAddress
+            )
+        }
+        return try ownedMigrationClaim(pointer, operation: "migrationReserveImmediate")
+    }
+
+    @DBActor
+    func migrationMaterializeImmediateSDK(
+        claim: MigrationClaimHandle,
+        usk: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        let pointer = usk.bytes.withUnsafeBufferPointer { uskBytes in
+            zcashlc_migration_materialize_immediate_sdk_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                claim.pointer,
+                uskBytes.baseAddress,
+                UInt(uskBytes.count),
+                spendParamsPath.0,
+                spendParamsPath.1,
+                outputParamsPath.0,
+                outputParamsPath.1
+            )
+        }
+        return try ownedMigrationClaim(pointer, operation: "migrationMaterializeImmediateSDK")
+    }
+
+    @DBActor
+    func migrationPrepareImmediateExternalSigning(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        try ownedMigrationClaim(
+            zcashlc_migration_prepare_immediate_external_signing_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                claim.pointer
+            ),
+            operation: "migrationPrepareImmediateExternalSigning"
+        )
+    }
+
+    @DBActor
+    func migrationFinalizeImmediateExternalSigning(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        try ownedMigrationClaim(
+            zcashlc_migration_finalize_immediate_external_signing_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                claim.pointer
+            ),
+            operation: "migrationFinalizeImmediateExternalSigning"
+        )
+    }
+
+    @DBActor
+    func migrationCommitExternalSchedule(
+        _ schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle {
+        let pointer = zcashlc_migration_commit_external_schedule_v1(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            schedule.proposalHandle
+        )
+        return try ownedMigrationRun(pointer, operation: "migrationCommitExternalSchedule")
+    }
+
+    @DBActor
+    func migrationRolloverInternalSchedule(
+        _ schedule: MigrationSchedule,
+        predecessor: MigrationRunHandle,
+        usk: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle {
+        let pointer = zcashlc_migration_rollover_internal_schedule_v1(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            predecessor.pointer,
+            schedule.proposalHandle,
+            usk.bytes,
+            UInt(usk.bytes.count)
+        )
+        return try ownedMigrationRun(pointer, operation: "migrationRolloverInternalSchedule")
+    }
+
+    @DBActor
+    func migrationRolloverExternalSchedule(
+        _ schedule: MigrationSchedule,
+        predecessor: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle {
+        let pointer = zcashlc_migration_rollover_external_schedule_v1(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            predecessor.pointer,
+            schedule.proposalHandle
+        )
+        return try ownedMigrationRun(pointer, operation: "migrationRolloverExternalSchedule")
+    }
+
+    @DBActor
+    func migrationClaimMaterialization(
+        transactionID: UInt32,
+        signer: MigrationSignerOwnership,
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle? {
+        zcashlc_clear_last_error()
+        let pointer = zcashlc_migration_claim_materialization_v1(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            run.pointer,
+            transactionID,
+            migrationSignerTag(signer)
+        )
+        return try optionalOwnedMigrationClaim(pointer, operation: "migrationClaimMaterialization")
+    }
+
+    @DBActor
+    func migrationStageExternalSigningPCZT(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        let pointer = zcashlc_migration_stage_external_signing_pczt_v1(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            claim.pointer,
+            nil,
+            0
+        )
+        return try ownedMigrationClaim(pointer, operation: "migrationStageExternalSigningPCZT")
+    }
+
+    @DBActor
+    func migrationStageSignedPCZT(
+        _ signedPCZT: Data,
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        let pointer = signedPCZT.withUnsafeBytes { bytes in
+            zcashlc_migration_stage_signed_pczt_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                claim.pointer,
+                bytes.bindMemory(to: UInt8.self).baseAddress,
+                UInt(bytes.count)
+            )
+        }
+        return try ownedMigrationClaim(pointer, operation: "migrationStageSignedPCZT")
+    }
+
+    @DBActor
+    func migrationAdvanceExternalSignature(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        try ownedMigrationClaim(
+            zcashlc_migration_advance_external_signature_v1(
+                dbData.0, dbData.1, account.id, networkType.networkId, claim.pointer
+            ),
+            operation: "migrationAdvanceExternalSignature"
+        )
+    }
+
+    @DBActor
+    func migrationProveClaim(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        try ownedMigrationClaim(
+            zcashlc_migration_prove_claim_v1(
+                dbData.0, dbData.1, account.id, networkType.networkId, claim.pointer
+            ),
+            operation: "migrationProveClaim"
+        )
+    }
+
+    @DBActor
+    func migrationClaimSubmission(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle? {
+        zcashlc_clear_last_error()
+        return try optionalOwnedMigrationClaim(
+            zcashlc_migration_claim_submission_v1(
+                dbData.0, dbData.1, account.id, networkType.networkId, claim.pointer
+            ),
+            operation: "migrationClaimSubmission"
+        )
+    }
+
+    @DBActor
+    func migrationClaimOutcomeResolution(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle? {
+        zcashlc_clear_last_error()
+        return try optionalOwnedMigrationClaim(
+            zcashlc_migration_claim_outcome_resolution_v1(
+                dbData.0, dbData.1, account.id, networkType.networkId, claim.pointer
+            ),
+            operation: "migrationClaimOutcomeResolution"
+        )
+    }
+
+    @DBActor
+    func migrationResumeClaim(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle? {
+        zcashlc_clear_last_error()
+        return try optionalOwnedMigrationClaim(
+            zcashlc_migration_resume_claim_v1(
+                dbData.0, dbData.1, account.id, networkType.networkId, claim.pointer
+            ),
+            operation: "migrationResumeClaim"
+        )
+    }
+
+    @DBActor
+    func migrationReacquireExternalSigning(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle? {
+        zcashlc_clear_last_error()
+        return try optionalOwnedMigrationClaim(
+            zcashlc_migration_reacquire_external_signing_v1(
+                dbData.0, dbData.1, account.id, networkType.networkId, claim.pointer
+            ),
+            operation: "migrationReacquireExternalSigning"
+        )
+    }
+
+    @DBActor
+    func migrationRenewClaim(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle? {
+        zcashlc_clear_last_error()
+        return try optionalOwnedMigrationClaim(
+            zcashlc_migration_renew_claim_v1(
+                dbData.0, dbData.1, account.id, networkType.networkId, claim.pointer
+            ),
+            operation: "migrationRenewClaim"
+        )
+    }
+
+    @DBActor
+    func migrationRecordSubmissionOutcome(
+        _ outcome: MigrationSubmissionOutcome,
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        try ownedMigrationClaim(
+            zcashlc_migration_record_submission_outcome_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                claim.pointer,
+                migrationSubmissionOutcomeTag(outcome)
+            ),
+            operation: "migrationRecordSubmissionOutcome"
+        )
+    }
+
+    @DBActor
+    func migrationReconcileSubmission(
+        claim: MigrationClaimHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        try ownedMigrationClaim(
+            zcashlc_migration_reconcile_submission_v1(
+                dbData.0, dbData.1, account.id, networkType.networkId, claim.pointer
+            ),
+            operation: "migrationReconcileSubmission"
+        )
+    }
+
+    @DBActor
+    func migrationReconcileCanonicalChain(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle {
+        try ownedMigrationRun(
+            zcashlc_migration_reconcile_canonical_chain_v1(
+                dbData.0, dbData.1, account.id, networkType.networkId, run.pointer
+            ),
+            operation: "migrationReconcileCanonicalChain"
+        )
+    }
+
+    @DBActor
+    func migrationReleaseKnownUnsentClaim(
+        claim: MigrationClaimHandle,
+        failure: MigrationDeliveryFailureReason,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        try ownedMigrationClaim(
+            zcashlc_migration_release_claim_known_unsent_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                claim.pointer,
+                migrationDeliveryFailureTag(failure)
+            ),
+            operation: "migrationReleaseKnownUnsentClaim"
+        )
+    }
+
+    @DBActor
+    func migrationRebuildExpiredTransfer(
+        claim: MigrationClaimHandle,
+        signer: MigrationSignerOwnership,
+        usk: UnifiedSpendingKey?,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        let pointer: OpaquePointer?
+        switch signer {
+        case .sdk:
+            guard let usk else {
+                throw malformedMigrationDelivery("SDK expired-transfer rebuild requires a spending key")
+            }
+            pointer = zcashlc_migration_rebuild_expired_transfer_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                claim.pointer,
+                migrationSignerTag(signer),
+                usk.bytes,
+                UInt(usk.bytes.count)
+            )
+        case .external:
+            guard usk == nil else {
+                throw malformedMigrationDelivery("external expired-transfer rebuild rejects a spending key")
+            }
+            pointer = zcashlc_migration_rebuild_expired_transfer_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                claim.pointer,
+                migrationSignerTag(signer),
+                nil,
+                0
+            )
+        }
+        return try ownedMigrationClaim(pointer, operation: "migrationRebuildExpiredTransfer")
+    }
+
+    @DBActor
+    func migrationPauseDelivery(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle {
+        try migrationRunTransition(run, account: account, operation: "migrationPauseDelivery") {
+            zcashlc_migration_pause_delivery_v1(dbData.0, dbData.1, account.id, networkType.networkId, $0)
+        }
+    }
+
+    @DBActor
+    func migrationResumeDelivery(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle {
+        try migrationRunTransition(run, account: account, operation: "migrationResumeDelivery") {
+            zcashlc_migration_resume_delivery_v1(dbData.0, dbData.1, account.id, networkType.networkId, $0)
+        }
+    }
+
+    @DBActor
+    func migrationBeginAbandonment(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle {
+        try migrationRunTransition(run, account: account, operation: "migrationBeginAbandonment") {
+            zcashlc_migration_begin_abandonment_v1(dbData.0, dbData.1, account.id, networkType.networkId, $0)
+        }
+    }
+
+    @DBActor
+    func migrationFinishAbandonment(
+        run: MigrationRunHandle,
+        for account: AccountUUID
+    ) async throws -> MigrationRunHandle {
+        try migrationRunTransition(run, account: account, operation: "migrationFinishAbandonment") {
+            zcashlc_migration_finish_abandonment_v1(dbData.0, dbData.1, account.id, networkType.networkId, $0)
+        }
+    }
+
+    func migrationClaimRun(_ claim: MigrationClaimHandle) async throws -> MigrationRunHandle {
+        try ownedMigrationRun(
+            zcashlc_migration_claim_run_handle_v1(claim.pointer),
+            operation: "migrationClaimRun"
+        )
+    }
+
+    func migrationClaimProposal(_ claim: MigrationClaimHandle) async throws -> Data? {
+        try migrationClaimBytes(claim, operation: "migrationClaimProposal", zcashlc_migration_claim_proposal_v1)
+    }
+
+    func migrationClaimExternalSigningPCZT(_ claim: MigrationClaimHandle) async throws -> Data? {
+        try migrationClaimBytes(
+            claim,
+            operation: "migrationClaimExternalSigningPCZT",
+            zcashlc_migration_claim_external_signing_pczt_v1
+        )
+    }
+
+    func migrationClaimSignedPCZT(_ claim: MigrationClaimHandle) async throws -> Data? {
+        try migrationClaimBytes(claim, operation: "migrationClaimSignedPCZT", zcashlc_migration_claim_signed_pczt_v1)
+    }
+
+    func migrationClaimExactTransaction(_ claim: MigrationClaimHandle) async throws -> Data? {
+        try migrationClaimBytes(
+            claim,
+            operation: "migrationClaimExactTransaction",
+            zcashlc_migration_claim_exact_transaction_v1
+        )
+    }
+
+    func migrationClaimTransactionID(_ claim: MigrationClaimHandle) async throws -> Data? {
+        let txid = try migrationClaimBytes(claim, operation: "migrationClaimTransactionID", zcashlc_migration_claim_txid_v1)
+        guard txid == nil || txid?.count == 32 else {
+            throw malformedMigrationDelivery("migration transaction id was not 32 bytes")
+        }
+        return txid
+    }
+
+    func migrationClaimStatus(_ claim: MigrationClaimHandle) async throws -> MigrationDeliveryClaimStatus {
+        zcashlc_clear_last_error()
+        let tag = zcashlc_migration_claim_status_v1(claim.pointer)
+        guard tag >= 0, let status = decodeMigrationClaimStatus(tag: UInt8(tag)) else {
+            if zcashlc_last_error_length() > 0 {
+                throw migrationDeliveryError("migrationClaimStatus")
+            }
+            throw malformedMigrationDelivery("unknown claim status tag \(tag)")
+        }
+        return status
+    }
+
+    func migrationClaimExpiryHeight(_ claim: MigrationClaimHandle) async throws -> BlockHeight {
+        zcashlc_clear_last_error()
+        let height = zcashlc_migration_claim_expiry_height_v1(claim.pointer)
+        guard height >= 0, let decoded = BlockHeight(exactly: height) else {
+            if zcashlc_last_error_length() > 0 {
+                throw migrationDeliveryError("migrationClaimExpiryHeight")
+            }
+            throw malformedMigrationDelivery("invalid migration expiry height \(height)")
+        }
+        return decoded
+    }
+
+    func migrationClaimConsensusBranchID(_ claim: MigrationClaimHandle) async throws -> UInt32 {
+        zcashlc_clear_last_error()
+        let branchID = zcashlc_migration_claim_consensus_branch_id_v1(claim.pointer)
+        guard branchID >= 0, let decoded = UInt32(exactly: branchID) else {
+            if zcashlc_last_error_length() > 0 {
+                throw migrationDeliveryError("migrationClaimConsensusBranchID")
+            }
+            throw malformedMigrationDelivery("invalid migration consensus branch id \(branchID)")
+        }
+        return decoded
+    }
+
+    private func migrationRunTransition(
+        _ run: MigrationRunHandle,
+        account: AccountUUID,
+        operation: String,
+        _ transition: (OpaquePointer) -> OpaquePointer?
+    ) throws -> MigrationRunHandle {
+        try ownedMigrationRun(transition(run.pointer), operation: operation)
+    }
+
+    private func migrationClaimBytes(
+        _ claim: MigrationClaimHandle,
+        operation: String,
+        _ accessor: (OpaquePointer) -> UnsafeMutablePointer<FfiBoxedSlice>?
+    ) throws -> Data? {
+        zcashlc_clear_last_error()
+        guard let pointer = accessor(claim.pointer) else {
+            throw migrationDeliveryError(operation)
+        }
+        defer { zcashlc_free_boxed_slice(pointer) }
+        let slice = pointer.pointee
+        guard let bytes = slice.ptr else {
+            guard slice.len == 0 else {
+                throw malformedMigrationDelivery("\(operation) returned a null non-empty slice")
+            }
+            return nil
+        }
+        return Data(bytes: bytes, count: Int(slice.len))
+    }
+
+    private func optionalOwnedMigrationClaim(
+        _ pointer: OpaquePointer?,
+        operation: String
+    ) throws -> MigrationClaimHandle? {
+        guard let pointer else {
+            if zcashlc_last_error_length() > 0 {
+                throw migrationDeliveryError(operation)
+            }
+            return nil
+        }
+        return try ownedMigrationClaim(pointer, operation: operation)
+    }
+
+    private func ownedMigrationRun(_ pointer: OpaquePointer?, operation: String) throws -> MigrationRunHandle {
+        guard let pointer else {
+            throw migrationDeliveryError(operation)
+        }
+        return MigrationRunHandle(
+            storage: MigrationOpaqueHandleStorage(pointer: pointer) {
+                zcashlc_migration_free_run_handle_v1($0)
+            }
+        )
+    }
+
+    private func ownedMigrationClaim(_ pointer: OpaquePointer?, operation: String) throws -> MigrationClaimHandle {
+        guard let pointer else {
+            throw migrationDeliveryError(operation)
+        }
+        return MigrationClaimHandle(
+            storage: MigrationOpaqueHandleStorage(pointer: pointer) {
+                zcashlc_migration_free_claim_handle_v1($0)
+            }
+        )
+    }
+
+    private func migrationDeliveryError(_ operation: String) -> ZcashError {
+        .rustMigrationDelivery(lastErrorMessage(fallback: "`\(operation)` failed with unknown error"))
+    }
+
+    private func malformedMigrationDelivery(_ message: String) -> ZcashError {
+        .rustMigrationDelivery("Malformed Rust migration delivery value: \(message)")
+    }
+
     @DBActor
     func proposeSendMaxTransfer(
         accountUUID: AccountUUID,
@@ -1768,30 +2395,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         usk: UnifiedSpendingKey,
         for account: AccountUUID
     ) async throws {
-        // Swift-side range guard: reuses this call's generic error case, never reaches rust.
-        guard let estimatedDurationHours = UInt32(exactly: schedule.estimatedDurationHours) else {
-            throw ZcashError.rustMigrationSignAndStoreSchedule(
-                "`estimatedDurationHours` \(schedule.estimatedDurationHours) does not fit in UInt32"
-            )
-        }
-
-        let success = withScheduleFFIArgs(schedule.transfers) { idsPtr, amounts, anchorHeights, nextExecutableAfterHeights, expiryHeights in
-            zcashlc_migration_sign_and_store_schedule(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                idsPtr.baseAddress,
-                UInt(idsPtr.count),
-                amounts,
-                anchorHeights,
-                nextExecutableAfterHeights,
-                expiryHeights,
-                estimatedDurationHours,
-                usk.bytes,
-                UInt(usk.bytes.count)
-            )
-        }
+        let success = zcashlc_migration_sign_and_store_schedule(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            schedule.proposalHandle,
+            usk.bytes,
+            UInt(usk.bytes.count)
+        )
 
         guard success else {
             throw migrationRoutedError(
@@ -1799,27 +2411,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
                 fallback: ZcashError.rustMigrationSignAndStoreSchedule
             )
         }
-    }
-
-    @DBActor
-    func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedMigrationTransfer? {
-        let preparedPtr = zcashlc_migration_next_due_transfer(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId
-        )
-
-        guard let preparedPtr else {
-            throw migrationRoutedError(
-                lastErrorMessage(fallback: "`migrationNextDueTransfer` failed with unknown error"),
-                fallback: ZcashError.rustMigrationNextDueTransfer
-            )
-        }
-
-        defer { zcashlc_free_migration_prepared_transfer(preparedPtr) }
-
-        return preparedPtr.pointee.unsafeToPreparedMigrationTransfer()
     }
 
     @DBActor
@@ -1853,364 +2444,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return proposalPtr.pointee.unsafeToMigrationTransferProposal()
     }
 
-    @DBActor
-    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data {
-        let txPtr: UnsafeMutablePointer<FfiBoxedSlice>? = pczt.withUnsafeBytes { buffer in
-            guard let bufferPtr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return nil
-            }
-
-            return zcashlc_migration_extract_broadcast_tx(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                bufferPtr,
-                UInt(pczt.count)
-            )
-        }
-
-        guard let txPtr else {
-            throw ZcashError.rustMigrationExtractBroadcastTx(
-                lastErrorMessage(fallback: "`migrationExtractBroadcastTx` failed with unknown error")
-            )
-        }
-
-        defer { zcashlc_free_boxed_slice(txPtr) }
-
-        return Data(bytes: txPtr.pointee.ptr, count: Int(txPtr.pointee.len))
-    }
-
-    @DBActor
-    func migrationRecordTransferResult(
-        transferId: String,
-        result: MigrationTransferResult,
-        for account: AccountUUID
-    ) async throws {
-        let resultTag: Int32
-        var txidBytes: [UInt8]?
-
-        switch result {
-        case .success(let txId):
-            // `txId` is the display-form hex string (see `MigrationTransferResult.success`); the
-            // FFI wants the raw 32-byte internal-order id, so round-trip it through `TxId`, which
-            // both validates the length and undoes the display byte-reversal.
-            guard let parsedTxId = try? TxId(txId), parsedTxId.id.count == 32 else {
-                throw ZcashError.migrationInvalidTxId(txId)
-            }
-
-            resultTag = 0
-            txidBytes = parsedTxId.id
-        case .networkError:
-            // `retryable` is a Swift-level signal for the caller's own retry policy; the rust
-            // layer's behavior for a network error never depended on it (tag 1 alone drives it).
-            resultTag = 1
-        case .invalidNote:
-            resultTag = 2
-        case .expired:
-            resultTag = 3
-        }
-
-        let success = zcashlc_migration_record_transfer_result(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId,
-            [CChar](transferId.utf8CString),
-            resultTag,
-            txidBytes
-        )
-
-        guard success else {
-            throw ZcashError.rustMigrationRecordTransferResult(
-                lastErrorMessage(fallback: "`migrationRecordTransferResult` failed with unknown error")
-            )
-        }
-    }
-
-    @DBActor
-    func migrationRecordImmediateRun(txid: Data, for account: AccountUUID) async throws {
-        guard txid.count == 32 else {
-            throw ZcashError.migrationRecordImmediateRunInvalidTxId(txid.count)
-        }
-
-        let success = txid.withUnsafeBytes { buffer -> Bool in
-            guard let bufferPtr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return false
-            }
-
-            return zcashlc_migration_record_immediate_run(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                bufferPtr
-            )
-        }
-
-        guard success else {
-            throw ZcashError.rustMigrationRecordImmediateRun(
-                lastErrorMessage(fallback: "`migrationRecordImmediateRun` failed with unknown error")
-            )
-        }
-    }
-
-    @DBActor
-    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule {
-        let schedulePtr = zcashlc_migration_restart_step(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId
-        )
-
-        guard let schedulePtr else {
-            throw ZcashError.rustMigrationRestartStep(lastErrorMessage(fallback: "`migrationRestartStep` failed with unknown error"))
-        }
-
-        defer { zcashlc_free_migration_schedule(schedulePtr) }
-
-        guard let schedule = schedulePtr.pointee.unsafeToMigrationSchedule() else {
-            throw ZcashError.rustMigrationRestartStep(lastErrorMessage(fallback: "`migrationRestartStep` returned a malformed schedule"))
-        }
-
-        return schedule
-    }
-
-    @DBActor
-    func migrationRefreshStaleTransfers(
-        usk: UnifiedSpendingKey?,
-        for account: AccountUUID
-    ) async throws -> MigrationSchedule {
-        // A `nil` spending key is the external-signer lane: NULL/0 selects the unsigned rebuild
-        // (the rebuilt transfer awaits its signature for the PCZT ceremony to complete).
-        let schedulePtr: UnsafeMutablePointer<FfiMigrationSchedule>?
-        if let usk {
-            schedulePtr = zcashlc_migration_refresh_stale_transfers(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                usk.bytes,
-                UInt(usk.bytes.count)
-            )
-        } else {
-            schedulePtr = zcashlc_migration_refresh_stale_transfers(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                nil,
-                0
-            )
-        }
-
-        // NULL is an unambiguous error sentinel here: every legitimate outcome — nothing stored,
-        // a terminal run, nothing expired, or a completed rebuild — returns a schedule (possibly
-        // empty), mirroring `migrationRestartStep`.
-        guard let schedulePtr else {
-            throw ZcashError.rustMigrationRefreshStaleTransfers(
-                lastErrorMessage(fallback: "`migrationRefreshStaleTransfers` failed with unknown error")
-            )
-        }
-
-        defer { zcashlc_free_migration_schedule(schedulePtr) }
-
-        guard let schedule = schedulePtr.pointee.unsafeToMigrationSchedule() else {
-            throw ZcashError.rustMigrationRefreshStaleTransfers(
-                lastErrorMessage(fallback: "`migrationRefreshStaleTransfers` returned a malformed schedule")
-            )
-        }
-
-        return schedule
-    }
-
-    @DBActor
-    func migrationCreateUnsignedNoteSplitPczts(for account: AccountUUID) async throws -> [MigrationUnsignedTransferPczt] {
-        let pcztsPtr = zcashlc_migration_create_unsigned_note_split_pczts(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId
-        )
-
-        guard let pcztsPtr else {
-            throw migrationRoutedError(
-                lastErrorMessage(fallback: "`migrationCreateUnsignedNoteSplitPczts` failed with unknown error"),
-                fallback: ZcashError.rustMigrationCreateUnsignedNoteSplitPczt
-            )
-        }
-
-        defer { zcashlc_free_migration_unsigned_transfer_pczts(pcztsPtr) }
-
-        var unsignedPczts: [MigrationUnsignedTransferPczt] = []
-        unsignedPczts.reserveCapacity(Int(pcztsPtr.pointee.len))
-
-        for index in 0 ..< Int(pcztsPtr.pointee.len) {
-            guard let unsignedPczt = pcztsPtr.pointee.ptr.advanced(by: index).pointee.unsafeToMigrationUnsignedTransferPczt() else {
-                throw ZcashError.rustMigrationCreateUnsignedNoteSplitPczt(
-                    lastErrorMessage(fallback: "`migrationCreateUnsignedNoteSplitPczts` returned a malformed pczt")
-                )
-            }
-
-            unsignedPczts.append(unsignedPczt)
-        }
-
-        return unsignedPczts
-    }
-
-    @DBActor
-    func migrationStoreSignedNoteSplitPczts(
-        _ signed: [MigrationSignedTransferPczt],
-        for account: AccountUUID
-    ) async throws -> PreparedMigrationTransfer {
-        let idsCStrings = makeCStrings(signed.map { $0.id })
-        defer { freeCStrings(idsCStrings) }
-        let idsConstPointers = constPointers(idsCStrings)
-
-        // One owned buffer per pczt (see `migrationStoreSignedSchedulePczts` for the rationale).
-        let pcztBuffers: [UnsafeMutablePointer<UInt8>] = signed.map { transfer in
-            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: transfer.pczt.count)
-            transfer.pczt.copyBytes(to: buffer, count: transfer.pczt.count)
-            return buffer
-        }
-        defer { pcztBuffers.forEach { $0.deallocate() } }
-
-        let pcztPointers: [UnsafePointer<UInt8>?] = pcztBuffers.map { UnsafePointer($0) }
-        let pcztLens: [UInt] = signed.map { UInt($0.pczt.count) }
-
-        let preparedPtr = idsConstPointers.withUnsafeBufferPointer { idsPtr in
-            pcztPointers.withUnsafeBufferPointer { pcztsPtr in
-                pcztLens.withUnsafeBufferPointer { lensPtr in
-                    zcashlc_migration_store_signed_note_split_pczts(
-                        dbData.0,
-                        dbData.1,
-                        account.id,
-                        networkType.networkId,
-                        idsPtr.baseAddress,
-                        UInt(idsPtr.count),
-                        pcztsPtr.baseAddress,
-                        lensPtr.baseAddress
-                    )
-                }
-            }
-        }
-
-        guard let preparedPtr else {
-            throw ZcashError.rustMigrationStoreSignedNoteSplitPczt(
-                lastErrorMessage(fallback: "`migrationStoreSignedNoteSplitPczts` failed with unknown error")
-            )
-        }
-
-        defer { zcashlc_free_migration_prepared_transfer(preparedPtr) }
-
-        guard let prepared = preparedPtr.pointee.unsafeToPreparedMigrationTransfer() else {
-            throw ZcashError.rustMigrationStoreSignedNoteSplitPczt(
-                lastErrorMessage(fallback: "`migrationStoreSignedNoteSplitPczts` returned a malformed prepared transfer")
-            )
-        }
-
-        return prepared
-    }
-
-    @DBActor
-    func migrationCreateUnsignedTransferPczts(
-        for schedule: MigrationSchedule,
-        for account: AccountUUID
-    ) async throws -> [MigrationUnsignedTransferPczt] {
-        // Swift-side range guard: reuses this call's generic error case, never reaches rust.
-        guard let estimatedDurationHours = UInt32(exactly: schedule.estimatedDurationHours) else {
-            throw ZcashError.rustMigrationCreateUnsignedTransferPczts(
-                "`estimatedDurationHours` \(schedule.estimatedDurationHours) does not fit in UInt32"
-            )
-        }
-
-        let pcztsPtr = withScheduleFFIArgs(schedule.transfers) { idsPtr, amounts, anchorHeights, nextExecutableAfterHeights, expiryHeights in
-            zcashlc_migration_create_unsigned_transfer_pczts(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                idsPtr.baseAddress,
-                UInt(idsPtr.count),
-                amounts,
-                anchorHeights,
-                nextExecutableAfterHeights,
-                expiryHeights,
-                estimatedDurationHours
-            )
-        }
-
-        guard let pcztsPtr else {
-            throw migrationRoutedError(
-                lastErrorMessage(fallback: "`migrationCreateUnsignedTransferPczts` failed with unknown error"),
-                fallback: ZcashError.rustMigrationCreateUnsignedTransferPczts
-            )
-        }
-
-        defer { zcashlc_free_migration_unsigned_transfer_pczts(pcztsPtr) }
-
-        var unsignedPczts: [MigrationUnsignedTransferPczt] = []
-        unsignedPczts.reserveCapacity(Int(pcztsPtr.pointee.len))
-
-        for index in 0 ..< Int(pcztsPtr.pointee.len) {
-            guard let unsignedPczt = pcztsPtr.pointee.ptr.advanced(by: index).pointee.unsafeToMigrationUnsignedTransferPczt() else {
-                throw ZcashError.rustMigrationCreateUnsignedTransferPczts(
-                    lastErrorMessage(fallback: "`migrationCreateUnsignedTransferPczts` returned a malformed pczt")
-                )
-            }
-
-            unsignedPczts.append(unsignedPczt)
-        }
-
-        return unsignedPczts
-    }
-
-    @DBActor
-    func migrationStoreSignedSchedulePczts(_ signed: [MigrationSignedTransferPczt], for account: AccountUUID) async throws {
-        let idsCStrings = makeCStrings(signed.map { $0.id })
-        defer { freeCStrings(idsCStrings) }
-        let idsConstPointers = constPointers(idsCStrings)
-
-        // One owned buffer per pczt, each populated with a single `copyBytes` call. The FFI call
-        // needs every pczt's bytes alive as an independent buffer simultaneously (parallel
-        // `pczts`/`pczt_lens` arrays), so unlike the single-pczt calls above this cannot be scoped to
-        // one `withUnsafeBytes`; `copyBytes(to:count:)` still keeps it to exactly one copy per pczt,
-        // instead of the previous `.bytes` + `ContiguousArray` + manual `initialize(from:count:)` chain.
-        let pcztBuffers: [UnsafeMutablePointer<UInt8>] = signed.map { transfer in
-            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: transfer.pczt.count)
-            transfer.pczt.copyBytes(to: buffer, count: transfer.pczt.count)
-            return buffer
-        }
-        defer { pcztBuffers.forEach { $0.deallocate() } }
-
-        let pcztPointers: [UnsafePointer<UInt8>?] = pcztBuffers.map { UnsafePointer($0) }
-        let pcztLens: [UInt] = signed.map { UInt($0.pczt.count) }
-
-        let success = idsConstPointers.withUnsafeBufferPointer { idsPtr in
-            pcztPointers.withUnsafeBufferPointer { pcztsPtr in
-                pcztLens.withUnsafeBufferPointer { lensPtr in
-                    zcashlc_migration_store_signed_schedule_pczts(
-                        dbData.0,
-                        dbData.1,
-                        account.id,
-                        networkType.networkId,
-                        idsPtr.baseAddress,
-                        UInt(idsPtr.count),
-                        pcztsPtr.baseAddress,
-                        lensPtr.baseAddress
-                    )
-                }
-            }
-        }
-
-        guard success else {
-            throw ZcashError.rustMigrationStoreSignedSchedulePczts(
-                lastErrorMessage(fallback: "`migrationStoreSignedSchedulePczts` failed with unknown error")
-            )
-        }
-    }
-
     /// The NU6.3 (Ironwood) activation height for `networkType`, or `nil` when NU6.3 is unset for
     /// that network. Stateless (no db access).
     ///
@@ -2236,6 +2469,435 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 }
 
 private extension ZcashRustBackend {
+    func decodeMigrationRuntimeSnapshot(
+        _ ffi: FfiMigrationRuntimeSnapshotV1
+    ) throws -> MigrationRuntimeSnapshot {
+        guard ffi.abi_version == 1 else {
+            throw malformedMigrationDelivery("unsupported runtime ABI version \(ffi.abi_version)")
+        }
+
+        let aggregateFinality = try migrationStorageFinality(
+            tag: ffi.aggregate_storage_finality,
+            recoveryTag: ffi.aggregate_storage_recovery_reason,
+            releaseHeight: ffi.aggregate_delivery_release_height
+        )
+        let availability = try migrationAvailability(
+            tag: ffi.availability,
+            reasonTag: ffi.unavailable_reason,
+            detail: ffi.unavailable_detail
+        )
+        let delivery = try ffi.has_delivery ? decodeMigrationDelivery(
+            laneTag: ffi.delivery_lane,
+            phaseTag: ffi.delivery_phase,
+            finalityTag: ffi.storage_finality,
+            recoveryTag: ffi.storage_recovery_reason,
+            releaseHeight: ffi.delivery_release_height,
+            activeSourceReservationCount: ffi.active_source_reservation_count,
+            hasSubmissionPolicy: ffi.has_submission_policy,
+            policyFailureTag: ffi.policy_validation_failure,
+            safeToCancel: ffi.safe_to_cancel,
+            claims: ffi.claims,
+            claimsCount: ffi.claims_len,
+            run: ffi.run_handle
+        ) : nil
+
+        if !ffi.has_delivery, ffi.run_handle != nil || ffi.claims_len != 0 {
+            throw malformedMigrationDelivery("runtime without delivery carried current-run capabilities")
+        }
+
+        var retained: [MigrationRetainedRun] = []
+        retained.reserveCapacity(Int(ffi.retained_runs_len))
+        if ffi.retained_runs_len > 0 {
+            guard let retainedRuns = ffi.retained_runs else {
+                throw malformedMigrationDelivery("runtime omitted retained-run storage")
+            }
+            for index in 0 ..< Int(ffi.retained_runs_len) {
+                retained.append(try decodeRetainedMigrationRun(retainedRuns.advanced(by: index).pointee))
+            }
+        }
+
+        return MigrationRuntimeSnapshot(
+            account: AccountUUID(id: ffiInlineBytes(ffi.account_uuid)),
+            canonical: try migrationCanonicalSummary(
+                hasState: ffi.canonical_status >= 0,
+                statusTag: ffi.canonical_status,
+                transactionCount: ffi.canonical_transaction_count
+            ),
+            schemaProvenance: try migrationSchemaProvenance(
+                tag: ffi.schema_provenance,
+                version: ffi.schema_version
+            ),
+            legacyCutover: try migrationLegacyCutover(
+                tag: ffi.legacy_cutover,
+                objects: ffi.legacy_object_count
+            ),
+            destinationSpendability: try migrationDestinationSpendability(tag: ffi.destination_spendability),
+            availability: availability,
+            ordinarySpendAuthorization: try migrationOrdinarySpendAuthorization(
+                tag: ffi.ordinary_spend_authorization,
+                reasonTag: ffi.ordinary_spend_block_reason,
+                releaseHeight: ffi.ordinary_spend_release_height,
+                availability: availability,
+                aggregateFinality: aggregateFinality
+            ),
+            accountDeletionAuthorization: try migrationAccountDeletionAuthorization(
+                tag: ffi.account_deletion_authorization,
+                reasonTag: ffi.account_deletion_block_reason
+            ),
+            canonicalMutationAuthorization: try migrationCanonicalMutationAuthorization(
+                tag: ffi.canonical_mutation_authorization,
+                reasonTag: ffi.canonical_mutation_block_reason
+            ),
+            aggregateStorageFinality: aggregateFinality,
+            delivery: delivery,
+            retainedRuns: retained
+        )
+    }
+
+    func decodeRetainedMigrationRun(_ ffi: FfiRetainedMigrationRunV1) throws -> MigrationRetainedRun {
+        MigrationRetainedRun(
+            canonical: try migrationCanonicalSummary(
+                hasState: ffi.has_canonical_state,
+                statusTag: ffi.canonical_status,
+                transactionCount: ffi.canonical_transaction_count
+            ),
+            destinationSpendability: try migrationDestinationSpendability(tag: ffi.destination_spendability),
+            delivery: try decodeMigrationDelivery(
+                laneTag: Int8(ffi.delivery_lane),
+                phaseTag: Int8(ffi.delivery_phase),
+                finalityTag: Int8(ffi.storage_finality),
+                recoveryTag: ffi.storage_recovery_reason,
+                releaseHeight: ffi.delivery_release_height,
+                activeSourceReservationCount: ffi.active_source_reservation_count,
+                hasSubmissionPolicy: ffi.has_submission_policy,
+                policyFailureTag: ffi.policy_validation_failure,
+                safeToCancel: ffi.safe_to_cancel,
+                claims: ffi.claims,
+                claimsCount: ffi.claims_len,
+                run: ffi.run_handle
+            )
+        )
+    }
+
+    func decodeMigrationDelivery(
+        laneTag: Int8,
+        phaseTag: Int8,
+        finalityTag: Int8,
+        recoveryTag: Int8,
+        releaseHeight: Int64,
+        activeSourceReservationCount: UInt64,
+        hasSubmissionPolicy: Bool,
+        policyFailureTag: Int8,
+        safeToCancel: Bool,
+        claims: UnsafeMutablePointer<FfiMigrationClaimSummaryV1>?,
+        claimsCount: UInt,
+        run: OpaquePointer?
+    ) throws -> MigrationDeliverySnapshot {
+        guard let lane = migrationDeliveryLane(tag: laneTag),
+              let phase = migrationDeliveryPhase(tag: phaseTag) else {
+            throw malformedMigrationDelivery("unknown delivery lane/phase tags \(laneTag)/\(phaseTag)")
+        }
+        let runHandle = try cloneMigrationRun(run)
+        var decodedClaims: [MigrationDeliveryClaimSummary] = []
+        decodedClaims.reserveCapacity(Int(claimsCount))
+        if claimsCount > 0 {
+            guard let claims else {
+                throw malformedMigrationDelivery("delivery omitted its claim array")
+            }
+            for index in 0 ..< Int(claimsCount) {
+                decodedClaims.append(try decodeMigrationClaim(claims.advanced(by: index).pointee))
+            }
+        }
+        return MigrationDeliverySnapshot(
+            lane: lane,
+            phase: phase,
+            storageFinality: try migrationStorageFinality(
+                tag: finalityTag,
+                recoveryTag: recoveryTag,
+                releaseHeight: releaseHeight
+            ),
+            activeSourceReservationCount: activeSourceReservationCount,
+            hasSubmissionPolicy: hasSubmissionPolicy,
+            policyValidationFailure: try migrationPolicyFailure(tag: policyFailureTag),
+            safeToCancel: safeToCancel,
+            claims: decodedClaims,
+            runHandle: runHandle
+        )
+    }
+
+    func decodeMigrationClaim(_ ffi: FfiMigrationClaimSummaryV1) throws -> MigrationDeliveryClaimSummary {
+        let artifact: MigrationArtifactIdentitySummary
+        switch ffi.artifact_lane {
+        case 0:
+            guard let transactionID = UInt32(exactly: ffi.scheduled_transaction_id) else {
+                throw malformedMigrationDelivery("scheduled artifact carried an invalid transaction id")
+            }
+            artifact = .scheduled(transactionID: transactionID)
+        case 1:
+            artifact = .immediate(identity: Data(ffiInlineBytes(ffi.immediate_artifact_identity)))
+        default:
+            throw malformedMigrationDelivery("unknown claim artifact lane \(ffi.artifact_lane)")
+        }
+        guard let signer = migrationSigner(tag: ffi.signer_ownership),
+              let status = decodeMigrationClaimStatus(tag: ffi.status) else {
+            throw malformedMigrationDelivery("unknown claim signer/status tags")
+        }
+        let txid = ffi.has_txid ? Data(ffiInlineBytes(ffi.txid)) : nil
+        guard txid == nil || txid?.count == 32 else {
+            throw malformedMigrationDelivery("claim transaction id was not 32 bytes")
+        }
+        return MigrationDeliveryClaimSummary(
+            artifact: artifact,
+            signerOwnership: signer,
+            status: status,
+            activeClaimKind: try migrationClaimKind(tag: ffi.claim_kind),
+            externallyExposed: ffi.externally_exposed,
+            hasSignedPCZT: ffi.has_signed_pczt,
+            hasExactTransaction: ffi.has_exact_transaction,
+            expiryHeight: BlockHeight(ffi.expiry_height),
+            txid: txid,
+            lastError: try migrationDeliveryFailure(tag: ffi.last_error),
+            claimHandle: try cloneMigrationClaim(ffi.claim_handle)
+        )
+    }
+
+    func cloneMigrationRun(_ pointer: OpaquePointer?) throws -> MigrationRunHandle {
+        guard let pointer else {
+            throw malformedMigrationDelivery("delivery omitted its run capability")
+        }
+        return try ownedMigrationRun(
+            zcashlc_migration_clone_run_handle_v1(pointer),
+            operation: "migrationCloneRunHandle"
+        )
+    }
+
+    func cloneMigrationClaim(_ pointer: OpaquePointer?) throws -> MigrationClaimHandle {
+        guard let pointer else {
+            throw malformedMigrationDelivery("claim summary omitted its capability")
+        }
+        return try ownedMigrationClaim(
+            zcashlc_migration_clone_claim_handle_v1(pointer),
+            operation: "migrationCloneClaimHandle"
+        )
+    }
+
+    func migrationCanonicalSummary(
+        hasState: Bool,
+        statusTag: Int8,
+        transactionCount: UInt32
+    ) throws -> MigrationCanonicalSummary {
+        guard hasState else {
+            guard statusTag == -1, transactionCount == 0 else {
+                throw malformedMigrationDelivery("absent canonical state carried canonical fields")
+            }
+            return MigrationCanonicalSummary(status: nil, transactionCount: 0)
+        }
+        let status: MigrationCanonicalStatus
+        switch statusTag {
+        case 0: status = .planning
+        case 1: status = .committed
+        case 2: status = .inProgress
+        case 3: status = .complete
+        case 4: status = .failed
+        default: throw malformedMigrationDelivery("unknown canonical status tag \(statusTag)")
+        }
+        return MigrationCanonicalSummary(status: status, transactionCount: transactionCount)
+    }
+
+    func migrationSchemaProvenance(tag: UInt8, version: UInt32) throws -> MigrationSchemaProvenance {
+        switch tag {
+        case 0: return .compatible(version: version)
+        case 1: return .unavailable
+        case 2: return .future(version: version)
+        case 3: return .corrupt
+        default: throw malformedMigrationDelivery("unknown schema provenance tag \(tag)")
+        }
+    }
+
+    func migrationLegacyCutover(tag: UInt8, objects: UInt32) throws -> MigrationLegacyCutoverStatus {
+        switch tag {
+        case 0: return .fresh
+        case 1: return .recoveryRequired(objects: objects)
+        default: throw malformedMigrationDelivery("unknown legacy cutover tag \(tag)")
+        }
+    }
+
+    func migrationDestinationSpendability(tag: UInt8) throws -> MigrationDestinationSpendability {
+        switch tag {
+        case 0: return .notSpendable
+        case 1: return .spendable
+        case 2: return .alreadySpent
+        case 3: return .notApplicable
+        default: throw malformedMigrationDelivery("unknown destination spendability tag \(tag)")
+        }
+    }
+
+    func migrationAvailability(
+        tag: UInt8,
+        reasonTag: Int8,
+        detail: UInt32
+    ) throws -> MigrationRuntimeAvailability {
+        switch tag {
+        case 0:
+            guard reasonTag == -1 else {
+                throw malformedMigrationDelivery("available runtime carried an unavailable reason")
+            }
+            return .available
+        case 1:
+            let reason: MigrationRuntimeUnavailableReason
+            switch reasonTag {
+            case 0: reason = .schemaUnavailable
+            case 1: reason = .futureSchema(version: detail)
+            case 2: reason = .corruptDeliveryState
+            case 3: reason = .legacyCutoverRecovery(objects: detail)
+            case 4: reason = .submissionPolicyMissing
+            case 5: reason = .submissionPolicyMismatch
+            case 6: reason = .deliveryInconsistent
+            case 7:
+                guard let recoveryTag = Int8(exactly: detail) else {
+                    throw malformedMigrationDelivery("finality recovery detail did not fit in Int8")
+                }
+                reason = .finalityRecovery(try migrationStorageRecoveryReason(tag: recoveryTag))
+            default: throw malformedMigrationDelivery("unknown unavailable reason tag \(reasonTag)")
+            }
+            return .unavailable(reason)
+        default: throw malformedMigrationDelivery("unknown runtime availability tag \(tag)")
+        }
+    }
+
+    func migrationOrdinarySpendAuthorization(
+        tag: UInt8,
+        reasonTag: Int8,
+        releaseHeight: Int64,
+        availability: MigrationRuntimeAvailability,
+        aggregateFinality: MigrationStorageFinality
+    ) throws -> MigrationOrdinarySpendAuthorization {
+        switch tag {
+        case 0:
+            return .unrestricted
+        case 1:
+            return .excludingMigrationSources(
+                releaseAtHeight: try migrationReleaseHeight(releaseHeight)
+            )
+        case 2:
+            switch reasonTag {
+            case 0: return .blocked(.migrationActive)
+            case 1: return .blocked(.destinationNotSpendable)
+            case 2: return .blocked(.runtimeUnavailable)
+            case 3:
+                if case .recoveryRequired(let reason) = aggregateFinality {
+                    return .blocked(.finalityRecovery(reason))
+                }
+                if case .unavailable(.finalityRecovery(let reason)) = availability {
+                    return .blocked(.finalityRecovery(reason))
+                }
+                throw malformedMigrationDelivery("finality-spend block omitted its recovery reason")
+            default: throw malformedMigrationDelivery("unknown ordinary-spend block tag \(reasonTag)")
+            }
+        default: throw malformedMigrationDelivery("unknown ordinary-spend authorization tag \(tag)")
+        }
+    }
+
+    func migrationAccountDeletionAuthorization(
+        tag: UInt8,
+        reasonTag: Int8
+    ) throws -> MigrationAccountDeletionAuthorization {
+        switch tag {
+        case 0: return .allowed
+        case 1:
+            switch reasonTag {
+            case 0: return .blocked(.runtimeUnavailable)
+            case 1: return .blocked(.unresolvedDelivery)
+            default: throw malformedMigrationDelivery("unknown account-deletion block tag \(reasonTag)")
+            }
+        default: throw malformedMigrationDelivery("unknown account-deletion authorization tag \(tag)")
+        }
+    }
+
+    func migrationCanonicalMutationAuthorization(
+        tag: UInt8,
+        reasonTag: Int8
+    ) throws -> MigrationCanonicalMutationAuthorization {
+        switch tag {
+        case 0: return .allowed
+        case 1:
+            switch reasonTag {
+            case 0: return .blocked(.runtimeUnavailable)
+            case 1: return .blocked(.deliveryOwned)
+            default: throw malformedMigrationDelivery("unknown canonical-mutation block tag \(reasonTag)")
+            }
+        default: throw malformedMigrationDelivery("unknown canonical-mutation authorization tag \(tag)")
+        }
+    }
+
+    func migrationStorageFinality(
+        tag: Int8,
+        recoveryTag: Int8,
+        releaseHeight: Int64
+    ) throws -> MigrationStorageFinality {
+        switch tag {
+        case 0: return .noRun
+        case 1: return .active
+        case 2: return .completePendingFinality(releaseAtHeight: try migrationReleaseHeight(releaseHeight))
+        case 3: return .finalized(releaseAtHeight: try migrationReleaseHeight(releaseHeight))
+        case 4: return .recoveryRequired(try migrationStorageRecoveryReason(tag: recoveryTag))
+        default: throw malformedMigrationDelivery("unknown storage finality tag \(tag)")
+        }
+    }
+
+    func migrationReleaseHeight(_ height: Int64) throws -> BlockHeight {
+        guard height >= 0, let height = BlockHeight(exactly: height) else {
+            throw malformedMigrationDelivery("invalid reservation release height \(height)")
+        }
+        return height
+    }
+
+    func migrationStorageRecoveryReason(tag: Int8) throws -> MigrationStorageRecoveryReason {
+        switch tag {
+        case 0: return .transferEvidenceLost
+        case 1: return .rewoundBeyondFinalityHorizon
+        case 2: return .corruptFinalityEvidence
+        case 3: return .externalSigningExposureUnresolved
+        default: throw malformedMigrationDelivery("unknown storage recovery tag \(tag)")
+        }
+    }
+
+    func migrationPolicyFailure(tag: Int8) throws -> MigrationPolicyValidationFailure? {
+        switch tag {
+        case -1: return nil
+        case 0: return .invalidEncoding
+        case 1: return .policyTooLarge
+        case 2: return .networkMismatch
+        case 3: return .consensusMismatch
+        case 4: return .unsupported
+        default: throw malformedMigrationDelivery("unknown policy validation tag \(tag)")
+        }
+    }
+
+    func migrationClaimKind(tag: Int8) throws -> MigrationDeliveryClaimKind? {
+        switch tag {
+        case -1: return nil
+        case 0: return .materialization
+        case 1: return .submission
+        case 2: return .outcomeResolution
+        default: throw malformedMigrationDelivery("unknown claim-kind tag \(tag)")
+        }
+    }
+
+    func migrationDeliveryFailure(tag: Int8) throws -> MigrationDeliveryFailureReason? {
+        switch tag {
+        case -1: return nil
+        case 0: return .materializationFailed
+        case 1: return .materializationLeaseExpired
+        case 2: return .signingCancelled
+        case 3: return .transportSetupFailed
+        case 4: return .transportDidNotBegin
+        case 5: return .submissionLeaseExpired
+        case 6: return .transportOutcomeUnknown
+        default: throw malformedMigrationDelivery("unknown delivery-failure tag \(tag)")
+        }
+    }
+
     static func initializeRust(logLevel: RustLogging) {
         logLevel.rawValue.utf8CString.withUnsafeBufferPointer { levelPtr in
             zcashlc_init_on_load(levelPtr.baseAddress)
@@ -2260,6 +2922,97 @@ nonisolated func lastErrorMessage(fallback: String) -> String {
     } else {
         return fallback
     }
+}
+
+private func migrationTransportTag(_ transport: MigrationSubmissionTransport) -> UInt8 {
+    switch transport {
+    case .directTLS: return 0
+    case .torOnion: return 1
+    case .loopbackDevelopment: return 2
+    }
+}
+
+private func migrationTransport(tag: Int32) -> MigrationSubmissionTransport? {
+    switch tag {
+    case 0: return .directTLS
+    case 1: return .torOnion
+    case 2: return .loopbackDevelopment
+    default: return nil
+    }
+}
+
+private func migrationSignerTag(_ signer: MigrationSignerOwnership) -> UInt8 {
+    switch signer {
+    case .sdk: return 0
+    case .external: return 1
+    }
+}
+
+private func migrationSigner(tag: UInt8) -> MigrationSignerOwnership? {
+    switch tag {
+    case 0: return .sdk
+    case 1: return .external
+    default: return nil
+    }
+}
+
+private func migrationDeliveryLane(tag: Int8) -> MigrationDeliveryLane? {
+    switch tag {
+    case 0: return .scheduled
+    case 1: return .immediate
+    default: return nil
+    }
+}
+
+private func migrationDeliveryPhase(tag: Int8) -> MigrationDeliveryPhase? {
+    switch tag {
+    case 0: return .active
+    case 1: return .paused
+    case 2: return .abandoning
+    case 3: return .abandoned
+    default: return nil
+    }
+}
+
+private func decodeMigrationClaimStatus(tag: UInt8) -> MigrationDeliveryClaimStatus? {
+    switch tag {
+    case 0: return .materializing
+    case 1: return .materializationFailed
+    case 2: return .awaitingExternalSignature
+    case 3: return .staged
+    case 4: return .submitting
+    case 5: return .outcomeUnknown
+    case 6: return .broadcasted
+    case 7: return .confirmed
+    case 8: return .expiredUnmined
+    case 9: return .externalSigningExpiredUnmined
+    default: return nil
+    }
+}
+
+private func migrationSubmissionOutcomeTag(_ outcome: MigrationSubmissionOutcome) -> UInt8 {
+    switch outcome {
+    case .accepted: return 0
+    case .knownUnsent: return 1
+    case .unknown: return 2
+    }
+}
+
+private func migrationDeliveryFailureTag(_ failure: MigrationDeliveryFailureReason) -> UInt8 {
+    switch failure {
+    case .materializationFailed: return 0
+    case .materializationLeaseExpired: return 1
+    case .signingCancelled: return 2
+    case .transportSetupFailed: return 3
+    case .transportDidNotBegin: return 4
+    case .submissionLeaseExpired: return 5
+    case .transportOutcomeUnknown: return 6
+    }
+}
+
+private func ffiInlineBytes<T>(_ value: T) -> [UInt8] {
+    var value = value
+    return withUnsafeBytes(of: &value) { [UInt8]($0) }
 }
 
 extension URL {
@@ -2476,79 +3229,73 @@ extension FfiMigrationProgress {
     }
 }
 
+private enum DecodedMigrationField<Value> {
+    case valid(Value)
+    case invalid
+}
+
 extension FfiMigrationTransactionStatus {
     /// Converts an [`FfiMigrationTransactionStatus`] into a [`MigrationTransactionStatus`], or
     /// `nil` for an out-of-range discriminant or an invariant the engine's own contract rules out
     /// (should not happen; defensive only) -- see `zcashlc_migration_transaction_statuses`'s doc
     /// for the field-by-field contract this mirrors.
     func unsafeToMigrationTransactionStatus() -> MigrationTransactionStatus? {
-        let kind: MigrationTransactionStatus.Kind
-        if is_transfer {
-            guard crossing >= 0 else { return nil }
-            kind = .transfer(crossing: Int(crossing))
-        } else {
-            guard prep_layer >= 0, prep_index >= 0 else { return nil }
-            kind = .preparation(layer: Int(prep_layer), index: Int(prep_index))
-        }
-
-        let decodedState: MigrationTransactionStatus.State
-        switch state {
-        case 0:
-            decodedState = .awaitingSignature
-        case 1:
-            decodedState = .signed
-        case 2:
-            decodedState = .proved
-        case 3:
-            guard has_txid else { return nil }
-            decodedState = .broadcast(txid: Data(FfiTxId(tuple: txid).array))
-        case 4:
-            guard mined_height >= 0 else { return nil }
-            decodedState = .mined(height: BlockHeight(mined_height))
-        default:
-            return nil
-        }
-
-        let decodedNextAction: MigrationTransactionStatus.NextAction?
-        switch action {
-        case 0:
-            decodedNextAction = nil
-        case 1:
-            decodedNextAction = .prove
-        case 2:
-            decodedNextAction = .broadcast
-        default:
-            return nil
-        }
-
-        let decodedBlockedOn: MigrationTransactionStatus.Blocker?
-        switch blocked_on {
-        case 0:
-            decodedBlockedOn = nil
-        case 1:
-            decodedBlockedOn = .dependencies
-        case 2:
-            decodedBlockedOn = .schedule
-        case 3:
-            decodedBlockedOn = .anchorBoundary
-        case 4:
-            decodedBlockedOn = .signature
-        case 5:
-            decodedBlockedOn = .expired
-        default:
-            return nil
-        }
+        guard let kind = decodedKind, let state = decodedState else { return nil }
+        guard case .valid(let nextAction) = decodedNextAction else { return nil }
+        guard case .valid(let blockedOn) = decodedBlocker else { return nil }
 
         return MigrationTransactionStatus(
             id: id,
             kind: kind,
-            state: decodedState,
+            state: state,
             scheduledHeight: BlockHeight(scheduled_height),
             expiryHeight: expiry_height == 0 ? nil : BlockHeight(expiry_height),
             isReady: ready,
-            nextAction: decodedNextAction,
-            blockedOn: decodedBlockedOn
+            nextAction: nextAction,
+            blockedOn: blockedOn
         )
+    }
+
+    private var decodedKind: MigrationTransactionStatus.Kind? {
+        if is_transfer {
+            crossing >= 0 ? .transfer(crossing: Int(crossing)) : nil
+        } else if prep_layer >= 0, prep_index >= 0 {
+            .preparation(layer: Int(prep_layer), index: Int(prep_index))
+        } else {
+            nil
+        }
+    }
+
+    private var decodedState: MigrationTransactionStatus.State? {
+        switch state {
+        case 0: .awaitingSignature
+        case 1: .signed
+        case 2: .proved
+        case 3 where has_txid: .broadcast(txid: Data(FfiTxId(tuple: txid).array))
+        case 4 where mined_height >= 0: .mined(height: BlockHeight(mined_height))
+        default: nil
+        }
+    }
+
+    private var decodedNextAction: DecodedMigrationField<MigrationTransactionStatus.NextAction?> {
+        switch action {
+        case 0: .valid(nil)
+        case 1: .valid(.prove)
+        case 2: .valid(.broadcast)
+        default: .invalid
+        }
+    }
+
+    private var decodedBlocker: DecodedMigrationField<MigrationTransactionStatus.Blocker?> {
+        switch blocked_on {
+        case 0: .valid(nil)
+        case 1: .valid(.dependencies)
+        case 2: .valid(.schedule)
+        case 3: .valid(.anchorBoundary)
+        case 4: .valid(.signature)
+        case 5: .valid(.expired)
+        default: .invalid
+        }
     }
 }
 
@@ -2628,26 +3375,10 @@ extension FfiNoteSplitProposal {
             outputNotes.append(Zatoshi(output_values.advanced(by: index).pointee))
         }
 
-        return NoteSplitProposal(outputNotes: outputNotes, fee: Zatoshi(fee))
-    }
-}
-
-extension FfiPreparedTransfer {
-    /// Converts an [`FfiPreparedTransfer`] into a [`PreparedMigrationTransfer`], or `nil` for the
-    /// "nothing due" sentinel (`id` and `pczt` both null).
-    func unsafeToPreparedMigrationTransfer() -> PreparedMigrationTransfer? {
-        guard
-            let idPtr = id,
-            let pcztPtr = pczt,
-            let transferId = String(validatingUTF8: idPtr)
-        else {
-            return nil
-        }
-
-        return PreparedMigrationTransfer(
-            id: transferId,
-            txid: Data(FfiTxId(tuple: txid).array),
-            pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
+        return NoteSplitProposal(
+            outputNotes: outputNotes,
+            fee: Zatoshi(fee),
+            proposalHandle: proposal_handle
         )
     }
 }
@@ -2683,7 +3414,11 @@ extension FfiMigrationSchedule {
             proposals.append(proposal)
         }
 
-        return MigrationSchedule(transfers: proposals, estimatedDurationHours: Int(estimated_duration_hours))
+        return MigrationSchedule(
+            transfers: proposals,
+            estimatedDurationHours: Int(estimated_duration_hours),
+            proposalHandle: proposal_handle
+        )
     }
 }
 
@@ -2708,74 +3443,6 @@ extension FfiMigrationRunEstimate {
         }
 
         return MigrationRunEstimate(runs: decodedRuns, finalResidual: Zatoshi(final_residual))
-    }
-}
-
-extension FfiUnsignedTransferPczt {
-    /// Converts an [`FfiUnsignedTransferPczt`] into a [`MigrationUnsignedTransferPczt`], or `nil`
-    /// for a missing `id`/`pczt` (should not happen; defensive only).
-    func unsafeToMigrationUnsignedTransferPczt() -> MigrationUnsignedTransferPczt? {
-        guard
-            let idPtr = id,
-            let pcztPtr = pczt,
-            let transferId = String(validatingUTF8: idPtr)
-        else {
-            return nil
-        }
-
-        return MigrationUnsignedTransferPczt(
-            id: transferId,
-            pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
-        )
-    }
-}
-
-/// Duplicates each string into an owned, null-terminated C string for a `const char *const *` FFI
-/// argument. Pair with `freeCStrings` once the call using them returns.
-private func makeCStrings(_ strings: [String]) -> [UnsafeMutablePointer<CChar>?] {
-    strings.map { strdup($0) }
-}
-
-/// Frees the C strings allocated by `makeCStrings`.
-private func freeCStrings(_ pointers: [UnsafeMutablePointer<CChar>?]) {
-    pointers.forEach { free($0) }
-}
-
-/// Views `makeCStrings`-owned pointers as `UnsafePointer<CChar>?`, matching the `const char *`
-/// element type a `const char *const *` FFI argument expects (the owning array stays
-/// `UnsafeMutablePointer` so `freeCStrings` can free it).
-private func constPointers(_ owned: [UnsafeMutablePointer<CChar>?]) -> [UnsafePointer<CChar>?] {
-    owned.map { pointer in pointer.map { UnsafePointer($0) } }
-}
-
-/// Builds the parallel `(ids, amounts, anchorHeights, nextExecutableAfterHeights, expiryHeights)`
-/// FFI arrays a `MigrationTransferProposal` schedule marshals to, scopes the owned `ids` C strings
-/// to `body`'s lifetime, and hands `body` the live `ids` buffer pointer alongside the plain value
-/// arrays. Shared by every FFI call that takes a whole schedule (`migrationSignAndStoreSchedule`,
-/// `migrationCreateUnsignedTransferPczts`) -- previously this exact marshaling was duplicated
-/// verbatim at both call sites, which the review flagged as a memory-unsafety drift risk (the two
-/// copies could silently diverge on array layout/ordering).
-private func withScheduleFFIArgs<T>(
-    _ transfers: [MigrationTransferProposal],
-    _ body: (
-        _ idsPtr: UnsafeBufferPointer<UnsafePointer<CChar>?>,
-        _ amounts: [Int64],
-        _ anchorHeights: [Int64],
-        _ nextExecutableAfterHeights: [Int64],
-        _ expiryHeights: [Int64]
-    ) throws -> T
-) rethrows -> T {
-    let idsCStrings = makeCStrings(transfers.map { $0.id })
-    defer { freeCStrings(idsCStrings) }
-    let idsConstPointers = constPointers(idsCStrings)
-
-    let amounts = transfers.map { $0.amount.amount }
-    let anchorHeights = transfers.map { Int64($0.anchorHeight) }
-    let nextExecutableAfterHeights = transfers.map { Int64($0.nextExecutableAfterHeight) }
-    let expiryHeights = transfers.map { Int64($0.expiryHeight) }
-
-    return try idsConstPointers.withUnsafeBufferPointer { idsPtr in
-        try body(idsPtr, amounts, anchorHeights, nextExecutableAfterHeights, expiryHeights)
     }
 }
 

@@ -1,20 +1,28 @@
 #!/bin/bash
 
-# Public-artifact gate for the committed Ironwood FFI. This intentionally requires no access to
-# the private migration-engine repository.
+# Public-artifact gate for the committed Ironwood FFI. It requires no external Rust checkout and
+# validates the complete ABI used by production Swift code in every binary slice. An alternate
+# extracted XCFramework may be supplied as the first argument; provenance and recipe default to
+# the reviewed files in this checkout.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-xcframework="LocalPackages/libzcashlc.xcframework"
-provenance="LocalPackages/IRONWOOD_FFI_PROVENANCE.env"
-build_recipe="BuildSupport/IRONWOOD_FFI_BUILD.env"
+if [[ $# -gt 3 ]]; then
+    echo "Usage: $0 [xcframework [provenance [build-recipe]]]" >&2
+    exit 1
+fi
+xcframework="${1:-LocalPackages/libzcashlc.xcframework}"
+provenance="${2:-LocalPackages/IRONWOOD_FFI_PROVENANCE.env}"
+build_recipe="${3:-BuildSupport/IRONWOOD_FFI_BUILD.env}"
 test -f "$xcframework/Info.plist"
 test -f "$provenance"
 test -f "$build_recipe"
 
+./Scripts/verify-ironwood-static-release-inputs.sh >/dev/null
+
 if find LocalPackages -type f \( -name '*.rs' -o -name Cargo.toml -o -name Cargo.lock -o -name '*.rlib' \) | grep -q .; then
-    echo "Error: private/source Rust material must not be committed under LocalPackages" >&2
+    echo "Error: Rust source material must not be committed under LocalPackages" >&2
     exit 1
 fi
 if find LocalPackages -type d -name .git | grep -q .; then
@@ -22,97 +30,285 @@ if find LocalPackages -type d -name .git | grep -q .; then
     exit 1
 fi
 
-required_symbols=(
-    zcashlc_network_upgrade_activation_height
-    zcashlc_consensus_chain_id
-    zcashlc_consensus_parameters_fingerprint
-    zcashlc_last_migration_error_code
+binaries=(
+    "$xcframework/ios-arm64/libzcashlc.framework/libzcashlc"
+    "$xcframework/ios-arm64_x86_64-simulator/libzcashlc.framework/libzcashlc"
+    "$xcframework/macos-arm64_x86_64/libzcashlc.framework/libzcashlc"
 )
+for binary in "${binaries[@]}"; do test -f "$binary"; done
+binary_count=$(find "$xcframework" \( -type f -o -type l \) -path '*/libzcashlc.framework/libzcashlc' | wc -l | tr -d ' ')
+if [[ "$binary_count" != "3" ]]; then
+    echo "Error: expected exactly three platform slices in the full XCFramework, found $binary_count" >&2
+    exit 1
+fi
 
-# Derive the complete migration ABI from every production Swift welding call. A hand-maintained
-# subset previously let a stale XCFramework pass while newer lifecycle/resume/commit entry points
-# were absent. The committed artifact must export every migration symbol the SDK can call, in every
-# slice, and its generated header must declare the same set.
+# Reject any extra payload or unsafe link before following framework paths, then validate the exact
+# semantic SwiftPM routing table independently of the self-recorded plist hash.
+./Scripts/verify-ironwood-ffi-layout.sh "$xcframework"
+./Scripts/verify-ironwood-xcframework-metadata.sh "$xcframework"
+
+max_git_blob_bytes=100000000
+for binary in "${binaries[@]}"; do
+    binary_size=$(stat -f '%z' "$binary")
+    if (( binary_size >= max_git_blob_bytes )); then
+        echo "Error: committed archive exceeds GitHub's object limit: $binary ($binary_size bytes)" >&2
+        exit 1
+    fi
+done
+
+work_dir=$(mktemp -d)
+cleanup() {
+    rm -rf "$work_dir"
+}
+trap cleanup EXIT
+
+# Parse every thin archive with the same Apple linker used by Swift/Xcode. This catches malformed
+# unwind relocations that can pass symbol and architecture checks but fail at final link time.
+linked_thin_architectures=0
+thin_archives=()
+thin_headers=()
+thin_labels=()
+thin_expected_platforms=()
+thin_maximum_minos=()
+thin_legacy_commands=()
+link_smoke_binary() {
+    local binary="$1"
+    local platform="$2"
+    local minimum_version="$3"
+    local sdk="$4"
+    local expected_arches="$5"
+    local expected_platform="$6"
+    local legacy_command="$7"
+    local sdk_version actual_arches arch thin_archive linked_object
+    sdk_version=$(xcrun --sdk "$sdk" --show-sdk-version)
+    actual_arches=$(lipo -archs "$binary" | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+    if [[ "$actual_arches" != "$expected_arches" ]]; then
+        echo "Error: unexpected architectures for linker smoke test $binary: $actual_arches" >&2
+        exit 1
+    fi
+    while IFS= read -r arch; do
+        thin_archive="$work_dir/$platform-$arch.a"
+        linked_object="$thin_archive.linked.o"
+        if [[ "$(lipo -archs "$binary" | wc -w | tr -d ' ')" == "1" ]]; then
+            cp "$binary" "$thin_archive"
+        else
+            lipo "$binary" -thin "$arch" -output "$thin_archive"
+        fi
+        xcrun ld -r -all_load -arch "$arch" \
+            -platform_version "$platform" "$minimum_version" "$sdk_version" \
+            "$thin_archive" -o "$linked_object"
+        if (( $(stat -f '%z' "$linked_object") < 1000000 )); then
+            echo "Error: Apple linker smoke test did not load the full $arch archive" >&2
+            exit 1
+        fi
+        thin_archives+=("$thin_archive")
+        thin_headers+=("$(dirname "$binary")/Headers/zcashlc.h")
+        thin_labels+=("$platform-$arch")
+        thin_expected_platforms+=("$expected_platform")
+        thin_maximum_minos+=("$minimum_version")
+        thin_legacy_commands+=("$legacy_command")
+        linked_thin_architectures=$((linked_thin_architectures + 1))
+    done < <(lipo -archs "$binary" | tr ' ' '\n')
+}
+link_smoke_binary "${binaries[0]}" ios 13.0 iphoneos "arm64" 2 LC_VERSION_MIN_IPHONEOS
+link_smoke_binary "${binaries[1]}" ios-simulator 14.0 iphonesimulator "arm64 x86_64" 7 LC_VERSION_MIN_IPHONEOS
+link_smoke_binary "${binaries[2]}" macos 12.0 macosx "arm64 x86_64" 1 LC_VERSION_MIN_MACOSX
+if [[ "$linked_thin_architectures" != "5" || ${#thin_archives[@]} -ne 5 ]]; then
+    echo "Error: Apple linker smoke-tested $linked_thin_architectures thin architectures instead of five" >&2
+    exit 1
+fi
+echo "Apple linker smoke-tested all five thin architectures"
+
+required_symbols=()
 while IFS= read -r symbol; do
     required_symbols+=("$symbol")
 done < <(
-    LC_ALL=C grep -Eo 'zcashlc_migration_[a-z0-9_]+' \
-        Sources/ZcashLightClientKit/Rust/ZcashRustBackend.swift \
+    rg --pcre2 -o --no-filename 'zcashlc_[a-z0-9_]+(?=\s*\()' Sources/ZcashLightClientKit/Rust \
         | LC_ALL=C sort -u
 )
+if [[ ${#required_symbols[@]} -eq 0 ]]; then
+    echo "Error: no production zcashlc ABI calls were discovered" >&2
+    exit 1
+fi
+
+# Apple nm cannot reliably parse LLVM 22 attributes emitted by Rust 1.96. Use llvm-nm from the
+# exact pinned toolchain instead.
+symbol_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+symbol_host=$(rustc "+$symbol_toolchain" --version --verbose | sed -n 's/^host: //p')
+llvm_nm="$(rustc "+$symbol_toolchain" --print sysroot)/lib/rustlib/$symbol_host/bin/llvm-nm"
+if [[ ! -x "$llvm_nm" ]]; then
+    echo "Error: pinned llvm-nm is missing; install llvm-tools-preview for Rust $symbol_toolchain" >&2
+    exit 1
+fi
 
 forbidden_paths=(
     '/host-users/'
     '/home/runner'
+    '/private/tmp/'
     '.codex/worktrees'
+    "$(pwd -P)"
 )
+if [[ -n "${IRONWOOD_ADDITIONAL_FORBIDDEN_BUILD_ROOTS:-}" ]]; then
+    while IFS= read -r build_root; do
+        if [[ -n "$build_root" ]]; then forbidden_paths+=("$build_root"); fi
+    done < <(printf '%s\n' "$IRONWOOD_ADDITIONAL_FORBIDDEN_BUILD_ROOTS" | tr ':' '\n')
+fi
+retired_pattern='zodl_ironwood_migration|ZODLIronwoodMigrationRust|github\.com/(just-zend|Chlup)/ZODLIronwoodMigrationRust'
 while IFS= read -r artifact_file; do
     for forbidden in "${forbidden_paths[@]}"; do
         if LC_ALL=C grep -aFq "$forbidden" "$artifact_file"; then
-            echo "Error: non-reproducible/private build path '$forbidden' found in $artifact_file" >&2
+            echo "Error: non-reproducible build path '$forbidden' found in $artifact_file" >&2
             exit 1
         fi
     done
-done < <(find LocalPackages -type f | LC_ALL=C sort)
+    if LC_ALL=C grep -aiEq "$retired_pattern" "$artifact_file"; then
+        echo "Error: retired standalone migration-engine metadata found in $artifact_file" >&2
+        exit 1
+    fi
+done < <(find "$xcframework" -type f | LC_ALL=C sort; printf '%s\n' "$provenance" "$build_recipe")
 
-# Rust's precompiled macOS compiler-builtins archive carries its public upstream CI source prefix.
-# Build-time remapping cannot rewrite those already-compiled members. Allow only that exact Rust
-# distribution prefix; any other `/Users/...` string is a local/private path leak.
+# Rust's compiler-builtins archive can carry this public upstream CI prefix; no other /Users path
+# may remain after remapping.
 while IFS= read -r artifact_file; do
     if strings "$artifact_file" \
         | sed 's@/Users/runner/work/rust/rust/@/rust-distribution/@g' \
         | LC_ALL=C grep -Fq '/Users/'
     then
-        echo "Error: non-reproducible/private /Users path found in $artifact_file" >&2
+        echo "Error: non-reproducible /Users path found in $artifact_file" >&2
         exit 1
     fi
-done < <(find LocalPackages -type f | LC_ALL=C sort)
+done < <(find "$xcframework" -type f | LC_ALL=C sort)
 
-# The repository basename is intentionally present once in the canonical provenance URL. It must
-# not leak into any generated framework/header, where it would indicate embedded private source
-# metadata or a build path.
-while IFS= read -r artifact_file; do
-    if LC_ALL=C grep -aFq 'ZODLIronwoodMigrationRust' "$artifact_file"; then
-        echo "Error: private migration-engine source metadata found in $artifact_file" >&2
-        exit 1
-    fi
-done < <(find LocalPackages -type f ! -path "$provenance" | LC_ALL=C sort)
-
-binary_count=0
-while IFS= read -r binary; do
-    binary_count=$((binary_count + 1))
+header_hash=""
+for binary in "${binaries[@]}"; do
     header="$(dirname "$binary")/Headers/zcashlc.h"
     test -f "$header"
-    symbols_file=$(mktemp)
-    nm_output=$(mktemp)
-    nm_errors=$(mktemp)
-    nm_status=0
-    # Rust 1.96 uses LLVM 22 bitcode attributes that the current Apple `nm` may warn it cannot
-    # decode for unrelated compiler-builtins archive members. Capture all successfully decoded
-    # global defined symbols and verify every required ABI entry explicitly; do not let those
-    # unrelated member diagnostics hide a missing production symbol.
-    nm -gUj "$binary" > "$nm_output" 2> "$nm_errors" || nm_status=$?
-    sed 's/^_//' "$nm_output" | LC_ALL=C sort -u > "$symbols_file"
+    current_header_hash=$(shasum -a 256 "$header" | awk '{print $1}')
+    if [[ -n "$header_hash" && "$current_header_hash" != "$header_hash" ]]; then
+        echo "Error: generated FFI headers differ between platform slices" >&2
+        exit 1
+    fi
+    header_hash="$current_header_hash"
+
     for symbol in "${required_symbols[@]}"; do
-        if ! grep -Fq "$symbol" "$header"; then
+        if ! rg -q --pcre2 "\\b${symbol}\\s*\\(" "$header"; then
             echo "Error: $symbol missing from $header" >&2
-            rm -f "$symbols_file" "$nm_output" "$nm_errors"
-            exit 1
-        fi
-        if ! grep -Fxq "$symbol" "$symbols_file"; then
-            echo "Error: $symbol missing from exported symbols in $binary" >&2
-            if [[ "$nm_status" != "0" ]]; then
-                sed -n '1,10p' "$nm_errors" >&2
-            fi
-            rm -f "$symbols_file" "$nm_output" "$nm_errors"
             exit 1
         fi
     done
-    rm -f "$symbols_file" "$nm_output" "$nm_errors"
-done < <(find "$xcframework" -type f -path '*/libzcashlc.framework/libzcashlc' | LC_ALL=C sort)
+done
 
-if [[ "$binary_count" == "0" ]]; then
-    echo "Error: no FFI binaries found" >&2
+for thin_index in "${!thin_archives[@]}"; do
+    thin_archive="${thin_archives[$thin_index]}"
+    thin_header="${thin_headers[$thin_index]}"
+    thin_label="${thin_labels[$thin_index]}"
+    ./Scripts/verify-ironwood-macho-floor.sh \
+        "$thin_archive" \
+        "${thin_expected_platforms[$thin_index]}" \
+        "${thin_maximum_minos[$thin_index]}" \
+        "${thin_legacy_commands[$thin_index]}"
+    symbols_file="$work_dir/symbols-$thin_label.txt"
+    nm_output="$symbols_file.raw"
+    nm_errors="$symbols_file.err"
+    if ! "$llvm_nm" --defined-only --extern-only --just-symbol-name "$thin_archive" \
+        > "$nm_output" 2> "$nm_errors"
+    then
+        echo "Error: llvm-nm could not parse the complete $thin_label archive" >&2
+        sed -n '1,20p' "$nm_errors" >&2
+        exit 1
+    fi
+    sed 's/^_//' "$nm_output" | LC_ALL=C sort -u > "$symbols_file"
+    for symbol in "${required_symbols[@]}"; do
+        if ! grep -Fxq "$symbol" "$symbols_file"; then
+            echo "Error: $symbol missing from exported symbols in $thin_label" >&2
+            echo "Header: $thin_header" >&2
+            exit 1
+        fi
+    done
+done
+
+read_field() {
+    local field="$1"
+    local file="${2:-$provenance}"
+    local matches
+    matches=$(grep -c "^${field}=" "$file" || true)
+    if [[ "$matches" != "1" ]]; then
+        echo "Error: $file must contain exactly one $field" >&2
+        exit 1
+    fi
+    sed -n "s/^${field}=//p" "$file"
+}
+
+verify_exact_merge() {
+    local label="$1"
+    local merge_revision="$2"
+    local expected_first_parent="$3"
+    local expected_second_parent="$4"
+    local parents
+    if ! git cat-file -e "${merge_revision}^{commit}" 2>/dev/null; then
+        echo "Error: $label merge commit is absent; checkout history must be complete" >&2
+        exit 1
+    fi
+    parents=$(git show -s --format=%P "$merge_revision")
+    if [[ "$parents" != "$expected_first_parent $expected_second_parent" ]]; then
+        echo "Error: $label merge topology differs from the reviewed two-parent merge" >&2
+        exit 1
+    fi
+}
+
+source_revision=$(read_field SDK_FFI_SOURCE_REVISION)
+source_tree=$(read_field SDK_FFI_SOURCE_TREE)
+implementation_revision=$(read_field SDK_IRONWOOD_IMPLEMENTATION_REVISION)
+sdk_base_revision=$(read_field SDK_BASE_REVISION)
+sdk_ironwood_upstream_revision=$(read_field SDK_IRONWOOD_UPSTREAM_REVISION)
+sdk_ironwood_merge_revision=$(read_field SDK_IRONWOOD_MERGE_REVISION)
+sdk_pool_upstream_revision=$(read_field SDK_POOL_MIGRATION_UPSTREAM_REVISION)
+sdk_pool_merge_revision=$(read_field SDK_POOL_MIGRATION_MERGE_REVISION)
+sdk_pr1812_upstream_revision=$(read_field SDK_PR_1812_UPSTREAM_REVISION)
+sdk_pr1812_merge_revision=$(read_field SDK_PR_1812_MERGE_REVISION)
+upstream_1807_merge_revision=$(read_field UPSTREAM_1807_MERGE_REVISION)
+included_1813_revision=$(read_field INCLUDED_UPSTREAM_1813_REVISION)
+included_1821_revision=$(read_field INCLUDED_UPSTREAM_1821_REVISION)
+included_1822_revision=$(read_field INCLUDED_UPSTREAM_1822_REVISION)
+upstream_1821_merge_revision=$(read_field UPSTREAM_1821_MERGE_REVISION)
+upstream_1822_merge_revision=$(read_field UPSTREAM_1822_MERGE_REVISION)
+
+for revision in \
+    "$source_revision" "$source_tree" "$implementation_revision" \
+    "$sdk_base_revision" "$sdk_ironwood_upstream_revision" "$sdk_ironwood_merge_revision" \
+    "$sdk_pool_upstream_revision" "$sdk_pool_merge_revision" \
+    "$sdk_pr1812_upstream_revision" "$sdk_pr1812_merge_revision" \
+    "$upstream_1807_merge_revision" \
+    "$included_1813_revision" "$included_1821_revision" "$included_1822_revision" \
+    "$upstream_1821_merge_revision" "$upstream_1822_merge_revision"
+do
+    if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "Error: invalid SDK lineage revision: $revision" >&2
+        exit 1
+    fi
+done
+if ! git cat-file -e "${source_revision}^{commit}" 2>/dev/null \
+    || [[ "$(git rev-parse "${source_revision}^{tree}")" != "$source_tree" ]]
+then
+    echo "Error: recorded SDK source revision/tree does not identify the reviewed source" >&2
+    exit 1
+fi
+verify_exact_merge SDK_IRONWOOD \
+    "$sdk_ironwood_merge_revision" "$sdk_base_revision" "$sdk_ironwood_upstream_revision"
+verify_exact_merge SDK_POOL_MIGRATION \
+    "$sdk_pool_merge_revision" "$sdk_ironwood_merge_revision" "$sdk_pool_upstream_revision"
+verify_exact_merge UPSTREAM_1821 \
+    "$upstream_1821_merge_revision" "$sdk_pool_merge_revision" "$included_1821_revision"
+verify_exact_merge UPSTREAM_1822 \
+    "$upstream_1822_merge_revision" "$upstream_1821_merge_revision" "$included_1822_revision"
+verify_exact_merge SDK_PR_1812 \
+    "$sdk_pr1812_merge_revision" "$upstream_1822_merge_revision" "$sdk_pr1812_upstream_revision"
+if ! git merge-base --is-ancestor "$included_1813_revision" "$sdk_pr1812_upstream_revision" \
+    || ! git merge-base --is-ancestor "$implementation_revision" "$source_revision" \
+    || ! git merge-base --is-ancestor "$sdk_pr1812_merge_revision" "$source_revision" \
+    || ! git merge-base --is-ancestor "$source_revision" HEAD
+then
+    echo "Error: SDK source/implementation/merge ancestry differs from the reviewed lineage" >&2
     exit 1
 fi
 
@@ -120,12 +316,11 @@ verify_hash() {
     local variable="$1"
     local relative_path="$2"
     local expected actual
-    expected=$(sed -n "s/^${variable}=//p" "$provenance")
+    expected=$(read_field "$variable")
     if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
         echo "Error: missing or invalid $variable in $provenance" >&2
         exit 1
     fi
-    test -f "$relative_path"
     actual=$(shasum -a 256 "$relative_path" | awk '{print $1}')
     if [[ "$actual" != "$expected" ]]; then
         echo "Error: hash mismatch for $relative_path" >&2
@@ -133,51 +328,33 @@ verify_hash() {
     fi
 }
 
-verify_hash IOS_ARM64_SHA256 "$xcframework/ios-arm64/libzcashlc.framework/libzcashlc"
-verify_hash IOS_ARM64_SIMULATOR_SHA256 "$xcframework/ios-arm64-simulator/libzcashlc.framework/libzcashlc"
-verify_hash MACOS_ARM64_SHA256 "$xcframework/macos-arm64/libzcashlc.framework/libzcashlc"
+verify_hash IOS_ARM64_SHA256 "${binaries[0]}"
+verify_hash IOS_SIMULATOR_UNIVERSAL_SHA256 "${binaries[1]}"
+verify_hash MACOS_UNIVERSAL_SHA256 "${binaries[2]}"
+verify_hash XCFRAMEWORK_INFO_SHA256 "$xcframework/Info.plist"
 
-verify_archive_platform_floor() {
+recorded_manifest_hash=$(read_field XCFRAMEWORK_MANIFEST_SHA256)
+actual_manifest_hash=$(./Scripts/hash-ironwood-xcframework.sh "$xcframework")
+if [[ ! "$recorded_manifest_hash" =~ ^[0-9a-f]{64}$ \
+    || "$recorded_manifest_hash" != "$actual_manifest_hash" ]]
+then
+    echo "Error: complete XCFramework file/symlink manifest differs from artifact provenance" >&2
+    exit 1
+fi
+
+verify_arches() {
     local binary="$1"
-    local expected_platform="$2"
-    local maximum_minos="$3"
-    if ! otool -l "$binary" 2>/dev/null | awk \
-        -v expected_platform="$expected_platform" -v maximum_minos="$maximum_minos" '
-        function version_gt(found, maximum, f, m, i) {
-            split(found, f, ".")
-            split(maximum, m, ".")
-            for (i = 1; i <= 3; i++) {
-                if ((f[i] + 0) > (m[i] + 0)) return 1
-                if ((f[i] + 0) < (m[i] + 0)) return 0
-            }
-            return 0
-        }
-        $1 == "platform" {
-            found_build_version = 1
-            if ($2 != expected_platform) invalid = 1
-        }
-        $1 == "minos" && version_gt($2, maximum_minos) { invalid = 1 }
-        END { exit (!found_build_version || invalid) }
-        '
-    then
-        echo "Error: $binary contains a wrong-platform or too-new deployment target" >&2
+    local expected="$2"
+    local actual
+    actual=$(lipo -archs "$binary" | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Error: unexpected architectures for $binary: $actual" >&2
         exit 1
     fi
 }
-
-# Mach-O LC_BUILD_VERSION platform constants: macOS=1, iOS=2, iOS Simulator=7.
-verify_archive_platform_floor \
-    "$xcframework/ios-arm64/libzcashlc.framework/libzcashlc" 2 13.0
-verify_archive_platform_floor \
-    "$xcframework/ios-arm64-simulator/libzcashlc.framework/libzcashlc" 7 14.0
-verify_archive_platform_floor \
-    "$xcframework/macos-arm64/libzcashlc.framework/libzcashlc" 1 12.0
-
-read_field() {
-    local field="$1"
-    local file="${2:-$provenance}"
-    sed -n "s/^${field}=//p" "$file"
-}
+verify_arches "${binaries[0]}" "arm64"
+verify_arches "${binaries[1]}" "arm64 x86_64"
+verify_arches "${binaries[2]}" "arm64 x86_64"
 
 recorded_source_hash=$(read_field SDK_FFI_SOURCE_SHA256)
 actual_source_hash=$(./Scripts/hash-ironwood-ffi-sources.sh)
@@ -188,8 +365,12 @@ fi
 
 recorded_toolchain=$(read_field RUST_TOOLCHAIN)
 expected_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
-if [[ "$recorded_toolchain" != "$expected_toolchain" || ! "$recorded_toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "Error: artifact Rust toolchain differs from rust-toolchain.toml" >&2
+makefile_toolchain=$(sed -nE 's/^RUST_TOOLCHAIN = ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' BuildSupport/Makefile)
+if [[ "$recorded_toolchain" != "$expected_toolchain" \
+    || "$makefile_toolchain" != "$expected_toolchain" \
+    || ! "$recorded_toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+then
+    echo "Error: artifact, rust-toolchain.toml, and BuildSupport/Makefile toolchains differ" >&2
     exit 1
 fi
 for field in RUSTC_RELEASE CARGO_RELEASE; do
@@ -205,6 +386,39 @@ for field in RUSTC_COMMIT CARGO_COMMIT; do
     fi
 done
 
+if [[ "$(read_field BUILD_PATH_POLICY)" != "explicit-required-tool-dirs-v1" \
+    || ! "$(read_field BUILD_PATH_SHA256)" =~ ^[0-9a-f]{64}$ \
+    || "$(read_field RUSTUP_HOME_POLICY)" != "ephemeral-empty-v1" \
+    || "$(read_field GIT_CONFIG_POLICY)" != "system-global-disabled-v1" ]]
+then
+    echo "Error: artifact provenance does not record the hermetic PATH/Rustup/Git policy" >&2
+    exit 1
+fi
+
+tool_sha256() {
+    shasum -a 256 "$1" | awk '{print $1}'
+}
+declare -a tool_fields=(
+    RUSTUP_SHA256 GIT_SHA256 MAKE_SHA256 LLVM_OBJCOPY_SHA256
+    APPLE_LD_SHA256 APPLE_LIPO_SHA256 APPLE_STRIP_SHA256 APPLE_CLANG_SHA256
+)
+declare -a tool_paths=(
+    "$(command -v rustup)" "/usr/bin/git" "/usr/bin/make" "$(dirname "$llvm_nm")/llvm-objcopy"
+    "$(xcrun --find ld)" "$(xcrun --find lipo)" "$(xcrun --find strip)" "$(xcrun --find clang)"
+)
+for tool_index in "${!tool_fields[@]}"; do
+    tool_field="${tool_fields[$tool_index]}"
+    tool_path="${tool_paths[$tool_index]}"
+    if [[ ! -x "$tool_path" || "$(read_field "$tool_field")" != "$(tool_sha256 "$tool_path")" ]]; then
+        echo "Error: $tool_field differs from the tool selected for verification" >&2
+        exit 1
+    fi
+done
+if [[ "$(read_field XCODE_DEVELOPER_DIR)" != "$(xcode-select -p)" ]]; then
+    echo "Error: artifact Xcode developer directory differs from the selected Xcode" >&2
+    exit 1
+fi
+
 if [[ "$(read_field MACOSX_DEPLOYMENT_TARGET)" != "12.0" \
     || "$(read_field IPHONEOS_DEPLOYMENT_TARGET)" != "13.0" \
     || "$(read_field IOS_ARM64_SIMULATOR_MINIMUM_OS)" != "14.0" \
@@ -215,10 +429,8 @@ then
     echo "Error: artifact deployment targets differ from the Swift package platform floor" >&2
     exit 1
 fi
-if ! grep -Fq '.iOS(.v13)' Package.swift || ! grep -Fq '.macOS(.v12)' Package.swift; then
-    echo "Error: Package.swift platform floor differs from the frozen FFI deployment targets" >&2
-    exit 1
-fi
+./Scripts/verify-ironwood-package-platforms.sh
+
 for field in XCODE_VERSION IPHONEOS_SDK_VERSION IPHONESIMULATOR_SDK_VERSION MACOSX_SDK_VERSION MACOS_VERSION; do
     if [[ ! "$(read_field "$field")" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
         echo "Error: missing or invalid $field in artifact provenance" >&2
@@ -232,51 +444,81 @@ for field in XCODE_BUILD_VERSION MACOS_BUILD_VERSION; do
     fi
 done
 
-recorded_source_date_epoch=$(read_field SOURCE_DATE_EPOCH)
-recipe_source_date_epoch=$(read_field SOURCE_DATE_EPOCH "$build_recipe")
-if [[ ! "$recorded_source_date_epoch" =~ ^[0-9]+$ || "$recorded_source_date_epoch" != "$recipe_source_date_epoch" ]]; then
-    echo "Error: SOURCE_DATE_EPOCH differs from the frozen build recipe" >&2
-    exit 1
-fi
+recipe_fields=(
+    SDK_FFI_SOURCE_REVISION SDK_FFI_SOURCE_TREE SDK_IRONWOOD_IMPLEMENTATION_REVISION
+    SDK_BASE_REVISION SDK_IRONWOOD_UPSTREAM_REVISION SDK_IRONWOOD_MERGE_REVISION
+    SDK_POOL_MIGRATION_UPSTREAM_REVISION SDK_POOL_MIGRATION_MERGE_REVISION
+    SDK_PR_1812_UPSTREAM_REVISION SDK_PR_1812_MERGE_REVISION
+    UPSTREAM_1807_MERGE_REVISION INCLUDED_UPSTREAM_1813_REVISION
+    INCLUDED_UPSTREAM_1821_REVISION INCLUDED_UPSTREAM_1822_REVISION
+    UPSTREAM_1821_MERGE_REVISION UPSTREAM_1822_MERGE_REVISION
+    LIBRUSTZCASH_REPOSITORY LIBRUSTZCASH_REVISION LIBRUSTZCASH_TREE
+    ZCASH_VOTING_REVISION ORCHARD_VERSION ORCHARD_CHECKSUM
+    SOURCE_DATE_EPOCH RUST_TOOLCHAIN BUILD_ENVIRONMENT_POLICY FFI_ARCHIVE_POSTPROCESSING
+    BUILD_PATH_POLICY BUILD_PATH_SHA256 RUSTUP_HOME_POLICY GIT_CONFIG_POLICY
+    RUSTUP_SHA256 GIT_SHA256 MAKE_SHA256 LLVM_OBJCOPY_SHA256
+    APPLE_LD_SHA256 APPLE_LIPO_SHA256 APPLE_STRIP_SHA256 APPLE_CLANG_SHA256
+    XCODE_DEVELOPER_DIR
+    MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET IOS_ARM64_SIMULATOR_MINIMUM_OS
+)
+for field in "${recipe_fields[@]}"; do
+    if [[ -z "$(read_field "$field")" || "$(read_field "$field")" != "$(read_field "$field" "$build_recipe")" ]]; then
+        echo "Error: $field differs from the frozen build recipe" >&2
+        exit 1
+    fi
+done
 
-expected_librustzcash_rev="0c2775f5ed1561360b164b3971ecf0cf734e75eb"
-recorded_librustzcash_rev=$(read_field LIBRUSTZCASH_REVISION)
-if [[ "$recorded_librustzcash_rev" != "$expected_librustzcash_rev" ]]; then
-    echo "Error: provenance does not record the audited librustzcash revision" >&2
-    exit 1
-fi
-expected_orchard_rev="fa6e5fee02ce38b54193005a35289ec705d4f5b2"
-recorded_orchard_rev=$(sed -nE \
-    's@^orchard[[:space:]]*= .*git = "https://github.com/zcash/orchard.git", rev = "([0-9a-f]{40})".*@\1@p' \
-    Cargo.toml)
-if [[ "$recorded_orchard_rev" != "$expected_orchard_rev" ]]; then
-    echo "Error: Cargo.toml does not pin the audited Orchard revision" >&2
-    exit 1
-fi
-
-migration_revision=$(read_field MIGRATION_ENGINE_REVISION)
-migration_tree=$(read_field MIGRATION_ENGINE_TREE)
-expected_migration_repository="ssh://git@github.com/just-zend/ZODLIronwoodMigrationRust.git"
-migration_repository=$(read_field MIGRATION_ENGINE_REPOSITORY)
-if [[ ! "$migration_revision" =~ ^[0-9a-f]{40}$ || ! "$migration_tree" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "Error: invalid migration-engine commit/tree provenance" >&2
-    exit 1
-fi
-if [[ "$migration_repository" != "$expected_migration_repository" \
-    || "$migration_repository" != "$(read_field MIGRATION_ENGINE_REPOSITORY "$build_recipe")" \
-    || "$migration_revision" != "$(read_field MIGRATION_ENGINE_REVISION "$build_recipe")" \
-    || "$migration_tree" != "$(read_field MIGRATION_ENGINE_TREE "$build_recipe")" \
-    || "$recorded_toolchain" != "$(read_field RUST_TOOLCHAIN "$build_recipe")" ]]
+if [[ "$(read_field SDK_BASE_REVISION)" != "9476ced615d90407270d3d741823d5797ef0f501" \
+    || "$(read_field SDK_IRONWOOD_UPSTREAM_REVISION)" != "61be7e006d0b4bacb5933d8da28b08410f8ee126" \
+    || "$(read_field SDK_IRONWOOD_MERGE_REVISION)" != "71f6977dce5b281d69a86597051849bf88ea13d0" \
+    || "$(read_field SDK_POOL_MIGRATION_UPSTREAM_REVISION)" != "92a9b2b663bb0c5275794788c1d33a0e3fe0adc8" \
+    || "$(read_field SDK_POOL_MIGRATION_MERGE_REVISION)" != "d2dbd935a896630a878d997c792d8e3b7c46563a" \
+    || "$(read_field SDK_PR_1812_UPSTREAM_REVISION)" != "daf1aa1bda57cbc4044f8978cb6170f82940a3d8" \
+    || "$(read_field SDK_PR_1812_MERGE_REVISION)" != "0835b3cd3275580802e5d26b0fd0896b2c1e3155" \
+    || "$(read_field UPSTREAM_1807_MERGE_REVISION)" != "ef6c31420cf861d459b5fe41a47997fe255ffa4b" \
+    || "$(read_field INCLUDED_UPSTREAM_1813_REVISION)" != "adfe9ca7a989f7a7197f8b10138519f8a02f790f" \
+    || "$(read_field INCLUDED_UPSTREAM_1821_REVISION)" != "eb219e2f86f5725377ebdf3985815c809a954450" \
+    || "$(read_field INCLUDED_UPSTREAM_1822_REVISION)" != "5aa8b4b4bb1ff4075a670b56de268295cff45589" \
+    || "$(read_field LIBRUSTZCASH_REPOSITORY)" != "https://github.com/just-zend/librustzcash" \
+    || "$(read_field ZCASH_VOTING_REVISION)" != "a4daaf77f793b35a98a3d811b920a01b95fbfa7a" \
+    || "$(read_field ORCHARD_VERSION)" != "0.15.4" \
+    || "$(read_field ORCHARD_CHECKSUM)" != "793e2e8c2323f35f082d1b3467ca8f576d646f9c93aef8c5168809d099245af8" ]]
 then
-    echo "Error: artifact provenance differs from the frozen build recipe" >&2
+    echo "Error: provenance does not record the reviewed Ironwood source graph" >&2
     exit 1
 fi
-if ! grep -Fxq \
-    "zodl_ironwood_migration = { git = \"$migration_repository\", rev = \"$migration_revision\" }" \
-    Cargo.toml
+for field in \
+    SDK_FFI_SOURCE_REVISION SDK_FFI_SOURCE_TREE SDK_IRONWOOD_IMPLEMENTATION_REVISION \
+    UPSTREAM_1821_MERGE_REVISION UPSTREAM_1822_MERGE_REVISION
+do
+    if [[ ! "$(read_field "$field")" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "Error: invalid canonical SDK source field $field" >&2
+        exit 1
+    fi
+done
+publication_ref=$(read_field LIBRUSTZCASH_PUBLICATION_REF_AT_BUILD)
+publication_tip=$(read_field LIBRUSTZCASH_PUBLICATION_TIP_AT_BUILD)
+if [[ ! "$publication_ref" =~ ^refs/(heads|tags)/[-A-Za-z0-9._/]+$ \
+    || ! "$publication_tip" =~ ^[0-9a-f]{40}$ ]]
 then
-    echo "Error: Cargo.toml migration-engine pin differs from FFI provenance" >&2
+    echo "Error: invalid non-canonical librustzcash publication evidence" >&2
+    exit 1
+fi
+for field in LIBRUSTZCASH_REVISION LIBRUSTZCASH_TREE; do
+    if [[ ! "$(read_field "$field")" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "Error: invalid $field in artifact provenance" >&2
+        exit 1
+    fi
+done
+if [[ ! "$(read_field SOURCE_DATE_EPOCH)" =~ ^[0-9]+$ \
+    || "$(read_field BUILD_ENVIRONMENT_POLICY)" != "hermetic-v1" \
+    || "$(read_field FFI_ARCHIVE_POSTPROCESSING)" != "thin-llvm-objcopy-remove-bitcode_lipo_apple-strip-S-x" ]]
+then
+    echo "Error: invalid source epoch or archive post-processing provenance" >&2
     exit 1
 fi
 
-echo "Committed Ironwood FFI passed provenance, hash, symbol, and path-leak checks."
+EXPECTED_LIBRUSTZCASH_REVISION="$(read_field LIBRUSTZCASH_REVISION)" \
+    ./Scripts/verify-ironwood-cargo-pins.sh
+
+echo "Committed Ironwood FFI passed source, hash, architecture, ABI, platform, and path-leak checks."

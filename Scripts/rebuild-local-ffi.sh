@@ -20,6 +20,14 @@ if [[ -f "$HOME/.cargo/env" ]]; then
     source "$HOME/.cargo/env"
 fi
 
+# shellcheck source=rust-build-env.sh
+source Scripts/rust-build-env.sh
+RUST_TOOLCHAIN=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+if [[ ! "$RUST_TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Error: rust-toolchain.toml must pin an exact stable toolchain" >&2
+    exit 1
+fi
+
 # Parse a target (ios-sim|ios-device|macos) + optional --universal.
 # --universal (macos, ios-sim): build BOTH archs of the slice and lipo them — REQUIRED
 # before an Xcode ARCHIVE (Release links arm64+x86_64; a host-arch-only macOS slice
@@ -64,16 +72,16 @@ case "$TARGET" in
             RUST_TARGET="x86_64-apple-ios"
             ARCH="x86_64"
         fi
-        XCFRAMEWORK_SLICE="ios-arm64_x86_64-simulator"
-        PLATFORM="ios"
-        PLATFORM_VARIANT="simulator"
+        if [[ "$UNIVERSAL" == "true" ]]; then
+            XCFRAMEWORK_SLICE="ios-arm64_x86_64-simulator"
+        else
+            XCFRAMEWORK_SLICE="ios-${ARCH}-simulator"
+        fi
         ;;
     ios-device)
         RUST_TARGET="aarch64-apple-ios"
         XCFRAMEWORK_SLICE="ios-arm64"
         ARCH="arm64"
-        PLATFORM="ios"
-        PLATFORM_VARIANT=""
         ;;
     macos)
         if [[ "$IS_APPLE_SILICON" == "true" ]]; then
@@ -83,9 +91,11 @@ case "$TARGET" in
             RUST_TARGET="x86_64-apple-darwin"
             ARCH="x86_64"
         fi
-        XCFRAMEWORK_SLICE="macos-arm64_x86_64"
-        PLATFORM="macos"
-        PLATFORM_VARIANT=""
+        if [[ "$UNIVERSAL" == "true" ]]; then
+            XCFRAMEWORK_SLICE="macos-arm64_x86_64"
+        else
+            XCFRAMEWORK_SLICE="macos-${ARCH}"
+        fi
         ;;
     *)
         echo "Unknown target: $TARGET"
@@ -98,7 +108,7 @@ echo "Building for $TARGET ($RUST_TARGET)..."
 echo ""
 
 # Check if Rust target is installed
-if ! rustup target list --installed | grep -q "^${RUST_TARGET}$"; then
+if ! rustup target list --installed --toolchain "$RUST_TOOLCHAIN" | grep -q "^${RUST_TARGET}$"; then
     echo "Rust target '$RUST_TARGET' is not installed."
     read -p "Install it now? [Y/n] " -n 1 -r
     echo
@@ -106,7 +116,7 @@ if ! rustup target list --installed | grep -q "^${RUST_TARGET}$"; then
         echo "Cannot build without the target. Exiting."
         exit 1
     fi
-    rustup target add "$RUST_TARGET"
+    rustup target add --toolchain "$RUST_TOOLCHAIN" "$RUST_TARGET"
 fi
 
 # Incremental cargo build (fast for small changes!)
@@ -114,10 +124,10 @@ fi
 if [[ "$TARGET" == "macos" && "$UNIVERSAL" == "true" ]]; then
     echo "Universal macOS build (arm64 + x86_64)..."
     for t in aarch64-apple-darwin x86_64-apple-darwin; do
-        if ! rustup target list --installed | grep -q "^${t}$"; then
-            rustup target add "$t"
+        if ! rustup target list --installed --toolchain "$RUST_TOOLCHAIN" | grep -q "^${t}$"; then
+            rustup target add --toolchain "$RUST_TOOLCHAIN" "$t"
         fi
-        cargo build --target "$t" --release
+        cargo "+$RUST_TOOLCHAIN" build --locked --target "$t" --release
     done
     BUILT_LIB="target/libzcashlc-macos-universal.a"
     lipo -create \
@@ -127,10 +137,10 @@ if [[ "$TARGET" == "macos" && "$UNIVERSAL" == "true" ]]; then
 elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
     echo "Universal iOS Simulator build (arm64 + x86_64)..."
     for t in aarch64-apple-ios-sim x86_64-apple-ios; do
-        if ! rustup target list --installed | grep -q "^${t}$"; then
-            rustup target add "$t"
+        if ! rustup target list --installed --toolchain "$RUST_TOOLCHAIN" | grep -q "^${t}$"; then
+            rustup target add --toolchain "$RUST_TOOLCHAIN" "$t"
         fi
-        cargo build --target "$t" --release
+        cargo "+$RUST_TOOLCHAIN" build --locked --target "$t" --release
     done
     BUILT_LIB="target/libzcashlc-ios-sim-universal.a"
     lipo -create \
@@ -138,7 +148,7 @@ elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
         target/x86_64-apple-ios/release/libzcashlc.a \
         -output "$BUILT_LIB"
 else
-    cargo build --target "$RUST_TARGET" --release
+    cargo "+$RUST_TOOLCHAIN" build --locked --target "$RUST_TARGET" --release
     # Path to built static library (target/ is at repo root)
     BUILT_LIB="target/$RUST_TARGET/release/libzcashlc.a"
 fi
@@ -147,7 +157,11 @@ fi
 # silently breaks builds that link both archs (macOS: Xcode ARCHIVE; iOS Simulator:
 # any `generic/platform=iOS Simulator` destination).
 if [[ ( "$TARGET" == "macos" || "$TARGET" == "ios-sim" ) && "$UNIVERSAL" != "true" ]]; then
-    OLD_BIN="$XCFRAMEWORK_DIR/$XCFRAMEWORK_SLICE/libzcashlc.framework/libzcashlc"
+    if [[ "$TARGET" == "macos" ]]; then
+        OLD_BIN="$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework/libzcashlc"
+    else
+        OLD_BIN="$XCFRAMEWORK_DIR/ios-arm64_x86_64-simulator/libzcashlc.framework/libzcashlc"
+    fi
     if [[ -e "$OLD_BIN" ]] && lipo -archs "$OLD_BIN" 2>/dev/null | grep -q "x86_64"; then
         echo "⚠️  DOWNGRADE: the existing $TARGET slice was universal (arm64+x86_64); this"
         echo "    rebuild replaces it with ${ARCH}-only. Builds that link both archs"
@@ -178,13 +192,20 @@ if [[ -d "target/Headers" ]]; then
     cp -R target/Headers/* "$TEMP_FRAMEWORK/Headers/"
 fi
 
-# Carry over every OTHER slice from the existing xcframework, with a loud
-# staleness reminder (they contain whatever Rust they were last built with).
+# Carry over slices for OTHER platforms only. Drop every alias for the rebuilt platform so a
+# single-architecture iteration can never coexist with a stale universal slice or create two
+# simulator entries in Info.plist.
 if [[ -d "$XCFRAMEWORK_DIR" ]]; then
     for slice_path in "$XCFRAMEWORK_DIR"/*/; do
         [[ -d "$slice_path" ]] || continue
         slice_name="$(basename "$slice_path")"
-        if [[ "$slice_name" != "$XCFRAMEWORK_SLICE" ]]; then
+        same_platform=false
+        case "$TARGET:$slice_name" in
+            ios-device:ios-arm64) same_platform=true ;;
+            ios-sim:ios-*-simulator) same_platform=true ;;
+            macos:macos-*) same_platform=true ;;
+        esac
+        if [[ "$same_platform" != "true" ]]; then
             # -P: keep symlinks as symlinks (the versioned macOS framework
             # layout relies on Versions/Current links).
             cp -RP "$slice_path" "$TEMP_XCFW/$slice_name"
@@ -222,13 +243,21 @@ PLISTHEAD
                 entry_platform="ios"
                 entry_archs="<string>arm64</string>"
                 entry_variant="			<key>SupportedPlatformVariant</key>
-			<string>simulator</string>" ;;
+				<string>simulator</string>" ;;
+            ios-x86_64-simulator)
+                entry_platform="ios"
+                entry_archs="<string>x86_64</string>"
+                entry_variant="			<key>SupportedPlatformVariant</key>
+				<string>simulator</string>" ;;
             macos-arm64_x86_64)
                 entry_platform="macos"
                 entry_archs="<string>arm64</string><string>x86_64</string>" ;;
             macos-arm64)
                 entry_platform="macos"
                 entry_archs="<string>arm64</string>" ;;
+            macos-x86_64)
+                entry_platform="macos"
+                entry_archs="<string>x86_64</string>" ;;
             *)
                 echo "warning: unknown slice '$slice_name' — no plist entry emitted" >&2
                 continue ;;

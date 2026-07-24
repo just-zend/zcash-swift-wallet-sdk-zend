@@ -1,0 +1,59 @@
+name: Verify FFI Reproducibility
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Package.swift'
+      - 'rust-toolchain.toml'
+      - 'rust/**'
+      - 'BuildSupport/**'
+      - 'Scripts/**ironwood**'
+      - 'Scripts/init-local-ffi.sh'
+      - 'Scripts/rebuild-local-ffi.sh'
+      - 'Scripts/rust-build-env.sh'
+      - 'Scripts/version-macos-framework.sh'
+      - 'Sources/ZcashLightClientKit/Rust/**'
+      - 'LocalPackages/IRONWOOD_FFI_PROVENANCE.env'
+      - 'LocalPackages/libzcashlc.xcframework/**'
+      - '.github/workflows/build-ffi.yml'
+      - '.github/workflows/ffi-reproducibility.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  reproduce:
+    runs-on: warp-macos-15-arm64-12x
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select pinned Xcode
+        run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
+
+      - name: Run network-free retired-engine and dependency gate
+        run: ./Scripts/verify-ironwood-static-release-inputs.sh
+
+      - name: Install pinned Rust verification tools
+        run: |
+          rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$rust_toolchain" --profile minimal
+          rustup component add --toolchain "$rust_toolchain" llvm-tools-preview
+
+      - name: Run adversarial release-gate fixtures
+        run: ./Scripts/test-ironwood-release-gates.sh
+
+      - name: Rebuild twice and byte-compare all five architectures
+        run: ./Scripts/verify-ironwood-ffi-reproducibility.sh
+
+      - name: Package twice, extract, and fully reverify
+        run: ./Scripts/verify-ironwood-package-reproducibility.sh

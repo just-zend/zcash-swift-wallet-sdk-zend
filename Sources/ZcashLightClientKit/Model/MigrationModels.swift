@@ -62,9 +62,8 @@ public struct MigrationProgress: Equatable, Sendable {
 /// returned by `ZcashRustBackendWelding.migrationTransactionStatuses(for:)` /
 /// `Synchronizer.migrationTransactionStatuses(accountUUID:)`. A verbatim marshal of the engine's
 /// own `MigrationState::transaction_statuses`: nothing here is derived independently of the
-/// engine's view, and it is reconciled against mined transactions at every read (the same
-/// read-path convention as `MigrationState`), so a transaction the wallet's own scan has since
-/// observed mined is reported `.mined` here even if the stored run still marks it broadcast.
+/// engine's view. Public migration reads reconcile canonical chain evidence through the opaque
+/// scheduled-run capability before obtaining this side-effect-free projection.
 public struct MigrationTransactionStatus: Equatable, Sendable {
     /// This transaction's kind: a note-PREPARATION at a given dependency-layer/index, or a
     /// phase-2 pool-crossing TRANSFER at a given funding-note crossing index.
@@ -122,11 +121,11 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
     }
 
     /// This transaction's stable id (the engine's own raw ordinal). Stable across reads and
-    /// across a stale-transfer rebuild (a rebuilt transfer keeps its id; only its state and
+    /// across an exact expired-attempt rebuild (a rebuilt transfer keeps its id; only its state and
     /// heights change), so a wallet may use it as a durable row key. It is the same ordinal the
     /// schedule surfaces carry as their opaque string id — `String(status.id)` equals
-    /// ``MigrationTransferProposal/id`` / ``PreparedMigrationTransfer/id`` for the same
-    /// transaction — so status rows (which carry no amount) join to their schedule row by id.
+    /// ``MigrationTransferProposal/id`` for the same transaction — so status rows (which carry no
+    /// amount) join to their schedule row by id.
     public let id: UInt32
     /// This transaction's kind and per-kind payload.
     public let kind: Kind
@@ -174,11 +173,16 @@ public struct NoteSplitProposal: Equatable, Sendable {
     public let outputNotes: [Zatoshi]
     /// The fee paid by the split transaction itself.
     public let fee: Zatoshi
+    /// Opaque identifier of the Rust-side cached migration plan this proposal was rendered from.
+    /// Commit calls pass the handle back instead of echoing caller-authored plan fields. `0`
+    /// means no live cached plan backs the proposal.
+    public let proposalHandle: UInt64
 
     /// Creates a `NoteSplitProposal`.
-    public init(outputNotes: [Zatoshi], fee: Zatoshi) {
+    public init(outputNotes: [Zatoshi], fee: Zatoshi, proposalHandle: UInt64) {
         self.outputNotes = outputNotes
         self.fee = fee
+        self.proposalHandle = proposalHandle
     }
 }
 
@@ -222,13 +226,47 @@ public struct MigrationTransferProposal: Identifiable, Equatable, Sendable, Coda
 public struct MigrationSchedule: Equatable, Sendable, Codable {
     /// The scheduled transfers, in execution order.
     public let transfers: [MigrationTransferProposal]
-    /// A rough estimate of how long the schedule takes to fully execute, in hours.
+    /// A rough display estimate, in hours, from the proposal (or most recent re-serve) time to the
+    /// last scheduled transfer. It never crosses the commit FFI boundary inward; the opaque plan
+    /// handle, not this serve-time-relative value, identifies the reviewed plan.
     public let estimatedDurationHours: Int
+    /// Opaque identifier of the Rust-side cached migration plan this schedule was rendered from.
+    /// The display fields above never cross the FFI boundary inward; fresh commit and rollover
+    /// calls pass only this handle, and Rust refuses a missing or superseded plan. `0` means no
+    /// live cached plan backs the schedule.
+    ///
+    /// This is process-local authority, not persistent data. Encoding deliberately omits it and
+    /// decoding always resets it to `0`, including when reading a payload produced by a buggy or
+    /// pre-release encoder that included a nonzero handle.
+    public let proposalHandle: UInt64
 
     /// Creates a `MigrationSchedule`.
-    public init(transfers: [MigrationTransferProposal], estimatedDurationHours: Int) {
+    public init(
+        transfers: [MigrationTransferProposal],
+        estimatedDurationHours: Int,
+        proposalHandle: UInt64
+    ) {
         self.transfers = transfers
         self.estimatedDurationHours = estimatedDurationHours
+        self.proposalHandle = proposalHandle
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case transfers
+        case estimatedDurationHours
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.transfers = try container.decode([MigrationTransferProposal].self, forKey: .transfers)
+        self.estimatedDurationHours = try container.decode(Int.self, forKey: .estimatedDurationHours)
+        self.proposalHandle = 0
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(transfers, forKey: .transfers)
+        try container.encode(estimatedDurationHours, forKey: .estimatedDurationHours)
     }
 }
 
@@ -345,15 +383,14 @@ public struct MigrationRunEstimate: Equatable, Sendable {
     }
 }
 
-/// The proposal for the immediate (single-transaction) Orchard -> Ironwood migration, as returned
-/// by `Synchronizer.proposeImmediateMigration(accountUUID:)`: an ordinary send-max transaction that
-/// sweeps the account's whole spendable Orchard balance to its own address. Unlike
-/// `MigrationSchedule`, this is held entirely by the caller -- there is no engine plan cache behind
-/// it, so nothing about it can go stale beyond the proposal's own validity window.
+/// Legacy immediate-migration proposal model retained only for source migration.
+///
+/// Immediate migration no longer exposes an ordinary proposal. Use the claim-backed
+/// `Synchronizer.submitImmediateMigration(accountUUID:usk:options:)` API, or its paired external
+/// signing APIs, so Rust atomically owns the source reservation and exact transaction.
+@available(*, deprecated, message: "Use the claim-backed immediate migration APIs on Synchronizer.")
 public struct ImmediateMigrationProposal: Equatable {
-    /// The underlying proposal: feed to `Synchronizer.createProposedTransactions(proposal:spendingKey:)`
-    /// (software accounts) or `Synchronizer.createPCZTFromProposal(accountUUID:proposal:)` (Keystone
-    /// accounts) exactly like any other ordinary transfer.
+    /// Legacy ordinary proposal. Do not use it to execute an immediate migration.
     public let proposal: Proposal
     /// The net swept amount -- what arrives in the Ironwood pool once mined. The proposal's single
     /// payment value: the account's spendable Orchard notes, minus `fee`.
@@ -369,30 +406,9 @@ public struct ImmediateMigrationProposal: Equatable {
     }
 }
 
-/// A fully proven, signed migration transaction persisted by the engine, ready for the platform
-/// to broadcast (see `ZcashRustBackendWelding.migrationExtractBroadcastTx(pczt:for:)`).
-public struct PreparedMigrationTransfer: Equatable, Sendable {
-    /// The transfer's opaque, engine-issued id.
-    public let id: String
-    /// The finalized transaction's id, in the SDK's raw/internal byte order (matching `TxId.id`,
-    /// not the reversed display-hex order produced by `Data.toHexStringTxId()`). Zeroed when the
-    /// value is a STORAGE RECEIPT (`migrationStoreSignedNoteSplitPczts`) whose transaction has not
-    /// been proven yet — the broadcastable value is served by the delivery lane.
-    public let txid: Data
-    /// The serialized, signed PCZT backing this transfer.
-    public let pczt: Data
-
-    /// Creates a `PreparedMigrationTransfer`.
-    public init(id: String, txid: Data, pczt: Data) {
-        self.id = id
-        self.txid = txid
-        self.pczt = pczt
-    }
-}
-
-/// The platform's outcome of broadcasting (or attempting to broadcast) a prepared migration
-/// transfer, reported back to the migration engine via
-/// `ZcashRustBackendWelding.migrationRecordTransferResult(transferId:result:for:)`.
+/// Legacy-shaped projection of one claim-backed scheduled migration submission outcome. The SDK
+/// derives this value from Rust-owned transaction identity and records the typed outcome under the
+/// same opaque claim before returning it.
 public enum MigrationTransferResult: Equatable, Sendable {
     /// The transfer was accepted by the network as `txId`.
     ///
@@ -415,36 +431,4 @@ public enum MigrationAttentionReason: Equatable, Sendable {
     case invalidTransfer(transferId: String)
     /// A transaction's anchor/expiry elapsed before it could be broadcast.
     case transferExpired
-}
-
-/// An unsigned-but-proven PCZT for one scheduled transfer, awaiting an external signer (see
-/// `ZcashRustBackendWelding.migrationCreateUnsignedTransferPczts(for:for:)`).
-public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
-    /// The transfer's opaque, engine-issued id.
-    public let id: String
-    /// The serialized, proven-but-unsigned PCZT.
-    public let pczt: Data
-
-    /// Creates a `MigrationUnsignedTransferPczt`.
-    public init(id: String, pczt: Data) {
-        self.id = id
-        self.pczt = pczt
-    }
-}
-
-/// An externally signed PCZT for one scheduled transfer, to be handed back to the engine via
-/// `ZcashRustBackendWelding.migrationStoreSignedSchedulePczts(_:for:)`.
-public struct MigrationSignedTransferPczt: Equatable, Sendable {
-    /// The transfer's opaque, engine-issued id (must match the corresponding
-    /// `MigrationUnsignedTransferPczt.id`).
-    public let id: String
-    /// The serialized, signed PCZT.
-    public let pczt: Data
-
-    /// Creates a `MigrationSignedTransferPczt`. Apps construct this directly after routing the
-    /// corresponding `MigrationUnsignedTransferPczt` through an external signer.
-    public init(id: String, pczt: Data) {
-        self.id = id
-        self.pczt = pczt
-    }
 }

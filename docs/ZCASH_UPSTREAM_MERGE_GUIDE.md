@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-22
+Last reviewed: 2026-07-23
 
 ## Remote and branch invariants
 
@@ -10,7 +10,12 @@ Last reviewed: 2026-07-22
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current monitor status (2026-07-22)
+## Prior monitor status (2026-07-22)
+
+These dated bullets describe the parity decision before the current Ironwood consolidation. The
+active consolidation adopts the reviewed upstream migration implementation, exact-pins the complete
+Cargo graph to public `just-zend/librustzcash`, and rebuilds the provenance-locked five-architecture
+XCFramework. See `docs/handoffs/ZEND-ironwood-consolidation.md` for the current capability mapping.
 
 - Both defaults remain `main`. `origin/main` is `faef1a52`; upstream advanced from `89d85c49` to
   `74cdbbc0` through upstream PR `#1816` / MOB-1512. The new public
@@ -76,7 +81,7 @@ Zend CI intentionally diverges from upstream's native GitHub-hosted runners:
 - `warp-macos-15-arm64-12x` runs the manual committed-XCFramework packaging job, the Swift PR build and offline tests, and the Swift CodeQL matrix row.
 - `warp-ubuntu-latest-x64-16x` runs the CodeQL `actions`, `c-cpp`, and `rust` matrix rows.
 - `warp-ubuntu-latest-x64-8x` runs SwiftLint and zizmor.
-- Public Swift and CodeQL jobs verify the reviewed, committed three-slice FFI artifact; they do not build Rust or require credentials for the private migration engine. Authenticated source rebuilds use `Scripts/build-ironwood-ffi-artifact.sh` outside public CI.
+- Public Swift and CodeQL jobs verify the reviewed, committed three-slice/five-architecture FFI artifact; they do not rebuild Rust. Source rebuilds use a clean checkout of the exact public `just-zend/librustzcash` revision through `Scripts/build-ironwood-ffi-artifact.sh` outside public CI.
 - Swift, SwiftLint, and zizmor PR workflows cancel superseded work for the same pull request.
 - A newer CodeQL push to the same ref cancels the older push scan. Scheduled and manually dispatched CodeQL scans remain independent, and manual FFI release runs do not cancel.
 
@@ -85,8 +90,18 @@ The first committed-artifact Swift control completed in 3m10s ([run `29467560549
 Moving the `contents: write` draft-release publisher to WarpBuild expands the trusted computing base for SDK releases. The following controls are required:
 
 - The live `sdk-release` GitHub environment must exist before the manual FFI release workflow is used. It must require an independent reviewer, prevent self-approval and administrator bypass where GitHub makes those controls available, and restrict deployment branches and tags to protected, reviewed release refs.
+- Both the read-only verifier and the write-only publisher query the authenticated GitHub API for
+  that environment. Immediately before tag or draft-release creation, the publisher requires at
+  least one configured reviewer, `prevent_self_review`, a protected-branches-only environment
+  policy, and the exact release SHA still at the tip of protected `main`; a missing environment,
+  unreadable policy, changed tip, or unexpected API schema fails closed.
 - WarpBuild GitHub App access must be limited to this repository and the minimum permissions required for these jobs.
 - The environment reviewer must verify and approve the exact commit SHA shown by the workflow run.
+- The workflow validates a strict SemVer release tag, binds that tag to the exact `GITHUB_SHA`, and
+  rejects any pre-existing tag that resolves elsewhere. It also requires the provenance-recorded
+  `just-zend/librustzcash` commit/tree to be durably reachable from the fork's `main` branch.
+- Artifact provenance records the exact SDK source revision/tree and exact Ironwood merge or
+  semantic-port revision; branch and PR refs are build-time audit evidence, never canonical input.
 - The workflow output must remain a draft release.
 - A second maintainer must download the draft XCFramework zip, independently run `shasum -a 256`, compare the result with both the workflow output and the checksum proposed for `Package.swift`, confirm that the draft asset came from the approved workflow SHA, and only then publish the release.
 
@@ -95,6 +110,32 @@ environment is still not configured. Do not dispatch the manual FFI release work
 environment protections and WarpBuild GitHub App controls above are verified.
 
 ### Ironwood integration and upstream parity snapshot (as of 2026-07-16)
+
+### Live migration-stack refresh (2026-07-23/24)
+
+- Upstream SDK PR `#1807` is merged to `release/2.6.0`: reviewed head `61be7e00`, merge commit
+  `ef6c3142`. It pins librustzcash `3a10e7fe` and Orchard `0.15.4`. Do not overwrite that release
+  lineage when refreshing Zend's broader migration branch.
+- Upstream SDK PR `#1825`, “Identify migration proposals by an opaque Rust-side handle,” remains
+  open and non-draft at `93ed4ed957df3c1962bad283cd588dc385f955a0`, based on the #1813 FFI
+  branch at `adfe9ca7`. The last live GitHub check reports `mergeStateStatus=UNSTABLE`; re-fetch the
+  head and checks before review rather than assuming it is merge-ready.
+- #1825's schema is the canonical pre-commit contract: Rust mints a nonzero `PlanHandle`, keeps one
+  current preview per database/account, invalidates an older handle on replacement, and accepts
+  only the handle for fresh commit or terminal successor rollover. Pure preview queries must not
+  replace that cached authority. A durable nonterminal run resumes through its post-commit
+  run/claim capability instead.
+- Zend adopts that implementation unchanged and layers one safety improvement on top:
+  `MigrationSchedule` never encodes its process-local handle and always decodes with the `0`
+  sentinel, even if prerelease data contains a nonzero field. Re-proposal is required after
+  persistence/relaunch. Do not reintroduce caller-field schedule validation or use `PlanHandle` as
+  post-commit authority.
+- Low-level Rust state/progress/status FFI reads remain side-effect-free. The public Swift migration
+  actor first obtains the runtime snapshot, reconciles canonical chain evidence using the opaque
+  scheduled-run capability, and then returns the projection. Tests must seed live canonical rows
+  through real source-bound PCZTs, Orchard nullifiers, one `LockOwner`, and
+  `lock_outputs_and_replace_migration`; never weaken the delivery-store invariant to admit an
+  unlocked fixture.
 
 ### Upstream refresh (2026-07-17)
 
@@ -163,13 +204,13 @@ Notable fork-ahead work currently preserved includes:
 - Voting-related Zend SDK additions that remain ahead of upstream.
 - Zend release-helper fixes in `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `Scripts/init-local-ffi.sh` that publish and consume fork-local artifacts from `just-zend/zcash-swift-wallet-sdk-zend`.
 
-Implication: Zend PRs `#18`, `#17`, `#20`, and `#21` have landed. `origin/main` contains upstream
+Historical implication at the time of this snapshot: Zend PRs `#18`, `#17`, `#20`, and `#21` had landed. `origin/main` contained upstream
 `main` through `d92a7940` / PR `#1802` plus the Zend-original Ironwood SDK hardening stack,
 spendable-completion FFI rebuild, and WarpBuild Swift CI optimization. PR `#17` replaced the
-sibling-path/private-CI blocker with an exact private-engine revision plus a committed, three-slice,
-provenance-verified XCFramework; PR `#21` extended that line with a spendable-completion gate. Future
-updates must continue to freeze the private revision, artifact hashes, Swift/offline tests, and GitHub
-checks together. Zend SDK release numbering remains separate from upstream and FFI artifact numbering.
+sibling-path/private-CI blocker with an exact standalone-engine revision plus a committed,
+provenance-verified XCFramework; PR `#21` extended that line with a spendable-completion gate. The
+current consolidation supersedes that source graph with public `just-zend/librustzcash` revision/tree
+provenance. Zend SDK release numbering remains separate from upstream and FFI artifact numbering.
 
 ## Conflict resolution heuristics
 
@@ -193,9 +234,9 @@ Zend parity branch note:
 - The July 3 refresh merged upstream through `018253d8` with no conflicts. The upstream `#1799` changes touch `CHANGELOG.md` and `Sources/ZcashLightClientKit/Block/CompactBlockProcessor.swift`; no Zend-specific artifact URL, checksum, branding, or release behavior changed.
 - The July 7 refresh merged upstream through `d92a7940` with no conflicts. The upstream `#1802` changes touch `Scripts/prepare-release.sh`, `Scripts/release.sh`, and `docs/ci.md`; no Zend-specific artifact URL, checksum, branding, or support surface changed.
 
-## Bleeding-edge snapshot (2026-07-16; refreshed 2026-07-20)
+## Historical bleeding-edge snapshot (2026-07-16; refreshed 2026-07-20)
 
-Current carry decisions:
+Carry decisions recorded at that time:
 
 - Upstream PR `#1813` (pool-migration FFI/welding) and PR `#1812` (pool-migration Synchronizer
   surface) are non-draft, clean, and currently green, but are one coupled Orchard-to-Ironwood
@@ -212,7 +253,7 @@ Current carry decisions:
   review-required. Dependabot, Dandelion++, older FFI, and release-workflow branches continue to
   lack the combined readiness, narrow scope, and Zend roadmap value required for an early carry.
 
-Zend Ironwood hardening line:
+Zend Ironwood hardening line at that snapshot:
 
 - PR `#17` (`codex/zcash-pr-or-branch-ironwood-nu63-2026-07-04`) merged as `1bbc35a6` and is the
   current Zend-original Ironwood SDK hardening baseline.

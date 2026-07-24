@@ -236,7 +236,6 @@ mod tests {
     use zcash_keys::keys::UnifiedSpendingKey;
     use zcash_protocol::consensus::Network;
     use zip32::AccountId;
-    use zip32::Scope;
 
     /// Raw Orchard FVK byte length — the extract lane's expected output size.
     const ORCHARD_FVK_LEN: usize = 96;
@@ -263,27 +262,6 @@ mod tests {
         let ufvk_str = ufvk.encode(&network);
         let orchard_bytes = ufvk.orchard().expect("orchard present").to_bytes();
         (ufvk_str, orchard_bytes)
-    }
-
-    fn derive_orchard_fvk_bytes(network: Network, seed: &[u8], account_index: u32) -> Vec<u8> {
-        let account = AccountId::try_from(account_index).expect("account");
-        let usk = UnifiedSpendingKey::from_seed(&network, seed, account).expect("from_seed");
-        usk.to_unified_full_viewing_key()
-            .orchard()
-            .expect("orchard fvk")
-            .to_bytes()
-            .to_vec()
-    }
-
-    fn derive_hotkey_raw_address(network: Network, seed: &[u8], account_index: u32) -> Vec<u8> {
-        let account = AccountId::try_from(account_index).expect("account");
-        let usk = UnifiedSpendingKey::from_seed(&network, seed, account).expect("from_seed");
-        let ufvk = usk.to_unified_full_viewing_key();
-        let orchard_fvk = ufvk.orchard().expect("orchard fvk");
-        orchard_fvk
-            .address_at(0u32, Scope::External)
-            .to_raw_address_bytes()
-            .to_vec()
     }
 
     #[test]

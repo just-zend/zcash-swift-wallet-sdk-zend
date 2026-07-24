@@ -15,6 +15,14 @@ final class MigrationLogicTests: ZcashTestCase {
     private let accountA = AccountUUID(id: [UInt8](repeating: 0x11, count: 16))
     private let referenceDate = Date(timeIntervalSince1970: 1_700_000_000)
     private let buffer: TimeInterval = 600
+    private static let immediateOptions = MigrationNetworkPrivacyOptions(
+        useTor: false,
+        submissionEndpoint: LightWalletEndpoint(
+            address: "submit.example",
+            port: 9067,
+            secure: true
+        )
+    )
     private static let uaString = """
     u1l9f0l4348negsncgr9pxd9d3qaxagmqv3lnexcplmufpq7muffvfaue6ksevfvd7wrz7xrvn95rc5zjtn7ugkmgh5rnxswmcj30y0pw52pn0zjvy38rn2esfgve64rj5pcmazxgpyuj
     """
@@ -741,122 +749,1160 @@ final class MigrationLogicTests: ZcashTestCase {
         }
     }
 
-    // MARK: - Immediate migration (send-max lane, MOB-1513)
+    // MARK: - Immediate migration (opaque claim lane)
 
-    /// `proposeImmediateMigration()` derives the account's own current address and proposes an
-    /// Orchard-only send-max transfer to it: the immediate lane is a self-send that lands in the
-    /// account's own Ironwood receiver (the UA's Orchard receiver doubles as the Ironwood receiver
-    /// post-NU6.3), with no memo, and restricted to the Orchard pool (never draws on Sapling funds).
-    func testProposeImmediateMigrationSendsMaxToOwnAddressOrchardOnly() async throws {
+    func testSubmitImmediateMigrationUsesOnlyRustOwnedExactBytesAndRecordsOutcome() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        let ownAddress = UnifiedAddress(validatedEncoding: Self.uaString, networkType: .testnet)
-        welding.getCurrentAddressAccountUUIDReturnValue = ownAddress
-        welding.proposeSendMaxTransferAccountUUIDRecipientMemoOrchardOnlyReturnValue = Self.makeSendMaxProposal(
-            inputValues: [1_000_000],
-            changeValues: [],
-            fee: 10_000
+        let reserved = Self.makeClaimHandle(1)
+        let staged = Self.makeClaimHandle(2)
+        welding.migrationReserveImmediateSignerSubmissionForReturnValue = reserved
+        welding.migrationMaterializeImmediateSDKClaimUskForReturnValue = staged
+        Self.configureImmediateSubmission(welding, identity: 10)
+        welding.migrationRenewClaimClaimForReturnValue = Self.makeClaimHandle(20)
+
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.result = .accepted
+        submitter.renewBeforeReturning = true
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
         )
-        let migration = makeMigration(welding: welding, account: accountA)
+        let usk = TestsData(networkType: .testnet).spendingKey
+        let options = Self.immediateOptions
 
-        _ = try await migration.proposeImmediateMigration()
+        let outcome = try await migration.submitImmediateMigration(usk: usk, options: options)
 
-        XCTAssertEqual(welding.getCurrentAddressAccountUUIDReceivedAccountUUID, accountA)
-        let received = welding.proposeSendMaxTransferAccountUUIDRecipientMemoOrchardOnlyReceivedArguments
-        XCTAssertEqual(received?.accountUUID, accountA)
-        XCTAssertEqual(received?.recipient, ownAddress.stringEncoded)
-        XCTAssertNil(received?.memo)
-        XCTAssertEqual(received?.orchardOnly, true)
+        XCTAssertEqual(outcome, .accepted)
+        XCTAssertEqual(
+            welding.migrationReserveImmediateSignerSubmissionForReceivedArguments?.signer,
+            .sdk
+        )
+        XCTAssertEqual(
+            welding.migrationReserveImmediateSignerSubmissionForReceivedArguments?.submission,
+            MigrationSubmissionIntent(transport: .directTLS, endpoint: "https://submit.example:9067")
+        )
+        XCTAssertEqual(welding.migrationMaterializeImmediateSDKClaimUskForCallsCount, 1)
+        XCTAssertEqual(submitter.receivedArguments?.transaction.raw, Data([0xAA, 0xBB, 0xCC]))
+        XCTAssertEqual(submitter.receivedArguments?.transaction.transactionId, Data(repeating: 0x44, count: 32))
+        XCTAssertEqual(submitter.receivedArguments?.expiryHeight, 2_000_040)
+        XCTAssertEqual(submitter.receivedArguments?.transactionConsensusBranchId, 0xC8E71055)
+        XCTAssertEqual(submitter.receivedArguments?.expectedChainName, "test")
+        XCTAssertEqual(submitter.renewalCallsCount, 1)
+        XCTAssertEqual(
+            welding.migrationRecordSubmissionOutcomeClaimForReceivedArguments?.outcome,
+            .accepted
+        )
+        let isBlocked = await migration.isSyncBlocked()
+        XCTAssertTrue(isBlocked)
+        XCTAssertFalse(welding.proposeSendMaxTransferAccountUUIDRecipientMemoOrchardOnlyCalled)
     }
 
-    /// The core decode: `amount` is the net value that crosses into Ironwood (input total minus the
-    /// fee), and `fee` is `Proposal.totalFeeRequired()` -- matching the documented "value that
-    /// crosses the turnstile" contract the rust half applies on the privacy path, applied here to
-    /// the immediate lane's ordinary proposal. A send-max proposal declares no change, so the net
-    /// amount is just the swept input total minus the fee.
-    func testProposeImmediateMigrationDecodesNetAmountAndFee() async throws {
+    func testImmediatePreSubmitFailureReleasesKnownUnsentClaimWithoutStartingPrivacyGate() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.getCurrentAddressAccountUUIDReturnValue = UnifiedAddress(validatedEncoding: Self.uaString, networkType: .testnet)
-        welding.proposeSendMaxTransferAccountUUIDRecipientMemoOrchardOnlyReturnValue = Self.makeSendMaxProposal(
-            inputValues: [600_000, 400_000],
-            changeValues: [],
-            fee: 15_000
+        welding.migrationReserveImmediateSignerSubmissionForReturnValue = Self.makeClaimHandle(30)
+        welding.migrationMaterializeImmediateSDKClaimUskForReturnValue = Self.makeClaimHandle(31)
+        Self.configureImmediateSubmission(welding, identity: 32)
+        welding.migrationReleaseKnownUnsentClaimClaimFailureForReturnValue = Self.makeClaimHandle(40)
+
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.throwableError = ZcashError.migrationTorUnavailable
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
         )
-        let migration = makeMigration(welding: welding, account: accountA)
 
-        let proposal = try await migration.proposeImmediateMigration()
+        do {
+            _ = try await migration.submitImmediateMigration(
+                usk: TestsData(networkType: .testnet).spendingKey,
+                options: Self.immediateOptions
+            )
+            XCTFail("Expected the pre-submit transport failure")
+        } catch ZcashError.migrationTorUnavailable {
+            // expected
+        }
 
-        XCTAssertEqual(proposal.fee, Zatoshi(15_000))
-        XCTAssertEqual(proposal.amount, Zatoshi(600_000 + 400_000 - 15_000))
+        XCTAssertEqual(
+            welding.migrationReleaseKnownUnsentClaimClaimFailureForReceivedArguments?.failure,
+            .transportDidNotBegin
+        )
+        XCTAssertFalse(welding.migrationRecordSubmissionOutcomeClaimForCalled)
+        let isBlocked = await migration.isSyncBlocked()
+        XCTAssertFalse(isBlocked)
     }
 
-    /// Defensive edge: a send-max proposal should never declare change (there is nothing left to
-    /// return), but the decode subtracts any declared change anyway rather than assuming it is
-    /// always empty, so `amount` always means "what left the wallet toward the payment" even if
-    /// that assumption is ever violated.
-    func testProposeImmediateMigrationSubtractsAnyDeclaredChangeFromTheAmount() async throws {
+    func testExternalImmediateSigningRoundTripConsumesTheOpaqueRequestClaim() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.getCurrentAddressAccountUUIDReturnValue = UnifiedAddress(validatedEncoding: Self.uaString, networkType: .testnet)
-        welding.proposeSendMaxTransferAccountUUIDRecipientMemoOrchardOnlyReturnValue = Self.makeSendMaxProposal(
-            inputValues: [1_000_000],
-            changeValues: [50_000],
-            fee: 10_000
+        welding.migrationReserveImmediateSignerSubmissionForReturnValue = Self.makeClaimHandle(50)
+        welding.migrationPrepareImmediateExternalSigningClaimForReturnValue = Self.makeClaimHandle(51)
+        let unsignedPCZT = Data("SECRET-PCZT".utf8)
+        welding.migrationClaimExternalSigningPCZTReturnValue = unsignedPCZT
+
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.result = .unknown
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
         )
-        let migration = makeMigration(welding: welding, account: accountA)
+        let request = try await migration.prepareImmediateMigrationForExternalSigning(
+            options: Self.immediateOptions
+        )
 
-        let proposal = try await migration.proposeImmediateMigration()
+        XCTAssertEqual(request.pczt, unsignedPCZT)
+        XCTAssertFalse(String(reflecting: request).contains("SECRET-PCZT"))
+        XCTAssertEqual(
+            welding.migrationReserveImmediateSignerSubmissionForReceivedArguments?.signer,
+            .external
+        )
 
-        XCTAssertEqual(proposal.amount, Zatoshi(1_000_000 - 50_000 - 10_000))
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeImmediateExternalRuntime(
+            account: accountA,
+            runIdentity: 52,
+            claim: Self.makeClaimHandle(52)
+        )
+        welding.migrationResumeClaimClaimForReturnValue = Self.makeClaimHandle(52)
+        welding.migrationStageSignedPCZTClaimForReturnValue = Self.makeClaimHandle(53)
+        welding.migrationFinalizeImmediateExternalSigningClaimForReturnValue = Self.makeClaimHandle(54)
+        Self.configureImmediateSubmission(welding, identity: 55)
+        let signedPCZT = Data("SIGNED-PCZT".utf8)
+
+        let outcome = try await migration.submitExternallySignedImmediateMigration(
+            request: request,
+            signedPCZT: signedPCZT
+        )
+
+        XCTAssertEqual(outcome, .unknown)
+        XCTAssertEqual(
+            welding.migrationStageSignedPCZTClaimForReceivedArguments?.signedPCZT,
+            signedPCZT
+        )
+        XCTAssertEqual(welding.migrationFinalizeImmediateExternalSigningClaimForCallsCount, 1)
+        XCTAssertFalse(welding.migrationReacquireExternalSigningClaimForCalled)
+        XCTAssertEqual(
+            welding.migrationRecordSubmissionOutcomeClaimForReceivedArguments?.outcome,
+            .unknown
+        )
+        let isBlocked = await migration.isSyncBlocked()
+        XCTAssertTrue(isBlocked)
     }
 
-    func testProposeImmediateMigrationRethrowsWhenAddressDerivationFails() async throws {
+    func testPrepareExternalImmediateSigningAfterRelaunchRecoversExactRustStagedPCZT() async throws {
+        let firstLaunchWelding = ZcashRustBackendWeldingMock()
+        firstLaunchWelding.migrationReserveImmediateSignerSubmissionForReturnValue = Self.makeClaimHandle(60)
+        firstLaunchWelding.migrationPrepareImmediateExternalSigningClaimForReturnValue = Self.makeClaimHandle(61)
+        let stagedPCZT = Data("EXACT-STAGED-PCZT".utf8)
+        firstLaunchWelding.migrationClaimExternalSigningPCZTReturnValue = stagedPCZT
+        let firstLaunch = makeMigration(welding: firstLaunchWelding, account: accountA)
+
+        let originalRequest = try await firstLaunch.prepareImmediateMigrationForExternalSigning(
+            options: Self.immediateOptions
+        )
+
+        // Simulate a process relaunch: the second OrchardMigration has no retained request and its
+        // welding projects a newly allocated opaque handle from the durable Rust runtime snapshot.
+        let runtimeClaim = Self.makeClaimHandle(62)
+        let secondLaunchWelding = ZcashRustBackendWeldingMock()
+        secondLaunchWelding.migrationRuntimeSnapshotForReturnValue = Self.makeImmediateExternalRuntime(
+            account: accountA,
+            runIdentity: 63,
+            claim: runtimeClaim
+        )
+        secondLaunchWelding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        secondLaunchWelding.migrationResumeClaimClaimForReturnValue = nil
+        let reacquiredClaim = Self.makeClaimHandle(64)
+        secondLaunchWelding.migrationReacquireExternalSigningClaimForReturnValue = reacquiredClaim
+        secondLaunchWelding.migrationClaimExternalSigningPCZTReturnValue = stagedPCZT
+        let secondLaunch = makeMigration(welding: secondLaunchWelding, account: accountA)
+
+        let recoveredRequest = try await secondLaunch.prepareImmediateMigrationForExternalSigning(
+            options: Self.immediateOptions
+        )
+
+        XCTAssertEqual(recoveredRequest.pczt, originalRequest.pczt)
+        XCTAssertEqual(recoveredRequest.claim.pointer, reacquiredClaim.pointer)
+        XCTAssertNotEqual(recoveredRequest.claim.pointer, originalRequest.claim.pointer)
+        XCTAssertEqual(secondLaunchWelding.migrationRuntimeSnapshotForCallsCount, 1)
+        XCTAssertEqual(secondLaunchWelding.migrationBoundSubmissionTargetForCallsCount, 1)
+        XCTAssertEqual(
+            secondLaunchWelding.migrationResumeClaimClaimForReceivedArguments?.claim.pointer,
+            runtimeClaim.pointer
+        )
+        XCTAssertEqual(
+            secondLaunchWelding.migrationReacquireExternalSigningClaimForReceivedArguments?.claim.pointer,
+            runtimeClaim.pointer
+        )
+        XCTAssertEqual(
+            secondLaunchWelding.migrationClaimExternalSigningPCZTReceivedClaim?.pointer,
+            reacquiredClaim.pointer
+        )
+        XCTAssertFalse(secondLaunchWelding.migrationReserveImmediateSignerSubmissionForCalled)
+        XCTAssertFalse(secondLaunchWelding.migrationPrepareImmediateExternalSigningClaimForCalled)
+    }
+
+    func testPrepareExternalImmediateSigningReusesLiveRuntimeClaimWithoutReacquiring() async throws {
+        let runtimeClaim = Self.makeClaimHandle(65)
         let welding = ZcashRustBackendWeldingMock()
-        welding.getCurrentAddressAccountUUIDThrowableError = ZcashError.rustGetCurrentAddress("boom")
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeImmediateExternalRuntime(
+            account: accountA,
+            runIdentity: 66,
+            claim: runtimeClaim
+        )
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        let resumedClaim = Self.makeClaimHandle(67)
+        welding.migrationResumeClaimClaimForReturnValue = resumedClaim
+        let stagedPCZT = Data("STILL-LIVE-STAGED-PCZT".utf8)
+        welding.migrationClaimExternalSigningPCZTReturnValue = stagedPCZT
+        let migration = makeMigration(welding: welding, account: accountA)
+
+        let request = try await migration.prepareImmediateMigrationForExternalSigning(
+            options: Self.immediateOptions
+        )
+
+        XCTAssertEqual(request.pczt, stagedPCZT)
+        XCTAssertEqual(request.claim.pointer, resumedClaim.pointer)
+        XCTAssertEqual(
+            welding.migrationResumeClaimClaimForReceivedArguments?.claim.pointer,
+            runtimeClaim.pointer
+        )
+        XCTAssertFalse(welding.migrationReacquireExternalSigningClaimForCalled)
+        XCTAssertFalse(welding.migrationReserveImmediateSignerSubmissionForCalled)
+    }
+
+    func testPrepareExternalImmediateSigningAfterRelaunchRejectsDifferentSubmissionPolicy() async throws {
+        let runtimeClaim = Self.makeClaimHandle(70)
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeImmediateExternalRuntime(
+            account: accountA,
+            runIdentity: 71,
+            claim: runtimeClaim
+        )
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        let migration = makeMigration(welding: welding, account: accountA)
+        let differentOptions = MigrationNetworkPrivacyOptions(
+            useTor: false,
+            submissionEndpoint: LightWalletEndpoint(
+                address: "other.example",
+                port: 9067,
+                secure: true
+            )
+        )
+
+        do {
+            _ = try await migration.prepareImmediateMigrationForExternalSigning(options: differentOptions)
+            XCTFail("Expected the Rust-bound submission policy to reject different relaunch options")
+        } catch MigrationDeliveryError.runtimeUnavailable(.submissionPolicyMismatch) {
+            // expected
+        } catch {
+            XCTFail("Expected submissionPolicyMismatch but got \(error)")
+        }
+
+        XCTAssertFalse(welding.migrationResumeClaimClaimForCalled)
+        XCTAssertFalse(welding.migrationReacquireExternalSigningClaimForCalled)
+        XCTAssertFalse(welding.migrationReserveImmediateSignerSubmissionForCalled)
+    }
+
+    func testImmediateSDKRelaunchSubmitsTheDurablyStagedExactArtifact() async throws {
+        let runtimeClaim = Self.makeClaimHandle(72)
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeImmediateSDKRuntime(
+            account: accountA,
+            runIdentity: 73,
+            claim: runtimeClaim,
+            status: .staged
+        )
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        Self.configureImmediateSubmission(welding, identity: 74)
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.result = .accepted
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
+        )
+
+        let outcome = try await migration.submitImmediateMigration(
+            usk: TestsData(networkType: .testnet).spendingKey,
+            options: Self.immediateOptions
+        )
+
+        XCTAssertEqual(outcome, .accepted)
+        XCTAssertEqual(
+            welding.migrationClaimSubmissionClaimForReceivedArguments?.claim.pointer,
+            runtimeClaim.pointer
+        )
+        XCTAssertFalse(welding.migrationReserveImmediateSignerSubmissionForCalled)
+        XCTAssertFalse(welding.migrationMaterializeImmediateSDKClaimUskForCalled)
+        XCTAssertEqual(submitter.callsCount, 1)
+    }
+
+    func testImmediateSDKRelaunchResumesSnapshotRefreshedMaterializationToken() async throws {
+        let snapshotClaim = Self.makeClaimHandle(171)
+        let resumedClaim = Self.makeClaimHandle(172)
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeImmediateSDKRuntime(
+            account: accountA,
+            runIdentity: 173,
+            claim: snapshotClaim,
+            status: .materializing,
+            activeClaimKind: .materialization
+        )
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        welding.migrationResumeClaimClaimForReturnValue = resumedClaim
+        welding.migrationMaterializeImmediateSDKClaimUskForReturnValue = Self.makeClaimHandle(174)
+        Self.configureImmediateSubmission(welding, identity: 175)
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.result = .accepted
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
+        )
+
+        let outcome = try await migration.submitImmediateMigration(
+            usk: TestsData(networkType: .testnet).spendingKey,
+            options: Self.immediateOptions
+        )
+
+        XCTAssertEqual(outcome, .accepted)
+        XCTAssertEqual(
+            welding.migrationResumeClaimClaimForReceivedArguments?.claim.pointer,
+            snapshotClaim.pointer
+        )
+        XCTAssertEqual(
+            welding.migrationMaterializeImmediateSDKClaimUskForReceivedArguments?.claim.pointer,
+            resumedClaim.pointer
+        )
+        XCTAssertFalse(welding.migrationReserveImmediateSignerSubmissionForCalled)
+        XCTAssertEqual(submitter.callsCount, 1)
+    }
+
+    func testImmediateSDKRelaunchReconcilesUnknownOutcomeWithoutResubmitting() async throws {
+        let runtimeClaim = Self.makeClaimHandle(75)
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeImmediateSDKRuntime(
+            account: accountA,
+            runIdentity: 76,
+            claim: runtimeClaim,
+            status: .outcomeUnknown,
+            activeClaimKind: .outcomeResolution
+        )
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        welding.migrationClaimOutcomeResolutionClaimForReturnValue = Self.makeClaimHandle(77)
+        welding.migrationReconcileSubmissionClaimForReturnValue = Self.makeClaimHandle(78)
+        let submitter = MigrationTransactionSubmitterMock()
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
+        )
+
+        let outcome = try await migration.submitImmediateMigration(
+            usk: TestsData(networkType: .testnet).spendingKey,
+            options: Self.immediateOptions
+        )
+
+        XCTAssertEqual(outcome, .unknown)
+        XCTAssertEqual(welding.migrationClaimOutcomeResolutionClaimForCallsCount, 1)
+        XCTAssertEqual(welding.migrationReconcileSubmissionClaimForCallsCount, 1)
+        XCTAssertFalse(welding.migrationClaimSubmissionClaimForCalled)
+        XCTAssertFalse(welding.migrationReserveImmediateSignerSubmissionForCalled)
+        XCTAssertEqual(submitter.callsCount, 0)
+    }
+
+    func testImmediateExternalRelaunchAfterFinalizationSubmitsWithoutRestagingSignerBytes() async throws {
+        let runtimeClaim = Self.makeClaimHandle(79)
+        let stagedPCZT = Data("DURABLE-EXTERNAL-PCZT".utf8)
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeImmediateExternalRuntime(
+            account: accountA,
+            runIdentity: 80,
+            claim: runtimeClaim,
+            status: .staged,
+            activeClaimKind: nil,
+            hasSignedPCZT: true,
+            hasExactTransaction: true,
+            txid: Data(repeating: 0x44, count: 32)
+        )
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        welding.migrationClaimExternalSigningPCZTReturnValue = stagedPCZT
+        Self.configureImmediateSubmission(welding, identity: 81)
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.result = .accepted
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
+        )
+
+        let recovered = try await migration.prepareImmediateMigrationForExternalSigning(
+            options: Self.immediateOptions
+        )
+        let outcome = try await migration.submitExternallySignedImmediateMigration(
+            request: recovered,
+            signedPCZT: Data("RETRIED-SIGNER-RESPONSE".utf8)
+        )
+
+        XCTAssertEqual(recovered.pczt, stagedPCZT)
+        XCTAssertEqual(outcome, .accepted)
+        XCTAssertFalse(welding.migrationResumeClaimClaimForCalled)
+        XCTAssertFalse(welding.migrationReacquireExternalSigningClaimForCalled)
+        XCTAssertFalse(welding.migrationStageSignedPCZTClaimForCalled)
+        XCTAssertFalse(welding.migrationFinalizeImmediateExternalSigningClaimForCalled)
+        XCTAssertEqual(
+            welding.migrationClaimSubmissionClaimForReceivedArguments?.claim.pointer,
+            runtimeClaim.pointer
+        )
+        XCTAssertEqual(submitter.callsCount, 1)
+    }
+
+    // MARK: - Scheduled migration (opaque claim lane)
+
+    func testPublicStateProgressAndStatusReadsReconcileThroughTheOpaqueRunFirst() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let runtime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .broadcasted,
+            hasExactTransaction: true,
+            runIdentity: 90,
+            claimIdentity: 91
+        )
+        welding.migrationRuntimeSnapshotForReturnValue = runtime
+        welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(92)
+        welding.migrationStateForClosure = { _ in
+            XCTAssertEqual(welding.migrationReconcileCanonicalChainRunForCallsCount, 1)
+            return .inProgress(
+                MigrationProgress(
+                    completedTransfers: 0,
+                    totalTransfers: 1,
+                    remainingOrchard: Zatoshi(1),
+                    nextTransferReadyAtHeight: 2_000_040
+                )
+            )
+        }
+        welding.migrationProgressForClosure = { _ in
+            XCTAssertEqual(welding.migrationReconcileCanonicalChainRunForCallsCount, 2)
+            return MigrationProgress(
+                completedTransfers: 0,
+                totalTransfers: 1,
+                remainingOrchard: Zatoshi(1),
+                nextTransferReadyAtHeight: 2_000_040
+            )
+        }
+        welding.migrationTransactionStatusesForClosure = { _ in
+            XCTAssertEqual(welding.migrationReconcileCanonicalChainRunForCallsCount, 3)
+            return []
+        }
+        let migration = makeMigration(welding: welding, account: accountA)
+
+        _ = try await migration.migrationState()
+        _ = try await migration.migrationProgress()
+        _ = try await migration.transactionStatuses()
+
+        XCTAssertEqual(welding.migrationRuntimeSnapshotForCallsCount, 6)
+        XCTAssertEqual(welding.migrationReconcileCanonicalChainRunForCallsCount, 3)
+        XCTAssertEqual(
+            welding.migrationReconcileCanonicalChainRunForReceivedArguments?.run.pointer,
+            runtime.delivery?.runHandle.pointer
+        )
+        XCTAssertEqual(welding.migrationReconcileCanonicalChainRunForReceivedArguments?.account, accountA)
+    }
+
+    func testPublicRuntimeSnapshotReturnsThePostReconciliationProjection() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let stale = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .broadcasted,
+            hasExactTransaction: true,
+            runIdentity: 86,
+            claimIdentity: 87
+        )
+        let current = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .confirmed,
+            hasExactTransaction: true,
+            runIdentity: 88,
+            claimIdentity: 89,
+            canonicalStatus: .complete
+        )
+        var reads = 0
+        welding.migrationRuntimeSnapshotForClosure = { _ in
+            defer { reads += 1 }
+            return reads == 0 ? stale : current
+        }
+        let migration = makeMigration(welding: welding, account: accountA)
+
+        let snapshot = try await migration.runtimeSnapshot()
+
+        XCTAssertEqual(snapshot.canonical.status, .complete)
+        XCTAssertEqual(snapshot.delivery?.claims.first?.status, .confirmed)
+        XCTAssertEqual(welding.migrationRuntimeSnapshotForCallsCount, 2)
+        XCTAssertEqual(welding.migrationReconcileCanonicalChainRunForCallsCount, 1)
+        XCTAssertEqual(
+            welding.migrationReconcileCanonicalChainRunForReceivedArguments?.run.pointer,
+            stale.delivery?.runHandle.pointer
+        )
+    }
+
+    func testTerminalScheduleUsesOpaqueInternalRollover() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let staleRuntime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .broadcasted,
+            hasExactTransaction: true,
+            runIdentity: 90,
+            claimIdentity: 91
+        )
+        let reconciledRuntime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .confirmed,
+            hasExactTransaction: true,
+            runIdentity: 92,
+            claimIdentity: 93,
+            canonicalStatus: .complete
+        )
+        var reads = 0
+        welding.migrationRuntimeSnapshotForClosure = { _ in
+            defer { reads += 1 }
+            return reads == 0 ? staleRuntime : reconciledRuntime
+        }
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        welding.migrationRolloverInternalSchedulePredecessorUskForReturnValue = Self.makeRunHandle(94)
+        let migration = makeMigration(welding: welding, account: accountA)
+        let schedule = Self.makeSchedule(count: 1)
+
+        try await migration.signAndStoreMigrationSchedule(
+            schedule,
+            usk: TestsData(networkType: .testnet).spendingKey,
+            options: Self.immediateOptions
+        )
+
+        XCTAssertEqual(welding.migrationRolloverInternalSchedulePredecessorUskForCallsCount, 1)
+        XCTAssertEqual(
+            welding.migrationRolloverInternalSchedulePredecessorUskForReceivedArguments?.schedule,
+            schedule
+        )
+        XCTAssertEqual(
+            welding.migrationRolloverInternalSchedulePredecessorUskForReceivedArguments?.predecessor.pointer,
+            reconciledRuntime.delivery?.runHandle.pointer
+        )
+        XCTAssertEqual(welding.migrationRuntimeSnapshotForCallsCount, 2)
+        XCTAssertEqual(welding.migrationReconcileCanonicalChainRunForCallsCount, 1)
+        XCTAssertFalse(welding.migrationSignAndStoreScheduleUskForCalled)
+    }
+
+    func testTerminalSDKScheduleRejectsDifferentPolicyBeforeAtomicRollover() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .confirmed,
+            hasExactTransaction: true,
+            runIdentity: 95,
+            claimIdentity: 96,
+            canonicalStatus: .complete
+        )
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://different.example:9067"
+        )
         let migration = makeMigration(welding: welding, account: accountA)
 
         do {
-            _ = try await migration.proposeImmediateMigration()
-            XCTFail("Expected proposeImmediateMigration to rethrow the address-derivation error")
-        } catch ZcashError.rustGetCurrentAddress {
+            try await migration.signAndStoreMigrationSchedule(
+                Self.makeSchedule(count: 1),
+                usk: TestsData(networkType: .testnet).spendingKey,
+                options: Self.immediateOptions
+            )
+            XCTFail("Expected inherited submission policy mismatch")
+        } catch MigrationDeliveryError.runtimeUnavailable(.submissionPolicyMismatch) {
             // expected
         } catch {
-            XCTFail("Expected rustGetCurrentAddress but got \(error)")
+            XCTFail("Expected submissionPolicyMismatch but got \(error)")
         }
+
+        XCTAssertFalse(welding.migrationRolloverInternalSchedulePredecessorUskForCalled)
+        XCTAssertFalse(welding.migrationSignAndStoreScheduleUskForCalled)
+        XCTAssertFalse(welding.migrationBindSubmissionPolicyRunForCalled)
     }
 
-    func testProposeImmediateMigrationRethrowsWhenSendMaxProposalFails() async throws {
+    func testTerminalExternalScheduleUsesOpaqueRolloverWithAtomicallyInheritedPolicy() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.getCurrentAddressAccountUUIDReturnValue = UnifiedAddress(validatedEncoding: Self.uaString, networkType: .testnet)
-        welding.proposeSendMaxTransferAccountUUIDRecipientMemoOrchardOnlyThrowableError = ZcashError.rustProposeSendMaxTransfer("boom")
+        let runtime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .confirmed,
+            hasExactTransaction: true,
+            runIdentity: 93,
+            claimIdentity: 94,
+            canonicalStatus: .complete
+        )
+        welding.migrationRuntimeSnapshotForReturnValue = runtime
+        welding.migrationRolloverExternalSchedulePredecessorForReturnValue = Self.makeRunHandle(95)
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        let migration = makeMigration(welding: welding, account: accountA)
+        let schedule = Self.makeSchedule(count: 1)
+
+        _ = try await migration.commitMigrationScheduleForExternalSigning(
+            schedule,
+            options: Self.immediateOptions
+        )
+
+        XCTAssertEqual(welding.migrationRolloverExternalSchedulePredecessorForCallsCount, 1)
+        XCTAssertFalse(welding.migrationCommitExternalScheduleForCalled)
+        XCTAssertFalse(welding.migrationBindSubmissionPolicyRunForCalled)
+        XCTAssertEqual(welding.migrationBoundSubmissionTargetForCallsCount, 1)
+    }
+
+    func testTerminalExternalScheduleRejectsDifferentPolicyBeforeAtomicRollover() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .confirmed,
+            hasExactTransaction: true,
+            runIdentity: 96,
+            claimIdentity: 97,
+            canonicalStatus: .complete
+        )
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://different.example:9067"
+        )
         let migration = makeMigration(welding: welding, account: accountA)
 
         do {
-            _ = try await migration.proposeImmediateMigration()
-            XCTFail("Expected proposeImmediateMigration to rethrow the send-max proposal error")
-        } catch ZcashError.rustProposeSendMaxTransfer {
+            _ = try await migration.commitMigrationScheduleForExternalSigning(
+                Self.makeSchedule(count: 1),
+                options: Self.immediateOptions
+            )
+            XCTFail("Expected inherited submission policy mismatch")
+        } catch MigrationDeliveryError.runtimeUnavailable(.submissionPolicyMismatch) {
             // expected
         } catch {
-            XCTFail("Expected rustProposeSendMaxTransfer but got \(error)")
+            XCTFail("Expected submissionPolicyMismatch but got \(error)")
+        }
+
+        XCTAssertFalse(welding.migrationRolloverExternalSchedulePredecessorForCalled)
+        XCTAssertFalse(welding.migrationBindSubmissionPolicyRunForCalled)
+        XCTAssertFalse(welding.migrationCommitExternalScheduleForCalled)
+    }
+
+    func testPrepareExternalSigningRecoversExposedClaimBeforeMintingAnother() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let runtime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .awaitingExternalSignature,
+            activeClaimKind: .materialization,
+            hasExactTransaction: false,
+            runIdentity: 97,
+            claimIdentity: 98,
+            signerOwnership: .external,
+            externallyExposed: true,
+            hasSignedPCZT: false
+        )
+        let reacquired = Self.makeClaimHandle(99)
+        let canonicalPCZT = Data("CANONICAL-PCZT".utf8)
+        welding.migrationRuntimeSnapshotForReturnValue = runtime
+        welding.migrationResumeClaimClaimForReturnValue = nil
+        welding.migrationReacquireExternalSigningClaimForReturnValue = reacquired
+        welding.migrationClaimExternalSigningPCZTReturnValue = canonicalPCZT
+        let migration = makeMigration(welding: welding, account: accountA)
+
+        let request = try await migration.prepareNextMigrationTransactionForExternalSigning()
+
+        XCTAssertEqual(request?.transactionID, 7)
+        XCTAssertEqual(request?.pczt, canonicalPCZT)
+        XCTAssertEqual(request?.claim.pointer, reacquired.pointer)
+        XCTAssertEqual(welding.migrationResumeClaimClaimForCallsCount, 1)
+        XCTAssertEqual(welding.migrationReacquireExternalSigningClaimForCallsCount, 1)
+        XCTAssertFalse(welding.migrationClaimMaterializationTransactionIDSignerRunForCalled)
+        XCTAssertFalse(welding.migrationStageExternalSigningPCZTClaimForCalled)
+    }
+
+    func testScheduledExternalSigningRelaunchAfterCanonicalSignedResumesProofWithoutReapplyingSignature() async throws {
+        let runtime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .awaitingExternalSignature,
+            activeClaimKind: .materialization,
+            hasExactTransaction: false,
+            runIdentity: 111,
+            claimIdentity: 110,
+            signerOwnership: .external,
+            externallyExposed: true,
+            hasSignedPCZT: true
+        )
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationRuntimeSnapshotForReturnValue = runtime
+        let active = Self.makeClaimHandle(112)
+        welding.migrationResumeClaimClaimForReturnValue = active
+        let canonicalPCZT = Data("SIGNED-BOUND-CANONICAL-PCZT".utf8)
+        welding.migrationClaimExternalSigningPCZTReturnValue = canonicalPCZT
+        welding.migrationTransactionStatusesForReturnValue = [
+            MigrationTransactionStatus(
+                id: 7,
+                kind: .transfer(crossing: 0),
+                state: .signed,
+                scheduledHeight: 2_000_010,
+                expiryHeight: 2_000_040,
+                isReady: true,
+                nextAction: .prove,
+                blockedOn: nil
+            )
+        ]
+        welding.migrationProveClaimClaimForReturnValue = Self.makeClaimHandle(113)
+        Self.configureImmediateSubmission(welding, identity: 114)
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.result = .accepted
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
+        )
+
+        let recovered = try await migration.prepareNextMigrationTransactionForExternalSigning()
+        let request = try XCTUnwrap(recovered)
+        let result = try await migration.submitExternallySignedMigrationTransaction(
+            request: request,
+            signedPCZT: Data("CALLER-RETRY-MUST-BE-IGNORED".utf8)
+        )
+
+        XCTAssertEqual(result, .success(txId: Data(repeating: 0x44, count: 32).toHexStringTxId()))
+        XCTAssertFalse(welding.migrationStageSignedPCZTClaimForCalled)
+        XCTAssertFalse(welding.migrationAdvanceExternalSignatureClaimForCalled)
+        XCTAssertEqual(welding.migrationProveClaimClaimForReceivedArguments?.claim.pointer, active.pointer)
+        XCTAssertEqual(submitter.callsCount, 1)
+    }
+
+    func testRebuildExpiredSDKTransferUsesExactRuntimeClaim() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let runtime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .expiredUnmined,
+            hasExactTransaction: true,
+            runIdentity: 130,
+            claimIdentity: 131
+        )
+        welding.migrationRuntimeSnapshotForReturnValue = runtime
+        welding.migrationRebuildExpiredTransferClaimSignerUskForReturnValue = Self.makeClaimHandle(132)
+        let migration = makeMigration(welding: welding, account: accountA)
+
+        let result = try await migration.rebuildExpiredTransfer(
+            transactionID: 7,
+            usk: TestsData(networkType: .testnet).spendingKey
+        )
+
+        XCTAssertEqual(result, runtime)
+        XCTAssertEqual(welding.migrationRebuildExpiredTransferClaimSignerUskForCallsCount, 1)
+        XCTAssertEqual(
+            welding.migrationRebuildExpiredTransferClaimSignerUskForReceivedArguments?.claim.pointer,
+            runtime.delivery?.claims.first?.claimHandle.pointer
+        )
+        XCTAssertEqual(
+            welding.migrationRebuildExpiredTransferClaimSignerUskForReceivedArguments?.signer,
+            .sdk
+        )
+        XCTAssertEqual(
+            welding.migrationRebuildExpiredTransferClaimSignerUskForReceivedArguments?.account,
+            accountA
+        )
+    }
+
+    func testPauseResumeAndAbandonmentForwardTheOpaqueRun() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let runtime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .materializationFailed,
+            hasExactTransaction: false,
+            runIdentity: 140,
+            claimIdentity: 141
+        )
+        welding.migrationRuntimeSnapshotForReturnValue = runtime
+        welding.migrationPauseDeliveryRunForReturnValue = Self.makeRunHandle(142)
+        welding.migrationResumeDeliveryRunForReturnValue = Self.makeRunHandle(143)
+        welding.migrationBeginAbandonmentRunForReturnValue = Self.makeRunHandle(144)
+        welding.migrationFinishAbandonmentRunForReturnValue = Self.makeRunHandle(145)
+        let migration = makeMigration(welding: welding, account: accountA)
+
+        _ = try await migration.pauseDelivery()
+        _ = try await migration.resumeDelivery()
+        _ = try await migration.beginAbandonment()
+        _ = try await migration.finishAbandonment()
+
+        let expected = runtime.delivery?.runHandle.pointer
+        XCTAssertEqual(welding.migrationPauseDeliveryRunForReceivedArguments?.run.pointer, expected)
+        XCTAssertEqual(welding.migrationResumeDeliveryRunForReceivedArguments?.run.pointer, expected)
+        XCTAssertEqual(welding.migrationBeginAbandonmentRunForReceivedArguments?.run.pointer, expected)
+        XCTAssertEqual(welding.migrationFinishAbandonmentRunForReceivedArguments?.run.pointer, expected)
+    }
+
+    func testExecuteNextPendingTransferBindsPolicyClaimsProvesAndSubmitsExactRustBytes() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let initial = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .unavailable(.submissionPolicyMissing),
+            claimStatus: .materializationFailed,
+            hasExactTransaction: false,
+            runIdentity: 100,
+            claimIdentity: 101
+        )
+        let bound = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .materializationFailed,
+            hasExactTransaction: false,
+            runIdentity: 102,
+            claimIdentity: 103
+        )
+        var snapshotReads = 0
+        welding.migrationRuntimeSnapshotForClosure = { _ in
+            defer { snapshotReads += 1 }
+            return snapshotReads == 0 ? initial : bound
+        }
+        welding.migrationBindSubmissionPolicyRunForReturnValue = Self.makeRunHandle(104)
+        welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(105)
+        welding.migrationClaimMaterializationTransactionIDSignerRunForReturnValue = Self.makeClaimHandle(106)
+        welding.migrationProveClaimClaimForReturnValue = Self.makeClaimHandle(107)
+        Self.configureImmediateSubmission(welding, identity: 108)
+
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.result = .accepted
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
+        )
+
+        let result = try await migration.executeNextPendingTransfer(options: Self.immediateOptions)
+
+        XCTAssertEqual(result, .success(txId: Data(repeating: 0x44, count: 32).toHexStringTxId()))
+        XCTAssertEqual(welding.migrationRuntimeSnapshotForCallsCount, 2)
+        XCTAssertEqual(
+            welding.migrationBindSubmissionPolicyRunForReceivedArguments?.intent,
+            MigrationSubmissionIntent(transport: .directTLS, endpoint: "https://submit.example:9067")
+        )
+        XCTAssertEqual(
+            welding.migrationClaimMaterializationTransactionIDSignerRunForReceivedArguments?.transactionID,
+            7
+        )
+        XCTAssertEqual(
+            welding.migrationClaimMaterializationTransactionIDSignerRunForReceivedArguments?.signer,
+            .sdk
+        )
+        XCTAssertEqual(welding.migrationProveClaimClaimForCallsCount, 1)
+        XCTAssertEqual(submitter.receivedArguments?.transaction.raw, Data([0xAA, 0xBB, 0xCC]))
+        XCTAssertEqual(welding.migrationRecordSubmissionOutcomeClaimForReceivedArguments?.outcome, .accepted)
+        let isBlocked = await migration.isSyncBlocked()
+        XCTAssertTrue(isBlocked)
+    }
+
+    func testExecuteNextPendingTransferRejectsEveryNonBindableUnavailableRuntimeBeforeMutation() async throws {
+        let reasons: [MigrationRuntimeUnavailableReason] = [
+            .schemaUnavailable,
+            .futureSchema(version: 2),
+            .corruptDeliveryState,
+            .legacyCutoverRecovery(objects: 1),
+            .submissionPolicyMismatch,
+            .deliveryInconsistent,
+            .finalityRecovery(.transferEvidenceLost)
+        ]
+
+        for reason in reasons {
+            let welding = ZcashRustBackendWeldingMock()
+            welding.migrationRuntimeSnapshotForReturnValue = Self.makeScheduledRuntime(
+                account: accountA,
+                availability: .unavailable(reason),
+                claimStatus: .staged,
+                hasExactTransaction: true,
+                runIdentity: 150,
+                claimIdentity: 151
+            )
+            let submitter = MigrationTransactionSubmitterMock()
+            let migration = makeMigration(
+                welding: welding,
+                account: accountA,
+                transactionSubmitter: submitter
+            )
+
+            do {
+                _ = try await migration.executeNextPendingTransfer(options: Self.immediateOptions)
+                XCTFail("Expected the unavailable runtime to fail closed: \(reason)")
+            } catch MigrationDeliveryError.runtimeUnavailable(let actualReason) {
+                XCTAssertEqual(actualReason, reason)
+            } catch {
+                XCTFail("Expected runtimeUnavailable(\(reason)) but got \(error)")
+            }
+
+            XCTAssertFalse(welding.migrationBindSubmissionPolicyRunForCalled)
+            XCTAssertFalse(welding.migrationReconcileCanonicalChainRunForCalled)
+            XCTAssertFalse(welding.migrationClaimMaterializationTransactionIDSignerRunForCalled)
+            XCTAssertFalse(welding.migrationProveClaimClaimForCalled)
+            XCTAssertFalse(welding.migrationClaimSubmissionClaimForCalled)
+            XCTAssertEqual(submitter.callsCount, 0)
         }
     }
 
-    /// `recordImmediateMigration` is a straight forward to the welding record call, bound to this
-    /// actor's own account -- the SDK-store bookkeeping (state-machine derivation) all lives
-    /// rust-side.
-    func testRecordImmediateMigrationForwardsTxidAndAccount() async throws {
+    func testExecuteNextPendingTransferAfterRelaunchUsesThePersistedStagedClaimWithoutRematerializing() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        var receivedTxid: Data?
-        var receivedAccount: AccountUUID?
-        welding.migrationRecordImmediateRunTxidForClosure = { txid, account in
-            receivedTxid = txid
-            receivedAccount = account
+        let runtime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .staged,
+            hasExactTransaction: true,
+            runIdentity: 160,
+            claimIdentity: 161
+        )
+        welding.migrationRuntimeSnapshotForReturnValue = runtime
+        welding.migrationBindSubmissionPolicyRunForReturnValue = Self.makeRunHandle(162)
+        welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(163)
+        Self.configureImmediateSubmission(welding, identity: 164)
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.result = .accepted
+
+        // A newly created actor has no Swift-retained claim. Its only authority is the staged claim
+        // projected from durable Rust state above, exactly as after process relaunch.
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
+        )
+        let result = try await migration.executeNextPendingTransfer(options: Self.immediateOptions)
+
+        XCTAssertEqual(result, .success(txId: Data(repeating: 0x44, count: 32).toHexStringTxId()))
+        XCTAssertEqual(
+            welding.migrationClaimSubmissionClaimForReceivedArguments?.claim.pointer,
+            runtime.delivery?.claims.first?.claimHandle.pointer
+        )
+        XCTAssertEqual(welding.migrationClaimSubmissionClaimForReceivedArguments?.account, accountA)
+        XCTAssertFalse(welding.migrationClaimMaterializationTransactionIDSignerRunForCalled)
+        XCTAssertFalse(welding.migrationProveClaimClaimForCalled)
+        XCTAssertFalse(welding.migrationResumeClaimClaimForCalled)
+        XCTAssertEqual(submitter.callsCount, 1)
+        XCTAssertEqual(welding.migrationRecordSubmissionOutcomeClaimForReceivedArguments?.outcome, .accepted)
+    }
+
+    func testExecuteNextPendingTransferReconcilesUnknownClaimWithoutResubmitting() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let initial = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .outcomeUnknown,
+            activeClaimKind: .outcomeResolution,
+            hasExactTransaction: true,
+            runIdentity: 120,
+            claimIdentity: 121
+        )
+        welding.migrationRuntimeSnapshotForReturnValue = initial
+        welding.migrationBindSubmissionPolicyRunForReturnValue = Self.makeRunHandle(122)
+        welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(123)
+        welding.migrationClaimOutcomeResolutionClaimForReturnValue = Self.makeClaimHandle(124)
+        welding.migrationReconcileSubmissionClaimForReturnValue = Self.makeClaimHandle(125)
+        let submitter = MigrationTransactionSubmitterMock()
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
+        )
+
+        let result = try await migration.executeNextPendingTransfer(options: Self.immediateOptions)
+
+        XCTAssertNil(result)
+        XCTAssertEqual(welding.migrationClaimOutcomeResolutionClaimForCallsCount, 1)
+        XCTAssertEqual(welding.migrationReconcileSubmissionClaimForCallsCount, 1)
+        XCTAssertEqual(submitter.callsCount, 0)
+        XCTAssertFalse(welding.migrationClaimSubmissionClaimForCalled)
+        let isBlocked = await migration.isSyncBlocked()
+        XCTAssertFalse(isBlocked)
+    }
+
+    func testTwoAccountActorsKeepOpaqueClaimsAndSubmissionOutcomesAccountScoped() async throws {
+        let accountA = self.accountA
+        let accountB = AccountUUID(id: [UInt8](repeating: 0x22, count: 16))
+        let runtimeA = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .staged,
+            hasExactTransaction: true,
+            runIdentity: 170,
+            claimIdentity: 171
+        )
+        let runtimeB = Self.makeScheduledRuntime(
+            account: accountB,
+            availability: .available,
+            claimStatus: .staged,
+            hasExactTransaction: true,
+            runIdentity: 180,
+            claimIdentity: 181
+        )
+        let stagedA = try XCTUnwrap(runtimeA.delivery?.claims.first?.claimHandle)
+        let stagedB = try XCTUnwrap(runtimeB.delivery?.claims.first?.claimHandle)
+        let runtimeRunA = try XCTUnwrap(runtimeA.delivery?.runHandle)
+        let runtimeRunB = try XCTUnwrap(runtimeB.delivery?.runHandle)
+        let boundRunA = Self.makeRunHandle(172)
+        let boundRunB = Self.makeRunHandle(182)
+        let activeA = Self.makeClaimHandle(173)
+        let activeB = Self.makeClaimHandle(183)
+        let txidA = Data(repeating: 0xA1, count: 32)
+        let txidB = Data(repeating: 0xB2, count: 32)
+        let welding = ZcashRustBackendWeldingMock()
+
+        welding.migrationRuntimeSnapshotForClosure = { account in
+            if account == accountA { return runtimeA }
+            if account == accountB { return runtimeB }
+            throw MigrationDeliveryError.claimUnavailable
         }
-        let migration = makeMigration(welding: welding, account: accountA)
-        let txid = Data(repeating: 0xCD, count: 32)
+        welding.migrationBindSubmissionPolicyRunForClosure = { _, run, account in
+            if account == accountA, run.pointer == runtimeRunA.pointer { return boundRunA }
+            if account == accountB, run.pointer == runtimeRunB.pointer { return boundRunB }
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        welding.migrationReconcileCanonicalChainRunForClosure = { run, account in
+            if account == accountA, run.pointer == boundRunA.pointer { return run }
+            if account == accountB, run.pointer == boundRunB.pointer { return run }
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        welding.migrationClaimSubmissionClaimForClosure = { claim, account in
+            if account == accountA, claim.pointer == stagedA.pointer { return activeA }
+            if account == accountB, claim.pointer == stagedB.pointer { return activeB }
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        welding.migrationClaimRunClosure = { claim in
+            if claim.pointer == activeA.pointer { return boundRunA }
+            if claim.pointer == activeB.pointer { return boundRunB }
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        welding.migrationBoundSubmissionTargetForClosure = { run in
+            guard run.pointer == boundRunA.pointer || run.pointer == boundRunB.pointer else {
+                throw MigrationDeliveryError.claimUnavailable
+            }
+            return MigrationBoundSubmissionTarget(
+                transport: .directTLS,
+                endpoint: "https://submit.example:9067"
+            )
+        }
+        welding.migrationClaimExactTransactionClosure = { claim in
+            if claim.pointer == activeA.pointer { return Data([0xAA]) }
+            if claim.pointer == activeB.pointer { return Data([0xBB]) }
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        welding.migrationClaimTransactionIDClosure = { claim in
+            if claim.pointer == activeA.pointer { return txidA }
+            if claim.pointer == activeB.pointer { return txidB }
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        welding.migrationClaimExpiryHeightReturnValue = 2_000_040
+        welding.migrationClaimConsensusBranchIDReturnValue = 0xC8E71055
+        welding.migrationRecordSubmissionOutcomeClaimForClosure = { outcome, claim, account in
+            guard outcome == .accepted else { throw MigrationDeliveryError.claimUnavailable }
+            if account == accountA, claim.pointer == activeA.pointer { return Self.makeClaimHandle(174) }
+            if account == accountB, claim.pointer == activeB.pointer { return Self.makeClaimHandle(184) }
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        let submitter = MigrationTransactionSubmitterMock()
+        submitter.result = .accepted
+        let migrationA = makeMigration(welding: welding, account: accountA, transactionSubmitter: submitter)
+        let migrationB = makeMigration(welding: welding, account: accountB, transactionSubmitter: submitter)
 
-        try await migration.recordImmediateMigration(txid: txid)
+        let resultA = try await migrationA.executeNextPendingTransfer(options: Self.immediateOptions)
+        let resultB = try await migrationB.executeNextPendingTransfer(options: Self.immediateOptions)
 
-        XCTAssertEqual(receivedTxid, txid)
-        XCTAssertEqual(receivedAccount, accountA)
+        XCTAssertEqual(resultA, .success(txId: txidA.toHexStringTxId()))
+        XCTAssertEqual(resultB, .success(txId: txidB.toHexStringTxId()))
+        XCTAssertEqual(welding.migrationClaimSubmissionClaimForCallsCount, 2)
+        XCTAssertEqual(welding.migrationRecordSubmissionOutcomeClaimForCallsCount, 2)
+        XCTAssertEqual(welding.migrationRecordSubmissionOutcomeClaimForReceivedArguments?.account, accountB)
+    }
+
+    func testSerializedBroadcastFlowLetsOnlyOneConcurrentCallerSubmitTheStagedClaim() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let stagedRuntime = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .available,
+            claimStatus: .staged,
+            hasExactTransaction: true,
+            runIdentity: 190,
+            claimIdentity: 191
+        )
+        let runtimeState = SingleFlightMigrationRuntimeState(
+            initial: stagedRuntime,
+            terminal: Self.makeNoRunRuntime(account: accountA)
+        )
+        welding.migrationRuntimeSnapshotForClosure = { _ in await runtimeState.snapshot() }
+        welding.migrationBindSubmissionPolicyRunForReturnValue = Self.makeRunHandle(192)
+        welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(193)
+        Self.configureImmediateSubmission(welding, identity: 194)
+        welding.migrationRecordSubmissionOutcomeClaimForClosure = { _, _, _ in
+            await runtimeState.markTerminal()
+            return Self.makeClaimHandle(197)
+        }
+        let submitter = GatedMigrationTransactionSubmitter()
+        let migration = makeMigration(
+            welding: welding,
+            account: accountA,
+            transactionSubmitter: submitter
+        )
+
+        let first = Task {
+            try await migration.executeNextPendingTransfer(options: Self.immediateOptions)
+        }
+        await submitter.waitUntilCallCount(1)
+
+        let secondStarted = expectation(description: "the concurrent caller started")
+        let second = Task {
+            secondStarted.fulfill()
+            return try await migration.executeNextPendingTransfer(options: Self.immediateOptions)
+        }
+        await fulfillment(of: [secondStarted], timeout: 1)
+        for _ in 0 ..< 20 { await Task.yield() }
+
+        let callsWhileFirstIsSuspended = await submitter.currentCallCount()
+        XCTAssertEqual(callsWhileFirstIsSuspended, 1)
+        await submitter.release()
+
+        let firstResult = try await first.value
+        let secondResult = try await second.value
+        XCTAssertEqual(firstResult, .success(txId: Data(repeating: 0x44, count: 32).toHexStringTxId()))
+        XCTAssertNil(secondResult)
+        let finalCallCount = await submitter.currentCallCount()
+        XCTAssertEqual(finalCallCount, 1)
+        XCTAssertEqual(welding.migrationRecordSubmissionOutcomeClaimForCallsCount, 1)
     }
 
     // MARK: - Residual locking and the run-count estimate (delegation)
@@ -961,58 +2007,6 @@ final class MigrationLogicTests: ZcashTestCase {
         }
     }
 
-    // MARK: - Broadcast composition (I1 canary)
-
-    /// Canary for the privacy-critical composition in `OrchardMigration.broadcastAndRecord`: a
-    /// pre-broadcast Tor failure must fail closed — throw, record nothing, and never start the
-    /// privacy buffer. Drives the real actor through the ``MigrationBroadcasting`` seam (a fake
-    /// transport), a real ``MigrationSyncGate``, and a welding mock, so a future regression that
-    /// reorders "record" before "broadcast", or adds a direct-transport fallback on Tor failure, would
-    /// turn this test red.
-    func testExecuteNextPendingTransferFailsClosedOnTorUnavailableWithoutRecordingOrGating() async throws {
-        let prepared = PreparedMigrationTransfer(
-            id: "transfer-0",
-            txid: Data(repeating: 0xAB, count: 32),
-            pczt: Data([0x01, 0x02])
-        )
-        let welding = ZcashRustBackendWeldingMock()
-        welding.migrationNextDueTransferForReturnValue = prepared
-        welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x03, 0x04])
-        // A no-op closure: if the fail-closed guard regresses and this ends up called anyway, it
-        // completes instead of crashing the process, so the call-count assertion below fails cleanly
-        // rather than taking the whole test run down with it.
-        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
-
-        let fakeBroadcaster = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable))
-        let gate = makeGate(account: accountA, clock: TestClock(referenceDate))
-
-        let migration = OrchardMigration(
-            welding: welding,
-            accountUUID: accountA,
-            broadcaster: fakeBroadcaster,
-            syncGate: gate,
-            logger: logger
-        )
-
-        do {
-            _ = try await migration.executeNextPendingTransfer(
-                options: MigrationNetworkPrivacyOptions(
-                    useTor: true,
-                    submissionEndpoint: LightWalletEndpoint(address: "default.example", port: 9067)
-                )
-            )
-            XCTFail("Expected migrationTorUnavailable to be thrown")
-        } catch ZcashError.migrationTorUnavailable {
-            // expected
-        } catch {
-            XCTFail("Expected migrationTorUnavailable but got \(error)")
-        }
-
-        XCTAssertEqual(fakeBroadcaster.receivedCalls.count, 1)
-        XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
-        XCTAssertNil(gate.currentResumeAt())
-    }
-
     // MARK: - Helpers
 
     private func makeGate(account: AccountUUID, clock: TestClock) -> MigrationSyncGate {
@@ -1030,13 +2024,248 @@ final class MigrationLogicTests: ZcashTestCase {
 
     /// Builds a real `OrchardMigration` around the given welding mock, wired with a real,
     /// temp-file-backed sync gate and a broadcaster that is never reached by the reschedule path.
-    private func makeMigration(welding: ZcashRustBackendWeldingMock, account: AccountUUID) -> OrchardMigration {
-        OrchardMigration(
+    private func makeMigration(
+        welding: ZcashRustBackendWeldingMock,
+        account: AccountUUID,
+        transactionSubmitter: (any MigrationTransactionSubmitting)? = nil
+    ) -> OrchardMigration {
+        // `isSyncBlocked()` is asserted by several delivery tests after the transaction path
+        // completes. Keep that independent engine query deterministic instead of relying on the
+        // generated mock's implicitly-unwrapped default.
+        welding.migrationHasOverdueTransfersForReturnValue = false
+        if welding.migrationRuntimeSnapshotForReturnValue == nil,
+           welding.migrationRuntimeSnapshotForClosure == nil {
+            welding.migrationRuntimeSnapshotForReturnValue = Self.makeNoRunRuntime(account: account)
+        }
+        if welding.migrationReconcileCanonicalChainRunForReturnValue == nil {
+            welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(0x7FFF)
+        }
+        return OrchardMigration(
             welding: welding,
             accountUUID: account,
             broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),
             syncGate: makeGate(account: account, clock: TestClock(referenceDate)),
-            logger: logger
+            logger: logger,
+            networkType: .testnet,
+            expectedChainName: "test",
+            transactionSubmitter: transactionSubmitter
+        )
+    }
+
+    private static func makeClaimHandle(_ identity: Int) -> MigrationClaimHandle {
+        MigrationClaimHandle(
+            storage: MigrationOpaqueHandleStorage(
+                pointer: OpaquePointer(bitPattern: identity)!,
+                release: { _ in }
+            )
+        )
+    }
+
+    private static func makeRunHandle(_ identity: Int) -> MigrationRunHandle {
+        MigrationRunHandle(
+            storage: MigrationOpaqueHandleStorage(
+                pointer: OpaquePointer(bitPattern: identity)!,
+                release: { _ in }
+            )
+        )
+    }
+
+    private static func configureImmediateSubmission(
+        _ welding: ZcashRustBackendWeldingMock,
+        identity: Int
+    ) {
+        welding.migrationClaimSubmissionClaimForReturnValue = makeClaimHandle(identity)
+        welding.migrationClaimRunReturnValue = makeRunHandle(identity + 1)
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
+        welding.migrationClaimExactTransactionReturnValue = Data([0xAA, 0xBB, 0xCC])
+        welding.migrationClaimTransactionIDReturnValue = Data(repeating: 0x44, count: 32)
+        welding.migrationClaimExpiryHeightReturnValue = 2_000_040
+        welding.migrationClaimConsensusBranchIDReturnValue = 0xC8E71055
+        welding.migrationRecordSubmissionOutcomeClaimForReturnValue = makeClaimHandle(identity + 2)
+    }
+
+    private static func makeNoRunRuntime(account: AccountUUID) -> MigrationRuntimeSnapshot {
+        MigrationRuntimeSnapshot(
+            account: account,
+            canonical: MigrationCanonicalSummary(status: nil, transactionCount: 0),
+            schemaProvenance: .compatible(version: 1),
+            legacyCutover: .fresh,
+            destinationSpendability: .notApplicable,
+            availability: .available,
+            ordinarySpendAuthorization: .unrestricted,
+            accountDeletionAuthorization: .allowed,
+            canonicalMutationAuthorization: .allowed,
+            aggregateStorageFinality: .noRun,
+            delivery: nil,
+            retainedRuns: []
+        )
+    }
+
+    private static func makeImmediateExternalRuntime(
+        account: AccountUUID,
+        runIdentity: Int,
+        claim: MigrationClaimHandle,
+        status: MigrationDeliveryClaimStatus = .awaitingExternalSignature,
+        activeClaimKind: MigrationDeliveryClaimKind? = .materialization,
+        hasSignedPCZT: Bool = false,
+        hasExactTransaction: Bool = false,
+        txid: Data? = nil
+    ) -> MigrationRuntimeSnapshot {
+        let summary = MigrationDeliveryClaimSummary(
+            artifact: .immediate(identity: Data(repeating: 0xA5, count: 32)),
+            signerOwnership: .external,
+            status: status,
+            activeClaimKind: activeClaimKind,
+            externallyExposed: true,
+            hasSignedPCZT: hasSignedPCZT,
+            hasExactTransaction: hasExactTransaction,
+            expiryHeight: 2_000_040,
+            txid: txid,
+            lastError: status == .outcomeUnknown ? .transportOutcomeUnknown : nil,
+            claimHandle: claim
+        )
+        let delivery = MigrationDeliverySnapshot(
+            lane: .immediate,
+            phase: .active,
+            storageFinality: .active,
+            activeSourceReservationCount: 1,
+            hasSubmissionPolicy: true,
+            policyValidationFailure: nil,
+            safeToCancel: false,
+            claims: [summary],
+            runHandle: makeRunHandle(runIdentity)
+        )
+        return MigrationRuntimeSnapshot(
+            account: account,
+            canonical: MigrationCanonicalSummary(status: .inProgress, transactionCount: 1),
+            schemaProvenance: .compatible(version: 1),
+            legacyCutover: .fresh,
+            destinationSpendability: .notSpendable,
+            availability: .available,
+            ordinarySpendAuthorization: .excludingMigrationSources(releaseAtHeight: 2_000_040),
+            accountDeletionAuthorization: .blocked(.unresolvedDelivery),
+            canonicalMutationAuthorization: .blocked(.deliveryOwned),
+            aggregateStorageFinality: .active,
+            delivery: delivery,
+            retainedRuns: []
+        )
+    }
+
+    private static func makeImmediateSDKRuntime(
+        account: AccountUUID,
+        runIdentity: Int,
+        claim: MigrationClaimHandle,
+        status: MigrationDeliveryClaimStatus,
+        activeClaimKind: MigrationDeliveryClaimKind? = nil
+    ) -> MigrationRuntimeSnapshot {
+        let exact = status == .staged || status == .submitting || status == .outcomeUnknown ||
+            status == .broadcasted || status == .confirmed || status == .expiredUnmined
+        let summary = MigrationDeliveryClaimSummary(
+            artifact: .immediate(identity: Data(repeating: 0x5A, count: 32)),
+            signerOwnership: .sdk,
+            status: status,
+            activeClaimKind: activeClaimKind,
+            externallyExposed: false,
+            hasSignedPCZT: false,
+            hasExactTransaction: exact,
+            expiryHeight: 2_000_040,
+            txid: exact ? Data(repeating: 0x44, count: 32) : nil,
+            lastError: status == .outcomeUnknown ? .transportOutcomeUnknown : nil,
+            claimHandle: claim
+        )
+        let delivery = MigrationDeliverySnapshot(
+            lane: .immediate,
+            phase: .active,
+            storageFinality: .active,
+            activeSourceReservationCount: 1,
+            hasSubmissionPolicy: true,
+            policyValidationFailure: nil,
+            safeToCancel: false,
+            claims: [summary],
+            runHandle: makeRunHandle(runIdentity)
+        )
+        return MigrationRuntimeSnapshot(
+            account: account,
+            canonical: MigrationCanonicalSummary(status: .inProgress, transactionCount: 1),
+            schemaProvenance: .compatible(version: 1),
+            legacyCutover: .fresh,
+            destinationSpendability: .notSpendable,
+            availability: .available,
+            ordinarySpendAuthorization: .excludingMigrationSources(releaseAtHeight: 2_000_040),
+            accountDeletionAuthorization: .blocked(.unresolvedDelivery),
+            canonicalMutationAuthorization: .blocked(.deliveryOwned),
+            aggregateStorageFinality: .active,
+            delivery: delivery,
+            retainedRuns: []
+        )
+    }
+
+    private static func makeScheduledRuntime(
+        account: AccountUUID,
+        availability: MigrationRuntimeAvailability,
+        claimStatus: MigrationDeliveryClaimStatus,
+        activeClaimKind: MigrationDeliveryClaimKind? = nil,
+        hasExactTransaction: Bool,
+        runIdentity: Int,
+        claimIdentity: Int,
+        transactionID: UInt32 = 7,
+        signerOwnership: MigrationSignerOwnership = .sdk,
+        externallyExposed: Bool = false,
+        hasSignedPCZT: Bool? = nil,
+        canonicalStatus: MigrationCanonicalStatus = .inProgress,
+        phase: MigrationDeliveryPhase = .active,
+        storageFinality: MigrationStorageFinality = .active
+    ) -> MigrationRuntimeSnapshot {
+        let durableSignedPCZT = hasSignedPCZT ?? (signerOwnership == .external && hasExactTransaction)
+        let lastError: MigrationDeliveryFailureReason?
+        switch claimStatus {
+        case .materializationFailed:
+            lastError = .materializationFailed
+        case .outcomeUnknown:
+            lastError = .transportOutcomeUnknown
+        default:
+            lastError = nil
+        }
+        let claim = MigrationDeliveryClaimSummary(
+            artifact: .scheduled(transactionID: transactionID),
+            signerOwnership: signerOwnership,
+            status: claimStatus,
+            activeClaimKind: activeClaimKind,
+            externallyExposed: externallyExposed,
+            hasSignedPCZT: durableSignedPCZT,
+            hasExactTransaction: hasExactTransaction,
+            expiryHeight: 2_000_040,
+            txid: hasExactTransaction ? Data(repeating: 0x44, count: 32) : nil,
+            lastError: lastError,
+            claimHandle: makeClaimHandle(claimIdentity)
+        )
+        let delivery = MigrationDeliverySnapshot(
+            lane: .scheduled,
+            phase: phase,
+            storageFinality: storageFinality,
+            activeSourceReservationCount: 1,
+            hasSubmissionPolicy: availability == .available,
+            policyValidationFailure: nil,
+            safeToCancel: false,
+            claims: [claim],
+            runHandle: makeRunHandle(runIdentity)
+        )
+        return MigrationRuntimeSnapshot(
+            account: account,
+            canonical: MigrationCanonicalSummary(status: canonicalStatus, transactionCount: 1),
+            schemaProvenance: .compatible(version: 1),
+            legacyCutover: .fresh,
+            destinationSpendability: .notSpendable,
+            availability: availability,
+            ordinarySpendAuthorization: .excludingMigrationSources(releaseAtHeight: 2_000_040),
+            accountDeletionAuthorization: .blocked(.unresolvedDelivery),
+            canonicalMutationAuthorization: .blocked(.deliveryOwned),
+            aggregateStorageFinality: storageFinality,
+            delivery: delivery,
+            retainedRuns: []
         )
     }
 
@@ -1056,7 +2285,11 @@ final class MigrationLogicTests: ZcashTestCase {
             )
             transfers.append(transfer)
         }
-        return MigrationSchedule(transfers: transfers, estimatedDurationHours: count * 6)
+        return MigrationSchedule(
+            transfers: transfers,
+            estimatedDurationHours: count * 6,
+            proposalHandle: 0xA11C_E
+        )
     }
 
     /// Builds a deliberately non-trivial `MigrationRunEstimate` fixture: two runs whose fields are
@@ -1082,38 +2315,83 @@ final class MigrationLogicTests: ZcashTestCase {
         )
     }
 
-    /// Builds a single-step `FfiProposal` fixture shaped like a send-max proposal: one
-    /// `receivedOutput` input per entry of `inputValues`, one `proposedChange` output per entry of
-    /// `changeValues` (empty for a "true" send-max, non-empty to exercise the decode's defensive
-    /// subtraction), and `fee` as the step's `feeRequired`.
-    static func makeSendMaxProposal(inputValues: [UInt64], changeValues: [UInt64], fee: UInt64) -> FfiProposal {
-        var inputs: [FfiProposedInput] = []
-        for value in inputValues {
-            var receivedOutput = FfiReceivedOutput()
-            receivedOutput.value = value
-            var input = FfiProposedInput()
-            input.receivedOutput = receivedOutput
-            inputs.append(input)
+}
+
+/// Mutable durable-state projection used to model the runtime changing underneath two serialized
+/// calls after the first call records its submission outcome.
+private actor SingleFlightMigrationRuntimeState {
+    private var current: MigrationRuntimeSnapshot
+    private let terminal: MigrationRuntimeSnapshot
+
+    init(initial: MigrationRuntimeSnapshot, terminal: MigrationRuntimeSnapshot) {
+        current = initial
+        self.terminal = terminal
+    }
+
+    func snapshot() -> MigrationRuntimeSnapshot {
+        current
+    }
+
+    func markTerminal() {
+        current = terminal
+    }
+}
+
+/// Suspends the first transaction submission until the test releases it, allowing a second caller
+/// to contend with the actor's serialized broadcast flow without relying on wall-clock sleeps.
+private actor GatedMigrationTransactionSubmitter: MigrationTransactionSubmitting {
+    private var callCount = 0
+    private var isReleased = false
+    private var submitWaiters: [CheckedContinuation<Void, Never>] = []
+    private var callCountWaiters: [(threshold: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    // swiftlint:disable:next function_parameter_count
+    func submit(
+        transaction: EncodedTransaction,
+        expiryHeight: BlockHeight,
+        target: MigrationBoundSubmissionTarget,
+        expectedChainName: String,
+        transactionConsensusBranchId: UInt32,
+        branchIdForHeight: @escaping (Int32) throws -> Int32,
+        renewLease: @escaping () async throws -> Void
+    ) async throws -> MigrationSubmissionOutcome {
+        callCount += 1
+        var remainingCallCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+        for waiter in callCountWaiters {
+            if callCount >= waiter.threshold {
+                waiter.continuation.resume()
+            } else {
+                remainingCallCountWaiters.append(waiter)
+            }
         }
+        callCountWaiters = remainingCallCountWaiters
 
-        var changes: [FfiChangeValue] = []
-        for value in changeValues {
-            var change = FfiChangeValue()
-            change.value = value
-            changes.append(change)
+        if !isReleased {
+            await withCheckedContinuation { continuation in
+                submitWaiters.append(continuation)
+            }
         }
+        return .accepted
+    }
 
-        var balance = FfiTransactionBalance()
-        balance.feeRequired = fee
-        balance.proposedChange = changes
+    func waitUntilCallCount(_ threshold: Int) async {
+        if callCount >= threshold { return }
+        await withCheckedContinuation { continuation in
+            callCountWaiters.append((threshold, continuation))
+        }
+    }
 
-        var step = FfiProposalStep()
-        step.inputs = inputs
-        step.balance = balance
+    func release() {
+        isReleased = true
+        let waiters = submitWaiters
+        submitWaiters = []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
 
-        var proposal = FfiProposal()
-        proposal.steps = [step]
-        return proposal
+    func currentCallCount() -> Int {
+        callCount
     }
 }
 

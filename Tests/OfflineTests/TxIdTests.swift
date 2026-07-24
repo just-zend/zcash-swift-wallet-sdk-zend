@@ -29,9 +29,8 @@ class TxIdTests: XCTestCase {
     /// regression cannot hide behind a symmetric fixture the way it could with e.g.
     /// `Data(repeating: 0xAB, count: 32)`, whose reversal is indistinguishable from the original.
     /// `displayHex`/`expectedRawBytes` are hand-derived from the documented convention (reverse the
-    /// byte order, then hex-encode -- see `PreparedMigrationTransfer.txid` and
-    /// `MigrationTransferResult.success`'s doc comments) rather than produced by running the helpers
-    /// under test and pasting their output.
+    /// byte order, then hex-encode -- see `MigrationTransferResult.success`'s doc comment) rather
+    /// than produced by running the helpers under test and pasting their output.
     ///
     /// This direction starts from the string: decode, check the raw bytes against the hand-written
     /// expectation, then re-encode and check the string comes back unchanged.

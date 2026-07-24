@@ -35,7 +35,7 @@ public struct AccountId: Equatable, Codable, Hashable {
     }
 }
 
-public struct AccountUUID: Equatable, Codable, Hashable, Identifiable {
+public struct AccountUUID: Equatable, Codable, Hashable, Identifiable, Sendable {
     public let id: [UInt8]
 
     /// Reconstructs an account UUID from its canonical 16-byte representation.

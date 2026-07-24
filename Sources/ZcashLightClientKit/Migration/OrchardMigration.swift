@@ -142,6 +142,9 @@ actor OrchardMigration {
     private let welding: ZcashRustBackendWelding
     private let accountUUID: AccountUUID
     private let broadcaster: any MigrationBroadcasting
+    private let transactionSubmitter: any MigrationTransactionSubmitting
+    private let networkType: NetworkType
+    private let expectedChainName: String
     private let syncGate: MigrationSyncGate
     private let logger: Logger
 
@@ -212,6 +215,16 @@ actor OrchardMigration {
         self.accountUUID = accountUUID
         self.logger = logger
         self.broadcaster = sharedBroadcaster
+        self.networkType = config.network.networkType
+        self.expectedChainName = (config.network.customNetworkBase ?? config.network.networkType).chainName
+        if let transportFactory = sharedBroadcaster as? any MigrationTransportCreating {
+            self.transactionSubmitter = LiveMigrationTransactionSubmitter(
+                transportFactory: transportFactory,
+                logger: logger
+            )
+        } else {
+            self.transactionSubmitter = UnavailableMigrationTransactionSubmitter()
+        }
         self.syncGate = MigrationSyncGate(
             directory: config.generalStorageURL,
             accountUUID: accountUUID,
@@ -231,32 +244,56 @@ actor OrchardMigration {
         accountUUID: AccountUUID,
         broadcaster: any MigrationBroadcasting,
         syncGate: MigrationSyncGate,
-        logger: Logger
+        logger: Logger,
+        networkType: NetworkType = .testnet,
+        expectedChainName: String? = nil,
+        transactionSubmitter: (any MigrationTransactionSubmitting)? = nil
     ) {
         self.welding = welding
         self.accountUUID = accountUUID
         self.broadcaster = broadcaster
+        self.networkType = networkType
+        self.expectedChainName = expectedChainName ?? networkType.chainName
+        self.transactionSubmitter = transactionSubmitter ?? UnavailableMigrationTransactionSubmitter()
         self.syncGate = syncGate
         self.logger = logger
     }
 
     // MARK: - State
 
-    /// The current Orchard -> Ironwood migration state. Also the reconciliation hub: call it on
-    /// launch and after every migration operation.
+    /// The current Orchard -> Ironwood migration state. A high-level read first gives the
+    /// Rust-owned delivery runtime its opaque scheduled-run capability to reconcile canonical
+    /// chain evidence, then reads the pure compatibility projection.
     func migrationState() async throws -> MigrationState {
-        try await welding.migrationState(for: accountUUID)
+        try await reconcileScheduledCanonicalChainBeforeProjection()
+        return try await welding.migrationState(for: accountUUID)
+    }
+
+    /// One atomic projection of the canonical upstream migration state together with the
+    /// Rust-owned delivery run and its opaque claim capabilities. Hosts should use this for
+    /// orchestration instead of rebuilding a parallel state machine from several legacy reads.
+    func runtimeSnapshot() async throws -> MigrationRuntimeSnapshot {
+        try await reconciledRuntimeSnapshot()
     }
 
     /// Live migration progress, or `nil` when no migration is in progress.
     func migrationProgress() async throws -> MigrationProgress? {
-        try await welding.migrationProgress(for: accountUUID)
+        try await reconcileScheduledCanonicalChainBeforeProjection()
+        return try await welding.migrationProgress(for: accountUUID)
     }
 
     /// The LIVE status of every committed migration transaction, keyed by its stable id -- the
     /// per-transaction detail view behind ``migrationProgress()``'s aggregate summary.
     func transactionStatuses() async throws -> [MigrationTransactionStatus] {
-        try await welding.migrationTransactionStatuses(for: accountUUID)
+        try await reconcileScheduledCanonicalChainBeforeProjection()
+        return try await welding.migrationTransactionStatuses(for: accountUUID)
+    }
+
+    /// Keeps low-level state/progress/status FFI reads side-effect free while ensuring the public
+    /// orchestration surface observes current chain evidence. Only the Rust-owned runtime can
+    /// supply the exact scheduled run capability required by the canonical reconciliation CAS.
+    private func reconcileScheduledCanonicalChainBeforeProjection() async throws {
+        _ = try await reconciledRuntimeSnapshot()
     }
 
     // MARK: - Note splitting
@@ -274,36 +311,6 @@ actor OrchardMigration {
         try await welding.migrationPrepareNoteSplit(for: accountUUID)
     }
 
-    /// Signs, extracts, broadcasts, and records the note-split transaction, returning the broadcast
-    /// outcome.
-    ///
-    /// Composition: sign the split, extract the broadcast bytes, broadcast once, and — only on a
-    /// success outcome — start the privacy buffer, *before* recording the mapped result: the gate
-    /// marks on submit success, independent of record bookkeeping. A transport failure or a server
-    /// rejection is *returned* as a ``MigrationTransferResult`` (and recorded first, gate untouched).
-    ///
-    /// Throws: a pre-broadcast failure throws untouched (a signing error, or
-    /// ``ZcashError/migrationTorUnavailable`` when `options.useTor` is set and Tor cannot be
-    /// established — nothing was broadcast and nothing is recorded). A record failure *after* a
-    /// successful broadcast throws ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the
-    /// broadcast DID land and the privacy buffer is already running; the failure is transient from
-    /// the migration's point of view, because a later execution window self-heals (re-submitting
-    /// draws a duplicate rejection, which records as success).
-    ///
-    /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
-    /// (this method or ``executeNextPendingTransfer(options:)``) is in flight, this call first waits
-    /// for it to finish — it never broadcasts concurrently with it and never throws on contention.
-    func submitNoteSplit(
-        proposal: NoteSplitProposal,
-        usk: UnifiedSpendingKey,
-        options: MigrationNetworkPrivacyOptions
-    ) async throws -> MigrationTransferResult {
-        try await serializedBroadcastFlow { () async throws -> MigrationTransferResult in
-            let prepared = try await welding.migrationSignNoteSplit(proposal: proposal, usk: usk, for: accountUUID)
-            return try await broadcastAndRecord(prepared: prepared, options: options)
-        }
-    }
-
     // MARK: - Migration proposal
 
     /// The full migration schedule for the spendable Orchard balance.
@@ -311,52 +318,97 @@ actor OrchardMigration {
         try await welding.migrationProposeTransfers(for: accountUUID)
     }
 
-    /// Proposes the immediate (single-transaction) migration: an ordinary send-max that spends ALL
-    /// spendable Orchard notes and pays everything minus the ZIP-317 fee to the account's own
-    /// unified address -- post-NU6.3 the payment lands in the Ironwood pool (the UA's Orchard
-    /// receiver doubles as the Ironwood receiver). Entirely outside the migration engine: the
-    /// returned proposal is an ORDINARY proposal held by the caller, so no engine plan-cache
-    /// staleness applies to it (unlike ``proposeMigrationTransfers()``).
-    func proposeImmediateMigration() async throws -> ImmediateMigrationProposal {
-        let ownAddress = try await welding.getCurrentAddress(accountUUID: accountUUID)
-        let ffiProposal = try await welding.proposeSendMaxTransfer(
-            accountUUID: accountUUID,
-            recipient: ownAddress.stringEncoded,
-            memo: nil,
-            orchardOnly: true
+    /// Atomically reserves, materializes, submits, and records one SDK-signed immediate migration.
+    /// The proposal, sources, destination, expiry, branch, exact transaction, and submission policy
+    /// are all sealed by Rust before any bytes can leave the wallet database. Swift never creates an
+    /// ordinary send proposal and never records a caller-supplied transaction id.
+    func submitImmediateMigration(
+        usk: UnifiedSpendingKey,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationSubmissionOutcome {
+        try await serializedBroadcastFlow {
+            let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+                options: options,
+                networkType: networkType
+            )
+            let runtime = try await reconciledRuntimeSnapshot()
+            if let recovered = try await resumeImmediateSDKSubmissionIfPresent(
+                runtime: runtime,
+                intent: intent,
+                usk: usk
+            ) {
+                return recovered
+            }
+            let reserved = try await welding.migrationReserveImmediate(
+                signer: .sdk,
+                submission: intent,
+                for: accountUUID
+            )
+            let staged: MigrationClaimHandle
+            do {
+                staged = try await welding.migrationMaterializeImmediateSDK(
+                    claim: reserved,
+                    usk: usk,
+                    for: accountUUID
+                )
+            } catch {
+                await releaseKnownUnsentClaim(reserved, failure: .materializationFailed)
+                throw error
+            }
+            return try await acquireAndSubmitClaim(staged).outcome
+        }
+    }
+
+    /// Reserves an external-signer immediate migration and returns only the PCZT Rust atomically
+    /// built, proved, and staged under the returned request's opaque claim. Repeating this call
+    /// after a process relaunch recovers the same Rust-owned artifact and exact staged PCZT; it
+    /// never replaces an externally exposed artifact with a newly planned migration.
+    func prepareImmediateMigrationForExternalSigning(
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> ImmediateMigrationExternalSigningRequest {
+        let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+            options: options,
+            networkType: networkType
         )
-        let proposal = Proposal(inner: ffiProposal)
-        let fee = proposal.totalFeeRequired()
-        let amount = OrchardMigration.sweptPaymentValue(of: ffiProposal) - fee
-        return ImmediateMigrationProposal(proposal: proposal, amount: amount, fee: fee)
+        if let recovered = try await recoverPreparedImmediateExternalSigning(intent: intent) {
+            return recovered
+        }
+        let reserved = try await welding.migrationReserveImmediate(
+            signer: .external,
+            submission: intent,
+            for: accountUUID
+        )
+        let staged: MigrationClaimHandle
+        do {
+            staged = try await welding.migrationPrepareImmediateExternalSigning(
+                claim: reserved,
+                for: accountUUID
+            )
+        } catch {
+            await releaseKnownUnsentClaim(reserved, failure: .materializationFailed)
+            throw error
+        }
+        guard let pczt = try await welding.migrationClaimExternalSigningPCZT(staged) else {
+            await releaseKnownUnsentClaim(staged, failure: .materializationFailed)
+            throw MigrationDeliveryError.missingExternalSigningPCZT
+        }
+        return ImmediateMigrationExternalSigningRequest(pczt: pczt, claim: staged)
     }
 
-    /// Records a broadcast immediate-migration sweep so the platform migration state machine
-    /// reports it: `InProgress` (0 of 1) while unmined, `Complete` once mined, or a re-offer
-    /// (`NotStarted`) if it expires unmined. Not broadcast-performing itself (the broadcast rides
-    /// the ordinary `createProposedTransactions`/`createTransactionFromPCZT` pipeline, already
-    /// guarded there) -- this only records the outcome, so it is not gated by
-    /// ``serializedBroadcastFlow(_:)``.
-    func recordImmediateMigration(txid: Data) async throws {
-        try await welding.migrationRecordImmediateRun(txid: txid, for: accountUUID)
-    }
-
-    /// The net value swept by an immediate-migration `FfiProposal` before its fee is subtracted:
-    /// the total value of the notes it consumes, minus any declared change. A send-max proposal
-    /// declares no change (there is nothing left to return), so this is ordinarily just the input
-    /// total; the change subtraction is defensive rather than load-bearing.
-    private static func sweptPaymentValue(of proposal: FfiProposal) -> Zatoshi {
-        proposal.steps.reduce(Zatoshi.zero) { total, step in
-            let stepInput = step.inputs.reduce(Zatoshi.zero) { inputTotal, input in
-                guard case .receivedOutput(let output) = input.value else {
-                    return inputTotal
-                }
-                return inputTotal + Zatoshi(Int64(output.value))
-            }
-            let stepChange = step.balance.proposedChange.reduce(Zatoshi.zero) { changeTotal, change in
-                changeTotal + Zatoshi(Int64(change.value))
-            }
-            return total + stepInput - stepChange
+    /// Merges an external signer's response against the exact staged PCZT, atomically finalizes the
+    /// reserved transaction in Rust, then submits and records it through the same claim-owned lane
+    /// as SDK signing.
+    func submitExternallySignedImmediateMigration(
+        request: ImmediateMigrationExternalSigningRequest,
+        signedPCZT: Data
+    ) async throws -> MigrationSubmissionOutcome {
+        try await serializedBroadcastFlow {
+            let runtime = try await reconciledRuntimeSnapshot()
+            return try await resumeImmediateExternalSubmission(
+                runtime: runtime,
+                request: request,
+                signedPCZT: signedPCZT
+            )
         }
     }
 
@@ -369,17 +421,20 @@ actor OrchardMigration {
         try await welding.migrationResidualAfterMigration(for: accountUUID)
     }
 
-    /// Locks every currently-spendable, not-already-locked legacy-Orchard note until explicit
-    /// unlock and returns the total value locked — the "Lock balance" choice at migration
-    /// `Complete`. A straight delegation to the welding lock call, bound to this actor's own
-    /// account; not broadcast-performing, so it is not gated by ``serializedBroadcastFlow(_:)``.
+    /// After strict public migration `Complete`, locks every currently-spendable,
+    /// not-already-locked legacy-Orchard note until explicit unlock and returns the total value
+    /// locked — the "Lock balance" choice. Rust re-audits exact outputs and clears the provisional
+    /// migration owner before acquiring the distinct residual owner. A straight delegation to the
+    /// welding lock call, bound to this actor's own account; not broadcast-performing, so it is not
+    /// gated by ``serializedBroadcastFlow(_:)``.
     func lockMigrationResidual() async throws -> Zatoshi {
         try await welding.lockMigrationResidual(accountUUID: accountUUID)
     }
 
-    /// Unlocks the account's locked outputs — the release half of ``lockMigrationResidual()`` —
-    /// and returns the number of outputs unlocked. A straight delegation to the welding unlock
-    /// call, bound to this actor's own account.
+    /// Unlocks only outputs held by this account's residual-lock owner — the release half of
+    /// ``lockMigrationResidual()`` — and returns the number of outputs unlocked. Migration,
+    /// ordinary-PCZT, and foreign-owner locks remain intact. A straight delegation to the welding
+    /// unlock call, bound to this actor's own account.
     func unlockMigrationResidual() async throws -> Int {
         try await welding.unlockMigrationResidual(accountUUID: accountUUID)
     }
@@ -391,49 +446,444 @@ actor OrchardMigration {
         try await welding.estimateMigrationRuns(accountUUID: accountUUID)
     }
 
-    /// Pre-signs and persists every transfer in `schedule` in the migration engine.
-    ///
-    /// The SDK does not retain the proposal list: hosts that need to render the committed schedule
-    /// later must persist it themselves at confirmation time.
-    func signAndStoreMigrationSchedule(_ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws {
-        try await welding.migrationSignAndStoreSchedule(schedule, usk: usk, for: accountUUID)
+    /// Commits the exact approved SDK-signed schedule and binds its submission policy. If the
+    /// current scheduled run is terminal, the requested policy must match the immutable predecessor
+    /// policy before Rust atomically rolls it into a successor that inherits that policy. This is
+    /// the supported second-and-later-run path and prevents a post-CAS policy mismatch from
+    /// stranding the new run.
+    func signAndStoreMigrationSchedule(
+        _ schedule: MigrationSchedule,
+        usk: UnifiedSpendingKey,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws {
+        let runtime = try await reconciledRuntimeSnapshot()
+        let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+            options: options,
+            networkType: networkType
+        )
+        if Self.isTerminal(runtime.canonical.status) {
+            guard let delivery = runtime.delivery, delivery.lane == .scheduled else {
+                throw MigrationDeliveryError.scheduledDeliveryRunUnavailable
+            }
+            try await requireBoundSubmissionTarget(delivery, matches: intent)
+            _ = try await welding.migrationRolloverInternalSchedule(
+                schedule,
+                predecessor: delivery.runHandle,
+                usk: usk,
+                for: accountUUID
+            )
+        } else {
+            try await welding.migrationSignAndStoreSchedule(schedule, usk: usk, for: accountUUID)
+            let committed = try await reconciledRuntimeSnapshot()
+            guard let delivery = committed.delivery, delivery.lane == .scheduled else {
+                throw MigrationDeliveryError.scheduledDeliveryRunUnavailable
+            }
+            _ = try await welding.migrationBindSubmissionPolicy(
+                intent,
+                run: delivery.runHandle,
+                for: accountUUID
+            )
+        }
+    }
+
+    /// Commits the exact approved external-signer schedule and binds its Rust-validated submission
+    /// policy. A terminal predecessor is rolled over atomically; no PCZT bytes are exposed here.
+    func commitMigrationScheduleForExternalSigning(
+        _ schedule: MigrationSchedule,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationRuntimeSnapshot {
+        let runtime = try await reconciledRuntimeSnapshot()
+        let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+            options: options,
+            networkType: networkType
+        )
+        if Self.isTerminal(runtime.canonical.status) {
+            guard let delivery = runtime.delivery, delivery.lane == .scheduled else {
+                throw MigrationDeliveryError.scheduledDeliveryRunUnavailable
+            }
+            // Rollover atomically inherits the immutable predecessor policy. Validate the caller's
+            // requested policy before the CAS so a mismatch cannot install a successor and fail only
+            // afterward while trying to rebind it.
+            try await requireBoundSubmissionTarget(delivery, matches: intent)
+            _ = try await welding.migrationRolloverExternalSchedule(
+                schedule,
+                predecessor: delivery.runHandle,
+                for: accountUUID
+            )
+        } else {
+            let run = try await welding.migrationCommitExternalSchedule(schedule, for: accountUUID)
+            _ = try await welding.migrationBindSubmissionPolicy(intent, run: run, for: accountUUID)
+        }
+        return try await reconciledRuntimeSnapshot()
+    }
+
+    /// Returns the next exact canonical scheduled PCZT that Rust has durably staged for an
+    /// external signer. On relaunch, an already-exposed artifact is resumed or reacquired by exact
+    /// identity; this method never skips it or replaces it with a new transaction.
+    func prepareNextMigrationTransactionForExternalSigning() async throws -> ScheduledMigrationExternalSigningRequest? {
+        try await serializedBroadcastFlow {
+            let runtime = try await reconciledRuntimeSnapshot()
+            guard case .available = runtime.availability else {
+                if case .unavailable(let reason) = runtime.availability {
+                    throw MigrationDeliveryError.runtimeUnavailable(reason)
+                }
+                throw MigrationDeliveryError.runtimeUnavailable(.deliveryInconsistent)
+            }
+            guard let delivery = runtime.delivery, delivery.lane == .scheduled else {
+                throw MigrationDeliveryError.scheduledDeliveryRunUnavailable
+            }
+            guard delivery.phase == .active else { return nil }
+
+            let candidates = delivery.claims.compactMap {
+                claim -> (UInt32, MigrationDeliveryClaimSummary)? in
+                guard case .scheduled(let transactionID) = claim.artifact,
+                      claim.signerOwnership == .external else {
+                    return nil
+                }
+                return (transactionID, claim)
+            }.sorted { $0.0 < $1.0 }
+
+            // An externally exposed artifact is irrevocable. Recover it before considering any
+            // other row. `hasSignedPCZT` means a signer merge already crossed the durable boundary;
+            // the submit path will resume canonical advancement/proving instead of merging it again.
+            if let (transactionID, exposed) = candidates.first(where: {
+                $0.1.externallyExposed &&
+                    ($0.1.status == .awaitingExternalSignature ||
+                        $0.1.status == .staged ||
+                        $0.1.status == .submitting ||
+                        $0.1.status == .outcomeUnknown ||
+                        $0.1.status == .broadcasted ||
+                        $0.1.status == .confirmed)
+            }) {
+                let recovered: MigrationClaimHandle
+                if exposed.status == .awaitingExternalSignature {
+                    recovered = try await resumableExternalSigningClaim(exposed.claimHandle)
+                } else {
+                    // Staged and network-outcome states need no signing lease. Their snapshot handle
+                    // identifies the same exact artifact and can only authorize the status-appropriate
+                    // submission or resolution transition.
+                    recovered = exposed.claimHandle
+                }
+                return try await externalSigningRequest(transactionID: transactionID, claim: recovered)
+            }
+
+            for (transactionID, summary) in candidates {
+                switch summary.status {
+                case .confirmed, .broadcasted, .expiredUnmined, .externalSigningExpiredUnmined,
+                     .staged, .submitting, .outcomeUnknown:
+                    continue
+                case .materializationFailed:
+                    continue
+                case .materializing, .awaitingExternalSignature:
+                    break
+                }
+
+                let resumed = try await welding.migrationResumeClaim(
+                    claim: summary.claimHandle,
+                    for: accountUUID
+                )
+                let active: MigrationClaimHandle?
+                if let resumed {
+                    active = resumed
+                } else {
+                    active = try await welding.migrationClaimMaterialization(
+                        transactionID: transactionID,
+                        signer: .external,
+                        run: delivery.runHandle,
+                        for: accountUUID
+                    )
+                }
+                guard let active else { continue }
+                let staged = try await welding.migrationStageExternalSigningPCZT(
+                    claim: active,
+                    for: accountUUID
+                )
+                return try await externalSigningRequest(transactionID: transactionID, claim: staged)
+            }
+            return nil
+        }
+    }
+
+    /// Applies the external signer's response to the exact opaque claim, advances the canonical
+    /// transaction, proves and stages exact network bytes, and submits through the bound policy.
+    func submitExternallySignedMigrationTransaction(
+        request: ScheduledMigrationExternalSigningRequest,
+        signedPCZT: Data
+    ) async throws -> MigrationTransferResult {
+        try await serializedBroadcastFlow {
+            let runtime = try await reconciledRuntimeSnapshot()
+            guard case .available = runtime.availability,
+                  let delivery = runtime.delivery,
+                  delivery.lane == .scheduled,
+                  let summary = delivery.claims.first(where: {
+                      $0.artifact == .scheduled(transactionID: request.transactionID) &&
+                          $0.signerOwnership == .external
+                  }) else {
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
+            guard let canonicalPCZT = try await welding.migrationClaimExternalSigningPCZT(summary.claimHandle),
+                  canonicalPCZT == request.pczt else {
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
+
+            switch summary.status {
+            case .awaitingExternalSignature:
+                let active = try await resumableExternalSigningClaim(summary.claimHandle)
+                let statuses = try await welding.migrationTransactionStatuses(for: accountUUID)
+                guard let canonical = statuses.first(where: { $0.id == request.transactionID }) else {
+                    throw MigrationDeliveryError.externalSigningClaimUnavailable
+                }
+
+                let signed: MigrationClaimHandle
+                switch (canonical.state, summary.hasSignedPCZT) {
+                case (.awaitingSignature, false):
+                    let merged = try await welding.migrationStageSignedPCZT(
+                        signedPCZT,
+                        claim: active,
+                        for: accountUUID
+                    )
+                    signed = try await welding.migrationAdvanceExternalSignature(
+                        claim: merged,
+                        for: accountUUID
+                    )
+                case (.awaitingSignature, true):
+                    // The signer merge committed but canonical advancement did not. Consume the
+                    // already-staged merge; never re-merge caller bytes.
+                    signed = try await welding.migrationAdvanceExternalSignature(
+                        claim: active,
+                        for: accountUUID
+                    )
+                case (.signed, true):
+                    // Relaunch after canonical AwaitingSignature -> Signed but before proving.
+                    // The fresh runtime claim contains the durable merge and can resume proof.
+                    signed = active
+                default:
+                    throw MigrationDeliveryError.externalSigningClaimUnavailable
+                }
+
+                let staged = try await welding.migrationProveClaim(claim: signed, for: accountUUID)
+                return try await acquireAndSubmitClaim(staged).legacyTransferResult
+            case .staged:
+                guard summary.hasExactTransaction else {
+                    throw MigrationDeliveryError.missingExactTransaction
+                }
+                return try await acquireAndSubmitClaim(summary.claimHandle).legacyTransferResult
+            case .submitting:
+                guard summary.activeClaimKind == .submission,
+                      let resumed = try await welding.migrationResumeClaim(
+                          claim: summary.claimHandle,
+                          for: accountUUID
+                      ) else {
+                    return .networkError(retryable: false)
+                }
+                return try await submitActiveClaim(resumed).legacyTransferResult
+            case .outcomeUnknown:
+                let reconciled = try await reconcileUnknownSubmission(summary)
+                return try legacyTransferResult(for: reconciled ?? summary)
+            case .broadcasted, .confirmed:
+                return try legacyTransferResult(for: summary)
+            case .expiredUnmined, .externalSigningExpiredUnmined:
+                return .networkError(retryable: false)
+            case .materializing, .materializationFailed:
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
+        }
+    }
+
+    /// Pauses the current delivery run without releasing reservations or exposed artifacts.
+    func pauseDelivery() async throws -> MigrationRuntimeSnapshot {
+        let delivery = try await currentDelivery()
+        _ = try await welding.migrationPauseDelivery(run: delivery.runHandle, for: accountUUID)
+        return try await reconciledRuntimeSnapshot()
+    }
+
+    /// Resumes the current paused delivery run.
+    func resumeDelivery() async throws -> MigrationRuntimeSnapshot {
+        let delivery = try await currentDelivery()
+        _ = try await welding.migrationResumeDelivery(run: delivery.runHandle, for: accountUUID)
+        return try await reconciledRuntimeSnapshot()
+    }
+
+    /// Begins safe abandonment while Rust retains every possibly exposed artifact and source.
+    func beginAbandonment() async throws -> MigrationRuntimeSnapshot {
+        let delivery = try await currentDelivery()
+        _ = try await welding.migrationBeginAbandonment(run: delivery.runHandle, for: accountUUID)
+        return try await reconciledRuntimeSnapshot()
+    }
+
+    /// Finishes abandonment only after Rust proves all exposed artifacts terminally safe.
+    func finishAbandonment() async throws -> MigrationRuntimeSnapshot {
+        let delivery = try await currentDelivery()
+        _ = try await welding.migrationFinishAbandonment(run: delivery.runHandle, for: accountUUID)
+        return try await reconciledRuntimeSnapshot()
+    }
+
+    /// Rebuilds exactly one positively expired SDK-signed attempt under its generation-bound
+    /// claim. The regular execute-next API resumes and proves the replacement.
+    func rebuildExpiredTransfer(transactionID: UInt32, usk: UnifiedSpendingKey) async throws -> MigrationRuntimeSnapshot {
+        let summary = try await expiredTransfer(transactionID: transactionID, signer: .sdk)
+        _ = try await welding.migrationRebuildExpiredTransfer(
+            claim: summary.claimHandle,
+            signer: .sdk,
+            usk: usk,
+            for: accountUUID
+        )
+        return try await reconciledRuntimeSnapshot()
+    }
+
+    /// Rebuilds exactly one positively expired external-signer attempt and atomically stages its
+    /// replacement PCZT before exposing it.
+    func rebuildExpiredTransferForExternalSigning(
+        transactionID: UInt32
+    ) async throws -> ScheduledMigrationExternalSigningRequest {
+        let summary = try await expiredTransfer(transactionID: transactionID, signer: .external)
+        let rebuilt = try await welding.migrationRebuildExpiredTransfer(
+            claim: summary.claimHandle,
+            signer: .external,
+            usk: nil,
+            for: accountUUID
+        )
+        let staged = try await welding.migrationStageExternalSigningPCZT(
+            claim: rebuilt,
+            for: accountUUID
+        )
+        return try await externalSigningRequest(transactionID: transactionID, claim: staged)
     }
 
     // MARK: - Background execution
 
-    /// Broadcasts the next height-due transfer, or returns `nil` when nothing is currently due.
+    /// Executes at most one Rust-authorized scheduled delivery action and returns its legacy result
+    /// projection, or `nil` when no SDK-signer artifact is currently actionable.
     ///
-    /// Composition mirrors ``submitNoteSplit(proposal:usk:options:)``: fetch the next due transfer
-    /// (nil ⇒ return nil, leaving the gate untouched), extract, broadcast once, and — only on a
-    /// success outcome — start the privacy buffer, *before* recording the mapped result: the gate
-    /// marks on submit success, independent of record bookkeeping. Transport/rejection outcomes are
-    /// returned (recorded first, gate untouched). Pre-broadcast failures throw untouched; a record
-    /// failure *after* a successful broadcast throws
-    /// ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast DID land and the
-    /// privacy buffer is already running; a later execution window self-heals the engine state
-    /// (re-submitting draws a duplicate rejection, which records as success).
+    /// The runtime snapshot, delivery run, transaction identity, claim lease, canonical PCZT,
+    /// exact network bytes, txid, expiry, consensus branch, and submission policy are all owned by
+    /// Rust. Swift supplies only raw transport intent, asks Rust for an opaque claim, and submits
+    /// the exact bytes projected from that claim. It never fetches an unclaimed prepared
+    /// transaction and never reports a caller-authored txid after broadcast.
     ///
-    /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
-    /// (this method or ``submitNoteSplit(proposal:usk:options:)``) is in flight, this call first
-    /// waits for it to finish and only then fetches the next due transfer — so a concurrent call
-    /// can never re-broadcast the in-flight transfer, and typically returns nil once the in-flight
-    /// flow has recorded. It never throws on contention.
+    /// Claim-exposure and broadcast flows are single-flight on this actor. When another scheduled
+    /// external-signing or broadcast-performing call is in flight, this call waits for it to finish
+    /// and only then reads the Rust-owned runtime again, so a concurrent call cannot reuse authority
+    /// for the in-flight artifact. It never throws on contention.
     ///
     /// - Important: This method must run only in a session that does **not** also sync. This actor
     ///   does not check sync state itself; the `Synchronizer` surface in front of it adds an
     ///   advisory point-in-time guard (``ZcashError/migrationBroadcastDuringSync``) plus the
     ///   10-minute privacy gate (see ``isSyncBlocked()``) — neither is a hard mutual-exclusion
     ///   lock, so hosts must still sequence sync and broadcast sessions.
-    /// - Note: Immediately after ``storeSignedNoteSplitPCZT(_:)``, the engine treats the pending note
-    ///   split as the next due transfer, so this method broadcasts that split first — it keeps
-    ///   returning the split's prepared transfer until the split is reported broadcast, and only then
-    ///   advances to the scheduled transfers.
     func executeNextPendingTransfer(options: MigrationNetworkPrivacyOptions) async throws -> MigrationTransferResult? {
         try await serializedBroadcastFlow { () async throws -> MigrationTransferResult? in
-            guard let prepared = try await welding.migrationNextDueTransfer(for: accountUUID) else {
+            var runtime = try await reconciledRuntimeSnapshot()
+            guard let initialDelivery = runtime.delivery, initialDelivery.lane == .scheduled else {
                 return nil
             }
-            return try await broadcastAndRecord(prepared: prepared, options: options)
+
+            switch runtime.availability {
+            case .available, .unavailable(.submissionPolicyMissing):
+                break
+            case .unavailable(let reason):
+                throw MigrationDeliveryError.runtimeUnavailable(reason)
+            }
+
+            let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+                options: options,
+                networkType: networkType
+            )
+            _ = try await welding.migrationBindSubmissionPolicy(
+                intent,
+                run: initialDelivery.runHandle,
+                for: accountUUID
+            )
+            runtime = try await reconciledRuntimeSnapshot()
+            guard case .available = runtime.availability,
+                  let delivery = runtime.delivery,
+                  delivery.lane == .scheduled,
+                  delivery.phase == .active else {
+                if case .unavailable(let reason) = runtime.availability {
+                    throw MigrationDeliveryError.runtimeUnavailable(reason)
+                }
+                return nil
+            }
+
+            // Ambiguous outcomes are resolution-only. Never turn them back into submission
+            // authority; Rust reconciles them exclusively from wallet chain evidence.
+            if let unknown = delivery.claims.first(where: { $0.status == .outcomeUnknown }),
+               let resolution = try await welding.migrationClaimOutcomeResolution(
+                   claim: unknown.claimHandle,
+                   for: accountUUID
+               ) {
+                _ = try await welding.migrationReconcileSubmission(
+                    claim: resolution,
+                    for: accountUUID
+                )
+                return nil
+            }
+
+            // Resume a still-live same-process claim first. After relaunch, Rust's clock-session
+            // recovery makes a possibly observed submission resolution-only instead.
+            if let submitting = delivery.claims.first(where: {
+                $0.status == .submitting && $0.activeClaimKind == .submission
+            }), let resumed = try await welding.migrationResumeClaim(
+                claim: submitting.claimHandle,
+                for: accountUUID
+            ) {
+                return try await submitActiveClaim(resumed).legacyTransferResult
+            }
+
+            if let staged = delivery.claims.first(where: {
+                $0.status == .staged && $0.hasExactTransaction
+            }) {
+                return try await acquireAndSubmitClaim(staged.claimHandle).legacyTransferResult
+            }
+
+            // The canonical engine decides readiness. Asking for a materialization claim on a
+            // not-due/dependency-blocked transaction simply returns nil without host scheduling.
+            let scheduled = delivery.claims.compactMap { claim -> (UInt32, MigrationDeliveryClaimSummary)? in
+                guard case .scheduled(let transactionID) = claim.artifact,
+                      claim.signerOwnership == .sdk else {
+                    return nil
+                }
+                return (transactionID, claim)
+            }.sorted { $0.0 < $1.0 }
+
+            for (transactionID, summary) in scheduled {
+                let materialization: MigrationClaimHandle?
+                if summary.status == .materializing,
+                   summary.activeClaimKind == .materialization {
+                    materialization = try await welding.migrationResumeClaim(
+                        claim: summary.claimHandle,
+                        for: accountUUID
+                    )
+                } else if summary.status == .confirmed ||
+                    summary.status == .broadcasted ||
+                    summary.status == .expiredUnmined ||
+                    summary.status == .externalSigningExpiredUnmined ||
+                    summary.status == .awaitingExternalSignature {
+                    materialization = nil
+                } else {
+                    materialization = try await welding.migrationClaimMaterialization(
+                        transactionID: transactionID,
+                        signer: .sdk,
+                        run: delivery.runHandle,
+                        for: accountUUID
+                    )
+                }
+
+                guard let materialization else { continue }
+                let staged: MigrationClaimHandle
+                do {
+                    staged = try await welding.migrationProveClaim(
+                        claim: materialization,
+                        for: accountUUID
+                    )
+                } catch {
+                    await releaseKnownUnsentClaim(materialization, failure: .materializationFailed)
+                    throw error
+                }
+                return try await acquireAndSubmitClaim(staged).legacyTransferResult
+            }
+
+            return nil
         }
     }
 
@@ -505,85 +955,503 @@ actor OrchardMigration {
         try await welding.migrationPendingTransferProposal(for: accountUUID)
     }
 
-    // MARK: - Invalidity recovery
-
-    /// Cancels the stored run and previews a fresh schedule against the live balance.
-    ///
-    /// The stored run is persisted as cancelled (its pre-signed transactions are abandoned;
-    /// already-broadcast ones are unaffected on-chain), the invalid marks are cleared, and a fresh
-    /// plan is previewed for the re-confirm lane — the follow-up
-    /// ``signAndStoreMigrationSchedule(_:usk:)`` / ``submitNoteSplit(proposal:usk:options:)`` (or
-    /// PCZT store) then commits it.
-    func restartCurrentMigrationStep() async throws -> MigrationSchedule {
-        try await welding.migrationRestartStep(for: accountUUID)
-    }
-
-    /// Rebuilds every EXPIRED transfer of the stored migration run in place through the engine and
-    /// returns the run's FULL transfer schedule as stored AFTER the refresh (the current stored
-    /// schedule when nothing had expired; empty when no run is stored or the run is terminal).
-    ///
-    /// Each rebuilt transfer re-spends the SAME funding note (recovered from the expired PCZT by
-    /// nullifier identity, never an equal-value substitute) on a fresh schedule — a fresh
-    /// memoryless delay from the current tip, a fresh canonical expiry, and a freshly drawn
-    /// boundary anchor. The rebuilt rows' fresh scheduled/expiry heights exist nowhere but in the
-    /// returned schedule — the atomically-persisted post-refresh truth the host must re-display
-    /// and use for every subsequent consent echo (``signAndStoreMigrationSchedule(_:usk:)``,
-    /// ``createUnsignedTransferPCZTs(for:)``); a pre-refresh copy fails the verified echo with
-    /// `ZcashError.migrationPlanStale` from then on. Passing a spending key signs each rebuilt
-    /// transfer anew in-process; passing `nil` (an external-signer account, whose spend authority
-    /// never exists on this device) leaves it awaiting its signature, so the
-    /// ``createUnsignedTransferPCZTs(for:)`` / ``storeSignedSchedulePCZTs(_:)`` ceremony
-    /// re-serves and completes it.
-    /// - Throws: notably, a `FundingNoteUnavailable`-class failure when an expired transfer's exact
-    ///   funding note was spent outside the migration, where the message names
-    ///   ``restartCurrentMigrationStep()`` (cancel and re-plan) as the remedy. Rebuilds are
-    ///   persisted ALL-OR-NOTHING: a mid-refresh throw (including this one) persists NONE of the
-    ///   batch's rebuilds, so a non-throwing return's schedule is exactly what was atomically
-    ///   persisted, never a partial batch.
-    func refreshStaleTransfers(usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
-        try await welding.migrationRefreshStaleTransfers(usk: usk, for: accountUUID)
-    }
-
-    // MARK: - External signing (PCZT)
-
-    /// Builds the whole previewed migration UNSIGNED — the run is created by this call — and
-    /// returns the preparation (note-split) subset of its PCZTs for the signing ceremony. The
-    /// transfer subset of the same build is served by ``createUnsignedTransferPCZTs(for:)``, so one
-    /// ceremony signs everything.
-    func createUnsignedNoteSplitPCZTs() async throws -> [MigrationUnsignedTransferPczt] {
-        try await welding.migrationCreateUnsignedNoteSplitPczts(for: accountUUID)
-    }
-
-    /// Applies the ceremony's signatures to the run's preparation (note-split) transactions,
-    /// all-or-nothing, and returns a STORAGE RECEIPT for the first one (its `txid` is zeroed — the
-    /// broadcastable, proven value is served by the delivery lane).
-    func storeSignedNoteSplitPCZTs(_ signed: [MigrationSignedTransferPczt]) async throws -> PreparedMigrationTransfer {
-        try await welding.migrationStoreSignedNoteSplitPczts(signed, for: accountUUID)
-    }
-
-    /// Builds one unsigned, proven PCZT per transfer of `schedule` for an external signer.
-    func createUnsignedTransferPCZTs(for schedule: MigrationSchedule) async throws -> [MigrationUnsignedTransferPczt] {
-        try await welding.migrationCreateUnsignedTransferPczts(for: schedule, for: accountUUID)
-    }
-
-    /// Accepts the full set of externally signed transfer PCZTs (all-or-nothing), persisting them in
-    /// the migration engine.
-    ///
-    /// The SDK does not retain the proposal list: hosts that need to render the committed schedule
-    /// later must persist it themselves at confirmation time.
-    func storeSignedSchedulePCZTs(_ signed: [MigrationSignedTransferPczt]) async throws {
-        try await welding.migrationStoreSignedSchedulePczts(signed, for: accountUUID)
-    }
-
     // MARK: - Private
 
-    /// Runs `flow` as the only broadcast-performing flow on this actor.
+    private static func isTerminal(_ status: MigrationCanonicalStatus?) -> Bool {
+        status == .complete || status == .failed
+    }
+
+    /// Returns a runtime projection that is never older than the scheduled canonical-chain CAS
+    /// performed by this call. Immediate runs have no scheduled canonical state and are returned
+    /// directly. Every high-level runtime operation uses this helper so a mined predecessor cannot
+    /// be mistaken for a still-active run merely because the caller did not make a state read first.
+    private func reconciledRuntimeSnapshot() async throws -> MigrationRuntimeSnapshot {
+        let runtime = try await welding.migrationRuntimeSnapshot(for: accountUUID)
+        guard let delivery = runtime.delivery, delivery.lane == .scheduled else {
+            return runtime
+        }
+        _ = try await welding.migrationReconcileCanonicalChain(
+            run: delivery.runHandle,
+            for: accountUUID
+        )
+        return try await welding.migrationRuntimeSnapshot(for: accountUUID)
+    }
+
+    /// Requires that raw host intent matches the normalized immutable policy already owned by a
+    /// run. This check grants no mutation authority. Rollover uses it before its atomic CAS because
+    /// the successor deliberately inherits the predecessor policy in the same SQLite transaction.
+    private func requireBoundSubmissionTarget(
+        _ delivery: MigrationDeliverySnapshot,
+        matches intent: MigrationSubmissionIntent
+    ) async throws {
+        guard delivery.hasSubmissionPolicy,
+              let target = try await welding.migrationBoundSubmissionTarget(for: delivery.runHandle) else {
+            throw MigrationDeliveryError.runtimeUnavailable(.submissionPolicyMissing)
+        }
+        guard Self.submissionTarget(target, matches: intent) else {
+            throw MigrationDeliveryError.runtimeUnavailable(.submissionPolicyMismatch)
+        }
+    }
+
+    /// Resumes an immediate SDK-signed run from durable Rust state before any new reservation is
+    /// attempted. Only `.staged` or a still-live `.submitting` claim may reach the transport; an
+    /// ambiguous prior attempt is resolution-only and never converted back into submission power.
+    private func resumeImmediateSDKSubmissionIfPresent(
+        runtime: MigrationRuntimeSnapshot,
+        intent: MigrationSubmissionIntent,
+        usk: UnifiedSpendingKey
+    ) async throws -> MigrationSubmissionOutcome? {
+        guard let delivery = runtime.delivery else { return nil }
+        guard delivery.lane == .immediate else { return nil }
+        guard case .available = runtime.availability else {
+            if case .unavailable(let reason) = runtime.availability {
+                throw MigrationDeliveryError.runtimeUnavailable(reason)
+            }
+            throw MigrationDeliveryError.runtimeUnavailable(.deliveryInconsistent)
+        }
+        guard delivery.phase == .active else {
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        try await requireBoundSubmissionTarget(delivery, matches: intent)
+        guard let summary = delivery.claims.first(where: {
+            if case .immediate = $0.artifact {
+                return $0.signerOwnership == .sdk
+            }
+            return false
+        }) else {
+            throw MigrationDeliveryError.claimUnavailable
+        }
+
+        switch summary.status {
+        case .materializing:
+            guard summary.activeClaimKind == .materialization,
+                  let resumed = try await welding.migrationResumeClaim(
+                      claim: summary.claimHandle,
+                      for: accountUUID
+                  ) else {
+                throw MigrationDeliveryError.claimUnavailable
+            }
+            let staged: MigrationClaimHandle
+            do {
+                staged = try await welding.migrationMaterializeImmediateSDK(
+                    claim: resumed,
+                    usk: usk,
+                    for: accountUUID
+                )
+            } catch {
+                await releaseKnownUnsentClaim(resumed, failure: .materializationFailed)
+                throw error
+            }
+            return try await acquireAndSubmitClaim(staged).outcome
+        case .staged:
+            guard summary.hasExactTransaction else {
+                throw MigrationDeliveryError.missingExactTransaction
+            }
+            return try await acquireAndSubmitClaim(summary.claimHandle).outcome
+        case .submitting:
+            guard summary.activeClaimKind == .submission,
+                  let resumed = try await welding.migrationResumeClaim(
+                      claim: summary.claimHandle,
+                      for: accountUUID
+                  ) else {
+                return .unknown
+            }
+            return try await submitActiveClaim(resumed).outcome
+        case .outcomeUnknown:
+            let reconciled = try await reconcileUnknownSubmission(summary)
+            return submissionOutcome(for: reconciled ?? summary)
+        case .broadcasted, .confirmed:
+            return .accepted
+        case .expiredUnmined, .externalSigningExpiredUnmined:
+            return .unknown
+        case .materializationFailed, .awaitingExternalSignature:
+            throw MigrationDeliveryError.claimUnavailable
+        }
+    }
+
+    /// Continues the immediate external-signer lane from the exact runtime artifact. The request's
+    /// public PCZT is matched against Rust's canonical staged bytes before its opaque handle is
+    /// ignored in favor of the fresh runtime handle, which is what makes process relaunch safe.
+    private func resumeImmediateExternalSubmission(
+        runtime: MigrationRuntimeSnapshot,
+        request: ImmediateMigrationExternalSigningRequest,
+        signedPCZT: Data
+    ) async throws -> MigrationSubmissionOutcome {
+        guard case .available = runtime.availability,
+              let delivery = runtime.delivery,
+              delivery.lane == .immediate,
+              delivery.phase == .active,
+              let summary = delivery.claims.first(where: {
+                  if case .immediate = $0.artifact {
+                      return $0.signerOwnership == .external
+                  }
+                  return false
+              }) else {
+            throw MigrationDeliveryError.externalSigningClaimUnavailable
+        }
+        guard let canonicalPCZT = try await welding.migrationClaimExternalSigningPCZT(summary.claimHandle),
+              canonicalPCZT == request.pczt else {
+            throw MigrationDeliveryError.externalSigningClaimUnavailable
+        }
+
+        switch summary.status {
+        case .awaitingExternalSignature:
+            let active = try await resumableExternalSigningClaim(summary.claimHandle)
+            let signed: MigrationClaimHandle
+            if summary.hasSignedPCZT {
+                // The merge is already durable. Finalization consumes that exact merge and must not
+                // inspect or persist the caller's retry bytes again.
+                signed = active
+            } else {
+                signed = try await welding.migrationStageSignedPCZT(
+                    signedPCZT,
+                    claim: active,
+                    for: accountUUID
+                )
+            }
+            let staged = try await welding.migrationFinalizeImmediateExternalSigning(
+                claim: signed,
+                for: accountUUID
+            )
+            return try await acquireAndSubmitClaim(staged).outcome
+        case .staged:
+            guard summary.hasSignedPCZT, summary.hasExactTransaction else {
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
+            return try await acquireAndSubmitClaim(summary.claimHandle).outcome
+        case .submitting:
+            guard summary.activeClaimKind == .submission,
+                  let resumed = try await welding.migrationResumeClaim(
+                      claim: summary.claimHandle,
+                      for: accountUUID
+                  ) else {
+                return .unknown
+            }
+            return try await submitActiveClaim(resumed).outcome
+        case .outcomeUnknown:
+            let reconciled = try await reconcileUnknownSubmission(summary)
+            return submissionOutcome(for: reconciled ?? summary)
+        case .broadcasted, .confirmed:
+            return .accepted
+        case .expiredUnmined, .externalSigningExpiredUnmined:
+            return .unknown
+        case .materializing, .materializationFailed:
+            throw MigrationDeliveryError.externalSigningClaimUnavailable
+        }
+    }
+
+    /// Uses only outcome-resolution authority, then returns the same artifact from a fresh runtime
+    /// projection. A missing resolution lease is a harmless concurrent-worker outcome.
+    private func reconcileUnknownSubmission(
+        _ summary: MigrationDeliveryClaimSummary
+    ) async throws -> MigrationDeliveryClaimSummary? {
+        if let resolution = try await welding.migrationClaimOutcomeResolution(
+            claim: summary.claimHandle,
+            for: accountUUID
+        ) {
+            _ = try await welding.migrationReconcileSubmission(
+                claim: resolution,
+                for: accountUUID
+            )
+        }
+        return try await reconciledRuntimeSnapshot().delivery?.claims.first(where: {
+            $0.artifact == summary.artifact && $0.signerOwnership == summary.signerOwnership
+        })
+    }
+
+    private func submissionOutcome(for summary: MigrationDeliveryClaimSummary) -> MigrationSubmissionOutcome {
+        switch summary.status {
+        case .broadcasted, .confirmed:
+            return .accepted
+        case .materializing, .materializationFailed, .awaitingExternalSignature, .staged:
+            return .knownUnsent
+        case .submitting, .outcomeUnknown, .expiredUnmined, .externalSigningExpiredUnmined:
+            return .unknown
+        }
+    }
+
+    private func legacyTransferResult(
+        for summary: MigrationDeliveryClaimSummary
+    ) throws -> MigrationTransferResult {
+        switch summary.status {
+        case .broadcasted, .confirmed:
+            guard let txid = summary.txid else {
+                throw MigrationDeliveryError.missingTransactionID
+            }
+            return .success(txId: txid.toHexStringTxId())
+        case .staged:
+            return .networkError(retryable: true)
+        case .materializing, .materializationFailed, .awaitingExternalSignature, .submitting,
+             .outcomeUnknown, .expiredUnmined, .externalSigningExpiredUnmined:
+            return .networkError(retryable: false)
+        }
+    }
+
+    private func currentDelivery() async throws -> MigrationDeliverySnapshot {
+        let runtime = try await reconciledRuntimeSnapshot()
+        guard let delivery = runtime.delivery else {
+            throw MigrationDeliveryError.deliveryRunUnavailable
+        }
+        return delivery
+    }
+
+    private func expiredTransfer(
+        transactionID: UInt32,
+        signer: MigrationSignerOwnership
+    ) async throws -> MigrationDeliveryClaimSummary {
+        let runtime = try await reconciledRuntimeSnapshot()
+        guard case .available = runtime.availability,
+              let delivery = runtime.delivery,
+              delivery.lane == .scheduled,
+              let summary = delivery.claims.first(where: {
+                  guard case .scheduled(let candidateID) = $0.artifact else { return false }
+                  return candidateID == transactionID &&
+                      $0.signerOwnership == signer &&
+                      ($0.status == .expiredUnmined || $0.status == .externalSigningExpiredUnmined)
+              }) else {
+            throw MigrationDeliveryError.expiredTransferUnavailable(transactionID: transactionID)
+        }
+        return summary
+    }
+
+    private func resumableExternalSigningClaim(
+        _ claim: MigrationClaimHandle
+    ) async throws -> MigrationClaimHandle {
+        let resumed: MigrationClaimHandle?
+        do {
+            resumed = try await welding.migrationResumeClaim(claim: claim, for: accountUUID)
+        } catch {
+            resumed = nil
+        }
+        if let resumed {
+            return resumed
+        }
+        if let reacquired = try await welding.migrationReacquireExternalSigning(
+            claim: claim,
+            for: accountUUID
+        ) {
+            return reacquired
+        }
+        throw MigrationDeliveryError.externalSigningClaimUnavailable
+    }
+
+    private func externalSigningRequest(
+        transactionID: UInt32,
+        claim: MigrationClaimHandle
+    ) async throws -> ScheduledMigrationExternalSigningRequest {
+        guard let pczt = try await welding.migrationClaimExternalSigningPCZT(claim) else {
+            throw MigrationDeliveryError.missingExternalSigningPCZT
+        }
+        return ScheduledMigrationExternalSigningRequest(
+            transactionID: transactionID,
+            pczt: pczt,
+            claim: claim
+        )
+    }
+
+    private struct ClaimSubmissionResult {
+        let outcome: MigrationSubmissionOutcome
+        let transactionID: Data
+
+        var legacyTransferResult: MigrationTransferResult {
+            switch outcome {
+            case .accepted:
+                return .success(txId: transactionID.toHexStringTxId())
+            case .knownUnsent:
+                return .networkError(retryable: true)
+            case .unknown:
+                // Retrying an ambiguous submission could reveal or duplicate the exact
+                // transaction. Rust keeps it resolution-only until scanning settles it.
+                return .networkError(retryable: false)
+            }
+        }
+    }
+
+    /// Recovers a Rust-staged external-signing artifact before a new immediate reservation is
+    /// attempted. Runtime-projected handles are deliberately used instead of any handle retained
+    /// by this actor, so this path also models a new SDK process over the same wallet database.
+    private func recoverPreparedImmediateExternalSigning(
+        intent: MigrationSubmissionIntent
+    ) async throws -> ImmediateMigrationExternalSigningRequest? {
+        let runtime = try await reconciledRuntimeSnapshot()
+        guard let delivery = runtime.delivery else {
+            return nil
+        }
+        guard delivery.lane == .immediate else {
+            return nil
+        }
+        guard case .available = runtime.availability else {
+            if case .unavailable(let reason) = runtime.availability {
+                throw MigrationDeliveryError.runtimeUnavailable(reason)
+            }
+            throw MigrationDeliveryError.runtimeUnavailable(.deliveryInconsistent)
+        }
+        guard delivery.phase == .active else {
+            throw MigrationDeliveryError.externalSigningClaimUnavailable
+        }
+
+        guard let summary = delivery.claims.first(where: { claim in
+            guard case .immediate = claim.artifact else { return false }
+            return claim.signerOwnership == .external
+        }) else {
+            // An immediate run already owns the sources. It may be an SDK-signer run or may have
+            // advanced past signing; either way, starting a replacement external run is unsafe.
+            throw MigrationDeliveryError.externalSigningClaimUnavailable
+        }
+        guard summary.externallyExposed else {
+            throw MigrationDeliveryError.externalSigningClaimUnavailable
+        }
+        try await requireBoundSubmissionTarget(delivery, matches: intent)
+
+        let recoveredClaim: MigrationClaimHandle
+        switch summary.status {
+        case .awaitingExternalSignature:
+            // A same-process snapshot can still carry a live token. After relaunch, Rust rejects or
+            // returns nil for that clock-session token and atomically reacquires a bounded token for
+            // this exact externally exposed artifact without replanning it.
+            recoveredClaim = try await resumableExternalSigningClaim(summary.claimHandle)
+        case .staged, .submitting, .outcomeUnknown, .broadcasted, .confirmed, .expiredUnmined:
+            // Return the same public PCZT plus a fresh runtime-projected artifact handle. The submit
+            // API branches on durable status and never reapplies the signer response in these states.
+            recoveredClaim = summary.claimHandle
+        case .materializing, .materializationFailed, .externalSigningExpiredUnmined:
+            throw MigrationDeliveryError.externalSigningClaimUnavailable
+        }
+
+        guard let pczt = try await welding.migrationClaimExternalSigningPCZT(recoveredClaim) else {
+            throw MigrationDeliveryError.missingExternalSigningPCZT
+        }
+        return ImmediateMigrationExternalSigningRequest(pczt: pczt, claim: recoveredClaim)
+    }
+
+    /// Compares app input only with Rust's normalized, already-bound target. This check grants no
+    /// authority; it merely prevents a relaunch caller from accidentally recovering a request
+    /// whose eventual submission would use different privacy or endpoint options.
+    private static func submissionTarget(
+        _ target: MigrationBoundSubmissionTarget,
+        matches intent: MigrationSubmissionIntent
+    ) -> Bool {
+        guard target.transport == intent.transport,
+              let endpoint = try? LiveMigrationTransactionSubmitter.endpoint(for: target) else {
+            return false
+        }
+        return LiveMigrationTransactionSubmitter.endpointIdentity(endpoint) == intent.endpoint
+    }
+
+    /// Acquires submission authority for exact staged bytes, then submits only those bytes.
+    private func acquireAndSubmitClaim(
+        _ stagedClaim: MigrationClaimHandle
+    ) async throws -> ClaimSubmissionResult {
+        guard let activeClaim = try await welding.migrationClaimSubmission(
+            claim: stagedClaim,
+            for: accountUUID
+        ) else {
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        return try await submitActiveClaim(activeClaim)
+    }
+
+    /// Submits only the exact bytes projected from `activeClaim`. Once the transport method
+    /// returns, the endpoint has observed a submission attempt even when Rust classifies it as
+    /// known-unsent, so the privacy gate starts before durable outcome recording on every returned
+    /// outcome. A thrown submitter error is guaranteed to precede the submit RPC and releases only
+    /// Rust-validated known-unsent authority.
+    private func submitActiveClaim(
+        _ claimed: MigrationClaimHandle
+    ) async throws -> ClaimSubmissionResult {
+        var activeClaim = claimed
+        let target: MigrationBoundSubmissionTarget
+        let rawTransaction: Data
+        let transactionID: Data
+        let expiryHeight: BlockHeight
+        let branchID: UInt32
+        do {
+            let run = try await welding.migrationClaimRun(activeClaim)
+            guard let boundTarget = try await welding.migrationBoundSubmissionTarget(for: run) else {
+                throw MigrationDeliveryError.submissionTargetUnavailable
+            }
+            guard let exactTransaction = try await welding.migrationClaimExactTransaction(activeClaim) else {
+                throw MigrationDeliveryError.missingExactTransaction
+            }
+            guard let exactTransactionID = try await welding.migrationClaimTransactionID(activeClaim) else {
+                throw MigrationDeliveryError.missingTransactionID
+            }
+            target = boundTarget
+            rawTransaction = exactTransaction
+            transactionID = exactTransactionID
+            expiryHeight = try await welding.migrationClaimExpiryHeight(activeClaim)
+            branchID = try await welding.migrationClaimConsensusBranchID(activeClaim)
+        } catch {
+            await releaseKnownUnsentClaim(activeClaim, failure: .transportSetupFailed)
+            throw error
+        }
+        let transaction = EncodedTransaction(transactionId: transactionID, raw: rawTransaction)
+
+        let outcome: MigrationSubmissionOutcome
+        do {
+            outcome = try await transactionSubmitter.submit(
+                transaction: transaction,
+                expiryHeight: expiryHeight,
+                target: target,
+                expectedChainName: expectedChainName,
+                transactionConsensusBranchId: branchID,
+                branchIdForHeight: { [welding] height in
+                    try welding.consensusBranchIdFor(height: height)
+                },
+                renewLease: { [welding, accountUUID] in
+                    guard let renewed = try await welding.migrationRenewClaim(
+                        claim: activeClaim,
+                        for: accountUUID
+                    ) else {
+                        throw MigrationDeliveryError.claimUnavailable
+                    }
+                    activeClaim = renewed
+                }
+            )
+        } catch {
+            await releaseKnownUnsentClaim(activeClaim, failure: .transportDidNotBegin)
+            throw error
+        }
+
+        // Any returned outcome means the submit RPC began and exposed the exact transaction to the
+        // selected migration endpoint. Start the anti-correlation buffer before recording so a
+        // record failure cannot let ordinary sync resume early.
+        syncGate.markBroadcast()
+        do {
+            _ = try await welding.migrationRecordSubmissionOutcome(
+                outcome,
+                claim: activeClaim,
+                for: accountUUID
+            )
+        } catch {
+            logger.error("OrchardMigration: failed to record a migration submission outcome: \(error)")
+            throw ZcashError.migrationRecordFailedAfterBroadcast(error)
+        }
+        return ClaimSubmissionResult(outcome: outcome, transactionID: transactionID)
+    }
+
+    private func releaseKnownUnsentClaim(
+        _ claim: MigrationClaimHandle,
+        failure: MigrationDeliveryFailureReason
+    ) async {
+        do {
+            _ = try await welding.migrationReleaseKnownUnsentClaim(
+                claim: claim,
+                failure: failure,
+                for: accountUUID
+            )
+        } catch {
+            logger.error("OrchardMigration: failed to release a known-unsent immediate claim: \(error)")
+        }
+    }
+
+    /// Runs `flow` as the only claim-exposure or broadcast-performing flow on this actor.
     ///
     /// The actor's methods are reentrant: the broadcast composition suspends at the welding hops and
     /// for the whole broadcast (a Tor bootstrap can take seconds), while the engine keeps reporting
     /// the same transfer as next-due until its result is recorded — so without this guard, a
-    /// concurrent `executeNextPendingTransfer`/`submitNoteSplit` could re-fetch and re-broadcast the
-    /// same bytes mid-flight. The serialization contract:
+    /// concurrent execution or external-signing calls could reuse an in-flight claim. The
+    /// serialization contract:
     /// - A concurrent caller never throws on contention and is never dropped: it awaits the
     ///   in-flight flow's completion (success or failure), then runs its own flow fresh, so its own
     ///   due-transfer fetch observes the recorded outcome (typically nil, or the next transfer).
@@ -610,38 +1478,4 @@ actor OrchardMigration {
         return try await flow()
     }
 
-    /// Shared broadcast/record composition for a prepared transfer: extract the broadcast bytes,
-    /// broadcast once to the resolved endpoint, and classify the outcome. On a success outcome the
-    /// privacy buffer starts *before* the result is recorded — ``MigrationSyncGate/markBroadcast()``
-    /// is a non-throwing local write, and a record failure after a real broadcast must never skip
-    /// the buffer; a record failure on that path throws
-    /// ``ZcashError/migrationRecordFailedAfterBroadcast(_:)``. Non-success outcomes are recorded
-    /// first and returned with the gate untouched (only success outcomes mark it, unchanged); only
-    /// pre-broadcast failures throw untouched.
-    private func broadcastAndRecord(
-        prepared: PreparedMigrationTransfer,
-        options: MigrationNetworkPrivacyOptions
-    ) async throws -> MigrationTransferResult {
-        let rawTransaction = try await welding.migrationExtractBroadcastTx(pczt: prepared.pczt, for: accountUUID)
-        let outcome = try await broadcaster.broadcast(
-            rawTransaction: rawTransaction,
-            to: options.submissionEndpoint,
-            useTor: options.useTor
-        )
-        let result = MigrationBroadcaster.map(outcome: outcome, successTxId: prepared.txid.toHexStringTxId())
-        if case MigrationTransferResult.success = result {
-            // The broadcast landed (or a duplicate rejection proved an earlier one did): start the
-            // privacy buffer first, so a record failure cannot skip it.
-            syncGate.markBroadcast()
-            do {
-                try await welding.migrationRecordTransferResult(transferId: prepared.id, result: result, for: accountUUID)
-            } catch {
-                logger.error("OrchardMigration: failed to record a successfully submitted broadcast: \(error)")
-                throw ZcashError.migrationRecordFailedAfterBroadcast(error)
-            }
-        } else {
-            try await welding.migrationRecordTransferResult(transferId: prepared.id, result: result, for: accountUUID)
-        }
-        return result
-    }
 }

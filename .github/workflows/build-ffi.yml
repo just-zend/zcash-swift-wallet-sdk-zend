@@ -1,76 +1,332 @@
-name: Package Verified FFI XCFramework
+name: Rebuild, Verify, and Draft FFI Release
 
 on:
-  # The private migration engine is intentionally unavailable to public GitHub Actions. This
-  # workflow verifies and packages the frozen three-slice artifact already committed on the
-  # selected branch; authenticated source rebuilds use Scripts/build-ironwood-ffi-artifact.sh.
   workflow_dispatch:
     inputs:
-      version:
-        description: 'SDK version (e.g., 2.5.0)'
+      mode:
+        description: 'Read-only candidate build or protected-main release'
         required: true
+        type: choice
+        default: candidate
+        options:
+          - candidate
+          - release
+      version:
+        description: 'SDK version (e.g., 2.6.0-alpha.7)'
+        required: false
+      candidate_source_sha:
+        description: 'Exact same-repository SDK branch tip to build in candidate mode'
+        required: false
+      librustzcash_revision:
+        description: 'Exact public just-zend/librustzcash revision for candidate mode'
+        required: false
+      librustzcash_publication_ref:
+        description: 'Full public Rust containing ref, for example refs/heads/agent/example'
+        required: false
 
 permissions: {}
 
+concurrency:
+  group: ironwood-ffi-release
+  cancel-in-progress: false
+
 jobs:
-  package-xcframework:
+  verify-release:
+    name: Read-only reproducibility and package verification
+    if: github.event.inputs.mode == 'release'
     runs-on: warp-macos-15-arm64-12x
-    # The live sdk-release environment must be protected before this workflow is dispatched.
+    timeout-minutes: 180
     environment: sdk-release
     permissions:
-      contents: write # Required for creating draft releases
+      actions: read
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      checksum: ${{ steps.release.outputs.checksum }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Select Xcode version
-        run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
-
-      - name: Verify frozen committed artifact
-        run: |
-          ./Scripts/verify-ironwood-ffi-artifact.sh
-          expected=(ios-arm64 ios-arm64-simulator macos-arm64)
-          for slice in "${expected[@]}"; do
-            test -f "LocalPackages/libzcashlc.xcframework/${slice}/libzcashlc.framework/libzcashlc"
-          done
-          count=$(find LocalPackages/libzcashlc.xcframework -type f -path '*/libzcashlc.framework/libzcashlc' | wc -l | tr -d ' ')
-          test "$count" = "3"
-
-      - name: Package and upload draft release
+      - name: Gate exact protected release source
+        id: request
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ github.event.inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+          CANDIDATE_SOURCE_SHA: ${{ github.event.inputs.candidate_source_sha }}
+          CANDIDATE_RUST_REVISION: ${{ github.event.inputs.librustzcash_revision }}
+          CANDIDATE_RUST_PUBLICATION_REF: ${{ github.event.inputs.librustzcash_publication_ref }}
         run: |
           set -euo pipefail
-          products=BuildSupport/products
+          test "$GITHUB_REPOSITORY" = "just-zend/zcash-swift-wallet-sdk-zend"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          bash ./Scripts/verify-sdk-release-environment.sh "$GITHUB_SHA"
+          test -z "$CANDIDATE_SOURCE_SHA"
+          test -z "$CANDIDATE_RUST_REVISION"
+          test -z "$CANDIDATE_RUST_PUBLICATION_REF"
+          version=$(./Scripts/validate-ironwood-release-version.sh "$VERSION_INPUT")
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Select pinned Xcode
+        run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
+
+      - name: Run network-free retired-engine and dependency gate
+        run: ./Scripts/verify-ironwood-static-release-inputs.sh
+
+      - name: Install pinned Rust verification tools
+        run: |
+          rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$rust_toolchain" --profile minimal
+          rustup component add --toolchain "$rust_toolchain" llvm-tools-preview
+
+      - name: Verify committed artifact and exact SDK lineage
+        run: ./Scripts/verify-ironwood-ffi-artifact.sh
+
+      - name: Run adversarial release-gate fixtures
+        run: ./Scripts/test-ironwood-release-gates.sh
+
+      - name: Verify Rust source is durably published on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./Scripts/verify-ironwood-librustzcash-publication.sh
+
+      - name: Rebuild twice and byte-compare all five architectures
+        run: ./Scripts/verify-ironwood-ffi-reproducibility.sh
+
+      - name: Package twice, extract, and fully reverify
+        run: ./Scripts/verify-ironwood-package-reproducibility.sh
+
+      - name: Produce deterministic release payload
+        id: release
+        env:
+          VERSION: ${{ steps.request.outputs.version }}
+        run: |
+          set -euo pipefail
+          products=BuildSupport/products/release
           archive=libzcashlc.xcframework.zip
+          rm -rf "$products"
           mkdir -p "$products"
-          rm -f "$products/$archive"
-          (cd LocalPackages && /usr/bin/zip -qry "../$products/$archive" libzcashlc.xcframework)
+          ./Scripts/package-ironwood-xcframework.sh "$products/$archive" >/dev/null
+          cp Scripts/verify-sdk-release-environment.sh "$products/"
           checksum=$(shasum -a 256 "$products/$archive" | awk '{print $1}')
-          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/${archive}"
-          printf 'CHECKSUM=%s\nDOWNLOAD_URL=%s\nVERSION=%s\n' \
-            "$checksum" "$download_url" "$VERSION" > "$products/release.env"
-          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $VERSION already exists; refusing to overwrite a frozen artifact." >&2
+          policy_verifier_sha=$(shasum -a 256 "$products/verify-sdk-release-environment.sh" \
+            | awk '{print $1}')
+          printf 'VERSION=%s\nCHECKSUM=%s\nSOURCE_SHA=%s\nREPOSITORY=%s\nARCHIVE=%s\nPOLICY_VERIFIER_SHA256=%s\n' \
+            "$VERSION" "$checksum" "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$archive" \
+            "$policy_verifier_sha" \
+            > "$products/release.env"
+          printf 'version=%s\nchecksum=%s\nsource_sha=%s\n' \
+            "$VERSION" "$checksum" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-ironwood-ffi-release
+          path: BuildSupport/products/release/
+          if-no-files-found: error
+          retention-days: 1
+
+  build-candidate:
+    name: Read-only exact-source FFI candidate build
+    if: github.event.inputs.mode == 'candidate'
+    runs-on: warp-macos-15-arm64-12x
+    timeout-minutes: 180
+    environment: sdk-ffi-candidate
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.inputs.candidate_source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Gate exact same-repository candidate source
+        env:
+          SOURCE_SHA: ${{ github.event.inputs.candidate_source_sha }}
+          RUST_REVISION: ${{ github.event.inputs.librustzcash_revision }}
+          RUST_PUBLICATION_REF: ${{ github.event.inputs.librustzcash_publication_ref }}
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "just-zend/zcash-swift-wallet-sdk-zend"
+          test "$GITHUB_REF_TYPE" = "branch"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RUST_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RUST_PUBLICATION_REF" =~ ^refs/(heads|tags)/[-A-Za-z0-9._/]+$ ]]
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+          test -z "$VERSION_INPUT"
+
+      - name: Select pinned Xcode
+        run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
+
+      - name: Validate the frozen Rust pin and publication lineage
+        id: rust
+        env:
+          RUST_REVISION: ${{ github.event.inputs.librustzcash_revision }}
+          RUST_PUBLICATION_REF: ${{ github.event.inputs.librustzcash_publication_ref }}
+        run: |
+          set -euo pipefail
+          cargo_revision=$(./Scripts/verify-ironwood-cargo-pins.sh --print-revision)
+          test "$cargo_revision" = "$RUST_REVISION"
+          rust_checkout="$RUNNER_TEMP/librustzcash-candidate"
+          rm -rf "$rust_checkout"
+          git clone --quiet --no-checkout https://github.com/just-zend/librustzcash "$rust_checkout"
+          remote_tip=$(git -C "$rust_checkout" ls-remote --refs origin "$RUST_PUBLICATION_REF" \
+            | awk 'NR == 1 { print $1 }')
+          [[ "$remote_tip" =~ ^[0-9a-f]{40}$ ]]
+          git -C "$rust_checkout" fetch --quiet --no-tags origin "$RUST_PUBLICATION_REF"
+          test "$(git -C "$rust_checkout" rev-parse FETCH_HEAD)" = "$remote_tip"
+          git -C "$rust_checkout" merge-base --is-ancestor "$RUST_REVISION" FETCH_HEAD
+          git -C "$rust_checkout" checkout --quiet --detach "$RUST_REVISION"
+          test "$(git -C "$rust_checkout" rev-parse HEAD)" = "$RUST_REVISION"
+          test -z "$(git -C "$rust_checkout" status --porcelain)"
+          printf 'checkout=%s\npublication_tip=%s\n' "$rust_checkout" "$remote_tip" >> "$GITHUB_OUTPUT"
+
+      - name: Build and verify the five-architecture candidate
+        env:
+          LIBRUSTZCASH_REPO: ${{ steps.rust.outputs.checkout }}
+          LIBRUSTZCASH_PUBLISHED_REF: ${{ github.event.inputs.librustzcash_publication_ref }}
+          LIBRUSTZCASH_RECORDED_PUBLICATION_TIP: ${{ steps.rust.outputs.publication_tip }}
+          SDK_IRONWOOD_IMPLEMENTATION_REVISION: ${{ github.event.inputs.candidate_source_sha }}
+        run: |
+          set -euo pipefail
+          ./Scripts/build-ironwood-ffi-artifact.sh
+          ./Scripts/verify-ironwood-ffi-artifact.sh
+          ./Scripts/verify-ironwood-package-reproducibility.sh
+
+      - name: Enforce the artifact-only worktree delta
+        run: |
+          set -euo pipefail
+          # LocalPackages/Package.swift is an ignored generated wrapper, so compare it to its
+          # reviewed source template explicitly instead of relying on Git status.
+          cmp -s BuildSupport/LocalPackages-Package.swift LocalPackages/Package.swift
+          while IFS= read -r status_line; do
+            path=${status_line:3}
+            case "$path" in
+              BuildSupport/IRONWOOD_FFI_BUILD.env | \
+              LocalPackages/IRONWOOD_FFI_PROVENANCE.env | \
+              LocalPackages/libzcashlc.xcframework/*) ;;
+              *)
+                echo "Error: candidate build changed a non-artifact path: $path" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git -c status.renames=false status --porcelain=v1 --untracked-files=all)
+
+      - name: Package the symlink-preserving candidate handoff
+        id: handoff
+        env:
+          SOURCE_SHA: ${{ github.event.inputs.candidate_source_sha }}
+          RUST_REVISION: ${{ github.event.inputs.librustzcash_revision }}
+          RUST_PUBLICATION_REF: ${{ github.event.inputs.librustzcash_publication_ref }}
+          RUST_PUBLICATION_TIP: ${{ steps.rust.outputs.publication_tip }}
+        run: |
+          set -euo pipefail
+          handoff="$RUNNER_TEMP/ironwood-ffi-candidate"
+          rm -rf "$handoff"
+          mkdir -p "$handoff"
+          ./Scripts/package-ironwood-xcframework.sh "$handoff/libzcashlc.xcframework.zip" >/dev/null
+          cp LocalPackages/IRONWOOD_FFI_PROVENANCE.env "$handoff/"
+          cp BuildSupport/IRONWOOD_FFI_BUILD.env "$handoff/"
+          archive_sha=$(shasum -a 256 "$handoff/libzcashlc.xcframework.zip" | awk '{print $1}')
+          provenance_sha=$(shasum -a 256 "$handoff/IRONWOOD_FFI_PROVENANCE.env" | awk '{print $1}')
+          recipe_sha=$(shasum -a 256 "$handoff/IRONWOOD_FFI_BUILD.env" | awk '{print $1}')
+          printf '%s\n' \
+            "REPOSITORY=$GITHUB_REPOSITORY" \
+            "WORKFLOW_RUN_ID=$GITHUB_RUN_ID" \
+            "WORKFLOW_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" \
+            "SDK_SOURCE_SHA=$SOURCE_SHA" \
+            "LIBRUSTZCASH_REVISION=$RUST_REVISION" \
+            "LIBRUSTZCASH_PUBLICATION_REF=$RUST_PUBLICATION_REF" \
+            "LIBRUSTZCASH_PUBLICATION_TIP=$RUST_PUBLICATION_TIP" \
+            "XCFRAMEWORK_ZIP_SHA256=$archive_sha" \
+            "PROVENANCE_SHA256=$provenance_sha" \
+            "BUILD_RECIPE_SHA256=$recipe_sha" \
+            > "$handoff/candidate.env"
+          printf 'path=%s\n' "$handoff" >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified candidate handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ironwood-ffi-candidate-${{ github.event.inputs.candidate_source_sha }}-${{ github.event.inputs.librustzcash_revision }}
+          path: ${{ steps.handoff.outputs.path }}/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-draft:
+    name: Minimal write-only draft publication
+    needs: verify-release
+    if: github.event.inputs.mode == 'release' && needs.verify-release.result == 'success'
+    runs-on: ubuntu-latest
+    environment: sdk-release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      # Deliberately no repository checkout: the write token is never exposed to checked-out code.
+      - name: Download read-only verified payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-ironwood-ffi-release
+          path: release
+
+      - name: Validate handoff and create immutable draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          EXPECTED_VERSION: ${{ needs.verify-release.outputs.version }}
+          EXPECTED_CHECKSUM: ${{ needs.verify-release.outputs.checksum }}
+          EXPECTED_SOURCE_SHA: ${{ needs.verify-release.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "just-zend/zcash-swift-wallet-sdk-zend"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_SHA" = "$EXPECTED_SOURCE_SHA"
+          test "$(sed -n 's/^VERSION=//p' release/release.env)" = "$EXPECTED_VERSION"
+          test "$(sed -n 's/^CHECKSUM=//p' release/release.env)" = "$EXPECTED_CHECKSUM"
+          test "$(sed -n 's/^SOURCE_SHA=//p' release/release.env)" = "$EXPECTED_SOURCE_SHA"
+          test "$(sed -n 's/^REPOSITORY=//p' release/release.env)" = "$GITHUB_REPOSITORY"
+          test "$(sed -n 's/^ARCHIVE=//p' release/release.env)" = "libzcashlc.xcframework.zip"
+          test "$(sha256sum release/libzcashlc.xcframework.zip | awk '{print $1}')" = "$EXPECTED_CHECKSUM"
+          policy_verifier_sha=$(sed -n 's/^POLICY_VERIFIER_SHA256=//p' release/release.env)
+          [[ "$policy_verifier_sha" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum release/verify-sdk-release-environment.sh | awk '{print $1}')" = \
+            "$policy_verifier_sha"
+          bash release/verify-sdk-release-environment.sh "$EXPECTED_SOURCE_SHA"
+          if gh release view "$EXPECTED_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $EXPECTED_VERSION already exists; refusing to overwrite it." >&2
             exit 1
           fi
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${EXPECTED_VERSION}" --jq .object.sha 2>/dev/null || true)
+          if [[ -n "$tag_sha" && "$tag_sha" != "$EXPECTED_SOURCE_SHA" ]]; then
+            echo "Existing tag $EXPECTED_VERSION does not bind the verified source SHA." >&2
+            exit 1
+          fi
+          if [[ -z "$tag_sha" ]]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${EXPECTED_VERSION}" -f sha="$EXPECTED_SOURCE_SHA" >/dev/null
+          fi
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${EXPECTED_VERSION}" --jq .sha)" = "$EXPECTED_SOURCE_SHA"
           prerelease=()
-          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
-          gh release create "$VERSION" "$products/$archive" \
-            --repo "$GITHUB_REPOSITORY" --title "$VERSION" \
-            --notes "Zcash Light Client SDK $VERSION verified frozen FFI" --draft "${prerelease[@]}"
+          if [[ "$EXPECTED_VERSION" == *-* ]]; then prerelease=(--prerelease); fi
+          bash release/verify-sdk-release-environment.sh "$EXPECTED_SOURCE_SHA"
+          gh release create "$EXPECTED_VERSION" release/libzcashlc.xcframework.zip \
+            --repo "$GITHUB_REPOSITORY" --title "$EXPECTED_VERSION" \
+            --notes "Zcash Light Client SDK $EXPECTED_VERSION; twice rebuilt and verified from $EXPECTED_SOURCE_SHA" \
+            --draft --verify-tag --target "$EXPECTED_SOURCE_SHA" "${prerelease[@]}"
 
-      - name: Output Package.swift Update
+      - name: Output Package.swift update
+        env:
+          VERSION: ${{ needs.verify-release.outputs.version }}
+          CHECKSUM: ${{ needs.verify-release.outputs.checksum }}
         run: |
-          source BuildSupport/products/release.env
-          echo ""
-          echo "========================================"
-          echo "Update Package.swift with:"
-          echo "========================================"
-          echo ""
-          echo "url: \"${DOWNLOAD_URL}\","
+          echo "url: \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/libzcashlc.xcframework.zip\","
           echo "checksum: \"${CHECKSUM}\""
-          echo ""
-          echo "Then commit, tag ${VERSION}, and publish the draft release."

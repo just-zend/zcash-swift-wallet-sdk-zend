@@ -54,7 +54,7 @@ protocol MigrationBroadcasting {
 /// Once the connection is established, a thrown error from the submit RPC is reported as
 /// ``MigrationBroadcastOutcome/transportError`` (a retryable network error), not as a fail-closed
 /// Tor failure.
-actor MigrationBroadcaster: MigrationBroadcasting {
+actor MigrationBroadcaster: MigrationBroadcasting, MigrationTransportCreating {
     private let torDirURL: URL
     private let logger: Logger
     private let torClientFactory: @Sendable (URL) async throws -> TorClient
@@ -165,6 +165,30 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         } else {
             return await broadcastDirect(rawTransaction: rawTransaction, to: endpoint)
         }
+    }
+
+    /// Creates the exact one-endpoint transport used by the claim-backed submission pipeline.
+    /// Tor construction remains fail-closed and reuses this broadcaster's dedicated migration
+    /// runtime; direct submission receives a fresh ephemeral gRPC service.
+    func makeTransport(endpoint: LightWalletEndpoint, useTor: Bool) async throws -> MigrationTransport {
+        if useTor {
+            do {
+                let runtime = try await dedicatedTorClient()
+                let isolated = try await runtime.isolatedClient()
+                return MigrationTransport(
+                    service: LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: isolated),
+                    mode: .defaultTor
+                )
+            } catch {
+                logger.error("MigrationBroadcaster: dedicated Tor transport unavailable: \(error)")
+                throw ZcashError.migrationTorUnavailable
+            }
+        }
+
+        return MigrationTransport(
+            service: LightWalletGRPCService(endpoint: endpoint),
+            mode: .direct
+        )
     }
 
     /// Resolves the dedicated migration Tor client: bootstraps it on the first call, and reuses the

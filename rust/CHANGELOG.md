@@ -6,107 +6,48 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+- `zcashlc_redact_pczt_for_signer` now applies the canonical Signer-role redaction policy from `zcash_client_backend::data_api::wallet::redact_pczt_for_signer`: in addition to the previously redacted wallet metadata and spend witnesses, it clears zero-knowledge proofs, binding signing keys, and dummy-spend signing keys (`dummy_sk` / `dummy_ask`), redacts the Ironwood bundle identically to Orchard, compacts resolvable Orchard/Ironwood fields (restored automatically when the returned PCZT is parsed), and removes shielded anchors from v6 transactions (v5 anchors are retained because signatures commit to them). Sapling spend witnesses remain omitted (this SDK's existing behavior; the upstream policy retains them). This substantially reduces the size of the redacted PCZT sent to hardware signers. Callers must (as before) retain the unredacted PCZT and combine it with the Signer output via `zcashlc_extract_and_store_from_pczt`.
+
 ### Added
-- Pool-migration (Orchard→Ironwood) FFI surface over the final engine
-  (`zcash_pool_migration_backend` + the account-keyed store inside
-  `zcash_client_sqlite::pool_migration`, both on librustzcash main; the family pin
-  targets a plain main rev — boundary-anchor proving (#2710) and owner-keyed
-  note locking (#2716) are both merged, nothing unmerged remains):
-  21 of the 24 `zcashlc_migration_*` entry points (the residual-locking pair
-  and the run-count estimate ride their own entries below) plus the
-  `zcashlc_ironwood_activation_height` helper, with their `#[repr(C)]` return
-  types and `zcashlc_free_migration_*` destructors. Each call opens the wallet database and
-  the account-keyed migration store (a second connection into the same file) from
-  the wallet-db path, 16-byte account uuid, and network id, and reports failures
-  through the thread-local last-error channel (`NULL` / `false` / `-1` sentinels),
-  with two stable prefixes (`MIGRATION_PLAN_STALE`, `MIGRATION_PROVING_UNAVAILABLE`)
-  for the actionable conditions. The engine plans previews (`plan_migration`,
-  carried propose→commit by an in-process plan cache), commits the note split and
-  the transfer schedule atomically (pre-signing every transaction), defers anchors
-  and witnesses to proving time (ZIP 374) — proving runs through the upstream
-  prover (`engine::prove_transfer` / `engine::prove_preparation` driving
-  `wallet::WalletMigrationProver`): transfers prove against the boundary anchor
-  their schedule drew and persisted (ZIP 318 anchor cohorts; upstream retention,
-  librustzcash #2700/#2710, keeps the matching 144-block boundary grid durably
-  witnessable from NU6.3 activation), preparations against the wallet's natural
-  anchor, and a boundary the wallet has not scanned or retained yet surfaces as
-  the transient nothing-due, not an error — and leaves broadcasting,
-  mined-reconciliation, rejection classification (the `sdk_invalid_marks` side
-  table), and the platform's 5-state derivation to this layer (the v1 crate's
-  `ReadyToPropose` state and `SyncRequiredBeforeNext` attention reason are gone
-  entirely — the engine's atomic split+schedule commit means that intermediate
-  moment cannot occur). `Complete` is
-  per-run; sequential runs commit over a terminal predecessor. The external-signer
-  note-split pair is plural (`zcashlc_migration_create_unsigned_note_split_pczts` /
-  `zcashlc_migration_store_signed_note_split_pczts`): the engine builds N
-  preparation transactions, not one split transaction. The schedule/note-split
-  echo parameters (`ids`/`amounts`/heights/duration on the schedule-commit calls;
-  `output_values`/`fee` on the note-split-commit call) are verified consent
-  echoes, checked against the previewed plan (or, once committed, the stored
-  state), with a mismatch surfacing `MIGRATION_PLAN_STALE`, so a stale or
-  tampered display can never sign different values than the ones the user
-  approved. Ids, amounts, expiry heights, and the estimated duration are
-  always compared; next-executable heights are compared only against the
-  previewed plan, never post-commit (the immediate lane's commit-time
-  reschedule legitimately moves them away from an honest echo, with no way
-  to converge by re-proposing); anchor heights are display-only, never
-  compared. `include_residual` and `retryable` parameters, and the
-  `is_sync_required` query, are removed — they never had a use.
-  - State: `zcashlc_migration_state`, `zcashlc_migration_progress`,
-    `zcashlc_migration_is_note_split_needed`,
-    `zcashlc_migration_has_overdue_transfers`,
-    `zcashlc_migration_has_invalid_transfers`,
-    `zcashlc_migration_pending_transfer_proposal`.
-  - Note split: `zcashlc_migration_prepare_note_split`,
-    `zcashlc_migration_sign_note_split`.
-  - Proposal/commit: `zcashlc_migration_residual_after_migration`,
-    `zcashlc_migration_propose_transfers`,
-    `zcashlc_migration_sign_and_store_schedule`.
-  - Delivery: `zcashlc_migration_next_due_transfer`,
-    `zcashlc_migration_extract_broadcast_tx`,
-    `zcashlc_migration_record_transfer_result`,
-    `zcashlc_migration_record_immediate_run` (records a broadcast
-    immediate-migration sweep — an ordinary send-max transaction built
-    outside the engine — so the migration state machine reports it).
-  - Recovery: `zcashlc_migration_restart_step` (cancel and re-plan), and
-    `zcashlc_migration_refresh_stale_transfers` — rebuilds every expired
-    transfer of the stored run in place through the engine's
-    rebuild-on-expiry (`rebuild_expired_transfer` /
-    `rebuild_expired_transfer_unsigned`): the same funding note, recovered
-    by nullifier identity from the expired PCZT, rescheduled from the tip
-    with a fresh memoryless delay, a fresh canonical expiry, and a freshly
-    drawn boundary anchor. The optional spending key selects the lane —
-    with a usk the rebuilt transfer is signed anew in-process; a NULL usk
-    (external signer) leaves it awaiting its signature for the unsigned
-    PCZT ceremony to re-serve and complete. Returns the run's FULL
-    transfer schedule as stored after the refresh (the same
-    `FfiMigrationSchedule` the restart returns, here encoded from the
-    persisted state) — the atomically-persisted truth the host
-    re-displays and echoes, since a rebuilt transfer's fresh
-    scheduled/expiry heights exist nowhere else; with nothing expired
-    the current stored schedule comes back unchanged, and with no
-    stored run or a terminal (completed or cancelled) stored run it is
-    empty. Persisted all-or-nothing (on any rebuild error nothing
-    persists and NULL is returned); a funding note spent outside the
-    migration is a hard error naming the restart remedy.
-  - External signer: `zcashlc_migration_create_unsigned_note_split_pczts`,
-    `zcashlc_migration_store_signed_note_split_pczts`,
-    `zcashlc_migration_create_unsigned_transfer_pczts`,
-    `zcashlc_migration_store_signed_schedule_pczts`.
-  - Helper: `zcashlc_ironwood_activation_height` (NU6.3 activation height for
-    mainnet/testnet).
+- Pool-migration (Orchard→Ironwood) FFI over the canonical `zcash_pool_migration` engine and
+  account-keyed `zcash_client_sqlite::pool_migration` store. Calls retain the SDK panic boundary,
+  paired destructors, thread-local last-error channel, and stable
+  `MIGRATION_PLAN_STALE` / `MIGRATION_PROVING_UNAVAILABLE` prefixes. ZIP 374 proving uses each
+  transfer's persisted ZIP 318 boundary and each preparation's natural wallet anchor.
+  - The exact upstream schema from SDK PR #1825 identifies a preview with a Rust-minted nonzero
+    `PlanHandle`. The cache holds one current plan per database/account; a later preview supersedes
+    its predecessor. Fresh commit and terminal successor rollover accept only this handle, never
+    caller-authored ids, amounts, heights, fee, or duration. Missing/superseded handles surface
+    `MIGRATION_PLAN_STALE`; pure preview queries do not replace cached authority.
+  - `PlanHandle` is pre-commit and process-local. Swift omits it from encoded schedules and resets
+    it to the `0` sentinel on decode. Durable nonterminal resume and all post-commit work use the
+    separate Rust run/revision/claim capabilities; a plan handle is never promoted into delivery
+    authority.
+  - Low-level state, progress, and transaction-status entry points are side-effect-free canonical
+    projections. Chain reconciliation requires `zcashlc_migration_reconcile_canonical_chain_v1`
+    with the opaque scheduled-run capability. The public Swift actor performs that CAS first.
+  - Canonical live rows enter SQLite only through source-bound atomic start: exact Orchard PCZT
+    nullifiers, one `LockOwner`, physical locks, typed reservations, canonical state, and delivery
+    control are committed together. Tests use the same seam instead of weakening the store for
+    synthetic fixtures.
+  - Immediate delivery, external signing, outcome resolution, expired-attempt rebuild, and
+    abandonment remain claim-backed typed operations. The older raw PCZT, direct result-recording,
+    restart, bulk refresh, and direct note-split mutation symbols are fail-closed compatibility
+    stubs and are not reachable from production Swift.
+  - `zcashlc_ironwood_activation_height` reports NU6.3 activation for mainnet/testnet.
 - Migration residual note locking: `zcashlc_migration_lock_residual` locks every
   currently-spendable, not-already-locked legacy-Orchard note of the account until
   explicit unlock (permanent lock expiry) and returns the total locked zatoshi
   (`0` is a legitimate "nothing was spendable" result; `-1` = error), and
-  `zcashlc_migration_unlock_residual` clears ALL of the account's output locks —
-  safe because this SDK never creates proposal-scoped locks — returning the
-  cleared-output count (`-1` = error). `Balance` (inside
+  `zcashlc_migration_unlock_residual` clears only exact outputs held by the deterministic
+  per-account residual owner, preserving migration, ordinary-PCZT, and foreign locks, and returns
+  the cleared-output count (`-1` = error). `Balance` (inside
   `FfiAccountBalance`/`FfiWalletSummary`) gains a trailing `locked_value` field
   marshaled from the upstream balance, keeping the "sum of the fields is the
   account's total" contract true now that upstream totals include locked value.
 - Migration run-count estimate: `zcashlc_migration_estimate_runs` marshals
-  `zcash_pool_migration_backend::engine::estimate_migration_runs` — one
+  `zcash_pool_migration::engine::estimate_migration_runs` — one
   `FfiRunEstimate` (migratable zatoshi, crossings, prep layers, prep
   transactions) per run inside an `FfiMigrationRunEstimate` (runs array +
   final residual), freed by `zcashlc_free_migration_run_estimate`. A zero (or
@@ -120,37 +61,30 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one row per committed migration transaction, keyed by its stable id (durable across
   reads and stale-transfer rebuilds), carrying kind, lifecycle state, scheduled/expiry
   heights, mined height, the broadcast txid while in-mempool, readiness, the next
-  action, and the blocking reason. Mined-transaction reconciliation runs first, per the
-  read-path convention, and a wallet with no stored run gets an empty container. Freed
-  with `zcashlc_free_migration_transaction_statuses`. This is the engine-delegated
+  action, and the blocking reason. The entry point is a side-effect-free projection; public Swift
+  state/progress/status calls reconcile first through the opaque scheduled-run delivery CAS. A
+  wallet with no stored run gets an empty container. Freed with
+  `zcashlc_free_migration_transaction_statuses`. This is the engine-delegated
   equivalent of the platform-side "refresh a cached transfer's display state after a
   reschedule" reads other SDKs hand-roll over the store's SQL.
 
 ### Changed
-- Immediate-migration state derivation (`zcashlc_migration_state` /
-  `zcashlc_migration_progress`): a MINED immediate (send-max) run is now CONSUMED —
-  it derives no migration state (the derivation falls through to `NotStarted`) and
-  masks a stale engine `Complete` left by an earlier engine-tracked run, so the app
-  goes fully quiet once the sweep mines instead of showing a per-run `Complete`. An
-  UNMINED, unexpired immediate run still derives `InProgress` of one, and the
-  expired-unmined re-offer is unchanged. To let the app keep the immediate
-  aftermath quiet, `FfiMigrationProgress` gains a trailing `is_immediate` boolean —
-  `true` for the immediate lane, `false` for engine-tracked runs (and for the
-  absent sentinel). Part of the still-unreleased migration surface above.
-- The librustzcash family pin advanced to current main, which now carries both
-  the boundary-anchor proving of #2710 (on the 144-block retention grid) and
-  the merged owner-keyed note locking of #2716 — nothing unmerged remains, so
-  the pin targets a plain main rev and the former michal/* aggregation
-  branches are retired. Note locks are owner-keyed at this rev: the residual
+- Immediate migration is no longer reconstructed by the legacy scheduled-state/progress
+  projections. Its canonical proposal, reservations, exact artifact, outcome, recovery, and
+  finality live in the Rust-owned immediate delivery lane and are read atomically through the
+  runtime snapshot. `FfiMigrationProgress.is_immediate` remains only a compatibility projection.
+- The librustzcash family pin advanced to the reviewed Zend consolidation revision, which carries
+  the boundary-anchor proving of #2710 (on the 144-block retention grid), the merged owner-keyed
+  note locking of #2716, and Zend's additive delivery runtime. Note locks are owner-keyed: the residual
   lock placed by `zcashlc_migration_lock_residual` is keyed to a deterministic
   per-account owner (making re-locking idempotent), every selection path keeps
-  excluding locked notes, and `zcashlc_migration_unlock_residual` still clears
-  the account's locks wholesale.
+  excluding locked notes, and `zcashlc_migration_unlock_residual` clears only the deterministic
+  residual owner's exact outputs.
 
 ### Fixed
 - Migration due-ness and expiry are now evaluated on the engine's target-height
   contract (`chain tip + 1`, the height of the next block) everywhere, matching
-  `zcash_pool_migration_backend`'s `MigrationState` queries. The read paths
+  `zcash_pool_migration`'s `MigrationState` queries. The read paths
   (`zcashlc_migration_state`/`_progress` state derivation,
   `zcashlc_migration_has_overdue_transfers`, `zcashlc_migration_has_invalid_transfers`,
   `zcashlc_migration_next_due_transfer`, `zcashlc_migration_pending_transfer_proposal`)

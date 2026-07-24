@@ -28,6 +28,14 @@ if [[ -f "$HOME/.cargo/env" ]]; then
     source "$HOME/.cargo/env"
 fi
 
+# shellcheck source=rust-build-env.sh
+source Scripts/rust-build-env.sh
+RUST_TOOLCHAIN=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+if [[ ! "$RUST_TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Error: rust-toolchain.toml must pin an exact stable toolchain" >&2
+    exit 1
+fi
+
 XCFRAMEWORK_DIR="LocalPackages/libzcashlc.xcframework"
 
 usage() {
@@ -54,9 +62,9 @@ USAGEEOF
 # Build an arm64-only xcframework containing exactly the requested slices, then
 # atomically swap it into place. Each argument is one of: ios-sim, ios-device, macos.
 #
-# The slices reuse the same LibraryIdentifiers as the full build (e.g.
-# macos-arm64_x86_64) but declare only arm64 in SupportedArchitectures, matching
-# what rebuild-local-ffi.sh produces, so the two tools stay interchangeable.
+# Slice identifiers name exactly the architectures they contain. Only the full build may use
+# ios-arm64_x86_64-simulator and macos-arm64_x86_64; advertising an absent x86_64 architecture
+# turns an unsupported destination into a late linker failure.
 build_arm_xcframework() {
     local targets=("$@")
 
@@ -74,7 +82,7 @@ build_arm_xcframework() {
         case "$target" in
             ios-sim)
                 rust_target="aarch64-apple-ios-sim"
-                slice="ios-arm64_x86_64-simulator"
+                slice="ios-arm64-simulator"
                 platform="ios"
                 variant="simulator"
                 ;;
@@ -86,7 +94,7 @@ build_arm_xcframework() {
                 ;;
             macos)
                 rust_target="aarch64-apple-darwin"
-                slice="macos-arm64_x86_64"
+                slice="macos-arm64"
                 platform="macos"
                 variant=""
                 ;;
@@ -100,8 +108,8 @@ build_arm_xcframework() {
 
         # Ensure the Rust target is available (idempotent), then build it.
         # cargo is incremental, so repeat builds after small edits are fast.
-        rustup target add "$rust_target"
-        cargo build --target "$rust_target" --release
+        rustup target add --toolchain "$RUST_TOOLCHAIN" "$rust_target"
+        cargo "+$RUST_TOOLCHAIN" build --locked --target "$rust_target" --release
 
         # Populate the framework for this slice.
         local framework="$temp_xcfw/$slice/libzcashlc.framework"
@@ -137,12 +145,8 @@ build_arm_xcframework() {
     mv "$temp_xcfw" "$XCFRAMEWORK_DIR"
     rm -rf "$temp_dir"
 
-    # The slices above are assembled shallow (iOS layout). macOS embedded
-    # frameworks require the VERSIONED bundle layout, else the app build fails
-    # ("expected Versions/Current/Resources/Info.plist"). Same fix as the full
-    # make path below and rebuild-local-ffi.sh; guarded for iOS-only subsets.
-    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework" ]]; then
-        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64/libzcashlc.framework" ]]; then
+        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64/libzcashlc.framework"
     fi
 }
 
@@ -243,6 +247,7 @@ elif [[ "$BUILD_MODE" == "cached" ]]; then
     echo "      Run './Scripts/rebuild-local-ffi.sh' to rebuild for your target platform."
 else
     echo "Building full xcframework from source (this takes a while)..."
+    rustup component add --toolchain "$RUST_TOOLCHAIN" llvm-tools-preview
     cd BuildSupport
     make xcframework
     cd ..
@@ -256,6 +261,9 @@ else
     # frameworks require the versioned bundle layout, else Xcode rejects the app
     # ("expected Versions/Current/Resources/Info.plist"). Fix the macOS slice.
     ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    if [[ "${IRONWOOD_DEFER_ARCHIVE_POSTPROCESSING:-false}" != "true" ]]; then
+        ./Scripts/strip-ironwood-ffi-archives.sh "$XCFRAMEWORK_DIR"
+    fi
 fi
 
 # Create local SPM package wrapper

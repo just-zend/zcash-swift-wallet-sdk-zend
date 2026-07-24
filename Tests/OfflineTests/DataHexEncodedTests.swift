@@ -3,7 +3,7 @@
 //  ZcashLightClientKit
 //
 //  Tests for the internal `Data(hexEncoded:)` initializer used by the Ironwood migration
-//  broadcast composites to turn the crate's hex `PreparedTx.txid` into bytes.
+//  broadcast composites to turn the crate's hex `MigrationPreparedDelivery.txid` into bytes.
 //
 
 import XCTest

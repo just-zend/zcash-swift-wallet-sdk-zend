@@ -69,10 +69,19 @@ use zcash_client_sqlite::{
     util::SystemClock,
     wallet::init::{WalletMigrationError, init_wallet_db},
 };
+use zcash_pool_migration::{
+    delivery::{MigrationRuntimeStore, OrdinarySpendAuthorization, OrdinarySpendScope},
+    wallet::{
+        OrchardReservationAuthorization, PcztLockValidationSource, validate_pczt_orchard_locks,
+    },
+};
 use zcash_primitives::{
     block::BlockHash,
     merkle_tree::HashSer,
-    transaction::{Transaction, TxId},
+    transaction::{
+        Transaction, TxId,
+        builder::{BundlePadding, cached_orchard_proving_key},
+    },
 };
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
@@ -2238,6 +2247,93 @@ where
     Ok(ordinary_spend_pools_at_target(params, target_height))
 }
 
+/// Reads every account in one store transaction and returns the selected account's authoritative
+/// ordinary-spend scope. Reading the owning batch (rather than independent canonical/delivery
+/// tables) prevents a caller from combining revisions, while selecting the requested account
+/// avoids letting an unrelated account's migration block this account.
+fn authorize_ordinary_spend_for_account<DbT>(
+    wallet_db: &mut DbT,
+    account_id: &DbT::AccountId,
+) -> anyhow::Result<OrdinarySpendScope>
+where
+    DbT: MigrationRuntimeStore,
+    DbT::Error: std::fmt::Debug,
+{
+    let batch = wallet_db
+        .all_account_migration_runtimes()
+        .map_err(|e| anyhow!("reading the atomic migration runtime batch failed: {e:?}"))?;
+    let account = batch
+        .accounts()
+        .iter()
+        .find(|runtime| runtime.account_id() == account_id)
+        .ok_or_else(|| {
+            anyhow!("the atomic migration runtime batch omitted the requested account")
+        })?;
+    match account.runtime().ordinary_spend_authorization() {
+        OrdinarySpendAuthorization::Allowed(scope) => Ok(scope),
+        OrdinarySpendAuthorization::Blocked(reason) => Err(anyhow!(
+            "ordinary spending is blocked by authoritative migration runtime: {reason:?}"
+        )),
+    }
+}
+
+/// Reads every account atomically for an account-less execution/finalization API. The returned
+/// flag is true when exact input validation must exclude retained migration sources.
+fn authorize_ordinary_spend_for_all_accounts<DbT>(wallet_db: &mut DbT) -> anyhow::Result<bool>
+where
+    DbT: MigrationRuntimeStore,
+    DbT::Error: std::fmt::Debug,
+{
+    let batch = wallet_db
+        .all_account_migration_runtimes()
+        .map_err(|e| anyhow!("reading the atomic migration runtime batch failed: {e:?}"))?;
+    if batch.accounts().is_empty() {
+        return Err(anyhow!(
+            "the atomic migration runtime batch contained no wallet accounts"
+        ));
+    }
+    let mut requires_source_exclusion = false;
+    for account in batch.accounts() {
+        match account.runtime().ordinary_spend_authorization() {
+            OrdinarySpendAuthorization::Allowed(OrdinarySpendScope::Unrestricted) => {}
+            OrdinarySpendAuthorization::Allowed(OrdinarySpendScope::ExcludingMigrationSources(
+                _,
+            )) => requires_source_exclusion = true,
+            OrdinarySpendAuthorization::Blocked(reason) => {
+                return Err(anyhow!(
+                    "ordinary spending is blocked by authoritative migration runtime: {reason:?}"
+                ));
+            }
+        }
+    }
+    Ok(requires_source_exclusion)
+}
+
+/// Rejects a stale pre-Ironwood proposal whenever runtime finality still requires migration-source
+/// exclusion. New ordinary proposals use `LockedInputPolicy::Exclude` and, after NU6.3, cannot
+/// select Orchard at all; this execution-time check prevents an older serialized proposal from
+/// bypassing that selection policy.
+fn ensure_proposal_excludes_migration_sources<FeeRuleT, NoteRef>(
+    proposal: &zcash_client_backend::proposal::Proposal<FeeRuleT, NoteRef>,
+    required: bool,
+) -> anyhow::Result<()> {
+    let spends_legacy_orchard = proposal.steps().iter().any(|step| {
+        step.shielded_inputs().is_some_and(|inputs| {
+            inputs
+                .notes()
+                .iter()
+                .any(|input| input.note().pool() == ShieldedPool::Orchard)
+        })
+    });
+    if required && spends_legacy_orchard {
+        Err(anyhow!(
+            "the serialized proposal spends legacy Orchard while migration source reservations remain; create a fresh proposal"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod ordinary_spend_pool_tests {
     use super::*;
@@ -2324,6 +2420,119 @@ mod ordinary_spend_pool_tests {
             "SpendPolicy::shielded_pools(spend_pools)",
         );
     }
+
+    #[test]
+    fn legacy_orchard_only_proposal_cannot_touch_a_database_or_escape_bytes() {
+        // An invalid network and null pointers would fail or be dereferenced if the retired path
+        // reached legacy proposal/database code. The early rejection must instead return no
+        // proposal bytes and therefore cannot create a post-hoc reservation side effect.
+        let confirmations_policy = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            zcashlc_propose_send_max_transfer(
+                std::ptr::null(),
+                0,
+                u32::MAX,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                ffi::MaxSpendMode::MaxSpendable,
+                confirmations_policy,
+                true,
+            )
+        };
+        assert!(result.is_null());
+
+        let source = include_str!("lib.rs");
+        let body = source
+            .split_once("pub unsafe extern \"C\" fn zcashlc_propose_send_max_transfer(")
+            .expect("send-max FFI must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("send-max FFI must be isolatable");
+        assert!(
+            body.find("if orchard_only").unwrap() < body.find("wallet_db(").unwrap(),
+            "retired Orchard-only requests must fail before database access"
+        );
+        assert!(body.contains("zcashlc_migration_reserve_immediate_v1"));
+    }
+
+    #[test]
+    fn every_ordinary_creation_and_execution_path_rechecks_owning_runtime() {
+        let source = include_str!("lib.rs");
+        for function_name in [
+            "zcashlc_propose_transfer",
+            "zcashlc_propose_send_max_transfer",
+            "zcashlc_propose_transfer_from_uri",
+            "zcashlc_propose_shielding",
+            "zcashlc_create_pczt_from_proposal",
+        ] {
+            let signature = format!("pub unsafe extern \"C\" fn {function_name}(");
+            let body = source
+                .split_once(&signature)
+                .unwrap_or_else(|| panic!("missing FFI entrypoint {function_name}"))
+                .1
+                .split_once("\n#[unsafe(no_mangle)]")
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("could not isolate FFI entrypoint {function_name}"));
+            assert!(
+                body.contains("authorize_ordinary_spend_for_account("),
+                "{function_name} must consume the selected account's owning runtime"
+            );
+        }
+
+        let execution = source
+            .split_once("pub unsafe extern \"C\" fn zcashlc_create_proposed_transactions(")
+            .expect("direct execution FFI must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("direct execution FFI must be isolatable");
+        assert!(execution.contains("db_data.transactionally("));
+        assert!(execution.contains("authorize_ordinary_spend_for_all_accounts(wdb)"));
+        assert!(execution.contains("ensure_proposal_excludes_migration_sources("));
+    }
+
+    #[test]
+    fn ordinary_pczt_reservation_validation_and_ingestion_share_one_transaction() {
+        // The canonical validator's own integration tests cover the load-bearing transition:
+        // migration ingestion auto-clears its explicit input lock, a stale different-txid ordinary
+        // PCZT is still rejected by the active-spend row, and an exact same-txid retry succeeds.
+        // This SDK-level guard proves our ordinary FFI cannot bypass that validator and that no
+        // database writer can interleave between it and ingestion.
+        let source = include_str!("lib.rs");
+        let body = source
+            .split_once("pub unsafe extern \"C\" fn zcashlc_extract_and_store_from_pczt(")
+            .expect("ordinary PCZT extract/store FFI must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("ordinary PCZT extract/store FFI must be isolatable");
+
+        let transaction = body
+            .find("db_data.transactionally(")
+            .expect("reservation validation and ingestion must share a wallet transaction");
+        let authorization = body
+            .find("authorize_ordinary_spend_for_all_accounts(wdb)")
+            .expect("ordinary PCZT finalization must consume the all-account runtime batch");
+        let validation = body
+            .find("validate_ordinary_pczt_orchard_locks(wdb, &pczt)")
+            .expect("ordinary PCZT must use canonical reservation validation");
+        let ingestion = body
+            .find("extract_and_store_transaction_from_pczt")
+            .expect("ordinary PCZT must be ingested after validation");
+
+        assert!(
+            transaction < authorization && authorization < validation && validation < ingestion,
+            "authorization and validation must run inside the transaction and before ingestion"
+        );
+        assert!(
+            source.contains(
+                "validate_pczt_orchard_locks(source, pczt, OrchardReservationAuthorization::ORDINARY)"
+            ),
+            "the SDK helper must delegate to the canonical lock-plus-active-spend validator"
+        );
+    }
 }
 
 /// Select transaction inputs, compute fees, and construct a proposal for a transaction
@@ -2363,6 +2572,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        let _ordinary_scope = authorize_ordinary_spend_for_account(&mut db_data, &account_uuid)?;
         let to = unsafe { CStr::from_ptr(to) }.to_str()?;
         let value = Zatoshis::from_nonnegative_i64(value)
             .map_err(|_| anyhow!("Invalid amount, out of range"))?;
@@ -2455,10 +2665,16 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
     orchard_only: bool,
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
+        if orchard_only {
+            return Err(anyhow!(
+                "the legacy Orchard-only proposal path is retired; use zcashlc_migration_reserve_immediate_v1 so sources are reserved before proposal exposure"
+            ));
+        }
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        let _ordinary_scope = authorize_ordinary_spend_for_account(&mut db_data, &account_uuid)?;
         let to = unsafe { CStr::from_ptr(to) }.to_str()?;
 
         let to: ZcashAddress = to
@@ -2481,17 +2697,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         let confirmation_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
         let spend_pools = ordinary_spend_pools(&db_data, &network, confirmation_policy)?;
 
-        let pools: &[ShieldedPool] = if orchard_only {
-            &[ShieldedPool::Orchard]
-        } else {
-            &spend_pools[..]
-        };
-
-        let pools: &[ShieldedPool] = if orchard_only {
-            &[ShieldedPool::Orchard]
-        } else {
-            &[ShieldedPool::Sapling, ShieldedPool::Orchard]
-        };
+        let pools = &spend_pools[..];
 
         let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
             &mut db_data,
@@ -2508,13 +2714,11 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
-        if !orchard_only {
-            ensure_ordinary_spend_pools_match_target(
-                &network,
-                spend_pools,
-                proposal.min_target_height(),
-            )?;
-        }
+        ensure_ordinary_spend_pools_match_target(
+            &network,
+            spend_pools,
+            proposal.min_target_height(),
+        )?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -2559,6 +2763,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        let _ordinary_scope = authorize_ordinary_spend_for_account(&mut db_data, &account_uuid)?;
         let payment_uri_str = unsafe { CStr::from_ptr(payment_uri) }.to_str()?;
 
         let (change_strategy, input_selector) = zip317_helper(None);
@@ -2679,6 +2884,7 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        let _ordinary_scope = authorize_ordinary_spend_for_account(&mut db_data, &account_uuid)?;
 
         let memo_bytes = if memo.is_null() {
             MemoBytes::empty()
@@ -2888,18 +3094,22 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
 
         let prover = LocalTxProver::new(spend_params, output_params);
 
-        let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
-            &mut db_data,
-            &network,
-            &prover,
-            &prover,
-            &SpendingKeys::from_unified_spending_key(usk),
-            OvkPolicy::Sender,
-            &proposal,
-            // No expiry override: keep the builder-derived expiry the SDK has always used.
-            None,
-        )
-        .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
+        let txids = db_data.transactionally(|wdb| -> anyhow::Result<_> {
+            let requires_source_exclusion = authorize_ordinary_spend_for_all_accounts(wdb)?;
+            ensure_proposal_excludes_migration_sources(&proposal, requires_source_exclusion)?;
+            create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                wdb,
+                &network,
+                &prover,
+                &prover,
+                &SpendingKeys::from_unified_spending_key(usk),
+                OvkPolicy::Sender,
+                &proposal,
+                // No expiry override: keep the builder-derived expiry the SDK has always used.
+                None,
+            )
+            .map_err(|e| anyhow!("Error while sending funds: {}", e))
+        })?;
 
         Ok(ffi::TxIds::ptr_from_vec(
             txids.into_iter().map(|txid| *txid.as_ref()).collect(),
@@ -2956,40 +3166,54 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
-        let proposal =
-            Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
-                .map_err(|e| anyhow!("Invalid proposal: {}", e))?
-                .try_into_standard_proposal(&network, &db_data)?;
-
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
-
-        if proposal.steps().len() == 1 {
-            let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
-                &mut db_data,
-                &network,
-                account_uuid,
-                OvkPolicy::Sender,
+        let proposal_bytes = unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) };
+        db_data.transactionally(|wdb| -> anyhow::Result<_> {
+            let ordinary_scope = authorize_ordinary_spend_for_account(wdb, &account_uuid)?;
+            let proposal = Proposal::decode(proposal_bytes)
+                .map_err(|e| anyhow!("Invalid proposal: {}", e))?
+                .try_into_standard_proposal(&network, wdb)?;
+            ensure_proposal_excludes_migration_sources(
                 &proposal,
-                // Use the transaction's default expiry height and the default Orchard
-                // bundle type; the SDK does not expose overrides for these.
-                None,
-                orchard::builder::BundleType::DEFAULT,
-            )
-            .map_err(|e| anyhow!("Error creating PCZT from single-step proposal: {}", e))?;
+                matches!(
+                    ordinary_scope,
+                    OrdinarySpendScope::ExcludingMigrationSources(_)
+                ),
+            )?;
 
-            Ok(ffi::BoxedSlice::some(pczt.serialize().map_err(|e| {
-                anyhow!("Failed to serialize PCZT: {:?}", e)
-            })?))
-        } else {
-            Err(anyhow!(
-                "Multi-step proposals are not yet supported for PCZT generation."
-            ))
-        }
+            if proposal.steps().len() == 1 {
+                let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
+                    wdb,
+                    &network,
+                    account_uuid,
+                    OvkPolicy::Sender,
+                    &proposal,
+                    // Use the transaction's default expiry height and default bundle padding;
+                    // the SDK does not expose overrides for these.
+                    None,
+                    BundlePadding::DEFAULT,
+                )
+                .map_err(|e| anyhow!("Error creating PCZT from single-step proposal: {}", e))?;
+
+                Ok(ffi::BoxedSlice::some(pczt.serialize().map_err(|e| {
+                    anyhow!("Failed to serialize PCZT: {:?}", e)
+                })?))
+            } else {
+                Err(anyhow!(
+                    "Multi-step proposals are not yet supported for PCZT generation."
+                ))
+            }
+        })
     });
     unwrap_exc_or_null(res)
 }
 
 /// Redacts information from the given PCZT that is unnecessary for the Signer role.
+///
+/// Applies the canonical Signer-role policy from
+/// [`zcash_client_backend::data_api::wallet::redact_pczt_for_signer`], and additionally
+/// omits Sapling spend witnesses. The caller must retain the unredacted PCZT and combine
+/// the Signer output into it via [`zcashlc_extract_and_store_from_pczt`].
 ///
 /// Returns the updated PCZT in its serialized format.
 ///
@@ -3017,24 +3241,11 @@ pub unsafe extern "C" fn zcashlc_redact_pczt_for_signer(
         let pczt_bytes = unsafe { slice::from_raw_parts(pczt_ptr, pczt_len) };
         let pczt = Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Invalid PCZT: {:?}", e))?;
 
-        let redacted_pczt = Redactor::new(pczt)
-            .redact_global_with(|mut r| r.redact_proprietary("zcash_client_backend:proposal_info"))
-            .redact_orchard_with(|mut r| {
-                r.redact_actions(|mut ar| {
-                    ar.clear_spend_witness();
-                    ar.redact_output_proprietary("zcash_client_backend:output_info");
-                })
-            })
+        // The upstream policy retains Sapling spend witnesses for Signers that verify
+        // nullifiers; the Signers this SDK targets do not, so keep omitting them.
+        let redacted_pczt = Redactor::new(wallet::redact_pczt_for_signer(&pczt))
             .redact_sapling_with(|mut r| {
                 r.redact_spends(|mut sr| sr.clear_witness());
-                r.redact_outputs(|mut or| {
-                    or.redact_proprietary("zcash_client_backend:output_info")
-                });
-            })
-            .redact_transparent_with(|mut r| {
-                r.redact_outputs(|mut or| {
-                    or.redact_proprietary("zcash_client_backend:output_info")
-                });
             })
             .finish();
 
@@ -3132,9 +3343,9 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
         let pczt_bytes = unsafe { slice::from_raw_parts(pczt_ptr, pczt_len) };
         let pczt = Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Invalid PCZT: {:?}", e))?;
 
-        // The Orchard proving key must be built for the circuit governing the Orchard pool
-        // under the consensus branch this PCZT was created for; derive it from the PCZT's
-        // consensus branch id before the PCZT is consumed by the prover.
+        // Select the process-wide cached proving key for the circuit governing the Orchard pool
+        // under the consensus branch this PCZT was created for; derive the version before the PCZT
+        // is consumed by the prover.
         let pczt_branch_id = BranchId::try_from(*pczt.global().consensus_branch_id())
             .map_err(|_| anyhow!("PCZT has an invalid consensus branch id"))?;
 
@@ -3151,9 +3362,7 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
                 })?
                 .circuit_version();
             prover = prover
-                .create_orchard_proof(&orchard::circuit::ProvingKey::build(
-                    orchard_circuit_version,
-                ))
+                .create_orchard_proof(cached_orchard_proving_key(orchard_circuit_version))
                 .map_err(|e| anyhow!("Failed to create Orchard proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_orchard_proof());
@@ -3166,9 +3375,9 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
             // extraction — otherwise a hardware-signed transaction fails at
             // extract with MissingProof. The Ironwood bundle uses the PostNu6_3
             // circuit (the fixed circuit plus the `disableCrossAddress`
-            // constraint), a distinct proving key from the Orchard pool's.
+            // constraint), whose process-wide cached key is distinct from earlier versions.
             prover = prover
-                .create_ironwood_proof(&orchard::circuit::ProvingKey::build(
+                .create_ironwood_proof(cached_orchard_proving_key(
                     orchard::circuit::OrchardCircuitVersion::PostNu6_3,
                 ))
                 .map_err(|e| anyhow!("Failed to create Ironwood proof for PCZT: {:?}", e))?;
@@ -3206,6 +3415,24 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
         ))
     });
     unwrap_exc_or_null(res)
+}
+
+/// Rejects an ordinary PCZT that spends an Orchard note currently reserved by any wallet flow.
+///
+/// Validation runs after the proof/signature PCZTs are combined and in the same transaction as
+/// extraction/storage. The storage-backed source covers active Orchard locks and
+/// current-chain/unexpired wallet spend records across every account with an empty
+/// recognized-owner set: an ordinary transaction owns none of the migration locks, even if its
+/// PCZT predates those locks. The canonical validator derives the candidate txid from this fully
+/// authorized PCZT; a different active spender is rejected after ingestion has auto-cleared its
+/// input lock, while an exact same-txid retry remains idempotent.
+fn validate_ordinary_pczt_orchard_locks<S>(source: &S, pczt: &Pczt) -> anyhow::Result<()>
+where
+    S: PcztLockValidationSource,
+    S::Error: std::fmt::Debug,
+{
+    validate_pczt_orchard_locks(source, pczt, OrchardReservationAuthorization::ORDINARY)
+        .map_err(|e| anyhow!("Ordinary PCZT reservation validation failed: {e:?}"))
 }
 
 /// Takes a PCZT that has been separately proven and signed, finalizes it, and stores it
@@ -3307,13 +3534,25 @@ pub unsafe extern "C" fn zcashlc_extract_and_store_from_pczt(
             .combine()
             .map_err(|e| anyhow!("Failed to combine PCZTs: {:?}", e))?;
 
-        let txid = extract_and_store_transaction_from_pczt::<_, ()>(
-            &mut db_data,
-            pczt,
-            sapling_vk.as_ref().map(|(s, o)| (s, o)),
-            None,
-        )
-        .map_err(|e| anyhow!("Failed to extract transaction from PCZT: {:?}", e))?;
+        // A proposal can go stale after it is created if the migration reserves or ingests a
+        // transaction spending one of its inputs. Validate every account's active locks and spend
+        // records, then store the extracted transaction inside one SQLite transaction: a competing
+        // database writer cannot interleave between the final reservation check and storage. The
+        // validator derives this fully authorized PCZT's candidate txid, rejecting a different
+        // active spender while allowing an exact retry. Locks remain advisory, so a separate
+        // process can still acquire one after this commit and before the host broadcasts; @DBActor
+        // serializes the supported in-process paths.
+        let txid = db_data.transactionally(|wdb| -> anyhow::Result<_> {
+            let _requires_source_exclusion = authorize_ordinary_spend_for_all_accounts(wdb)?;
+            validate_ordinary_pczt_orchard_locks(wdb, &pczt)?;
+            extract_and_store_transaction_from_pczt::<_, ()>(
+                wdb,
+                pczt,
+                sapling_vk.as_ref().map(|(s, o)| (s, o)),
+                None,
+            )
+            .map_err(|e| anyhow!("Failed to extract transaction from PCZT: {e:?}"))
+        })?;
 
         Ok(ffi::BoxedSlice::some(txid.as_ref().to_vec()))
     });

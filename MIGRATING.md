@@ -1,100 +1,97 @@
 # Migrating from previous versions to _Unreleased_
 
-## The pool-migration surface rides the final engine
+## The pool-migration surface rides the canonical engine
 
-The Orchard→Ironwood migration group (never in a released SDK) is rewired onto the final engine
-crates (`zcash_pool_migration_backend` + `zcash_pool_migration_sqlite`). For integrators tracking
-the unreleased surface:
+The Orchard→Ironwood migration group (never in a released SDK) now uses
+`zcash_pool_migration` plus `zcash_client_sqlite::pool_migration` as its planner, persistence, and
+lifecycle schema. The public Swift surface composes those upstream models with opaque Rust-owned
+delivery capabilities; it does not expose the older transaction-by-transaction FFI ceremony.
 
-- **The external-signer note-split pair went plural.** The engine builds N preparation
-  transactions, not one split transaction, so
-  `createUnsignedNoteSplitPCZT(accountUUID:) -> Data` is now
-  `createUnsignedNoteSplitPCZTs(accountUUID:) -> [MigrationUnsignedTransferPczt]` (it also creates
-  the run, persisted unsigned), and `storeSignedNoteSplitPCZT(accountUUID:_: Data)` is now
-  `storeSignedNoteSplitPCZTs(accountUUID:_: [MigrationSignedTransferPczt])` (all-or-nothing; the
-  returned `PreparedMigrationTransfer` is a storage receipt with a zeroed `txid` — the
-  broadcastable value is served by the delivery lane). One signing ceremony still covers the whole
-  migration together with `createUnsignedMigrationTransferPCZTs`.
-- **`MigrationState.complete` is PER-RUN.** It means "the stored run is fully mined", never
-  "nothing left to migrate": ask `proposeMigrationTransfers` whether anything remains (an empty
-  schedule means no), and only then treat the account as done. Sequential runs are first-class — a
-  new commit over a completed run starts the next one.
-- **`MigrationState.readyToPropose` and `MigrationAttentionReason.syncRequiredBeforeNext` are
-  removed** (not merely unreachable): the note split and the schedule commit atomically, so
-  neither case ever had a real value to carry. This is source-breaking for an exhaustive `switch`
-  over either enum — drop the corresponding `case`.
-- **`includeResidual` is removed** from `proposeMigrationTransfers`, `restartCurrentMigrationStep`,
-  and `refreshStaleMigrationTransfers`: the engine plans canonically and ZIP 318 keeps the residual
-  in Orchard, so the parameter never had a real choice behind it. **`isSyncRequiredBeforeNextMigrationTransfer`
-  is removed entirely** for the same reason: the note split and the schedule commit atomically, so
-  a sync-required gate before the next transfer never had a use.
-- **`refreshStaleMigrationTransfers(accountUUID:usk:)` really rebuilds expired transfers.** It
-  rebuilds every EXPIRED transfer of the stored run in place: each rebuilt transfer re-spends the
-  SAME funding note (recovered by nullifier identity, never an equal-value substitute) on a fresh
-  schedule — a fresh memoryless delay from the current tip, a fresh canonical expiry, and a
-  freshly drawn boundary anchor — and returns the run's full `MigrationSchedule` as stored AFTER
-  the refresh (the current stored schedule when nothing had expired; empty when no run is stored
-  or the run is terminal), persisted ALL-OR-NOTHING: a mid-refresh failure persists NONE of the
-  batch's rebuilds, so a successful return's schedule is exactly what was atomically committed,
-  never a partial batch. The rebuilt rows' fresh scheduled/expiry heights exist nowhere but in
-  that returned schedule — re-display it and use it for every later consent echo; a pre-refresh
-  copy fails the verified echo with `migrationPlanStale` from then on. `usk` is now
-  `UnifiedSpendingKey?`: pass a spending key to sign each rebuilt transfer anew in-process, or
-  `nil` for the external-signer (Keystone) lane, which leaves the rebuilt transfers awaiting their
-  signature so the existing `createUnsignedMigrationTransferPCZTs` / `storeSignedMigrationSchedulePCZTs`
-  ceremony re-serves and completes them. A `FundingNoteUnavailable`-class failure (the expired
-  transfer's exact funding note was spent outside the migration) throws naming
-  `restartCurrentMigrationStep` (cancel and re-plan the remaining balance) as the remedy.
-- **Two new errors:** `migrationPlanStale` (ZRUST0128 — the schedule/note-split consent echo no
-  longer matches what is about to be signed; the echo is VERIFIED, never inert display data.
-  Recovery depends on when it fires: BEFORE a run is committed, the mismatch is against the
-  previewed plan — propose again and re-display. AFTER a run is committed, the mismatch is
-  against the stored run itself, and re-proposing cannot converge (proposals re-randomize and
-  never touch the committed run) — instead re-read the current stored schedule, which
-  `refreshStaleMigrationTransfers(accountUUID:usk:)` returns and the unsigned-transfer PCZT
-  serve path works from, and re-display that) and `migrationProvingUnavailable` (ZRUST0127 —
-  proving failed hard).
+- **`MigrationState.complete` is per run.** It means the stored run is fully mined, never that the
+  account has nothing left to migrate. Call `proposeMigrationTransfers(accountUUID:)` again; an
+  empty schedule means no balance remains. Passing a later approved schedule to
+  `signAndStoreMigrationSchedule` or `commitMigrationScheduleForExternalSigning` atomically rolls a
+  terminal run into its successor while retaining predecessor evidence and reservations.
+- **SDK-held keys use high-level operations.** Confirm a gradual schedule with
+  `signAndStoreMigrationSchedule`, then call
+  `executeNextPendingMigrationTransfer(accountUUID:options:)` when due. Rust selects the exact
+  canonical transaction, proves it, owns its submission claim, and records a typed outcome.
+- **External signers use opaque request objects.** First call
+  `commitMigrationScheduleForExternalSigning(accountUUID:_:options:)`. For each transaction, call
+  `prepareNextMigrationTransactionForExternalSigning(accountUUID:)`, give the request's PCZT to the
+  signer, and return that same request plus the signer response to
+  `submitExternallySignedMigrationTransaction`. A relaunch resumes or reacquires the exact exposed
+  artifact; callers never reconstruct a claim or choose a replacement transaction.
+  These APIs represent one request at a time. A future batch-signing transport must use
+  `redact_pczt_for_batch_signer`, retain every original PCZT, include the required derivation
+  annotation, and correlate ordered signer responses with their originating requests; ordinary
+  `redact_pczt_for_signer` is not a batch protocol.
+- **Recovery is explicit and claim-backed.** Use `pauseMigrationDelivery`,
+  `resumeMigrationDelivery`, `beginMigrationAbandonment`, and `finishMigrationAbandonment` for
+  delivery control. Rebuild one positively expired attempt with
+  `rebuildExpiredMigrationTransfer` (SDK signer) or
+  `rebuildExpiredMigrationTransferForExternalSigning` (external signer). The former batch refresh,
+  cancel-and-replan restart, raw unsigned/signed PCZT arrays, and caller-recorded result APIs are
+  retired and are not compatibility entry points.
+- **Removed enum cases and parameters stay removed.** `MigrationState.readyToPropose`,
+  `MigrationAttentionReason.syncRequiredBeforeNext`, `includeResidual`, and
+  `isSyncRequiredBeforeNextMigrationTransfer` do not exist in the consolidated API.
+- **A preview carries process-local authority, not caller-field authority.** Rust assigns every
+  note-split proposal and migration schedule a nonzero opaque `proposalHandle`. Fresh commit and
+  terminal successor rollover pass only that handle back; a second preview supersedes the first,
+  and a missing or stale handle throws `migrationPlanStale` (ZRUST0128). The handle is deliberately
+  omitted from `MigrationSchedule` encoding and always resets to the zero sentinel on decode, so a
+  persisted or restored schedule is display-only and must be re-proposed before commit. Resuming an
+  existing nonterminal run uses its durable Rust run/claim capability instead. Hard proving failures
+  surface as `migrationProvingUnavailable` (ZRUST0127).
 - **`MigrationTransferProposal.anchorHeight` is a reference height** (the proposal-time tip), not
   a commitment-tree anchor: ZIP 374 defers real anchors to proving time.
 
-## The immediate migration lane leaves the engine
+## Immediate migration now consumes an opaque Rust delivery claim
 
-The immediate (single-transaction) Orchard→Ironwood migration is no longer proposed or tracked by
-the migration engine's own schedule/commit machinery. It is now an ordinary send-max transfer that
-the app executes through the normal transaction pipeline, with one new call to record the outcome:
+The intermediate ordinary-send design has been retired. Immediate Orchard→Ironwood migration is
+reserved, materialized, submitted, and recorded by the Rust-owned delivery runtime. Hosts can no
+longer hold an ordinary proposal or tell the SDK which transaction id was broadcast:
 
-- **`proposeImmediateMigration(accountUUID:) async throws -> MigrationSchedule` is now
-  `proposeImmediateMigration(accountUUID:) async throws -> ImmediateMigrationProposal`.**
-  `ImmediateMigrationProposal` carries an ordinary `Proposal` — feed it to
-  `createProposedTransactions(proposal:spendingKey:)` (software accounts) or
-  `createPCZTFromProposal(accountUUID:proposal:)` (Keystone accounts) exactly like any other
-  transfer — plus the decoded `amount` (the net value crossing into Ironwood) and `fee`. There is
-  no engine plan cache behind it: nothing about the returned proposal can go stale the way a
-  `MigrationSchedule` preview can, and `signAndStoreMigrationSchedule` is not part of this lane (it
-  remains for `proposeMigrationTransfers`'s gradual path).
-- **New: `recordImmediateMigration(accountUUID:txid:) async throws`.** Call it after a successful
-  broadcast (software or Keystone lane) so the platform migration state machine reports the sweep:
-  `InProgress(0 of 1)` while unmined, then a quiet `NotStarted` once it mines. A MINED immediate
-  sweep is CONSUMED — it is NOT surfaced as `Complete`, so there is nothing for the user to
-  acknowledge and no per-run completion screen (the sweep zeroes the spendable Orchard balance, so
-  the balance-gated "Migration Required" prompt does not re-offer unless new Orchard funds arrive
-  later; an unmined sweep that expires likewise falls back to `NotStarted` so the prompt re-offers
-  while funds remain). One row per account — a new record supersedes any previous one. Not
-  broadcast-sensitive itself (no `migrationBroadcastDuringSync` guard): the actual broadcast already
-  rides the guarded `createProposedTransactions`/`createTransactionFromPCZT` path.
-- **`MigrationProgress` gains `isImmediate: Bool`** (additive — the public memberwise initializer
-  defaults it to `false`, so existing `MigrationProgress(...)` construction sites keep compiling
-  unchanged). It is `true` only while the immediate (send-max) lane's sweep is in progress and
-  `false` for engine-tracked schedule runs, letting the app keep the immediate aftermath quiet (no
-  per-transfer progress UI).
-- **Removed** (internal welding surface, never reachable from outside the SDK):
-  `ZcashRustBackendWelding.migrationProposeImmediateTransfers` and its FFI,
-  `zcashlc_migration_propose_immediate_transfers`. Replaced by the general-purpose
-  `proposeSendMaxTransfer(accountUUID:recipient:memo:orchardOnly:)` (called with `orchardOnly: true`
-  and `recipient` set to the account's own address, `memo: nil`) — a plain "spend everything to one
-  recipient" primitive the migration engine itself never touches.
-- **`MigrationSchedule` itself is unaffected** and still backs `proposeMigrationTransfers` /
-  `signAndStoreMigrationSchedule` (the gradual, privacy-path schedule).
+- **Removed:** `proposeImmediateMigration(accountUUID:) -> ImmediateMigrationProposal` and
+  `recordImmediateMigration(accountUUID:txid:)`. Do not execute immediate migration through
+  `createProposedTransactions` / `createPCZTFromProposal`, and do not persist or replay a txid as
+  migration authority.
+- **SDK signer:** call
+  `submitImmediateMigration(accountUUID:usk:options:) -> MigrationSubmissionOutcome`. Rust
+  atomically selects and reserves the Orchard sources, seals the destination, target height,
+  expiry, consensus branch, and submission policy, builds and stores the exact transaction, then
+  grants a one-shot submission claim. Swift submits only the exact bytes copied from that claim.
+- **External signer:** call
+  `prepareImmediateMigrationForExternalSigning(accountUUID:options:)` and give the returned
+  request's `pczt` to the signer. Return that same opaque request plus the signer's response to
+  `submitExternallySignedImmediateMigration(accountUUID:request:signedPCZT:)`. Rust validates the
+  merge against the staged PCZT and finalizes the exact transaction atomically; the request's claim
+  cannot be constructed or altered by the host. If the app relaunches before the signer returns,
+  call `prepareImmediateMigrationForExternalSigning` again with the same options: the SDK recovers
+  the exact staged PCZT and reacquires its Rust claim rather than reserving a replacement artifact.
+  Different transport or endpoint options fail closed against the persisted Rust policy.
+- Every returned submission outcome (`accepted`, `knownUnsent`, or `unknown`) means the submit RPC
+  began, so the 10-minute anti-correlation sync buffer is active before the outcome is recorded.
+  A thrown pre-submit failure broadcasts nothing and releases only Rust-validated known-unsent
+  authority. Stop synchronization before either submitting method; `SDKSynchronizer` enforces the
+  existing `migrationBroadcastDuringSync` guard.
+- `MigrationSchedule` remains the preview/consent model for gradual migration only.
+
+### Retired Zend state-machine API mapping
+
+The former Zend-only snapshot/intent API represented a second migration state machine and is not
+preserved as a compatibility facade. Its replacement keeps planner and transaction state in the
+upstream schema and keeps delivery authority in opaque Rust capabilities:
+
+| Retired call/model | Replacement |
+| --- | --- |
+| `migrationSnapshot(for:) -> MigrationSnapshot` | `migrationRuntimeSnapshot(accountUUID:) -> MigrationRuntimeSnapshot`. Read this atomically before and after work; do not reconstruct run ids, revisions, claims, or policy fingerprints in the app. |
+| `previewImmediateMigration(for:)` | No immediate read-only proposal. Immediate source selection and economics are reserved atomically at confirmation. Use `proposeMigrationTransfers(accountUUID:)` only for the gradual schedule preview. |
+| `proposeImmediateMigrationIntent` + `commitMigrationIntents` | SDK signer: `submitImmediateMigration`. External signer: `prepareImmediateMigrationForExternalSigning` followed by `submitExternallySignedImmediateMigration`. |
+| Scheduled `commitMigrationIntents` | SDK signer: `signAndStoreMigrationSchedule`. External signer: `commitMigrationScheduleForExternalSigning`, then one opaque `prepareNextMigrationTransactionForExternalSigning` / `submitExternallySignedMigrationTransaction` round trip per canonical transaction. The delivery policy is bound before any PCZT is exposed. |
+| `executeNextMigrationAction(expectedRunId:expectedRevision:...)` | `executeNextPendingMigrationTransfer(accountUUID:options:)`. Rust chooses readiness, consumes the opaque materialization/submission claim, and keeps ambiguous outcomes resolution-only. Refresh `migrationRuntimeSnapshot` afterward. |
+| App-authored `runId`, numeric revision, txid, expiry, or branch | No replacement input. These values stay sealed in Rust run/claim handles; public fields are status projections only. |
 
 ## Residual locking and the run-count estimate join the migration group
 
@@ -111,9 +108,10 @@ behavior (`SDKSynchronizer` does):
   repeating the call locks (and reports) only notes that became spendable since. A concurrent-lock
   race throws (`rustMigrationLockResidual`, ZRUST0132) and may be retried.
 - **New: `unlockMigrationResidual(accountUUID:) async throws -> Int`.** The release half: clears
-  ALL of the account's output locks and returns the cleared count (safe — the SDK never creates
-  proposal-scoped output locks). "Migrate anyway" over a locked residual composes as this call
-  followed by `proposeImmediateMigration(accountUUID:)`; locked notes are excluded from note
+  only outputs owned by the account's deterministic residual-lock owner and returns the cleared
+  count. Migration-source, ordinary-PCZT, and foreign-owner locks remain intact. "Migrate anyway"
+  over a locked residual composes as this call followed by
+  `submitImmediateMigration(accountUUID:usk:options:)`; locked notes are excluded from note
   selection, so the unlock must come first.
 - **New: `estimateMigrationRuns(accountUUID:) async throws -> MigrationRunEstimate`.** The rounds
   preview for the multi-round migration UI: how many migration RUNS ("rounds") migrating the whole
@@ -135,9 +133,10 @@ behavior (`SDKSynchronizer` does):
   crossing), lifecycle state (`broadcast`/`mined` fold the engine's txid/mined-height payload into
   the matching case, so illegal combinations are unrepresentable — a MINED row's txid is NOT
   carried by the engine's own state model), scheduled/expiry heights, readiness, and next
-  action/blocker, keyed by a stable id. A verbatim marshal of the engine's own
-  `MigrationState::transaction_statuses`, mined-reconciled at read like every sibling; an empty
-  array means no stored run or no transactions, not an error. New error code
+  action/blocker, keyed by a stable id. The public migration actor first reconciles a scheduled run
+  through the Rust-owned opaque run capability, then returns a side-effect-free verbatim marshal of
+  the engine's own `MigrationState::transaction_statuses`; an empty array means no stored run or no
+  transactions, not an error. New error code
   `rustMigrationTransactionStatuses` (ZRUST0135).
 
 ## `prepare` now validates the seed against the existing wallet

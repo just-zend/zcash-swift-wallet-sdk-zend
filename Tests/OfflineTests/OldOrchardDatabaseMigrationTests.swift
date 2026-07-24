@@ -18,7 +18,6 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
     ])
     private static let fixtureSeed = [UInt8](repeating: 0, count: 32)
     private static let orchardValue = Zatoshi(123_456_789)
-    private static let immediateFee: UInt64 = 20_000
 
     func testRestoreUpgradesCanonicalOldOrchardTestnetWalletWithoutLosingState() async throws {
         let fixtureURL = try XCTUnwrap(TestDbBuilder.zend260Alpha6OrchardDataDbURL())
@@ -157,22 +156,28 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
         XCTAssertEqual(accountBalance.orchardBalance.spendableValue, .zero)
         XCTAssertEqual(accountBalance.ironwoodBalance.total(), .zero)
 
-        try await synchronizer.initializePostUpgrade(for: Self.expectedAccount)
-        let snapshot = try await synchronizer.migrationSnapshot(for: Self.expectedAccount)
-        XCTAssertEqual(snapshot.schemaVersion, MigrationSnapshot.supportedSchemaVersion)
-        XCTAssertEqual(snapshot.schemaProvenance, .compatible)
-        XCTAssertEqual(snapshot.state, .notStarted)
-        XCTAssertFalse(snapshot.ordinarySpendsBlocked)
-        XCTAssertEqual(try Self.schemaObjectCount(prefix: "ext_ironwood_migration_", at: dataDbURL), 10)
-        XCTAssertEqual(try Self.engineSchemaVersion(at: dataDbURL), MigrationSnapshot.supportedSchemaVersion)
+        let snapshot = try await synchronizer.migrationRuntimeSnapshot(accountUUID: Self.expectedAccount)
+        guard case .compatible(let schemaVersion) = snapshot.schemaProvenance else {
+            return XCTFail("the upgraded wallet must expose the current Rust delivery schema")
+        }
+        XCTAssertGreaterThan(schemaVersion, 0)
+        XCTAssertNil(snapshot.canonical.status)
+        XCTAssertEqual(snapshot.canonical.transactionCount, 0)
+        XCTAssertEqual(snapshot.availability, .available)
+        XCTAssertEqual(snapshot.ordinarySpendAuthorization, .unrestricted)
+        XCTAssertNil(snapshot.delivery)
+        XCTAssertTrue(snapshot.retainedRuns.isEmpty)
+        XCTAssertEqual(try Self.schemaObjectCount(prefix: "ext_ironwood_migration_", at: dataDbURL), 0)
+        XCTAssertEqual(try Self.schemaObjectCount(named: "orchard_ironwood_migrations", at: dataDbURL), 1)
+        XCTAssertEqual(try Self.schemaObjectCount(named: "zend_orchard_ironwood_delivery_meta", at: dataDbURL), 1)
 
-        let engineRowsBeforePreview = try Self.engineRowCount(at: dataDbURL)
-        let preview = try await synchronizer.previewImmediateMigration(for: Self.expectedAccount)
-        XCTAssertEqual(preview, .noSpendableFunds)
+        let migrationRowsBeforeProposal = try Self.migrationRowCount(at: dataDbURL)
+        let proposal = try await synchronizer.proposeMigrationTransfers(accountUUID: Self.expectedAccount)
+        XCTAssertTrue(proposal.transfers.isEmpty)
         XCTAssertEqual(try Self.captureDurableState(at: dataDbURL), afterPrepare)
-        XCTAssertEqual(try Self.engineRowCount(at: dataDbURL), engineRowsBeforePreview)
-        let snapshotAfterPreview = try await synchronizer.migrationSnapshot(for: Self.expectedAccount)
-        XCTAssertEqual(snapshotAfterPreview, snapshot)
+        XCTAssertEqual(try Self.migrationRowCount(at: dataDbURL), migrationRowsBeforeProposal)
+        let snapshotAfterProposal = try await synchronizer.migrationRuntimeSnapshot(accountUUID: Self.expectedAccount)
+        XCTAssertEqual(snapshotAfterProposal, snapshot)
 
         // A production synchronizer self-heals this expected waiting state by downloading and
         // scanning the Historic range. Replay the exact compact blocks that created the old
@@ -206,25 +211,19 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
         XCTAssertEqual(healedBalance.orchardBalance.spendableValue, Self.orchardValue)
         XCTAssertEqual(healedBalance.orchardBalance.valuePendingSpendability, .zero)
 
-        let healedPreview = try await synchronizer.previewImmediateMigration(for: Self.expectedAccount)
-        guard case let .actionable(spendableBalance, migrationAmount, fee) = healedPreview else {
-            return XCTFail("the canonical Orchard note must become actionable after its queued rescan")
-        }
-        let orchardSpendable = try XCTUnwrap(UInt64(exactly: Self.orchardValue.amount))
-        XCTAssertEqual(spendableBalance, orchardSpendable)
-        XCTAssertEqual(fee, Self.immediateFee)
-        XCTAssertEqual(migrationAmount, orchardSpendable - Self.immediateFee)
-        XCTAssertEqual(try Self.engineRowCount(at: dataDbURL), engineRowsBeforePreview)
-        let healedSnapshot = try await synchronizer.migrationSnapshot(for: Self.expectedAccount)
+        let healedProposal = try await synchronizer.proposeMigrationTransfers(accountUUID: Self.expectedAccount)
+        XCTAssertFalse(healedProposal.transfers.isEmpty)
+        XCTAssertGreaterThan(try XCTUnwrap(healedProposal.transfers.first).amount, .zero)
+        XCTAssertEqual(try Self.migrationRowCount(at: dataDbURL), migrationRowsBeforeProposal)
+        let healedSnapshot = try await synchronizer.migrationRuntimeSnapshot(accountUUID: Self.expectedAccount)
         XCTAssertEqual(healedSnapshot, snapshot)
 
         // Both migration layers are restart-safe. A launch interrupted after either step can
         // repeat them without duplicating an account, note, scan range, or engine marker.
         let repeatedInit = try await initializer.rustBackend.initDataDb(seed: Self.fixtureSeed)
         XCTAssertEqual(repeatedInit, .success)
-        try await synchronizer.initializePostUpgrade(for: Self.expectedAccount)
         XCTAssertEqual(try Self.captureDurableState(at: dataDbURL), before)
-        XCTAssertEqual(try Self.engineMetaRowCount(at: dataDbURL), 1)
+        XCTAssertEqual(try Self.deliveryMetaRowCount(at: dataDbURL), 1)
     }
 
     private struct DurableState: Equatable {
@@ -357,34 +356,33 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
         return try scalarInt("SELECT note_version FROM orchard_received_notes", in: db)
     }
 
-    private static func engineSchemaVersion(at url: URL) throws -> UInt32 {
+    private static func deliveryMetaRowCount(at url: URL) throws -> Int64 {
         let db = try Connection(url.path)
-        return UInt32(try scalarInt(
-            "SELECT schema_version FROM ext_ironwood_migration_meta WHERE singleton = 1",
-            in: db
-        ))
+        return try scalarInt("SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_meta", in: db)
     }
 
-    private static func engineMetaRowCount(at url: URL) throws -> Int64 {
-        let db = try Connection(url.path)
-        return try scalarInt("SELECT COUNT(*) FROM ext_ironwood_migration_meta", in: db)
-    }
-
-    private static func engineRowCount(at url: URL) throws -> Int64 {
+    private static func migrationRowCount(at url: URL) throws -> Int64 {
         let db = try Connection(url.path)
         return try scalarInt(
             """
             SELECT SUM(row_count) FROM (
-                SELECT COUNT(*) AS row_count FROM ext_ironwood_migration_meta
-                UNION ALL SELECT COUNT(*) FROM ext_ironwood_migration_runs
-                UNION ALL SELECT COUNT(*) FROM ext_ironwood_migration_submission_policies
-                UNION ALL SELECT COUNT(*) FROM ext_ironwood_migration_intent_drafts
-                UNION ALL SELECT COUNT(*) FROM ext_ironwood_migration_intents
-                UNION ALL SELECT COUNT(*) FROM ext_ironwood_migration_prepared_notes
-                UNION ALL SELECT COUNT(*) FROM ext_ironwood_migration_prep_tx
-                UNION ALL SELECT COUNT(*) FROM ext_ironwood_migration_pending_txs
-                UNION ALL SELECT COUNT(*) FROM ext_ironwood_migration_staged_pczts
-                UNION ALL SELECT COUNT(*) FROM ext_ironwood_migration_reorg_queue
+                SELECT COUNT(*) AS row_count FROM orchard_ironwood_migrations
+                UNION ALL SELECT COUNT(*) FROM orchard_ironwood_migration_crossing_values
+                UNION ALL SELECT COUNT(*) FROM orchard_ironwood_migration_prep_inputs
+                UNION ALL SELECT COUNT(*) FROM orchard_ironwood_migration_prep_outputs
+                UNION ALL SELECT COUNT(*) FROM orchard_ironwood_migration_prep_direct_funding
+                UNION ALL SELECT COUNT(*) FROM orchard_ironwood_migration_transactions
+                UNION ALL SELECT COUNT(*) FROM orchard_ironwood_migration_transaction_deps
+                UNION ALL SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_meta
+                UNION ALL SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_runs
+                UNION ALL SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_control
+                UNION ALL SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_claims
+                UNION ALL SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_reservations
+                UNION ALL SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_evidence
+                UNION ALL SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_attempt_archive
+                UNION ALL SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_run_archive
+                UNION ALL SELECT COUNT(*) FROM zend_orchard_ironwood_immediate_delivery
+                UNION ALL SELECT COUNT(*) FROM zend_ironwood_legacy_quarantine
             )
             """,
             in: db

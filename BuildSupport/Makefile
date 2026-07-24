@@ -13,9 +13,6 @@ IOS_SIM_ARCHS_STABLE = x86_64-apple-ios  aarch64-apple-ios-sim
 MACOS_ARCHS = x86_64-apple-darwin aarch64-apple-darwin
 IOS_SIM_ARCHS = $(IOS_SIM_ARCHS_STABLE)
 
-RUST_SRCS = $(shell find ../rust -name "*.rs") ../Cargo.toml
-STATIC_LIBS = $(shell find ../target -name "libzcashlc.a")
-
 install:
 	rustup toolchain add $(RUST_TOOLCHAIN) --profile minimal
 	rustup +$(RUST_TOOLCHAIN) target add aarch64-apple-ios x86_64-apple-ios x86_64-apple-darwin aarch64-apple-darwin aarch64-apple-ios-sim
@@ -60,15 +57,21 @@ products/%/frameworks/libzcashlc.framework: products/%/universal/libzcashlc.a
 
 products/macos/universal/libzcashlc.a: $(MACOS_ARCHS)
 	mkdir -p $(@D)
-	lipo -create $(shell find products/macos/static-libraries -name "libzcashlc.a") -output $@
+	lipo -create \
+		products/macos/static-libraries/aarch64-apple-darwin/libzcashlc.a \
+		products/macos/static-libraries/x86_64-apple-darwin/libzcashlc.a \
+		-output $@
 
 products/ios-simulator/universal/libzcashlc.a: $(IOS_SIM_ARCHS)
 	mkdir -p $(@D)
-	lipo -create $(shell find products/ios-simulator/static-libraries -name "libzcashlc.a") -output $@
+	lipo -create \
+		products/ios-simulator/static-libraries/aarch64-apple-ios-sim/libzcashlc.a \
+		products/ios-simulator/static-libraries/x86_64-apple-ios/libzcashlc.a \
+		-output $@
 
 products/ios-device/universal/libzcashlc.a: $(IOS_DEVICE_ARCHS)
 	mkdir -p $(@D)
-	lipo -create $(shell find products/ios-device/static-libraries -name "libzcashlc.a") -output $@
+	lipo -create products/ios-device/static-libraries/aarch64-apple-ios/libzcashlc.a -output $@
 
 $(MACOS_ARCHS): %: stable-%
 	mkdir -p products/macos/static-libraries/$*

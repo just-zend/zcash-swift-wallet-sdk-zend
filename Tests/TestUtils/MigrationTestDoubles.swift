@@ -33,7 +33,7 @@ final class ScriptedBroadcaster: MigrationBroadcasting {
         case throwing(Error)
     }
 
-    private(set) var receivedCalls: [(endpoint: LightWalletEndpoint, useTor: Bool)] = []
+    private(set) var receivedCalls: [(rawTransaction: Data, endpoint: LightWalletEndpoint, useTor: Bool)] = []
     var onBroadcast: (() -> Void)?
     private let script: Script
 
@@ -46,7 +46,7 @@ final class ScriptedBroadcaster: MigrationBroadcasting {
         to endpoint: LightWalletEndpoint,
         useTor: Bool
     ) async throws -> MigrationBroadcastOutcome {
-        receivedCalls.append((endpoint: endpoint, useTor: useTor))
+        receivedCalls.append((rawTransaction: rawTransaction, endpoint: endpoint, useTor: useTor))
         onBroadcast?()
         switch script {
         case .outcome(let outcome):

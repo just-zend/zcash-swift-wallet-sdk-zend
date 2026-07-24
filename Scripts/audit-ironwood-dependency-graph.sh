@@ -1,24 +1,64 @@
 #!/bin/bash
 
-# Verifies the fund-moving Rust graph before an FFI artifact is rebuilt. Public SDK CI consumes
-# the committed XCFramework; this source audit runs only in an authenticated release/private-Rust
-# environment where the exact migration-engine revision is available.
+# Verifies the fund-moving Rust graph before an FFI artifact is rebuilt. The exact Zend
+# librustzcash revision is derived from Cargo.toml and, once generated, cross-checked against the
+# frozen build recipe; no moving branch or separately maintained revision constant is accepted.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-expected_librustzcash_rev="0c2775f5ed1561360b164b3971ecf0cf734e75eb"
-expected_orchard_rev="fa6e5fee02ce38b54193005a35289ec705d4f5b2"
-tree_file=$(mktemp)
-duplicates_file=$(mktemp)
-trap 'rm -f "$tree_file" "$duplicates_file"' EXIT
+expected_librustzcash_repository="https://github.com/just-zend/librustzcash"
+expected_zcash_voting_revision="a4daaf77f793b35a98a3d811b920a01b95fbfa7a"
+rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+expected_librustzcash_revision=$(./Scripts/verify-ironwood-cargo-pins.sh --print-revision)
 
-# Cargo repeats shared nodes with `(*)`; normalize those markers before checking unique resolved
-# packages. Optional voting is intentionally absent from the default graph.
-cargo tree --locked -e normal --prefix none --format '{p}' \
+tree_file=$(mktemp)
+cleanup() {
+    rm -f "$tree_file"
+}
+trap cleanup EXIT
+
+if [[ -f .cargo/config.toml ]]; then
+    echo "Error: the retired private-git credential workaround .cargo/config.toml remains" >&2
+    exit 1
+fi
+if rg -q 'zodl_ironwood_migration|ZODLIronwoodMigrationRust' Cargo.toml Cargo.lock rust Sources; then
+    echo "Error: retired standalone migration-engine code remains in a live source path" >&2
+    exit 1
+fi
+if rg -q 'zcash_unstable.*nu6\.3|Ironwood FFI requires --cfg' \
+    Cargo.toml rust Scripts/rust-build-env.sh Scripts/init-local-ffi.sh \
+    Scripts/rebuild-local-ffi.sh BuildSupport/Makefile
+then
+    echo "Error: obsolete synthetic NU6.3 cfg gate remains in a live build path" >&2
+    exit 1
+fi
+if ! grep -Fxq \
+    'zcash_client_sqlite = { version = "0.22.0-rc.1", features = ["migration-delivery", "orchard", "transparent-inputs", "unstable", "serde"] }' \
+    Cargo.toml
+then
+    echo "Error: the Rust FFI graph does not opt into zcash_client_sqlite/migration-delivery" >&2
+    exit 1
+fi
+
+recipe="BuildSupport/IRONWOOD_FFI_BUILD.env"
+read_recipe_field() {
+    sed -n "s/^${1}=//p" "$recipe"
+}
+if [[ -f "$recipe" && -n "$(read_recipe_field LIBRUSTZCASH_REVISION)" ]]; then
+    if [[ "$(read_recipe_field LIBRUSTZCASH_REPOSITORY)" != "$expected_librustzcash_repository" \
+        || "$(read_recipe_field LIBRUSTZCASH_REVISION)" != "$expected_librustzcash_revision" ]]
+    then
+        echo "Error: Cargo graph differs from the frozen librustzcash build recipe" >&2
+        exit 1
+    fi
+fi
+
+# `--target all` includes every target-specific dependency edge, and therefore covers the five
+# Apple architectures without silently auditing only the host macOS graph.
+cargo "+$rust_toolchain" tree --locked --target all -e normal --prefix none --format '{p}' \
     | sed 's/ (\*)$//' \
     | LC_ALL=C sort -u > "$tree_file"
-cargo tree --locked -e normal -d > "$duplicates_file"
 
 assert_one() {
     local crate="$1"
@@ -43,64 +83,28 @@ assert_one() {
     fi
 }
 
-assert_one orchard 0.15.0 "github.com/zcash/orchard.git?rev=$expected_orchard_rev"
 for crate_and_version in \
+    "equihash 0.3.0" \
+    "f4jumble 0.1.1" \
     "pczt 0.8.0-rc.1" \
     "zcash_address 0.13.0" \
     "zcash_client_backend 0.24.0-rc.1" \
     "zcash_client_sqlite 0.22.0-rc.1" \
+    "zcash_encoding 0.4.0" \
     "zcash_keys 0.15.0" \
+    "zcash_pool_migration 0.1.0-alpha.1" \
     "zcash_primitives 0.29.0" \
-    "zcash_proofs 0.29.0" \
-    "zcash_protocol 0.10.0" \
-    "zcash_transparent 0.9.0" \
+    "zcash_protocol 0.10.1" \
+    "zcash_transparent 0.10.0" \
     "zip321 0.9.0-rc.1"
 do
     read -r crate version <<< "$crate_and_version"
-    assert_one "$crate" "$version" "github.com/zcash/librustzcash?rev=$expected_librustzcash_rev"
+    assert_one "$crate" "$version" "github.com/just-zend/librustzcash?rev=$expected_librustzcash_revision"
 done
+assert_one zcash_voting 1.0.0 "github.com/zodl-inc/zcash_voting.git?rev=$expected_zcash_voting_revision"
+assert_one orchard 0.15.4
+assert_one voting-circuits 0.9.0-rc.3
+assert_one imt-tree 0.2.0
 
-if grep -q '^zcash_voting ' "$tree_file"; then
-    echo "Error: optional voting stack entered the default Ironwood graph" >&2
-    exit 1
-fi
-
-# The upstream default backend still owns narrowly scoped `unstable-*` serialization/tree
-# features. SQLite's broad feature is intentionally retained because this exact revision exposes
-# the SDK's existing FsBlockDb/BlockMeta/init_blockmeta_db cache API behind no narrower feature.
-# Upstream SQLite's feature itself activates backend/unstable transitively, so audit that it is
-# present for this concrete cache dependency but never requested directly by this SDK.
-features_file=$(mktemp)
-trap 'rm -f "$tree_file" "$duplicates_file" "$features_file"' EXIT
-cargo tree --locked -e features --prefix none > "$features_file"
-if ! grep -Eq '^zcash_client_sqlite feature "unstable"( \(\*\))?$' "$features_file"
-then
-    echo "Error: required filesystem compact-block cache feature is absent" >&2
-    exit 1
-fi
-if awk '
-    /^zcash_client_backend =/ { in_backend = 1 }
-    in_backend { print }
-    in_backend && /] }$/ { exit }
-' Cargo.toml | grep -Eq '"unstable"'
-then
-    echo "Error: zcash_client_backend unstable must not be requested directly" >&2
-    exit 1
-fi
-
-if rg -q 'zcash_unstable.*nu6\.3|Ironwood FFI requires --cfg' \
-    .cargo \
-    Cargo.toml \
-    rust \
-    Scripts/rust-build-env.sh \
-    Scripts/init-local-ffi.sh \
-    Scripts/rebuild-local-ffi.sh \
-    BuildSupport/Makefile
-then
-    echo "Error: obsolete synthetic NU6.3 cfg gate remains in a live build path" >&2
-    exit 1
-fi
-
-echo "Ironwood dependency graph is unified at librustzcash $expected_librustzcash_rev."
-echo "Stable default builds use no synthetic NU6.3 cfg or direct backend unstable feature."
-echo "SQLite unstable is retained for the legacy filesystem compact-block cache API."
+echo "Ironwood dependency graph is unified at just-zend/librustzcash $expected_librustzcash_revision."
+echo "Orchard 0.15.4 and the reviewed voting graph are locked; no synthetic NU6.3 cfg is active."

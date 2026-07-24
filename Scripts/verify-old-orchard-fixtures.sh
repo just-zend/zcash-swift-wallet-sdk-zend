@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Verifies the exact pre-Ironwood production fixtures without requiring the private migration
-# engine or rebuilding Rust. The Swift regression performs the full current-SDK upgrade.
+# Verifies the exact pre-Ironwood production fixtures without rebuilding Rust. The Swift regression
+# performs the full current-SDK upgrade.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

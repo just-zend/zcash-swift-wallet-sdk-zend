@@ -28,7 +28,7 @@ Test targets are grouped by external dependencies:
 The Rust code in `rust/` is compiled into the `libzcashlc` XCFramework. Two modes are switched automatically by `Package.swift` based on whether `LocalPackages/libzcashlc.xcframework/Info.plist` exists:
 
 - **Binary release mode** (default): `.binaryTarget` in `Package.swift` pulls the XCFramework zip from the GitHub Release referenced there (URL + checksum).
-- **Local/committed FFI mode**: `LocalPackages/libzcashlc.xcframework` is a path-based binary target. The Ironwood branch commits a provenance-verified arm64 XCFramework so public CI and remote SwiftPM consumers never need credentials for the private migration-engine source.
+- **Local/committed FFI mode**: `LocalPackages/libzcashlc.xcframework` is a path-based binary target. The Ironwood branch commits a provenance-verified five-architecture XCFramework built from the exact public `just-zend/librustzcash` source graph.
 
 Scripts:
 
@@ -36,7 +36,7 @@ Scripts:
 - `./Scripts/rebuild-local-ffi.sh [ios-sim|ios-device|macos]` — fast single-arch incremental rebuild after Rust edits. `ios-sim` is default.
 - `./Scripts/reset-local-ffi.sh` — remove `LocalPackages/` and switch back to the release binary.
 
-For FFI work, open `ZcashSDK.xcworkspace` (not `Package.swift`) so `FFIBuilder` auto-runs. After switching modes or if headers look stale, in Xcode: Cmd+Shift+K, then File > Packages > Reset Package Caches. When modifying the Rust/Swift FFI boundary, freeze and exact-pin the private engine, then use `Scripts/build-ironwood-ffi-artifact.sh` to build all three Apple arm64 slices and their provenance record. `rebuild-local-ffi.sh` remains a fast single-slice iteration tool, not a release artifact builder.
+For FFI work, open `ZcashSDK.xcworkspace` (not `Package.swift`) so `FFIBuilder` auto-runs. After switching modes or if headers look stale, in Xcode: Cmd+Shift+K, then File > Packages > Reset Package Caches. When modifying the Rust/Swift FFI boundary, exact-pin the complete Cargo graph to a clean, published `just-zend/librustzcash` commit, set `LIBRUSTZCASH_REPO` to that checkout, and run `Scripts/build-ironwood-ffi-artifact.sh`. The release builder creates three platform slices containing five Apple architectures plus a provenance record; `rebuild-local-ffi.sh` remains an iteration tool, not a release artifact builder.
 
 See `docs/LOCAL_DEVELOPMENT.md` for the full reference.
 

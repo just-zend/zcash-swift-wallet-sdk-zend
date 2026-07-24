@@ -54,28 +54,55 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.prepareNoteSplit(accountUUID: self.accountUUID) }
     }
 
-    func testSubmitNoteSplitDefaultThrowsUnimplemented() async {
-        let proposal = NoteSplitProposal(outputNotes: [Zatoshi(10_000)], fee: Zatoshi(1_000))
-        let usk = TestsData(networkType: .testnet).spendingKey
-        let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067))
-        await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.submitNoteSplit(accountUUID: self.accountUUID, proposal: proposal, usk: usk, options: options)
-        }
-    }
-
     func testProposeMigrationTransfersDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented {
             _ = try await self.synchronizer.proposeMigrationTransfers(accountUUID: self.accountUUID)
         }
     }
 
-    func testProposeImmediateMigrationDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.proposeImmediateMigration(accountUUID: self.accountUUID) }
+    func testSubmitImmediateMigrationDefaultThrowsUnimplemented() async {
+        let usk = TestsData(networkType: .testnet).spendingKey
+        let options = MigrationNetworkPrivacyOptions(
+            useTor: false,
+            submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067)
+        )
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.submitImmediateMigration(
+                accountUUID: self.accountUUID,
+                usk: usk,
+                options: options
+            )
+        }
     }
 
-    func testRecordImmediateMigrationDefaultThrowsUnimplemented() async {
+    func testPrepareImmediateMigrationForExternalSigningDefaultThrowsUnimplemented() async {
+        let options = MigrationNetworkPrivacyOptions(
+            useTor: false,
+            submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067)
+        )
         await assertThrowsMigrationUnimplemented {
-            try await self.synchronizer.recordImmediateMigration(accountUUID: self.accountUUID, txid: Data(repeating: 0x01, count: 32))
+            _ = try await self.synchronizer.prepareImmediateMigrationForExternalSigning(
+                accountUUID: self.accountUUID,
+                options: options
+            )
+        }
+    }
+
+    func testSubmitExternallySignedImmediateMigrationDefaultThrowsUnimplemented() async {
+        let storage = MigrationOpaqueHandleStorage(
+            pointer: OpaquePointer(bitPattern: 1)!,
+            release: { _ in }
+        )
+        let request = ImmediateMigrationExternalSigningRequest(
+            pczt: Data([0x50, 0x43, 0x5A, 0x54]),
+            claim: MigrationClaimHandle(storage: storage)
+        )
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.submitExternallySignedImmediateMigration(
+                accountUUID: self.accountUUID,
+                request: request,
+                signedPCZT: Data([0x53, 0x49, 0x47, 0x4E, 0x45, 0x44])
+            )
         }
     }
 
@@ -96,10 +123,51 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
     }
 
     func testSignAndStoreMigrationScheduleDefaultThrowsUnimplemented() async {
-        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1)
+        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1, proposalHandle: 1)
         let usk = TestsData(networkType: .testnet).spendingKey
         await assertThrowsMigrationUnimplemented {
-            try await self.synchronizer.signAndStoreMigrationSchedule(accountUUID: self.accountUUID, schedule, usk: usk)
+            try await self.synchronizer.signAndStoreMigrationSchedule(
+                accountUUID: self.accountUUID,
+                schedule,
+                usk: usk,
+                options: MigrationNetworkPrivacyOptions(
+                    useTor: false,
+                    submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067)
+                )
+            )
+        }
+    }
+
+    func testCommitExternalScheduleDefaultThrowsUnimplemented() async {
+        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1, proposalHandle: 1)
+        let options = MigrationNetworkPrivacyOptions(
+            useTor: false,
+            submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067)
+        )
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.commitMigrationScheduleForExternalSigning(
+                accountUUID: self.accountUUID,
+                schedule,
+                options: options
+            )
+        }
+    }
+
+    func testPrepareNextExternalTransactionDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.prepareNextMigrationTransactionForExternalSigning(
+                accountUUID: self.accountUUID
+            )
+        }
+    }
+
+    func testSubmitExternallySignedScheduledTransactionDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.submitExternallySignedMigrationTransaction(
+                accountUUID: self.accountUUID,
+                request: self.makeScheduledRequest(),
+                signedPCZT: Data([0x53, 0x49, 0x47])
+            )
         }
     }
 
@@ -122,51 +190,47 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.rescheduleOverdueMigrationTransfer(accountUUID: self.accountUUID) }
     }
 
-    func testRestartCurrentMigrationStepDefaultThrowsUnimplemented() async {
+    func testPauseMigrationDeliveryDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.restartCurrentMigrationStep(accountUUID: self.accountUUID)
+            _ = try await self.synchronizer.pauseMigrationDelivery(accountUUID: self.accountUUID)
         }
     }
 
-    func testRefreshStaleMigrationTransfersDefaultThrowsUnimplemented() async {
+    func testResumeMigrationDeliveryDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.resumeMigrationDelivery(accountUUID: self.accountUUID)
+        }
+    }
+
+    func testBeginMigrationAbandonmentDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.beginMigrationAbandonment(accountUUID: self.accountUUID)
+        }
+    }
+
+    func testFinishMigrationAbandonmentDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.finishMigrationAbandonment(accountUUID: self.accountUUID)
+        }
+    }
+
+    func testRebuildExpiredSDKTransferDefaultThrowsUnimplemented() async {
         let usk = TestsData(networkType: .testnet).spendingKey
         await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.refreshStaleMigrationTransfers(accountUUID: self.accountUUID, usk: usk)
-        }
-    }
-
-    /// The nil-usk (external-signer/Keystone) lane must fall through to the same default as the
-    /// real-usk call above -- `usk` being optional must not bypass the "unimplemented" default.
-    func testRefreshStaleMigrationTransfersDefaultThrowsUnimplementedWithNilUsk() async {
-        await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.refreshStaleMigrationTransfers(accountUUID: self.accountUUID, usk: nil)
-        }
-    }
-
-    func testCreateUnsignedNoteSplitPCZTsDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.createUnsignedNoteSplitPCZTs(accountUUID: self.accountUUID) }
-    }
-
-    func testStoreSignedNoteSplitPCZTsDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.storeSignedNoteSplitPCZTs(
+            _ = try await self.synchronizer.rebuildExpiredMigrationTransfer(
                 accountUUID: self.accountUUID,
-                [MigrationSignedTransferPczt(id: "0", pczt: Data([0x01, 0x02]))]
+                transactionID: 7,
+                usk: usk
             )
         }
     }
 
-    func testCreateUnsignedMigrationTransferPCZTsDefaultThrowsUnimplemented() async {
-        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1)
+    func testRebuildExpiredExternalTransferDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.createUnsignedMigrationTransferPCZTs(accountUUID: self.accountUUID, for: schedule)
-        }
-    }
-
-    func testStoreSignedMigrationSchedulePCZTsDefaultThrowsUnimplemented() async {
-        let signed = [MigrationSignedTransferPczt(id: "transfer-0", pczt: Data([0x03, 0x04]))]
-        await assertThrowsMigrationUnimplemented {
-            try await self.synchronizer.storeSignedMigrationSchedulePCZTs(accountUUID: self.accountUUID, signed)
+            _ = try await self.synchronizer.rebuildExpiredMigrationTransferForExternalSigning(
+                accountUUID: self.accountUUID,
+                transactionID: 7
+            )
         }
     }
 
@@ -217,6 +281,19 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         } catch {
             XCTFail("Expected a LocalizedError describing a missing default implementation, got \(error)", file: file, line: line)
         }
+    }
+
+    private func makeScheduledRequest() -> ScheduledMigrationExternalSigningRequest {
+        ScheduledMigrationExternalSigningRequest(
+            transactionID: 7,
+            pczt: Data([0x50, 0x43, 0x5A, 0x54]),
+            claim: MigrationClaimHandle(
+                storage: MigrationOpaqueHandleStorage(
+                    pointer: OpaquePointer(bitPattern: 7)!,
+                    release: { _ in }
+                )
+            )
+        )
     }
 }
 

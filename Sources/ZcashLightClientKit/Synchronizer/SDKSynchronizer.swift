@@ -1199,14 +1199,17 @@ public class SDKSynchronizer: Synchronizer {
     // MARK: Migration (Orchard -> Ironwood)
     //
     // Thin forwards to `migrationHost.migration(for:)`'s per-account `OrchardMigration` actor (or,
-    // for the three wallet-scope gate members, to the host itself). The two members that can
-    // broadcast (`submitNoteSplit`, `executeNextPendingMigrationTransfer`) are guarded here by
+    // for the three wallet-scope gate members, to the host itself). Members that can broadcast are guarded here by
     // `throwIfSyncingForMigrationBroadcast()` — an advisory point-in-time check, not a hard
     // mutual-exclusion lock: sync and migration broadcasts must never share a session, and hosts
     // still sequence sessions themselves.
 
     public func migrationState(accountUUID: AccountUUID) async throws -> MigrationState {
         try await migrationHost.migration(for: accountUUID).migrationState()
+    }
+
+    public func migrationRuntimeSnapshot(accountUUID: AccountUUID) async throws -> MigrationRuntimeSnapshot {
+        try await migrationHost.migration(for: accountUUID).runtimeSnapshot()
     }
 
     public func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress? {
@@ -1225,26 +1228,41 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).prepareNoteSplit()
     }
 
-    public func submitNoteSplit(
-        accountUUID: AccountUUID,
-        proposal: NoteSplitProposal,
-        usk: UnifiedSpendingKey,
-        options: MigrationNetworkPrivacyOptions
-    ) async throws -> MigrationTransferResult {
-        try await throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
-    }
-
     public func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule {
         try await migrationHost.migration(for: accountUUID).proposeMigrationTransfers()
     }
 
-    public func proposeImmediateMigration(accountUUID: AccountUUID) async throws -> ImmediateMigrationProposal {
-        try await migrationHost.migration(for: accountUUID).proposeImmediateMigration()
+    public func submitImmediateMigration(
+        accountUUID: AccountUUID,
+        usk: UnifiedSpendingKey,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationSubmissionOutcome {
+        try await throwIfSyncingForMigrationBroadcast()
+        return try await migrationHost.migration(for: accountUUID).submitImmediateMigration(
+            usk: usk,
+            options: options
+        )
     }
 
-    public func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws {
-        try await migrationHost.migration(for: accountUUID).recordImmediateMigration(txid: txid)
+    public func prepareImmediateMigrationForExternalSigning(
+        accountUUID: AccountUUID,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> ImmediateMigrationExternalSigningRequest {
+        try await migrationHost.migration(for: accountUUID).prepareImmediateMigrationForExternalSigning(
+            options: options
+        )
+    }
+
+    public func submitExternallySignedImmediateMigration(
+        accountUUID: AccountUUID,
+        request: ImmediateMigrationExternalSigningRequest,
+        signedPCZT: Data
+    ) async throws -> MigrationSubmissionOutcome {
+        try await throwIfSyncingForMigrationBroadcast()
+        return try await migrationHost.migration(for: accountUUID).submitExternallySignedImmediateMigration(
+            request: request,
+            signedPCZT: signedPCZT
+        )
     }
 
     public func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi? {
@@ -1263,8 +1281,46 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).estimateMigrationRuns()
     }
 
-    public func signAndStoreMigrationSchedule(accountUUID: AccountUUID, _ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws {
-        try await migrationHost.migration(for: accountUUID).signAndStoreMigrationSchedule(schedule, usk: usk)
+    public func signAndStoreMigrationSchedule(
+        accountUUID: AccountUUID,
+        _ schedule: MigrationSchedule,
+        usk: UnifiedSpendingKey,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws {
+        try await migrationHost.migration(for: accountUUID).signAndStoreMigrationSchedule(
+            schedule,
+            usk: usk,
+            options: options
+        )
+    }
+
+    public func commitMigrationScheduleForExternalSigning(
+        accountUUID: AccountUUID,
+        _ schedule: MigrationSchedule,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationRuntimeSnapshot {
+        try await migrationHost.migration(for: accountUUID).commitMigrationScheduleForExternalSigning(
+            schedule,
+            options: options
+        )
+    }
+
+    public func prepareNextMigrationTransactionForExternalSigning(
+        accountUUID: AccountUUID
+    ) async throws -> ScheduledMigrationExternalSigningRequest? {
+        try await migrationHost.migration(for: accountUUID).prepareNextMigrationTransactionForExternalSigning()
+    }
+
+    public func submitExternallySignedMigrationTransaction(
+        accountUUID: AccountUUID,
+        request: ScheduledMigrationExternalSigningRequest,
+        signedPCZT: Data
+    ) async throws -> MigrationTransferResult {
+        try await throwIfSyncingForMigrationBroadcast()
+        return try await migrationHost.migration(for: accountUUID).submitExternallySignedMigrationTransaction(
+            request: request,
+            signedPCZT: signedPCZT
+        )
     }
 
     public func executeNextPendingMigrationTransfer(
@@ -1299,37 +1355,45 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).rescheduleOverdueTransfer()
     }
 
-    public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
-        try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
+    public func pauseMigrationDelivery(accountUUID: AccountUUID) async throws -> MigrationRuntimeSnapshot {
+        try await migrationHost.migration(for: accountUUID).pauseDelivery()
     }
 
-    public func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
-        try await migrationHost.migration(for: accountUUID).refreshStaleTransfers(usk: usk)
+    public func resumeMigrationDelivery(accountUUID: AccountUUID) async throws -> MigrationRuntimeSnapshot {
+        try await migrationHost.migration(for: accountUUID).resumeDelivery()
     }
 
-    public func createUnsignedNoteSplitPCZTs(accountUUID: AccountUUID) async throws -> [MigrationUnsignedTransferPczt] {
-        try await migrationHost.migration(for: accountUUID).createUnsignedNoteSplitPCZTs()
+    public func beginMigrationAbandonment(accountUUID: AccountUUID) async throws -> MigrationRuntimeSnapshot {
+        try await migrationHost.migration(for: accountUUID).beginAbandonment()
     }
 
-    public func storeSignedNoteSplitPCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws -> PreparedMigrationTransfer {
-        try await migrationHost.migration(for: accountUUID).storeSignedNoteSplitPCZTs(signed)
+    public func finishMigrationAbandonment(accountUUID: AccountUUID) async throws -> MigrationRuntimeSnapshot {
+        try await migrationHost.migration(for: accountUUID).finishAbandonment()
     }
 
-    public func createUnsignedMigrationTransferPCZTs(
+    public func rebuildExpiredMigrationTransfer(
         accountUUID: AccountUUID,
-        for schedule: MigrationSchedule
-    ) async throws -> [MigrationUnsignedTransferPczt] {
-        try await migrationHost.migration(for: accountUUID).createUnsignedTransferPCZTs(for: schedule)
+        transactionID: UInt32,
+        usk: UnifiedSpendingKey
+    ) async throws -> MigrationRuntimeSnapshot {
+        try await migrationHost.migration(for: accountUUID).rebuildExpiredTransfer(
+            transactionID: transactionID,
+            usk: usk
+        )
     }
 
-    public func storeSignedMigrationSchedulePCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws {
-        try await migrationHost.migration(for: accountUUID).storeSignedSchedulePCZTs(signed)
+    public func rebuildExpiredMigrationTransferForExternalSigning(
+        accountUUID: AccountUUID,
+        transactionID: UInt32
+    ) async throws -> ScheduledMigrationExternalSigningRequest {
+        try await migrationHost.migration(for: accountUUID).rebuildExpiredTransferForExternalSigning(
+            transactionID: transactionID
+        )
     }
 
     /// Throws ``ZcashError/migrationBroadcastDuringSync`` when the synchronizer is actively syncing.
     ///
-    /// Guards the two migration entry points that broadcast (``submitNoteSplit(accountUUID:proposal:usk:options:)``
-    /// and ``executeNextPendingMigrationTransfer(accountUUID:options:)``): sync and migration
+    /// Guards migration entry points that submit exact Rust-owned transactions: sync and migration
     /// broadcasts must never share a session. Reads `status` -- the same source `start(retry:)`
     /// switches on -- so the guard triggers on the syncing case only; stopped/synced/disconnected/
     /// error/unprepared all proceed.
