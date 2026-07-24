@@ -318,10 +318,13 @@ then
 fi
 
 rustup toolchain install "$rust_toolchain" --profile minimal
-rustup component add --toolchain "$rust_toolchain" llvm-tools-preview
-rustup target add --toolchain "$rust_toolchain" \
+# Rustup 1.29 requires the component/target operands before `--toolchain`; the older ordering can
+# be misparsed as a request to install the `rustup` proxy into the fresh CARGO_HOME.
+rustup component add llvm-tools-preview --toolchain "$rust_toolchain"
+rustup target add \
     aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim \
-    x86_64-apple-darwin x86_64-apple-ios
+    x86_64-apple-darwin x86_64-apple-ios \
+    --toolchain "$rust_toolchain"
 
 # `RUSTUP_HOME` and `CARGO_HOME` above are deliberately fresh, so rustup does not install proxy
 # shims such as `$CARGO_HOME/bin/rustc`. Resolve the binaries from the installed toolchain itself
