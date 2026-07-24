@@ -386,8 +386,9 @@ public struct MigrationRunEstimate: Equatable, Sendable {
 /// Legacy immediate-migration proposal model retained only for source migration.
 ///
 /// Immediate migration no longer exposes an ordinary proposal. Use the claim-backed
-/// `Synchronizer.submitImmediateMigration(accountUUID:usk:options:)` API, or its paired external
-/// signing APIs, so Rust atomically owns the source reservation and exact transaction.
+/// `Synchronizer.submitImmediateMigration(accountUUID:usk:maximumGrossAmount:options:)` API, or its
+/// paired external signing APIs, so Rust atomically owns the source reservation and exact
+/// transaction.
 @available(*, deprecated, message: "Use the claim-backed immediate migration APIs on Synchronizer.")
 public struct ImmediateMigrationProposal: Equatable {
     /// Legacy ordinary proposal. Do not use it to execute an immediate migration.

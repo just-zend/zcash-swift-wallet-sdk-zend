@@ -58,19 +58,48 @@ longer hold an ordinary proposal or tell the SDK which transaction id was broadc
   `createProposedTransactions` / `createPCZTFromProposal`, and do not persist or replay a txid as
   migration authority.
 - **SDK signer:** call
-  `submitImmediateMigration(accountUUID:usk:options:) -> MigrationSubmissionOutcome`. Rust
-  atomically selects and reserves the Orchard sources, seals the destination, target height,
-  expiry, consensus branch, and submission policy, builds and stores the exact transaction, then
-  grants a one-shot submission claim. Swift submits only the exact bytes copied from that claim.
+  `submitImmediateMigration(accountUUID:usk:maximumGrossAmount:options:) -> MigrationSubmissionOutcome`.
+  `maximumGrossAmount` is the user's explicit ceiling for the sum of the selected Orchard inputs.
+  Rust atomically selects the sources, derives their exact gross value from the canonical proposal,
+  rejects an over-limit proposal before writing any run, reservation, lock, or claim, seals the
+  destination, target height, expiry, consensus branch, and submission policy, builds and stores
+  the exact transaction, then grants a one-shot submission claim. Swift submits only the exact
+  bytes copied from that claim.
+- **Pre-cap runtime rows:** delivery schema v2 records the exact approved ceiling beside every new
+  immediate run. A v1 pre-exposure row has no durable evidence for a numeric spend authorization
+  and is exposed as `MigrationRuntimeUnavailableReason.missingSpendAuthorization`. Treat it as
+  recovery-only: do not substitute the wallet balance, total supply, or a legacy consent flag, and
+  do not materialize, sign, or submit it automatically. An exact unexposed known-unsent failure may
+  be reauthorized only with a newly supplied sufficient ceiling; already exposed rows continue
+  outcome/finality reconciliation without gaining new submission authority. Read
+  `MigrationRuntimeSnapshot.immediateMigrationRecoveryCapability` from the snapshot that rendered
+  the recovery action and return that opaque value to `recoverFailedImmediateMigration` (SDK
+  signer) or `recoverFailedImmediateMigrationForExternalSigning` (external signer). The capability
+  seals the account, immediate artifact, signer, and hidden delivery revision plus the Rust claim
+  handle. A later fresh read is only a state gate: it cannot replace the rendered capability with
+  authority for a same-account, same-signer replacement run. Generic submit/prepare entry points
+  reject `materializationFailed` state and never perform this recovery.
 - **External signer:** call
-  `prepareImmediateMigrationForExternalSigning(accountUUID:options:)` and give the returned
-  request's `pczt` to the signer. Return that same opaque request plus the signer's response to
-  `submitExternallySignedImmediateMigration(accountUUID:request:signedPCZT:)`. Rust validates the
-  merge against the staged PCZT and finalizes the exact transaction atomically; the request's claim
-  cannot be constructed or altered by the host. If the app relaunches before the signer returns,
-  call `prepareImmediateMigrationForExternalSigning` again with the same options: the SDK recovers
-  the exact staged PCZT and reacquires its Rust claim rather than reserving a replacement artifact.
-  Different transport or endpoint options fail closed against the persisted Rust policy.
+  `prepareImmediateMigrationForExternalSigning(accountUUID:maximumGrossAmount:options:)` and give
+  the returned request's `pczt` to the signer. Return that same opaque request plus the signer's
+  response to `submitExternallySignedImmediateMigration(accountUUID:request:signedPCZT:)`. Rust
+  validates the merge against the staged PCZT and finalizes the exact transaction atomically; the
+  request's claim cannot be constructed or altered by the host. If materialization fails before
+  exposure, call the external recovery-only API with the capability captured from the rendered
+  failure and a sufficient current ceiling. Account, signer, policy, and matching display fields
+  alone are not recovery authority. The SDK first requires the fresh runtime's hidden capability
+  seal to match, then Rust CAS-validates and consumes the caller-bound claim handle to mint only a
+  fresh bounded token for that exact proposal; it never replans or falls through to reservation. If the
+  app relaunches after PCZT exposure, call `prepareImmediateMigrationForExternalSigning` again with
+  the same options: the SDK recovers the exact staged PCZT rather than reserving a replacement
+  artifact. After the signer response has been merged and Rust reports an exact `staged`
+  transaction, retry with `resumeStagedImmediateExternalSubmission(accountUUID:)`; do not ask the
+  signer again or replay the old process-local request. The scheduled lane uses
+  `resumeStagedScheduledExternalSubmission(accountUUID:transactionID:)` under the same rule. These
+  APIs accept no PCZT or transaction bytes and resume only Rust's current exact staged claim. A
+  later lower ceiling cannot revoke or rewrite an already-authorized live, exposed, or submitted
+  artifact; those states must be reconciled. Different transport or endpoint options fail closed
+  against the persisted Rust policy.
 - Every returned submission outcome (`accepted`, `knownUnsent`, or `unknown`) means the submit RPC
   began, so the 10-minute anti-correlation sync buffer is active before the outcome is recorded.
   A thrown pre-submit failure broadcasts nothing and releases only Rust-validated known-unsent
@@ -88,7 +117,7 @@ upstream schema and keeps delivery authority in opaque Rust capabilities:
 | --- | --- |
 | `migrationSnapshot(for:) -> MigrationSnapshot` | `migrationRuntimeSnapshot(accountUUID:) -> MigrationRuntimeSnapshot`. Read this atomically before and after work; do not reconstruct run ids, revisions, claims, or policy fingerprints in the app. |
 | `previewImmediateMigration(for:)` | No immediate read-only proposal. Immediate source selection and economics are reserved atomically at confirmation. Use `proposeMigrationTransfers(accountUUID:)` only for the gradual schedule preview. |
-| `proposeImmediateMigrationIntent` + `commitMigrationIntents` | SDK signer: `submitImmediateMigration`. External signer: `prepareImmediateMigrationForExternalSigning` followed by `submitExternallySignedImmediateMigration`. |
+| `proposeImmediateMigrationIntent` + `commitMigrationIntents` | SDK signer: `submitImmediateMigration` with an explicit maximum gross amount. External signer: `prepareImmediateMigrationForExternalSigning` with the same explicit ceiling, followed by `submitExternallySignedImmediateMigration`. |
 | Scheduled `commitMigrationIntents` | SDK signer: `signAndStoreMigrationSchedule`. External signer: `commitMigrationScheduleForExternalSigning`, then one opaque `prepareNextMigrationTransactionForExternalSigning` / `submitExternallySignedMigrationTransaction` round trip per canonical transaction. The delivery policy is bound before any PCZT is exposed. |
 | `executeNextMigrationAction(expectedRunId:expectedRevision:...)` | `executeNextPendingMigrationTransfer(accountUUID:options:)`. Rust chooses readiness, consumes the opaque materialization/submission claim, and keeps ambiguous outcomes resolution-only. Refresh `migrationRuntimeSnapshot` afterward. |
 | App-authored `runId`, numeric revision, txid, expiry, or branch | No replacement input. These values stay sealed in Rust run/claim handles; public fields are status projections only. |
@@ -111,7 +140,7 @@ behavior (`SDKSynchronizer` does):
   only outputs owned by the account's deterministic residual-lock owner and returns the cleared
   count. Migration-source, ordinary-PCZT, and foreign-owner locks remain intact. "Migrate anyway"
   over a locked residual composes as this call followed by
-  `submitImmediateMigration(accountUUID:usk:options:)`; locked notes are excluded from note
+  `submitImmediateMigration(accountUUID:usk:maximumGrossAmount:options:)`; locked notes are excluded from note
   selection, so the unlock must come first.
 - **New: `estimateMigrationRuns(accountUUID:) async throws -> MigrationRunEstimate`.** The rounds
   preview for the multi-round migration UI: how many migration RUNS ("rounds") migrating the whole
@@ -180,9 +209,10 @@ Anything that resolves the custom network id before that registration — e.g. a
 `DerivationTool(networkType: .regtest)` created before any `Initializer` — fails with
 "custom network (id 2) used before it was configured", and key validators return `false`. Create the
 `Initializer` first, or call `ZcashRustBackend.setCustomNetwork` yourself at startup. Registering a
-**different** custom network later in the same process is a configuration bug: the newest values win
-process-globally while earlier instances keep their own per-instance state (checkpoint sources,
-constants), so the two desynchronize — the registration call reports this (and asserts in debug).
+**different** custom network later in the same process is a configuration bug: Rust preserves the
+first process-global configuration and reports the conflict instead of changing the consensus rules
+under a live wallet. `Initializer` and the standalone migration runtime terminate on this error in
+both debug and release builds because they cannot safely continue with the rejected configuration.
 
 ## Voting: submission contract and pre-1.0 database reset
 

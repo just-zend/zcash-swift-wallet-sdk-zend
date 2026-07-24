@@ -370,6 +370,7 @@ printf '%s\n' \
     "ZCASH_VOTING_REVISION=$zcash_voting_revision" \
     "ORCHARD_VERSION=$orchard_version" \
     "ORCHARD_CHECKSUM=$orchard_checksum" \
+    "MIGRATION_RESERVE_ABI_POLICY=legacy-v1-fail-closed-authorized-v2" \
     "SOURCE_DATE_EPOCH=$source_date_epoch" \
     "RUST_TOOLCHAIN=$rust_toolchain" \
     "BUILD_ENVIRONMENT_POLICY=$IRONWOOD_BUILD_ENVIRONMENT_POLICY" \

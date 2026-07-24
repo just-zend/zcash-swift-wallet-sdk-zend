@@ -286,7 +286,7 @@ final class MigrationFFITests: XCTestCase {
     /// height. Registers the same idempotent custom heights as
     /// `testOrchardMigrationRegistersCustomActivationHeightsOnInit` /
     /// `RegtestActivationHeightsTests.testRegtestConsensusBranchIdReflectsCustomActivationHeights`
-    /// (`zcashlc_set_custom_network` is process-global and a conflicting re-registration asserts, so
+    /// (`zcashlc_set_custom_network` is process-global and a conflicting re-registration terminates, so
     /// identical values keep every registrant idempotent regardless of run order).
     func testIronwoodActivationHeightForCustomNetworkIsNil() {
         let activationHeights = NetworkActivationHeights(
@@ -594,7 +594,7 @@ final class MigrationFFITests: XCTestCase {
     /// `RegtestActivationHeightsTests.testRegtestConsensusBranchIdReflectsCustomActivationHeights`'s
     /// values exactly: `zcashlc_set_custom_network` is process-global, `swift test` runs the whole
     /// `OfflineTests` bundle in one process, and a conflicting re-registration is a host
-    /// configuration bug this code path asserts on (`assertionFailure`, live in a debug/test build).
+    /// configuration error this code path terminates on in both release and debug builds.
     /// Identical values make both tests' registrations idempotent regardless of run order.
     ///
     /// The engine's store tables ride the wallet schema migrations (the FFI no longer creates

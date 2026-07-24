@@ -330,7 +330,8 @@ final class TxResubmissionActionTests: ZcashTestCase {
             policyValidationFailure: nil,
             safeToCancel: false,
             claims: [claim],
-            runHandle: makeRunHandle(0x17)
+            runHandle: makeRunHandle(0x17),
+            revision: 1
         )
         return MigrationRuntimeSnapshot(
             account: TestsData.mockedAccountUUID,

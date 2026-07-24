@@ -130,6 +130,14 @@ if [[ ${#required_symbols[@]} -eq 0 ]]; then
     echo "Error: no production zcashlc ABI calls were discovered" >&2
     exit 1
 fi
+# v1 is intentionally absent from production Swift: it preserves the original prerelease ABI but
+# always fails closed because that signature has no maximum-gross authorization. Keep both versions
+# in every artifact so an old header can never call a differently-shaped function under the same
+# exported name.
+required_symbols+=(
+    zcashlc_migration_reserve_immediate_v1
+    zcashlc_migration_reserve_immediate_v2
+)
 
 # Apple nm cannot reliably parse LLVM 22 attributes emitted by Rust 1.96. Use llvm-nm from the
 # exact pinned toolchain instead.
@@ -197,6 +205,39 @@ for binary in "${binaries[@]}"; do
         fi
     done
 done
+
+# Symbol-name checks alone cannot detect a C ABI break. Compile exact function-pointer assignments
+# against the generated header so argument insertion, removal, reordering, or type drift fails the
+# artifact gate. The v1 prototype is permanently frozen; authorized reservation belongs to v2.
+signature_audit="$work_dir/migration-reserve-abi.c"
+cat > "$signature_audit" <<'EOF'
+#include "zcashlc.h"
+
+typedef struct FfiMigrationClaimHandle *(*migration_reserve_immediate_v1_fn)(
+    const uint8_t *, uintptr_t, const uint8_t *, uint32_t, uint8_t, uint8_t, const char *
+);
+typedef struct FfiMigrationClaimHandle *(*migration_reserve_immediate_v2_fn)(
+    const uint8_t *, uintptr_t, const uint8_t *, uint32_t, uint8_t, int64_t, uint8_t, const char *
+);
+
+_Static_assert(
+    __builtin_types_compatible_p(
+        __typeof__(&zcashlc_migration_reserve_immediate_v1),
+        migration_reserve_immediate_v1_fn
+    ),
+    "zcashlc_migration_reserve_immediate_v1 ABI changed"
+);
+_Static_assert(
+    __builtin_types_compatible_p(
+        __typeof__(&zcashlc_migration_reserve_immediate_v2),
+        migration_reserve_immediate_v2_fn
+    ),
+    "zcashlc_migration_reserve_immediate_v2 ABI changed"
+);
+EOF
+xcrun clang -std=c11 -fsyntax-only -Werror \
+    -I "$(dirname "${binaries[0]}")/Headers" "$signature_audit"
+echo "Generated migration reservation header passed exact v1/v2 signature audit"
 
 for thin_index in "${!thin_archives[@]}"; do
     thin_archive="${thin_archives[$thin_index]}"
@@ -454,6 +495,7 @@ recipe_fields=(
     UPSTREAM_1821_MERGE_REVISION UPSTREAM_1822_MERGE_REVISION
     LIBRUSTZCASH_REPOSITORY LIBRUSTZCASH_REVISION LIBRUSTZCASH_TREE
     ZCASH_VOTING_REVISION ORCHARD_VERSION ORCHARD_CHECKSUM
+    MIGRATION_RESERVE_ABI_POLICY
     SOURCE_DATE_EPOCH RUST_TOOLCHAIN BUILD_ENVIRONMENT_POLICY FFI_ARCHIVE_POSTPROCESSING
     BUILD_PATH_POLICY BUILD_PATH_SHA256 RUSTUP_HOME_POLICY GIT_CONFIG_POLICY
     RUSTUP_SHA256 GIT_SHA256 MAKE_SHA256 LLVM_OBJCOPY_SHA256
@@ -482,7 +524,8 @@ if [[ "$(read_field SDK_BASE_REVISION)" != "9476ced615d90407270d3d741823d5797ef0
     || "$(read_field LIBRUSTZCASH_REPOSITORY)" != "https://github.com/just-zend/librustzcash" \
     || "$(read_field ZCASH_VOTING_REVISION)" != "a4daaf77f793b35a98a3d811b920a01b95fbfa7a" \
     || "$(read_field ORCHARD_VERSION)" != "0.15.4" \
-    || "$(read_field ORCHARD_CHECKSUM)" != "793e2e8c2323f35f082d1b3467ca8f576d646f9c93aef8c5168809d099245af8" ]]
+    || "$(read_field ORCHARD_CHECKSUM)" != "793e2e8c2323f35f082d1b3467ca8f576d646f9c93aef8c5168809d099245af8" \
+    || "$(read_field MIGRATION_RESERVE_ABI_POLICY)" != "legacy-v1-fail-closed-authorized-v2" ]]
 then
     echo "Error: provenance does not record the reviewed Ironwood source graph" >&2
     exit 1

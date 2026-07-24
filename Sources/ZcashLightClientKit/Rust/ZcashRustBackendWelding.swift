@@ -506,6 +506,7 @@ protocol ZcashRustBackendWelding {
     /// Atomically reserves a wallet-derived immediate proposal and its initial claim.
     func migrationReserveImmediate(
         signer: MigrationSignerOwnership,
+        maximumGrossAmount: Zatoshi,
         submission: MigrationSubmissionIntent,
         for account: AccountUUID
     ) async throws -> MigrationClaimHandle
@@ -607,6 +608,14 @@ protocol ZcashRustBackendWelding {
         claim: MigrationClaimHandle,
         for account: AccountUUID
     ) async throws -> MigrationClaimHandle?
+
+    /// Reacquires materialization authority for the same unexposed failed immediate artifact.
+    func migrationReacquireFailedImmediateMaterialization(
+        claim: MigrationClaimHandle,
+        signer: MigrationSignerOwnership,
+        maximumGrossAmount: Zatoshi,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle
 
     /// Reacquires external-signing authority for the same staged artifact after expiry/relaunch.
     func migrationReacquireExternalSigning(

@@ -113,10 +113,12 @@ final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
         networkType: NetworkType
     ) -> MigrationSubmissionIntent {
         let transport: MigrationSubmissionTransport
-        if options.useTor {
+        if options.useTor && options.submissionEndpoint.host.lowercased().hasSuffix(".onion") {
             transport = .torOnion
         } else if !options.submissionEndpoint.secure && networkType == .regtest {
             transport = .loopbackDevelopment
+        } else if options.useTor {
+            transport = .torProxyTLS
         } else {
             transport = .directTLS
         }
@@ -137,7 +139,7 @@ final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
         renewLease: @escaping () async throws -> Void
     ) async throws -> MigrationSubmissionOutcome {
         let endpoint = try Self.endpoint(for: target)
-        let useTor = target.transport == .torOnion
+        let useTor = target.transport == .torOnion || target.transport == .torProxyTLS
 
         // Transport construction and every preflight operation occur before submit begins. A
         // failure here is known-unsent and is reported to Rust by the claim-owning caller.
@@ -298,13 +300,13 @@ final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
 
         let secure: Bool
         switch target.transport {
-        case .directTLS:
-            guard scheme == "https" else {
+        case .directTLS, .torProxyTLS:
+            guard scheme == "https", Self.isCanonicalPublicDNSHost(host) else {
                 throw MigrationBroadcastError.invalidSubmissionEndpoint
             }
             secure = true
         case .torOnion:
-            guard (scheme == "http" || scheme == "https"), host.hasSuffix(".onion") else {
+            guard scheme == "http" || scheme == "https", host.hasSuffix(".onion") else {
                 throw MigrationBroadcastError.invalidSubmissionEndpoint
             }
             secure = scheme == "https"
@@ -322,13 +324,50 @@ final class LiveMigrationTransactionSubmitter: MigrationTransactionSubmitting {
         return LightWalletEndpoint(address: host, port: port, secure: secure)
     }
 
-    private static func isExplicitLoopback(_ host: String) -> Bool {
-        host == "localhost" || host == "127.0.0.1" || host == "::1"
-    }
-
     static func endpointIdentity(_ endpoint: LightWalletEndpoint) -> String {
         let host = endpoint.host.lowercased()
         let renderedHost = host.contains(":") ? "[\(host)]" : host
         return "\(endpoint.secure ? "https" : "http")://\(renderedHost):\(endpoint.port)"
+    }
+}
+
+private extension LiveMigrationTransactionSubmitter {
+    static func isExplicitLoopback(_ host: String) -> Bool {
+        host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }
+
+    static func isCanonicalPublicDNSHost(_ host: String) -> Bool {
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count > 1,
+              host != "localhost",
+              !host.hasSuffix(".onion"),
+              let finalLabel = labels.last,
+              finalLabel.utf8.contains(where: { $0 >= 0x61 && $0 <= 0x7A }) else {
+            return false
+        }
+        let labelsAreCanonical = labels.allSatisfy { label in
+            guard let first = label.utf8.first,
+                  let last = label.utf8.last,
+                  first != 0x2D,
+                  last != 0x2D else {
+                return false
+            }
+            return label.utf8.allSatisfy { byte in
+                (byte >= 0x61 && byte <= 0x7A) ||
+                    (byte >= 0x30 && byte <= 0x39) ||
+                    byte == 0x2D
+            }
+        }
+        let isNumericAddressSpelling = labels.allSatisfy { label in
+            if label.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) {
+                return true
+            }
+            guard label.hasPrefix("0x") else { return false }
+            let hexadecimalDigits = label.dropFirst(2).utf8
+            return !hexadecimalDigits.isEmpty && hexadecimalDigits.allSatisfy { byte in
+                (byte >= 0x30 && byte <= 0x39) || (byte >= 0x61 && byte <= 0x66)
+            }
+        }
+        return labelsAreCanonical && !isNumericAddressSpelling
     }
 }

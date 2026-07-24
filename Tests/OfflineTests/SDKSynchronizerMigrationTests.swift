@@ -174,7 +174,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     func testPrepareImmediateMigrationForExternalSigningUsesTheOpaqueClaimLane() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.migrationRuntimeSnapshotForReturnValue = Self.makeRuntimeSnapshot(account: accountUUID)
-        welding.migrationReserveImmediateSignerSubmissionForReturnValue = Self.makeClaimHandle(1)
+        welding.migrationReserveImmediateSignerMaximumGrossAmountSubmissionForReturnValue = Self.makeClaimHandle(1)
         welding.migrationPrepareImmediateExternalSigningClaimForReturnValue = Self.makeClaimHandle(2)
         let expectedPCZT = Data([0x50, 0x43, 0x5A, 0x54])
         welding.migrationClaimExternalSigningPCZTReturnValue = expectedPCZT
@@ -183,23 +183,29 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
             useTor: false,
             submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067, secure: true)
         )
+        let maximumGrossAmount = Zatoshi(100_000_000)
 
         let request = try await synchronizer.prepareImmediateMigrationForExternalSigning(
             accountUUID: accountUUID,
+            maximumGrossAmount: maximumGrossAmount,
             options: options
         )
 
         XCTAssertEqual(request.pczt, expectedPCZT)
         XCTAssertEqual(
-            welding.migrationReserveImmediateSignerSubmissionForReceivedArguments?.signer,
+            welding.migrationReserveImmediateSignerMaximumGrossAmountSubmissionForReceivedArguments?.signer,
             .external
         )
         XCTAssertEqual(
-            welding.migrationReserveImmediateSignerSubmissionForReceivedArguments?.account,
+            welding.migrationReserveImmediateSignerMaximumGrossAmountSubmissionForReceivedArguments?.account,
             accountUUID
         )
         XCTAssertEqual(
-            welding.migrationReserveImmediateSignerSubmissionForReceivedArguments?.submission,
+            welding.migrationReserveImmediateSignerMaximumGrossAmountSubmissionForReceivedArguments?.maximumGrossAmount,
+            maximumGrossAmount
+        )
+        XCTAssertEqual(
+            welding.migrationReserveImmediateSignerMaximumGrossAmountSubmissionForReceivedArguments?.submission,
             MigrationSubmissionIntent(transport: .directTLS, endpoint: "https://submit.example:9067")
         )
         XCTAssertEqual(welding.migrationPrepareImmediateExternalSigningClaimForCallsCount, 1)

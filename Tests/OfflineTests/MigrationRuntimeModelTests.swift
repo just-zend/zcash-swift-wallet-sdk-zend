@@ -66,6 +66,55 @@ final class MigrationRuntimeModelTests: XCTestCase {
         XCTAssertFalse(intent.description.contains(endpoint))
     }
 
+    func testDeliveryRevisionReservesZeroForNoDelivery() {
+        XCTAssertFalse(MigrationDeliverySnapshot.isValidRevision(0))
+        XCTAssertTrue(MigrationDeliverySnapshot.isValidRevision(1))
+        XCTAssertTrue(MigrationDeliverySnapshot.isValidRevision(.max))
+    }
+
+    func testFFICollectionLengthsMustFitSwiftIntBeforeDecoding() {
+        XCTAssertEqual(MigrationDeliverySnapshot.hostCollectionCount(0), 0)
+        XCTAssertEqual(MigrationDeliverySnapshot.hostCollectionCount(UInt(Int.max)), Int.max)
+        XCTAssertNil(MigrationDeliverySnapshot.hostCollectionCount(.max))
+    }
+
+    func testAbsentDeliveryEnvelopeRejectsEveryCurrentRunCapabilityField() {
+        XCTAssertTrue(MigrationDeliverySnapshot.isValidRuntimeEnvelope(
+            hasDelivery: false,
+            deliveryRevision: 0,
+            hasClaimsStorage: false,
+            claimsCount: 0,
+            hasRunHandle: false
+        ))
+
+        let malformedEnvelopes: [(revision: UInt64, hasClaims: Bool, claimsCount: UInt, hasRun: Bool)] = [
+            (1, false, 0, false),
+            (0, true, 0, false),
+            (0, false, 1, false),
+            (0, false, 0, true),
+            (1, true, 1, true)
+        ]
+        for envelope in malformedEnvelopes {
+            XCTAssertFalse(MigrationDeliverySnapshot.isValidRuntimeEnvelope(
+                hasDelivery: false,
+                deliveryRevision: envelope.revision,
+                hasClaimsStorage: envelope.hasClaims,
+                claimsCount: envelope.claimsCount,
+                hasRunHandle: envelope.hasRun
+            ))
+        }
+    }
+
+    func testPresentDeliveryEnvelopeDefersRevisionAndClaimValidationToDeliveryDecoder() {
+        XCTAssertTrue(MigrationDeliverySnapshot.isValidRuntimeEnvelope(
+            hasDelivery: true,
+            deliveryRevision: 0,
+            hasClaimsStorage: false,
+            claimsCount: 1,
+            hasRunHandle: false
+        ))
+    }
+
     func testClaimSummaryExposesOnlySanitizedMetadata() {
         let txid = Data("secret-transaction-id".utf8)
         let claim = makeOutcomeUnknownSDKClaim(
@@ -269,7 +318,8 @@ final class MigrationRuntimeModelTests: XCTestCase {
             policyValidationFailure: nil,
             safeToCancel: false,
             claims: [claim],
-            runHandle: makeRunHandle(runIdentity)
+            runHandle: makeRunHandle(runIdentity),
+            revision: UInt64(runIdentity)
         )
     }
 

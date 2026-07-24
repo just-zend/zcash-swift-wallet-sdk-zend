@@ -18,12 +18,26 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `commitMigrationScheduleForExternalSigning` →
   `prepareNextMigrationTransactionForExternalSigning` →
   `submitExternallySignedMigrationTransaction` flow. Immediate migration similarly uses
-  `submitImmediateMigration` or the paired opaque external-signing request APIs. Pause/resume,
-  two-phase abandonment, and one-attempt expired rebuilds are explicit claim-backed operations.
+  `submitImmediateMigration` or the paired opaque external-signing request APIs, now with an
+  explicit maximum gross input authorization enforced atomically by Rust. An unexposed,
+  known-unsent materialization failure can reacquire only a bounded token for the same proposal,
+  signer, policy, and reservations; it cannot replan. Pause/resume, two-phase abandonment, and
+  one-attempt expired rebuilds are explicit claim-backed operations.
+  Delivery schema v2 persists that ceiling as separate versioned authority in the same wallet
+  transaction as a new immediate reservation. A pre-exposure immediate row created by the
+  prerelease v1 runtime has no such evidence and therefore opens as
+  `missingSpendAuthorization` recovery; neither Swift nor a legacy consent record may synthesize
+  a ceiling or resume its capability. Already exposed rows retain only outcome/finality recovery.
   The former public raw-PCZT arrays, note-split submission, batch stale refresh, restart, and
   caller-recorded result APIs are retired rather than adapted.
+  The prerelease `zcashlc_migration_reserve_immediate_v1` C ABI remains a fail-closed compatibility
+  symbol; the gross-authorized reservation implementation is exposed as v2 and both exact
+  signatures are artifact-gated.
   Migration broadcasts use a dedicated Tor runtime (`<torDir>/migration_tor`) and exactly one
-  caller-selected endpoint per attempt. Tor is fail-closed, confirmation comes from scanning, and
+  caller-selected endpoint per attempt. Direct canonical public-DNS TLS, public-DNS TLS through
+  Tor, Tor onion, and explicit loopback-development transports are distinct Rust-bound policy
+  variants; literal and legacy numeric-IP spellings fail closed. Tor is fail-closed, confirmation
+  comes from scanning, and
   the wallet-wide 10-minute broadcast→sync privacy gate remains enforced by
   `isMigrationSyncBlocked()` / `migrationSyncBlockedStream` /
   `migrationPrivacySyncBufferDuration`; broadcast entry points reject an already-running sync.
@@ -96,7 +110,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults like the rest of the group: the app's "Lock balance" choice calls
   `lockMigrationResidual(accountUUID:)`, and "Migrate anyway" over a locked residual composes as
   `unlockMigrationResidual(accountUUID:)` followed by
-  `submitImmediateMigration(accountUUID:usk:options:)`
+  `submitImmediateMigration(accountUUID:usk:maximumGrossAmount:options:)`
   (locked notes are excluded from note selection, so the unlock must come first).
 - Migration run-count estimate. `ZcashRustBackendWelding` gains
   `estimateMigrationRuns(accountUUID:)`, returning the new public `MigrationRunEstimate` model:
@@ -169,14 +183,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Initializer.initialize` / `Synchronizer.prepare` now return `InitializationResult.seedNotRelevant` instead of silently proceeding when the rust layer reports the provided seed is not relevant to the wallet database (breaking change: `InitializationResult` gained a new case, so exhaustive switches over it must add a case; see MIGRATING.md). Previously this case was indistinguishable from `.success`: account creation was skipped (accounts already existed) and callers proceeded as if they had prepared the wallet they expected, even when the database on disk belonged to a different wallet than the provided seed (e.g. a device-backup restore that brings back `data.db` without the matching keychain seed). Callers must now handle `.seedNotRelevant` the same way they already handle `.seedRequired`. (MOB-1512)
 - Immediate migration now consumes an opaque Rust delivery claim end to end. The retired ordinary
   `proposeImmediateMigration` / caller-authored `recordImmediateMigration(txid:)` flow is replaced by
-  `submitImmediateMigration(accountUUID:usk:options:)` for SDK signing and the paired
-  `prepareImmediateMigrationForExternalSigning` /
+  `submitImmediateMigration(accountUUID:usk:maximumGrossAmount:options:)` for SDK signing and the
+  paired `prepareImmediateMigrationForExternalSigning(accountUUID:maximumGrossAmount:options:)` /
   `submitExternallySignedImmediateMigration` APIs for external signing. Rust atomically reserves
-  sources, seals the proposal/expiry/consensus branch/submission policy, stages exact PCZT or
-  transaction bytes, and records a typed `MigrationSubmissionOutcome`; Swift cannot supply a
-  proposal, finalized transaction, transaction id, expiry, or branch. Repeating external-signing
-  preparation after relaunch recovers the exact staged PCZT and reacquires the Rust claim only when
-  the original submission policy matches. See `MIGRATING.md`.
+  sources, enforces the explicit gross-input ceiling, seals the proposal/expiry/consensus
+  branch/submission policy, stages exact PCZT or transaction bytes, and records a typed
+  `MigrationSubmissionOutcome`; Swift cannot supply a proposal, finalized transaction, transaction
+  id, expiry, or branch. A known-unsent failure before exposure may reacquire only the same
+  authorized proposal; repeating external-signing preparation after exposure or relaunch recovers
+  the exact staged PCZT only when the original submission policy matches. Once an external signer
+  response has been durably merged and exact transaction bytes are staged, immediate and scheduled
+  retries use dedicated `resumeStaged...ExternalSubmission` APIs that accept no signer bytes and
+  cannot reserve or materialize a replacement. See `MIGRATING.md`.
 - The Rust core now exact-pins one reviewed `just-zend/librustzcash` commit across the direct
   `zcash_pool_migration` dependency and every patched librustzcash-family crate. That fork is based
   on current `zcash/librustzcash` main and contains only the documented Zend delivery-safety deltas;
@@ -239,9 +257,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zcashlc_voting_precompute_delegation_pir` honors its documented empty-`notes_json` contract
   (treats `len == 0` as the empty note list) instead of failing to parse.
 - `zcashlc_set_custom_network` (and `ZcashRustBackend.setCustomNetwork`) now report a conflicting
-  re-registration — replacing a **different** already-registered custom network returns `false`
-  (the replacement is still applied, last writer wins), and the `Initializer` asserts on it in debug
-  builds. Registering twice with identical values remains a clean, idempotent `true`.
+  re-registration — registering a **different** custom network returns `false` and preserves the
+  existing process-global configuration so live wallets cannot have their consensus rules silently
+  replaced. `Initializer` and the standalone migration runtime fail this configuration error in both
+  debug and release builds. Registering twice with identical values remains a clean, idempotent `true`.
 - `prepare(with:...)` no longer throws `ZcashError.initializerSeedMismatch` (`ZINIT0006`) for a wallet whose only accounts are imported (hardware-wallet UFVKs). The seed-relevance check treats "the wallet has no seed-derived account" as relevant — there is nothing for the seed to conflict with — matching the documented exemption; previously an imported-spending account was miscounted as seed-derived, so a hardware-wallet-only wallet was bricked until `wipe()`. The `initializerSeedMismatch` message is also no longer truncated mid-sentence.
 - `putSaplingSubtreeRoots` / `putOrchardSubtreeRoots` / `putIronwoodSubtreeRoots` reject an out-of-range server-supplied `completingBlockHeight` (a `uint64` proto field) via `UInt32(exactly:)` instead of trapping. A malformed or hostile lightwalletd response can no longer crash the process at this conversion.
 - `UpdateSubtreeRootsAction` rethrows an Ironwood subtree-roots stream timeout into the retry machinery — like the Sapling and Orchard streams — instead of swallowing it. A server that black-holes the Ironwood stream no longer silently adds the full streaming deadline (~100 s) to every sync pass; genuine "Ironwood not supported" errors are still skipped best-effort.

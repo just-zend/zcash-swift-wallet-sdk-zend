@@ -641,20 +641,50 @@ public protocol Synchronizer: AnyObject {
     ///
     /// Stop synchronization first. A returned outcome means the submit RPC began and the migration
     /// privacy buffer is active; a pre-submit failure throws after Rust releases only a validated
-    /// known-unsent claim.
+    /// known-unsent claim. `maximumGrossAmount` is required user authorization for the sum of the
+    /// exact Orchard inputs; Rust enforces it when reserving. This generic entry point does not
+    /// recover `materializationFailed` state. Use the recovery-only API with the opaque capability
+    /// from the snapshot that rendered the failure. Once valid materialization authority or later
+    /// exact evidence exists, recovery continues the immutable artifact under its original
+    /// authorization; a later lower value cannot cancel, replace, or replan it.
     func submitImmediateMigration(
         accountUUID: AccountUUID,
         usk: UnifiedSpendingKey,
+        maximumGrossAmount: Zatoshi,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationSubmissionOutcome
+
+    /// Recovers only the exact SDK-signed immediate failure represented by `recoveryCapability`.
+    /// The opaque capability comes from the runtime snapshot rendered to the caller and seals the
+    /// run revision and artifact; this entry point never reserves a replacement run.
+    func recoverFailedImmediateMigration(
+        accountUUID: AccountUUID,
+        recoveryCapability: ImmediateMigrationRecoveryCapability,
+        usk: UnifiedSpendingKey,
+        maximumGrossAmount: Zatoshi,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationSubmissionOutcome
 
     /// Atomically reserves an immediate external-signer migration and exposes only the proven PCZT
     /// bound to an opaque claim. Calling this again after relaunch recovers the exact Rust-staged
     /// PCZT and a fresh claim when its original submission policy matches `options`; it never
-    /// replans an externally exposed artifact. Pass the returned value, unchanged, to
+    /// replans an externally exposed artifact. `maximumGrossAmount` authorizes a fresh reservation,
+    /// but this generic entry point rejects failed materialization; use the recovery-only API and
+    /// rendered opaque capability for that state. The ceiling cannot rewrite or cancel an artifact
+    /// after valid authority or exposure exists. Pass the returned value, unchanged, to
     /// ``submitExternallySignedImmediateMigration(accountUUID:request:signedPCZT:)``.
     func prepareImmediateMigrationForExternalSigning(
         accountUUID: AccountUUID,
+        maximumGrossAmount: Zatoshi,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> ImmediateMigrationExternalSigningRequest
+
+    /// Recovers only the exact external-signer failure represented by `recoveryCapability`. It
+    /// never reserves or exposes a replacement artifact.
+    func recoverFailedImmediateMigrationForExternalSigning(
+        accountUUID: AccountUUID,
+        recoveryCapability: ImmediateMigrationRecoveryCapability,
+        maximumGrossAmount: Zatoshi,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> ImmediateMigrationExternalSigningRequest
 
@@ -665,6 +695,12 @@ public protocol Synchronizer: AnyObject {
         accountUUID: AccountUUID,
         request: ImmediateMigrationExternalSigningRequest,
         signedPCZT: Data
+    ) async throws -> MigrationSubmissionOutcome
+
+    /// Resubmits the exact immediate external-signer transaction already signed and staged in
+    /// Rust. No signer response is accepted and no replacement reservation can be created.
+    func resumeStagedImmediateExternalSubmission(
+        accountUUID: AccountUUID
     ) async throws -> MigrationSubmissionOutcome
 
     /// The leftover Orchard balance a migration of `accountUUID` would not cross, when large enough
@@ -693,7 +729,8 @@ public protocol Synchronizer: AnyObject {
     /// Releases only the exact Orchard outputs held by `accountUUID`'s deterministic residual-lock
     /// owner and returns the number unlocked (`0` when no residual lock is active). Migration,
     /// ordinary-PCZT, and foreign-owner locks are preserved. "Migrate anyway" over a locked residual
-    /// composes as this call followed by ``submitImmediateMigration(accountUUID:usk:options:)``:
+    /// composes as this call followed by
+    /// ``submitImmediateMigration(accountUUID:usk:maximumGrossAmount:options:)``:
     /// locked notes are excluded from note selection, so the unlock must come first.
     /// - Parameter accountUUID: the account whose owner-scoped residual locks should be released.
     func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int
@@ -723,8 +760,9 @@ public protocol Synchronizer: AnyObject {
     ///     `migrationPlanStale` after relaunch or supersession. Persisted schedules decode with a
     ///     zero handle and must be re-proposed before a fresh commit. The immediate lane instead
     ///     uses a Rust-owned opaque claim via
-    ///     ``submitImmediateMigration(accountUUID:usk:options:)`` or the paired external-signing
-    ///     methods; it never accepts this caller-held schedule or an ordinary proposal.
+    ///     ``submitImmediateMigration(accountUUID:usk:maximumGrossAmount:options:)`` or the paired
+    ///     external-signing methods; it never accepts this caller-held schedule or an ordinary
+    ///     proposal.
     ///   - usk: the account's unified spending key.
     ///   - options: the submission policy to bind to the run. A terminal successor inherits its
     ///     predecessor's immutable policy, so these options must match before rollover can commit.
@@ -758,6 +796,13 @@ public protocol Synchronizer: AnyObject {
         accountUUID: AccountUUID,
         request: ScheduledMigrationExternalSigningRequest,
         signedPCZT: Data
+    ) async throws -> MigrationTransferResult
+
+    /// Resubmits one exact scheduled external-signer transaction already signed and staged in
+    /// Rust. `transactionID` selects canonical state but carries no mutation authority.
+    func resumeStagedScheduledExternalSubmission(
+        accountUUID: AccountUUID,
+        transactionID: UInt32
     ) async throws -> MigrationTransferResult
 
     /// Broadcasts the next height-due migration transfer for `accountUUID`, or returns `nil` when
@@ -997,6 +1042,17 @@ public extension Synchronizer {
     func submitImmediateMigration(
         accountUUID: AccountUUID,
         usk: UnifiedSpendingKey,
+        maximumGrossAmount: Zatoshi,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationSubmissionOutcome {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func recoverFailedImmediateMigration(
+        accountUUID: AccountUUID,
+        recoveryCapability: ImmediateMigrationRecoveryCapability,
+        usk: UnifiedSpendingKey,
+        maximumGrossAmount: Zatoshi,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationSubmissionOutcome {
         throw MigrationUnimplemented(member: #function)
@@ -1004,6 +1060,16 @@ public extension Synchronizer {
 
     func prepareImmediateMigrationForExternalSigning(
         accountUUID: AccountUUID,
+        maximumGrossAmount: Zatoshi,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> ImmediateMigrationExternalSigningRequest {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func recoverFailedImmediateMigrationForExternalSigning(
+        accountUUID: AccountUUID,
+        recoveryCapability: ImmediateMigrationRecoveryCapability,
+        maximumGrossAmount: Zatoshi,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> ImmediateMigrationExternalSigningRequest {
         throw MigrationUnimplemented(member: #function)
@@ -1013,6 +1079,12 @@ public extension Synchronizer {
         accountUUID: AccountUUID,
         request: ImmediateMigrationExternalSigningRequest,
         signedPCZT: Data
+    ) async throws -> MigrationSubmissionOutcome {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func resumeStagedImmediateExternalSubmission(
+        accountUUID: AccountUUID
     ) async throws -> MigrationSubmissionOutcome {
         throw MigrationUnimplemented(member: #function)
     }
@@ -1060,6 +1132,13 @@ public extension Synchronizer {
         accountUUID: AccountUUID,
         request: ScheduledMigrationExternalSigningRequest,
         signedPCZT: Data
+    ) async throws -> MigrationTransferResult {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func resumeStagedScheduledExternalSubmission(
+        accountUUID: AccountUUID,
+        transactionID: UInt32
     ) async throws -> MigrationTransferResult {
         throw MigrationUnimplemented(member: #function)
     }

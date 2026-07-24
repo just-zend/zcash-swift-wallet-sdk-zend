@@ -32,9 +32,23 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     control are committed together. Tests use the same seam instead of weakening the store for
     synthetic fixtures.
   - Immediate delivery, external signing, outcome resolution, expired-attempt rebuild, and
-    abandonment remain claim-backed typed operations. The older raw PCZT, direct result-recording,
-    restart, bulk refresh, and direct note-split mutation symbols are fail-closed compatibility
-    stubs and are not reachable from production Swift.
+    abandonment remain claim-backed typed operations. Immediate reservation derives the exact
+    gross Orchard input value and atomically rejects it above the caller's explicit ceiling before
+    any authority write. An unexposed known-unsent materialization failure can reacquire only a
+    bounded token for the same account, artifact, signer, policy, proposal, and reservations; it
+    never replans. Delivery schema v2 persists the ceiling as versioned per-run authority; a v1
+    pre-exposure row without that evidence is recovery-required and cannot receive or resume a
+    capability. Already exposed rows remain outcome/finality-only. The older raw PCZT, direct
+    result-recording, restart, bulk refresh, and direct
+    note-split mutation symbols are fail-closed compatibility stubs and are not reachable from
+    production Swift.
+  - The original `zcashlc_migration_reserve_immediate_v1` C signature remains exported as a
+    fail-closed compatibility stub. The maximum-gross-authorized implementation is versioned as
+    `zcashlc_migration_reserve_immediate_v2`; artifact validation pins both exact prototypes and
+    both exported symbols so an older generated header cannot invoke a changed ABI.
+  - Submission policy now distinguishes direct canonical public-DNS TLS, public-DNS TLS through an
+    isolated Tor proxy, canonical v3 onion transport, and explicit loopback development transport;
+    literal and legacy numeric-IP spellings fail closed.
   - `zcashlc_ironwood_activation_height` reports NU6.3 activation for mainnet/testnet.
 - Migration residual note locking: `zcashlc_migration_lock_residual` locks every
   currently-spendable, not-already-locked legacy-Orchard note of the account until

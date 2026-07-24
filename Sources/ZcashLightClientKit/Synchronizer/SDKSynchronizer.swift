@@ -1235,22 +1235,57 @@ public class SDKSynchronizer: Synchronizer {
     public func submitImmediateMigration(
         accountUUID: AccountUUID,
         usk: UnifiedSpendingKey,
+        maximumGrossAmount: Zatoshi,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationSubmissionOutcome {
         try await throwIfSyncingForMigrationBroadcast()
         return try await migrationHost.migration(for: accountUUID).submitImmediateMigration(
             usk: usk,
+            maximumGrossAmount: maximumGrossAmount,
             options: options
         )
     }
 
+    public func recoverFailedImmediateMigration(
+        accountUUID: AccountUUID,
+        recoveryCapability: ImmediateMigrationRecoveryCapability,
+        usk: UnifiedSpendingKey,
+        maximumGrossAmount: Zatoshi,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationSubmissionOutcome {
+        try await throwIfSyncingForMigrationBroadcast()
+        return try await migrationHost.migration(for: accountUUID)
+            .recoverFailedImmediateMigration(
+                recoveryCapability: recoveryCapability,
+                usk: usk,
+                maximumGrossAmount: maximumGrossAmount,
+                options: options
+            )
+    }
+
     public func prepareImmediateMigrationForExternalSigning(
         accountUUID: AccountUUID,
+        maximumGrossAmount: Zatoshi,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> ImmediateMigrationExternalSigningRequest {
         try await migrationHost.migration(for: accountUUID).prepareImmediateMigrationForExternalSigning(
+            maximumGrossAmount: maximumGrossAmount,
             options: options
         )
+    }
+
+    public func recoverFailedImmediateMigrationForExternalSigning(
+        accountUUID: AccountUUID,
+        recoveryCapability: ImmediateMigrationRecoveryCapability,
+        maximumGrossAmount: Zatoshi,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> ImmediateMigrationExternalSigningRequest {
+        try await migrationHost.migration(for: accountUUID)
+            .recoverFailedImmediateMigrationForExternalSigning(
+                recoveryCapability: recoveryCapability,
+                maximumGrossAmount: maximumGrossAmount,
+                options: options
+            )
     }
 
     public func submitExternallySignedImmediateMigration(
@@ -1263,6 +1298,13 @@ public class SDKSynchronizer: Synchronizer {
             request: request,
             signedPCZT: signedPCZT
         )
+    }
+
+    public func resumeStagedImmediateExternalSubmission(
+        accountUUID: AccountUUID
+    ) async throws -> MigrationSubmissionOutcome {
+        try await throwIfSyncingForMigrationBroadcast()
+        return try await migrationHost.migration(for: accountUUID).resumeStagedImmediateExternalSubmission()
     }
 
     public func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi? {
@@ -1320,6 +1362,16 @@ public class SDKSynchronizer: Synchronizer {
         return try await migrationHost.migration(for: accountUUID).submitExternallySignedMigrationTransaction(
             request: request,
             signedPCZT: signedPCZT
+        )
+    }
+
+    public func resumeStagedScheduledExternalSubmission(
+        accountUUID: AccountUUID,
+        transactionID: UInt32
+    ) async throws -> MigrationTransferResult {
+        try await throwIfSyncingForMigrationBroadcast()
+        return try await migrationHost.migration(for: accountUUID).resumeStagedScheduledExternalSubmission(
+            transactionID: transactionID
         )
     }
 

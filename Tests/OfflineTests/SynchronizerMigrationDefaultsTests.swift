@@ -70,6 +70,24 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
             _ = try await self.synchronizer.submitImmediateMigration(
                 accountUUID: self.accountUUID,
                 usk: usk,
+                maximumGrossAmount: Zatoshi(100_000_000),
+                options: options
+            )
+        }
+    }
+
+    func testRecoverMissingSpendAuthorizationImmediateMigrationDefaultThrowsUnimplemented() async {
+        let usk = TestsData(networkType: .testnet).spendingKey
+        let options = MigrationNetworkPrivacyOptions(
+            useTor: false,
+            submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067)
+        )
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.recoverFailedImmediateMigration(
+                accountUUID: self.accountUUID,
+                recoveryCapability: self.recoveryCapability(signer: .sdk),
+                usk: usk,
+                maximumGrossAmount: Zatoshi(100_000_000),
                 options: options
             )
         }
@@ -83,9 +101,43 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await assertThrowsMigrationUnimplemented {
             _ = try await self.synchronizer.prepareImmediateMigrationForExternalSigning(
                 accountUUID: self.accountUUID,
+                maximumGrossAmount: Zatoshi(100_000_000),
                 options: options
             )
         }
+    }
+
+    func testRecoverMissingSpendAuthorizationImmediateExternalSigningDefaultThrowsUnimplemented() async {
+        let options = MigrationNetworkPrivacyOptions(
+            useTor: false,
+            submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067)
+        )
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer
+                .recoverFailedImmediateMigrationForExternalSigning(
+                    accountUUID: self.accountUUID,
+                    recoveryCapability: self.recoveryCapability(signer: .external),
+                    maximumGrossAmount: Zatoshi(100_000_000),
+                    options: options
+                )
+        }
+    }
+
+    private func recoveryCapability(
+        signer: MigrationSignerOwnership
+    ) -> ImmediateMigrationRecoveryCapability {
+        ImmediateMigrationRecoveryCapability(
+            claimHandle: MigrationClaimHandle(
+                storage: MigrationOpaqueHandleStorage(
+                    pointer: OpaquePointer(bitPattern: 0xCAFE)!,
+                    release: { _ in }
+                )
+            ),
+            account: accountUUID,
+            artifact: .immediate(identity: Data(repeating: 0xCA, count: 32)),
+            signerOwnership: signer,
+            deliveryRevision: 1
+        )
     }
 
     func testSubmitExternallySignedImmediateMigrationDefaultThrowsUnimplemented() async {

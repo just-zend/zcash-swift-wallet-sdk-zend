@@ -143,9 +143,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     /// A `nil` height means "not activated on this network".
     ///
     /// Returns `true` on a fresh registration or an identical re-registration. Returns `false` when
-    /// the call replaced a **different** existing configuration (the replacement is still applied,
-    /// last writer wins) — a host configuration bug, since the parameters are process-global and two
-    /// live instances with different custom networks cannot both be honored.
+    /// a **different** configuration is already registered; the existing configuration is preserved.
+    /// This is a host configuration bug, since the parameters are process-global and two live
+    /// instances with different custom networks cannot both be honored.
     @discardableResult
     static func setCustomNetwork(base: NetworkType, _ heights: NetworkActivationHeights) -> Bool {
         func height(_ value: BlockHeight?) -> Int64 {
@@ -1725,10 +1725,13 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         if batch.accounts_len == 0 {
             return []
         }
+        guard let accountsCount = MigrationDeliverySnapshot.hostCollectionCount(batch.accounts_len) else {
+            throw malformedMigrationDelivery("runtime batch account count exceeded host collection limits")
+        }
         guard let accounts = batch.accounts else {
             throw malformedMigrationDelivery("runtime batch omitted its account array")
         }
-        return try (0 ..< Int(batch.accounts_len)).map {
+        return try (0 ..< accountsCount).map {
             try decodeMigrationRuntimeSnapshot(accounts.advanced(by: $0).pointee)
         }
     }
@@ -1775,7 +1778,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         guard let bytes = endpointPtr.pointee.ptr, endpointPtr.pointee.len > 0 else {
             throw malformedMigrationDelivery("bound submission policy omitted its endpoint")
         }
-        let endpointData = Data(bytes: bytes, count: Int(endpointPtr.pointee.len))
+        guard let endpointLength = MigrationDeliverySnapshot.hostCollectionCount(endpointPtr.pointee.len) else {
+            throw malformedMigrationDelivery("bound submission endpoint exceeded host collection limits")
+        }
+        let endpointData = Data(bytes: bytes, count: endpointLength)
         guard let endpoint = String(data: endpointData, encoding: .utf8) else {
             throw malformedMigrationDelivery("bound submission endpoint was not UTF-8")
         }
@@ -1785,17 +1791,19 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     @DBActor
     func migrationReserveImmediate(
         signer: MigrationSignerOwnership,
+        maximumGrossAmount: Zatoshi,
         submission: MigrationSubmissionIntent,
         for account: AccountUUID
     ) async throws -> MigrationClaimHandle {
         let endpoint = submission.endpoint.utf8CString
         let pointer = endpoint.withUnsafeBufferPointer { endpoint in
-            zcashlc_migration_reserve_immediate_v1(
+            zcashlc_migration_reserve_immediate_v2(
                 dbData.0,
                 dbData.1,
                 account.id,
                 networkType.networkId,
                 migrationSignerTag(signer),
+                maximumGrossAmount.amount,
                 migrationTransportTag(submission.transport),
                 endpoint.baseAddress
             )
@@ -2035,6 +2043,27 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
                 dbData.0, dbData.1, account.id, networkType.networkId, claim.pointer
             ),
             operation: "migrationResumeClaim"
+        )
+    }
+
+    @DBActor
+    func migrationReacquireFailedImmediateMaterialization(
+        claim: MigrationClaimHandle,
+        signer: MigrationSignerOwnership,
+        maximumGrossAmount: Zatoshi,
+        for account: AccountUUID
+    ) async throws -> MigrationClaimHandle {
+        try ownedMigrationClaim(
+            zcashlc_migration_reacquire_failed_immediate_materialization_v1(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                claim.pointer,
+                migrationSignerTag(signer),
+                maximumGrossAmount.amount
+            ),
+            operation: "migrationReacquireFailedImmediateMaterialization"
         )
     }
 
@@ -2312,7 +2341,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             }
             return nil
         }
-        return Data(bytes: bytes, count: Int(slice.len))
+        guard let length = MigrationDeliverySnapshot.hostCollectionCount(slice.len) else {
+            throw malformedMigrationDelivery("\(operation) returned bytes exceeding host collection limits")
+        }
+        return Data(bytes: bytes, count: length)
     }
 
     private func optionalOwnedMigrationClaim(
@@ -2486,7 +2518,18 @@ private extension ZcashRustBackend {
             reasonTag: ffi.unavailable_reason,
             detail: ffi.unavailable_detail
         )
+        guard MigrationDeliverySnapshot.isValidRuntimeEnvelope(
+            hasDelivery: ffi.has_delivery,
+            deliveryRevision: ffi.delivery_revision,
+            hasClaimsStorage: ffi.claims != nil,
+            claimsCount: ffi.claims_len,
+            hasRunHandle: ffi.run_handle != nil
+        ) else {
+            throw malformedMigrationDelivery("runtime without delivery carried current-run capabilities")
+        }
+
         let delivery = try ffi.has_delivery ? decodeMigrationDelivery(
+            revision: ffi.delivery_revision,
             laneTag: ffi.delivery_lane,
             phaseTag: ffi.delivery_phase,
             finalityTag: ffi.storage_finality,
@@ -2501,17 +2544,16 @@ private extension ZcashRustBackend {
             run: ffi.run_handle
         ) : nil
 
-        if !ffi.has_delivery, ffi.run_handle != nil || ffi.claims_len != 0 {
-            throw malformedMigrationDelivery("runtime without delivery carried current-run capabilities")
+        guard let retainedRunsCount = MigrationDeliverySnapshot.hostCollectionCount(ffi.retained_runs_len) else {
+            throw malformedMigrationDelivery("retained-run count exceeded host collection limits")
         }
-
         var retained: [MigrationRetainedRun] = []
-        retained.reserveCapacity(Int(ffi.retained_runs_len))
+        retained.reserveCapacity(retainedRunsCount)
         if ffi.retained_runs_len > 0 {
             guard let retainedRuns = ffi.retained_runs else {
                 throw malformedMigrationDelivery("runtime omitted retained-run storage")
             }
-            for index in 0 ..< Int(ffi.retained_runs_len) {
+            for index in 0 ..< retainedRunsCount {
                 retained.append(try decodeRetainedMigrationRun(retainedRuns.advanced(by: index).pointee))
             }
         }
@@ -2563,6 +2605,7 @@ private extension ZcashRustBackend {
             ),
             destinationSpendability: try migrationDestinationSpendability(tag: ffi.destination_spendability),
             delivery: try decodeMigrationDelivery(
+                revision: ffi.delivery_revision,
                 laneTag: Int8(ffi.delivery_lane),
                 phaseTag: Int8(ffi.delivery_phase),
                 finalityTag: Int8(ffi.storage_finality),
@@ -2581,6 +2624,7 @@ private extension ZcashRustBackend {
 
     // swiftlint:disable:next function_parameter_count
     func decodeMigrationDelivery(
+        revision: UInt64,
         laneTag: Int8,
         phaseTag: Int8,
         finalityTag: Int8,
@@ -2594,18 +2638,24 @@ private extension ZcashRustBackend {
         claimsCount: UInt,
         run: OpaquePointer?
     ) throws -> MigrationDeliverySnapshot {
+        guard MigrationDeliverySnapshot.isValidRevision(revision) else {
+            throw malformedMigrationDelivery("delivery carried the reserved zero revision")
+        }
         guard let lane = migrationDeliveryLane(tag: laneTag),
               let phase = migrationDeliveryPhase(tag: phaseTag) else {
             throw malformedMigrationDelivery("unknown delivery lane/phase tags \(laneTag)/\(phaseTag)")
         }
+        guard let decodedClaimsCount = MigrationDeliverySnapshot.hostCollectionCount(claimsCount) else {
+            throw malformedMigrationDelivery("delivery claim count exceeded host collection limits")
+        }
         let runHandle = try cloneMigrationRun(run)
         var decodedClaims: [MigrationDeliveryClaimSummary] = []
-        decodedClaims.reserveCapacity(Int(claimsCount))
+        decodedClaims.reserveCapacity(decodedClaimsCount)
         if claimsCount > 0 {
             guard let claims else {
                 throw malformedMigrationDelivery("delivery omitted its claim array")
             }
-            for index in 0 ..< Int(claimsCount) {
+            for index in 0 ..< decodedClaimsCount {
                 decodedClaims.append(try decodeMigrationClaim(claims.advanced(by: index).pointee))
             }
         }
@@ -2622,7 +2672,8 @@ private extension ZcashRustBackend {
             policyValidationFailure: try migrationPolicyFailure(tag: policyFailureTag),
             safeToCancel: safeToCancel,
             claims: decodedClaims,
-            runHandle: runHandle
+            runHandle: runHandle,
+            revision: revision
         )
     }
 
@@ -2759,6 +2810,7 @@ private extension ZcashRustBackend {
                     throw malformedMigrationDelivery("finality recovery detail did not fit in Int8")
                 }
                 reason = .finalityRecovery(try migrationStorageRecoveryReason(tag: recoveryTag))
+            case 8: reason = .missingSpendAuthorization
             default: throw malformedMigrationDelivery("unknown unavailable reason tag \(reasonTag)")
             }
             return .unavailable(reason)
@@ -2930,6 +2982,7 @@ private func migrationTransportTag(_ transport: MigrationSubmissionTransport) ->
     case .directTLS: return 0
     case .torOnion: return 1
     case .loopbackDevelopment: return 2
+    case .torProxyTLS: return 3
     }
 }
 
@@ -2938,6 +2991,7 @@ private func migrationTransport(tag: Int32) -> MigrationSubmissionTransport? {
     case 0: return .directTLS
     case 1: return .torOnion
     case 2: return .loopbackDevelopment
+    case 3: return .torProxyTLS
     default: return nil
     }
 }

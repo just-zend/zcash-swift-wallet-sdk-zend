@@ -88,6 +88,102 @@ final class MigrationTransactionSubmitterTests: XCTestCase {
         XCTAssertEqual(factory.receivedArguments?.useTor, true)
         XCTAssertEqual(service.submitSpendTransactionModeReceivedArguments?.mode, .defaultTor)
     }
+}
+
+extension MigrationTransactionSubmitterTests {
+    func testPublicTLSTorIntentRemainsTorProxiedWithoutClaimingAnOnionEndpoint() {
+        let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+            options: MigrationNetworkPrivacyOptions(
+                useTor: true,
+                submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067)
+            ),
+            networkType: .testnet
+        )
+
+        XCTAssertEqual(intent.transport, .torProxyTLS)
+        XCTAssertEqual(intent.endpoint, "https://submit.example:9067")
+    }
+
+    func testOnionTorIntentKeepsTheOnionTransport() {
+        let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+            options: MigrationNetworkPrivacyOptions(
+                useTor: true,
+                submissionEndpoint: LightWalletEndpoint(
+                    address: "migrationexample.onion",
+                    port: 80,
+                    secure: false
+                )
+            ),
+            networkType: .testnet
+        )
+
+        XCTAssertEqual(intent.transport, .torOnion)
+        XCTAssertEqual(intent.endpoint, "http://migrationexample.onion:80")
+    }
+
+    func testTorProxyTLSTargetUsesOnlyTheBoundPublicEndpointOverTor() async throws {
+        let service = makeService(response: makeResponse())
+        let factory = TransportFactoryMock(service: service, mode: .defaultTor)
+        let target = MigrationBoundSubmissionTarget(
+            transport: .torProxyTLS,
+            endpoint: "https://submit.example:9067"
+        )
+
+        let result = try await submit(using: makeSubmitter(factory: factory), target: target)
+
+        XCTAssertEqual(result, .accepted)
+        XCTAssertEqual(factory.receivedArguments?.endpoint.host, "submit.example")
+        XCTAssertEqual(factory.receivedArguments?.endpoint.port, 9067)
+        XCTAssertEqual(factory.receivedArguments?.endpoint.secure, true)
+        XCTAssertEqual(factory.receivedArguments?.useTor, true)
+        XCTAssertEqual(service.submitSpendTransactionModeReceivedArguments?.mode, .defaultTor)
+    }
+
+    func testTorProxyTLSRejectsCleartextBeforeTransportCreation() async throws {
+        let service = makeService(response: makeResponse())
+        let factory = TransportFactoryMock(service: service, mode: .defaultTor)
+
+        do {
+            _ = try await submit(
+                using: makeSubmitter(factory: factory),
+                target: MigrationBoundSubmissionTarget(
+                    transport: .torProxyTLS,
+                    endpoint: "http://submit.example:9067"
+                )
+            )
+            XCTFail("expected invalidSubmissionEndpoint")
+        } catch let error as MigrationBroadcastError {
+            XCTAssertEqual(error, .invalidSubmissionEndpoint)
+        }
+
+        XCTAssertEqual(factory.callsCount, 0)
+        XCTAssertFalse(service.submitSpendTransactionModeCalled)
+    }
+
+    func testPublicTLSTransportsRejectNonPublicDNSTargetsBeforeTransportCreation() throws {
+        for transport in [MigrationSubmissionTransport.directTLS, .torProxyTLS] {
+            for endpoint in [
+                "https://migrationexample.onion:443",
+                "https://localhost:9067",
+                "https://127.0.0.2:9067",
+                "https://10.0.0.1:9067",
+                "https://169.254.169.254:9067",
+                "https://2130706433:9067",
+                "https://0x7f000001:9067",
+                "https://0x7f.0x1:9067",
+                "https://[::1]:9067"
+            ] {
+                XCTAssertThrowsError(
+                    try LiveMigrationTransactionSubmitter.endpoint(
+                        for: MigrationBoundSubmissionTarget(
+                            transport: transport,
+                            endpoint: endpoint
+                        )
+                    )
+                )
+            }
+        }
+    }
 
     func testMalformedOrTransportMismatchedBoundTargetFailsBeforeTransportCreation() async throws {
         let service = makeService(response: makeResponse())

@@ -2825,49 +2825,97 @@ class SynchronizerMock: Synchronizer {
 
     // MARK: - submitImmediateMigration
 
-    var submitImmediateMigrationAccountUUIDUskOptionsThrowableError: Error?
-    var submitImmediateMigrationAccountUUIDUskOptionsCallsCount = 0
-    var submitImmediateMigrationAccountUUIDUskOptionsCalled: Bool {
-        return submitImmediateMigrationAccountUUIDUskOptionsCallsCount > 0
+    var submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsThrowableError: Error?
+    var submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsCallsCount = 0
+    var submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsCalled: Bool {
+        return submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsCallsCount > 0
     }
-    var submitImmediateMigrationAccountUUIDUskOptionsReceivedArguments: (accountUUID: AccountUUID, usk: UnifiedSpendingKey, options: MigrationNetworkPrivacyOptions)?
-    var submitImmediateMigrationAccountUUIDUskOptionsReturnValue: MigrationSubmissionOutcome!
-    var submitImmediateMigrationAccountUUIDUskOptionsClosure: ((AccountUUID, UnifiedSpendingKey, MigrationNetworkPrivacyOptions) async throws -> MigrationSubmissionOutcome)?
+    var submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsReceivedArguments: (accountUUID: AccountUUID, usk: UnifiedSpendingKey, maximumGrossAmount: Zatoshi, options: MigrationNetworkPrivacyOptions)?
+    var submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsReturnValue: MigrationSubmissionOutcome!
+    var submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsClosure: ((AccountUUID, UnifiedSpendingKey, Zatoshi, MigrationNetworkPrivacyOptions) async throws -> MigrationSubmissionOutcome)?
 
-    func submitImmediateMigration(accountUUID: AccountUUID, usk: UnifiedSpendingKey, options: MigrationNetworkPrivacyOptions) async throws -> MigrationSubmissionOutcome {
-        if let error = submitImmediateMigrationAccountUUIDUskOptionsThrowableError {
+    func submitImmediateMigration(accountUUID: AccountUUID, usk: UnifiedSpendingKey, maximumGrossAmount: Zatoshi, options: MigrationNetworkPrivacyOptions) async throws -> MigrationSubmissionOutcome {
+        if let error = submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsThrowableError {
             throw error
         }
-        submitImmediateMigrationAccountUUIDUskOptionsCallsCount += 1
-        submitImmediateMigrationAccountUUIDUskOptionsReceivedArguments = (accountUUID: accountUUID, usk: usk, options: options)
-        if let closure = submitImmediateMigrationAccountUUIDUskOptionsClosure {
-            return try await closure(accountUUID, usk, options)
+        submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsCallsCount += 1
+        submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsReceivedArguments = (accountUUID: accountUUID, usk: usk, maximumGrossAmount: maximumGrossAmount, options: options)
+        if let closure = submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsClosure {
+            return try await closure(accountUUID, usk, maximumGrossAmount, options)
         } else {
-            return submitImmediateMigrationAccountUUIDUskOptionsReturnValue
+            return submitImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsReturnValue
+        }
+    }
+
+    // MARK: - recoverFailedImmediateMigration
+
+    var recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsThrowableError: Error?
+    var recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsCallsCount = 0
+    var recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsCalled: Bool {
+        return recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsCallsCount > 0
+    }
+    var recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsReceivedArguments: (accountUUID: AccountUUID, recoveryCapability: ImmediateMigrationRecoveryCapability, usk: UnifiedSpendingKey, maximumGrossAmount: Zatoshi, options: MigrationNetworkPrivacyOptions)?
+    var recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsReturnValue: MigrationSubmissionOutcome!
+    var recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsClosure: ((AccountUUID, ImmediateMigrationRecoveryCapability, UnifiedSpendingKey, Zatoshi, MigrationNetworkPrivacyOptions) async throws -> MigrationSubmissionOutcome)?
+
+    func recoverFailedImmediateMigration(accountUUID: AccountUUID, recoveryCapability: ImmediateMigrationRecoveryCapability, usk: UnifiedSpendingKey, maximumGrossAmount: Zatoshi, options: MigrationNetworkPrivacyOptions) async throws -> MigrationSubmissionOutcome {
+        if let error = recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsThrowableError {
+            throw error
+        }
+        recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsCallsCount += 1
+        recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsReceivedArguments = (accountUUID: accountUUID, recoveryCapability: recoveryCapability, usk: usk, maximumGrossAmount: maximumGrossAmount, options: options)
+        if let closure = recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsClosure {
+            return try await closure(accountUUID, recoveryCapability, usk, maximumGrossAmount, options)
+        } else {
+            return recoverFailedImmediateMigrationAccountUUIDUskMaximumGrossAmountOptionsReturnValue
         }
     }
 
     // MARK: - prepareImmediateMigrationForExternalSigning
 
-    var prepareImmediateMigrationForExternalSigningAccountUUIDOptionsThrowableError: Error?
-    var prepareImmediateMigrationForExternalSigningAccountUUIDOptionsCallsCount = 0
-    var prepareImmediateMigrationForExternalSigningAccountUUIDOptionsCalled: Bool {
-        return prepareImmediateMigrationForExternalSigningAccountUUIDOptionsCallsCount > 0
+    var prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsThrowableError: Error?
+    var prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsCallsCount = 0
+    var prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsCalled: Bool {
+        return prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsCallsCount > 0
     }
-    var prepareImmediateMigrationForExternalSigningAccountUUIDOptionsReceivedArguments: (accountUUID: AccountUUID, options: MigrationNetworkPrivacyOptions)?
-    var prepareImmediateMigrationForExternalSigningAccountUUIDOptionsReturnValue: ImmediateMigrationExternalSigningRequest!
-    var prepareImmediateMigrationForExternalSigningAccountUUIDOptionsClosure: ((AccountUUID, MigrationNetworkPrivacyOptions) async throws -> ImmediateMigrationExternalSigningRequest)?
+    var prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsReceivedArguments: (accountUUID: AccountUUID, maximumGrossAmount: Zatoshi, options: MigrationNetworkPrivacyOptions)?
+    var prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsReturnValue: ImmediateMigrationExternalSigningRequest!
+    var prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsClosure: ((AccountUUID, Zatoshi, MigrationNetworkPrivacyOptions) async throws -> ImmediateMigrationExternalSigningRequest)?
 
-    func prepareImmediateMigrationForExternalSigning(accountUUID: AccountUUID, options: MigrationNetworkPrivacyOptions) async throws -> ImmediateMigrationExternalSigningRequest {
-        if let error = prepareImmediateMigrationForExternalSigningAccountUUIDOptionsThrowableError {
+    func prepareImmediateMigrationForExternalSigning(accountUUID: AccountUUID, maximumGrossAmount: Zatoshi, options: MigrationNetworkPrivacyOptions) async throws -> ImmediateMigrationExternalSigningRequest {
+        if let error = prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsThrowableError {
             throw error
         }
-        prepareImmediateMigrationForExternalSigningAccountUUIDOptionsCallsCount += 1
-        prepareImmediateMigrationForExternalSigningAccountUUIDOptionsReceivedArguments = (accountUUID: accountUUID, options: options)
-        if let closure = prepareImmediateMigrationForExternalSigningAccountUUIDOptionsClosure {
-            return try await closure(accountUUID, options)
+        prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsCallsCount += 1
+        prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsReceivedArguments = (accountUUID: accountUUID, maximumGrossAmount: maximumGrossAmount, options: options)
+        if let closure = prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsClosure {
+            return try await closure(accountUUID, maximumGrossAmount, options)
         } else {
-            return prepareImmediateMigrationForExternalSigningAccountUUIDOptionsReturnValue
+            return prepareImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsReturnValue
+        }
+    }
+
+    // MARK: - recoverFailedImmediateMigrationForExternalSigning
+
+    var recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsThrowableError: Error?
+    var recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsCallsCount = 0
+    var recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsCalled: Bool {
+        return recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsCallsCount > 0
+    }
+    var recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsReceivedArguments: (accountUUID: AccountUUID, recoveryCapability: ImmediateMigrationRecoveryCapability, maximumGrossAmount: Zatoshi, options: MigrationNetworkPrivacyOptions)?
+    var recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsReturnValue: ImmediateMigrationExternalSigningRequest!
+    var recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsClosure: ((AccountUUID, ImmediateMigrationRecoveryCapability, Zatoshi, MigrationNetworkPrivacyOptions) async throws -> ImmediateMigrationExternalSigningRequest)?
+
+    func recoverFailedImmediateMigrationForExternalSigning(accountUUID: AccountUUID, recoveryCapability: ImmediateMigrationRecoveryCapability, maximumGrossAmount: Zatoshi, options: MigrationNetworkPrivacyOptions) async throws -> ImmediateMigrationExternalSigningRequest {
+        if let error = recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsThrowableError {
+            throw error
+        }
+        recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsCallsCount += 1
+        recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsReceivedArguments = (accountUUID: accountUUID, recoveryCapability: recoveryCapability, maximumGrossAmount: maximumGrossAmount, options: options)
+        if let closure = recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsClosure {
+            return try await closure(accountUUID, recoveryCapability, maximumGrossAmount, options)
+        } else {
+            return recoverFailedImmediateMigrationForExternalSigningAccountUUIDMaximumGrossAmountOptionsReturnValue
         }
     }
 
@@ -4985,25 +5033,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     // MARK: - migrationReserveImmediate
 
-    var migrationReserveImmediateSignerSubmissionForThrowableError: Error?
-    var migrationReserveImmediateSignerSubmissionForCallsCount = 0
-    var migrationReserveImmediateSignerSubmissionForCalled: Bool {
-        return migrationReserveImmediateSignerSubmissionForCallsCount > 0
+    var migrationReserveImmediateSignerMaximumGrossAmountSubmissionForThrowableError: Error?
+    var migrationReserveImmediateSignerMaximumGrossAmountSubmissionForCallsCount = 0
+    var migrationReserveImmediateSignerMaximumGrossAmountSubmissionForCalled: Bool {
+        return migrationReserveImmediateSignerMaximumGrossAmountSubmissionForCallsCount > 0
     }
-    var migrationReserveImmediateSignerSubmissionForReceivedArguments: (signer: MigrationSignerOwnership, submission: MigrationSubmissionIntent, account: AccountUUID)?
-    var migrationReserveImmediateSignerSubmissionForReturnValue: MigrationClaimHandle!
-    var migrationReserveImmediateSignerSubmissionForClosure: ((MigrationSignerOwnership, MigrationSubmissionIntent, AccountUUID) async throws -> MigrationClaimHandle)?
+    var migrationReserveImmediateSignerMaximumGrossAmountSubmissionForReceivedArguments: (signer: MigrationSignerOwnership, maximumGrossAmount: Zatoshi, submission: MigrationSubmissionIntent, account: AccountUUID)?
+    var migrationReserveImmediateSignerMaximumGrossAmountSubmissionForReturnValue: MigrationClaimHandle!
+    var migrationReserveImmediateSignerMaximumGrossAmountSubmissionForClosure: ((MigrationSignerOwnership, Zatoshi, MigrationSubmissionIntent, AccountUUID) async throws -> MigrationClaimHandle)?
 
-    func migrationReserveImmediate(signer: MigrationSignerOwnership, submission: MigrationSubmissionIntent, for account: AccountUUID) async throws -> MigrationClaimHandle {
-        if let error = migrationReserveImmediateSignerSubmissionForThrowableError {
+    func migrationReserveImmediate(signer: MigrationSignerOwnership, maximumGrossAmount: Zatoshi, submission: MigrationSubmissionIntent, for account: AccountUUID) async throws -> MigrationClaimHandle {
+        if let error = migrationReserveImmediateSignerMaximumGrossAmountSubmissionForThrowableError {
             throw error
         }
-        migrationReserveImmediateSignerSubmissionForCallsCount += 1
-        migrationReserveImmediateSignerSubmissionForReceivedArguments = (signer: signer, submission: submission, account: account)
-        if let closure = migrationReserveImmediateSignerSubmissionForClosure {
-            return try await closure(signer, submission, account)
+        migrationReserveImmediateSignerMaximumGrossAmountSubmissionForCallsCount += 1
+        migrationReserveImmediateSignerMaximumGrossAmountSubmissionForReceivedArguments = (signer: signer, maximumGrossAmount: maximumGrossAmount, submission: submission, account: account)
+        if let closure = migrationReserveImmediateSignerMaximumGrossAmountSubmissionForClosure {
+            return try await closure(signer, maximumGrossAmount, submission, account)
         } else {
-            return migrationReserveImmediateSignerSubmissionForReturnValue
+            return migrationReserveImmediateSignerMaximumGrossAmountSubmissionForReturnValue
         }
     }
 
@@ -5354,6 +5402,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(claim, account)
         } else {
             return migrationResumeClaimClaimForReturnValue
+        }
+    }
+
+    // MARK: - migrationReacquireFailedImmediateMaterialization
+
+    var migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForThrowableError: Error?
+    var migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForCallsCount = 0
+    var migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForCalled: Bool {
+        return migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForCallsCount > 0
+    }
+    var migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForReceivedArguments: (claim: MigrationClaimHandle, signer: MigrationSignerOwnership, maximumGrossAmount: Zatoshi, account: AccountUUID)?
+    var migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForReturnValue: MigrationClaimHandle!
+    var migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForClosure: ((MigrationClaimHandle, MigrationSignerOwnership, Zatoshi, AccountUUID) async throws -> MigrationClaimHandle)?
+
+    func migrationReacquireFailedImmediateMaterialization(claim: MigrationClaimHandle, signer: MigrationSignerOwnership, maximumGrossAmount: Zatoshi, for account: AccountUUID) async throws -> MigrationClaimHandle {
+        if let error = migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForThrowableError {
+            throw error
+        }
+        migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForCallsCount += 1
+        migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForReceivedArguments = (claim: claim, signer: signer, maximumGrossAmount: maximumGrossAmount, account: account)
+        if let closure = migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForClosure {
+            return try await closure(claim, signer, maximumGrossAmount, account)
+        } else {
+            return migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForReturnValue
         }
     }
 

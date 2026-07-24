@@ -83,8 +83,8 @@ use zcash_pool_migration::delivery::{
     PolicyValidationFailure, ReservationRollover, ReservedImmediateArtifact, RetainedMigrationRun,
     RuntimeUnavailableReason, SignerOwnership, SourceReservationOwner, StorageFinality,
     StorageRecoveryReason, SubmissionContext, SubmissionOutcome, SubmissionPolicy,
-    SubmissionPolicyRequest, SubmissionTransport, TorOnionEndpoint, exact_immediate_transaction,
-    scheduled_artifact_evidence,
+    SubmissionPolicyRequest, SubmissionTransport, TorOnionEndpoint, TorProxyTlsEndpoint,
+    exact_immediate_transaction, scheduled_artifact_evidence,
 };
 #[cfg(test)]
 use zcash_pool_migration::engine::PoolMigrationWrite;
@@ -1292,6 +1292,7 @@ fn runtime_unavailable_tag(reason: RuntimeUnavailableReason) -> (i8, u32) {
         RuntimeUnavailableReason::FinalityRecovery(reason) => {
             (7, u32::try_from(storage_recovery_tag(reason)).unwrap_or(0))
         }
+        RuntimeUnavailableReason::MissingSpendAuthorization => (8, 0),
     }
 }
 
@@ -1315,6 +1316,7 @@ fn run_handle(account_uuid: [u8; 16], snapshot: &DeliverySnapshot) -> FfiMigrati
                 SubmissionTransport::DirectTls(_) => 0,
                 SubmissionTransport::TorOnion(_) => 1,
                 SubmissionTransport::LoopbackDevelopment(_) => 2,
+                SubmissionTransport::TorProxyTls(_) => 3,
             };
             (Some(tag), Some(transport.endpoint().to_owned()))
         })
@@ -1867,8 +1869,8 @@ pub unsafe extern "C" fn zcashlc_migration_run_policy_validation_failure_v1(
     unwrap_exc_or(res, -2)
 }
 
-/// Returns the validated transport tag (`0` direct TLS, `1` Tor onion, `2` loopback development),
-/// or `-1` when no policy is bound / the handle is invalid.
+/// Returns the validated transport tag (`0` direct TLS, `1` Tor onion, `2` loopback development,
+/// `3` public TLS over Tor), or `-1` when no policy is bound / the handle is invalid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_run_submission_transport_v1(
     handle: *const FfiMigrationRunHandle,
@@ -2095,6 +2097,9 @@ fn policy_from_transport_intent(
         1 => TorOnionEndpoint::try_from(endpoint.to_owned()).map(SubmissionTransport::TorOnion),
         2 => LoopbackDevelopmentEndpoint::try_from(endpoint.to_owned())
             .map(SubmissionTransport::LoopbackDevelopment),
+        3 => {
+            TorProxyTlsEndpoint::try_from(endpoint.to_owned()).map(SubmissionTransport::TorProxyTls)
+        }
         _ => return Err(PolicyValidationFailure::InvalidEncoding),
     }
     .map_err(|_| PolicyValidationFailure::InvalidEncoding)?;
@@ -2244,12 +2249,17 @@ pub unsafe extern "C" fn zcashlc_migration_bind_submission_policy_v1(
     unwrap_exc_or_null(res)
 }
 
-/// Atomically derives and reserves an immediate Orchard-to-Ironwood proposal, binds its validated
-/// submission policy, and acquires the initial bounded materialization claim. Proposal bytes are
-/// unavailable to the host until this call commits successfully.
+/// Retained only as a disabled C ABI compatibility symbol.
+///
+/// The original, unreleased-WIP v1 ABI did not accept a gross-amount authorization. It therefore
+/// cannot safely reserve spend authority under the current migration contract. The signature must
+/// remain stable for already-generated headers and binaries, but every invocation fails closed
+/// before reading caller data or opening wallet state. New callers must use v2.
 ///
 /// # Safety
-/// Common database/account pointer rules apply; `endpoint` must be a non-null UTF-8 C string.
+/// All arguments are ignored and no caller pointers are dereferenced. The function always returns
+/// NULL and sets the last-error channel.
+#[deprecated(note = "use zcashlc_migration_reserve_immediate_v2")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_reserve_immediate_v1(
     db_data: *const u8,
@@ -2260,6 +2270,41 @@ pub unsafe extern "C" fn zcashlc_migration_reserve_immediate_v1(
     transport_tag: u8,
     endpoint: *const c_char,
 ) -> *mut FfiMigrationClaimHandle {
+    let _ = (
+        db_data,
+        db_data_len,
+        account_uuid_bytes,
+        network_id,
+        signer_tag,
+        transport_tag,
+        endpoint,
+    );
+    let res = catch_panic(|| {
+        Err(anyhow!(
+            "zcashlc_migration_reserve_immediate_v1 is disabled because its legacy ABI lacks a gross-amount authorization; use zcashlc_migration_reserve_immediate_v2"
+        ))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Atomically derives and reserves an immediate Orchard-to-Ironwood proposal, binds its validated
+/// submission policy, enforces the user-confirmed maximum gross amount against the exact selected
+/// Orchard inputs, and acquires the initial bounded materialization claim. Proposal bytes are
+/// unavailable to the host until this call commits successfully.
+///
+/// # Safety
+/// Common database/account pointer rules apply; `endpoint` must be a non-null UTF-8 C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_reserve_immediate_v2(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    signer_tag: u8,
+    maximum_gross_amount: i64,
+    transport_tag: u8,
+    endpoint: *const c_char,
+) -> *mut FfiMigrationClaimHandle {
     let res = catch_panic(|| {
         if endpoint.is_null() {
             return Err(anyhow!("submission endpoint is null"));
@@ -2267,13 +2312,15 @@ pub unsafe extern "C" fn zcashlc_migration_reserve_immediate_v1(
         let endpoint = unsafe { CStr::from_ptr(endpoint) }
             .to_str()
             .map_err(|e| anyhow!("submission endpoint is not UTF-8: {e}"))?;
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let signer = signer_ownership(signer_tag)?;
+        let maximum_gross_amount = Zatoshis::from_nonnegative_i64(maximum_gross_amount)
+            .map_err(|_| anyhow!("maximum immediate migration gross amount is invalid"))?;
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let policy = policy_from_transport_intent(&ctx.network, transport_tag, endpoint)
             .map_err(|failure| anyhow!("immediate submission policy is invalid: {failure:?}"))?;
         let artifact = ImmediateMigrationDeliveryStore::reserve_immediate_delivery(
             &mut ctx.wallet,
-            ImmediateMigrationIntent::new(ctx.account, signer),
+            ImmediateMigrationIntent::new(ctx.account, signer, maximum_gross_amount),
             &policy,
             lease_duration(ClaimKind::Materialization),
         )
@@ -3379,6 +3426,67 @@ pub unsafe extern "C" fn zcashlc_migration_resume_claim_v1(
             account_uuid,
             &snapshot,
             artifact_identity,
+        )?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Reacquires a fresh bounded materialization token for the same unexposed immediate artifact
+/// after a known-unsent materialization failure. The persisted proposal must remain within the
+/// caller's current explicit gross-amount authorization; this operation never replans.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_reacquire_failed_immediate_materialization_v1(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    claim_handle_ptr: *const FfiMigrationClaimHandle,
+    signer_tag: u8,
+    maximum_gross_amount: i64,
+) -> *mut FfiMigrationClaimHandle {
+    let res = catch_panic(|| {
+        let signer = signer_ownership(signer_tag)?;
+        let maximum_gross_amount = Zatoshis::from_nonnegative_i64(maximum_gross_amount)
+            .map_err(|_| anyhow!("maximum immediate migration gross amount is invalid"))?;
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let handle = unsafe { require_claim(&ctx, claim_handle_ptr)? };
+        let DeliveryArtifactIdentity::Immediate(artifact_identity) = handle.artifact_identity
+        else {
+            return Err(anyhow!(
+                "failed immediate materialization reacquisition requires an immediate artifact"
+            ));
+        };
+        if handle.signer_ownership != signer
+            || handle.status != ClaimStatus::MaterializationFailed
+            || handle.claim_kind.is_some()
+            || handle.token.is_some()
+            || handle.external_signing_pczt.is_some()
+            || handle.signed_pczt.is_some()
+            || handle.exact_transaction.is_some()
+            || handle.txid.is_some()
+        {
+            return Err(anyhow!(
+                "failed immediate materialization reacquisition requires the same unexposed known-unsent artifact"
+            ));
+        }
+        let policy_fingerprint = required_policy_fingerprint(&handle.run)?;
+        let account_uuid = ctx.account_bytes;
+        let snapshot = ImmediateMigrationDeliveryStore::reacquire_failed_immediate_materialization(
+            &mut ctx.wallet,
+            &ctx.account,
+            handle.run.revision,
+            handle.run.run_identity,
+            artifact_identity,
+            signer,
+            maximum_gross_amount,
+            lease_duration(ClaimKind::Materialization),
+            policy_fingerprint,
+        )
+        .map_err(|e| anyhow!("reacquiring failed immediate materialization failed: {e}"))?;
+        Ok(Box::into_raw(Box::new(claim_handle(
+            account_uuid,
+            &snapshot,
+            DeliveryArtifactIdentity::Immediate(artifact_identity),
         )?)))
     });
     unwrap_exc_or_null(res)
@@ -6283,6 +6391,46 @@ mod tests {
     }
 
     #[test]
+    fn failed_immediate_reacquisition_preserves_the_exact_artifact_and_current_gross_authority() {
+        let source = include_str!("migration.rs");
+        let body = source
+            .split_once("fn zcashlc_migration_reacquire_failed_immediate_materialization_v1(")
+            .expect("failed immediate materialization reacquisition FFI must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("failed immediate materialization reacquisition FFI must be isolatable");
+        for required in [
+            "require_claim(",
+            "signer_ownership(signer_tag)",
+            "Zatoshis::from_nonnegative_i64(maximum_gross_amount)",
+            "ClaimStatus::MaterializationFailed",
+            "handle.claim_kind.is_some()",
+            "handle.external_signing_pczt.is_some()",
+            "handle.signed_pczt.is_some()",
+            "handle.exact_transaction.is_some()",
+            "handle.txid.is_some()",
+            "reacquire_failed_immediate_materialization(",
+        ] {
+            assert!(
+                body.contains(required),
+                "failed immediate reacquisition must invoke {required}"
+            );
+        }
+        for forbidden in [
+            "reserve_immediate_delivery(",
+            "ImmediateMigrationIntent::new(",
+            "propose_send_max_transfer_unlocked(",
+            "ImmediateProposal::decode(",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "failed immediate reacquisition must never invoke {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn successor_rollover_uses_only_opaque_predecessor_and_typed_atomic_store_seam() {
         let source = include_str!("migration.rs");
         let helper = source
@@ -6738,6 +6886,113 @@ mod tests {
                 && message.contains("is disabled"),
             "the error must identify the disabled compatibility symbol, got: {message}"
         );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_immediate_reservation_ffi_fails_closed_before_database_access() {
+        let claim = unsafe {
+            zcashlc_migration_reserve_immediate_v1(
+                std::ptr::null(),
+                usize::MAX,
+                std::ptr::null(),
+                u32::MAX,
+                u8::MAX,
+                u8::MAX,
+                std::ptr::null(),
+            )
+        };
+        assert!(claim.is_null());
+        let message = ffi_helpers::error_handling::error_message()
+            .expect("the legacy reservation ABI must set the last-error channel");
+        assert!(
+            message.contains("zcashlc_migration_reserve_immediate_v1")
+                && message.contains("is disabled")
+                && message.contains("zcashlc_migration_reserve_immediate_v2"),
+            "the error must identify the disabled legacy ABI and its replacement, got: {message}"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn immediate_reservation_ffi_signatures_remain_versioned() {
+        let _: unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *const u8,
+            u32,
+            u8,
+            u8,
+            *const c_char,
+        ) -> *mut FfiMigrationClaimHandle = zcashlc_migration_reserve_immediate_v1;
+        let _: unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *const u8,
+            u32,
+            u8,
+            i64,
+            u8,
+            *const c_char,
+        ) -> *mut FfiMigrationClaimHandle = zcashlc_migration_reserve_immediate_v2;
+    }
+
+    #[test]
+    fn immediate_ffi_rejects_an_invalid_gross_ceiling_before_database_access() {
+        let endpoint = std::ffi::CString::new("https://lightwalletd.example:9067").unwrap();
+        let claim = unsafe {
+            zcashlc_migration_reserve_immediate_v2(
+                std::ptr::null(),
+                usize::MAX,
+                std::ptr::null(),
+                u32::MAX,
+                0,
+                -1,
+                0,
+                endpoint.as_ptr(),
+            )
+        };
+        assert!(claim.is_null());
+        let message = ffi_helpers::error_handling::error_message()
+            .expect("an invalid maximum must set the last-error channel");
+        assert!(
+            message.contains("maximum immediate migration gross amount is invalid"),
+            "gross authorization must be validated before database access, got: {message}"
+        );
+
+        let claim = unsafe {
+            zcashlc_migration_reacquire_failed_immediate_materialization_v1(
+                std::ptr::null(),
+                usize::MAX,
+                std::ptr::null(),
+                u32::MAX,
+                std::ptr::null(),
+                0,
+                -1,
+            )
+        };
+        assert!(claim.is_null());
+        let message = ffi_helpers::error_handling::error_message()
+            .expect("an invalid reacquisition maximum must set the last-error channel");
+        assert!(
+            message.contains("maximum immediate migration gross amount is invalid"),
+            "reacquisition gross authorization must be validated before database access, got: {message}"
+        );
+    }
+
+    #[test]
+    fn public_tls_over_tor_is_a_distinct_validated_policy_transport() {
+        let network = parse_network(NETWORK_ID_MAINNET).expect("mainnet parameters");
+        let policy = policy_from_transport_intent(&network, 3, "https://lightwalletd.example:9067")
+            .expect("a canonical public TLS endpoint is valid over Tor");
+        assert!(matches!(
+            policy.request().transport(),
+            SubmissionTransport::TorProxyTls(_)
+        ));
+        assert!(
+            policy_from_transport_intent(&network, 3, "http://lightwalletd.example:9067").is_err()
+        );
+        assert!(policy_from_transport_intent(&network, 3, "https://service.onion:9067").is_err());
     }
 
     /// A rebuild that cannot recover the exact funding note names only the current typed recovery

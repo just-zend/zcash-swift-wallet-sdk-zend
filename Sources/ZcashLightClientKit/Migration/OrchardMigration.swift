@@ -180,7 +180,7 @@ actor OrchardMigration {
     ///   building the backend: `OrchardMigration` deliberately does not share the synchronizer's
     ///   backend (see the type doc), so it cannot rely on an `Initializer` having already registered
     ///   it -- an app may construct this before any `Initializer` exists at all. Process-global (see
-    ///   `MIGRATING.md`); a conflicting re-registration is a host configuration bug (`assertionFailure`).
+    ///   `MIGRATING.md`); a conflicting re-registration is a process-level host configuration error.
     init(config: Config, sharedBroadcaster: any MigrationBroadcasting) {
         if let activationHeights = config.network.customActivationHeights {
             let cleanRegistration = ZcashRustBackend.setCustomNetwork(
@@ -188,11 +188,11 @@ actor OrchardMigration {
                 activationHeights
             )
             if !cleanRegistration {
-                // A different custom network was already registered in this process. The new values
-                // are applied (last writer wins), but per-instance state of any earlier registrant
-                // (e.g. its checkpoint source) no longer matches the process-global parameters -- a
-                // host configuration bug worth failing fast on during development.
-                assertionFailure(
+                // A different custom network was already registered in this process. Rust preserves
+                // that configuration so existing wallets remain safe, but this migration instance
+                // cannot operate with the requested parameters. Fail this process-level configuration
+                // error consistently in release and debug builds.
+                preconditionFailure(
                     "Conflicting custom-network registration: a different custom network was already registered in this process."
                 )
             }
@@ -322,9 +322,12 @@ actor OrchardMigration {
     /// Atomically reserves, materializes, submits, and records one SDK-signed immediate migration.
     /// The proposal, sources, destination, expiry, branch, exact transaction, and submission policy
     /// are all sealed by Rust before any bytes can leave the wallet database. Swift never creates an
-    /// ordinary send proposal and never records a caller-supplied transaction id.
+    /// ordinary send proposal and never records a caller-supplied transaction id. The gross ceiling
+    /// is consumed when Rust creates fresh authority. Failed materialization is intentionally
+    /// excluded here and requires the recovery-only API plus its snapshot-issued capability.
     func submitImmediateMigration(
         usk: UnifiedSpendingKey,
+        maximumGrossAmount: Zatoshi,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationSubmissionOutcome {
         try await serializedBroadcastFlow {
@@ -342,6 +345,7 @@ actor OrchardMigration {
             }
             let reserved = try await welding.migrationReserveImmediate(
                 signer: .sdk,
+                maximumGrossAmount: maximumGrossAmount,
                 submission: intent,
                 for: accountUUID
             )
@@ -360,40 +364,144 @@ actor OrchardMigration {
         }
     }
 
+    /// Recovers only the current unexposed immediate SDK-signing materialization failure. It accepts
+    /// either an already-authorized run or a legacy row that lacks durable gross authorization. Unlike
+    /// ``submitImmediateMigration(usk:maximumGrossAmount:options:)``, this API can never reserve a
+    /// new run: the capability must match the fresh hidden account/artifact/signer/revision seal,
+    /// and absent, replaced, or advanced state fails closed and requires canonical reentry.
+    func recoverFailedImmediateMigration(
+        recoveryCapability: ImmediateMigrationRecoveryCapability,
+        usk: UnifiedSpendingKey,
+        maximumGrossAmount: Zatoshi,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationSubmissionOutcome {
+        try await serializedBroadcastFlow {
+            let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+                options: options,
+                networkType: networkType
+            )
+            let runtime = try await reconciledRuntimeSnapshot()
+            try requireExactRecoverableImmediateMaterializationFailure(
+                runtime: runtime,
+                signer: .sdk,
+                recoveryCapability: recoveryCapability
+            )
+            guard let delivery = runtime.delivery else {
+                throw MigrationDeliveryError.immediateRecoveryStateChanged
+            }
+            try await requireBoundSubmissionTarget(delivery, matches: intent)
+
+            let reacquired = try await welding.migrationReacquireFailedImmediateMaterialization(
+                claim: recoveryCapability.claimHandle,
+                signer: .sdk,
+                maximumGrossAmount: maximumGrossAmount,
+                for: accountUUID
+            )
+            let staged: MigrationClaimHandle
+            do {
+                staged = try await welding.migrationMaterializeImmediateSDK(
+                    claim: reacquired,
+                    usk: usk,
+                    for: accountUUID
+                )
+            } catch {
+                await releaseKnownUnsentClaim(reacquired, failure: .materializationFailed)
+                throw error
+            }
+            return try await acquireAndSubmitClaim(staged).outcome
+        }
+    }
+
     /// Reserves an external-signer immediate migration and returns only the PCZT Rust atomically
     /// built, proved, and staged under the returned request's opaque claim. Repeating this call
     /// after a process relaunch recovers the same Rust-owned artifact and exact staged PCZT; it
-    /// never replaces an externally exposed artifact with a newly planned migration.
+    /// never replaces an externally exposed artifact with a newly planned migration. Failed
+    /// materialization is intentionally excluded and requires the recovery-only API.
     func prepareImmediateMigrationForExternalSigning(
+        maximumGrossAmount: Zatoshi,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> ImmediateMigrationExternalSigningRequest {
-        let intent = LiveMigrationTransactionSubmitter.submissionIntent(
-            options: options,
-            networkType: networkType
-        )
-        if let recovered = try await recoverPreparedImmediateExternalSigning(intent: intent) {
-            return recovered
-        }
-        let reserved = try await welding.migrationReserveImmediate(
-            signer: .external,
-            submission: intent,
-            for: accountUUID
-        )
-        let staged: MigrationClaimHandle
-        do {
-            staged = try await welding.migrationPrepareImmediateExternalSigning(
-                claim: reserved,
+        try await serializedBroadcastFlow {
+            let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+                options: options,
+                networkType: networkType
+            )
+            if let recovered = try await recoverPreparedImmediateExternalSigning(
+                intent: intent
+            ) {
+                return recovered
+            }
+            let reserved = try await welding.migrationReserveImmediate(
+                signer: .external,
+                maximumGrossAmount: maximumGrossAmount,
+                submission: intent,
                 for: accountUUID
             )
-        } catch {
-            await releaseKnownUnsentClaim(reserved, failure: .materializationFailed)
-            throw error
+            let staged: MigrationClaimHandle
+            do {
+                staged = try await welding.migrationPrepareImmediateExternalSigning(
+                    claim: reserved,
+                    for: accountUUID
+                )
+            } catch {
+                await releaseKnownUnsentClaim(reserved, failure: .materializationFailed)
+                throw error
+            }
+            guard let pczt = try await welding.migrationClaimExternalSigningPCZT(staged) else {
+                await releaseKnownUnsentClaim(staged, failure: .materializationFailed)
+                throw MigrationDeliveryError.missingExternalSigningPCZT
+            }
+            return ImmediateMigrationExternalSigningRequest(pczt: pczt, claim: staged)
         }
-        guard let pczt = try await welding.migrationClaimExternalSigningPCZT(staged) else {
-            await releaseKnownUnsentClaim(staged, failure: .materializationFailed)
-            throw MigrationDeliveryError.missingExternalSigningPCZT
+    }
+
+    /// Recovers only the current unexposed immediate external-signing materialization failure, with
+    /// either existing durable authorization or a fresh cap for a legacy row. The caller must return
+    /// the capability from the snapshot that rendered the failure. It never falls through to
+    /// `migrationReserveImmediate`; a changed runtime must be re-projected by the host first.
+    func recoverFailedImmediateMigrationForExternalSigning(
+        recoveryCapability: ImmediateMigrationRecoveryCapability,
+        maximumGrossAmount: Zatoshi,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> ImmediateMigrationExternalSigningRequest {
+        try await serializedBroadcastFlow {
+            let intent = LiveMigrationTransactionSubmitter.submissionIntent(
+                options: options,
+                networkType: networkType
+            )
+            let runtime = try await reconciledRuntimeSnapshot()
+            try requireExactRecoverableImmediateMaterializationFailure(
+                runtime: runtime,
+                signer: .external,
+                recoveryCapability: recoveryCapability
+            )
+            guard let delivery = runtime.delivery else {
+                throw MigrationDeliveryError.immediateRecoveryStateChanged
+            }
+            try await requireBoundSubmissionTarget(delivery, matches: intent)
+
+            let reacquired = try await welding.migrationReacquireFailedImmediateMaterialization(
+                claim: recoveryCapability.claimHandle,
+                signer: .external,
+                maximumGrossAmount: maximumGrossAmount,
+                for: accountUUID
+            )
+            let staged: MigrationClaimHandle
+            do {
+                staged = try await welding.migrationPrepareImmediateExternalSigning(
+                    claim: reacquired,
+                    for: accountUUID
+                )
+            } catch {
+                await releaseKnownUnsentClaim(reacquired, failure: .materializationFailed)
+                throw error
+            }
+            guard let pczt = try await welding.migrationClaimExternalSigningPCZT(staged) else {
+                await releaseKnownUnsentClaim(staged, failure: .materializationFailed)
+                throw MigrationDeliveryError.missingExternalSigningPCZT
+            }
+            return ImmediateMigrationExternalSigningRequest(pczt: pczt, claim: staged)
         }
-        return ImmediateMigrationExternalSigningRequest(pczt: pczt, claim: staged)
     }
 
     /// Merges an external signer's response against the exact staged PCZT, atomically finalizes the
@@ -410,6 +518,30 @@ actor OrchardMigration {
                 request: request,
                 signedPCZT: signedPCZT
             )
+        }
+    }
+
+    /// Resubmits only the current immediate external-signer artifact after Rust has durably merged
+    /// the signature and staged exact transaction bytes. No signer response or process-local
+    /// request is accepted, so relaunch recovery cannot re-sign or replace the artifact.
+    func resumeStagedImmediateExternalSubmission() async throws -> MigrationSubmissionOutcome {
+        try await serializedBroadcastFlow {
+            let runtime = try await reconciledRuntimeSnapshot()
+            guard case .available = runtime.availability,
+                  let delivery = runtime.delivery,
+                  delivery.lane == .immediate,
+                  delivery.phase == .active,
+                  delivery.claims.count == 1,
+                  let summary = delivery.claims.first,
+                  case .immediate = summary.artifact,
+                  summary.signerOwnership == .external,
+                  summary.status == .staged,
+                  summary.externallyExposed,
+                  summary.hasSignedPCZT,
+                  summary.hasExactTransaction else {
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
+            return try await acquireAndSubmitClaim(summary.claimHandle).outcome
         }
     }
 
@@ -531,14 +663,15 @@ actor OrchardMigration {
             }
             guard delivery.phase == .active else { return nil }
 
-            let candidates = delivery.claims.compactMap {
-                claim -> (UInt32, MigrationDeliveryClaimSummary)? in
-                guard case .scheduled(let transactionID) = claim.artifact,
-                      claim.signerOwnership == .external else {
-                    return nil
+            let candidates = delivery.claims
+                .compactMap { claim -> (UInt32, MigrationDeliveryClaimSummary)? in
+                    guard case .scheduled(let transactionID) = claim.artifact,
+                          claim.signerOwnership == .external else {
+                        return nil
+                    }
+                    return (transactionID, claim)
                 }
-                return (transactionID, claim)
-            }.sorted { $0.0 < $1.0 }
+                .sorted { $0.0 < $1.0 }
 
             // An externally exposed artifact is irrevocable. Recover it before considering any
             // other row. `hasSignedPCZT` means a signer merge already crossed the durable boundary;
@@ -567,11 +700,9 @@ actor OrchardMigration {
             for (transactionID, summary) in candidates {
                 switch summary.status {
                 case .confirmed, .broadcasted, .expiredUnmined, .externalSigningExpiredUnmined,
-                     .staged, .submitting, .outcomeUnknown:
+                    .staged, .submitting, .outcomeUnknown:
                     continue
-                case .materializationFailed:
-                    continue
-                case .materializing, .awaitingExternalSignature:
+                case .materializing, .materializationFailed, .awaitingExternalSignature:
                     break
                 }
 
@@ -684,6 +815,32 @@ actor OrchardMigration {
             case .materializing, .materializationFailed:
                 throw MigrationDeliveryError.externalSigningClaimUnavailable
             }
+        }
+    }
+
+    /// Resubmits one exact scheduled external-signer transaction whose signer response, proof, and
+    /// network bytes are already durable. The transaction id is a selector only; Rust's fresh
+    /// runtime claim supplies all mutation authority and no PCZT bytes are accepted from Swift.
+    func resumeStagedScheduledExternalSubmission(
+        transactionID: UInt32
+    ) async throws -> MigrationTransferResult {
+        try await serializedBroadcastFlow {
+            let runtime = try await reconciledRuntimeSnapshot()
+            guard case .available = runtime.availability,
+                  let delivery = runtime.delivery,
+                  delivery.lane == .scheduled,
+                  delivery.phase == .active,
+                  let summary = delivery.claims.first(where: {
+                      $0.artifact == .scheduled(transactionID: transactionID) &&
+                          $0.signerOwnership == .external
+                  }),
+                  summary.status == .staged,
+                  summary.externallyExposed,
+                  summary.hasSignedPCZT,
+                  summary.hasExactTransaction else {
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
+            return try await acquireAndSubmitClaim(summary.claimHandle).legacyTransferResult
         }
     }
 
@@ -815,7 +972,9 @@ actor OrchardMigration {
             // Resume a still-live same-process claim first. After relaunch, Rust's clock-session
             // recovery makes a possibly observed submission resolution-only instead.
             if let submitting = delivery.claims.first(where: {
-                $0.status == .submitting && $0.activeClaimKind == .submission
+                $0.signerOwnership == .sdk &&
+                    $0.status == .submitting &&
+                    $0.activeClaimKind == .submission
             }), let resumed = try await welding.migrationResumeClaim(
                 claim: submitting.claimHandle,
                 for: accountUUID
@@ -824,7 +983,9 @@ actor OrchardMigration {
             }
 
             if let staged = delivery.claims.first(where: {
-                $0.status == .staged && $0.hasExactTransaction
+                $0.signerOwnership == .sdk &&
+                    $0.status == .staged &&
+                    $0.hasExactTransaction
             }) {
                 return try await acquireAndSubmitClaim(staged.claimHandle).legacyTransferResult
             }
@@ -1025,12 +1186,6 @@ actor OrchardMigration {
     ) async throws -> MigrationSubmissionOutcome? {
         guard let delivery = runtime.delivery else { return nil }
         guard delivery.lane == .immediate else { return nil }
-        guard case .available = runtime.availability else {
-            if case .unavailable(let reason) = runtime.availability {
-                throw MigrationDeliveryError.runtimeUnavailable(reason)
-            }
-            throw MigrationDeliveryError.runtimeUnavailable(.deliveryInconsistent)
-        }
         guard delivery.phase == .active else {
             throw MigrationDeliveryError.claimUnavailable
         }
@@ -1042,6 +1197,12 @@ actor OrchardMigration {
             return false
         }) else {
             throw MigrationDeliveryError.claimUnavailable
+        }
+        guard runtime.availability == .available else {
+            if case .unavailable(let reason) = runtime.availability {
+                throw MigrationDeliveryError.runtimeUnavailable(reason)
+            }
+            throw MigrationDeliveryError.runtimeUnavailable(.deliveryInconsistent)
         }
 
         switch summary.status {
@@ -1086,7 +1247,11 @@ actor OrchardMigration {
             return .accepted
         case .expiredUnmined, .externalSigningExpiredUnmined:
             return .unknown
-        case .materializationFailed, .awaitingExternalSignature:
+        case .materializationFailed:
+            // Failed materialization is a recovery-only capability domain. Keeping it out of this
+            // create-or-resume method prevents stale retry intent from falling through to reserve.
+            throw MigrationDeliveryError.claimUnavailable
+        case .awaitingExternalSignature:
             throw MigrationDeliveryError.claimUnavailable
         }
     }
@@ -1204,7 +1369,7 @@ actor OrchardMigration {
         case .staged:
             return .networkError(retryable: true)
         case .materializing, .materializationFailed, .awaitingExternalSignature, .submitting,
-             .outcomeUnknown, .expiredUnmined, .externalSigningExpiredUnmined:
+            .outcomeUnknown, .expiredUnmined, .externalSigningExpiredUnmined:
             return .networkError(retryable: false)
         }
     }
@@ -1302,12 +1467,6 @@ actor OrchardMigration {
         guard delivery.lane == .immediate else {
             return nil
         }
-        guard case .available = runtime.availability else {
-            if case .unavailable(let reason) = runtime.availability {
-                throw MigrationDeliveryError.runtimeUnavailable(reason)
-            }
-            throw MigrationDeliveryError.runtimeUnavailable(.deliveryInconsistent)
-        }
         guard delivery.phase == .active else {
             throw MigrationDeliveryError.externalSigningClaimUnavailable
         }
@@ -1320,23 +1479,35 @@ actor OrchardMigration {
             // advanced past signing; either way, starting a replacement external run is unsafe.
             throw MigrationDeliveryError.externalSigningClaimUnavailable
         }
-        guard summary.externallyExposed else {
-            throw MigrationDeliveryError.externalSigningClaimUnavailable
+        guard runtime.availability == .available else {
+            if case .unavailable(let reason) = runtime.availability {
+                throw MigrationDeliveryError.runtimeUnavailable(reason)
+            }
+            throw MigrationDeliveryError.runtimeUnavailable(.deliveryInconsistent)
         }
         try await requireBoundSubmissionTarget(delivery, matches: intent)
 
         let recoveredClaim: MigrationClaimHandle
         switch summary.status {
+        case .materializationFailed:
+            // Failed materialization must enter through the non-fallthrough recovery-only API.
+            throw MigrationDeliveryError.externalSigningClaimUnavailable
         case .awaitingExternalSignature:
+            guard summary.externallyExposed else {
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
             // A same-process snapshot can still carry a live token. After relaunch, Rust rejects or
             // returns nil for that clock-session token and atomically reacquires a bounded token for
             // this exact externally exposed artifact without replanning it.
             recoveredClaim = try await resumableExternalSigningClaim(summary.claimHandle)
         case .staged, .submitting, .outcomeUnknown, .broadcasted, .confirmed, .expiredUnmined:
+            guard summary.externallyExposed else {
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
             // Return the same public PCZT plus a fresh runtime-projected artifact handle. The submit
             // API branches on durable status and never reapplies the signer response in these states.
             recoveredClaim = summary.claimHandle
-        case .materializing, .materializationFailed, .externalSigningExpiredUnmined:
+        case .materializing, .externalSigningExpiredUnmined:
             throw MigrationDeliveryError.externalSigningClaimUnavailable
         }
 
@@ -1344,6 +1515,71 @@ actor OrchardMigration {
             throw MigrationDeliveryError.missingExternalSigningPCZT
         }
         return ImmediateMigrationExternalSigningRequest(pczt: pczt, claim: recoveredClaim)
+    }
+
+    /// Swift only routes a retry when the sanitized runtime projection proves the artifact is the
+    /// same known-unsent, unexposed failure. Rust repeats this predicate against the opaque handle
+    /// and persisted row before atomically checking the current gross ceiling and minting a token.
+    private static func isRetryableImmediateMaterializationFailure(
+        _ summary: MigrationDeliveryClaimSummary,
+        signer: MigrationSignerOwnership
+    ) -> Bool {
+        guard case .immediate = summary.artifact else { return false }
+        return summary.signerOwnership == signer &&
+            summary.status == .materializationFailed &&
+            summary.activeClaimKind == nil &&
+            !summary.externallyExposed &&
+            !summary.hasSignedPCZT &&
+            !summary.hasExactTransaction &&
+            summary.txid == nil &&
+            matchesRetryableMaterializationFailure(summary.lastError)
+    }
+
+    /// Selects the only artifact accepted by the recovery-only APIs. The runtime state check is
+    /// deliberately separate from the claim predicate so callers can distinguish stale canonical
+    /// state from a malformed/wrong-signer claim without ever attempting a fresh reservation.
+    private func requireExactRecoverableImmediateMaterializationFailure(
+        runtime: MigrationRuntimeSnapshot,
+        signer: MigrationSignerOwnership,
+        recoveryCapability: ImmediateMigrationRecoveryCapability
+    ) throws {
+        guard recoveryCapability.account == accountUUID else {
+            throw MigrationDeliveryError.immediateRecoveryStateChanged
+        }
+        let hasRecoveryAvailability = runtime.availability == .available
+            || runtime.availability == .unavailable(.missingSpendAuthorization)
+        guard hasRecoveryAvailability,
+              let delivery = runtime.delivery,
+              delivery.lane == .immediate,
+              delivery.phase == .active,
+              delivery.hasSubmissionPolicy,
+              delivery.policyValidationFailure == nil,
+              delivery.claims.count == 1 else {
+            throw MigrationDeliveryError.immediateRecoveryStateChanged
+        }
+        guard recoveryCapability.signerOwnership == signer,
+              let summary = delivery.claims.first,
+              Self.isRetryableImmediateMaterializationFailure(summary, signer: signer) else {
+            if signer == .external {
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        guard runtime.immediateMigrationRecoveryCapability == recoveryCapability else {
+            throw MigrationDeliveryError.immediateRecoveryStateChanged
+        }
+    }
+
+    private static func matchesRetryableMaterializationFailure(
+        _ failure: MigrationDeliveryFailureReason?
+    ) -> Bool {
+        switch failure {
+        case .materializationFailed, .materializationLeaseExpired, .signingCancelled:
+            return true
+        case .transportSetupFailed, .transportDidNotBegin, .submissionLeaseExpired,
+            .transportOutcomeUnknown, nil:
+            return false
+        }
     }
 
     /// Compares app input only with Rust's normalized, already-bound target. This check grants no
@@ -1480,14 +1716,16 @@ actor OrchardMigration {
     /// - Waiting is a suspension on a continuation that the finishing flow resumes exactly once —
     ///   no busy-waiting, and no unstructured tasks.
     /// - Cancelling a waiting caller never cancels the in-flight flow: the waiter holds no
-    ///   reference to it, and the waiter's own cancellation is observed only by its own flow once
-    ///   it proceeds.
-    private func serializedBroadcastFlow<T>(_ flow: () async throws -> T) async rethrows -> T {
+    ///   reference to it. Once resumed, cancellation is checked before the caller can take
+    ///   ownership or execute any welding mutation.
+    private func serializedBroadcastFlow<T>(_ flow: () async throws -> T) async throws -> T {
         while isBroadcastFlowInFlight {
             await withCheckedContinuation { continuation in
                 broadcastFlowWaiters.append(continuation)
             }
+            try Task.checkCancellation()
         }
+        try Task.checkCancellation()
         isBroadcastFlowInFlight = true
         defer {
             isBroadcastFlowInFlight = false
@@ -1497,6 +1735,7 @@ actor OrchardMigration {
                 waiter.resume()
             }
         }
+        try Task.checkCancellation()
         return try await flow()
     }
 

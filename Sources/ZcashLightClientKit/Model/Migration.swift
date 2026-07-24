@@ -183,6 +183,41 @@ struct MigrationClaimHandle: @unchecked Sendable {
     var pointer: OpaquePointer { storage.pointer }
 }
 
+/// Opaque authority to recover one exact failed immediate-migration materialization.
+///
+/// The SDK issues this value only from a runtime snapshot whose single immediate artifact is a
+/// known-unsent, unexposed materialization failure. It seals the Rust-owned run revision, run
+/// identity, artifact identity, signer, and policy binding without exposing any of those values.
+/// Callers can retain and return it, but cannot construct it or use it to reserve a new run.
+public struct ImmediateMigrationRecoveryCapability: @unchecked Sendable, Equatable {
+    let claimHandle: MigrationClaimHandle
+    let account: AccountUUID
+    let artifact: MigrationArtifactIdentitySummary
+    let signerOwnership: MigrationSignerOwnership
+    let deliveryRevision: UInt64
+
+    init(
+        claimHandle: MigrationClaimHandle,
+        account: AccountUUID,
+        artifact: MigrationArtifactIdentitySummary,
+        signerOwnership: MigrationSignerOwnership,
+        deliveryRevision: UInt64
+    ) {
+        self.claimHandle = claimHandle
+        self.account = account
+        self.artifact = artifact
+        self.signerOwnership = signerOwnership
+        self.deliveryRevision = deliveryRevision
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.account == rhs.account &&
+            lhs.artifact == rhs.artifact &&
+            lhs.signerOwnership == rhs.signerOwnership &&
+            lhs.deliveryRevision == rhs.deliveryRevision
+    }
+}
+
 // MARK: - Raw host intent
 
 /// Transport intent accepted at the public boundary. Rust validates the raw endpoint, derives the
@@ -191,6 +226,7 @@ public enum MigrationSubmissionTransport: String, Equatable, Sendable, Codable {
     case directTLS = "direct_tls"
     case torOnion = "tor_onion"
     case loopbackDevelopment = "loopback_development"
+    case torProxyTLS = "tor_proxy_tls"
 }
 
 /// Raw submission intent. This is not a bound policy and carries no delivery authority.
@@ -325,6 +361,8 @@ public enum MigrationRuntimeUnavailableReason: Equatable, Sendable {
     case submissionPolicyMismatch
     case deliveryInconsistent
     case finalityRecovery(MigrationStorageRecoveryReason)
+    /// The immediate run predates the durable user-confirmed gross-spend ceiling.
+    case missingSpendAuthorization
 }
 
 public enum MigrationRuntimeAvailability: Equatable, Sendable {
@@ -445,6 +483,8 @@ public struct MigrationDeliverySnapshot: Equatable, Sendable, CustomStringConver
     public let safeToCancel: Bool
     public let claims: [MigrationDeliveryClaimSummary]
     let runHandle: MigrationRunHandle
+    /// Hidden Rust CAS revision used only to seal opaque capabilities and compare fresh clones.
+    let revision: UInt64
 
     init(
         lane: MigrationDeliveryLane,
@@ -455,8 +495,10 @@ public struct MigrationDeliverySnapshot: Equatable, Sendable, CustomStringConver
         policyValidationFailure: MigrationPolicyValidationFailure?,
         safeToCancel: Bool,
         claims: [MigrationDeliveryClaimSummary],
-        runHandle: MigrationRunHandle
+        runHandle: MigrationRunHandle,
+        revision: UInt64
     ) {
+        precondition(Self.isValidRevision(revision), "migration delivery revisions are nonzero")
         self.lane = lane
         self.phase = phase
         self.storageFinality = storageFinality
@@ -466,6 +508,35 @@ public struct MigrationDeliverySnapshot: Equatable, Sendable, CustomStringConver
         self.safeToCancel = safeToCancel
         self.claims = claims
         self.runHandle = runHandle
+        self.revision = revision
+    }
+
+    static func isValidRevision(_ revision: UInt64) -> Bool {
+        revision != 0
+    }
+
+    /// Converts an untrusted C ABI collection length only when pointer arithmetic and Swift array
+    /// allocation can represent it. Every migration decoder must validate before `Int` conversion.
+    static func hostCollectionCount(_ count: UInt) -> Int? {
+        Int(exactly: count)
+    }
+
+    /// Validates the nullable outer runtime envelope before any opaque capability is cloned.
+    /// Rust reserves revision zero for "no delivery", so an absent delivery may not smuggle a
+    /// revision, claim storage, a claim count, or a run handle into the host projection.
+    static func isValidRuntimeEnvelope(
+        hasDelivery: Bool,
+        deliveryRevision: UInt64,
+        hasClaimsStorage: Bool,
+        claimsCount: UInt,
+        hasRunHandle: Bool
+    ) -> Bool {
+        hasDelivery || (
+            deliveryRevision == 0 &&
+                !hasClaimsStorage &&
+                claimsCount == 0 &&
+                !hasRunHandle
+        )
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -476,7 +547,8 @@ public struct MigrationDeliverySnapshot: Equatable, Sendable, CustomStringConver
             lhs.hasSubmissionPolicy == rhs.hasSubmissionPolicy &&
             lhs.policyValidationFailure == rhs.policyValidationFailure &&
             lhs.safeToCancel == rhs.safeToCancel &&
-            lhs.claims == rhs.claims
+            lhs.claims == rhs.claims &&
+            lhs.revision == rhs.revision
     }
 
     public var description: String {
@@ -545,6 +617,53 @@ public struct MigrationRuntimeSnapshot: Equatable, Sendable, CustomStringConvert
         self.aggregateStorageFinality = aggregateStorageFinality
         self.delivery = delivery
         self.retainedRuns = retainedRuns
+    }
+
+    /// Recovery authority for the exact failed immediate artifact represented by this snapshot.
+    ///
+    /// This is intentionally absent for every other runtime shape. In particular, account and
+    /// signer metadata alone cannot recreate it, so a recovery action rendered for an older run
+    /// cannot silently target a same-account, same-signer replacement run.
+    public var immediateMigrationRecoveryCapability: ImmediateMigrationRecoveryCapability? {
+        let hasRecoveryAvailability = availability == .available
+            || availability == .unavailable(.missingSpendAuthorization)
+        guard hasRecoveryAvailability,
+              let delivery,
+              delivery.lane == .immediate,
+              delivery.phase == .active,
+              delivery.hasSubmissionPolicy,
+              delivery.policyValidationFailure == nil,
+              delivery.claims.count == 1,
+              let claim = delivery.claims.first,
+              case .immediate = claim.artifact,
+              claim.status == .materializationFailed,
+              claim.activeClaimKind == nil,
+              !claim.externallyExposed,
+              !claim.hasSignedPCZT,
+              !claim.hasExactTransaction,
+              claim.txid == nil,
+              Self.isRecoverableImmediateMaterializationFailure(claim.lastError) else {
+            return nil
+        }
+        return ImmediateMigrationRecoveryCapability(
+            claimHandle: claim.claimHandle,
+            account: account,
+            artifact: claim.artifact,
+            signerOwnership: claim.signerOwnership,
+            deliveryRevision: delivery.revision
+        )
+    }
+
+    private static func isRecoverableImmediateMaterializationFailure(
+        _ failure: MigrationDeliveryFailureReason?
+    ) -> Bool {
+        switch failure {
+        case .materializationFailed, .materializationLeaseExpired, .signingCancelled:
+            return true
+        case .transportSetupFailed, .transportDidNotBegin, .submissionLeaseExpired,
+            .transportOutcomeUnknown, nil:
+            return false
+        }
     }
 
     public var description: String {
@@ -623,6 +742,10 @@ public struct ScheduledMigrationExternalSigningRequest: @unchecked Sendable,
 public enum MigrationDeliveryError: Error, Equatable, Sendable, LocalizedError {
     case claimUnavailable
     case externalSigningClaimUnavailable
+    /// The recovery-only entry point no longer observes the exact failed legacy artifact it was
+    /// asked to recover. Callers must project fresh canonical state; this error never grants the
+    /// SDK permission to reserve a replacement run.
+    case immediateRecoveryStateChanged
     case deliveryRunUnavailable
     case scheduledDeliveryRunUnavailable
     case expiredTransferUnavailable(transactionID: UInt32)
@@ -639,6 +762,8 @@ public enum MigrationDeliveryError: Error, Equatable, Sendable, LocalizedError {
             return "The immediate migration claim is not currently available."
         case .externalSigningClaimUnavailable:
             return "The migration external-signing claim expired or cannot be resumed."
+        case .immediateRecoveryStateChanged:
+            return "The recoverable immediate migration artifact changed or is no longer available."
         case .deliveryRunUnavailable:
             return "No migration delivery run is available for this account."
         case .scheduledDeliveryRunUnavailable:
