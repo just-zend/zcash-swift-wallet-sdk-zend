@@ -1321,6 +1321,79 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertFalse(welding.migrationSignAndStoreScheduleUskForCalled)
     }
 
+    func testInitialSDKScheduleRejectsPersistedPolicyValidationFailure() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let missingPolicy = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .unavailable(.submissionPolicyMissing),
+            claimStatus: .materializationFailed,
+            hasExactTransaction: false,
+            runIdentity: 194,
+            claimIdentity: 195
+        )
+        var reads = 0
+        welding.migrationRuntimeSnapshotForClosure = { _ in
+            defer { reads += 1 }
+            return reads == 0 ? Self.makeNoRunRuntime(account: self.accountA) : missingPolicy
+        }
+        welding.migrationSignAndStoreScheduleUskForClosure = { _, _, _ in }
+        welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(196)
+        welding.migrationBindSubmissionPolicyRunForReturnValue = Self.makeRunHandle(197)
+        // A validation failure is represented by a fresh Rust run handle with no bound target.
+        welding.migrationBoundSubmissionTargetForReturnValue = nil
+        let migration = makeMigration(welding: welding, account: accountA)
+
+        do {
+            try await migration.signAndStoreMigrationSchedule(
+                Self.makeSchedule(count: 1),
+                usk: TestsData(networkType: .testnet).spendingKey,
+                options: Self.immediateOptions
+            )
+            XCTFail("Expected persisted policy validation failure")
+        } catch MigrationDeliveryError.runtimeUnavailable(.submissionPolicyMismatch) {
+            // expected
+        } catch {
+            XCTFail("Expected submissionPolicyMismatch but got \(error)")
+        }
+
+        XCTAssertEqual(welding.migrationSignAndStoreScheduleUskForCallsCount, 1)
+        XCTAssertEqual(welding.migrationBindSubmissionPolicyRunForCallsCount, 1)
+        XCTAssertEqual(welding.migrationBoundSubmissionTargetForCallsCount, 1)
+    }
+
+    func testInitialSDKScheduleAcceptsOnlyTheTargetProjectedByTheBoundHandle() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let missingPolicy = Self.makeScheduledRuntime(
+            account: accountA,
+            availability: .unavailable(.submissionPolicyMissing),
+            claimStatus: .materializationFailed,
+            hasExactTransaction: false,
+            runIdentity: 198,
+            claimIdentity: 199
+        )
+        var reads = 0
+        welding.migrationRuntimeSnapshotForClosure = { _ in
+            defer { reads += 1 }
+            return reads == 0 ? Self.makeNoRunRuntime(account: self.accountA) : missingPolicy
+        }
+        welding.migrationSignAndStoreScheduleUskForClosure = { _, _, _ in }
+        welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(200)
+        welding.migrationBindSubmissionPolicyRunForReturnValue = Self.makeRunHandle(201)
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://SUBMIT.EXAMPLE:9067/"
+        )
+        let migration = makeMigration(welding: welding, account: accountA)
+
+        try await migration.signAndStoreMigrationSchedule(
+            Self.makeSchedule(count: 1),
+            usk: TestsData(networkType: .testnet).spendingKey,
+            options: Self.immediateOptions
+        )
+
+        XCTAssertEqual(welding.migrationBoundSubmissionTargetForCallsCount, 1)
+    }
+
     func testTerminalSDKScheduleRejectsDifferentPolicyBeforeAtomicRollover() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.migrationRuntimeSnapshotForReturnValue = Self.makeScheduledRuntime(
@@ -1731,6 +1804,10 @@ final class MigrationLogicTests: ZcashTestCase {
         )
         welding.migrationRuntimeSnapshotForReturnValue = initial
         welding.migrationBindSubmissionPolicyRunForReturnValue = Self.makeRunHandle(122)
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
         welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(123)
         welding.migrationClaimOutcomeResolutionClaimForReturnValue = Self.makeClaimHandle(124)
         welding.migrationReconcileSubmissionClaimForReturnValue = Self.makeClaimHandle(125)
@@ -2314,7 +2391,6 @@ final class MigrationLogicTests: ZcashTestCase {
             finalResidual: Zatoshi(42_000)
         )
     }
-
 }
 
 /// Mutable durable-state projection used to model the runtime changing underneath two serialized

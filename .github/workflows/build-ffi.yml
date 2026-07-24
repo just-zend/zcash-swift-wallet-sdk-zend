@@ -167,6 +167,15 @@ jobs:
       - name: Select pinned Xcode
         run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
+      # The canonical build uses a fresh build-owned Rustup home that is deleted on exit. Install
+      # the same exact verifier toolchain in the job's ambient home for the post-build artifact and
+      # package checks that intentionally run outside that hermetic build process.
+      - name: Install pinned Rust verification tools
+        run: |
+          rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$rust_toolchain" --profile minimal
+          rustup component add --toolchain "$rust_toolchain" llvm-tools-preview
+
       - name: Validate the frozen Rust pin and publication lineage
         id: rust
         env:

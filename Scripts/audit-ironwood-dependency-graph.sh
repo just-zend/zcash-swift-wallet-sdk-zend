@@ -56,7 +56,7 @@ fi
 
 # `--target all` includes every target-specific dependency edge, and therefore covers the five
 # Apple architectures without silently auditing only the host macOS graph.
-cargo "+$rust_toolchain" tree --locked --target all -e normal --prefix none --format '{p}' \
+rustup run "$rust_toolchain" cargo tree --locked --target all -e normal --prefix none --format '{p}' \
     | sed 's/ (\*)$//' \
     | LC_ALL=C sort -u > "$tree_file"
 

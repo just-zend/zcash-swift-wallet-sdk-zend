@@ -22,6 +22,7 @@ files=(
     Scripts/audit-ironwood-dependency-graph.sh
     Scripts/build-ironwood-ffi-artifact.sh
     Scripts/compare-ironwood-xcframeworks.sh
+    Scripts/hash-ironwood-build-path.sh
     Scripts/hash-ironwood-xcframework.sh
     Scripts/hash-ironwood-ffi-sources.sh
     Scripts/init-local-ffi.sh

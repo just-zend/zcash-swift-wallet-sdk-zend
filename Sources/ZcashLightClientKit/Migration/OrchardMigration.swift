@@ -47,6 +47,7 @@ public struct MigrationNetworkPrivacyOptions: Equatable {
 /// ``MigrationBroadcaster``, and a persisted ``MigrationSyncGate`` (the 10-minute post-broadcast
 /// privacy buffer plus the overdue-transfer block). The engine owns all migration state, including
 /// the committed schedule; the SDK keeps no local copy of the proposal list.
+// swiftlint:disable:next type_body_length
 actor OrchardMigration {
     /// The immutable configuration an ``OrchardMigration`` is built from.
     ///
@@ -478,11 +479,7 @@ actor OrchardMigration {
             guard let delivery = committed.delivery, delivery.lane == .scheduled else {
                 throw MigrationDeliveryError.scheduledDeliveryRunUnavailable
             }
-            _ = try await welding.migrationBindSubmissionPolicy(
-                intent,
-                run: delivery.runHandle,
-                for: accountUUID
-            )
+            try await bindSubmissionPolicy(intent, run: delivery.runHandle)
         }
     }
 
@@ -512,7 +509,7 @@ actor OrchardMigration {
             )
         } else {
             let run = try await welding.migrationCommitExternalSchedule(schedule, for: accountUUID)
-            _ = try await welding.migrationBindSubmissionPolicy(intent, run: run, for: accountUUID)
+            try await bindSubmissionPolicy(intent, run: run)
         }
         return try await reconciledRuntimeSnapshot()
     }
@@ -789,11 +786,7 @@ actor OrchardMigration {
                 options: options,
                 networkType: networkType
             )
-            _ = try await welding.migrationBindSubmissionPolicy(
-                intent,
-                run: initialDelivery.runHandle,
-                for: accountUUID
-            )
+            try await bindSubmissionPolicy(intent, run: initialDelivery.runHandle)
             runtime = try await reconciledRuntimeSnapshot()
             guard case .available = runtime.availability,
                   let delivery = runtime.delivery,
@@ -970,11 +963,40 @@ actor OrchardMigration {
         guard let delivery = runtime.delivery, delivery.lane == .scheduled else {
             return runtime
         }
+        // A missing policy is the only unavailable state that this layer is authorized to repair.
+        // Every other unavailable projection is fail-closed: in particular, do not let a read or a
+        // high-level operation acquire canonical-mutation authority before it reports the persisted
+        // reason to its caller.
+        switch runtime.availability {
+        case .available, .unavailable(.submissionPolicyMissing):
+            break
+        case .unavailable:
+            return runtime
+        }
         _ = try await welding.migrationReconcileCanonicalChain(
             run: delivery.runHandle,
             for: accountUUID
         )
         return try await welding.migrationRuntimeSnapshot(for: accountUUID)
+    }
+
+    /// Binds raw host intent and verifies the returned Rust capability actually carries the
+    /// normalized immutable target. Policy-validation failures are durable Rust state and return a
+    /// fresh handle rather than an FFI error, so ignoring this projection would make schedule setup
+    /// appear successful while leaving the run permanently unavailable.
+    private func bindSubmissionPolicy(
+        _ intent: MigrationSubmissionIntent,
+        run: MigrationRunHandle
+    ) async throws {
+        let bound = try await welding.migrationBindSubmissionPolicy(
+            intent,
+            run: run,
+            for: accountUUID
+        )
+        guard let target = try await welding.migrationBoundSubmissionTarget(for: bound),
+              Self.submissionTarget(target, matches: intent) else {
+            throw MigrationDeliveryError.runtimeUnavailable(.submissionPolicyMismatch)
+        }
     }
 
     /// Requires that raw host intent matches the normalized immutable policy already owned by a

@@ -23,6 +23,7 @@ disabled_symbols=(
     zcashlc_migration_store_signed_note_split_pczts
     zcashlc_migration_create_unsigned_transfer_pczts
     zcashlc_migration_store_signed_schedule_pczts
+    zcashlc_migration_stage_materialized_transaction_v1
 )
 
 found=0
@@ -43,4 +44,5 @@ if [[ "$found" -ne 0 ]]; then
     exit 1
 fi
 
-printf 'Production Swift contains no calls to the 10 fail-closed migration FFI symbols.\n'
+printf 'Production Swift contains no calls to the %s fail-closed migration FFI symbols.\n' \
+    "${#disabled_symbols[@]}"

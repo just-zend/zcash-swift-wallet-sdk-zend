@@ -70,7 +70,10 @@ use zcash_client_sqlite::{
     wallet::init::{WalletMigrationError, init_wallet_db},
 };
 use zcash_pool_migration::{
-    delivery::{MigrationRuntimeStore, OrdinarySpendAuthorization, OrdinarySpendScope},
+    delivery::{
+        AccountDeletionAuthorization, MigrationRuntimeStore, OrdinarySpendAuthorization,
+        OrdinarySpendScope,
+    },
     wallet::{
         OrchardReservationAuthorization, PcztLockValidationSource, validate_pczt_orchard_locks,
     },
@@ -713,7 +716,16 @@ pub unsafe extern "C" fn zcashlc_delete_account(
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
-        db_data.delete_account(account_uuid)?;
+        // The schema-level delete trigger is defense in depth for compatible delivery schemas, but
+        // cannot protect a missing, future, or corrupt schema. Read the authoritative runtime and
+        // delete inside the same wallet transaction so no migration writer can acquire authority
+        // between authorization and account removal.
+        db_data.transactionally(|wallet| -> anyhow::Result<()> {
+            authorize_account_deletion_for_account(wallet, &account_uuid)?;
+            wallet
+                .delete_account(account_uuid)
+                .map_err(|e| anyhow!("deleting account failed: {e}"))
+        })?;
 
         Ok(true)
     });
@@ -2277,6 +2289,40 @@ where
     }
 }
 
+fn ensure_account_deletion_authorized(
+    authorization: AccountDeletionAuthorization,
+) -> anyhow::Result<()> {
+    match authorization {
+        AccountDeletionAuthorization::Allowed => Ok(()),
+        AccountDeletionAuthorization::Blocked(reason) => Err(anyhow!(
+            "account deletion is blocked by authoritative migration runtime: {reason:?}"
+        )),
+    }
+}
+
+/// Reads every account in one store transaction and enforces the selected account's authoritative
+/// deletion decision. The caller must perform deletion in that same wallet transaction.
+fn authorize_account_deletion_for_account<DbT>(
+    wallet_db: &mut DbT,
+    account_id: &DbT::AccountId,
+) -> anyhow::Result<()>
+where
+    DbT: MigrationRuntimeStore,
+    DbT::Error: std::fmt::Debug,
+{
+    let batch = wallet_db
+        .all_account_migration_runtimes()
+        .map_err(|e| anyhow!("reading the atomic migration runtime batch failed: {e:?}"))?;
+    let account = batch
+        .accounts()
+        .iter()
+        .find(|runtime| runtime.account_id() == account_id)
+        .ok_or_else(|| {
+            anyhow!("the atomic migration runtime batch omitted the account being deleted")
+        })?;
+    ensure_account_deletion_authorized(account.runtime().account_deletion_authorization())
+}
+
 /// Reads every account atomically for an account-less execution/finalization API. The returned
 /// flag is true when exact input validation must exclude retained migration sources.
 fn authorize_ordinary_spend_for_all_accounts<DbT>(wallet_db: &mut DbT) -> anyhow::Result<bool>
@@ -2337,6 +2383,7 @@ fn ensure_proposal_excludes_migration_sources<FeeRuleT, NoteRef>(
 #[cfg(test)]
 mod ordinary_spend_pool_tests {
     use super::*;
+    use zcash_pool_migration::delivery::{AccountDeletionBlockReason, MigrationRunIdentity};
 
     fn testnet_nu6_3_activation_height() -> BlockHeight {
         TestNetwork
@@ -2491,6 +2538,41 @@ mod ordinary_spend_pool_tests {
         assert!(execution.contains("db_data.transactionally("));
         assert!(execution.contains("authorize_ordinary_spend_for_all_accounts(wdb)"));
         assert!(execution.contains("ensure_proposal_excludes_migration_sources("));
+    }
+
+    #[test]
+    fn account_deletion_allows_only_the_runtime_allowed_state() {
+        assert!(ensure_account_deletion_authorized(AccountDeletionAuthorization::Allowed).is_ok());
+
+        let run_identity = MigrationRunIdentity::random(&mut OsRng);
+        let error = ensure_account_deletion_authorized(AccountDeletionAuthorization::Blocked(
+            AccountDeletionBlockReason::UnresolvedDelivery(run_identity),
+        ))
+        .expect_err("an unresolved delivery run must block account deletion");
+        assert!(error.to_string().contains("account deletion is blocked"));
+    }
+
+    #[test]
+    fn delete_account_checks_runtime_and_deletes_in_one_transaction() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split_once("pub unsafe extern \"C\" fn zcashlc_delete_account(")
+            .expect("delete-account FFI must exist")
+            .1
+            .split_once("\n#[unsafe(no_mangle)]")
+            .map(|(body, _)| body)
+            .expect("delete-account FFI must be isolatable");
+
+        let transaction = body
+            .find("db_data.transactionally(")
+            .expect("account authorization and deletion must share a wallet transaction");
+        let authorization = body
+            .find("authorize_account_deletion_for_account(wallet, &account_uuid)")
+            .expect("delete-account FFI must consume the owning runtime");
+        let deletion = body
+            .find(".delete_account(account_uuid)")
+            .expect("authorized account deletion must still invoke the canonical wallet API");
+        assert!(transaction < authorization && authorization < deletion);
     }
 
     #[test]

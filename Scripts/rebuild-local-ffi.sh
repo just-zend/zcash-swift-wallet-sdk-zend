@@ -127,7 +127,7 @@ if [[ "$TARGET" == "macos" && "$UNIVERSAL" == "true" ]]; then
         if ! rustup target list --installed --toolchain "$RUST_TOOLCHAIN" | grep -q "^${t}$"; then
             rustup target add --toolchain "$RUST_TOOLCHAIN" "$t"
         fi
-        cargo "+$RUST_TOOLCHAIN" build --locked --target "$t" --release
+        rustup run "$RUST_TOOLCHAIN" cargo build --locked --target "$t" --release
     done
     BUILT_LIB="target/libzcashlc-macos-universal.a"
     lipo -create \
@@ -140,7 +140,7 @@ elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
         if ! rustup target list --installed --toolchain "$RUST_TOOLCHAIN" | grep -q "^${t}$"; then
             rustup target add --toolchain "$RUST_TOOLCHAIN" "$t"
         fi
-        cargo "+$RUST_TOOLCHAIN" build --locked --target "$t" --release
+        rustup run "$RUST_TOOLCHAIN" cargo build --locked --target "$t" --release
     done
     BUILT_LIB="target/libzcashlc-ios-sim-universal.a"
     lipo -create \
@@ -148,7 +148,7 @@ elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
         target/x86_64-apple-ios/release/libzcashlc.a \
         -output "$BUILT_LIB"
 else
-    cargo "+$RUST_TOOLCHAIN" build --locked --target "$RUST_TARGET" --release
+    rustup run "$RUST_TOOLCHAIN" cargo build --locked --target "$RUST_TARGET" --release
     # Path to built static library (target/ is at repo root)
     BUILT_LIB="target/$RUST_TARGET/release/libzcashlc.a"
 fi

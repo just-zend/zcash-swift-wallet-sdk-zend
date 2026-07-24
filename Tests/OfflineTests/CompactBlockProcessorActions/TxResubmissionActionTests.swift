@@ -7,9 +7,11 @@ import XCTest
 @testable import TestUtils
 @testable import ZcashLightClientKit
 
+// swiftlint:disable:next type_body_length
 final class TxResubmissionActionTests: ZcashTestCase {
     private var transactionRepository: TransactionRepositoryMock!
     private var transactionEncoder: StubTransactionEncoder!
+    private var rustBackend = ZcashRustBackendWeldingMock()
     private var submitPlanStore: SubmitPlanStoringMock!
     private var endpointSubmitter: EndpointSubmitterMock!
 
@@ -52,11 +54,14 @@ final class TxResubmissionActionTests: ZcashTestCase {
         transactionRepository = TransactionRepositoryMock()
         transactionRepository.findForResubmissionUpToClosure = { _ in candidates }
         transactionEncoder = StubTransactionEncoder(createdTransactions: encoderTransactions)
+        rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.migrationRuntimeSnapshotsReturnValue = []
         submitPlanStore = SubmitPlanStoringMock()
         endpointSubmitter = EndpointSubmitterMock()
 
         mockContainer.mock(type: TransactionRepository.self, isSingleton: true) { _ in self.transactionRepository }
         mockContainer.mock(type: TransactionEncoder.self, isSingleton: true) { _ in self.transactionEncoder }
+        mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in self.rustBackend }
         mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in self.submitPlanStore }
         mockContainer.mock(type: Logger.self, isSingleton: true) { _ in submissionLifecycleLogger() }
         mockContainer.mock(type: SubmitPlanExecutor.self, isSingleton: true) { _ in
@@ -120,6 +125,59 @@ final class TxResubmissionActionTests: ZcashTestCase {
         XCTAssertEqual(transactionEncoder.submittedTransactions.count, 1)
         XCTAssertEqual(transactionEncoder.submittedTransactions.first?.transactionId, rawID)
         XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty)
+    }
+
+    func testRustOwnedMigrationTransactionNeverUsesOrdinaryResubmission() async throws {
+        let rawID = Data(repeating: 0x13, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        transactionRepository.findForResubmissionUpToClosure = { _ in
+            XCTAssertEqual(
+                self.rustBackend.migrationRuntimeSnapshotsCallsCount,
+                0,
+                "The candidate list must be frozen before migration ownership is projected"
+            )
+            return [candidate]
+        }
+        rustBackend.migrationRuntimeSnapshotsClosure = {
+            XCTAssertTrue(
+                self.transactionRepository.findForResubmissionUpToCalled,
+                "Migration ownership must be projected after the candidate list is frozen"
+            )
+            return [self.makeMigrationRuntime(transactionID: rawID)]
+        }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty)
+        XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty)
+    }
+
+    func testMigrationOwnershipReadFailureFailsClosedForOrdinaryResubmission() async throws {
+        struct RuntimeReadError: Error {}
+        let rawID = Data(repeating: 0x14, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        rustBackend.migrationRuntimeSnapshotsThrowableError = RuntimeReadError()
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty)
+        XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty)
+        XCTAssertTrue(transactionRepository.findForResubmissionUpToCalled)
+    }
+
+    func testUnavailableMigrationRuntimeProjectionFailsClosedForOrdinaryResubmission() async throws {
+        let rawID = Data(repeating: 0x18, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        rustBackend.migrationRuntimeSnapshotsReturnValue = [makeUnavailableMigrationRuntime()]
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty)
+        XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty)
+        XCTAssertTrue(transactionRepository.findForResubmissionUpToCalled)
     }
 
     func testPruningRemovesExpiredMissingAndNilExpiryPlansButKeepsMinedUntilExpiry() async throws {
@@ -247,5 +305,87 @@ final class TxResubmissionActionTests: ZcashTestCase {
 
         let remaining = await submitPlanStore.allPlannedTransactionIds()
         XCTAssertEqual(remaining, [txId], "A transient repository error must not prune a live retry plan")
+    }
+
+    private func makeMigrationRuntime(transactionID: Data) -> MigrationRuntimeSnapshot {
+        let claim = MigrationDeliveryClaimSummary(
+            artifact: .immediate(identity: Data(repeating: 0x15, count: 32)),
+            signerOwnership: .sdk,
+            status: .broadcasted,
+            activeClaimKind: nil,
+            externallyExposed: false,
+            hasSignedPCZT: false,
+            hasExactTransaction: true,
+            expiryHeight: 3_000_000,
+            txid: transactionID,
+            lastError: nil,
+            claimHandle: makeClaimHandle(0x16)
+        )
+        let delivery = MigrationDeliverySnapshot(
+            lane: .immediate,
+            phase: .active,
+            storageFinality: .active,
+            activeSourceReservationCount: 1,
+            hasSubmissionPolicy: true,
+            policyValidationFailure: nil,
+            safeToCancel: false,
+            claims: [claim],
+            runHandle: makeRunHandle(0x17)
+        )
+        return MigrationRuntimeSnapshot(
+            account: TestsData.mockedAccountUUID,
+            canonical: MigrationCanonicalSummary(status: .inProgress, transactionCount: 1),
+            schemaProvenance: .compatible(version: 1),
+            legacyCutover: .fresh,
+            destinationSpendability: .notSpendable,
+            availability: .available,
+            ordinarySpendAuthorization: .excludingMigrationSources(releaseAtHeight: 3_000_000),
+            accountDeletionAuthorization: .blocked(.unresolvedDelivery),
+            canonicalMutationAuthorization: .blocked(.deliveryOwned),
+            aggregateStorageFinality: .active,
+            delivery: delivery,
+            retainedRuns: []
+        )
+    }
+
+    private func makeUnavailableMigrationRuntime() -> MigrationRuntimeSnapshot {
+        MigrationRuntimeSnapshot(
+            account: TestsData.mockedAccountUUID,
+            canonical: MigrationCanonicalSummary(status: nil, transactionCount: 0),
+            schemaProvenance: .unavailable,
+            legacyCutover: .fresh,
+            destinationSpendability: .notApplicable,
+            availability: .unavailable(.schemaUnavailable),
+            ordinarySpendAuthorization: .blocked(.runtimeUnavailable),
+            accountDeletionAuthorization: .blocked(.runtimeUnavailable),
+            canonicalMutationAuthorization: .blocked(.runtimeUnavailable),
+            aggregateStorageFinality: .noRun,
+            delivery: nil,
+            retainedRuns: []
+        )
+    }
+
+    private func makeClaimHandle(_ identity: Int) -> MigrationClaimHandle {
+        guard let pointer = OpaquePointer(bitPattern: identity) else {
+            preconditionFailure("test migration claim identity must be nonzero")
+        }
+        return MigrationClaimHandle(
+            storage: MigrationOpaqueHandleStorage(
+                pointer: pointer,
+                release: { _ in }
+            )
+        )
+    }
+
+    private func makeRunHandle(_ identity: Int) -> MigrationRunHandle {
+        guard let pointer = OpaquePointer(bitPattern: identity) else {
+            preconditionFailure("test migration run identity must be nonzero")
+        }
+        return MigrationRunHandle(
+            storage: MigrationOpaqueHandleStorage(
+                pointer: pointer,
+                release: { _ in }
+            )
+        )
     }
 }

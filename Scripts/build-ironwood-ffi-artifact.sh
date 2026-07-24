@@ -336,7 +336,7 @@ apple_ld_sha256=$(tool_sha256 "$apple_ld")
 apple_lipo_sha256=$(tool_sha256 "$apple_lipo")
 apple_strip_sha256=$(tool_sha256 "$apple_strip")
 apple_clang_sha256=$(tool_sha256 "$apple_clang")
-build_path_sha256=$(printf '%s' "$PATH" | shasum -a 256 | awk '{print $1}')
+build_path_sha256=$(./Scripts/hash-ironwood-build-path.sh "$PATH" "$rust_toolchain_bin")
 
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 export IRONWOOD_HERMETIC_BUILD=true
@@ -374,7 +374,7 @@ printf '%s\n' \
     "RUST_TOOLCHAIN=$rust_toolchain" \
     "BUILD_ENVIRONMENT_POLICY=$IRONWOOD_BUILD_ENVIRONMENT_POLICY" \
     "FFI_ARCHIVE_POSTPROCESSING=$archive_postprocessing" \
-    "BUILD_PATH_POLICY=explicit-required-tool-dirs-v1" \
+    "BUILD_PATH_POLICY=explicit-required-tool-dirs-normalized-rust-v1" \
     "BUILD_PATH_SHA256=$build_path_sha256" \
     "RUSTUP_HOME_POLICY=ephemeral-empty-v1" \
     "GIT_CONFIG_POLICY=system-global-disabled-v1" \

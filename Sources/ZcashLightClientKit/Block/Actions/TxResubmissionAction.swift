@@ -12,9 +12,14 @@ final class TxResubmissionAction {
         static let thresholdToTrigger = TimeInterval(300.0)
     }
 
+    private enum MigrationOwnershipError: Error {
+        case runtimeUnavailable
+    }
+
     var latestResolvedTime: TimeInterval = Date().timeIntervalSince1970
     let transactionRepository: TransactionRepository
     var transactionEncoder: TransactionEncoder
+    let rustBackend: ZcashRustBackendWelding
     let submitPlanStore: SubmitPlanStoring
     let submitPlanExecutor: SubmitPlanExecutor
     let logger: Logger
@@ -22,6 +27,7 @@ final class TxResubmissionAction {
     init(container: DIContainer) {
         transactionRepository = container.resolve(TransactionRepository.self)
         transactionEncoder = container.resolve(TransactionEncoder.self)
+        rustBackend = container.resolve(ZcashRustBackendWelding.self)
         submitPlanStore = container.resolve(SubmitPlanStoring.self)
         submitPlanExecutor = container.resolve(SubmitPlanExecutor.self)
         logger = container.resolve(Logger.self)
@@ -58,19 +64,45 @@ extension TxResubmissionAction: Action {
 
                 // the last time resubmission was triggered is more than 5 minutes ago so try again
                 if diff > Constants.thresholdToTrigger {
-                    // resubmission; per-transaction error handling so one
-                    // transaction's dead endpoints can't starve the others
-                    for transaction in transactions {
-                        do {
-                            try await resubmit(transaction: transaction)
-                        } catch {
-                            logger.error(
-                                "TxResubmissionAction failed to resubmit transaction \(transaction.rawID.toHexStringTxId()): \(error)"
-                            )
-                        }
+                    // Freeze the candidate list first, then read migration ownership immediately
+                    // before any network attempt. Migration materialization stores its ordinary
+                    // wallet transaction and Rust claim atomically: an artifact committed before
+                    // this query must appear in the following runtime batch, while one committed
+                    // afterward cannot enter this fixed candidate list. Reversing these reads would
+                    // create a TOCTOU window in which a newly materialized migration transaction
+                    // could be absent from the ownership set but present among the candidates.
+                    let migrationOwnedTransactionIDs: Set<Data>?
+                    do {
+                        let runtimes = try await rustBackend.migrationRuntimeSnapshots()
+                        migrationOwnedTransactionIDs = try Self.migrationOwnedTransactionIDs(in: runtimes)
+                    } catch {
+                        logger.error(
+                            "TxResubmissionAction could not establish migration transaction ownership; skipping resubmission."
+                        )
+                        migrationOwnedTransactionIDs = nil
                     }
 
-                    latestResolvedTime = Date().timeIntervalSince1970
+                    if let migrationOwnedTransactionIDs {
+                        // resubmission; per-transaction error handling so one
+                        // transaction's dead endpoints can't starve the others
+                        for transaction in transactions {
+                            if migrationOwnedTransactionIDs.contains(transaction.rawID) {
+                                logger.info(
+                                    "TxResubmissionAction skipping Rust-owned migration transaction \(transaction.rawID.toHexStringTxId())."
+                                )
+                                continue
+                            }
+                            do {
+                                try await resubmit(transaction: transaction)
+                            } catch {
+                                logger.error(
+                                    "TxResubmissionAction failed to resubmit transaction \(transaction.rawID.toHexStringTxId()): \(error)"
+                                )
+                            }
+                        }
+
+                        latestResolvedTime = Date().timeIntervalSince1970
+                    }
                 }
             }
         } catch {
@@ -89,6 +121,25 @@ extension TxResubmissionAction: Action {
 }
 
 private extension TxResubmissionAction {
+    static func migrationOwnedTransactionIDs(in runtimes: [MigrationRuntimeSnapshot]) throws -> Set<Data> {
+        // An unavailable runtime may intentionally omit or distrust claim identity. Treat every
+        // unavailable reason conservatively: an empty projected txid set is not proof that the
+        // wallet contains no migration-owned transaction.
+        guard runtimes.allSatisfy({ runtime in
+            if case .available = runtime.availability { return true }
+            return false
+        }) else {
+            throw MigrationOwnershipError.runtimeUnavailable
+        }
+        return Set(runtimes.flatMap { runtime in
+            let current = runtime.delivery.map { [$0] } ?? []
+            let retained = runtime.retainedRuns.map(\.delivery)
+            return (current + retained).flatMap { delivery in
+                delivery.claims.compactMap(\.txid)
+            }
+        })
+    }
+
     func resubmit(transaction: ZcashTransaction.Overview) async throws {
         let plan = await submitPlanStore.plan(for: transaction.rawID)
 

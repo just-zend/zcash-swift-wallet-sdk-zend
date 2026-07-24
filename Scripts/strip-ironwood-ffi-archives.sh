@@ -10,8 +10,8 @@ cd "$(dirname "$0")/.."
 
 xcframework="${1:-LocalPackages/libzcashlc.xcframework}"
 rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
-rust_host=$(rustc "+$rust_toolchain" --version --verbose | sed -n 's/^host: //p')
-llvm_objcopy="$(rustc "+$rust_toolchain" --print sysroot)/lib/rustlib/$rust_host/bin/llvm-objcopy"
+rust_host=$(rustup run "$rust_toolchain" rustc --version --verbose | sed -n 's/^host: //p')
+llvm_objcopy="$(rustup run "$rust_toolchain" rustc --print sysroot)/lib/rustlib/$rust_host/bin/llvm-objcopy"
 if [[ ! -x "$llvm_objcopy" ]]; then
     echo "Error: pinned llvm-objcopy is missing; install llvm-tools-preview for Rust $rust_toolchain" >&2
     exit 1

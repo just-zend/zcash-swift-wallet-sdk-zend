@@ -2579,6 +2579,7 @@ private extension ZcashRustBackend {
         )
     }
 
+    // swiftlint:disable:next function_parameter_count
     func decodeMigrationDelivery(
         laneTag: Int8,
         phaseTag: Int8,

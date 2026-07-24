@@ -134,8 +134,8 @@ fi
 # Apple nm cannot reliably parse LLVM 22 attributes emitted by Rust 1.96. Use llvm-nm from the
 # exact pinned toolchain instead.
 symbol_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
-symbol_host=$(rustc "+$symbol_toolchain" --version --verbose | sed -n 's/^host: //p')
-llvm_nm="$(rustc "+$symbol_toolchain" --print sysroot)/lib/rustlib/$symbol_host/bin/llvm-nm"
+symbol_host=$(rustup run "$symbol_toolchain" rustc --version --verbose | sed -n 's/^host: //p')
+llvm_nm="$(rustup run "$symbol_toolchain" rustc --print sysroot)/lib/rustlib/$symbol_host/bin/llvm-nm"
 if [[ ! -x "$llvm_nm" ]]; then
     echo "Error: pinned llvm-nm is missing; install llvm-tools-preview for Rust $symbol_toolchain" >&2
     exit 1
@@ -386,7 +386,7 @@ for field in RUSTC_COMMIT CARGO_COMMIT; do
     fi
 done
 
-if [[ "$(read_field BUILD_PATH_POLICY)" != "explicit-required-tool-dirs-v1" \
+if [[ "$(read_field BUILD_PATH_POLICY)" != "explicit-required-tool-dirs-normalized-rust-v1" \
     || ! "$(read_field BUILD_PATH_SHA256)" =~ ^[0-9a-f]{64}$ \
     || "$(read_field RUSTUP_HOME_POLICY)" != "ephemeral-empty-v1" \
     || "$(read_field GIT_CONFIG_POLICY)" != "system-global-disabled-v1" ]]

@@ -20,6 +20,28 @@ temp_root=$(mktemp -d)
 cleanup() { rm -rf "$temp_root"; }
 trap cleanup EXIT
 
+path_hash_one=$(./Scripts/hash-ironwood-build-path.sh \
+    "$temp_root/build-one/rust/bin:/usr/bin:/bin" \
+    "$temp_root/build-one/rust/bin")
+path_hash_two=$(./Scripts/hash-ironwood-build-path.sh \
+    "$temp_root/build-two/rust/bin:/usr/bin:/bin" \
+    "$temp_root/build-two/rust/bin")
+path_hash_different=$(./Scripts/hash-ironwood-build-path.sh \
+    "$temp_root/build-two/rust/bin:/usr/bin:/sbin" \
+    "$temp_root/build-two/rust/bin")
+if [[ "$path_hash_one" != "$path_hash_two" ]]; then
+    echo "Error: normalized build PATH hash depends on its random Rustup root" >&2
+    exit 1
+fi
+if [[ "$path_hash_one" == "$path_hash_different" ]]; then
+    echo "Error: normalized build PATH hash ignored a non-Rust tool directory" >&2
+    exit 1
+fi
+expect_failure "missing pinned Rust toolchain PATH entry" \
+    ./Scripts/hash-ironwood-build-path.sh "/usr/bin:/bin" "$temp_root/rust/bin"
+expect_failure "empty build PATH entry" \
+    ./Scripts/hash-ironwood-build-path.sh "/usr/bin::/bin" "/usr/bin"
+
 pristine="$temp_root/pristine.xcframework"
 cp -R -P LocalPackages/libzcashlc.xcframework "$pristine"
 ./Scripts/verify-ironwood-ffi-layout.sh "$pristine" >/dev/null
@@ -82,6 +104,10 @@ mkdir -p "$disabled_swift"
 printf 'func unsafeMigrationCall() { zcashlc_migration_restart_step() }\n' \
     > "$disabled_swift/Production.swift"
 expect_failure "production call to disabled migration FFI" \
+    ./Scripts/audit-disabled-migration-ffi.sh "$disabled_swift"
+printf 'func unsafeRawStaging() { zcashlc_migration_stage_materialized_transaction_v1() }\n' \
+    > "$disabled_swift/Production.swift"
+expect_failure "production call to retired raw-byte staging FFI" \
     ./Scripts/audit-disabled-migration-ffi.sh "$disabled_swift"
 
 source_root="$temp_root/source-root"

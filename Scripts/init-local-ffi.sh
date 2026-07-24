@@ -109,7 +109,7 @@ build_arm_xcframework() {
         # Ensure the Rust target is available (idempotent), then build it.
         # cargo is incremental, so repeat builds after small edits are fast.
         rustup target add --toolchain "$RUST_TOOLCHAIN" "$rust_target"
-        cargo "+$RUST_TOOLCHAIN" build --locked --target "$rust_target" --release
+        rustup run "$RUST_TOOLCHAIN" cargo build --locked --target "$rust_target" --release
 
         # Populate the framework for this slice.
         local framework="$temp_xcfw/$slice/libzcashlc.framework"
