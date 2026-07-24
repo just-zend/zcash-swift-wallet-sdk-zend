@@ -317,7 +317,11 @@ then
     exit 1
 fi
 
-rustup toolchain install "$rust_toolchain" --profile minimal
+# The bootstrap rustup binary lives outside the fresh CARGO_HOME. Disable its proxy/self-update
+# step explicitly; otherwise a successful toolchain download ends by trying to mutate that empty
+# home and exits nonzero before component installation.
+rustup set auto-self-update disable
+rustup toolchain install "$rust_toolchain" --profile minimal --no-self-update
 # Rustup 1.29 requires the component/target operands before `--toolchain`; the older ordering can
 # be misparsed as a request to install the `rustup` proxy into the fresh CARGO_HOME.
 rustup component add llvm-tools-preview --toolchain "$rust_toolchain"
@@ -436,6 +440,7 @@ printf '%s\n' \
     "BUILD_PATH_POLICY=explicit-required-tool-dirs-normalized-rust-v1" \
     "BUILD_PATH_SHA256=$build_path_sha256" \
     "RUSTUP_HOME_POLICY=ephemeral-empty-v1" \
+    "RUSTUP_SELF_UPDATE_POLICY=disabled-v1" \
     "GIT_CONFIG_POLICY=system-global-disabled-v1" \
     "RUSTUP_SHA256=$rustup_sha256" \
     "GIT_SHA256=$git_sha256" \

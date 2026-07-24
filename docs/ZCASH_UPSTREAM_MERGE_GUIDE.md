@@ -104,6 +104,9 @@ Moving the `contents: write` draft-release publisher to WarpBuild expands the tr
   semantic-port revision, integrated migration-feature head/merge, #1825 proposal-handle base,
   Keystone introduction commit, and Zend librustzcash revision; branch and PR refs are build-time
   audit evidence, never canonical input.
+- Canonical rebuilds use fresh `CARGO_HOME` and `RUSTUP_HOME` directories, install the exact
+  `rust-toolchain.toml` toolchain and targets there, and explicitly disable rustup self-update/proxy
+  installation. The build records that policy and the bootstrap rustup hash in provenance.
 - The workflow output must remain a draft release.
 - A second maintainer must download the draft XCFramework zip, independently run `shasum -a 256`, compare the result with both the workflow output and the checksum proposed for `Package.swift`, confirm that the draft asset came from the approved workflow SHA, and only then publish the release.
 

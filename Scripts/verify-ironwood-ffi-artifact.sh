@@ -473,6 +473,7 @@ done
 if [[ "$(read_field BUILD_PATH_POLICY)" != "explicit-required-tool-dirs-normalized-rust-v1" \
     || ! "$(read_field BUILD_PATH_SHA256)" =~ ^[0-9a-f]{64}$ \
     || "$(read_field RUSTUP_HOME_POLICY)" != "ephemeral-empty-v1" \
+    || "$(read_field RUSTUP_SELF_UPDATE_POLICY)" != "disabled-v1" \
     || "$(read_field GIT_CONFIG_POLICY)" != "system-global-disabled-v1" ]]
 then
     echo "Error: artifact provenance does not record the hermetic PATH/Rustup/Git policy" >&2
@@ -548,7 +549,8 @@ recipe_fields=(
     ORCHARD_VERSION ORCHARD_CHECKSUM
     MIGRATION_RESERVE_ABI_POLICY
     SOURCE_DATE_EPOCH RUST_TOOLCHAIN BUILD_ENVIRONMENT_POLICY FFI_ARCHIVE_POSTPROCESSING
-    BUILD_PATH_POLICY BUILD_PATH_SHA256 RUSTUP_HOME_POLICY GIT_CONFIG_POLICY
+    BUILD_PATH_POLICY BUILD_PATH_SHA256 RUSTUP_HOME_POLICY RUSTUP_SELF_UPDATE_POLICY
+    GIT_CONFIG_POLICY
     RUSTUP_SHA256 GIT_SHA256 MAKE_SHA256 LLVM_OBJCOPY_SHA256
     APPLE_LD_SHA256 APPLE_LIPO_SHA256 APPLE_STRIP_SHA256 APPLE_CLANG_SHA256
     XCODE_DEVELOPER_DIR
