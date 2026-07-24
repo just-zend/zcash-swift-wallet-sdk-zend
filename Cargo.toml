@@ -134,16 +134,16 @@ lto = true
 # network in `rust/src/lib.rs`. Bump it deliberately (build + OfflineTests
 # green), and delete the whole block at the 0.24-era crates.io release.
 [patch.crates-io]
-zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting.git", rev = "a4daaf77f793b35a98a3d811b920a01b95fbfa7a" }
+zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting.git", rev = "e5d885c2128f59ba39f44631dee537a0ade2f3fd" }
 
 # Pin the whole librustzcash stack to a single git rev, pending a crates.io release.
 # zcash_voting no longer hard-pins librustzcash (it declares crates.io versions and
 # patches from its own root), so this workspace's patch governs the rev for the entire
 # graph and everything resolves to one copy. Bump this rev in one place to advance the
-# stack — but note that this rev carries the zcash_primitives 0.30 / zcash_transparent
-# 0.10 releases, which zcash_voting's own `zcash_primitives = "0.29.0"` requirement
-# cannot accept; that pin has to move first or the graph splits into two
-# zcash_primitives copies.
+# stack. This rev carries the zcash_primitives 0.30 / zcash_transparent 0.10 releases,
+# and the zcash_voting pin above is on the matching 0.30 generation, so the patch
+# reaches it too and the graph stays single-copy. Keep the two in step: a zcash_voting
+# rev on the 0.29 generation cannot accept this patch and the graph splits.
 # librustzcash itself patches orchard to the ZIP 374 deferred-anchor-builder
 # rev below (unreleased); [patch] does not propagate to consumers, so this workspace
 # declares the identical rev. Drop when orchard releases it.
