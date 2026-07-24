@@ -280,10 +280,30 @@ rustup component add --toolchain "$rust_toolchain" llvm-tools-preview
 rustup target add --toolchain "$rust_toolchain" \
     aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim \
     x86_64-apple-darwin x86_64-apple-ios
-rustc_release=$(rustc "+$rust_toolchain" --version --verbose | sed -n 's/^release: //p')
-rustc_commit=$(rustc "+$rust_toolchain" --version --verbose | sed -n 's/^commit-hash: //p')
-cargo_release=$(cargo "+$rust_toolchain" --version --verbose | sed -n 's/^release: //p')
-cargo_commit=$(cargo "+$rust_toolchain" --version --verbose | sed -n 's/^commit-hash: //p')
+
+# `RUSTUP_HOME` and `CARGO_HOME` above are deliberately fresh, so rustup does not install proxy
+# shims such as `$CARGO_HOME/bin/rustc`. Resolve the binaries from the installed toolchain itself
+# and add only their reviewed directory to the already-reduced PATH. This keeps the build hermetic
+# and works on runners that provide `rustup` without ambient `rustc`/`cargo` shims.
+rustc_binary=$(rustup which --toolchain "$rust_toolchain" rustc)
+cargo_binary=$(rustup which --toolchain "$rust_toolchain" cargo)
+for rust_tool in "$rustc_binary" "$cargo_binary"; do
+    if [[ "$rust_tool" != /* || ! -x "$rust_tool" ]]; then
+        echo "Error: rustup returned an invalid pinned toolchain binary: $rust_tool" >&2
+        exit 1
+    fi
+done
+rust_toolchain_bin=$(cd "$(dirname "$rustc_binary")" && pwd -P)
+if [[ "$(cd "$(dirname "$cargo_binary")" && pwd -P)" != "$rust_toolchain_bin" ]]; then
+    echo "Error: pinned rustc and cargo did not resolve from one toolchain directory" >&2
+    exit 1
+fi
+export PATH="$rust_toolchain_bin:$PATH"
+
+rustc_release=$("$rustc_binary" --version --verbose | sed -n 's/^release: //p')
+rustc_commit=$("$rustc_binary" --version --verbose | sed -n 's/^commit-hash: //p')
+cargo_release=$("$cargo_binary" --version --verbose | sed -n 's/^release: //p')
+cargo_commit=$("$cargo_binary" --version --verbose | sed -n 's/^commit-hash: //p')
 xcode_version=$(xcodebuild -version | sed -n '1s/^Xcode //p')
 xcode_build_version=$(xcodebuild -version | sed -n '2s/^Build version //p')
 iphoneos_sdk_version=$(xcrun --sdk iphoneos --show-sdk-version)
@@ -291,8 +311,8 @@ iphonesimulator_sdk_version=$(xcrun --sdk iphonesimulator --show-sdk-version)
 macosx_sdk_version=$(xcrun --sdk macosx --show-sdk-version)
 macos_version=$(sw_vers -productVersion)
 macos_build_version=$(sw_vers -buildVersion)
-rust_host=$(rustc "+$rust_toolchain" --version --verbose | sed -n 's/^host: //p')
-llvm_objcopy="$(rustc "+$rust_toolchain" --print sysroot)/lib/rustlib/$rust_host/bin/llvm-objcopy"
+rust_host=$("$rustc_binary" --version --verbose | sed -n 's/^host: //p')
+llvm_objcopy="$("$rustc_binary" --print sysroot)/lib/rustlib/$rust_host/bin/llvm-objcopy"
 if [[ ! -x "$llvm_objcopy" ]]; then
     echo "Error: pinned llvm-objcopy is missing after llvm-tools installation" >&2
     exit 1
