@@ -2,8 +2,9 @@
 
 # Removes embedded LLVM payloads from each thin Rust archive, rebuilds universal archives, then
 # lets Apple's Mach-O-aware strip remove debug/local symbols. Global FFI exports and unwind
-# relocations remain intact, while every committed binary stays below GitHub's 100,000,000-byte
-# object limit without Git LFS.
+# relocations remain intact, while every committed binary stays below Zend's conservative
+# 100,000,000-byte Git-blob safety cap without Git LFS. This intentionally leaves headroom below
+# GitHub's 100 MiB hard limit.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -33,7 +34,7 @@ expected_arch_sets=(
     "arm64 x86_64"
 )
 
-max_git_blob_bytes=100000000
+zend_git_blob_safety_cap_bytes=100000000
 work_dir=$(mktemp -d)
 cleanup() {
     rm -rf "$work_dir"
@@ -76,7 +77,7 @@ for binary in "${binaries[@]}"; do
 
         # Rust 1.96's LLVM strip -x removes local symbols that Mach-O SUBTRACTOR relocations in
         # __eh_frame still reference. Remove only embedded LLVM payloads here; Apple's strip below
-        # preserves those relocation pairs while bringing universal archives under GitHub's limit.
+        # preserves those relocation pairs while bringing universal archives under Zend's cap.
         "$llvm_objcopy" \
             --remove-section='__LLVM,__bitcode' \
             --remove-section='__LLVM,__cmdline' \
@@ -95,8 +96,8 @@ for binary in "${binaries[@]}"; do
     mv "$rebuilt_archive" "$binary"
 
     size=$(stat -f '%z' "$binary")
-    if (( size >= max_git_blob_bytes )); then
-        echo "Error: post-processed archive remains too large for GitHub: $binary ($size bytes)" >&2
+    if (( size >= zend_git_blob_safety_cap_bytes )); then
+        echo "Error: post-processed archive exceeds Zend's Git-blob safety cap: $binary ($size bytes)" >&2
         exit 1
     fi
     echo "Post-processed $binary ($size bytes)"

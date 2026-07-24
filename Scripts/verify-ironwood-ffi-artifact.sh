@@ -47,11 +47,13 @@ fi
 ./Scripts/verify-ironwood-ffi-layout.sh "$xcframework"
 ./Scripts/verify-ironwood-xcframework-metadata.sh "$xcframework"
 
-max_git_blob_bytes=100000000
+# Stay below Zend's conservative decimal-byte cap, which intentionally leaves headroom below
+# GitHub's 100 MiB hard file-size limit.
+zend_git_blob_safety_cap_bytes=100000000
 for binary in "${binaries[@]}"; do
     binary_size=$(stat -f '%z' "$binary")
-    if (( binary_size >= max_git_blob_bytes )); then
-        echo "Error: committed archive exceeds GitHub's object limit: $binary ($binary_size bytes)" >&2
+    if (( binary_size >= zend_git_blob_safety_cap_bytes )); then
+        echo "Error: committed archive exceeds Zend's Git-blob safety cap: $binary ($binary_size bytes)" >&2
         exit 1
     fi
 done

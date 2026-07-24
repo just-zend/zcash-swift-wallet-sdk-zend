@@ -247,7 +247,8 @@ Simulator'`) then dies late at link time with missing `_zcashlc_*` symbols for
 the absent architecture instead of an explicit unsupported-architecture error.
 The committed release artifact is always the full five-architecture form. The release builder
 removes embedded LLVM payloads and strips debug/local symbols from each thin archive before
-reassembling the universal slices, keeping each committed Git blob below GitHub's 100MB limit.
+reassembling the universal slices, keeping each committed Git blob below Zend's conservative
+100,000,000-byte cap (with headroom below GitHub's 100 MiB hard limit).
 
 ### Build Targets
 
