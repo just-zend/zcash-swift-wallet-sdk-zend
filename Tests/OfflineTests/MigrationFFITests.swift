@@ -174,15 +174,37 @@ final class MigrationFFITests: XCTestCase {
 
     // MARK: - Invalid-state transitions
 
-    /// A commit without a matching previewed plan is the plan-stale contract: the engine signs
-    /// exactly the plan the most recent propose call cached (ZIP 318 draws fresh schedule
-    /// randomness on every proposal), so committing with nothing cached must surface
-    /// `migrationPlanStale` — the actionable "propose again" signal — not a generic failure.
+    /// A commit whose handle identifies no cached plan is the plan-stale contract: the engine
+    /// signs exactly the plan the handle identifies (ZIP 318 draws fresh schedule randomness on
+    /// every proposal, so plan identity is the consent boundary), so committing with nothing
+    /// cached — here via the `0` "no plan" sentinel an empty or persisted schedule carries —
+    /// must surface `migrationPlanStale`, the actionable "propose again" signal, not a generic
+    /// failure.
     func testSignAndStoreWithoutAPreviewedPlanThrowsPlanStale() async throws {
-        let emptySchedule = MigrationSchedule(transfers: [], estimatedDurationHours: 0)
+        let emptySchedule = MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 0)
         do {
             try await rustBackend.migrationSignAndStoreSchedule(emptySchedule, usk: usk, for: account)
             XCTFail("Expected committing without a previewed plan to throw")
+        } catch ZcashError.migrationPlanStale {
+            // expected
+        } catch {
+            XCTFail("Expected migrationPlanStale but got \(error)")
+        }
+    }
+
+    /// The handle gate's second arm: even with a NONZERO handle — one a live proposal DTO could
+    /// have carried before a process restart, or before a newer proposal replaced it — a commit
+    /// finding no cached plan under that handle surfaces the same `migrationPlanStale` recovery
+    /// signal. Nothing was ever cached in this fixture, so any handle value is "missing".
+    func testSignAndStoreWithAStaleNonzeroHandleThrowsPlanStale() async throws {
+        let staleSchedule = MigrationSchedule(
+            transfers: [],
+            estimatedDurationHours: 0,
+            proposalHandle: 0xDEAD_BEEF
+        )
+        do {
+            try await rustBackend.migrationSignAndStoreSchedule(staleSchedule, usk: usk, for: account)
+            XCTFail("Expected committing with a stale handle to throw")
         } catch ZcashError.migrationPlanStale {
             // expected
         } catch {

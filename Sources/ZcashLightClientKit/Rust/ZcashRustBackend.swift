@@ -1561,16 +1561,12 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         usk: UnifiedSpendingKey,
         for account: AccountUUID
     ) async throws -> PreparedMigrationTransfer {
-        let outputValues = proposal.outputNotes.map { $0.amount }
-
         let preparedPtr = zcashlc_migration_sign_note_split(
             dbData.0,
             dbData.1,
             account.id,
             networkType.networkId,
-            outputValues,
-            UInt(outputValues.count),
-            proposal.fee.amount,
+            proposal.proposalHandle,
             usk.bytes,
             UInt(usk.bytes.count)
         )
@@ -1737,29 +1733,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         usk: UnifiedSpendingKey,
         for account: AccountUUID
     ) async throws {
-        guard let estimatedDurationHours = UInt32(exactly: schedule.estimatedDurationHours) else {
-            throw ZcashError.rustMigrationSignAndStoreSchedule(
-                "`estimatedDurationHours` \(schedule.estimatedDurationHours) does not fit in UInt32"
-            )
-        }
-
-        let success = withScheduleFFIArgs(schedule.transfers) { idsPtr, amounts, anchorHeights, nextExecutableAfterHeights, expiryHeights in
-            zcashlc_migration_sign_and_store_schedule(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                idsPtr.baseAddress,
-                UInt(idsPtr.count),
-                amounts,
-                anchorHeights,
-                nextExecutableAfterHeights,
-                expiryHeights,
-                estimatedDurationHours,
-                usk.bytes,
-                UInt(usk.bytes.count)
-            )
-        }
+        let success = zcashlc_migration_sign_and_store_schedule(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            schedule.proposalHandle,
+            usk.bytes,
+            UInt(usk.bytes.count)
+        )
 
         guard success else {
             throw migrationRoutedError(
@@ -1967,12 +1949,16 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationCreateUnsignedNoteSplitPczts(for account: AccountUUID) async throws -> [MigrationUnsignedTransferPczt] {
+    func migrationCreateUnsignedNoteSplitPczts(
+        for schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> [MigrationUnsignedTransferPczt] {
         let pcztsPtr = zcashlc_migration_create_unsigned_note_split_pczts(
             dbData.0,
             dbData.1,
             account.id,
-            networkType.networkId
+            networkType.networkId,
+            schedule.proposalHandle
         )
 
         guard let pcztsPtr else {
@@ -2059,27 +2045,13 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         for schedule: MigrationSchedule,
         for account: AccountUUID
     ) async throws -> [MigrationUnsignedTransferPczt] {
-        guard let estimatedDurationHours = UInt32(exactly: schedule.estimatedDurationHours) else {
-            throw ZcashError.rustMigrationCreateUnsignedTransferPczts(
-                "`estimatedDurationHours` \(schedule.estimatedDurationHours) does not fit in UInt32"
-            )
-        }
-
-        let pcztsPtr = withScheduleFFIArgs(schedule.transfers) { idsPtr, amounts, anchorHeights, nextExecutableAfterHeights, expiryHeights in
-            zcashlc_migration_create_unsigned_transfer_pczts(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                idsPtr.baseAddress,
-                UInt(idsPtr.count),
-                amounts,
-                anchorHeights,
-                nextExecutableAfterHeights,
-                expiryHeights,
-                estimatedDurationHours
-            )
-        }
+        let pcztsPtr = zcashlc_migration_create_unsigned_transfer_pczts(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            schedule.proposalHandle
+        )
 
         guard let pcztsPtr else {
             throw migrationRoutedError(
@@ -2470,7 +2442,7 @@ extension FfiNoteSplitProposal {
             outputNotes.append(Zatoshi(output_values.advanced(by: index).pointee))
         }
 
-        return NoteSplitProposal(outputNotes: outputNotes, fee: Zatoshi(fee))
+        return NoteSplitProposal(outputNotes: outputNotes, fee: Zatoshi(fee), proposalHandle: proposal_handle)
     }
 }
 
@@ -2525,7 +2497,11 @@ extension FfiMigrationSchedule {
             proposals.append(proposal)
         }
 
-        return MigrationSchedule(transfers: proposals, estimatedDurationHours: Int(estimated_duration_hours))
+        return MigrationSchedule(
+            transfers: proposals,
+            estimatedDurationHours: Int(estimated_duration_hours),
+            proposalHandle: proposal_handle
+        )
     }
 }
 
@@ -2588,37 +2564,6 @@ private func freeCStrings(_ pointers: [UnsafeMutablePointer<CChar>?]) {
 /// `UnsafeMutablePointer` so `freeCStrings` can free it).
 private func constPointers(_ owned: [UnsafeMutablePointer<CChar>?]) -> [UnsafePointer<CChar>?] {
     owned.map { pointer in pointer.map { UnsafePointer($0) } }
-}
-
-/// Builds the parallel `(ids, amounts, anchorHeights, nextExecutableAfterHeights, expiryHeights)`
-/// FFI arrays a `MigrationTransferProposal` schedule marshals to, scopes the owned `ids` C strings
-/// to `body`'s lifetime, and hands `body` the live `ids` buffer pointer alongside the plain value
-/// arrays. Shared by every FFI call that takes a whole schedule (`migrationSignAndStoreSchedule`,
-/// `migrationCreateUnsignedTransferPczts`) -- previously this exact marshaling was duplicated
-/// verbatim at both call sites, which the review flagged as a memory-unsafety drift risk (the two
-/// copies could silently diverge on array layout/ordering).
-private func withScheduleFFIArgs<T>(
-    _ transfers: [MigrationTransferProposal],
-    _ body: (
-        _ idsPtr: UnsafeBufferPointer<UnsafePointer<CChar>?>,
-        _ amounts: [Int64],
-        _ anchorHeights: [Int64],
-        _ nextExecutableAfterHeights: [Int64],
-        _ expiryHeights: [Int64]
-    ) throws -> T
-) rethrows -> T {
-    let idsCStrings = makeCStrings(transfers.map { $0.id })
-    defer { freeCStrings(idsCStrings) }
-    let idsConstPointers = constPointers(idsCStrings)
-
-    let amounts = transfers.map { $0.amount.amount }
-    let anchorHeights = transfers.map { Int64($0.anchorHeight) }
-    let nextExecutableAfterHeights = transfers.map { Int64($0.nextExecutableAfterHeight) }
-    let expiryHeights = transfers.map { Int64($0.expiryHeight) }
-
-    return try idsConstPointers.withUnsafeBufferPointer { idsPtr in
-        try body(idsPtr, amounts, anchorHeights, nextExecutableAfterHeights, expiryHeights)
-    }
 }
 
 // swiftlint:disable large_tuple line_length file_length

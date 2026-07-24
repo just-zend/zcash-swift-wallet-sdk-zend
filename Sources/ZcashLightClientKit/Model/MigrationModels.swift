@@ -59,11 +59,19 @@ public struct NoteSplitProposal: Equatable, Sendable {
     public let outputNotes: [Zatoshi]
     /// The fee paid by the split transaction itself.
     public let fee: Zatoshi
+    /// Opaque identifier of the SDK-native cached migration plan this proposal was rendered
+    /// from. The plan's details never leave the native side: commit calls pass the handle back,
+    /// and the native side refuses to sign any plan other than the one it identifies — throwing
+    /// `migrationPlanStale` when a later propose/prepare call superseded it, so what gets signed
+    /// is always exactly what the user reviewed. `0` means no plan was cached (the empty
+    /// nothing-to-migrate proposal).
+    public let proposalHandle: UInt64
 
     /// Creates a `NoteSplitProposal`.
-    public init(outputNotes: [Zatoshi], fee: Zatoshi) {
+    public init(outputNotes: [Zatoshi], fee: Zatoshi, proposalHandle: UInt64) {
         self.outputNotes = outputNotes
         self.fee = fee
+        self.proposalHandle = proposalHandle
     }
 }
 
@@ -109,11 +117,31 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
     public let transfers: [MigrationTransferProposal]
     /// A rough estimate of how long the schedule takes to fully execute, in hours.
     public let estimatedDurationHours: Int
+    /// Opaque identifier of the SDK-native cached plan this schedule was rendered from — see
+    /// `NoteSplitProposal.proposalHandle` for the contract. The transfer fields above are for
+    /// display; commit calls pass only this handle back, so the native side signs exactly the
+    /// identified plan. `0` means no cached plan backs this schedule (the empty
+    /// nothing-to-migrate answer, or a schedule read from the already-committed stored run —
+    /// which commit calls resume without consulting a handle). A schedule decoded from a
+    /// PERSISTED copy also carries `0`: the native cache is process-lifetime, so a persisted
+    /// schedule can never identify a live plan — re-propose instead of committing it.
+    public let proposalHandle: UInt64
 
     /// Creates a `MigrationSchedule`.
-    public init(transfers: [MigrationTransferProposal], estimatedDurationHours: Int) {
+    public init(transfers: [MigrationTransferProposal], estimatedDurationHours: Int, proposalHandle: UInt64) {
         self.transfers = transfers
         self.estimatedDurationHours = estimatedDurationHours
+        self.proposalHandle = proposalHandle
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.transfers = try container.decode([MigrationTransferProposal].self, forKey: .transfers)
+        self.estimatedDurationHours = try container.decode(Int.self, forKey: .estimatedDurationHours)
+        // Absent in copies persisted before the handle existed — and a persisted handle could
+        // not identify a live plan anyway (the native cache is process-lifetime), so `0` ("no
+        // plan") is the honest decode either way.
+        self.proposalHandle = try container.decodeIfPresent(UInt64.self, forKey: .proposalHandle) ?? 0
     }
 }
 

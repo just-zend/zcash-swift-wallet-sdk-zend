@@ -2,6 +2,17 @@
 //! gap between `plan_migration()` (a pure, unpersisted preview) and the commit functions
 //! (`commit_preparation`/`build_preparation_unsigned`) that must sign that exact plan value later.
 //!
+//! Every cached plan is identified by an opaque, randomly drawn [`PlanHandle`], returned to the
+//! platform inside the proposal DTOs (`FfiNoteSplitProposal::proposal_handle` /
+//! `FfiMigrationSchedule::proposal_handle`). A commit call passes the handle back, and [`get`]
+//! refuses to release a plan under any other handle — so a commit can only ever sign the exact
+//! plan the platform displayed, never one that a later propose/prepare call happened to cache in
+//! the meantime (ZIP 318's scheduling draws fresh randomness on every `plan_migration()` call, so
+//! two plans essentially never agree even over unchanged wallet state). The handle gate replaces
+//! the earlier field-by-field "verified consent echo" (F4) contract: instead of the platform
+//! echoing schedule values back for comparison against a byte-for-byte reproduction of the
+//! preview DTO, plan details now never cross the FFI boundary inward at all.
+//!
 //! This is deliberately NOT persisted: the engine's `MigrationPlan` (and its `NoteSplitPlan`/
 //! `PreparationPlan` fields) has no `serde` support and no public constructor — the only way to
 //! obtain one is calling `plan_migration()` itself — so it cannot round-trip through our own
@@ -10,38 +21,62 @@
 //! lifetime. If the process is killed between propose and confirm, the commit path surfaces the
 //! stable `MIGRATION_PLAN_STALE` error (mapped to `ZcashError.migrationPlanStale` in Swift) so
 //! the app re-proposes, rather than silently recomputing a fresh, differently-randomized plan the
-//! user never saw or approved (ZIP 318's scheduling draws fresh randomness on every
-//! `plan_migration()` call).
+//! user never saw or approved.
 //!
 //! Each entry also records whether the plan was previewed through the IMMEDIATE lane
 //! (`zcashlc_migration_propose_immediate_transfers`), so the commit path knows to rewrite the
 //! committed transfers' scheduled heights to the commit height (everything due at once) instead
-//! of keeping the drawn ZIP 318 spread; and the tip at preview time, so a commit call can verify
-//! the platform's echoed consent values (F4) against exactly what was previewed, not a freshly
-//! re-read tip that could disagree without the plan itself having gone stale.
+//! of keeping the drawn ZIP 318 spread.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use rand::RngCore;
+use rand::rngs::OsRng;
 use zcash_pool_migration_backend::engine::MigrationPlan;
-use zcash_protocol::consensus::BlockHeight;
 
-/// A cached preview: the plan, whether it was previewed through the immediate lane, and the tip
-/// reference at preview time.
+/// Opaque identifier of one cached [`MigrationPlan`]. Drawn fresh (randomly, never zero) for
+/// every plan, so a handle from an earlier proposal can never accidentally match a later one.
+/// `0` is reserved as the platform-visible "no plan" sentinel (an empty nothing-to-migrate
+/// schedule, or a schedule encoded from already-committed STORED state, which no cache entry
+/// backs) and is never issued.
+pub(crate) type PlanHandle = u64;
+
+/// Why [`get`] could not release a plan for the requested handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanLookupError {
+    /// No plan is cached for the `(database, account)` at all — the process was likely restarted
+    /// (the cache is in-memory only), or the plan was already committed and cleared.
+    Missing,
+    /// A plan is cached, but under a different handle: a later propose/prepare call replaced the
+    /// plan the platform displayed (or the handle is the `0` "no plan" sentinel).
+    Superseded,
+}
+
+impl std::fmt::Display for PlanLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanLookupError::Missing => {
+                f.write_str("no previewed migration plan for this account — propose again")
+            }
+            PlanLookupError::Superseded => f.write_str(
+                "the migration proposal identified by this handle has been superseded by a newer \
+                 proposal — re-propose and re-display the new schedule before signing",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlanLookupError {}
+
+/// A cached preview: the plan, the handle identifying it, and whether it was previewed through
+/// the immediate lane.
 #[derive(Clone)]
 pub(crate) struct CachedPlan {
     pub plan: MigrationPlan,
     pub immediate: bool,
-    /// The chain tip at the moment this plan was previewed — the exact "now" reference
-    /// `zcashlc_migration_propose_transfers`/`_immediate_transfers` encoded into the returned
-    /// schedule (`FfiTransferProposal::anchor_height`, and, for the immediate lane, also
-    /// `next_executable_after_height`). Recorded so a later commit can reproduce byte-for-byte the
-    /// schedule DTO the platform actually saw when validating the platform's echoed consent
-    /// values — re-reading the wallet's CURRENT tip instead could disagree with what was
-    /// previewed if blocks landed between propose and confirm, without the plan itself having
-    /// gone stale.
-    pub reference_height: BlockHeight,
+    handle: PlanHandle,
 }
 
 type Key = (PathBuf, [u8; 16]);
@@ -52,31 +87,48 @@ fn store() -> &'static Mutex<HashMap<Key, CachedPlan>> {
 }
 
 /// Records the most recently previewed plan for `(db_path, account)`, replacing any previous one
-/// (each propose call replaces any prior unconsumed proposal).
+/// (each propose call replaces any prior unconsumed proposal), and returns the fresh handle that
+/// now identifies it. Any handle previously issued for the key is thereby invalidated:
+/// committing with it fails with [`PlanLookupError::Superseded`].
 pub(crate) fn set(
     db_path: PathBuf,
     account: [u8; 16],
     plan: MigrationPlan,
     immediate: bool,
-    reference_height: BlockHeight,
-) {
+) -> PlanHandle {
+    let handle = loop {
+        let candidate = OsRng.next_u64();
+        if candidate != 0 {
+            break candidate;
+        }
+    };
     store().lock().unwrap_or_else(|e| e.into_inner()).insert(
         (db_path, account),
         CachedPlan {
             plan,
             immediate,
-            reference_height,
+            handle,
         },
     );
+    handle
 }
 
-/// Returns a clone of the cached plan for `(db_path, account)`, if any.
-pub(crate) fn get(db_path: &PathBuf, account: [u8; 16]) -> Option<CachedPlan> {
-    store()
+/// Returns a clone of the cached plan for `(db_path, account)`, but only if `handle` identifies
+/// it — i.e. only if no later propose/prepare call has replaced the plan the platform displayed.
+pub(crate) fn get(
+    db_path: &PathBuf,
+    account: [u8; 16],
+    handle: PlanHandle,
+) -> Result<CachedPlan, PlanLookupError> {
+    match store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(db_path.clone(), account))
-        .cloned()
+    {
+        None => Err(PlanLookupError::Missing),
+        Some(cached) if cached.handle != handle => Err(PlanLookupError::Superseded),
+        Some(cached) => Ok(cached.clone()),
+    }
 }
 
 /// Drops the cached plan for `(db_path, account)` — called once it has been committed, since the

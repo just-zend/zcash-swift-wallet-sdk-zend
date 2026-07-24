@@ -436,13 +436,13 @@ protocol ZcashRustBackendWelding {
     func migrationPrepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
 
     /// Builds, signs, and persists the note-split transaction; returns the broadcastable prepared
-    /// transfer. `proposal` is a VERIFIED consent echo, not an inert display value: its output
-    /// values and fee are checked against the previewed note split when one is cached for the
-    /// account, so a stale or tampered display cannot sign different values than the ones the
-    /// user approved.
-    /// - Throws: `migrationPlanStale` when the echo mismatches the previewed plan, or when no
-    ///   previewed plan is cached and no resumable run is stored — re-propose and re-display;
-    ///   `rustMigrationSignNoteSplit` for other rust-layer errors.
+    /// transfer. Only `proposal.proposalHandle` crosses to the native side — it identifies the
+    /// exact cached plan the user was shown, and the native side refuses to sign any other plan,
+    /// so a stale display cannot sign different values than the ones the user approved.
+    /// - Throws: `migrationPlanStale` when the identified plan is missing (process restart
+    ///   between propose and confirm) or superseded by a later propose/prepare call, and no
+    ///   resumable run is stored — re-propose and re-display; `rustMigrationSignNoteSplit` for
+    ///   other rust-layer errors.
     func migrationSignNoteSplit(
         proposal: NoteSplitProposal,
         usk: UnifiedSpendingKey,
@@ -496,20 +496,14 @@ protocol ZcashRustBackendWelding {
 
     /// Pre-signs and persists every transfer in `schedule` (a no-op when a matching non-terminal
     /// run is already stored — the normal case, since the note-split submission commits the run).
-    /// `schedule` is a VERIFIED consent echo of what the user approved, not an inert display
-    /// value: ids, amounts, and expiry heights are checked against the previewed plan (or, once a
-    /// run is committed, against the stored run itself). `nextExecutableAfterHeight` is
-    /// additionally checked against the preview before commit but never post-commit (the
-    /// immediate lane's commit-time reschedule can legitimately move it away from an honest
-    /// echo), and the estimated duration is likewise checked pre-commit only: a refresh rebuilds
-    /// an expired transfer with a fresh scheduled height, and the duration is measured from serve
-    /// time, so an honest echo of an earlier serve can legitimately disagree with a later
-    /// re-derivation, with no way to converge by re-proposing. `anchorHeight` is display-only,
-    /// never compared.
-    /// - Throws: `migrationPlanStale` when the echo mismatches, or when nothing is committed and
-    ///   no previewed plan is cached — recover by re-proposing and re-displaying (pre-commit) or
-    ///   re-reading the stored schedule (post-commit); `rustMigrationSignAndStoreSchedule` for
-    ///   other rust-layer errors.
+    /// Only `schedule.proposalHandle` crosses to the native side — the schedule's display fields
+    /// are never echoed back. A fresh commit signs exactly the cached plan the handle identifies;
+    /// the resume/no-op case does not consult the handle (the stored run is durable, already
+    /// handle-verified state).
+    /// - Throws: `migrationPlanStale` when nothing is committed and the identified plan is
+    ///   missing (process restart) or superseded by a later propose/prepare call — re-propose
+    ///   and re-display the new schedule before retrying; `rustMigrationSignAndStoreSchedule`
+    ///   for other rust-layer errors.
     func migrationSignAndStoreSchedule(
         _ schedule: MigrationSchedule,
         usk: UnifiedSpendingKey,
@@ -560,13 +554,13 @@ protocol ZcashRustBackendWelding {
     /// `migrationStoreSignedSchedulePczts` ceremony re-serves and completes it.
     ///
     /// Returns the run's FULL transfer schedule as stored AFTER the refresh — the same shape
-    /// `migrationRestartStep` returns, here read from the persisted run. The rebuilt state
-    /// persists all-or-nothing, and the returned schedule is that atomically-persisted truth:
-    /// the host must re-display it and echo it on the consent-verified calls (a rebuilt
-    /// transfer's fresh scheduled/expiry heights exist nowhere else, so holding on to the
-    /// pre-refresh copy would fail the schedule echo with `migrationPlanStale` from then on).
-    /// With nothing expired the current stored schedule comes back unchanged; with no stored
-    /// run, or a terminal (completed or cancelled) one, the schedule is empty.
+    /// `migrationRestartStep` returns, here read from the persisted run (its `proposalHandle` is
+    /// `0`: a stored run is durable, already handle-verified state that commit-shaped calls
+    /// resume without consulting a handle). The rebuilt state persists all-or-nothing, and the
+    /// returned schedule is that atomically-persisted truth for the host to re-display (a
+    /// rebuilt transfer's fresh scheduled/expiry heights exist nowhere else). With nothing
+    /// expired the current stored schedule comes back unchanged; with no stored run, or a
+    /// terminal (completed or cancelled) one, the schedule is empty.
     /// - Throws: `rustMigrationRefreshStaleTransfers` if the rust layer returns an error —
     ///   notably when an expired transfer's funding note was spent outside the migration, where
     ///   the message names `restartCurrentMigrationStep` (cancel and re-plan) as the remedy. On
@@ -580,10 +574,16 @@ protocol ZcashRustBackendWelding {
     /// by this call, with every transaction persisted awaiting its signature — and returns the
     /// preparation (note-split) subset of the PCZTs for the signing ceremony. The transfer subset
     /// of the same build is served by `migrationCreateUnsignedTransferPczts`. Resumes a stored
-    /// non-terminal run; replaces a terminal one (the sequential-runs path).
-    /// - Throws: `migrationPlanStale` when no previewed plan is cached for the account;
+    /// non-terminal run; replaces a terminal one (the sequential-runs path). Only
+    /// `schedule.proposalHandle` crosses to the native side: the run is built from exactly the
+    /// cached plan the user-reviewed schedule identifies.
+    /// - Throws: `migrationPlanStale` when the identified plan is missing (process restart) or
+    ///   superseded by a later propose/prepare call — re-propose and re-display;
     ///   `rustMigrationCreateUnsignedNoteSplitPczt` for other rust-layer errors.
-    func migrationCreateUnsignedNoteSplitPczts(for account: AccountUUID) async throws -> [MigrationUnsignedTransferPczt]
+    func migrationCreateUnsignedNoteSplitPczts(
+        for schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> [MigrationUnsignedTransferPczt]
 
     /// Applies the ceremony's signatures to the run's preparation (note-split) transactions,
     /// all-or-nothing: every element must match a stored transaction awaiting its signature or
@@ -596,22 +596,13 @@ protocol ZcashRustBackendWelding {
     ) async throws -> PreparedMigrationTransfer
 
     /// Serves the TRANSFER subset of the unsigned build for the signing ceremony (see
-    /// `migrationCreateUnsignedNoteSplitPczts`). `schedule` is a VERIFIED consent echo, not an
-    /// inert display value: its ids, amounts, and expiry heights are checked against the STORED
-    /// committed run this call serves from, so a stale or tampered display cannot route
-    /// different values than the ones the user approved into the ceremony.
-    /// `nextExecutableAfterHeight` is accepted but not compared post-commit (the immediate
-    /// lane's commit-time reschedule can legitimately move it away from an honest echo, with no
-    /// way to converge by re-proposing), and the estimated duration is likewise accepted but not
-    /// compared post-commit (a refresh rebuilds expired transfers with fresh scheduled heights,
-    /// and the duration is measured from serve time — an honest echo of an earlier serve can
-    /// legitimately disagree with a later re-derivation, with no way to converge by
-    /// re-proposing); `anchorHeight` is display-only, never compared.
-    /// - Throws: `migrationPlanStale` when the echoed schedule does not match the stored run —
-    ///   recover by re-reading the run's stored schedule (`migrationRefreshStaleTransfers`
-    ///   returns exactly that) and re-displaying it — or when nothing is committed and no
-    ///   previewed plan is cached; `rustMigrationCreateUnsignedTransferPczts` for other
-    ///   rust-layer errors.
+    /// `migrationCreateUnsignedNoteSplitPczts` — the run and every unsigned transaction already
+    /// exist, so the normal path here is the handle-free resume of the stored run;
+    /// `schedule.proposalHandle` only gates the fresh-build case where this call is the one
+    /// creating the run).
+    /// - Throws: `migrationPlanStale` when nothing is committed and the identified plan is
+    ///   missing or superseded — re-propose and re-display;
+    ///   `rustMigrationCreateUnsignedTransferPczts` for other rust-layer errors.
     func migrationCreateUnsignedTransferPczts(
         for schedule: MigrationSchedule,
         for account: AccountUUID

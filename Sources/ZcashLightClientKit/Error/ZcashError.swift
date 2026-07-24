@@ -607,7 +607,7 @@ public enum ZcashError: Equatable, Error {
     /// ZRUST0127
     case migrationProvingUnavailable(_ message: String)
     /// A migration commit was requested without a matching previewed plan.
-    /// The process restarted between propose and confirm, or the wallet's balance changed underneath the preview, or the echoed values do not match it. Propose again and re-confirm — ZIP 318 draws fresh schedule randomness on every proposal, so the SDK never silently signs a plan the user did not see.
+    /// The proposal handle identifies no live previewed plan: the process restarted between propose and confirm, a later propose/prepare call superseded the displayed proposal, or the wallet's balance changed underneath the preview. Propose again and re-confirm — ZIP 318 draws fresh schedule randomness on every proposal, so the SDK never silently signs a plan the user did not see.
     /// ZRUST0128
     case migrationPlanStale
     /// Error from rust layer when calling ZcashRustBackend.lockMigrationResidual
