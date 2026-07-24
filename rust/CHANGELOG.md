@@ -115,6 +115,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is deliberately NOT a parameter: the platform evaluates signing sessions
   from the per-run transaction counts.
 
+- Live per-transaction migration status read: `zcashlc_migration_transaction_statuses`
+  marshals the engine's own `MigrationState::transaction_statuses(target)` verbatim —
+  one row per committed migration transaction, keyed by its stable id (durable across
+  reads and stale-transfer rebuilds), carrying kind, lifecycle state, scheduled/expiry
+  heights, mined height, the broadcast txid while in-mempool, readiness, the next
+  action, and the blocking reason. Mined-transaction reconciliation runs first, per the
+  read-path convention, and a wallet with no stored run gets an empty container. Freed
+  with `zcashlc_free_migration_transaction_statuses`. This is the engine-delegated
+  equivalent of the platform-side "refresh a cached transfer's display state after a
+  reschedule" reads other SDKs hand-roll over the store's SQL.
+
 ### Changed
 - Immediate-migration state derivation (`zcashlc_migration_state` /
   `zcashlc_migration_progress`): a MINED immediate (send-max) run is now CONSUMED —
@@ -135,6 +146,36 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-account owner (making re-locking idempotent), every selection path keeps
   excluding locked notes, and `zcashlc_migration_unlock_residual` still clears
   the account's locks wholesale.
+
+### Fixed
+- Migration due-ness and expiry are now evaluated on the engine's target-height
+  contract (`chain tip + 1`, the height of the next block) everywhere, matching
+  `zcash_pool_migration_backend`'s `MigrationState` queries. The read paths
+  (`zcashlc_migration_state`/`_progress` state derivation,
+  `zcashlc_migration_has_overdue_transfers`, `zcashlc_migration_has_invalid_transfers`,
+  `zcashlc_migration_next_due_transfer`, `zcashlc_migration_pending_transfer_proposal`)
+  previously passed the raw tip and two sites hand-rolled the expiry predicate as
+  `tip > expiry_height` with no "never expires" (`expiry_height == 0`) guard — so at
+  `tip == expiry_height` the SDK still reported a transfer in progress (and could
+  serve its doomed broadcast, recording a spurious terminal `expired` mark) while
+  the refresh lane, already on engine semantics, considered it expired and rebuilt
+  it. The hand-rolled checks are replaced by the engine's own
+  `expired_transactions(target)`; transfers now become due and expire exactly one
+  block earlier, consistently across every read.
+- Transfer amounts are now read from the engine's authoritative
+  `NoteSplitPlan::crossing_values()` (on both the previewed plan and the stored
+  state) instead of re-deriving them as `funding_notes()[i] − note_fee_buffer` at
+  three marshal sites. The values are identical by construction at the pinned
+  engine (`funding_notes()` is exactly `crossing_values()[i] + buffer`, 1:1 —
+  the old comment's "post-reconciliation divergence" described a retired
+  pre-finalization engine and no longer exists), so this removes the duplicated
+  formula rather than changing any displayed number; a test pins the identity
+  both ways.
+- `FfiMigrationProgress.next_transfer_ready_at_height` no longer reports the
+  height of a transfer that is already in the mempool: the minimum is taken over
+  transfers still awaiting broadcast (`AwaitingSignature`/`Signed`/`Proved`)
+  instead of merely "not yet mined", matching the field's documented contract
+  ("the height at which the next transfer becomes broadcastable").
 
 ## 2.6.0-alpha.6 - 2026-06-26
 
