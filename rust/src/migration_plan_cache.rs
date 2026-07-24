@@ -26,6 +26,10 @@ use zcash_pool_migration_backend::engine::MigrationPlan;
 #[derive(Clone)]
 pub(crate) struct CachedPlan {
     pub plan: MigrationPlan,
+    /// The chain tip used when the preview was encoded. This is retained so the pre-commit
+    /// consent check can reproduce `estimated_duration_hours` exactly even if the live tip moves
+    /// while the user reviews the schedule.
+    pub reference_height: zcash_protocol::consensus::BlockHeight,
 }
 
 type Key = (PathBuf, [u8; 16]);
@@ -37,11 +41,19 @@ fn store() -> &'static Mutex<HashMap<Key, CachedPlan>> {
 
 /// Records the most recently previewed plan for `(db_path, account)`, replacing any previous one
 /// (each propose call replaces any prior unconsumed proposal).
-pub(crate) fn set(db_path: PathBuf, account: [u8; 16], plan: MigrationPlan) {
-    store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert((db_path, account), CachedPlan { plan });
+pub(crate) fn set(
+    db_path: PathBuf,
+    account: [u8; 16],
+    plan: MigrationPlan,
+    reference_height: zcash_protocol::consensus::BlockHeight,
+) {
+    store().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        (db_path, account),
+        CachedPlan {
+            plan,
+            reference_height,
+        },
+    );
 }
 
 /// Returns a clone of the cached plan for `(db_path, account)`, if any.

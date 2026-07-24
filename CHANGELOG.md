@@ -101,10 +101,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   display values: they are checked against the previewed plan (or, once committed, the stored
   state) and a mismatch throws `migrationPlanStale` — the same "re-propose and re-display"
   recovery as an actually stale plan — so a stale or tampered display can never sign different
-  values than the ones the user approved. Ids, amounts, expiry heights, and the estimated
-  duration are always compared; `nextExecutableAfterHeight` is compared only against the
-  previewed plan, never post-commit (the immediate lane's commit-time reschedule legitimately
-  moves it away from an honest echo), and `anchorHeight` is display-only, never compared. `migrationRefreshStaleTransfers(usk:for:)` rebuilds every expired transfer of
+  values than the ones the user approved. Ids, amounts, and expiry heights are always compared;
+  `nextExecutableAfterHeight` and the estimated duration are compared against the previewed plan
+  only, never post-commit (a refresh rebuild can legitimately reschedule a stored transfer, and
+  duration is serve-time-relative display metadata), and `anchorHeight` is display-only, never
+  compared. `migrationRefreshStaleTransfers(usk:for:)` rebuilds every expired transfer of
   the stored run in place through the engine's rebuild-on-expiry — the same funding note
   (recovered by nullifier identity from the expired PCZT, never an equal-value substitute),
   rescheduled from the current tip with a fresh canonical expiry and a freshly drawn boundary
@@ -288,6 +289,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `.newWallet` birthday floor now uses the network's configured Sapling activation height (`network.saplingActivationHeight`) instead of the static regtest constant, so custom networks clamp the birthday to the correct height.
 - `markVoteSubmitted` surfaces the real cause of a vote-tx-hash lookup failure (missing vote row, locked/corrupt database) instead of always reporting "requires a stored vote tx hash"; that guidance now appears only when the vote exists but has no stored hash yet.
 - Tor-layer errors (`rustTorConnectToLightwalletd`, `rustTorLwdGetInfo`, `rustTorLwdSubmit`, `rustTorLwdFetchTransaction`, `rustTorLwdLatestBlockHeight`, `rustTorLwdGetTreeState`) are now classified as retryable service errors in `CompactBlockProcessor`. Previously these errors bypassed the service-error retry path and went straight to a fatal sync failure, so a transient Tor circuit/stream issue (e.g. "remote hostname lookup failure", "Failed to obtain exit circuit for ports", "Tor network protocol violation") required a full app restart to recover. They now trigger the same reset-and-retry behavior (including tearing down cached Tor connections via `service.closeConnections()`) as other transport errors, up to `ZcashSDK.serviceFailureRetries` times.
+- `MigrationSchedule.estimatedDurationHours` now measures from proposal (or re-serve) time to the last scheduled transfer, matching its documented "how long the schedule takes to fully execute" contract. Previously it measured only the first-to-last scheduled-transfer span, which excluded the wait until the first transfer fires and could read shorter than the per-transfer ETAs computed from the same schedule. Correspondingly, the post-commit consent-echo validation no longer exact-matches the echoed duration (it is serve-time-relative display metadata now); the pre-commit validation still checks it byte-for-byte.
 
 # 2.6.0-alpha.6
 
