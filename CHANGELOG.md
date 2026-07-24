@@ -160,7 +160,9 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   surface `zcashlc_slipstream_*` with error codes `ZRUST0093`–`ZRUST0097`. Hosts opt in by
   constructing it; `SDKSynchronizer` remains the default engine. It also implements the
   `Synchronizer` protocol's migration group (above) against its own `OrchardMigrationHost`, with
-  the same SDK-enforced start-gate/broadcast-guard session separation as `SDKSynchronizer`.
+  the same SDK-enforced start-gate/broadcast-guard session separation as `SDKSynchronizer`, and
+  forwards the Keystone batch-signing bridge the same way `SDKSynchronizer` does — straight to the
+  same rust backend instance, bypassing `OrchardMigrationHost` since the bridge is DB-free.
 - `Synchronizer.allTransactions()` is a formal protocol requirement, and
   `TransactionRepository.unreconciledTxids()` exposes the read-side reconciliation view (defaults
   to empty when the engine's view is absent).
