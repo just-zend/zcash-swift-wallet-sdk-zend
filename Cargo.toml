@@ -19,7 +19,7 @@ orchard = { version = "0.15", features = ["unstable-voting-circuits"] }
 pasta_curves = "0.5"
 ff = "0.13"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
-transparent = { package = "zcash_transparent", version = "0.9", default-features = false }
+transparent = { package = "zcash_transparent", version = "0.10", default-features = false }
 zcash_address = { version = "0.13" }
 zcash_client_backend = { version = "0.24.0-rc.1", features = [
     "lightwalletd-tonic-tls-webpki-roots",
@@ -31,17 +31,16 @@ zcash_client_backend = { version = "0.24.0-rc.1", features = [
 ] }
 zcash_client_sqlite = { version = "0.22.0-rc.1", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_note_encryption = "0.4.1"
-zcash_primitives = "0.29"
-zcash_proofs = "0.29"
+zcash_primitives = "0.30"
+zcash_proofs = "0.30"
 zcash_protocol = { version = "0.10", features = ["local-consensus"] }
-# Not on crates.io yet — the pool-migration engine lives on librustzcash main (its
-# SQLite store moved into `zcash_client_sqlite::pool_migration`, so the old separate
-# store crate is gone). Direct git dependency at the same rev as the
-# [patch.crates-io] family below so the whole graph stays one family instance.
-zcash_pool_migration_backend = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb", features = ["wallet"] }
+# The pool-migration engine, renamed from `zcash_pool_migration_backend` and now an
+# alpha release on crates.io; it rides the same [patch.crates-io] rev as the rest of
+# the family below (its SQLite store lives in `zcash_client_sqlite::pool_migration`).
+zcash_pool_migration = { version = "0.1.0-alpha.1", features = ["wallet"] }
 zcash_script = "0.4"
 zip32 = "0.2"
-pczt = { version = "0.8.0-rc.1", features = ["prover", "orchard", "sapling", "signer"] }
+pczt = { version = "0.8", features = ["prover", "orchard", "sapling", "signer"] }
 shardtree = "0.7"
 
 # Keystone hardware-wallet batch signing for the Orchard migration flow.
@@ -129,31 +128,37 @@ lto = true
 
 # The Ironwood-era librustzcash family is not on crates.io yet; unreleased
 # sources ride [patch.crates-io] against the canonical repo — never direct
-# git+branch dependencies. The rev is current zcash/librustzcash main — the
-# same rev the zcash_voting workspace rides, so the whole graph resolves to a
-# single family instance. Bump it deliberately (build + OfflineTests green),
-# and delete the whole block at the 0.24-era crates.io release.
+# git+branch dependencies. The rev is a commit hash on
+# zcash/librustzcash's `feature/configurable-anchor-bucket-interval`, which is
+# what supplies the configurable anchor retention interval this SDK selects per
+# network in `rust/src/lib.rs`. Bump it deliberately (build + OfflineTests
+# green), and delete the whole block at the 0.24-era crates.io release.
 [patch.crates-io]
 zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting.git", rev = "a4daaf77f793b35a98a3d811b920a01b95fbfa7a" }
 
-# Pin the whole librustzcash stack to a single git rev carrying the merged Ironwood
-# historical selector, pending a crates.io release. zcash_voting no longer hard-pins
-# librustzcash (it declares crates.io versions and patches from its own root), so this
-# workspace's patch governs the rev for the entire graph and everything resolves to one
-# copy. Bump this rev in one place to advance the stack.
-# librustzcash@3a10e7f itself patches orchard to the ZIP 374 deferred-anchor-builder
+# Pin the whole librustzcash stack to a single git rev, pending a crates.io release.
+# zcash_voting no longer hard-pins librustzcash (it declares crates.io versions and
+# patches from its own root), so this workspace's patch governs the rev for the entire
+# graph and everything resolves to one copy. Bump this rev in one place to advance the
+# stack — but note that this rev carries the zcash_primitives 0.30 / zcash_transparent
+# 0.10 releases, which zcash_voting's own `zcash_primitives = "0.29.0"` requirement
+# cannot accept; that pin has to move first or the graph splits into two
+# zcash_primitives copies.
+# librustzcash itself patches orchard to the ZIP 374 deferred-anchor-builder
 # rev below (unreleased); [patch] does not propagate to consumers, so this workspace
 # declares the identical rev. Drop when orchard releases it.
 orchard = { git = "https://github.com/zcash/orchard.git", rev = "3bd2b736d1273226595773265313fc3f3428af16" }
-equihash = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "cd2b9a6a27dd784df3d245cd047bfeade21d9430" }

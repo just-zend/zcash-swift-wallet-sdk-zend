@@ -1,6 +1,6 @@
 //! The adapter wiring this SDK's wallet database into the pool-migration engine's traits.
 //!
-//! [`zcash_pool_migration_backend`]'s engine works over four traits — `MigrationBackend` (notes and
+//! [`zcash_pool_migration`]'s engine works over four traits — `MigrationBackend` (notes and
 //! chain tip), `MigrationCrypto` (viewing key, note plaintexts, signing), and `PoolMigrationRead` /
 //! `PoolMigrationWrite` (the store). The crate ships its own `wallet::WalletMigration` adapter, but
 //! that adapter requires a `UnifiedSpendingKey` unconditionally (it derives the Orchard FVK from
@@ -32,11 +32,12 @@ use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::pool_migration::orchard_ironwood::PoolMigrations;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_pool_migration_backend::build::sign_pczt;
-use zcash_pool_migration_backend::engine::{
+use zcash_pool_migration::build::sign_pczt;
+use zcash_pool_migration::engine::{
     MigrationBackend, MigrationCrypto, MigrationState, MigrationTxId, MigrationTxState,
     PoolMigrationRead, PoolMigrationWrite,
 };
+use zcash_pool_migration::scheduling::SchedulingParams;
 use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
@@ -153,6 +154,17 @@ impl MigrationBackend for Backend<'_> {
             .chain_height()
             .map_err(|e| anyhow!("chain height lookup failed: {e}"))?
             .ok_or_else(|| anyhow!("the wallet has no chain tip yet; sync first"))
+    }
+
+    /// The anchor bucket grid is the wallet's own anchor retention interval (selected per network
+    /// in [`crate::wallet_db`]), so a transfer can only anchor to a boundary whose checkpoint this
+    /// wallet retains; the delay distributions are derived from that interval by the ZIP 318
+    /// ratios, which reproduces the specified schedule exactly on the standard 144-block grid and
+    /// compresses it by the same factor on a shortened one.
+    fn scheduling_params(&self) -> SchedulingParams {
+        SchedulingParams::new_with_default_distributions(
+            self.wallet.anchor_retention_interval().into(),
+        )
     }
 }
 

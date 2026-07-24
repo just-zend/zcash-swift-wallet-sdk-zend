@@ -1,5 +1,5 @@
 //! FFI over the final Orchard→Ironwood pool-migration engine
-//! ([`zcash_pool_migration_backend`] + the `zcash_client_sqlite::pool_migration` store).
+//! ([`zcash_pool_migration`] + the `zcash_client_sqlite::pool_migration` store).
 //!
 //! The engine is a set of free functions over traits — [`crate::migration_engine::Backend`] wires
 //! this SDK's wallet database (and the account-keyed migration store living inside it) into them;
@@ -71,11 +71,11 @@ use zcash_protocol::consensus::{
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
 
-use zcash_pool_migration_backend::engine::{
+use zcash_pool_migration::engine::{
     self, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction, MigrationTxId,
     MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
-use zcash_pool_migration_backend::wallet::WalletMigrationProver;
+use zcash_pool_migration::wallet::WalletMigrationProver;
 
 use crate::migration_engine::{Backend, MigrationWallet};
 use crate::migration_finalize;
@@ -380,7 +380,7 @@ fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bloc
 ///   funding-note order differ from broadcast order.
 fn schedule_rows(
     funding_notes: &[Zatoshis],
-    schedule: &[zcash_pool_migration_backend::scheduling::Schedule],
+    schedule: &[zcash_pool_migration::scheduling::Schedule],
     prep_tx_count: u32,
 ) -> anyhow::Result<Vec<(MigrationTxId, Zatoshis, BlockHeight, BlockHeight)>> {
     if funding_notes.len() != schedule.len() {
@@ -640,6 +640,9 @@ fn commit_or_resume(
             state.note_split().clone(),
             state.preparation().clone(),
             transactions,
+            // Rebuilding transfers does not re-plan the run, so it stays on the grid it was
+            // committed under.
+            state.anchor_bucket_interval(),
         );
         let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         backend.replace_migration(&state)?;
@@ -1439,7 +1442,7 @@ fn marshal_state(
 /// The account's live spendable Orchard balance (what is still in the old pool).
 fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
     let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-    use zcash_pool_migration_backend::engine::MigrationBackend;
+    use zcash_pool_migration::engine::MigrationBackend;
     let values = backend.spendable_orchard_note_values()?;
     values
         .into_iter()
@@ -2212,6 +2215,7 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
                         state.note_split().clone(),
                         state.preparation().clone(),
                         state.transactions().clone(),
+                        state.anchor_bucket_interval(),
                     );
                     backend.replace_migration(&cancelled)?;
                 }
@@ -2742,9 +2746,9 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use zcash_pool_migration_backend::note_splitting::NoteSplitPlan;
-    use zcash_pool_migration_backend::preparation::PreparationPlan;
-    use zcash_pool_migration_backend::scheduling;
+    use zcash_pool_migration::note_splitting::NoteSplitPlan;
+    use zcash_pool_migration::preparation::PreparationPlan;
+    use zcash_pool_migration::scheduling::{self, AnchorBucketInterval, SchedulingParams};
 
     fn zat(v: u64) -> Zatoshis {
         Zatoshis::from_u64(v).unwrap()
@@ -2918,6 +2922,7 @@ mod tests {
             .unwrap(),
             PreparationPlan::from_parts(Vec::new(), Vec::new()),
             transactions,
+            AnchorBucketInterval::ZIP_318,
         )
     }
 
@@ -3028,7 +3033,7 @@ mod tests {
     #[test]
     fn schedule_rows_sort_chronologically_with_prep_offset() {
         let mut rng = StdRng::seed_from_u64(7);
-        let schedule = scheduling::schedule(h(1_000), 5, &mut rng);
+        let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng);
         let amounts: Vec<Zatoshis> = (1..=5).map(|i| zat(i * 100_000_000)).collect();
         let rows = schedule_rows(&amounts, &schedule, 3).unwrap();
         assert_eq!(rows.len(), 5);
@@ -3050,7 +3055,7 @@ mod tests {
     #[test]
     fn schedule_rows_reject_length_mismatch() {
         let mut rng = StdRng::seed_from_u64(7);
-        let schedule = scheduling::schedule(h(1_000), 3, &mut rng);
+        let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 3, &mut rng);
         let amounts = vec![zat(100)];
         assert!(schedule_rows(&amounts, &schedule, 0).is_err());
     }
@@ -3166,6 +3171,7 @@ mod tests {
             .unwrap(),
             PreparationPlan::from_parts(Vec::new(), Vec::new()),
             transactions,
+            AnchorBucketInterval::ZIP_318,
         );
 
         let schedule_ptr =
@@ -3509,7 +3515,7 @@ mod tests {
         )
         .into_option()
         .expect("valid fixture note parts");
-        zcash_pool_migration_backend::build::build_transfer_pczt(
+        zcash_pool_migration::build::build_transfer_pczt(
             &MAIN_NETWORK,
             target_height,
             expiry_height,
@@ -3727,6 +3733,7 @@ mod tests {
             base.note_split().clone(),
             base.preparation().clone(),
             transactions,
+            base.anchor_bucket_interval(),
         );
         store_fixture_state(&path, &account, &state);
 
@@ -3782,8 +3789,8 @@ mod tests {
 
     // ----- prove dispatch (kind routing + transient/hard error mapping) -----
 
-    use zcash_pool_migration_backend::engine::MigrationProver;
-    use zcash_pool_migration_backend::wallet::WalletProveError;
+    use zcash_pool_migration::engine::MigrationProver;
+    use zcash_pool_migration::wallet::WalletProveError;
     use zcash_protocol::consensus::BranchId;
 
     /// The prover error type the dispatch tests fail with: the REAL upstream
@@ -3823,6 +3830,10 @@ mod tests {
             self.calls.push(ProveCall::Preparation(anchor));
             Ok(pczt)
         }
+
+        fn anchor_bucket_interval(&self) -> AnchorBucketInterval {
+            AnchorBucketInterval::ZIP_318
+        }
     }
 
     /// A test prover that fails its one expected call with the configured error.
@@ -3847,6 +3858,10 @@ mod tests {
             _anchor: BlockHeight,
         ) -> Result<pczt::Pczt, Self::Error> {
             Err(self.error.take().expect("the prover is consulted once"))
+        }
+
+        fn anchor_bucket_interval(&self) -> AnchorBucketInterval {
+            AnchorBucketInterval::ZIP_318
         }
     }
 
@@ -3903,6 +3918,7 @@ mod tests {
             base.note_split().clone(),
             base.preparation().clone(),
             transactions,
+            base.anchor_bucket_interval(),
         )
     }
 
@@ -4163,6 +4179,7 @@ mod tests {
             base.note_split().clone(),
             base.preparation().clone(),
             transactions,
+            base.anchor_bucket_interval(),
         )
     }
 

@@ -165,6 +165,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-account owner (making re-locking idempotent), every selection path keeps
   excluding locked notes, and `zcashlc_migration_unlock_residual` still clears
   the account's locks wholesale.
+- The anchor bucket interval is now selected per network. Mainnet keeps the ZIP
+  318 grid (144 blocks); testnet and custom-parameter networks retain durable
+  anchor checkpoints every 12 blocks instead, so a pool migration crosses enough
+  anchor boundaries to be exercised in a test run. The transfer and preparation
+  delay distributions are derived from that interval, so the whole ZIP 318
+  schedule is compressed by the same factor rather than a short grid being
+  crossed with three-hour delays. Nothing crosses the FFI for this: every wallet
+  handle is opened with the interval its already-known `network_id` selects, so
+  the retention grid and the grid migrations anchor to cannot disagree. Existing
+  testnet wallets with a migration already in flight are unaffected — the
+  interval a migration was committed under is recorded with it and keeps being
+  retained until the run ends.
+- The pool-migration engine crate is now `zcash_pool_migration` (renamed from
+  `zcash_pool_migration_backend`) and is consumed from crates.io through the
+  same `[patch.crates-io]` family pin as the rest of librustzcash, rather than
+  as a standalone git dependency.
 
 ## 2.6.0-alpha.6 - 2026-06-26
 

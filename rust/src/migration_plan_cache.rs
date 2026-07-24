@@ -34,7 +34,7 @@ use std::sync::{Mutex, OnceLock};
 
 use rand::RngCore;
 use rand::rngs::OsRng;
-use zcash_pool_migration_backend::engine::MigrationPlan;
+use zcash_pool_migration::engine::MigrationPlan;
 
 /// Opaque identifier of one cached [`MigrationPlan`]. Drawn fresh (randomly, never zero) for
 /// every plan, so a handle from an earlier proposal can never accidentally match a later one.

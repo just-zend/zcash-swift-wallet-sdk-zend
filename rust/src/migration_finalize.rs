@@ -1,6 +1,6 @@
 //! Prove-at-broadcast-time support for the migration engine (ZIP 374 deferred anchor/witness).
 //!
-//! The engine (`zcash_pool_migration_backend`) commits every migration transaction fully built and
+//! The engine (`zcash_pool_migration`) commits every migration transaction fully built and
 //! signed, with its Orchard spend witnesses and anchors left unset — the durable artifact in
 //! `MigrationTransaction::pczt()` never changes after commit. At proving time this module routes
 //! each due transaction through the UPSTREAM prover: [`prove_due_transaction`] dispatches on the
@@ -19,9 +19,10 @@
 //!   instead of timestamping the wallet's recent activity with a fresh anchor. A transfer with no
 //!   stored boundary is a corrupt store and a HARD error — never a fallback to the natural
 //!   anchor. Boundary checkpoints stay durably witnessable because upstream anchor-checkpoint
-//!   retention (`ANCHOR_RETENTION_INTERVAL`, active from NU6.3 activation) retains every
-//!   144th-block checkpoint — the same 144-block grid the engine draws boundaries on
-//!   (`scheduling::BOUNDARY_MODULUS`).
+//!   retention (active from NU6.3 activation) keeps every boundary of the wallet's anchor
+//!   retention interval — necessarily the same grid the engine draws boundaries on, since the
+//!   engine reads that interval back off the wallet. [`crate::anchor_retention_interval`] is where
+//!   the SDK selects it per network.
 //! - PREPARATIONS carry no drawn boundary (they anchor to their already-mined dependencies, not
 //!   to a bucketed boundary) and prove against the wallet's current natural anchor
 //!   ([`natural_anchor_height`]) via `engine::prove_preparation`.
@@ -36,10 +37,10 @@
 
 use anyhow::anyhow;
 use zcash_client_backend::data_api::WalletRead;
-use zcash_pool_migration_backend::engine::{
+use zcash_pool_migration::engine::{
     self, MigrationProver, MigrationState, MigrationTxId, MigrationTxKind,
 };
-use zcash_pool_migration_backend::wallet::WalletProveError;
+use zcash_pool_migration::wallet::WalletProveError;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::migration::proving_unavailable;

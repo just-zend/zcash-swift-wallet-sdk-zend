@@ -64,7 +64,9 @@ pub(super) fn json_to_boxed_slice<T: Serialize>(
     Ok(crate::ffi::BoxedSlice::some(json))
 }
 
-/// Open the wallet database.
+/// Open the wallet database, retaining durable anchor checkpoints on the same interval every other
+/// wallet handle in this crate uses for `network_id` (see [`crate::anchor_retention_interval`]), so
+/// that scanning through this path keeps the boundaries a pool migration will need.
 pub(super) fn open_wallet_db(
     wallet_db_path: &str,
     network_id: u32,
@@ -78,6 +80,7 @@ pub(super) fn open_wallet_db(
 > {
     let network = crate::parse_network(network_id)?;
     zcash_client_sqlite::WalletDb::for_path(wallet_db_path, network, SystemClock, rand::rngs::OsRng)
+        .map(|db| db.with_anchor_retention_interval(crate::anchor_retention_interval(network)))
         .map_err(|e| anyhow!("failed to open wallet DB: {}", e))
 }
 
