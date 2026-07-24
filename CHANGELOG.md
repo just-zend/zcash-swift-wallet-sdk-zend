@@ -101,11 +101,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   display values: they are checked against the previewed plan (or, once committed, the stored
   state) and a mismatch throws `migrationPlanStale` — the same "re-propose and re-display"
   recovery as an actually stale plan — so a stale or tampered display can never sign different
-  values than the ones the user approved. Ids, amounts, and expiry heights are always compared;
-  `nextExecutableAfterHeight` and the estimated duration are compared against the previewed plan
-  only, never post-commit (a refresh rebuild can legitimately reschedule a stored transfer, and
-  duration is serve-time-relative display metadata), and `anchorHeight` is display-only, never
-  compared. `migrationRefreshStaleTransfers(usk:for:)` rebuilds every expired transfer of
+  values than the ones the user approved. Ids, amounts, expiry heights, and the estimated
+  duration are always compared; `nextExecutableAfterHeight` is compared only against the
+  previewed plan, never post-commit (the immediate lane's commit-time reschedule legitimately
+  moves it away from an honest echo), and `anchorHeight` is display-only, never compared. `migrationRefreshStaleTransfers(usk:for:)` rebuilds every expired transfer of
   the stored run in place through the engine's rebuild-on-expiry — the same funding note
   (recovered by nullifier identity from the expired PCZT, never an equal-value substitute),
   rescheduled from the current tip with a fresh canonical expiry and a freshly drawn boundary

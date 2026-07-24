@@ -21,15 +21,20 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use zcash_pool_migration_backend::engine::MigrationPlan;
+use zcash_protocol::consensus::BlockHeight;
 
 /// A cached preview.
 #[derive(Clone)]
 pub(crate) struct CachedPlan {
     pub plan: MigrationPlan,
-    /// The chain tip used when the preview was encoded. This is retained so the pre-commit
-    /// consent check can reproduce `estimated_duration_hours` exactly even if the live tip moves
-    /// while the user reviews the schedule.
-    pub reference_height: zcash_protocol::consensus::BlockHeight,
+    /// The chain tip at propose time — the `now` stamped into the encoded schedule
+    /// (`FfiTransferProposal::anchor_height`, and, since #1806, the base of
+    /// `estimated_duration_hours`). Recorded so a later commit can reproduce byte-for-byte the
+    /// schedule DTO the platform actually saw when validating the platform's echoed consent
+    /// values — re-reading the wallet's CURRENT tip instead could disagree with what was
+    /// previewed if blocks landed between propose and confirm, without the plan itself having
+    /// gone stale.
+    pub reference_height: BlockHeight,
 }
 
 type Key = (PathBuf, [u8; 16]);
@@ -45,7 +50,7 @@ pub(crate) fn set(
     db_path: PathBuf,
     account: [u8; 16],
     plan: MigrationPlan,
-    reference_height: zcash_protocol::consensus::BlockHeight,
+    reference_height: BlockHeight,
 ) {
     store().lock().unwrap_or_else(|e| e.into_inner()).insert(
         (db_path, account),

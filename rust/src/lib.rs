@@ -2487,6 +2487,12 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             &spend_pools[..]
         };
 
+        let pools: &[ShieldedPool] = if orchard_only {
+            &[ShieldedPool::Orchard]
+        } else {
+            &[ShieldedPool::Sapling, ShieldedPool::Orchard]
+        };
+
         let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
             &mut db_data,
             &network,

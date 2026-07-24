@@ -568,7 +568,7 @@ fn encode_empty_schedule() -> *mut FfiMigrationSchedule {
 //
 // `zcashlc_migration_sign_and_store_schedule` and `zcashlc_migration_create_unsigned_transfer_pczts`
 // take back the transfer schedule the platform displayed and got the user's consent for — the same
-// shape `zcashlc_migration_propose_transfers` returned. These are verified
+// shape `zcashlc_migration_propose_transfers`/`_immediate_transfers` returned. These are verified
 // consent echoes: the values the user approved must match what is about to be signed, or the call
 // fails with the `MIGRATION_PLAN_STALE:` prefix (the app's existing recovery — re-propose/re-read
 // and re-display — reused rather than adding a new error route).
@@ -623,13 +623,16 @@ struct StoredEchoRow {
 
 /// The consent-echo rows and duration `zcashlc_migration_propose_transfers` returned for the
 /// cached plan, reconstructed byte-for-byte from the cache: the plan is deterministic — ids,
-/// net amounts, drawn broadcast heights, and expiries never move between propose and commit.
-/// Duration is measured from `cached.reference_height` (the ORIGINAL propose-time `now`, see
-/// [`estimated_duration_hours`]) rather than a freshly re-read tip: it is what
-/// `encode_schedule_from_plan` used to compute the value this call reproduces, byte for byte. This
-/// PRE-commit path is, since #1806, the ONLY place `estimated_duration_hours` is still checked as
-/// a verified consent echo — see [`StoredEchoRow`]'s doc for why the POST-commit (STORED-state)
-/// path deliberately excludes it instead of re-deriving a value that could disagree here.
+/// net amounts, drawn broadcast heights, and expiries never move between propose and commit for
+/// the scheduled lane, so no row-level tip re-read is involved. (The immediate lane is an
+/// ordinary send-max sweep outside the engine and never touches the plan cache — see the module
+/// doc.) The duration is, since #1806, measured from `cached.reference_height` (the ORIGINAL
+/// propose-time `now`, see [`estimated_duration_hours`]) rather than a freshly re-read tip: it is
+/// exactly what `encode_schedule_from_plan` used to compute the value this call reproduces, byte
+/// for byte. This PRE-commit path is also, since #1806, the ONLY place
+/// `estimated_duration_hours` is still checked as a verified consent echo — see
+/// [`StoredEchoRow`]'s doc for why the POST-commit (STORED-state) path deliberately excludes it
+/// instead of re-deriving a value that could disagree here.
 fn expected_rows_from_cached_plan(
     cached: &migration_plan_cache::CachedPlan,
 ) -> anyhow::Result<(Vec<EchoRow>, u32)> {
@@ -639,11 +642,7 @@ fn expected_rows_from_cached_plan(
         prep_tx_count(&cached.plan),
     )?;
     let duration = estimated_duration_hours(
-        cached
-            .plan
-            .schedule()
-            .iter()
-            .map(|entry| entry.broadcast_height()),
+        cached.plan.schedule().iter().map(|e| e.broadcast_height()),
         cached.reference_height,
     );
     let rows = rows
@@ -829,7 +828,7 @@ fn note_split_echo_matches(
 }
 
 /// Validates the platform's echoed transfer-schedule values against the plan cached for this
-/// account — the values `zcashlc_migration_propose_transfers` returned.
+/// account — the values `zcashlc_migration_propose_transfers`/`_immediate_transfers` returned.
 /// `Ok(())` when nothing is cached: that is the resume case (a run is already stored, so there is
 /// nothing "about to commit" to check the echo against here); `commit_or_resume`'s own cache
 /// lookup handles the "neither a cache nor a stored run" case.
@@ -867,9 +866,10 @@ fn validate_schedule_echo_against_cache(
 /// committed transfer subset — the source of truth once a run exists (there is no cache to consult
 /// post-commit). Two of the five echoed values are accepted but deliberately NOT compared here —
 /// see [`StoredEchoRow`]'s doc for why both are structurally excluded, not just unchecked:
-/// - `next_executable_after_heights`: rebuilding an expired transfer legitimately reschedules it
-///   after the platform captured its display copy, and unlike an actually stale plan there is no
-///   way to converge on a match by re-proposing (the stored run is already committed).
+/// - `next_executable_after_heights`: the immediate lane's commit-time reschedule can legitimately
+///   move this value away from what the platform honestly previewed and is echoing back, and
+///   unlike an actually stale plan there is no way to converge on a match by re-proposing (the
+///   stored value is already fixed by the completed commit).
 /// - `estimated_duration_hours` (#1806): post-fix it is derived, serve-time-relative display
 ///   metadata (`max(scheduled) - now`), not a value with a stable pre-commit reference surviving
 ///   here to reproduce byte-for-byte the way [`expected_rows_from_cached_plan`]'s cached
@@ -2482,8 +2482,9 @@ pub unsafe extern "C" fn zcashlc_migration_propose_transfers(
 /// resume/no-op case — there is no cache to consult, and the stored state is the actual thing
 /// about to be (re-)signed), only `ids`/`amounts`/`expiry_heights` are checked, against the
 /// STORED state; `next_executable_after_heights` and `estimated_duration_hours` are NOT:
-/// - `next_executable_after_heights`: rebuilding an expired transfer legitimately gives it a
-///   fresh scheduled height after the platform captured its display copy.
+/// - `next_executable_after_heights`: the immediate lane's commit legitimately reschedules every
+///   transfer to the commit-time tip, which can differ from the preview-time tip the platform is
+///   honestly echoing back (e.g. a block landed during user review).
 /// - `estimated_duration_hours` (#1806): once committed, duration is re-serve-time-relative
 ///   display metadata (see `stored_duration_hours`'s doc) with no stable pre-commit reference
 ///   surviving here to check an echo against byte-for-byte.
@@ -2999,8 +3000,8 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
 /// including a length mismatch — errors with the `MIGRATION_PLAN_STALE:` prefix (the app re-reads
 /// the current state). `next_executable_after_heights`/`anchor_heights`/`estimated_duration_hours`
 /// are accepted but NOT checked — see `zcashlc_migration_sign_and_store_schedule`'s doc for why
-/// (a refresh rebuild can legitimately move the first away from an honest echo, with no way to
-/// converge by re-proposing; the second is never consent-critical;
+/// (the first's immediate-lane commit-time reschedule can legitimately move it away from an
+/// honest echo, with no way to converge by re-proposing; the second is never consent-critical;
 /// the third (#1806) is re-serve-time-relative display metadata post-commit, with no stable
 /// pre-commit reference surviving here to check it against).
 ///
@@ -4088,7 +4089,9 @@ mod tests {
         );
         // `test_state`'s two transfers (ids 0, 1) both cross 100_000_000 zatoshi NET (the stored
         // funding note is gross of the fixed 10_000-zatoshi fee buffer; `transfer_amount` nets it
-        // back out), at height 50, expiring at 10_000; duration is zero (one shared height).
+        // back out), at height 50, expiring at 10_000; the echoed duration (`0` below) is
+        // excluded from the state-side comparison entirely (see `StoredEchoRow`), so its value
+        // is arbitrary here.
         let (_owned, ids) = c_ids(&[0, 1]);
         let amounts = [100_000_000i64, 100_000_000i64];
         let next_executable_after_heights = [50i64, 50i64];
@@ -4210,8 +4213,8 @@ mod tests {
         );
         let (_owned, ids) = c_ids(&[0]);
         let amounts = [100_000_000i64];
-        // Drifted far from the stored transfer's actual scheduled height (50) — as if the stored
-        // transfer had been rebuilt after the platform captured its prior display copy.
+        // Drifted far from the stored transfer's actual scheduled height (50) — as if a block (or
+        // several) landed between the immediate-lane preview and the commit that rescheduled it.
         let next_executable_after_heights = [999_999i64];
         let expiry_heights = [10_000i64];
         assert!(
