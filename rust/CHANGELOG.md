@@ -69,6 +69,45 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`runs_len == 0`), not an error; NULL = error. Signer per-session capacity
   is deliberately NOT a parameter: the platform evaluates signing sessions
   from the per-run transaction counts.
+- Keystone batch-signing UR bridge (`rust/src/migration_keystone.rs`, adopted from the upstream
+  Swift SDK migration feature branch and kept on its `ur`/`ur-registry` wire schema): the four
+  upstream FFI functions plus one additive Zend claim-owned builder.
+  - `zcashlc_migration_keystone_build_sign_batch_qr_parts` redacts every passed-in unsigned PCZT
+    with `redact_pczt_for_batch_signer` (clearing the wire spend FVK and any pre-existing
+    Orchard/Ironwood `spend_auth_sig` — the dummy padding spend `IoFinalizer` already self-signs,
+    which the Keystone batch firmware otherwise rejects outright) before encoding a
+    `pczt::roles::signer::batch::BatchSignRequest` into animated multi-part
+    `"zcash-sign-batch"` UR QR frames (`FfiKeystoneQrParts`, this crate's first string-array FFI
+    output type, freed by `zcashlc_free_migration_keystone_qr_parts`). Takes ONE ordered PCZT
+    array (preparation PCZTs first, then transfer PCZTs) rather than the Android source's
+    `(split, transfers)` pair — same wire order, flattened Rust-side shape, since the Swift
+    caller already holds every unsigned PCZT as one collection. `ids` is deliberately not a
+    parameter here; the build step has no use for them.
+  - `zcashlc_migration_keystone_reset_sign_batch_decoder` (void, infallible) and
+    `zcashlc_migration_keystone_decode_sign_batch_part` (returns
+    `FfiKeystoneBatchDecodeResult`, freed by
+    `zcashlc_free_migration_keystone_batch_decode_result`) drive the stateful multi-frame
+    `"zcash-batch-sig-result"` scan session one QR frame at a time — `complete`/`progress` for
+    the fountain-decoder state, and, once complete, the serialized `BatchSignResponse` bytes plus
+    the signing device's own reported firmware version (the only place a batch-signed migration
+    can learn it, since the response never echoes back PCZT bytes). Verifies the decoded
+    response's request id against the caller-supplied `expected_request_id` and errors on
+    mismatch rather than silently accepting a scan of an unrelated/stale response.
+  - `zcashlc_migration_keystone_apply_batch_signatures` applies the decoded response's
+    signatures back onto the SAME caller-held unsigned PCZTs, in the SAME order passed to the
+    build call (signatures align by position, not by any id in the wire format), returning
+    signed-but-unproven PCZT bytes through `FfiUnsignedTransferPczts` (now documented as a
+    generic `(id, PCZT bytes)` pair set, not just an unsigned-PCZT container) with the input ids
+    passed through positionally. Errors if the response's signature-set count doesn't match the
+    PCZT count.
+  - The legacy unscoped unsigned-PCZT builders remain fail-closed. Instead,
+    `zcashlc_migration_keystone_build_sign_batch_qr_parts_v2` accepts only live opaque scheduled
+    external-signing claim handles, reloads them from one current Rust-owned delivery snapshot,
+    rejects stale, foreign, immediate-lane, duplicate, or substituted artifacts, and obtains the
+    exact staged canonical PCZTs from those claims. It annotates only transient QR-input copies
+    with the account's ZIP 32 seed fingerprint and account index (`spend_zip32_derivation` on each
+    not-yet-signed Orchard/Ironwood spend action). The durable staged bytes remain unchanged, and
+    the upstream batch combiner applies returned signatures to those original canonical bytes.
 
 - Live per-transaction migration status read: `zcashlc_migration_transaction_statuses`
   marshals the engine's own `MigrationState::transaction_statuses(target)` verbatim —
