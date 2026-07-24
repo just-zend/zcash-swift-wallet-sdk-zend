@@ -31,17 +31,17 @@ zcash_client_backend = { version = "0.24.0-rc.1", features = [
 ] }
 zcash_client_sqlite = { version = "0.22.0-rc.1", features = ["migration-delivery", "orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_note_encryption = "0.4.1"
-zcash_primitives = "0.29"
-zcash_proofs = "0.29"
+zcash_primitives = "0.30"
+zcash_proofs = "0.30"
 zcash_protocol = { version = "0.10", features = ["local-consensus"] }
 # Not on crates.io yet — the pool-migration engine lives on librustzcash main (its
 # SQLite store moved into `zcash_client_sqlite::pool_migration`, so the old separate
 # store crate is gone). Direct git dependency at the same rev as the
 # [patch.crates-io] family below so the whole graph stays one family instance.
-zcash_pool_migration = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b", features = ["wallet"] }
+zcash_pool_migration = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7", features = ["wallet"] }
 zcash_script = "0.4"
 zip32 = "0.2"
-pczt = { version = "0.8.0-rc.1", features = ["prover"] }
+pczt = { version = "0.8.0", features = ["prover"] }
 shardtree = "0.7"
 
 # EIP-681
@@ -118,22 +118,23 @@ lto = true
 # Bump it deliberately (build + OfflineTests green), and delete the whole block at the 0.24-era
 # crates.io release.
 [patch.crates-io]
-zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting.git", rev = "a4daaf77f793b35a98a3d811b920a01b95fbfa7a" }
+zcash_voting = { git = "https://github.com/just-zend/zcash_voting.git", rev = "04d255628f1d56de0479e3fb6963409dbe44ec1f" }
 
 # Pin the whole librustzcash stack to a single git rev carrying the merged Ironwood
 # historical selector, pending a crates.io release. zcash_voting no longer hard-pins
 # librustzcash (it declares crates.io versions and patches from its own root), so this
 # workspace's patch governs the rev for the entire graph and everything resolves to one
 # copy. Bump this rev in one place to advance the stack.
-equihash = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-f4jumble = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-pczt = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-zcash_address = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-zcash_client_backend = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-zcash_client_sqlite = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-zcash_encoding = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-zcash_keys = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-zcash_primitives = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-zcash_protocol = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-zcash_transparent = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
-zip321 = { git = "https://github.com/just-zend/librustzcash", rev = "99709cf00a812a33095410a042534a2cf111d41b" }
+equihash = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+f4jumble = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+pczt = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zcash_address = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zcash_client_backend = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zcash_client_sqlite = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zcash_encoding = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zcash_keys = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zcash_primitives = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zcash_proofs = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zcash_protocol = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zcash_transparent = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }
+zip321 = { git = "https://github.com/just-zend/librustzcash", rev = "d44099e1ee6701427b00f7b68d82824d4cbbf2b7" }

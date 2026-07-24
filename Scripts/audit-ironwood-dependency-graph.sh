@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 expected_librustzcash_repository="https://github.com/just-zend/librustzcash"
-expected_zcash_voting_revision="a4daaf77f793b35a98a3d811b920a01b95fbfa7a"
+expected_zcash_voting_revision="04d255628f1d56de0479e3fb6963409dbe44ec1f"
 rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
 expected_librustzcash_revision=$(./Scripts/verify-ironwood-cargo-pins.sh --print-revision)
 
@@ -86,14 +86,15 @@ assert_one() {
 for crate_and_version in \
     "equihash 0.3.0" \
     "f4jumble 0.1.1" \
-    "pczt 0.8.0-rc.1" \
+    "pczt 0.8.0" \
     "zcash_address 0.13.0" \
     "zcash_client_backend 0.24.0-rc.1" \
     "zcash_client_sqlite 0.22.0-rc.1" \
     "zcash_encoding 0.4.0" \
     "zcash_keys 0.15.0" \
     "zcash_pool_migration 0.1.0-alpha.1" \
-    "zcash_primitives 0.29.0" \
+    "zcash_primitives 0.30.0" \
+    "zcash_proofs 0.30.0" \
     "zcash_protocol 0.10.1" \
     "zcash_transparent 0.10.0" \
     "zip321 0.9.0-rc.1"
@@ -101,7 +102,7 @@ do
     read -r crate version <<< "$crate_and_version"
     assert_one "$crate" "$version" "github.com/just-zend/librustzcash?rev=$expected_librustzcash_revision"
 done
-assert_one zcash_voting 1.0.0 "github.com/zodl-inc/zcash_voting.git?rev=$expected_zcash_voting_revision"
+assert_one zcash_voting 1.0.0 "github.com/just-zend/zcash_voting.git?rev=$expected_zcash_voting_revision"
 assert_one orchard 0.15.4
 assert_one voting-circuits 0.9.0-rc.3
 assert_one imt-tree 0.2.0

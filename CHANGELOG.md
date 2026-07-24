@@ -200,10 +200,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on current `zcash/librustzcash` main and contains only the documented Zend delivery-safety deltas;
   the resolved graph uses Orchard 0.15.4. The standalone migration-engine repository and the former
   topic-branch pin are no longer build inputs.
-- Voting rides upstream `zcash_voting` (a pinned rev of its repository's main, aligned to the same
-  librustzcash rev and orchard 0.15; the published 0.11 release pins `orchard ^0.14` and cannot
-  coexist with the Ironwood graph) with **real implementations across the FFI**. Behavioral changes
-  that follow the crate's 1.0/Ironwood redesign:
+- Voting rides upstream `zcash_voting` 1.0 through a minimal Zend dependency bridge that updates
+  only its workspace pins to `pczt 0.8.0`, `zcash_primitives 0.30.0`, the same reviewed
+  librustzcash revision, and Orchard 0.15.4. This prevents an incompatible mixed 0.29/0.30
+  primitive type graph while preserving the upstream implementation. The older published 0.11
+  release pins `orchard ^0.14` and cannot coexist with the Ironwood graph. The SDK exposes the
+  crate's **real implementations across the FFI**. Behavioral changes that follow the crate's
+  1.0/Ironwood redesign:
   - Round ids are 32-byte values (64 lowercase hex chars, canonical Pallas field elements), rounds
     persist their wallet network (`open` takes a `networkId`), and snapshot note selection is
     Ironwood-only at the snapshot anchor.

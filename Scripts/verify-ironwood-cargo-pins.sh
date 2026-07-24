@@ -11,8 +11,8 @@ cd "$(dirname "$0")/.."
 manifest="${IRONWOOD_CARGO_MANIFEST:-Cargo.toml}"
 lockfile="${IRONWOOD_CARGO_LOCKFILE:-Cargo.lock}"
 expected_repository="https://github.com/just-zend/librustzcash"
-expected_voting_repository="https://github.com/zodl-inc/zcash_voting.git"
-expected_voting_revision="a4daaf77f793b35a98a3d811b920a01b95fbfa7a"
+expected_voting_repository="https://github.com/just-zend/zcash_voting.git"
+expected_voting_revision="04d255628f1d56de0479e3fb6963409dbe44ec1f"
 
 for file in "$manifest" "$lockfile"; do
     if [[ ! -f "$file" ]]; then
@@ -59,12 +59,13 @@ expected_names=$(printf '%s\n' \
     zcash_keys \
     zcash_pool_migration \
     zcash_primitives \
+    zcash_proofs \
     zcash_protocol \
     zcash_transparent \
     zip321 | LC_ALL=C sort)
 actual_names=$(sed -nE 's/^([a-zA-Z0-9_-]+)[[:space:]]*=.*$/\1/p' "$librust_lines" | LC_ALL=C sort)
 if [[ "$actual_names" != "$expected_names" ]]; then
-    echo "Error: Cargo.toml does not contain the exact 13 canonical librustzcash-family pins" >&2
+    echo "Error: Cargo.toml does not contain the exact 14 canonical librustzcash-family pins" >&2
     diff -u <(printf '%s\n' "$expected_names") <(printf '%s\n' "$actual_names") >&2 || true
     exit 1
 fi
@@ -73,7 +74,7 @@ fi
 # still locked by Cargo.lock and rebuilt by the reproducibility gate; every non-registry source is
 # restricted here to the exact Zend librustzcash family plus the one reviewed voting repository.
 unexpected_git_lines=$(grep -Ev \
-    'git[[:space:]]*=[[:space:]]*"https://github.com/(just-zend/librustzcash|zodl-inc/zcash_voting\.git)"' \
+    'git[[:space:]]*=[[:space:]]*"https://github.com/just-zend/(librustzcash|zcash_voting\.git)"' \
     "$all_git_lines" || true)
 if [[ -n "$unexpected_git_lines" ]]; then
     echo "Error: Cargo.toml contains an unreviewed git dependency" >&2
@@ -81,8 +82,8 @@ if [[ -n "$unexpected_git_lines" ]]; then
     exit 1
 fi
 git_dependency_count=$(wc -l < "$all_git_lines" | tr -d ' ')
-if [[ "$git_dependency_count" != "14" ]]; then
-    echo "Error: Cargo.toml must contain exactly 13 librustzcash pins and one voting pin" >&2
+if [[ "$git_dependency_count" != "15" ]]; then
+    echo "Error: Cargo.toml must contain exactly 14 librustzcash pins and one voting pin" >&2
     exit 1
 fi
 # The package's own library target is the sole path key in the manifest. Reject inline, multiline,
@@ -122,7 +123,7 @@ while IFS= read -r name; do
 done <<< "$expected_names"
 revisions=$(printf '%s' "$revisions" | LC_ALL=C sort -u)
 if [[ ! "$revisions" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "Error: all 13 canonical librustzcash-family dependencies must use one exact revision" >&2
+    echo "Error: all 14 canonical librustzcash-family dependencies must use one exact revision" >&2
     exit 1
 fi
 revision="$revisions"
@@ -166,14 +167,15 @@ librust_source="git+${expected_repository}?rev=${revision}#${revision}"
 for crate_and_version in \
     "equihash 0.3.0" \
     "f4jumble 0.1.1" \
-    "pczt 0.8.0-rc.1" \
+    "pczt 0.8.0" \
     "zcash_address 0.13.0" \
     "zcash_client_backend 0.24.0-rc.1" \
     "zcash_client_sqlite 0.22.0-rc.1" \
     "zcash_encoding 0.4.0" \
     "zcash_keys 0.15.0" \
     "zcash_pool_migration 0.1.0-alpha.1" \
-    "zcash_primitives 0.29.0" \
+    "zcash_primitives 0.30.0" \
+    "zcash_proofs 0.30.0" \
     "zcash_protocol 0.10.1" \
     "zcash_transparent 0.10.0" \
     "zip321 0.9.0-rc.1"
@@ -251,5 +253,5 @@ elif [[ $# -ne 0 ]]; then
     echo "Usage: $0 [--print-revision]" >&2
     exit 1
 else
-    echo "Cargo manifest and lockfile exact-pin all 13 canonical librustzcash packages at $revision."
+    echo "Cargo manifest and lockfile exact-pin all 14 canonical librustzcash packages at $revision."
 fi

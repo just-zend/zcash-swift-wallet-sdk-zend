@@ -28,6 +28,10 @@ canonical pool-migration implementation in `librustzcash`.
   Orchard 0.15.4. Before release, every direct and patched librustzcash-family dependency must
   exact-pin the same reviewed commit containing the retained Zend deltas, and the clean
   five-architecture XCFramework must record that commit in its provenance.
+- Upstream librustzcash PR #2751 released `pczt 0.8.0`, `zcash_primitives 0.30.0`, and
+  `zcash_proofs 0.30.0`. Upstream `zcash_voting` has not yet advanced its 0.29 primitive
+  requirement, so Zend carries a dependency-only bridge in `just-zend/zcash_voting`; it changes
+  no voting source and is required to keep one PCZT/primitive type graph.
 - `ZODLIronwoodMigrationRust` is no longer a dependency, schema authority, or release artifact.
   Archive both repositories only after all SDK/app consumers are repinned to the provenance-locked
   librustzcash build.
