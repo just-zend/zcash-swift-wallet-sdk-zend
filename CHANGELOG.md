@@ -219,6 +219,14 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   above.
 
 ## Fixed
+- The Keystone batch-signing apply (`Synchronizer.applyKeystoneBatchSignatures`) no longer
+  looks its PCZT ids up: the apply step only echoes them back positionally, so ids on this call
+  are correlation labels, not engine lookups. A batch whose ids were not engine-numeric used to
+  fail after every successful device scan (an app labelling its preparation entries, for
+  example); ids now cross the FFI as the engine's own `UInt32`, so there is no id decode left to
+  fail. The two signed-PCZT store calls do still look transactions up by that id, and the
+  `MigrationUnsignedTransferPczt.id` / `MigrationSignedTransferPczt.id` documentation spells the
+  split out.
 
 - Transient Tor transport failures no longer end a sync session fatally. Tor-layer errors are now
   classified as retryable service errors, so a circuit or stream failure triggers the usual

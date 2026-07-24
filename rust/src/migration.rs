@@ -2991,7 +2991,14 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
     unwrap_exc_or(res, false)
 }
 
-/// Decode the platform's parallel `(id, pczt)` arrays into owned pairs.
+/// Decode the platform's parallel `(id, pczt)` arrays into owned pairs, parsing every id as an
+/// engine [`MigrationTxId`].
+///
+/// The two store externs ([`zcashlc_migration_store_signed_note_split_pczts`] and
+/// [`zcashlc_migration_store_signed_schedule_pczts`]) look transactions up by that id;
+/// [`zcashlc_migration_keystone_apply_batch_signatures`] never does — it only echoes each id back
+/// onto the returned pair positionally, so there an id is a caller-side correlation label that
+/// happens to share the engine's `u32` type.
 ///
 /// # Safety
 /// `ids`/`pczts`/`pczt_lens` must be valid for reads of `len` elements, and every `pczts[i]` valid
@@ -3119,14 +3126,17 @@ pub unsafe extern "C" fn zcashlc_migration_keystone_decode_sign_batch_part(
 /// Applies the ceremony's Keystone batch signatures to the caller-held unsigned PCZTs,
 /// positionally (see [`crate::migration_keystone::apply_batch_signatures`]) — `ids`/`pczts` must
 /// be the SAME PCZTs, in the SAME order, passed to
-/// [`zcashlc_migration_keystone_build_sign_batch_qr_parts`]. `ids` pass through positionally onto
-/// the returned signed PCZTs, reusing [`FfiUnsignedTransferPczts`] as a generic `(id, PCZT
-/// bytes)` pair set (see its doc) and [`decode_signed_pairs`] to decode the parallel input
-/// arrays.
+/// [`zcashlc_migration_keystone_build_sign_batch_qr_parts`]. `ids` are caller-side correlation
+/// labels here: nothing is looked up by them, they only ride positionally onto the returned
+/// signed PCZTs, reusing [`FfiUnsignedTransferPczts`] as a generic `(id, PCZT bytes)` pair set
+/// (see its doc). A caller that needs to tell a preparation PCZT from a schedule transfer keeps
+/// that mapping itself: the batch is positional, and the engine numbers every preparation
+/// transaction before the transfers (MOB-1513 R8 finding 1, whose sentinel-prefixed ids the
+/// former decimal-string id decode rejected — there is no id parse left to fail).
 ///
 /// # Safety
-/// See [`decode_signed_pairs`]. `response` must be valid for reads of `response_len` bytes. Free
-/// the returned pointer with [`zcashlc_free_migration_unsigned_transfer_pczts`].
+/// See [`decode_signed_pairs`]. `response` must be valid for reads of `response_len`
+/// bytes. Free the returned pointer with [`zcashlc_free_migration_unsigned_transfer_pczts`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_keystone_apply_batch_signatures(
     ids: *const u32,
@@ -3183,6 +3193,55 @@ mod tests {
 
     fn h(v: u32) -> BlockHeight {
         BlockHeight::from_u32(v)
+    }
+
+    // ----- Keystone batch-apply id contract (MOB-1513 R8 finding 1) -----
+
+    /// The apply lane never looks an id up: ids ride positionally onto the returned pairs, so a
+    /// batch reaches the apply step whatever its ids are. With an empty (zero-signature-set)
+    /// response the apply step then fails its OWN count check — the failure the caller sees is
+    /// about signatures, never about an id. (The PCZT bytes are never parsed on this path:
+    /// `apply_batch_signatures` checks the response's set count before touching any PCZT.)
+    ///
+    /// The defect this pins was a decimal-string id decode that rejected the app's
+    /// `note-split#<engine id>` preparation sentinels and aborted every ceremony carrying a
+    /// preparation transaction. Ids now cross the FFI as the engine's own `u32`, so there is no
+    /// parse left to reject anything — a caller that needs to tell a preparation PCZT from a
+    /// schedule transfer keeps that mapping itself.
+    #[test]
+    fn keystone_apply_extern_reaches_the_apply_step_without_looking_ids_up() {
+        use pczt::roles::signer::batch::BatchSignResponse;
+
+        let ids = [3u32];
+        let pczts = [vec![0xDEu8, 0xAD]];
+        let pczt_ptrs: Vec<*const u8> = pczts.iter().map(|bytes| bytes.as_ptr()).collect();
+        let pczt_lens: Vec<usize> = pczts.iter().map(Vec::len).collect();
+        let response = BatchSignResponse::new(Vec::new())
+            .serialize()
+            .expect("serialize empty batch sign response");
+
+        let result = unsafe {
+            zcashlc_migration_keystone_apply_batch_signatures(
+                ids.as_ptr(),
+                ids.len(),
+                pczt_ptrs.as_ptr(),
+                pczt_lens.as_ptr(),
+                response.as_ptr(),
+                response.len(),
+            )
+        };
+
+        assert!(
+            result.is_null(),
+            "an empty response must still fail the apply step"
+        );
+        let err = ffi_helpers::error_handling::take_last_error()
+            .expect("the failed extern must record a last-error");
+        let message = err.to_string();
+        assert!(
+            message.contains("expected 1"),
+            "the failure must come from the apply step's signature-set count check: {message}"
+        );
     }
 
     /// Creates a real account in the initialized wallet database at `path` and returns its uuid

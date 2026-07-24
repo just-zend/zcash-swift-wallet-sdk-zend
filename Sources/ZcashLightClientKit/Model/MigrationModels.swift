@@ -452,6 +452,14 @@ public enum MigrationAttentionReason: Equatable, Sendable {
 /// `ZcashRustBackendWelding.migrationCreateUnsignedTransferPczts(for:for:)`).
 public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
     /// The transfer's engine-issued id.
+    ///
+    /// The two signed-PCZT STORE calls (`storeSignedNoteSplitPCZTs` /
+    /// `storeSignedMigrationSchedulePCZTs`) look the transaction up by it, so it must be the id
+    /// the engine issued. The Keystone batch-signing bridge, by contrast, never looks it up:
+    /// `applyKeystoneBatchSignatures` echoes each id back onto the returned signed pair
+    /// positionally, so on that path the id is a pure correlation label. Callers that need to
+    /// tell a preparation PCZT from a schedule transfer keep that mapping themselves — the batch
+    /// is positional, and engine ids number every preparation transaction before the transfers.
     public let id: UInt32
     /// The serialized, proven-but-unsigned PCZT.
     public let pczt: Data
@@ -467,7 +475,9 @@ public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
 /// `ZcashRustBackendWelding.migrationStoreSignedSchedulePczts(_:for:)`.
 public struct MigrationSignedTransferPczt: Equatable, Sendable {
     /// The transfer's engine-issued id (must match the corresponding
-    /// `MigrationUnsignedTransferPczt.id`).
+    /// `MigrationUnsignedTransferPczt.id` — the STORE calls consuming this type look the
+    /// transaction up by it, while `applyKeystoneBatchSignatures` produces these pairs with
+    /// whatever ids it was given, echoed back positionally).
     public let id: UInt32
     /// The serialized, signed PCZT.
     public let pczt: Data
