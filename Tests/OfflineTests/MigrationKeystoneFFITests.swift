@@ -91,6 +91,31 @@ final class MigrationKeystoneFFITests: XCTestCase {
         }
     }
 
+    /// The Zend adapter reaches the v2 ABI and rejects an unbound ceremony before opening the
+    /// wallet or dereferencing the opaque test handle.
+    func testClaimOwnedBuildWithEmptyRequestIDFailsClosedBeforeDatabaseAccess() async {
+        let claim = MigrationClaimHandle(
+            storage: MigrationOpaqueHandleStorage(
+                pointer: OpaquePointer(bitPattern: 1)!,
+                release: { _ in }
+            )
+        )
+
+        do {
+            _ = try await rustBackend.migrationKeystoneBuildClaimOwnedSignBatchQrParts(
+                requestId: Data(),
+                claim: claim,
+                for: AccountUUID(id: [UInt8](repeating: 0x31, count: 16)),
+                maxFragmentLen: 200
+            )
+            XCTFail("Expected the claim-owned builder to reject an empty request id")
+        } catch ZcashError.rustMigrationKeystoneBuildSignBatchQrParts {
+            // expected
+        } catch {
+            XCTFail("Expected rustMigrationKeystoneBuildSignBatchQrParts but got \(error)")
+        }
+    }
+
     // MARK: - applyKeystoneBatchSignatures
 
     /// A syntactically-invalid PCZT paired with a syntactically-invalid batch-signature response

@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-23
+Last reviewed: 2026-07-24
 
 ## Remote and branch invariants
 
@@ -100,8 +100,10 @@ Moving the `contents: write` draft-release publisher to WarpBuild expands the tr
 - The workflow validates a strict SemVer release tag, binds that tag to the exact `GITHUB_SHA`, and
   rejects any pre-existing tag that resolves elsewhere. It also requires the provenance-recorded
   `just-zend/librustzcash` commit/tree to be durably reachable from the fork's `main` branch.
-- Artifact provenance records the exact SDK source revision/tree and exact Ironwood merge or
-  semantic-port revision; branch and PR refs are build-time audit evidence, never canonical input.
+- Artifact provenance records the exact SDK source revision/tree, exact Ironwood merge or
+  semantic-port revision, integrated migration-feature head/merge, #1825 proposal-handle base,
+  Keystone introduction commit, and Zend librustzcash revision; branch and PR refs are build-time
+  audit evidence, never canonical input.
 - The workflow output must remain a draft release.
 - A second maintainer must download the draft XCFramework zip, independently run `shasum -a 256`, compare the result with both the workflow output and the checksum proposed for `Package.swift`, confirm that the draft asset came from the approved workflow SHA, and only then publish the release.
 
@@ -116,10 +118,14 @@ environment protections and WarpBuild GitHub App controls above are verified.
 - Upstream SDK PR `#1807` is merged to `release/2.6.0`: reviewed head `61be7e00`, merge commit
   `ef6c3142`. It pins librustzcash `3a10e7fe` and Orchard `0.15.4`. Do not overwrite that release
   lineage when refreshing Zend's broader migration branch.
-- Upstream SDK PR `#1825`, “Identify migration proposals by an opaque Rust-side handle,” remains
-  open and non-draft at `93ed4ed957df3c1962bad283cd588dc385f955a0`, based on the #1813 FFI
-  branch at `adfe9ca7`. The last live GitHub check reports `mergeStateStatus=UNSTABLE`; re-fetch the
-  head and checks before review rather than assuming it is merge-ready.
+- Upstream split the migration work into dedicated FFI and Swift feature branches. Zend preserves
+  the exact topology: FFI head `e1fdd10eec9c97cdbee4e944d571ee38fa748ae9` (including #1825
+  `93ed4ed957df3c1962bad283cd588dc385f955a0` and Keystone introduction
+  `5960351ab1effc488009b426d441f67530f015f3`) was merged as `ddcd9eca`; the follow-up FFI head
+  `90306346725d2e45e9cc4d25cef62732c7e7fd09` was merged as `98294cb7`; and Swift head
+  `37b03692c089c5cccd0ff5b5feafe1dcaaf4b312` (including public-surface commit
+  `3c9d6cb9a00649489f7740abea608eae8ea8630e`) was merged as `d7047c50`. These are feature-branch
+  integrations, not claims that the work has landed on upstream `main`.
 - #1825's schema is the canonical pre-commit contract: Rust mints a nonzero `PlanHandle`, keeps one
   current preview per database/account, invalidates an older handle on replacement, and accepts
   only the handle for fresh commit or terminal successor rollover. Pure preview queries must not
@@ -130,6 +136,24 @@ environment protections and WarpBuild GitHub App controls above are verified.
   sentinel, even if prerelease data contains a nonzero field. Re-proposal is required after
   persistence/relaunch. Do not reintroduce caller-field schedule validation or use `PlanHandle` as
   post-commit authority.
+- Zend also keeps the exact upstream Keystone QR builder, decoder-reset, request-correlated decoder,
+  batch-signature combiner, and their free functions. The additive
+  `zcashlc_migration_keystone_build_sign_batch_qr_parts_v2` wrapper derives ZIP 32 account metadata
+  in Rust and annotates transient QR copies only; durable staged PCZTs and the upstream wire codec
+  remain unchanged. Swift exposes the exact upstream byte-oriented codec and adds a scheduled
+  batch-of-one adapter whose QR build accepts only `ScheduledMigrationExternalSigningRequest`'s
+  private claim; the signed response is applied to that request's retained canonical bytes and is
+  returned to the existing claim-checked submit call. Artifact verification requires all six
+  upstream exports plus the Zend v2 export in the generated header and all five thin architectures.
+- All direct and patched librustzcash-family dependencies pin Zend fork head
+  `1d63c9c07b0b40b3de633c8396008ff543464a01`, which includes upstream `zcash/librustzcash` head
+  `718610837e77d84449f0572dc0b4afe23429decb` plus the reviewed Zend delivery deltas. The upstream
+  change after the prior base was
+  documentation/cargo-vet metadata only, but the exact fork head is still provenance-locked.
+- Freeze Keystone's envelope dependencies by commit as part of the reviewed graph: `ur`
+  `81b8bb3b6b3a823128489c81ffee5bb4001ba2ae` (the commit behind upstream's 0.3.3 tag) and
+  `ur-registry` `7c90bf1ae504720c3f4b44ff26f996836d8b1553`. The manifest, lockfile, build recipe, provenance,
+  and artifact verifier must agree; do not release from a mutable tag.
 - Low-level Rust state/progress/status FFI reads remain side-effect-free. The public Swift migration
   actor first obtains the runtime snapshot, reconciles canonical chain evidence using the opaque
   scheduled-run capability, and then returns the projection. Tests must seed live canonical rows
@@ -367,14 +391,18 @@ Unmerged upstream branches (not carried):
 - `michal/MOB-1455-3-ironwood-sdk-support`: 22 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1796`, build-failing, and part of the Ironwood stack.
 - `michal/MOB-1455-4-set-activation-height`: 29 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1797`, build-failing, and part of the Ironwood stack.
 - `michal/MOB-1455-5-final-fixes`: 35 commits ahead and 7 behind `upstream/main`; covered by draft upstream PR `#1798`, build-failing, and part of the Ironwood stack.
-- `michal/MOB-1455-6-integration-with-final-zodl`: 38 commits ahead and 7 behind `upstream/main`; no upstream PR exists yet, and the branch layers Keystone PCZT and final Zodl integration work on top of the draft build-failing Ironwood stack, so do not carry it until upstream opens/reviews it and the stack turns green.
+- `michal/MOB-1455-6-integration-with-final-zodl`: historical predecessor to the reviewed
+  migration feature line. Do not carry this stale branch independently; Zend's consolidation uses
+  the exact dedicated FFI and Swift heads above and provenance-locks their ancestry instead.
 - `michal/MOB-1455/MOB-1495-sdk-pool-migration`: 4 commits ahead and 29 behind `upstream/main`;
   covered by upstream PR `#1812`, now clean and green but still broad across public `Synchronizer`,
   FFI, Rust dependency, migration privacy, and persistence surfaces. Wait for upstream merge, a
   released FFI artifact, and a Zend reconciliation plan.
-- `michal/slipstream-support`: 37 commits ahead and 4 behind `upstream/main` after a force-push; no
-  upstream PR is open for this active branch. It is unreviewed Slipstream integration work, so do
-  not carry it until a scoped PR, review thread, and stable public artifact direction exist.
+- `michal/MOB-1458/MOB-1513-keystone-batch-slipstream` (`97d3dcea`): exact Keystone forwards plus
+  the separate Slipstream engine/support stack. Zend does not use this as the current migration
+  runtime and importing it would change the sync-engine dependency graph independently of the
+  librustzcash consolidation. Defer it until upstream lands or scopes that stack and Zend chooses
+  Slipstream deliberately; do not silently mix it into this SDK PR.
 - `michal/ironwood-support-2.6.0`: 18 commits ahead and 2 behind `upstream/main`; covered by open
   upstream PR `#1807`, which is green but review-required and broad across protocol, FFI, and
   voting surfaces. Wait for upstream merge/reconciliation rather than carrying it ahead.

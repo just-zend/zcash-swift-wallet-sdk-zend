@@ -3200,6 +3200,46 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - buildKeystoneSignBatchQRParts
+
+    var buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenThrowableError: Error?
+    var buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenCallsCount = 0
+    var buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenCalled: Bool {
+        buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenCallsCount > 0
+    }
+    var buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenReceivedArguments: (
+        accountUUID: AccountUUID,
+        requestId: Data,
+        request: ScheduledMigrationExternalSigningRequest,
+        maxFragmentLen: Int
+    )?
+    var buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenReturnValue: [String]!
+    var buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenClosure: (
+        (AccountUUID, Data, ScheduledMigrationExternalSigningRequest, Int) async throws -> [String]
+    )?
+
+    func buildKeystoneSignBatchQRParts(
+        accountUUID: AccountUUID,
+        requestId: Data,
+        request: ScheduledMigrationExternalSigningRequest,
+        maxFragmentLen: Int
+    ) async throws -> [String] {
+        if let error = buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenThrowableError {
+            throw error
+        }
+        buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenCallsCount += 1
+        buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenReceivedArguments = (
+            accountUUID: accountUUID,
+            requestId: requestId,
+            request: request,
+            maxFragmentLen: maxFragmentLen
+        )
+        if let closure = buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenClosure {
+            return try await closure(accountUUID, requestId, request, maxFragmentLen)
+        }
+        return buildKeystoneSignBatchQRPartsAccountUUIDRequestIdRequestMaxFragmentLenReturnValue
+    }
+
     // MARK: - resetKeystoneSignBatchDecoder
 
     var resetKeystoneSignBatchDecoderCallsCount = 0
@@ -5240,6 +5280,9 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     var migrationRolloverInternalSchedulePredecessorUskForThrowableError: Error?
     var migrationRolloverInternalSchedulePredecessorUskForCallsCount = 0
+    var migrationRolloverInternalSchedulePredecessorUskForCalled: Bool {
+        return migrationRolloverInternalSchedulePredecessorUskForCallsCount > 0
+    }
     var migrationRolloverInternalSchedulePredecessorUskForReceivedArguments: (
         schedule: MigrationSchedule,
         predecessor: MigrationRunHandle,
@@ -5272,6 +5315,9 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     var migrationRolloverExternalSchedulePredecessorForThrowableError: Error?
     var migrationRolloverExternalSchedulePredecessorForCallsCount = 0
+    var migrationRolloverExternalSchedulePredecessorForCalled: Bool {
+        return migrationRolloverExternalSchedulePredecessorForCallsCount > 0
+    }
     var migrationRolloverExternalSchedulePredecessorForReceivedArguments: (
         schedule: MigrationSchedule,
         predecessor: MigrationRunHandle,
@@ -6082,6 +6128,46 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         } else {
             return migrationKeystoneBuildSignBatchQrPartsRequestIdPcztsMaxFragmentLenReturnValue
         }
+    }
+
+    // MARK: - migrationKeystoneBuildClaimOwnedSignBatchQrParts
+
+    var migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenThrowableError: Error?
+    var migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenCallsCount = 0
+    var migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenCalled: Bool {
+        migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenCallsCount > 0
+    }
+    var migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenReceivedArguments: (
+        requestId: Data,
+        claim: MigrationClaimHandle,
+        account: AccountUUID,
+        maxFragmentLen: Int
+    )?
+    var migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenReturnValue: [String]!
+    var migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenClosure: (
+        (Data, MigrationClaimHandle, AccountUUID, Int) async throws -> [String]
+    )?
+
+    func migrationKeystoneBuildClaimOwnedSignBatchQrParts(
+        requestId: Data,
+        claim: MigrationClaimHandle,
+        for account: AccountUUID,
+        maxFragmentLen: Int
+    ) async throws -> [String] {
+        if let error = migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenThrowableError {
+            throw error
+        }
+        migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenCallsCount += 1
+        migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenReceivedArguments = (
+            requestId: requestId,
+            claim: claim,
+            account: account,
+            maxFragmentLen: maxFragmentLen
+        )
+        if let closure = migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenClosure {
+            return try await closure(requestId, claim, account, maxFragmentLen)
+        }
+        return migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenReturnValue
     }
 
     // MARK: - migrationKeystoneResetSignBatchDecoder

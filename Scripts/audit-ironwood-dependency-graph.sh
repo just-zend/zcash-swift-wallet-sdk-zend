@@ -9,6 +9,8 @@ cd "$(dirname "$0")/.."
 
 expected_librustzcash_repository="https://github.com/just-zend/librustzcash"
 expected_zcash_voting_revision="04d255628f1d56de0479e3fb6963409dbe44ec1f"
+expected_keystone_ur_revision="81b8bb3b6b3a823128489c81ffee5bb4001ba2ae"
+expected_keystone_registry_revision="7c90bf1ae504720c3f4b44ff26f996836d8b1553"
 rust_toolchain=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
 expected_librustzcash_revision=$(./Scripts/verify-ironwood-cargo-pins.sh --print-revision)
 
@@ -103,9 +105,11 @@ do
     assert_one "$crate" "$version" "github.com/just-zend/librustzcash?rev=$expected_librustzcash_revision"
 done
 assert_one zcash_voting 1.0.0 "github.com/just-zend/zcash_voting.git?rev=$expected_zcash_voting_revision"
+assert_one ur 0.3.0 "github.com/KeystoneHQ/ur-rs?rev=$expected_keystone_ur_revision"
+assert_one ur-registry 1.0.8 "github.com/KeystoneHQ/keystone-sdk-rust?rev=$expected_keystone_registry_revision"
 assert_one orchard 0.15.4
 assert_one voting-circuits 0.9.0-rc.3
 assert_one imt-tree 0.2.0
 
 echo "Ironwood dependency graph is unified at just-zend/librustzcash $expected_librustzcash_revision."
-echo "Orchard 0.15.4 and the reviewed voting graph are locked; no synthetic NU6.3 cfg is active."
+echo "Orchard 0.15.4 plus the reviewed voting and Keystone graphs are locked; no synthetic NU6.3 cfg is active."

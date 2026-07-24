@@ -1461,6 +1461,19 @@ public class SDKSynchronizer: Synchronizer {
         )
     }
 
+    public func buildKeystoneSignBatchQRParts(
+        accountUUID: AccountUUID,
+        requestId: Data,
+        request: ScheduledMigrationExternalSigningRequest,
+        maxFragmentLen: Int
+    ) async throws -> [String] {
+        try await migrationHost.migration(for: accountUUID).buildKeystoneSignBatchQRParts(
+            requestId: requestId,
+            request: request,
+            maxFragmentLen: maxFragmentLen
+        )
+    }
+
     public func resetKeystoneSignBatchDecoder() async {
         await initializer.rustBackend.migrationKeystoneResetSignBatchDecoder()
     }

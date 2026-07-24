@@ -170,11 +170,11 @@ behavior (`SDKSynchronizer` does):
 
 ## The Keystone batch-signing bridge joins the migration group
 
-The `Synchronizer` migration group gains four DB-free, account-free requirements — no
-`accountUUID` parameter, since all four operate purely on caller-held PCZT bytes and a scanned
-device response, never the wallet database or the migration engine. Like the rest of the group,
-the three throwing members come with a protocol-extension default that throws an "unimplemented"
-`LocalizedError`, so a custom `Synchronizer` conformer keeps compiling; the fourth
+The SDK adopts upstream's four DB-free, account-free requirements exactly — no `accountUUID`
+parameter, since those compatibility calls operate purely on caller-held PCZT bytes and a scanned
+device response. These byte-oriented values are not migration authority. Like the rest of the
+group, the three throwing members come with a protocol-extension default that throws an
+"unimplemented" `LocalizedError`, so a custom `Synchronizer` conformer keeps compiling; the fourth
 (`resetKeystoneSignBatchDecoder()`) is non-throwing and gets an inert no-op default instead
 (mirroring `isMigrationSyncBlocked()`'s treatment). `SDKSynchronizer` overrides all four with real
 behavior, forwarding straight to the rust backend rather than through the per-account migration
@@ -201,13 +201,25 @@ actor:
   Applies the ceremony's Keystone batch signatures to `pczts`, positionally — `pczts` MUST be the
   SAME array, in the SAME order (including the SAME unredacted bytes), passed to
   `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)`. Returns one signed PCZT per
-  element, ready for the existing `storeSignedNoteSplitPCZTs(accountUUID:_:)` /
-  `storeSignedMigrationSchedulePCZTs(accountUUID:_:)` calls.
+  element. This is the exact upstream compatibility codec; it does not grant delivery authority.
+
+Zend adds the claim-owned scheduled adapter on top. For production migration delivery, call
+`prepareNextMigrationTransactionForExternalSigning(accountUUID:)`, then
+`buildKeystoneSignBatchQRParts(accountUUID:requestId:request:maxFragmentLen:)`. Rust accepts only
+the request's private live claim, reloads the canonical PCZT from the delivery store, derives the
+account's ZIP 32 metadata, and annotates only the transient QR copy. After decoding the matching
+response, `applyKeystoneBatchSignatures(request:batchSignResponse:)` applies it to the exact PCZT
+retained by that same request and returns one signed `Data` value. Submit that value with the
+unchanged request through
+`submitExternallySignedMigrationTransaction(accountUUID:request:signedPCZT:)`; the existing opaque
+claim checks remain authoritative. The retired raw note-split/schedule storage APIs are not
+restored.
 
 New error codes `rustMigrationKeystoneBuildSignBatchQrParts` (ZRUST0136),
 `rustMigrationKeystoneDecodeSignBatchPart` (ZRUST0137), and
 `rustMigrationKeystoneApplyBatchSignatures` (ZRUST0138). Like the rest of the migration group, the
-Closure/Combine wrapper synchronizers do not mirror these four members.
+Closure/Combine wrapper synchronizers do not mirror these members. Zend's existing
+`rustMigrationDelivery` moved from the colliding prerelease code ZRUST0136 to ZRUST0139.
 
 ## `prepare` now validates the seed against the existing wallet
 

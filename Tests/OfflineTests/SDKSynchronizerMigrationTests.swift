@@ -334,6 +334,39 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(received?.maxFragmentLen, 200)
     }
 
+    func testClaimOwnedKeystoneBuildForwardsOnlyTheOpaqueScheduledClaim() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let expectedParts = ["ur:zcash-sign-batch/1-1/claim-owned"]
+        welding.migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenReturnValue = expectedParts
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+        let claim = Self.makeClaimHandle(71)
+        let request = ScheduledMigrationExternalSigningRequest(
+            transactionID: 7,
+            pczt: Data([0x50, 0x43, 0x5A, 0x54]),
+            claim: claim
+        )
+        let requestId = Data(repeating: 0x17, count: 16)
+
+        let parts = try await synchronizer.buildKeystoneSignBatchQRParts(
+            accountUUID: accountUUID,
+            requestId: requestId,
+            request: request,
+            maxFragmentLen: 180
+        )
+
+        XCTAssertEqual(parts, expectedParts)
+        let received = welding
+            .migrationKeystoneBuildClaimOwnedSignBatchQrPartsRequestIdClaimForMaxFragmentLenReceivedArguments
+        XCTAssertEqual(received?.requestId, requestId)
+        XCTAssertEqual(received?.claim.pointer, claim.pointer)
+        XCTAssertEqual(received?.account, accountUUID)
+        XCTAssertEqual(received?.maxFragmentLen, 180)
+        XCTAssertFalse(
+            welding.migrationKeystoneBuildSignBatchQrPartsRequestIdPcztsMaxFragmentLenCalled,
+            "the claim-owned path must not route caller-held PCZT bytes through the raw builder"
+        )
+    }
+
     /// Infallible and DB-free: pinned by call count alone, since there is no return value to
     /// round-trip.
     func testResetKeystoneSignBatchDecoderForwardsToTheRustBackend() async throws {
@@ -394,6 +427,32 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         let received = welding.migrationKeystoneApplyBatchSignaturesPcztsBatchSignResponseReceivedArguments
         XCTAssertEqual(received?.pczts, pczts)
         XCTAssertEqual(received?.batchSignResponse, batchSignResponse)
+    }
+
+    func testClaimOwnedKeystoneApplyUsesTheExactRetainedRequestPCZT() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let request = ScheduledMigrationExternalSigningRequest(
+            transactionID: 7,
+            pczt: Data([0x50, 0x43, 0x5A, 0x54]),
+            claim: Self.makeClaimHandle(72)
+        )
+        let signedPCZT = Data([0x53, 0x49, 0x47])
+        welding.migrationKeystoneApplyBatchSignaturesPcztsBatchSignResponseReturnValue = [
+            MigrationSignedTransferPczt(id: "7", pczt: signedPCZT)
+        ]
+        mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in welding }
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+        let response = Data(repeating: 0x33, count: 8)
+
+        let result = try await synchronizer.applyKeystoneBatchSignatures(
+            request: request,
+            batchSignResponse: response
+        )
+
+        XCTAssertEqual(result, signedPCZT)
+        let received = welding.migrationKeystoneApplyBatchSignaturesPcztsBatchSignResponseReceivedArguments
+        XCTAssertEqual(received?.pczts, [MigrationUnsignedTransferPczt(id: "7", pczt: request.pczt)])
+        XCTAssertEqual(received?.batchSignResponse, response)
     }
 
     // MARK: - Forwarding: wallet-scope gate members
@@ -546,11 +605,12 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertFalse(welding.migrationRuntimeSnapshotForCalled, "the engine must never see a during-sync execution attempt")
     }
 
-    /// Not-syncing companion: the exact-request route reaches the claim-resume boundary.
+    /// Not-syncing companion: the exact-request route reaches the per-account actor's runtime
+    /// reconciliation boundary.
     func testSubmitExternallySignedMigrationTransactionForwardsWhenNotSyncing() async throws {
-        struct StubClaimFailure: Error, Equatable {}
+        struct StubRuntimeSnapshotFailure: Error, Equatable {}
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationResumeClaimClaimForThrowableError = StubClaimFailure()
+        welding.migrationRuntimeSnapshotForThrowableError = StubRuntimeSnapshotFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
         await synchronizer.updateStatus(.stopped)
@@ -567,11 +627,11 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
                 request: request,
                 signedPCZT: Data([0x53, 0x49, 0x47])
             )
-            XCTFail("expected the stubbed claim failure to propagate")
-        } catch let error as StubClaimFailure {
-            XCTAssertEqual(error, StubClaimFailure())
+            XCTFail("expected the stubbed runtime-snapshot failure to propagate")
+        } catch let error as StubRuntimeSnapshotFailure {
+            XCTAssertEqual(error, StubRuntimeSnapshotFailure())
         } catch {
-            XCTFail("expected StubClaimFailure, got \(error)")
+            XCTFail("expected StubRuntimeSnapshotFailure, got \(error)")
         }
 
         XCTAssertEqual(recorder.callCount, 1, "the host must be consulted when the synchronizer is not syncing")

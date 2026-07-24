@@ -11,23 +11,46 @@ canonical pool-migration implementation in `librustzcash`.
 - Swift schema and API source of truth: the upstream migration work from SDK PRs #1807, #1812,
   and its included FFI PR #1813. The consolidation branch includes #1807 at `61be7e00` (merged to
   `release/2.6.0` as `ef6c3142`), #1812 at `daf1aa1b`, and #1813 at `adfe9ca7`.
-- Upstream SDK PR #1825 is the current pre-commit proposal-authority delta. At the last live check
-  it is open, non-draft, and at `93ed4ed957df3c1962bad283cd588dc385f955a0` on top of #1813. Its
-  exact schema is retained: a Rust-minted nonzero `PlanHandle` keys the latest preview for one
-  database/account, a newer preview supersedes the former handle, and fresh commit/terminal
+- The upstream migration work is now split across exact FFI and Swift heads. The FFI lineage is
+  `93ed4ed957df3c1962bad283cd588dc385f955a0` (#1825 proposal handles) ->
+  `5960351ab1effc488009b426d441f67530f015f3` (Keystone codec) ->
+  `e1fdd10eec9c97cdbee4e944d571ee38fa748ae9` (request-ID/firmware tests) ->
+  `90306346725d2e45e9cc4d25cef62732c7e7fd09` (latest balance-reporting fix). The separate Swift
+  line is reviewed at `37b03692c089c5cccd0ff5b5feafe1dcaaf4b312`, including surface commit
+  `3c9d6cb9a00649489f7740abea608eae8ea8630e`. Zend preserves these as three exact two-parent
+  merges (`ddcd9eca`, `98294cb7`, `d7047c50`); this does not imply upstream-main landing.
+- #1825's exact schema is retained: a Rust-minted nonzero `PlanHandle` keys the latest preview for
+  one database/account, a newer preview supersedes the former handle, and fresh commit/terminal
   rollover send only the handle across FFI. No caller-authored plan fields cross inward.
 - SDK PR #1818 remains a draft. Preserve its non-conflicting canonical planner and transaction
   semantics underneath the Zend delivery runtime, but do not claim API parity: this branch does not
   expose #1818's raw-PCZT or ordinary-immediate orchestration as public migration authority.
+- Upstream's dedicated Keystone Slipstream head `97d3dcea6205eb710dd8805154e131636535ccf0`
+  is intentionally deferred. It includes a separate sync-engine/support dependency stack that the
+  current Zend runtime does not use; importing it here would be an independent engine migration,
+  not completion of the librustzcash consolidation. Reassess when upstream lands or scopes it.
 - SDK PR #1823 was closed unmerged at head `450fda4f`. Its exact ordinary single-signer use of
   `zcash_client_backend::wallet::redact_pczt_for_signer` is retained as a Zend-only alignment and
-  safety delta, not an active upstream carry. A future migration batch signer must use
-  `redact_pczt_for_batch_signer`, retain the original PCZTs, include the required derivation
-  annotation, and correlate ordered signer responses to their originating requests.
-- The staging pin is the immutable `just-zend/librustzcash` revision recorded in `Cargo.toml`, with
-  Orchard 0.15.4. Before release, every direct and patched librustzcash-family dependency must
-  exact-pin the same reviewed commit containing the retained Zend deltas, and the clean
-  five-architecture XCFramework must record that commit in its provenance.
+  safety delta, not an active upstream carry. Migration batch signing instead keeps the exact
+  upstream `5960351a` codec and FFI, including batch redaction, retained originals, ordered
+  response correlation, request-ID validation, decoder reset, and firmware passthrough.
+- The staging pin is immutable `just-zend/librustzcash`
+  `1d63c9c07b0b40b3de633c8396008ff543464a01`, with Orchard 0.15.4. Every direct and patched
+  librustzcash-family dependency exact-pins that reviewed commit, and the clean five-architecture
+  XCFramework records it in provenance. That fork head contains current upstream
+  `718610837e77d84449f0572dc0b4afe23429decb` plus Zend's reviewed delivery/runtime deltas.
+- The upstream Keystone envelope graph is immutable in Zend releases: `ur` pins the exact commit
+  `81b8bb3b6b3a823128489c81ffee5bb4001ba2ae` resolved by upstream's 0.3.3 tag, and `ur-registry`
+  pins `7c90bf1ae504720c3f4b44ff26f996836d8b1553`. Both revisions are release-gated and recorded in
+  artifact provenance; a moved tag or substitute Git source fails closed.
+- Zend adds one versioned Keystone wrapper on top of the unchanged upstream bridge:
+  `zcashlc_migration_keystone_build_sign_batch_qr_parts_v2` derives account ZIP 32 metadata in
+  Rust and annotates only transient QR-input copies. Durable staged PCZTs stay byte-for-byte
+  canonical, and the exact upstream batch combiner applies returned signatures to those originals.
+  Swift keeps upstream's byte-oriented compatibility surface and adds a scheduled batch-of-one
+  adapter: QR construction accepts only the request's private opaque claim, while signature apply
+  uses the exact canonical PCZT retained by that same request before the existing claim-checked
+  submit path consumes it.
 - Upstream librustzcash PR #2751 released `pczt 0.8.0`, `zcash_primitives 0.30.0`, and
   `zcash_proofs 0.30.0`. Upstream `zcash_voting` has not yet advanced its 0.29 primitive
   requirement, so Zend carries a dependency-only bridge in `just-zend/zcash_voting`; it changes
@@ -102,9 +125,10 @@ The Zend fork should keep only deltas that layer on the upstream representation:
    authorization, exact known-unsent materialization reacquisition, durable claim leases,
    resolution-only unknown outcomes and immutable typed policy binding, including distinct direct
    TLS, public-TLS-over-Tor, onion, and development transports.
-8. Exact single-signer `redact_pczt_for_signer` alignment from closed-unmerged SDK PR #1823. Keep it
-   isolated from any future batch-signing implementation, which has the stronger batch redaction,
-   annotation, retained-original, ordering, and request-correlation requirements above.
+8. Exact single-signer `redact_pczt_for_signer` alignment from closed-unmerged SDK PR #1823 remains
+   isolated from the exact upstream Keystone batch bridge. Zend's v2 builder adds only
+   account-derived annotation on transient QR copies; it does not alter the upstream wire codec,
+   decoder, signature combiner, retained-original ordering, or durable delivery evidence.
 9. Nonpersistent proposal authority on top of upstream #1825: preserve its exact `PlanHandle`
    cache/FFI schema, while ensuring Swift encoding omits the handle and decoding always yields the
    zero sentinel. This prevents a process-local capability from becoming durable app state without
@@ -139,8 +163,13 @@ lifecycle schema.
    with duplicate simulator slices.
 4. Record the canonical Rust repository/commit/tree (without branch coupling), exact SDK source
    revision/tree and merge-or-semantic-port implementation revision, reviewed SDK lineage,
-   exact included upstream `#1821`/`#1822`/`#1825` heads and Zend merge or semantic-port revisions,
-   including `INCLUDED_UPSTREAM_1825_REVISION` and `SDK_PR_1825_SEMANTIC_PORT_REVISION`,
+   exact included upstream `#1821`/`#1822`/`#1825` heads, integrated FFI and Swift feature heads,
+   Keystone introduction commits, and Zend merge or semantic-port revisions, including
+   `INCLUDED_UPSTREAM_1825_REVISION`, `INCLUDED_UPSTREAM_KEYSTONE_REVISION`,
+   `INCLUDED_UPSTREAM_KEYSTONE_SWIFT_REVISION`, `UPSTREAM_MIGRATION_FEATURE_REVISION`,
+   `UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION`, `UPSTREAM_MIGRATION_FFI_REVISION`,
+   `UPSTREAM_MIGRATION_FFI_MERGE_REVISION`, `UPSTREAM_MIGRATION_SWIFT_REVISION`,
+   `UPSTREAM_MIGRATION_SWIFT_MERGE_REVISION`, and `SDK_PR_1825_SEMANTIC_PORT_REVISION`,
    toolchain, hermetic environment policy, targets, per-slice checksums, and the complete
    XCFramework file/symlink manifest in provenance. Before packaging a release, require that Rust
    commit/tree on `just-zend/librustzcash` `main` and bind the release tag to the exact SDK workflow

@@ -1732,8 +1732,10 @@ final class MigrationLogicTests: ZcashTestCase {
                 transport: .directTLS,
                 endpoint: "https://submit.example:9067"
             )
-            welding.migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForThrowableError =
-                ZcashError.rustMigrationDelivery(message)
+            welding.migrationReacquireFailedImmediateMaterializationClaimSignerMaximumGrossAmountForClosure = {
+                _, _, _, _ in
+                throw ZcashError.rustMigrationDelivery(message)
+            }
             let migration = makeMigration(welding: welding, account: accountA)
 
             do {
@@ -1769,6 +1771,10 @@ final class MigrationLogicTests: ZcashTestCase {
             claim: Self.makeClaimHandle(181),
             status: .staged,
             availability: .unavailable(.missingSpendAuthorization)
+        )
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
         )
         let migration = makeMigration(welding: welding, account: accountA)
 
@@ -2797,7 +2803,9 @@ final class MigrationLogicTests: ZcashTestCase {
         let result = try await migration.executeNextPendingTransfer(options: Self.immediateOptions)
 
         XCTAssertEqual(result, .success(txId: Data(repeating: 0x44, count: 32).toHexStringTxId()))
-        XCTAssertEqual(welding.migrationRuntimeSnapshotForCallsCount, 2)
+        // The operation performs two high-level scheduled-runtime reads; each reconciles the
+        // canonical chain and then re-reads the Rust projection.
+        XCTAssertEqual(welding.migrationRuntimeSnapshotForCallsCount, 4)
         XCTAssertEqual(
             welding.migrationBindSubmissionPolicyRunForReceivedArguments?.intent,
             MigrationSubmissionIntent(transport: .directTLS, endpoint: "https://submit.example:9067")
@@ -2915,6 +2923,10 @@ final class MigrationLogicTests: ZcashTestCase {
             externallyExposed: true
         )
         welding.migrationBindSubmissionPolicyRunForReturnValue = Self.makeRunHandle(0x2C2)
+        welding.migrationBoundSubmissionTargetForReturnValue = MigrationBoundSubmissionTarget(
+            transport: .directTLS,
+            endpoint: "https://submit.example:9067"
+        )
         welding.migrationReconcileCanonicalChainRunForReturnValue = Self.makeRunHandle(0x2C3)
         let submitter = MigrationTransactionSubmitterMock()
         let migration = makeMigration(
@@ -3012,8 +3024,8 @@ final class MigrationLogicTests: ZcashTestCase {
             throw MigrationDeliveryError.claimUnavailable
         }
         welding.migrationReconcileCanonicalChainRunForClosure = { run, account in
-            if account == accountA, run.pointer == boundRunA.pointer { return run }
-            if account == accountB, run.pointer == boundRunB.pointer { return run }
+            if account == accountA, run.pointer == runtimeRunA.pointer { return run }
+            if account == accountB, run.pointer == runtimeRunB.pointer { return run }
             throw MigrationDeliveryError.claimUnavailable
         }
         welding.migrationClaimSubmissionClaimForClosure = { claim, account in

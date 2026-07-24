@@ -732,6 +732,22 @@ actor OrchardMigration {
         }
     }
 
+    /// Builds a Keystone batch-of-one request from the same opaque scheduled claim that will later
+    /// authorize signature storage and submission. Rust reloads the live delivery snapshot and
+    /// canonical PCZT; the public `request.pczt` is never trusted as QR-build input.
+    func buildKeystoneSignBatchQRParts(
+        requestId: Data,
+        request: ScheduledMigrationExternalSigningRequest,
+        maxFragmentLen: Int
+    ) async throws -> [String] {
+        try await welding.migrationKeystoneBuildClaimOwnedSignBatchQrParts(
+            requestId: requestId,
+            claim: request.claim,
+            for: accountUUID,
+            maxFragmentLen: maxFragmentLen
+        )
+    }
+
     /// Applies the external signer's response to the exact opaque claim, advances the canonical
     /// transaction, proves and stages exact network bytes, and submits through the bound policy.
     func submitExternallySignedMigrationTransaction(
@@ -1559,7 +1575,18 @@ actor OrchardMigration {
         }
         guard recoveryCapability.signerOwnership == signer,
               let summary = delivery.claims.first,
-              Self.isRetryableImmediateMaterializationFailure(summary, signer: signer) else {
+              summary.signerOwnership == signer else {
+            if signer == .external {
+                throw MigrationDeliveryError.externalSigningClaimUnavailable
+            }
+            throw MigrationDeliveryError.claimUnavailable
+        }
+        // A same-signer artifact that has advanced beyond a retryable materialization failure is
+        // stale canonical state, not a malformed claim. The caller must render a fresh action.
+        guard summary.status == .materializationFailed else {
+            throw MigrationDeliveryError.immediateRecoveryStateChanged
+        }
+        guard Self.isRetryableImmediateMaterializationFailure(summary, signer: signer) else {
             if signer == .external {
                 throw MigrationDeliveryError.externalSigningClaimUnavailable
             }

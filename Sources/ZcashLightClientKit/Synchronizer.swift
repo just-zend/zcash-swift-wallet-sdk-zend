@@ -901,9 +901,8 @@ public protocol Synchronizer: AnyObject {
     //
     // A DB-free, account-free bridge for driving a Keystone hardware signer through the migration
     // ceremony's PCZTs over an animated multi-part QR UR: none of these four calls take an
-    // `accountUUID`, since they operate purely on caller-held PCZT bytes (from
-    // `createUnsignedNoteSplitPCZTs(accountUUID:)` / `createUnsignedMigrationTransferPCZTs(accountUUID:for:)`)
-    // and a scanned device response, never touching the wallet database or the migration engine.
+    // `accountUUID`, since they preserve upstream's pure caller-held-byte codec. They are not
+    // delivery authority; the claim-owned overload below is the production scheduled adapter.
 
     /// Builds the animated multi-part QR frames for a Keystone batch-signing request covering
     /// every PCZT in `pczts`, in the given order.
@@ -927,6 +926,16 @@ public protocol Synchronizer: AnyObject {
     ///   - maxFragmentLen: the maximum byte length of each animated QR frame's payload.
     /// - Returns: the QR frame strings, in wire fragment order -- display/scan them in that order.
     func buildKeystoneSignBatchQRParts(requestId: Data, pczts: [MigrationUnsignedTransferPczt], maxFragmentLen: Int) async throws -> [String]
+
+    /// Zend's claim-owned scheduled-migration adapter. This builds a batch-of-one QR request from
+    /// the canonical PCZT reloaded by Rust through `request`'s opaque claim. The public PCZT bytes
+    /// are retained only for applying the response and for the existing claim-checked submit call.
+    func buildKeystoneSignBatchQRParts(
+        accountUUID: AccountUUID,
+        requestId: Data,
+        request: ScheduledMigrationExternalSigningRequest,
+        maxFragmentLen: Int
+    ) async throws -> [String]
 
     /// Discards any in-flight multi-part Keystone sign-batch-response scan session.
     ///
@@ -960,10 +969,9 @@ public protocol Synchronizer: AnyObject {
     /// unredacted bytes retained from that call, never the redacted wire copy.
     /// `batchSignResponse` is the `KeystoneBatchDecodeResult.data` a completed
     /// ``decodeKeystoneSignBatchPart(_:expectedRequestId:)`` returned.
-    /// - Returns: one signed PCZT per element of `pczts`, in the same order, ready for the
-    ///   existing note-split / schedule storage calls
-    ///   (``storeSignedNoteSplitPCZTs(accountUUID:_:)`` /
-    ///   ``storeSignedMigrationSchedulePCZTs(accountUUID:_:)``).
+    /// - Returns: one signed PCZT per element of `pczts`, in the same order. For Zend scheduled
+    ///   delivery, prefer the request-taking convenience below and submit its returned bytes with
+    ///   the same opaque request.
     func applyKeystoneBatchSignatures(pczts: [MigrationUnsignedTransferPczt], batchSignResponse: Data) async throws -> [MigrationSignedTransferPczt]
 }
 
@@ -1279,6 +1287,15 @@ public extension Synchronizer {
         throw MigrationUnimplemented(member: #function)
     }
 
+    func buildKeystoneSignBatchQRParts(
+        accountUUID: AccountUUID,
+        requestId: Data,
+        request: ScheduledMigrationExternalSigningRequest,
+        maxFragmentLen: Int
+    ) async throws -> [String] {
+        throw MigrationUnimplemented(member: #function)
+    }
+
     /// Inert default: conformers must override to provide real Keystone batch-signing decode
     /// session support. Mirrors `isMigrationSyncBlocked()`'s non-throwing inert-default
     /// treatment: this member is infallible by contract (see the protocol doc), so it cannot
@@ -1291,6 +1308,24 @@ public extension Synchronizer {
 
     func applyKeystoneBatchSignatures(pczts: [MigrationUnsignedTransferPczt], batchSignResponse: Data) async throws -> [MigrationSignedTransferPczt] {
         throw MigrationUnimplemented(member: #function)
+    }
+
+    /// Applies a completed Keystone batch-of-one response to the exact canonical PCZT retained in
+    /// `request`. Pass the returned bytes, together with the same request, to
+    /// ``submitExternallySignedMigrationTransaction(accountUUID:request:signedPCZT:)``.
+    func applyKeystoneBatchSignatures(
+        request: ScheduledMigrationExternalSigningRequest,
+        batchSignResponse: Data
+    ) async throws -> Data {
+        let id = String(request.transactionID)
+        let signed = try await applyKeystoneBatchSignatures(
+            pczts: [MigrationUnsignedTransferPczt(id: id, pczt: request.pczt)],
+            batchSignResponse: batchSignResponse
+        )
+        guard signed.count == 1, signed[0].id == id else {
+            throw MigrationDeliveryError.keystoneBatchResponseMismatch
+        }
+        return signed[0].pczt
     }
 }
 

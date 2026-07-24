@@ -13,6 +13,10 @@ lockfile="${IRONWOOD_CARGO_LOCKFILE:-Cargo.lock}"
 expected_repository="https://github.com/just-zend/librustzcash"
 expected_voting_repository="https://github.com/just-zend/zcash_voting.git"
 expected_voting_revision="04d255628f1d56de0479e3fb6963409dbe44ec1f"
+expected_keystone_ur_repository="https://github.com/KeystoneHQ/ur-rs"
+expected_keystone_ur_revision="81b8bb3b6b3a823128489c81ffee5bb4001ba2ae"
+expected_keystone_registry_repository="https://github.com/KeystoneHQ/keystone-sdk-rust"
+expected_keystone_registry_revision="7c90bf1ae504720c3f4b44ff26f996836d8b1553"
 
 for file in "$manifest" "$lockfile"; do
     if [[ ! -f "$file" ]]; then
@@ -72,9 +76,10 @@ fi
 
 # No extra git or path dependency may hide beside the reviewed family. Registry dependencies are
 # still locked by Cargo.lock and rebuilt by the reproducibility gate; every non-registry source is
-# restricted here to the exact Zend librustzcash family plus the one reviewed voting repository.
+# restricted here to the exact Zend librustzcash family, voting repository, and two Keystone
+# envelope repositories used by the exact upstream batch-signing codec.
 unexpected_git_lines=$(grep -Ev \
-    'git[[:space:]]*=[[:space:]]*"https://github.com/just-zend/(librustzcash|zcash_voting\.git)"' \
+    'git[[:space:]]*=[[:space:]]*"https://github.com/(just-zend/(librustzcash|zcash_voting\.git)|KeystoneHQ/(ur-rs|keystone-sdk-rust))"' \
     "$all_git_lines" || true)
 if [[ -n "$unexpected_git_lines" ]]; then
     echo "Error: Cargo.toml contains an unreviewed git dependency" >&2
@@ -82,8 +87,8 @@ if [[ -n "$unexpected_git_lines" ]]; then
     exit 1
 fi
 git_dependency_count=$(wc -l < "$all_git_lines" | tr -d ' ')
-if [[ "$git_dependency_count" != "15" ]]; then
-    echo "Error: Cargo.toml must contain exactly 14 librustzcash pins and one voting pin" >&2
+if [[ "$git_dependency_count" != "17" ]]; then
+    echo "Error: Cargo.toml must contain exactly 14 librustzcash, one voting, and two Keystone pins" >&2
     exit 1
 fi
 # The package's own library target is the sole path key in the manifest. Reject inline, multiline,
@@ -196,13 +201,42 @@ assert_lock_package \
     1.0.0 \
     "git+${expected_voting_repository}?rev=${expected_voting_revision}#${expected_voting_revision}"
 
+if ! grep -Fxq \
+    "ur = { git = \"$expected_keystone_ur_repository\", rev = \"$expected_keystone_ur_revision\" }" \
+    "$manifest" \
+    || ! grep -Fxq \
+        "ur-registry = { git = \"$expected_keystone_registry_repository\", rev = \"$expected_keystone_registry_revision\", package = \"ur-registry\", default-features = false, features = [" \
+        "$manifest"
+then
+    echo "Error: Cargo.toml does not contain the reviewed Keystone envelope pins" >&2
+    exit 1
+fi
+assert_lock_package \
+    ur \
+    0.3.0 \
+    "git+${expected_keystone_ur_repository}?rev=${expected_keystone_ur_revision}#${expected_keystone_ur_revision}"
+assert_lock_package \
+    ur-registry \
+    1.0.8 \
+    "git+${expected_keystone_registry_repository}?rev=${expected_keystone_registry_revision}#${expected_keystone_registry_revision}"
+
 voting_source="git+${expected_voting_repository}?rev=${expected_voting_revision}#${expected_voting_revision}"
-unexpected_lock_sources=$(awk -v librust_source="$librust_source" -v voting_source="$voting_source" '
+keystone_ur_source="git+${expected_keystone_ur_repository}?rev=${expected_keystone_ur_revision}#${expected_keystone_ur_revision}"
+keystone_registry_source="git+${expected_keystone_registry_repository}?rev=${expected_keystone_registry_revision}#${expected_keystone_registry_revision}"
+unexpected_lock_sources=$(awk \
+    -v librust_source="$librust_source" \
+    -v voting_source="$voting_source" \
+    -v keystone_ur_source="$keystone_ur_source" \
+    -v keystone_registry_source="$keystone_registry_source" '
     /^source = "/ {
         source = $0
         sub(/^source = "/, "", source)
         sub(/"$/, "", source)
-        if (source !~ /^registry\+/ && source != librust_source && source != voting_source) {
+        if (source !~ /^registry\+/ \
+            && source != librust_source \
+            && source != voting_source \
+            && source != keystone_ur_source \
+            && source != keystone_registry_source) {
             print source
         }
     }

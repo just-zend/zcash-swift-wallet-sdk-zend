@@ -2482,7 +2482,13 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         pczts: [MigrationUnsignedTransferPczt],
         maxFragmentLen: Int
     ) async throws -> [String] {
-        // One owned buffer per pczt (see `migrationStoreSignedSchedulePczts` for the rationale).
+        guard maxFragmentLen > 0 else {
+            throw ZcashError.rustMigrationKeystoneBuildSignBatchQrParts(
+                "`maxFragmentLen` must be greater than zero"
+            )
+        }
+
+        // One owned buffer per PCZT keeps every parallel FFI pointer valid for the whole call.
         let pcztBuffers: [UnsafeMutablePointer<UInt8>] = pczts.map { unsigned in
             let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: unsigned.pczt.count)
             unsigned.pczt.copyBytes(to: buffer, count: unsigned.pczt.count)
@@ -2534,6 +2540,61 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return parts
     }
 
+    @DBActor
+    func migrationKeystoneBuildClaimOwnedSignBatchQrParts(
+        requestId: Data,
+        claim: MigrationClaimHandle,
+        for account: AccountUUID,
+        maxFragmentLen: Int
+    ) async throws -> [String] {
+        guard maxFragmentLen > 0 else {
+            throw ZcashError.rustMigrationKeystoneBuildSignBatchQrParts(
+                "`maxFragmentLen` must be greater than zero"
+            )
+        }
+
+        let requestIdBytes = requestId.bytes
+        let claimPointers: [OpaquePointer?] = [claim.pointer]
+        let qrPartsPtr = claimPointers.withUnsafeBufferPointer { claimsPtr in
+            zcashlc_migration_keystone_build_sign_batch_qr_parts_v2(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                requestIdBytes,
+                UInt(requestIdBytes.count),
+                claimsPtr.baseAddress,
+                UInt(claimsPtr.count),
+                UInt(maxFragmentLen)
+            )
+        }
+
+        guard let qrPartsPtr else {
+            throw ZcashError.rustMigrationKeystoneBuildSignBatchQrParts(
+                lastErrorMessage(fallback: "`migrationKeystoneBuildClaimOwnedSignBatchQrParts` failed with unknown error")
+            )
+        }
+
+        defer { zcashlc_free_migration_keystone_qr_parts(qrPartsPtr) }
+
+        var parts: [String] = []
+        parts.reserveCapacity(Int(qrPartsPtr.pointee.len))
+        for index in 0 ..< Int(qrPartsPtr.pointee.len) {
+            guard
+                let partCString = qrPartsPtr.pointee.ptr.advanced(by: index).pointee,
+                let part = String(validatingUTF8: partCString)
+            else {
+                throw ZcashError.rustMigrationKeystoneBuildSignBatchQrParts(
+                    lastErrorMessage(
+                        fallback: "`migrationKeystoneBuildClaimOwnedSignBatchQrParts` returned a malformed QR part"
+                    )
+                )
+            }
+            parts.append(part)
+        }
+        return parts
+    }
+
     func migrationKeystoneResetSignBatchDecoder() async {
         zcashlc_migration_keystone_reset_sign_batch_decoder()
     }
@@ -2569,7 +2630,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         defer { freeCStrings(idsCStrings) }
         let idsConstPointers = constPointers(idsCStrings)
 
-        // One owned buffer per pczt (see `migrationStoreSignedSchedulePczts` for the rationale).
+        // One owned buffer per PCZT keeps every parallel FFI pointer valid for the whole call.
         let pcztBuffers: [UnsafeMutablePointer<UInt8>] = pczts.map { unsigned in
             let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: unsigned.pczt.count)
             unsigned.pczt.copyBytes(to: buffer, count: unsigned.pczt.count)

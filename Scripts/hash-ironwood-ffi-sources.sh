@@ -40,6 +40,7 @@ files=(
     Scripts/verify-ironwood-macho-floor.sh
     Scripts/verify-ironwood-package-platforms.sh
     Scripts/verify-ironwood-package-reproducibility.sh
+    Scripts/verify-ironwood-reviewed-source-locks.sh
     Scripts/verify-ironwood-cargo-pins.sh
     Scripts/verify-ironwood-static-release-inputs.sh
     Scripts/verify-ironwood-xcframework-metadata.sh

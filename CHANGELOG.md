@@ -159,8 +159,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mismatch at completion throws, rejecting a stale/unrelated scan); and
   `migrationKeystoneApplyBatchSignatures(pczts:batchSignResponse:)` applies the device's positional
   signatures back onto the caller-held unredacted PCZTs (the SAME array, SAME order passed to
-  `migrationKeystoneBuildSignBatchQrParts`), returning `[MigrationSignedTransferPczt]` ready for the
-  existing `storeSignedNoteSplitPCZTs`/`storeSignedMigrationSchedulePCZTs` calls. New error codes
+  `migrationKeystoneBuildSignBatchQrParts`), returning `[MigrationSignedTransferPczt]`. These four
+  methods preserve the exact upstream byte-oriented codec and do not grant migration authority.
+  Zend layers a scheduled batch-of-one adapter on top:
+  `buildKeystoneSignBatchQRParts(accountUUID:requestId:request:maxFragmentLen:)` sends only the
+  request's private live claim to the v2 Rust builder, and
+  `applyKeystoneBatchSignatures(request:batchSignResponse:)` applies the response to that request's
+  exact retained canonical PCZT before the existing claim-checked submit call. Retired raw
+  note-split/schedule storage APIs remain absent. New error codes
   `rustMigrationKeystoneBuildSignBatchQrParts` ZRUST0136, `rustMigrationKeystoneDecodeSignBatchPart`
   ZRUST0137, and `rustMigrationKeystoneApplyBatchSignatures` ZRUST0138. Surfaced on the
   `Synchronizer` protocol as `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)`,
@@ -169,7 +175,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend (no per-account migration actor, since the bridge is DB-free), with throwing
   "unimplemented" protocol-extension defaults for the three throwing members like the rest of the
   group (`resetKeystoneSignBatchDecoder()` gets the group's fourth inert default instead, since it
-  is itself infallible).
+  is itself infallible). The pre-existing Zend-only `rustMigrationDelivery` code moves to
+  ZRUST0139 so upstream's exact ZRUST0136-0138 schema remains unchanged. The upstream Keystone
+  envelope dependencies are frozen to exact commits (`ur`'s 0.3.3 tag resolution and the reviewed
+  `ur-registry` revision) and recorded in artifact provenance.
 - Ironwood (NU6.3) receive/sync readiness. The lightwalletd protocol gains the Ironwood fields
   (`CompactTx.ironwoodActions`, `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
   `ShieldedProtocol.ironwood`); `UpdateSubtreeRootsAction` fetches and stores Ironwood subtree roots

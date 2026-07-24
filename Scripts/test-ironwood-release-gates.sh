@@ -20,6 +20,70 @@ temp_root=$(mktemp -d)
 cleanup() { rm -rf "$temp_root"; }
 trap cleanup EXIT
 
+replace_required_field() {
+    local file="$1" field="$2" value="$3" matches replacement
+    matches=$(grep -c "^${field}=" "$file" || true)
+    if [[ "$matches" != "1" ]]; then
+        echo "Error: source-lock fixture must contain exactly one $field" >&2
+        exit 1
+    fi
+    replacement="$file.replacement"
+    awk -v field="$field" -v value="$value" '
+        index($0, field "=") == 1 { print field "=" value; next }
+        { print }
+    ' "$file" > "$replacement"
+    mv "$replacement" "$file"
+}
+
+reviewed_locks="$temp_root/reviewed-locks.env"
+cat > "$reviewed_locks" <<'EOF'
+SDK_MIGRATION_FEATURE_BASE_REVISION=1f5061a6773b811382f18aed8a5ab50e69cdc59e
+UPSTREAM_MIGRATION_FEATURE_REVISION=e1fdd10eec9c97cdbee4e944d571ee38fa748ae9
+UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+UPSTREAM_MIGRATION_FFI_REVISION=90306346725d2e45e9cc4d25cef62732c7e7fd09
+UPSTREAM_MIGRATION_FFI_MERGE_REVISION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+UPSTREAM_MIGRATION_SWIFT_REVISION=37b03692c089c5cccd0ff5b5feafe1dcaaf4b312
+UPSTREAM_MIGRATION_SWIFT_MERGE_REVISION=cccccccccccccccccccccccccccccccccccccccc
+INCLUDED_UPSTREAM_1825_REVISION=93ed4ed957df3c1962bad283cd588dc385f955a0
+INCLUDED_UPSTREAM_KEYSTONE_REVISION=5960351ab1effc488009b426d441f67530f015f3
+INCLUDED_UPSTREAM_KEYSTONE_SWIFT_REVISION=3c9d6cb9a00649489f7740abea608eae8ea8630e
+SDK_PR_1825_SEMANTIC_PORT_REVISION=641e8f6ee7f998cd6810fe4ce231419a1e933a01
+LIBRUSTZCASH_REVISION=1d63c9c07b0b40b3de633c8396008ff543464a01
+KEYSTONE_UR_REVISION=81b8bb3b6b3a823128489c81ffee5bb4001ba2ae
+KEYSTONE_UR_REGISTRY_REVISION=7c90bf1ae504720c3f4b44ff26f996836d8b1553
+EOF
+matching_locks="$temp_root/matching-reviewed-locks.env"
+cp "$reviewed_locks" "$matching_locks"
+./Scripts/verify-ironwood-reviewed-source-locks.sh \
+    "$reviewed_locks" "$matching_locks" >/dev/null
+
+for field in \
+    UPSTREAM_MIGRATION_FEATURE_REVISION \
+    UPSTREAM_MIGRATION_FFI_REVISION \
+    UPSTREAM_MIGRATION_SWIFT_REVISION \
+    INCLUDED_UPSTREAM_1825_REVISION \
+    INCLUDED_UPSTREAM_KEYSTONE_REVISION \
+    INCLUDED_UPSTREAM_KEYSTONE_SWIFT_REVISION \
+    SDK_PR_1825_SEMANTIC_PORT_REVISION \
+    LIBRUSTZCASH_REVISION \
+    KEYSTONE_UR_REVISION \
+    KEYSTONE_UR_REGISTRY_REVISION
+do
+    tampered_locks="$temp_root/tampered-$field.env"
+    cp "$reviewed_locks" "$tampered_locks"
+    replace_required_field "$tampered_locks" "$field" \
+        0000000000000000000000000000000000000000
+    expect_failure "tampered reviewed source lock: $field" \
+        ./Scripts/verify-ironwood-reviewed-source-locks.sh "$tampered_locks"
+done
+
+wrong_merge_locks="$temp_root/wrong-feature-merge.env"
+cp "$matching_locks" "$wrong_merge_locks"
+replace_required_field "$wrong_merge_locks" UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION \
+    dddddddddddddddddddddddddddddddddddddddd
+expect_failure "provenance/recipe migration-feature merge mismatch" \
+    ./Scripts/verify-ironwood-reviewed-source-locks.sh "$reviewed_locks" "$wrong_merge_locks"
+
 path_hash_one=$(./Scripts/hash-ironwood-build-path.sh \
     "$temp_root/build-one/rust/bin:/usr/bin:/bin" \
     "$temp_root/build-one/rust/bin")
@@ -243,6 +307,22 @@ printf '\nunreviewed = { git = "https://example.invalid/unreviewed", rev = "0000
     >> "$extra_git_manifest"
 expect_failure "extra non-registry dependency" env \
     IRONWOOD_CARGO_MANIFEST="$extra_git_manifest" IRONWOOD_CARGO_LOCKFILE=Cargo.lock \
+    ./Scripts/verify-ironwood-cargo-pins.sh
+
+mutable_keystone_manifest="$temp_root/Cargo-mutable-keystone.toml"
+sed \
+    's/rev = "81b8bb3b6b3a823128489c81ffee5bb4001ba2ae"/tag = "0.3.3"/' \
+    Cargo.toml > "$mutable_keystone_manifest"
+expect_failure "mutable Keystone UR tag" env \
+    IRONWOOD_CARGO_MANIFEST="$mutable_keystone_manifest" IRONWOOD_CARGO_LOCKFILE=Cargo.lock \
+    ./Scripts/verify-ironwood-cargo-pins.sh
+
+wrong_keystone_lock="$temp_root/Cargo-wrong-keystone.lock"
+sed \
+    's/7c90bf1ae504720c3f4b44ff26f996836d8b1553/0000000000000000000000000000000000000000/g' \
+    Cargo.lock > "$wrong_keystone_lock"
+expect_failure "wrong Keystone registry lock revision" env \
+    IRONWOOD_CARGO_MANIFEST=Cargo.toml IRONWOOD_CARGO_LOCKFILE="$wrong_keystone_lock" \
     ./Scripts/verify-ironwood-cargo-pins.sh
 
 multiline_git_manifest="$temp_root/Cargo-multiline-git.toml"

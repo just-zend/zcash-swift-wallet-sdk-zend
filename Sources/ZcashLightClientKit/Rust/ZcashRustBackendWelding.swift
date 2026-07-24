@@ -766,6 +766,16 @@ protocol ZcashRustBackendWelding {
         maxFragmentLen: Int
     ) async throws -> [String]
 
+    /// Builds a batch-of-one Keystone request from the exact canonical PCZT sealed inside a live
+    /// scheduled migration claim. Unlike the upstream pure bridge above, caller-authored PCZT
+    /// bytes never cross this boundary.
+    func migrationKeystoneBuildClaimOwnedSignBatchQrParts(
+        requestId: Data,
+        claim: MigrationClaimHandle,
+        for account: AccountUUID,
+        maxFragmentLen: Int
+    ) async throws -> [String]
+
     /// Discards any in-flight multi-part Keystone sign-batch-response scan session. Callers
     /// should invoke this on scan-screen entry, on retry, and on exit, so a new attempt always
     /// starts from a clean slate regardless of how a previous attempt ended (cancel, back button,

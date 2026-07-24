@@ -547,8 +547,7 @@ public struct MigrationDeliverySnapshot: Equatable, Sendable, CustomStringConver
             lhs.hasSubmissionPolicy == rhs.hasSubmissionPolicy &&
             lhs.policyValidationFailure == rhs.policyValidationFailure &&
             lhs.safeToCancel == rhs.safeToCancel &&
-            lhs.claims == rhs.claims &&
-            lhs.revision == rhs.revision
+            lhs.claims == rhs.claims
     }
 
     public var description: String {
@@ -750,6 +749,7 @@ public enum MigrationDeliveryError: Error, Equatable, Sendable, LocalizedError {
     case scheduledDeliveryRunUnavailable
     case expiredTransferUnavailable(transactionID: UInt32)
     case missingExternalSigningPCZT
+    case keystoneBatchResponseMismatch
     case missingExactTransaction
     case missingTransactionID
     case submissionTargetUnavailable
@@ -772,6 +772,8 @@ public enum MigrationDeliveryError: Error, Equatable, Sendable, LocalizedError {
             return "The requested migration transaction is not the current exact expired attempt."
         case .missingExternalSigningPCZT:
             return "The migration engine did not return the reserved external-signing PCZT."
+        case .keystoneBatchResponseMismatch:
+            return "The Keystone batch response did not produce exactly the requested migration PCZT."
         case .missingExactTransaction:
             return "The migration engine did not return the reserved exact transaction."
         case .missingTransactionID:

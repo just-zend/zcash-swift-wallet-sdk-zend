@@ -150,9 +150,9 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
         let accountBalance = try XCTUnwrap(summary.accountBalances[Self.expectedAccount])
         XCTAssertEqual(accountBalance.orchardBalance.total(), Self.orchardValue)
         // The schema migration introduces a historic Ironwood activation range. Until the next
-        // synchronization scans that range, the open Orchard shard is not witness-complete under
-        // current librustzcash rules. Total value must survive, but presenting it as immediately
-        // spendable would race the required rescan.
+        // synchronization scans that range, the wallet summary conservatively masks spendability.
+        // The upstream migration planner can still preview against the Orchard witnesses already
+        // present in this upgraded wallet; previewing remains pure and does not bypass sync gating.
         XCTAssertEqual(accountBalance.orchardBalance.spendableValue, .zero)
         XCTAssertEqual(accountBalance.ironwoodBalance.total(), .zero)
 
@@ -173,7 +173,8 @@ final class OldOrchardDatabaseMigrationTests: ZcashTestCase {
 
         let migrationRowsBeforeProposal = try Self.migrationRowCount(at: dataDbURL)
         let proposal = try await synchronizer.proposeMigrationTransfers(accountUUID: Self.expectedAccount)
-        XCTAssertTrue(proposal.transfers.isEmpty)
+        XCTAssertFalse(proposal.transfers.isEmpty)
+        XCTAssertTrue(proposal.transfers.allSatisfy { $0.amount > .zero })
         XCTAssertEqual(try Self.captureDurableState(at: dataDbURL), afterPrepare)
         XCTAssertEqual(try Self.migrationRowCount(at: dataDbURL), migrationRowsBeforeProposal)
         let snapshotAfterProposal = try await synchronizer.migrationRuntimeSnapshot(accountUUID: Self.expectedAccount)

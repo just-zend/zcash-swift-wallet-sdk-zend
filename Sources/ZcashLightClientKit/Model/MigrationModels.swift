@@ -433,8 +433,11 @@ public enum MigrationAttentionReason: Equatable, Sendable {
     /// A transaction's anchor/expiry elapsed before it could be broadcast.
     case transferExpired
 }
-/// An unsigned-but-proven PCZT for one scheduled transfer, awaiting an external signer (see
-/// `ZcashRustBackendWelding.migrationCreateUnsignedTransferPczts(for:for:)`).
+/// An unsigned-but-proven PCZT accepted by the upstream-compatible pure Keystone codec.
+///
+/// This value carries bytes, not migration authority. Zend's scheduled-delivery API instead
+/// returns ``ScheduledMigrationExternalSigningRequest`` and uses its private opaque claim when
+/// building the QR request and accepting the signed result.
 public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
     /// The transfer's opaque, engine-issued id.
     public let id: String
@@ -448,8 +451,9 @@ public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
     }
 }
 
-/// An externally signed PCZT for one scheduled transfer, to be handed back to the engine via
-/// `ZcashRustBackendWelding.migrationStoreSignedSchedulePczts(_:for:)`.
+/// An externally signed PCZT produced by the upstream-compatible pure Keystone codec.
+/// Zend's claim-owned scheduled adapter extracts the one signed PCZT and submits it with the same
+/// ``ScheduledMigrationExternalSigningRequest`` that authorized the ceremony.
 public struct MigrationSignedTransferPczt: Equatable, Sendable {
     /// The transfer's opaque, engine-issued id (must match the corresponding
     /// `MigrationUnsignedTransferPczt.id`).

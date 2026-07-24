@@ -19,6 +19,7 @@ test -f "$xcframework/Info.plist"
 test -f "$provenance"
 test -f "$build_recipe"
 
+./Scripts/verify-ironwood-reviewed-source-locks.sh "$provenance" "$build_recipe" >/dev/null
 ./Scripts/verify-ironwood-static-release-inputs.sh >/dev/null
 
 if find LocalPackages -type f \( -name '*.rs' -o -name Cargo.toml -o -name Cargo.lock -o -name '*.rlib' \) | grep -q .; then
@@ -132,13 +133,19 @@ if [[ ${#required_symbols[@]} -eq 0 ]]; then
     echo "Error: no production zcashlc ABI calls were discovered" >&2
     exit 1
 fi
-# v1 is intentionally absent from production Swift: it preserves the original prerelease ABI but
-# always fails closed because that signature has no maximum-gross authorization. Keep both versions
-# in every artifact so an old header can never call a differently-shaped function under the same
-# exported name.
+# Some compatibility/upstream bridge entry points are intentionally not discovered from production
+# Swift calls. Keep the frozen immediate-reservation ABI, the exact upstream Keystone batch bridge,
+# and Zend's account-aware v2 QR builder in every regenerated header and every binary slice.
 required_symbols+=(
     zcashlc_migration_reserve_immediate_v1
     zcashlc_migration_reserve_immediate_v2
+    zcashlc_free_migration_keystone_qr_parts
+    zcashlc_free_migration_keystone_batch_decode_result
+    zcashlc_migration_keystone_build_sign_batch_qr_parts
+    zcashlc_migration_keystone_reset_sign_batch_decoder
+    zcashlc_migration_keystone_decode_sign_batch_part
+    zcashlc_migration_keystone_apply_batch_signatures
+    zcashlc_migration_keystone_build_sign_batch_qr_parts_v2
 )
 
 # Apple nm cannot reliably parse LLVM 22 attributes emitted by Rust 1.96. Use llvm-nm from the
@@ -309,11 +316,20 @@ sdk_pool_upstream_revision=$(read_field SDK_POOL_MIGRATION_UPSTREAM_REVISION)
 sdk_pool_merge_revision=$(read_field SDK_POOL_MIGRATION_MERGE_REVISION)
 sdk_pr1812_upstream_revision=$(read_field SDK_PR_1812_UPSTREAM_REVISION)
 sdk_pr1812_merge_revision=$(read_field SDK_PR_1812_MERGE_REVISION)
+sdk_migration_feature_base_revision=$(read_field SDK_MIGRATION_FEATURE_BASE_REVISION)
+upstream_migration_feature_revision=$(read_field UPSTREAM_MIGRATION_FEATURE_REVISION)
+upstream_migration_feature_merge_revision=$(read_field UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION)
+upstream_migration_ffi_revision=$(read_field UPSTREAM_MIGRATION_FFI_REVISION)
+upstream_migration_ffi_merge_revision=$(read_field UPSTREAM_MIGRATION_FFI_MERGE_REVISION)
+upstream_migration_swift_revision=$(read_field UPSTREAM_MIGRATION_SWIFT_REVISION)
+upstream_migration_swift_merge_revision=$(read_field UPSTREAM_MIGRATION_SWIFT_MERGE_REVISION)
 upstream_1807_merge_revision=$(read_field UPSTREAM_1807_MERGE_REVISION)
 included_1813_revision=$(read_field INCLUDED_UPSTREAM_1813_REVISION)
 included_1821_revision=$(read_field INCLUDED_UPSTREAM_1821_REVISION)
 included_1822_revision=$(read_field INCLUDED_UPSTREAM_1822_REVISION)
 included_1825_revision=$(read_field INCLUDED_UPSTREAM_1825_REVISION)
+included_keystone_revision=$(read_field INCLUDED_UPSTREAM_KEYSTONE_REVISION)
+included_keystone_swift_revision=$(read_field INCLUDED_UPSTREAM_KEYSTONE_SWIFT_REVISION)
 sdk_pr1825_semantic_port_revision=$(read_field SDK_PR_1825_SEMANTIC_PORT_REVISION)
 upstream_1821_merge_revision=$(read_field UPSTREAM_1821_MERGE_REVISION)
 upstream_1822_merge_revision=$(read_field UPSTREAM_1822_MERGE_REVISION)
@@ -323,9 +339,14 @@ for revision in \
     "$sdk_base_revision" "$sdk_ironwood_upstream_revision" "$sdk_ironwood_merge_revision" \
     "$sdk_pool_upstream_revision" "$sdk_pool_merge_revision" \
     "$sdk_pr1812_upstream_revision" "$sdk_pr1812_merge_revision" \
+    "$sdk_migration_feature_base_revision" "$upstream_migration_feature_revision" \
+    "$upstream_migration_feature_merge_revision" \
+    "$upstream_migration_ffi_revision" "$upstream_migration_ffi_merge_revision" \
+    "$upstream_migration_swift_revision" "$upstream_migration_swift_merge_revision" \
     "$upstream_1807_merge_revision" \
     "$included_1813_revision" "$included_1821_revision" "$included_1822_revision" \
-    "$included_1825_revision" "$sdk_pr1825_semantic_port_revision" \
+    "$included_1825_revision" "$included_keystone_revision" "$included_keystone_swift_revision" \
+    "$sdk_pr1825_semantic_port_revision" \
     "$upstream_1821_merge_revision" "$upstream_1822_merge_revision"
 do
     if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
@@ -349,9 +370,25 @@ verify_exact_merge UPSTREAM_1822 \
     "$upstream_1822_merge_revision" "$upstream_1821_merge_revision" "$included_1822_revision"
 verify_exact_merge SDK_PR_1812 \
     "$sdk_pr1812_merge_revision" "$upstream_1822_merge_revision" "$sdk_pr1812_upstream_revision"
+verify_exact_merge UPSTREAM_MIGRATION_FEATURE \
+    "$upstream_migration_feature_merge_revision" \
+    "$sdk_migration_feature_base_revision" \
+    "$upstream_migration_feature_revision"
+verify_exact_merge UPSTREAM_MIGRATION_FFI \
+    "$upstream_migration_ffi_merge_revision" \
+    "$upstream_migration_feature_merge_revision" \
+    "$upstream_migration_ffi_revision"
+verify_exact_merge UPSTREAM_MIGRATION_SWIFT \
+    "$upstream_migration_swift_merge_revision" \
+    "$upstream_migration_ffi_merge_revision" \
+    "$upstream_migration_swift_revision"
 if ! git merge-base --is-ancestor "$included_1813_revision" "$sdk_pr1812_upstream_revision" \
+    || ! git merge-base --is-ancestor "$included_1825_revision" "$upstream_migration_feature_revision" \
+    || ! git merge-base --is-ancestor "$included_keystone_revision" "$upstream_migration_feature_revision" \
+    || ! git merge-base --is-ancestor "$included_keystone_swift_revision" "$upstream_migration_swift_revision" \
     || ! git merge-base --is-ancestor "$implementation_revision" "$source_revision" \
     || ! git merge-base --is-ancestor "$sdk_pr1825_semantic_port_revision" "$source_revision" \
+    || ! git merge-base --is-ancestor "$upstream_migration_swift_merge_revision" "$source_revision" \
     || ! git merge-base --is-ancestor "$sdk_pr1812_merge_revision" "$source_revision" \
     || ! git merge-base --is-ancestor "$source_revision" HEAD
 then
@@ -496,12 +533,19 @@ recipe_fields=(
     SDK_BASE_REVISION SDK_IRONWOOD_UPSTREAM_REVISION SDK_IRONWOOD_MERGE_REVISION
     SDK_POOL_MIGRATION_UPSTREAM_REVISION SDK_POOL_MIGRATION_MERGE_REVISION
     SDK_PR_1812_UPSTREAM_REVISION SDK_PR_1812_MERGE_REVISION
+    SDK_MIGRATION_FEATURE_BASE_REVISION UPSTREAM_MIGRATION_FEATURE_REVISION
+    UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION
+    UPSTREAM_MIGRATION_FFI_REVISION UPSTREAM_MIGRATION_FFI_MERGE_REVISION
+    UPSTREAM_MIGRATION_SWIFT_REVISION UPSTREAM_MIGRATION_SWIFT_MERGE_REVISION
     UPSTREAM_1807_MERGE_REVISION INCLUDED_UPSTREAM_1813_REVISION
     INCLUDED_UPSTREAM_1821_REVISION INCLUDED_UPSTREAM_1822_REVISION
-    INCLUDED_UPSTREAM_1825_REVISION SDK_PR_1825_SEMANTIC_PORT_REVISION
+    INCLUDED_UPSTREAM_1825_REVISION INCLUDED_UPSTREAM_KEYSTONE_REVISION
+    INCLUDED_UPSTREAM_KEYSTONE_SWIFT_REVISION
+    SDK_PR_1825_SEMANTIC_PORT_REVISION
     UPSTREAM_1821_MERGE_REVISION UPSTREAM_1822_MERGE_REVISION
     LIBRUSTZCASH_REPOSITORY LIBRUSTZCASH_REVISION LIBRUSTZCASH_TREE
-    ZCASH_VOTING_REVISION ORCHARD_VERSION ORCHARD_CHECKSUM
+    ZCASH_VOTING_REVISION KEYSTONE_UR_REVISION KEYSTONE_UR_REGISTRY_REVISION
+    ORCHARD_VERSION ORCHARD_CHECKSUM
     MIGRATION_RESERVE_ABI_POLICY
     SOURCE_DATE_EPOCH RUST_TOOLCHAIN BUILD_ENVIRONMENT_POLICY FFI_ARCHIVE_POSTPROCESSING
     BUILD_PATH_POLICY BUILD_PATH_SHA256 RUSTUP_HOME_POLICY GIT_CONFIG_POLICY
@@ -524,14 +568,23 @@ if [[ "$(read_field SDK_BASE_REVISION)" != "9476ced615d90407270d3d741823d5797ef0
     || "$(read_field SDK_POOL_MIGRATION_MERGE_REVISION)" != "d2dbd935a896630a878d997c792d8e3b7c46563a" \
     || "$(read_field SDK_PR_1812_UPSTREAM_REVISION)" != "daf1aa1bda57cbc4044f8978cb6170f82940a3d8" \
     || "$(read_field SDK_PR_1812_MERGE_REVISION)" != "0835b3cd3275580802e5d26b0fd0896b2c1e3155" \
+    || "$(read_field SDK_MIGRATION_FEATURE_BASE_REVISION)" != "1f5061a6773b811382f18aed8a5ab50e69cdc59e" \
+    || "$(read_field UPSTREAM_MIGRATION_FEATURE_REVISION)" != "e1fdd10eec9c97cdbee4e944d571ee38fa748ae9" \
+    || "$(read_field UPSTREAM_MIGRATION_FFI_REVISION)" != "90306346725d2e45e9cc4d25cef62732c7e7fd09" \
+    || "$(read_field UPSTREAM_MIGRATION_SWIFT_REVISION)" != "37b03692c089c5cccd0ff5b5feafe1dcaaf4b312" \
     || "$(read_field UPSTREAM_1807_MERGE_REVISION)" != "ef6c31420cf861d459b5fe41a47997fe255ffa4b" \
     || "$(read_field INCLUDED_UPSTREAM_1813_REVISION)" != "adfe9ca7a989f7a7197f8b10138519f8a02f790f" \
     || "$(read_field INCLUDED_UPSTREAM_1821_REVISION)" != "eb219e2f86f5725377ebdf3985815c809a954450" \
     || "$(read_field INCLUDED_UPSTREAM_1822_REVISION)" != "5aa8b4b4bb1ff4075a670b56de268295cff45589" \
     || "$(read_field INCLUDED_UPSTREAM_1825_REVISION)" != "93ed4ed957df3c1962bad283cd588dc385f955a0" \
+    || "$(read_field INCLUDED_UPSTREAM_KEYSTONE_REVISION)" != "5960351ab1effc488009b426d441f67530f015f3" \
+    || "$(read_field INCLUDED_UPSTREAM_KEYSTONE_SWIFT_REVISION)" != "3c9d6cb9a00649489f7740abea608eae8ea8630e" \
     || "$(read_field SDK_PR_1825_SEMANTIC_PORT_REVISION)" != "641e8f6ee7f998cd6810fe4ce231419a1e933a01" \
     || "$(read_field LIBRUSTZCASH_REPOSITORY)" != "https://github.com/just-zend/librustzcash" \
+    || "$(read_field LIBRUSTZCASH_REVISION)" != "1d63c9c07b0b40b3de633c8396008ff543464a01" \
     || "$(read_field ZCASH_VOTING_REVISION)" != "04d255628f1d56de0479e3fb6963409dbe44ec1f" \
+    || "$(read_field KEYSTONE_UR_REVISION)" != "81b8bb3b6b3a823128489c81ffee5bb4001ba2ae" \
+    || "$(read_field KEYSTONE_UR_REGISTRY_REVISION)" != "7c90bf1ae504720c3f4b44ff26f996836d8b1553" \
     || "$(read_field ORCHARD_VERSION)" != "0.15.4" \
     || "$(read_field ORCHARD_CHECKSUM)" != "793e2e8c2323f35f082d1b3467ca8f576d646f9c93aef8c5168809d099245af8" \
     || "$(read_field MIGRATION_RESERVE_ABI_POLICY)" != "legacy-v1-fail-closed-authorized-v2" ]]
@@ -541,7 +594,8 @@ then
 fi
 for field in \
     SDK_FFI_SOURCE_REVISION SDK_FFI_SOURCE_TREE SDK_IRONWOOD_IMPLEMENTATION_REVISION \
-    SDK_PR_1825_SEMANTIC_PORT_REVISION \
+    SDK_PR_1825_SEMANTIC_PORT_REVISION UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION \
+    UPSTREAM_MIGRATION_FFI_MERGE_REVISION UPSTREAM_MIGRATION_SWIFT_MERGE_REVISION \
     UPSTREAM_1821_MERGE_REVISION UPSTREAM_1822_MERGE_REVISION
 do
     if [[ ! "$(read_field "$field")" =~ ^[0-9a-f]{40}$ ]]; then

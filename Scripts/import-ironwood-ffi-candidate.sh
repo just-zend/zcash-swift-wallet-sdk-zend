@@ -20,10 +20,18 @@ expected_publication_ref="$4"
 repository="just-zend/zcash-swift-wallet-sdk-zend"
 workflow_path=".github/workflows/build-ffi.yml"
 artifact_name="ironwood-ffi-candidate-${expected_source_sha}-${expected_rust_revision}"
+reviewed_rust_revision="1d63c9c07b0b40b3de633c8396008ff543464a01"
+reviewed_migration_feature_base_revision="1f5061a6773b811382f18aed8a5ab50e69cdc59e"
+reviewed_migration_feature_revision="e1fdd10eec9c97cdbee4e944d571ee38fa748ae9"
+reviewed_migration_ffi_revision="90306346725d2e45e9cc4d25cef62732c7e7fd09"
+reviewed_migration_swift_revision="37b03692c089c5cccd0ff5b5feafe1dcaaf4b312"
+reviewed_1825_revision="93ed4ed957df3c1962bad283cd588dc385f955a0"
+reviewed_keystone_revision="5960351ab1effc488009b426d441f67530f015f3"
+reviewed_keystone_swift_revision="3c9d6cb9a00649489f7740abea608eae8ea8630e"
 
 if [[ ! "$run_id" =~ ^[1-9][0-9]*$ \
     || ! "$expected_source_sha" =~ ^[0-9a-f]{40}$ \
-    || ! "$expected_rust_revision" =~ ^[0-9a-f]{40}$ \
+    || "$expected_rust_revision" != "$reviewed_rust_revision" \
     || ! "$expected_publication_ref" =~ ^refs/(heads|tags)/[-A-Za-z0-9._/]+$ ]]
 then
     echo "Error: candidate import requires an exact run, SDK SHA, Rust SHA, and public ref" >&2
@@ -134,6 +142,7 @@ verify_file_hash() {
 verify_file_hash "$(read_field "$candidate" XCFRAMEWORK_ZIP_SHA256)" "$archive"
 verify_file_hash "$(read_field "$candidate" PROVENANCE_SHA256)" "$provenance"
 verify_file_hash "$(read_field "$candidate" BUILD_RECIPE_SHA256)" "$recipe"
+./Scripts/verify-ironwood-reviewed-source-locks.sh "$provenance" "$recipe" >/dev/null
 
 for record in "$provenance" "$recipe"; do
     if [[ "$(read_field "$record" SDK_FFI_SOURCE_REVISION)" != "$expected_source_sha" \
@@ -146,6 +155,29 @@ for record in "$provenance" "$recipe"; do
         exit 1
     fi
 done
+migration_feature_merge_revision=$(read_field "$provenance" UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION)
+migration_ffi_merge_revision=$(read_field "$provenance" UPSTREAM_MIGRATION_FFI_MERGE_REVISION)
+migration_swift_merge_revision=$(read_field "$provenance" UPSTREAM_MIGRATION_SWIFT_MERGE_REVISION)
+if [[ ! "$migration_feature_merge_revision" =~ ^[0-9a-f]{40}$ \
+    || ! "$migration_ffi_merge_revision" =~ ^[0-9a-f]{40}$ \
+    || ! "$migration_swift_merge_revision" =~ ^[0-9a-f]{40}$ \
+    || "$(read_field "$recipe" UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION)" != "$migration_feature_merge_revision" \
+    || "$(read_field "$recipe" UPSTREAM_MIGRATION_FFI_MERGE_REVISION)" != "$migration_ffi_merge_revision" \
+    || "$(read_field "$recipe" UPSTREAM_MIGRATION_SWIFT_MERGE_REVISION)" != "$migration_swift_merge_revision" ]] \
+    || [[ "$(git show -s --format=%P "$migration_feature_merge_revision" 2>/dev/null)" \
+        != "$reviewed_migration_feature_base_revision $reviewed_migration_feature_revision" ]] \
+    || [[ "$(git show -s --format=%P "$migration_ffi_merge_revision" 2>/dev/null)" \
+        != "$migration_feature_merge_revision $reviewed_migration_ffi_revision" ]] \
+    || [[ "$(git show -s --format=%P "$migration_swift_merge_revision" 2>/dev/null)" \
+        != "$migration_ffi_merge_revision $reviewed_migration_swift_revision" ]] \
+    || ! git merge-base --is-ancestor "$reviewed_1825_revision" "$reviewed_migration_feature_revision" \
+    || ! git merge-base --is-ancestor "$reviewed_keystone_revision" "$reviewed_migration_feature_revision" \
+    || ! git merge-base --is-ancestor "$reviewed_keystone_swift_revision" "$reviewed_migration_swift_revision" \
+    || ! git merge-base --is-ancestor "$migration_swift_merge_revision" "$expected_source_sha"
+then
+    echo "Error: candidate build record differs from the reviewed upstream migration-feature lineage" >&2
+    exit 1
+fi
 if [[ "$(read_field "$provenance" LIBRUSTZCASH_PUBLICATION_REF_AT_BUILD)" != "$expected_publication_ref" \
     || "$(read_field "$provenance" LIBRUSTZCASH_PUBLICATION_TIP_AT_BUILD)" != "$publication_tip" ]]
 then

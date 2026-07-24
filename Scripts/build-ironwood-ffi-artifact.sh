@@ -14,13 +14,22 @@ expected_sdk_pool_migration_upstream_revision="92a9b2b663bb0c5275794788c1d33a0e3
 expected_sdk_pool_migration_merge_revision="d2dbd935a896630a878d997c792d8e3b7c46563a"
 expected_sdk_pr1812_upstream_revision="daf1aa1bda57cbc4044f8978cb6170f82940a3d8"
 expected_sdk_pr1812_merge_revision="0835b3cd3275580802e5d26b0fd0896b2c1e3155"
+expected_sdk_migration_feature_base_revision="1f5061a6773b811382f18aed8a5ab50e69cdc59e"
+upstream_migration_feature_revision="e1fdd10eec9c97cdbee4e944d571ee38fa748ae9"
+upstream_migration_ffi_revision="90306346725d2e45e9cc4d25cef62732c7e7fd09"
+upstream_migration_swift_revision="37b03692c089c5cccd0ff5b5feafe1dcaaf4b312"
 upstream_1807_merge_revision="ef6c31420cf861d459b5fe41a47997fe255ffa4b"
 included_upstream_1813_revision="adfe9ca7a989f7a7197f8b10138519f8a02f790f"
 included_upstream_1821_revision="eb219e2f86f5725377ebdf3985815c809a954450"
 included_upstream_1822_revision="5aa8b4b4bb1ff4075a670b56de268295cff45589"
 included_upstream_1825_revision="93ed4ed957df3c1962bad283cd588dc385f955a0"
+included_upstream_keystone_revision="5960351ab1effc488009b426d441f67530f015f3"
+included_upstream_keystone_swift_revision="3c9d6cb9a00649489f7740abea608eae8ea8630e"
 sdk_pr1825_semantic_port_revision="641e8f6ee7f998cd6810fe4ce231419a1e933a01"
+expected_librustzcash_revision="1d63c9c07b0b40b3de633c8396008ff543464a01"
 zcash_voting_revision="04d255628f1d56de0479e3fb6963409dbe44ec1f"
+keystone_ur_revision="81b8bb3b6b3a823128489c81ffee5bb4001ba2ae"
+keystone_ur_registry_revision="7c90bf1ae504720c3f4b44ff26f996836d8b1553"
 orchard_version="0.15.4"
 orchard_checksum="793e2e8c2323f35f082d1b3467ca8f576d646f9c93aef8c5168809d099245af8"
 archive_postprocessing="thin-llvm-objcopy-remove-bitcode_lipo_apple-strip-S-x"
@@ -108,10 +117,10 @@ librustzcash_revision=$(git -C "$librustzcash_repo" rev-parse HEAD)
 librustzcash_tree=$(git -C "$librustzcash_repo" rev-parse 'HEAD^{tree}')
 source_date_epoch=$(git -C "$librustzcash_repo" log -1 --format=%ct)
 if [[ "$librustzcash_origin" != "$expected_librustzcash_repository" \
-    || ! "$librustzcash_revision" =~ ^[0-9a-f]{40}$ \
+    || "$librustzcash_revision" != "$expected_librustzcash_revision" \
     || ! "$librustzcash_tree" =~ ^[0-9a-f]{40}$ ]]
 then
-    echo "Error: librustzcash checkout is not an exact commit in the canonical Zend repository" >&2
+    echo "Error: librustzcash checkout is not the reviewed exact commit in the canonical Zend repository" >&2
     exit 1
 fi
 
@@ -245,6 +254,18 @@ upstream_1822_merge_revision=$(resolve_integration_merge \
     UPSTREAM_1822 \
     "$included_upstream_1822_revision" \
     "${UPSTREAM_1822_MERGE_REVISION:-}")
+upstream_migration_feature_merge_revision=$(resolve_integration_merge \
+    UPSTREAM_MIGRATION_FEATURE \
+    "$upstream_migration_feature_revision" \
+    "${UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION:-}")
+upstream_migration_ffi_merge_revision=$(resolve_integration_merge \
+    UPSTREAM_MIGRATION_FFI \
+    "$upstream_migration_ffi_revision" \
+    "${UPSTREAM_MIGRATION_FFI_MERGE_REVISION:-}")
+upstream_migration_swift_merge_revision=$(resolve_integration_merge \
+    UPSTREAM_MIGRATION_SWIFT \
+    "$upstream_migration_swift_revision" \
+    "${UPSTREAM_MIGRATION_SWIFT_MERGE_REVISION:-}")
 verify_merge \
     "$upstream_1821_merge_revision" \
     "$expected_sdk_pool_migration_merge_revision" \
@@ -257,15 +278,33 @@ verify_merge \
     "$expected_sdk_pr1812_merge_revision" \
     "$upstream_1822_merge_revision" \
     "$expected_sdk_pr1812_upstream_revision"
+verify_merge \
+    "$upstream_migration_feature_merge_revision" \
+    "$expected_sdk_migration_feature_base_revision" \
+    "$upstream_migration_feature_revision"
+verify_merge \
+    "$upstream_migration_ffi_merge_revision" \
+    "$upstream_migration_feature_merge_revision" \
+    "$upstream_migration_ffi_revision"
+verify_merge \
+    "$upstream_migration_swift_merge_revision" \
+    "$upstream_migration_ffi_merge_revision" \
+    "$upstream_migration_swift_revision"
 if [[ "$(git rev-parse "$upstream_1807_merge_revision^2")" != "$expected_sdk_ironwood_upstream_revision" ]] \
     || ! git merge-base --is-ancestor "$included_upstream_1813_revision" "$expected_sdk_pr1812_upstream_revision" \
+    || ! git merge-base --is-ancestor "$included_upstream_1825_revision" "$upstream_migration_feature_revision" \
+    || ! git merge-base --is-ancestor "$included_upstream_keystone_revision" "$upstream_migration_feature_revision" \
+    || ! git merge-base --is-ancestor "$included_upstream_keystone_swift_revision" "$upstream_migration_swift_revision" \
     || ! git merge-base --is-ancestor "$included_upstream_1821_revision" HEAD \
     || ! git merge-base --is-ancestor "$included_upstream_1822_revision" HEAD \
     || ! git merge-base --is-ancestor "$sdk_pr1825_semantic_port_revision" HEAD \
+    || ! git merge-base --is-ancestor "$upstream_migration_feature_merge_revision" HEAD \
+    || ! git merge-base --is-ancestor "$upstream_migration_ffi_merge_revision" HEAD \
+    || ! git merge-base --is-ancestor "$upstream_migration_swift_merge_revision" HEAD \
     || ! git merge-base --is-ancestor "$expected_sdk_pool_migration_merge_revision" HEAD \
     || ! git merge-base --is-ancestor "$expected_sdk_pr1812_merge_revision" HEAD
 then
-    echo "Error: SDK checkout does not contain the reviewed #1807/#1812/#1825 source graph" >&2
+    echo "Error: SDK checkout does not contain the reviewed #1807/#1812/#1825/Keystone source graph" >&2
     exit 1
 fi
 
@@ -361,11 +400,20 @@ printf '%s\n' \
     "SDK_POOL_MIGRATION_MERGE_REVISION=$expected_sdk_pool_migration_merge_revision" \
     "SDK_PR_1812_UPSTREAM_REVISION=$expected_sdk_pr1812_upstream_revision" \
     "SDK_PR_1812_MERGE_REVISION=$expected_sdk_pr1812_merge_revision" \
+    "SDK_MIGRATION_FEATURE_BASE_REVISION=$expected_sdk_migration_feature_base_revision" \
+    "UPSTREAM_MIGRATION_FEATURE_REVISION=$upstream_migration_feature_revision" \
+    "UPSTREAM_MIGRATION_FEATURE_MERGE_REVISION=$upstream_migration_feature_merge_revision" \
+    "UPSTREAM_MIGRATION_FFI_REVISION=$upstream_migration_ffi_revision" \
+    "UPSTREAM_MIGRATION_FFI_MERGE_REVISION=$upstream_migration_ffi_merge_revision" \
+    "UPSTREAM_MIGRATION_SWIFT_REVISION=$upstream_migration_swift_revision" \
+    "UPSTREAM_MIGRATION_SWIFT_MERGE_REVISION=$upstream_migration_swift_merge_revision" \
     "UPSTREAM_1807_MERGE_REVISION=$upstream_1807_merge_revision" \
     "INCLUDED_UPSTREAM_1813_REVISION=$included_upstream_1813_revision" \
     "INCLUDED_UPSTREAM_1821_REVISION=$included_upstream_1821_revision" \
     "INCLUDED_UPSTREAM_1822_REVISION=$included_upstream_1822_revision" \
     "INCLUDED_UPSTREAM_1825_REVISION=$included_upstream_1825_revision" \
+    "INCLUDED_UPSTREAM_KEYSTONE_REVISION=$included_upstream_keystone_revision" \
+    "INCLUDED_UPSTREAM_KEYSTONE_SWIFT_REVISION=$included_upstream_keystone_swift_revision" \
     "SDK_PR_1825_SEMANTIC_PORT_REVISION=$sdk_pr1825_semantic_port_revision" \
     "UPSTREAM_1821_MERGE_REVISION=$upstream_1821_merge_revision" \
     "UPSTREAM_1822_MERGE_REVISION=$upstream_1822_merge_revision" \
@@ -373,6 +421,8 @@ printf '%s\n' \
     "LIBRUSTZCASH_REVISION=$librustzcash_revision" \
     "LIBRUSTZCASH_TREE=$librustzcash_tree" \
     "ZCASH_VOTING_REVISION=$zcash_voting_revision" \
+    "KEYSTONE_UR_REVISION=$keystone_ur_revision" \
+    "KEYSTONE_UR_REGISTRY_REVISION=$keystone_ur_registry_revision" \
     "ORCHARD_VERSION=$orchard_version" \
     "ORCHARD_CHECKSUM=$orchard_checksum" \
     "MIGRATION_RESERVE_ABI_POLICY=legacy-v1-fail-closed-authorized-v2" \
@@ -398,6 +448,7 @@ printf '%s\n' \
     "IOS_ARM64_SIMULATOR_MINIMUM_OS=$IRONWOOD_IOS_ARM64_SIMULATOR_MINIMUM_OS" \
     > "$recipe_temp"
 mv "$recipe_temp" BuildSupport/IRONWOOD_FFI_BUILD.env
+./Scripts/verify-ironwood-reviewed-source-locks.sh BuildSupport/IRONWOOD_FFI_BUILD.env
 
 sdk_ffi_source_sha256_before=$(./Scripts/hash-ironwood-ffi-sources.sh)
 IRONWOOD_STATIC_SKIP_ARTIFACT=true ./Scripts/verify-ironwood-static-release-inputs.sh

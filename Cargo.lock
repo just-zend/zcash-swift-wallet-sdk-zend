@@ -6522,7 +6522,7 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 [[package]]
 name = "ur"
 version = "0.3.0"
-source = "git+https://github.com/KeystoneHQ/ur-rs?tag=0.3.3#81b8bb3b6b3a823128489c81ffee5bb4001ba2ae"
+source = "git+https://github.com/KeystoneHQ/ur-rs?rev=81b8bb3b6b3a823128489c81ffee5bb4001ba2ae#81b8bb3b6b3a823128489c81ffee5bb4001ba2ae"
 dependencies = [
  "bitcoin_hashes",
  "crc",
