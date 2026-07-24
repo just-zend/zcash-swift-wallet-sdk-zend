@@ -244,7 +244,14 @@ _Static_assert(
     "zcashlc_migration_reserve_immediate_v2 ABI changed"
 );
 EOF
-xcrun clang -std=c11 -fsyntax-only -Werror \
+# The canonical builder exports both deployment-floor variables for native dependencies. Do not
+# let Clang infer an iPhone target while retaining its host macOS sysroot; bind this header-only
+# audit to one explicit supported device target and SDK instead.
+signature_sdk_root=$(xcrun --sdk iphoneos --show-sdk-path)
+signature_clang=$(xcrun --sdk iphoneos --find clang)
+env -u MACOSX_DEPLOYMENT_TARGET -u IPHONEOS_DEPLOYMENT_TARGET \
+    "$signature_clang" -std=c11 -fsyntax-only -Werror \
+    -target arm64-apple-ios13.0 -isysroot "$signature_sdk_root" \
     -I "$(dirname "${binaries[0]}")/Headers" "$signature_audit"
 echo "Generated migration reservation header passed exact v1/v2 signature audit"
 
