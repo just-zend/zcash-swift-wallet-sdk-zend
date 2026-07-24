@@ -1039,7 +1039,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance(
                 target,
                 confirmations_policy,
                 CoinbaseFilter::AllTransparentOutputs,
-                LockFilter::Policy(&LockedInputPolicy::Exclude),
+                LockFilter::Unfiltered,
             )
             .map_err(|e| anyhow!("Error while fetching verified transparent balance: {}", e))?;
         let amount = utxos
@@ -1104,7 +1104,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
                         target,
                         confirmations_policy,
                         CoinbaseFilter::AllTransparentOutputs,
-                        LockFilter::Policy(&LockedInputPolicy::Exclude),
+                        LockFilter::Unfiltered,
                     )
                     .map_err(|e| {
                         anyhow!("Error while fetching verified transparent balance: {}", e)
@@ -1156,7 +1156,7 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance(
                 target,
                 wallet::ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
                 CoinbaseFilter::AllTransparentOutputs,
-                LockFilter::Policy(&LockedInputPolicy::Exclude),
+                LockFilter::Unfiltered,
             )
             .map_err(|e| anyhow!("Error while fetching total transparent balance: {}", e))?
             .iter()
