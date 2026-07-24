@@ -49,19 +49,20 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
 - `MigrationState`, `MigrationProgress`, `MigrationAttentionReason`, `MigrationSchedule`,
   `MigrationTransferProposal`, `MigrationTransferResult`, `MigrationRunEstimate` (and its
   `MigrationRunEstimate.Run`), `NoteSplitProposal`, `PreparedMigrationTransfer`,
-  `MigrationUnsignedTransferPczt`, and `MigrationSignedTransferPczt`.
+  `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`, `MigrationTransactionStatus`,
+  `KeystoneBatchDecodeResult`, and `KeystoneFirmwareVersion`.
 - Migration transaction ids are `UInt32` (the engine's own id type) rather than decimal strings,
   across `MigrationTransferProposal`, `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`,
   `MigrationSignedTransferPczt`, `MigrationAttentionReason.invalidTransfer`, and
   `migrationRecordTransferResult(transferId:result:for:)`.
 - These are the value types the `Synchronizer` migration group below produces and consumes.
 - New `ZcashError` cases for the migration surface: `ZRUST0098`–`ZRUST0106`, `ZRUST0108`, and
-  `ZRUST0111`–`ZRUST0134` (`ZRUST0107` was retired with the engine-backed immediate lane; see
+  `ZRUST0111`–`ZRUST0138` (`ZRUST0107` was retired with the engine-backed immediate lane; see
   `## Changed`).
 
 ### Orchard → Ironwood migration (`Synchronizer` surface)
 
-- Orchard→Ironwood pool-migration engine, exposed as a 27-member migration group on the
+- Orchard→Ironwood pool-migration engine, exposed as a 31-member migration group on the
   `Synchronizer` protocol, built over the pool-migration FFI/welding layer whose model types
   are listed above: the app talks only to `Synchronizer` — the per-account migration engine,
   broadcaster, and privacy gate behind it are internal. Account-scoped members take an
@@ -110,6 +111,29 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
     `MigrationRunEstimate` behind the multi-round UI). "Migrate anyway" over a locked residual
     composes as `unlockMigrationResidual` then `proposeImmediateMigration`, in that order, since
     locked notes are excluded from note selection.
+  - `migrationTransactionStatuses(accountUUID:)` serves the LIVE per-transaction rows behind
+    `migrationProgress`'s aggregate summary: every committed migration transaction's kind
+    (preparation layer/index or transfer crossing), lifecycle state, scheduled/expiry heights,
+    readiness, and next action/blocker, keyed by a stable id. `broadcast`/`mined` fold the engine's
+    txid/mined-height payload into the matching case so illegal combinations are unrepresentable —
+    a MINED row's txid is NOT carried by the engine's own state model, so it is available only
+    while a transaction is `broadcast` (in flight), not once mined. An empty array means no stored
+    run or no transactions, not an error.
+  - The Keystone batch-signing bridge carries the external-signer ceremony's PCZTs to a hardware
+    signer over an animated multi-part QR UR, as four DB-free members:
+    `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)` redacts every PCZT for the
+    batch-Signer role and returns the animated QR frames (callers retain their own unredacted
+    PCZTs — those are what applying signatures signs, and must be passed back in the SAME order);
+    `resetKeystoneSignBatchDecoder()` discards any in-flight scan session (infallible — call on
+    scan-screen entry/retry/exit, since only one session exists at a time);
+    `decodeKeystoneSignBatchPart(_:expectedRequestId:)` feeds one scanned frame to the session and
+    returns a `KeystoneBatchDecodeResult` (`complete`/`progress`; on completion, the
+    signatures-only response bytes and — the ONLY way to learn it in this flow — the signing
+    device's `KeystoneFirmwareVersion`, sourced from the response envelope, not any PCZT field; a
+    request-id mismatch at completion throws, rejecting a stale or unrelated scan); and
+    `applyKeystoneBatchSignatures(pczts:batchSignResponse:)` applies the device's positional
+    signatures onto the caller-held unredacted PCZTs, returning `[MigrationSignedTransferPczt]`
+    ready for `storeSignedNoteSplitPCZTs` / `storeSignedMigrationSchedulePCZTs`.
   - Duplicate re-submissions self-heal: a submit rejection identifying the transaction as already
     known (zcashd's already-in-chain code −27, or the already-in-block-chain/mempool-duplicate
     reject messages) is recorded as success, so a retried broadcast whose first attempt actually
