@@ -90,6 +90,7 @@ use zip32::fingerprint::SeedFingerprint;
 mod derivation;
 mod eip681;
 mod ffi;
+mod migration;
 mod tor;
 // Voting is gated off on the Ironwood (NU6.3) deps: zcash_voting cannot resolve
 // against orchard 0.15 (see Cargo.toml). Re-enable with the `voting` feature
@@ -2250,6 +2251,45 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
+        Ok(ffi::BoxedSlice::some(encoded))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
+///
+/// Sends the maximum from Orchard to the account's own internal Orchard receiver,
+/// with the fee computed so nothing is left over. Fails unless NU6.3 is active at
+/// the chain tip. See [`crate::migration::propose_orchard_to_ironwood`].
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an alignment
+///   of `1`.
+/// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+///   pointer when done using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_propose_orchard_to_ironwood_migration(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+        let proposal =
+            migration::propose_orchard_to_ironwood(&mut db_data, &network, account_uuid)?;
+
+        let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
         Ok(ffi::BoxedSlice::some(encoded))
     });
     unwrap_exc_or_null(res)
