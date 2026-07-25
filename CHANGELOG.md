@@ -71,6 +71,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off-by-default Cargo feature (and its Swift layer is excluded): the current crates.io
   `zcash_voting 1.0.0` still pins Orchard 0.14 + unstable voting circuits, while this audited
   Ironwood graph uses Orchard 0.15.0. Re-enable only after the voting stack moves to Orchard 0.15.
+## Changed
+- `Initializer.initialize` / `Synchronizer.prepare` now return `InitializationResult.seedNotRelevant` instead of silently proceeding when the rust layer reports the provided seed is not relevant to the wallet database (breaking change: `InitializationResult` gained a new case, so exhaustive switches over it must add a case; see MIGRATING.md). Previously this case was indistinguishable from `.success`: account creation was skipped (accounts already existed) and callers proceeded as if they had prepared the wallet they expected, even when the database on disk belonged to a different wallet than the provided seed (e.g. a device-backup restore that brings back `data.db` without the matching keychain seed). Callers must now handle `.seedNotRelevant` the same way they already handle `.seedRequired`. (MOB-1512)
+
 ## Fixed
 - Ordinary transfer, ZIP-321, and send-max proposals now apply the NU6.3 spend policy at the
   proposal target height: Sapling and Orchard before activation, and Sapling and Ironwood at or

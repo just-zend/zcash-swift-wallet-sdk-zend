@@ -83,4 +83,82 @@ class WalletTests: ZcashTestCase {
         // fileExists actually sucks, so attempting to delete the file and checking what happens is far better :)
         XCTAssertNoThrow( try FileManager.default.removeItem(at: dbData!) )
     }
+
+    /// MOB-1512: when the rust layer reports that the provided seed isn't relevant to the accounts already present in the
+    /// wallet database (for example, a restored `data.db` that belongs to a different wallet than the seed available to the
+    /// caller), `Initializer.initialize` must surface `.seedNotRelevant` to the caller instead of silently proceeding as if
+    /// initialization succeeded.
+    func testInitializePropagatesSeedNotRelevantFromRustBackend() async throws {
+        let rustBackendMock = ZcashRustBackendWeldingMock()
+        rustBackendMock.initBlockMetadataDbClosure = { }
+        rustBackendMock.initDataDbSeedClosure = { _ in DbInitResult.seedNotRelevant }
+
+        mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in rustBackendMock }
+
+        let initializer = Initializer(
+            container: mockContainer,
+            cacheDbURL: nil,
+            fsBlockDbRoot: testTempDirectory,
+            generalStorageURL: testGeneralStorageDirectory,
+            dataDbURL: try __dataDbURL(),
+            torDirURL: try __torDirURL(),
+            endpoint: LightWalletEndpointBuilder.default,
+            network: network,
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            isTorEnabled: false,
+            isExchangeRateEnabled: false
+        )
+
+        let result = try await initializer.initialize(
+            with: seedData.bytes,
+            walletBirthday: 663194,
+            for: .existingWallet,
+            name: ""
+        )
+
+        guard case .seedNotRelevant = result else {
+            XCTFail("Expected `.seedNotRelevant` when rustBackend.initDataDb() reports it, got \(result) instead.")
+            return
+        }
+    }
+
+    /// Companion regression test for `testInitializePropagatesSeedNotRelevantFromRustBackend`: the pre-existing
+    /// `.seedRequired` propagation must keep working once `initialize` switches exhaustively over `DbInitResult`.
+    func testInitializePropagatesSeedRequiredFromRustBackend() async throws {
+        let rustBackendMock = ZcashRustBackendWeldingMock()
+        rustBackendMock.initBlockMetadataDbClosure = { }
+        rustBackendMock.initDataDbSeedClosure = { _ in DbInitResult.seedRequired }
+
+        mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in rustBackendMock }
+
+        let initializer = Initializer(
+            container: mockContainer,
+            cacheDbURL: nil,
+            fsBlockDbRoot: testTempDirectory,
+            generalStorageURL: testGeneralStorageDirectory,
+            dataDbURL: try __dataDbURL(),
+            torDirURL: try __torDirURL(),
+            endpoint: LightWalletEndpointBuilder.default,
+            network: network,
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            isTorEnabled: false,
+            isExchangeRateEnabled: false
+        )
+
+        let result = try await initializer.initialize(
+            with: nil,
+            walletBirthday: 663194,
+            for: .existingWallet,
+            name: ""
+        )
+
+        guard case .seedRequired = result else {
+            XCTFail("Expected `.seedRequired` when rustBackend.initDataDb() reports it, got \(result) instead.")
+            return
+        }
+    }
 }
