@@ -1731,6 +1731,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - proposeOrchardToIronwoodMigration
+
+    var proposeOrchardToIronwoodMigrationAccountUUIDThrowableError: Error?
+    var proposeOrchardToIronwoodMigrationAccountUUIDCallsCount = 0
+    var proposeOrchardToIronwoodMigrationAccountUUIDCalled: Bool {
+        return proposeOrchardToIronwoodMigrationAccountUUIDCallsCount > 0
+    }
+    var proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID: AccountUUID?
+    var proposeOrchardToIronwoodMigrationAccountUUIDReturnValue: Proposal!
+    var proposeOrchardToIronwoodMigrationAccountUUIDClosure: ((AccountUUID) async throws -> Proposal)?
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
+        if let error = proposeOrchardToIronwoodMigrationAccountUUIDThrowableError {
+            throw error
+        }
+        proposeOrchardToIronwoodMigrationAccountUUIDCallsCount += 1
+        proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = proposeOrchardToIronwoodMigrationAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return proposeOrchardToIronwoodMigrationAccountUUIDReturnValue
+        }
+    }
+
     // MARK: - proposeShielding
 
     var proposeShieldingAccountUUIDShieldingThresholdMemoTransparentReceiverThrowableError: Error?
@@ -3722,6 +3746,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(accountUUID, address, value, memo)
         } else {
             return proposeTransferAccountUUIDToValueMemoReturnValue
+        }
+    }
+
+    // MARK: - proposeOrchardToIronwoodMigration
+
+    var proposeOrchardToIronwoodMigrationAccountUUIDThrowableError: Error?
+    var proposeOrchardToIronwoodMigrationAccountUUIDCallsCount = 0
+    var proposeOrchardToIronwoodMigrationAccountUUIDCalled: Bool {
+        return proposeOrchardToIronwoodMigrationAccountUUIDCallsCount > 0
+    }
+    var proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID: AccountUUID?
+    var proposeOrchardToIronwoodMigrationAccountUUIDReturnValue: FfiProposal!
+    var proposeOrchardToIronwoodMigrationAccountUUIDClosure: ((AccountUUID) async throws -> FfiProposal)?
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> FfiProposal {
+        if let error = proposeOrchardToIronwoodMigrationAccountUUIDThrowableError {
+            throw error
+        }
+        proposeOrchardToIronwoodMigrationAccountUUIDCallsCount += 1
+        proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = proposeOrchardToIronwoodMigrationAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return proposeOrchardToIronwoodMigrationAccountUUIDReturnValue
         }
     }
 
