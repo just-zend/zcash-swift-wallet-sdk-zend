@@ -992,6 +992,12 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
                             valuePendingSpendability: accountBalance.orchardBalance.valuePendingSpendability
                             + accountBalance.orchardBalance.spendableValue
                         ),
+                        ironwoodBalance: PoolBalance(
+                            spendableValue: .zero,
+                            changePendingConfirmation: accountBalance.ironwoodBalance.changePendingConfirmation,
+                            valuePendingSpendability: accountBalance.ironwoodBalance.valuePendingSpendability
+                            + accountBalance.ironwoodBalance.spendableValue
+                        ),
                         unshielded: .zero,
                         awaitingResolution: accountBalance.unshielded
                     )
@@ -1006,7 +1012,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             recoveryProgress: summaryPtr.pointee.recovery_progress?.pointee.toScanProgress(),
             scanProgress: summaryPtr.pointee.scan_progress?.pointee.toScanProgress(),
             nextSaplingSubtreeIndex: UInt32(summaryPtr.pointee.next_sapling_subtree_index),
-            nextOrchardSubtreeIndex: UInt32(summaryPtr.pointee.next_orchard_subtree_index)
+            nextOrchardSubtreeIndex: UInt32(summaryPtr.pointee.next_orchard_subtree_index),
+            nextIronwoodSubtreeIndex: UInt32(summaryPtr.pointee.next_ironwood_subtree_index)
         )
     }
 
@@ -1512,6 +1519,7 @@ extension FfiAccountBalance {
         .init(
             saplingBalance: self.sapling_balance.toPoolBalance(),
             orchardBalance: self.orchard_balance.toPoolBalance(),
+            ironwoodBalance: self.ironwood_balance.toPoolBalance(),
             unshielded: Zatoshi(self.unshielded)
         )
     }
