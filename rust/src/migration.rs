@@ -12,7 +12,7 @@ use zcash_address::{ToAddress, ZcashAddress, unified, unified::Encoding as _};
 use zcash_client_backend::{
     data_api::{
         Account as _, InputSource, MaxSpendMode, WalletRead,
-        wallet::{ConfirmationsPolicy, propose_send_max_transfer},
+        wallet::{ConfirmationsPolicy, input_selection::LockedInputPolicy, propose_send_max_transfer},
     },
     fees::StandardFeeRule,
     proposal::Proposal,
@@ -79,6 +79,8 @@ pub(crate) fn propose_orchard_to_ironwood(
     let memo: Option<MemoBytes> = None;
     let mode = MaxSpendMode::Everything;
     let confirmations_policy = ConfirmationsPolicy::default();
+    let locked_input_policy = LockedInputPolicy::Exclude;
+    let lock_inputs = None;
 
     propose_send_max_transfer::<_, _, _, std::convert::Infallible>(
         db_data,
@@ -90,6 +92,8 @@ pub(crate) fn propose_orchard_to_ironwood(
         memo,
         mode,
         confirmations_policy,
+        &locked_input_policy,
+        lock_inputs,
     )
     .map_err(|e| anyhow!("Error creating the migration proposal: {}", e))
 }
