@@ -6,6 +6,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- `AccountBalance.ironwoodBalance`: the Ironwood (NU6.3, Orchard note-version V3) pool balance, alongside the existing sapling and orchard balances. It is masked with the other pools while the chain tip is stale, and stays zero until NU6.3 activates and a lightwalletd serves the Ironwood fields.
+
+## Changed
+- Bumped the Rust dependency stack to the Ironwood (NU6.3) crates.io releases (`orchard` 0.13→0.15, `zcash_client_backend` 0.23→0.24.0-rc.1, `zcash_client_sqlite` 0.21→0.22.0-rc.1, `zcash_primitives`/`zcash_proofs` 0.28→0.29, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13, `zcash_transparent` 0.8→0.9, `pczt` 0.7→0.8.0-rc.1, `zcash_keys` 0.14→0.15) and dropped the `[patch.crates-io]` git overrides, matching the Android SDK's 2.5.x dependency set. `addProofsToPCZT` now also proves Ironwood bundles.
+
+## Removed
+- The shielded voting surface (`VotingRustBackend`, the public `Voting*` types, `PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe`, and the `zcashlc_voting_*` FFI). `zcash_voting` cannot resolve against the Ironwood `orchard` release, so voting is not shipped on the 2.5.x line, matching the Android SDK.
 
 # 2.5.1 - 2026-05-14
 
