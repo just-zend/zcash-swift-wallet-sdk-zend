@@ -3532,6 +3532,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         try await putOrchardSubtreeRootsStartIndexRootsClosure!(startIndex, roots)
     }
 
+    // MARK: - putIronwoodSubtreeRoots
+
+    var putIronwoodSubtreeRootsStartIndexRootsThrowableError: Error?
+    var putIronwoodSubtreeRootsStartIndexRootsCallsCount = 0
+    var putIronwoodSubtreeRootsStartIndexRootsCalled: Bool {
+        return putIronwoodSubtreeRootsStartIndexRootsCallsCount > 0
+    }
+    var putIronwoodSubtreeRootsStartIndexRootsReceivedArguments: (startIndex: UInt64, roots: [SubtreeRoot])?
+    var putIronwoodSubtreeRootsStartIndexRootsClosure: ((UInt64, [SubtreeRoot]) async throws -> Void)?
+
+    func putIronwoodSubtreeRoots(startIndex: UInt64, roots: [SubtreeRoot]) async throws {
+        if let error = putIronwoodSubtreeRootsStartIndexRootsThrowableError {
+            throw error
+        }
+        putIronwoodSubtreeRootsStartIndexRootsCallsCount += 1
+        putIronwoodSubtreeRootsStartIndexRootsReceivedArguments = (startIndex: startIndex, roots: roots)
+        try await putIronwoodSubtreeRootsStartIndexRootsClosure!(startIndex, roots)
+    }
+
     // MARK: - updateChainTip
 
     var updateChainTipHeightThrowableError: Error?

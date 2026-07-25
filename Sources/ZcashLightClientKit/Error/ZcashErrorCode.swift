@@ -197,6 +197,10 @@ public enum ZcashErrorCode: String {
     case rustPutOrchardSubtreeRootsAllocationProblem = "ZRUST0060"
     /// Error from rust layer when calling ZcashRustBackend.putOrchardSubtreeRoots
     case rustPutOrchardSubtreeRoots = "ZRUST0061"
+    /// Unable to allocate memory required to write blocks when calling ZcashRustBackend.putIronwoodSubtreeRoots
+    case rustPutIronwoodSubtreeRootsAllocationProblem = "ZRUST0109"
+    /// Error from rust layer when calling ZcashRustBackend.putIronwoodSubtreeRoots
+    case rustPutIronwoodSubtreeRoots = "ZRUST0110"
     /// Error from rust layer when calling TorClient.init
     case rustTorClientInit = "ZRUST0062"
     /// Error from rust layer when calling TorClient.get
@@ -419,6 +423,8 @@ public enum ZcashErrorCode: String {
     case compactBlockProcessorSupportedSyncAlgorithm = "ZCBPEO0021"
     /// Put Orchard subtree roots to the DB failed.
     case compactBlockProcessorPutOrchardSubtreeRoots = "ZCBPEO0022"
+    /// Put Ironwood subtree roots to the DB failed.
+    case compactBlockProcessorPutIronwoodSubtreeRoots = "ZCBPEO0023"
     /// The synchronizer is unprepared.
     case synchronizerNotPrepared = "ZSYNCO0001"
     /// Memos can't be sent to transparent addresses.

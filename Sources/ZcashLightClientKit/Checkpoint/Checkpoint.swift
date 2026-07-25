@@ -31,6 +31,23 @@ struct Checkpoint: Equatable {
     let time: UInt32
     let saplingTree: String
     let orchardTree: String?
+    let ironwoodTree: String?
+
+    init(
+        height: BlockHeight,
+        hash: String,
+        time: UInt32,
+        saplingTree: String,
+        orchardTree: String? = nil,
+        ironwoodTree: String? = nil
+    ) {
+        self.height = height
+        self.hash = hash
+        self.time = time
+        self.saplingTree = saplingTree
+        self.orchardTree = orchardTree
+        self.ironwoodTree = ironwoodTree
+    }
 }
 
 extension Checkpoint: Decodable {
@@ -40,6 +57,7 @@ extension Checkpoint: Decodable {
         case time
         case saplingTree
         case orchardTree
+        case ironwoodTree
     }
 
     public init(from decoder: Decoder) throws {
@@ -50,6 +68,7 @@ extension Checkpoint: Decodable {
             self.time = try container.decode(UInt32.self, forKey: .time)
             self.saplingTree = try container.decode(String.self, forKey: .saplingTree)
             self.orchardTree = try container.decodeIfPresent(String.self, forKey: .orchardTree)
+            self.ironwoodTree = try container.decodeIfPresent(String.self, forKey: .ironwoodTree)
         } catch {
             throw ZcashError.checkpointDecode(error)
         }
@@ -80,6 +99,9 @@ extension Checkpoint: Decodable {
         ret.saplingTree = saplingTree
         if let tree = orchardTree {
             ret.orchardTree = tree
+        }
+        if let tree = ironwoodTree {
+            ret.ironwoodTree = tree
         }
         return ret
     }
