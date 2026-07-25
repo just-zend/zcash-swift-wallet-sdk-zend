@@ -36,6 +36,9 @@ struct ChainMetadata {
   /// the size of the Orchard note commitment tree as of the end of this block
   var orchardCommitmentTreeSize: UInt32 = 0
 
+  /// the size of the Ironwood note commitment tree as of the end of this block
+  var ironwoodCommitmentTreeSize: UInt32 = 0
+
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
   init() {}
@@ -116,6 +119,8 @@ struct CompactTx {
   var outputs: [CompactSaplingOutput] = []
 
   var actions: [CompactOrchardAction] = []
+
+  var ironwoodActions: [CompactOrchardAction] = []
 
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -203,6 +208,7 @@ extension ChainMetadata: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
   static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
     1: .same(proto: "saplingCommitmentTreeSize"),
     2: .same(proto: "orchardCommitmentTreeSize"),
+    3: .same(proto: "ironwoodCommitmentTreeSize"),
   ]
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -213,6 +219,7 @@ extension ChainMetadata: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt32Field(value: &self.saplingCommitmentTreeSize) }()
       case 2: try { try decoder.decodeSingularUInt32Field(value: &self.orchardCommitmentTreeSize) }()
+      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.ironwoodCommitmentTreeSize) }()
       default: break
       }
     }
@@ -225,12 +232,16 @@ extension ChainMetadata: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
     if self.orchardCommitmentTreeSize != 0 {
       try visitor.visitSingularUInt32Field(value: self.orchardCommitmentTreeSize, fieldNumber: 2)
     }
+    if self.ironwoodCommitmentTreeSize != 0 {
+      try visitor.visitSingularUInt32Field(value: self.ironwoodCommitmentTreeSize, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   static func ==(lhs: ChainMetadata, rhs: ChainMetadata) -> Bool {
     if lhs.saplingCommitmentTreeSize != rhs.saplingCommitmentTreeSize {return false}
     if lhs.orchardCommitmentTreeSize != rhs.orchardCommitmentTreeSize {return false}
+    if lhs.ironwoodCommitmentTreeSize != rhs.ironwoodCommitmentTreeSize {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -323,6 +334,7 @@ extension CompactTx: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     4: .same(proto: "spends"),
     5: .same(proto: "outputs"),
     6: .same(proto: "actions"),
+    9: .same(proto: "ironwoodActions"),
   ]
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -337,6 +349,7 @@ extension CompactTx: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
       case 4: try { try decoder.decodeRepeatedMessageField(value: &self.spends) }()
       case 5: try { try decoder.decodeRepeatedMessageField(value: &self.outputs) }()
       case 6: try { try decoder.decodeRepeatedMessageField(value: &self.actions) }()
+      case 9: try { try decoder.decodeRepeatedMessageField(value: &self.ironwoodActions) }()
       default: break
       }
     }
@@ -361,6 +374,9 @@ extension CompactTx: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     if !self.actions.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.actions, fieldNumber: 6)
     }
+    if !self.ironwoodActions.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.ironwoodActions, fieldNumber: 9)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -371,6 +387,7 @@ extension CompactTx: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     if lhs.spends != rhs.spends {return false}
     if lhs.outputs != rhs.outputs {return false}
     if lhs.actions != rhs.actions {return false}
+    if lhs.ironwoodActions != rhs.ironwoodActions {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

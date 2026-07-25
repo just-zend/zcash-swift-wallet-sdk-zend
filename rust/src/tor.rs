@@ -198,13 +198,13 @@ impl LwdConn {
     /// Discovers UTXOs received by the given transparent address in the provided block range, and
     /// invokes the provided callback with the [`WalletTransparentOutput`] corresponding to that
     /// UTXO.
-    pub(crate) fn with_taddress_utxos(
+    pub(crate) fn with_taddress_utxos<A>(
         &mut self,
         params: &impl consensus::Parameters,
         address: TransparentAddress,
         start: Option<BlockHeight>,
         limit: Option<u32>,
-        mut f: impl FnMut(WalletTransparentOutput) -> anyhow::Result<()>,
+        mut f: impl FnMut(WalletTransparentOutput<A>) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let request = service::GetAddressUtxosArg {
             addresses: vec![address.encode(params)],
@@ -224,6 +224,10 @@ impl LwdConn {
                 .into_inner();
 
             while let Some(result) = utxos.message().await? {
+                let recipient_account = None;
+                let key_scope = None;
+                let funding_account = None;
+
                 f(WalletTransparentOutput::from_parts(
                     OutPoint::new(result.txid[..].try_into()?, result.index.try_into()?),
                     TxOut::new(
@@ -231,6 +235,9 @@ impl LwdConn {
                         Script(script::Code(result.script)),
                     ),
                     Some(BlockHeight::from(u32::try_from(result.height)?)),
+                    recipient_account,
+                    key_scope,
+                    funding_account,
                 )
                 .ok_or(anyhow!(
                     "Received UTXO that doesn't correspond to a valid P2PKH or P2SH address"

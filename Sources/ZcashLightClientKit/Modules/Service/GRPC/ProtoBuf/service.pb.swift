@@ -28,6 +28,7 @@ enum ShieldedProtocol: SwiftProtobuf.Enum {
   typealias RawValue = Int
   case sapling // = 0
   case orchard // = 1
+  case ironwood // = 2
   case UNRECOGNIZED(Int)
 
   init() {
@@ -38,6 +39,7 @@ enum ShieldedProtocol: SwiftProtobuf.Enum {
     switch rawValue {
     case 0: self = .sapling
     case 1: self = .orchard
+    case 2: self = .ironwood
     default: self = .UNRECOGNIZED(rawValue)
     }
   }
@@ -46,6 +48,7 @@ enum ShieldedProtocol: SwiftProtobuf.Enum {
     switch self {
     case .sapling: return 0
     case .orchard: return 1
+    case .ironwood: return 2
     case .UNRECOGNIZED(let i): return i
     }
   }
@@ -59,6 +62,7 @@ extension ShieldedProtocol: CaseIterable {
   static let allCases: [ShieldedProtocol] = [
     .sapling,
     .orchard,
+    .ironwood,
   ]
 }
 
@@ -380,6 +384,8 @@ struct TreeState {
 
   /// orchard commitment tree state
   var orchardTree: String = String()
+
+  var ironwoodTree: String = String()
 
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -1114,6 +1120,7 @@ extension TreeState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     4: .same(proto: "time"),
     5: .same(proto: "saplingTree"),
     6: .same(proto: "orchardTree"),
+    7: .same(proto: "ironwoodTree"),
   ]
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -1128,6 +1135,7 @@ extension TreeState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
       case 4: try { try decoder.decodeSingularUInt32Field(value: &self.time) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.saplingTree) }()
       case 6: try { try decoder.decodeSingularStringField(value: &self.orchardTree) }()
+      case 7: try { try decoder.decodeSingularStringField(value: &self.ironwoodTree) }()
       default: break
       }
     }
@@ -1152,6 +1160,9 @@ extension TreeState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     if !self.orchardTree.isEmpty {
       try visitor.visitSingularStringField(value: self.orchardTree, fieldNumber: 6)
     }
+    if !self.ironwoodTree.isEmpty {
+      try visitor.visitSingularStringField(value: self.ironwoodTree, fieldNumber: 7)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -1162,6 +1173,7 @@ extension TreeState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementation
     if lhs.time != rhs.time {return false}
     if lhs.saplingTree != rhs.saplingTree {return false}
     if lhs.orchardTree != rhs.orchardTree {return false}
+    if lhs.ironwoodTree != rhs.ironwoodTree {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
