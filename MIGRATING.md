@@ -95,6 +95,9 @@ Snapshot read/decode/corruption failures surface as a non-operational
 render or execute a cached runnable snapshot in that state. Ordinary-spend reservations are scoped
 to the migrating account, so another account in the same wallet remains usable when its own
 authoritative guard succeeds.
+## `Initializer.InitializationResult` gained `.seedNotRelevant`
+
+`Initializer.InitializationResult` (returned by `Initializer.initialize` and `Synchronizer.prepare`) gained a new case, `.seedNotRelevant`, returned when the rust layer reports that the provided seed does not match the accounts already present in the wallet database. Any exhaustive `switch` over `InitializationResult` must add a case for it. `prepare`/`initialize` can now return `.seedNotRelevant` in situations where they previously returned `.success` over a mismatched database — handle it the same way you already handle `.seedRequired`.
 
 # Migrating from previous versions to 0.20.0-beta
 The `SDKSynchronizer` no longer uses `NotificationCenter` to send notifications.
