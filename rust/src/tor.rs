@@ -93,7 +93,9 @@ impl TorRuntime {
     pub(crate) fn connect_to_lightwalletd(&self, endpoint: Uri) -> anyhow::Result<LwdConn> {
         let Self { runtime, client } = self.isolated_client();
 
-        let conn = runtime.block_on(async { client.connect_to_lightwalletd(endpoint).await })?;
+        let allow_onion_services = false;
+        let conn =
+            runtime.block_on(async { client.connect_to_lightwalletd(endpoint, allow_onion_services).await })?;
 
         Ok(LwdConn {
             runtime,

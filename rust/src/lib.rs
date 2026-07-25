@@ -47,7 +47,7 @@ use zcash_client_backend::{
         wallet::{
             self, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
             decrypt_and_store_transaction, extract_and_store_transaction_from_pczt,
-            input_selection::{GreedyInputSelector, SpendPolicy},
+            input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
             propose_send_max_transfer, propose_shielding, propose_transfer,
         },
     },
@@ -1034,6 +1034,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance(
                 target,
                 confirmations_policy,
                 CoinbaseFilter::AllTransparentOutputs,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map_err(|e| anyhow!("Error while fetching verified transparent balance: {}", e))?;
         let amount = utxos
@@ -1098,6 +1099,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
                         target,
                         confirmations_policy,
                         CoinbaseFilter::AllTransparentOutputs,
+                        LockFilter::Policy(&LockedInputPolicy::Exclude),
                     )
                     .map_err(|e| {
                         anyhow!("Error while fetching verified transparent balance: {}", e)
@@ -1149,6 +1151,7 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance(
                 target,
                 wallet::ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
                 CoinbaseFilter::AllTransparentOutputs,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map_err(|e| anyhow!("Error while fetching total transparent balance: {}", e))?
             .iter()
@@ -2235,6 +2238,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
         .map_err(|e| anyhow!("Error creating transaction request: {:?}", e))?;
 
         let spend_policy = SpendPolicy::default();
+        let lock_inputs = None;
         let proposed_version = None;
         let proposal = propose_transfer::<_, _, _, _, Infallible>(
             &mut db_data,
@@ -2245,6 +2249,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
             &spend_policy,
+            lock_inputs,
             proposed_version,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2352,6 +2357,8 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         };
 
         let confirmation_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
+        let locked_input_policy = LockedInputPolicy::Exclude;
+        let lock_inputs = None;
 
         let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
             &mut db_data,
@@ -2363,6 +2370,8 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             memo,
             mode,
             confirmation_policy,
+            &locked_input_policy,
+            lock_inputs,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2417,6 +2426,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             .map_err(|e| anyhow!("Error creating transaction request: {:?}", e))?;
 
         let spend_policy = SpendPolicy::default();
+        let lock_inputs = None;
         let proposed_version = None;
         let proposal = propose_transfer::<_, _, _, _, Infallible>(
             &mut db_data,
@@ -2427,6 +2437,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
             &spend_policy,
+            lock_inputs,
             proposed_version,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2625,6 +2636,7 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
         };
 
         let (change_strategy, input_selector) = zip317_helper(Some(memo_bytes));
+        let lock_inputs = None;
         let proposal = propose_shielding::<_, _, _, _, Infallible>(
             &mut db_data,
             &network,
@@ -2635,6 +2647,7 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
             account_uuid,
             confirmations_policy,
             CoinbaseFilter::AllTransparentOutputs,
+            lock_inputs,
         )
         .map_err(|e| anyhow!("Error while shielding transaction: {}", e))?;
 
@@ -2727,6 +2740,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
         }));
 
         let prover = LocalTxProver::new(spend_params, output_params);
+        let expiry_height = None;
 
         let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
             &mut db_data,
@@ -2736,6 +2750,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             &SpendingKeys::from_unified_spending_key(usk),
             OvkPolicy::Sender,
             &proposal,
+            expiry_height,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2803,7 +2818,7 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
 
         if proposal.steps().len() == 1 {
             let target_expiry_height = None;
-            let orchard_pool_bundle_type = orchard::builder::BundleType::DEFAULT;
+            let orchard_pool_padding = zcash_primitives::transaction::builder::BundlePadding::DEFAULT;
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
                 &mut db_data,
                 &network,
@@ -2811,7 +2826,7 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
                 OvkPolicy::Sender,
                 &proposal,
                 target_expiry_height,
-                orchard_pool_bundle_type,
+                orchard_pool_padding,
             )
             .map_err(|e| anyhow!("Error creating PCZT from single-step proposal: {}", e))?;
 
