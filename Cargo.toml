@@ -33,7 +33,7 @@ zcash_client_sqlite = { version = "0.22.0-rc.1", features = ["orchard", "transpa
 zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.29"
 zcash_proofs = "0.29"
-zcash_protocol = { version = "0.10", features = ["local-consensus"] }
+zcash_protocol = "0.10"
 zcash_script = "0.4"
 zip32 = "0.2"
 # Pinned exactly: 0.8.0 pulls zcash_transparent 0.10 / zcash_primitives 0.30,
