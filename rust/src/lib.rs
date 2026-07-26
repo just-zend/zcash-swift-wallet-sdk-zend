@@ -45,8 +45,9 @@ use zcash_client_backend::{
         chain::{CommitmentTreeRoot, scan_cached_blocks},
         scanning::ScanPriority,
         wallet::{
-            self, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
-            decrypt_and_store_transaction, extract_and_store_transaction_from_pczt,
+            self, SignerView, SpendingKeys, create_pczt_from_proposal,
+            create_proposed_transactions, decrypt_and_store_transaction,
+            extract_and_store_transaction_from_pczt,
             input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
             propose_send_max_transfer, propose_shielding, propose_transfer, redact_pczt_for_signer,
         },
@@ -2880,7 +2881,14 @@ pub unsafe extern "C" fn zcashlc_redact_pczt_for_signer(
         let pczt_bytes = unsafe { slice::from_raw_parts(pczt_ptr, pczt_len) };
         let pczt = Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Invalid PCZT: {:?}", e))?;
 
-        let redacted_pczt = redact_pczt_for_signer(&pczt);
+        // Keystone's ordinary send flow signs the full (non-compacted) signer
+        // view: deployed firmware predates the compact view and, for v5
+        // transactions, the v2 PCZT encoding (which `Pczt::serialize` only
+        // selects when the content requires it). Do not switch this to
+        // `SignerView::Compact` without confirming the target signer supports
+        // it — the compact view here caused missing-signature failures at
+        // extraction (#1863 regression).
+        let redacted_pczt = redact_pczt_for_signer(&pczt, SignerView::Full);
 
         Ok(ffi::BoxedSlice::some(redacted_pczt.serialize().map_err(
             |e| anyhow!("Failed to serialize redacted PCZT: {:?}", e),
