@@ -139,16 +139,35 @@ lto = true
 # same source and exact revision so direct SDK dependencies and the local migration engine unify.
 # Keep this rev immutable; changing it requires rebuilding and recommitting every FFI slice.
 [patch.crates-io]
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
-zcash_client_sqlite  = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
-zcash_primitives     = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
-zcash_keys           = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
-zcash_protocol       = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
-zcash_transparent    = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
-zcash_proofs         = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
-zcash_address        = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
-zip321               = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
-pczt                 = { git = "https://github.com/zcash/librustzcash", rev = "0c2775f5ed1561360b164b3971ecf0cf734e75eb" }
+zcash_client_backend = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_client_sqlite  = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_primitives     = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_keys           = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_protocol       = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_transparent    = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_proofs         = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_address        = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zip321               = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+pczt                 = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
 # Merged Orchard #535, including the #534 deferred-anchor implementation consumed by
 # the final librustzcash #2663 source.
 orchard              = { git = "https://github.com/zcash/orchard.git", rev = "fa6e5fee02ce38b54193005a35289ec705d4f5b2" }
+
+# `zodl_ironwood_migration` declares its librustzcash crates as a git dependency on
+# `zcash/librustzcash` rather than through crates.io, and `[patch.crates-io]` above cannot redirect a
+# git source. While this SDK pinned the identical upstream URL and revision the two resolved to one
+# copy by coincidence; pinning the Zend fork above splits the graph, and the engine's
+# `SqliteClientError` stops being the same type as the SDK's. Patch the upstream git source itself so
+# every member unifies on one librustzcash again — which is what the note above has always assumed.
+# Keep this list identical to `[patch.crates-io]`; it covers exactly the crates the engine pins.
+[patch."https://github.com/zcash/librustzcash"]
+zcash_client_backend = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_client_sqlite  = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_primitives     = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_keys           = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_protocol       = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_transparent    = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_proofs         = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zcash_address        = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+zip321               = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }
+pczt                 = { git = "https://github.com/just-zend/librustzcash", rev = "73c497173b7ac4de4869d3b674b4e64348a53346" }

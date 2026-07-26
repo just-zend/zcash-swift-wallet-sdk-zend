@@ -7,7 +7,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-expected_librustzcash_rev="0c2775f5ed1561360b164b3971ecf0cf734e75eb"
+# Repository and revision are asserted as a pair. They were previously separate — the revision was a
+# variable while the repository was written inline at each use — so repinning to a fork could update
+# one and leave the other, and the mismatch only surfaced as an opaque "unexpected <crate> source".
+expected_librustzcash_repo="github.com/just-zend/librustzcash"
+expected_librustzcash_rev="73c497173b7ac4de4869d3b674b4e64348a53346"
 expected_orchard_rev="fa6e5fee02ce38b54193005a35289ec705d4f5b2"
 tree_file=$(mktemp)
 duplicates_file=$(mktemp)
@@ -57,7 +61,7 @@ for crate_and_version in \
     "zip321 0.9.0-rc.1"
 do
     read -r crate version <<< "$crate_and_version"
-    assert_one "$crate" "$version" "github.com/zcash/librustzcash?rev=$expected_librustzcash_rev"
+    assert_one "$crate" "$version" "$expected_librustzcash_repo?rev=$expected_librustzcash_rev"
 done
 
 if grep -q '^zcash_voting ' "$tree_file"; then
