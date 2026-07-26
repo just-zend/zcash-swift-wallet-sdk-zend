@@ -19,6 +19,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `vin`/`vout` data, the `PoolType` enum, `BlockRange.poolTypes`, and new
   `LightdInfo` fields; these generated types are internal to the SDK, so the
   public API is unchanged.
+- Transparent-address transaction enhancement now uses the
+  `GetTaddressTransactions` RPC in place of the deprecated (and otherwise
+  identical) `GetTaddressTxids`, so it requires a lightwalletd new enough to
+  serve lightwallet-protocol v0.3.6 (lightwalletd v0.4.18, 2025-05) or newer.
+  The public `ZcashError.serviceGetTaddressTxidsFailed` case is unchanged
+  aside from its message text.
 
 # 2.7.0-rc.1 - 2026-07-25
 
