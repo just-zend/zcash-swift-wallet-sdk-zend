@@ -2360,11 +2360,21 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         let locked_input_policy = LockedInputPolicy::Exclude;
         let lock_inputs = None;
 
+        // Send-max draws the entire spendable balance across every shielded pool,
+        // so Ironwood is included alongside Sapling and Orchard; omitting it would
+        // silently leave a post-NU6.3 wallet's Ironwood funds behind. Including it
+        // is a no-op when the account holds no Ironwood notes.
+        let spend_pools = [
+            ShieldedPool::Sapling,
+            ShieldedPool::Orchard,
+            ShieldedPool::Ironwood,
+        ];
+
         let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
             &mut db_data,
             &network,
             account_uuid,
-            &[ShieldedPool::Sapling, ShieldedPool::Orchard],
+            &spend_pools,
             &StandardFeeRule::Zip317,
             to,
             memo,
