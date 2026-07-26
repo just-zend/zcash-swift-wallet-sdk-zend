@@ -76,7 +76,7 @@ The `CompactBlockProcessor` downloads compact blocks via `Block/Download/`, stor
 
 ### Networking
 
-- gRPC lightwalletd client: `Modules/Service/GRPC/` (proto files under `ProtoBuf/proto/` — generated `*.pb.swift`/`*.grpc.swift` files are checked in and excluded from SwiftLint; regenerate them, don't hand-edit).
+- gRPC lightwalletd client: `Modules/Service/GRPC/`. The lightwalletd proto files are vendored from https://github.com/zcash/lightwallet-protocol as a git subtree under `lightwallet-protocol/`; update them with `Scripts/update-lightwallet-protocol.sh <ref>` (needs `protoc`, provided by `nix develop`), which also regenerates the checked-in `*.pb.swift`/`*.grpc.swift` sources (excluded from SwiftLint; regenerate, don't hand-edit). `ProtoBuf/proto/proposal.proto` is vendored from librustzcash, not the subtree.
 - Tor: `Modules/Service/Tor/` and `Tor/TorClient.swift`. A Tor directory is provisioned in the Initializer config.
 - `Modules/Service/LightWalletService.swift` is the service-level abstraction the rest of the SDK depends on.
 

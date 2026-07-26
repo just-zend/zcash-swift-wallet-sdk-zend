@@ -42,9 +42,7 @@ targets.append(contentsOf: [
         name: "ZcashLightClientKit",
         dependencies: sdkDependencies,
         exclude: [
-            "Modules/Service/GRPC/ProtoBuf/proto/compact_formats.proto",
             "Modules/Service/GRPC/ProtoBuf/proto/proposal.proto",
-            "Modules/Service/GRPC/ProtoBuf/proto/service.proto",
             "Error/Sourcery/"
         ],
         resources: [

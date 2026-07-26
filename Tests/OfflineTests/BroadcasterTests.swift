@@ -500,6 +500,10 @@ private final class RecordingCompactTxStreamerService: CompactTxStreamerProvider
         unimplementedStreaming(on: context.eventLoop)
     }
 
+    func getTaddressTransactions(request: TransparentAddressBlockFilter, context: StreamingResponseCallContext<RawTransaction>) -> EventLoopFuture<GRPCStatus> {
+        unimplementedStreaming(on: context.eventLoop)
+    }
+
     func getTaddressBalance(request: AddressList, context: StatusOnlyCallContext) -> EventLoopFuture<Balance> {
         unimplementedUnary(on: context.eventLoop)
     }
@@ -508,7 +512,7 @@ private final class RecordingCompactTxStreamerService: CompactTxStreamerProvider
         unimplementedUnary(on: context.eventLoop)
     }
 
-    func getMempoolTx(request: Exclude, context: StreamingResponseCallContext<CompactTx>) -> EventLoopFuture<GRPCStatus> {
+    func getMempoolTx(request: GetMempoolTxRequest, context: StreamingResponseCallContext<CompactTx>) -> EventLoopFuture<GRPCStatus> {
         unimplementedStreaming(on: context.eventLoop)
     }
 

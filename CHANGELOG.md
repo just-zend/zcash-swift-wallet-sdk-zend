@@ -6,6 +6,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+- The lightwalletd protobuf definitions (`compact_formats.proto`,
+  `service.proto`) are now vendored from
+  https://github.com/zcash/lightwallet-protocol as a git subtree under
+  `lightwallet-protocol/`, currently at v0.5.0, and the generated Swift
+  sources have been regenerated from it. Future updates should use
+  `Scripts/update-lightwallet-protocol.sh <ref>`, which pulls the subtree and
+  regenerates the sources (a nix dev shell providing `protoc` is available
+  via the new `flake.nix`). Protocol v0.5.0 renames `CompactTx.hash` to
+  `CompactTx.txid`, removes `CompactTx.protoVersion`, and adds transparent
+  `vin`/`vout` data, the `PoolType` enum, `BlockRange.poolTypes`, and new
+  `LightdInfo` fields; these generated types are internal to the SDK, so the
+  public API is unchanged.
+
 # 2.7.0-rc.1 - 2026-07-25
 
 ## Added
