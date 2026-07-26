@@ -194,6 +194,17 @@ public protocol Synchronizer: AnyObject {
         memo: Memo?
     ) async throws -> Proposal
 
+    /// Creates a proposal that migrates the account's entire Orchard balance into the Ironwood pool.
+    ///
+    /// NU6.3 introduces the Orchard turnstile: value may leave the Orchard pool but never re-enter
+    /// it, so Orchard funds must be moved across once and in full. This spends every Orchard note and
+    /// sends the maximum to the account's own internal receiver, with the fee computed so no change
+    /// returns to Orchard. Sapling and transparent funds are untouched. Fails unless NU6.3 is active
+    /// at the chain tip.
+    ///
+    /// - Parameter accountUUID: the account whose Orchard balance is migrated.
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal
+
     /// Creates a proposal for shielding any transparent funds received by the given account.
     ///
     /// - Parameter accountUUID: the account for which to shield funds.

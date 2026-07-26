@@ -384,6 +384,10 @@ private final class StubTransactionEncoder: TransactionEncoder {
         fatalError("Unused in test")
     }
 
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
+        fatalError("Unused in test")
+    }
+
     func proposeShielding(
         accountUUID: AccountUUID,
         shieldingThreshold: Zatoshi,

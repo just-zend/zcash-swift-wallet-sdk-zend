@@ -1731,6 +1731,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - proposeOrchardToIronwoodMigration
+
+    var proposeOrchardToIronwoodMigrationAccountUUIDThrowableError: Error?
+    var proposeOrchardToIronwoodMigrationAccountUUIDCallsCount = 0
+    var proposeOrchardToIronwoodMigrationAccountUUIDCalled: Bool {
+        return proposeOrchardToIronwoodMigrationAccountUUIDCallsCount > 0
+    }
+    var proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID: AccountUUID?
+    var proposeOrchardToIronwoodMigrationAccountUUIDReturnValue: Proposal!
+    var proposeOrchardToIronwoodMigrationAccountUUIDClosure: ((AccountUUID) async throws -> Proposal)?
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
+        if let error = proposeOrchardToIronwoodMigrationAccountUUIDThrowableError {
+            throw error
+        }
+        proposeOrchardToIronwoodMigrationAccountUUIDCallsCount += 1
+        proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = proposeOrchardToIronwoodMigrationAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return proposeOrchardToIronwoodMigrationAccountUUIDReturnValue
+        }
+    }
+
     // MARK: - proposeShielding
 
     var proposeShieldingAccountUUIDShieldingThresholdMemoTransparentReceiverThrowableError: Error?
@@ -3532,6 +3556,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         try await putOrchardSubtreeRootsStartIndexRootsClosure!(startIndex, roots)
     }
 
+    // MARK: - putIronwoodSubtreeRoots
+
+    var putIronwoodSubtreeRootsStartIndexRootsThrowableError: Error?
+    var putIronwoodSubtreeRootsStartIndexRootsCallsCount = 0
+    var putIronwoodSubtreeRootsStartIndexRootsCalled: Bool {
+        return putIronwoodSubtreeRootsStartIndexRootsCallsCount > 0
+    }
+    var putIronwoodSubtreeRootsStartIndexRootsReceivedArguments: (startIndex: UInt64, roots: [SubtreeRoot])?
+    var putIronwoodSubtreeRootsStartIndexRootsClosure: ((UInt64, [SubtreeRoot]) async throws -> Void)?
+
+    func putIronwoodSubtreeRoots(startIndex: UInt64, roots: [SubtreeRoot]) async throws {
+        if let error = putIronwoodSubtreeRootsStartIndexRootsThrowableError {
+            throw error
+        }
+        putIronwoodSubtreeRootsStartIndexRootsCallsCount += 1
+        putIronwoodSubtreeRootsStartIndexRootsReceivedArguments = (startIndex: startIndex, roots: roots)
+        try await putIronwoodSubtreeRootsStartIndexRootsClosure!(startIndex, roots)
+    }
+
     // MARK: - updateChainTip
 
     var updateChainTipHeightThrowableError: Error?
@@ -3703,6 +3746,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(accountUUID, address, value, memo)
         } else {
             return proposeTransferAccountUUIDToValueMemoReturnValue
+        }
+    }
+
+    // MARK: - proposeOrchardToIronwoodMigration
+
+    var proposeOrchardToIronwoodMigrationAccountUUIDThrowableError: Error?
+    var proposeOrchardToIronwoodMigrationAccountUUIDCallsCount = 0
+    var proposeOrchardToIronwoodMigrationAccountUUIDCalled: Bool {
+        return proposeOrchardToIronwoodMigrationAccountUUIDCallsCount > 0
+    }
+    var proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID: AccountUUID?
+    var proposeOrchardToIronwoodMigrationAccountUUIDReturnValue: FfiProposal!
+    var proposeOrchardToIronwoodMigrationAccountUUIDClosure: ((AccountUUID) async throws -> FfiProposal)?
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> FfiProposal {
+        if let error = proposeOrchardToIronwoodMigrationAccountUUIDThrowableError {
+            throw error
+        }
+        proposeOrchardToIronwoodMigrationAccountUUIDCallsCount += 1
+        proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = proposeOrchardToIronwoodMigrationAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return proposeOrchardToIronwoodMigrationAccountUUIDReturnValue
         }
     }
 

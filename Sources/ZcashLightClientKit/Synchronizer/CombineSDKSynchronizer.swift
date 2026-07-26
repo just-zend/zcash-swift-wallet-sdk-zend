@@ -94,6 +94,12 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         }
     }
 
+    public func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) -> SinglePublisher<Proposal, Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
+        }
+    }
+
     public func proposefulfillingPaymentURI(
         _ uri: String,
         accountUUID: AccountUUID
