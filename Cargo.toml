@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "2.6.0-alpha.4"
+version = "2.8.0-rc.1"
 authors = [
     "Jack Grigg <thestr4d@gmail.com>",
     "Lukas Korba <lukas@tangiblecodes.com>",
@@ -21,7 +21,7 @@ ff = "0.13"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
 transparent = { package = "zcash_transparent", version = "0.10", default-features = false }
 zcash_address = { version = "0.13" }
-zcash_client_backend = { version = "0.24.0-rc.2", features = [
+zcash_client_backend = { version = "0.24.0-rc.3", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "pczt",
@@ -29,14 +29,14 @@ zcash_client_backend = { version = "0.24.0-rc.2", features = [
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "0.22.0-rc.2", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "0.22.0-rc.3", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.30"
 zcash_proofs = "0.30"
 zcash_protocol = "0.10"
 zcash_script = "0.4"
 zip32 = "0.2"
-pczt = { version = "0.8.0", features = ["prover", "orchard", "sapling"] }
+pczt = { version = "0.9.0", features = ["prover", "orchard", "sapling"] }
 
 # EIP-681
 eip681 = "0.1.0"
@@ -98,13 +98,6 @@ cc = "1.0"
 # TODO: [#1869] Remove these patches once pczt 0.9.0 and zcash_client_backend
 # 0.24.0-rc.3 are published (zcash/librustzcash#2769); the sibling crates are
 # patched to the same revision to keep the dependency graph on a single source.
-pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "2cbb55ec58887c52b96ff697b081861cb6467b45" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash.git", rev = "2cbb55ec58887c52b96ff697b081861cb6467b45" }
-zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "2cbb55ec58887c52b96ff697b081861cb6467b45" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "2cbb55ec58887c52b96ff697b081861cb6467b45" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "2cbb55ec58887c52b96ff697b081861cb6467b45" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "2cbb55ec58887c52b96ff697b081861cb6467b45" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash.git", rev = "2cbb55ec58887c52b96ff697b081861cb6467b45" }
 
 [features]
 default = []
