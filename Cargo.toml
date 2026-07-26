@@ -93,9 +93,6 @@ cc = "1.0"
 
 [patch.crates-io]
 # zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "7d39d02b297f0ce23751f2638bf403285e34e675" }
-# TODO: [#1869] Remove these patches once pczt 0.9.0 and zcash_client_backend
-# 0.24.0-rc.3 are published (zcash/librustzcash#2769); the sibling crates are
-# patched to the same revision to keep the dependency graph on a single source.
 
 [features]
 default = []
