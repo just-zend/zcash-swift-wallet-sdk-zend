@@ -6,6 +6,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Removed
+- The `zcashlc_voting_*` FFI is no longer compiled. `zcash_voting` cannot resolve
+  against the Ironwood (NU6.3) `orchard` release, so the `voting` module is gated
+  behind `#[cfg(zcash_voting)]` and the `zcash_voting`/`zcash_keys` dependencies are
+  commented out in `Cargo.toml`. The module sources are retained so the surface can
+  be reinstated once the voting crates support the Ironwood dependency stack.
+
 ## 2.6.0-alpha.6 - 2026-06-26
 
 ### Fixed
