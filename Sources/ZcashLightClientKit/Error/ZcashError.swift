@@ -61,7 +61,7 @@ public enum ZcashError: Equatable, Error {
     /// LightWalletService.getSubtreeRoots failed.
     /// ZSRVC0009
     case serviceSubtreeRootsStreamFailed(_ error: LightWalletServiceError)
-    /// LightWalletService.getTaddressTxids failed.
+    /// LightWalletService.getTaddressTransactions failed.
     /// ZSRVC0010
     case serviceGetTaddressTxidsFailed(_ error: LightWalletServiceError)
     /// LightWalletService.getMempoolStream failed.
@@ -800,7 +800,7 @@ public enum ZcashError: Equatable, Error {
         case .serviceFetchUTXOsFailed: return "LightWalletService.fetchUTXOs failed."
         case .serviceBlockStreamFailed: return "LightWalletService.blockStream failed."
         case .serviceSubtreeRootsStreamFailed: return "LightWalletService.getSubtreeRoots failed."
-        case .serviceGetTaddressTxidsFailed: return "LightWalletService.getTaddressTxids failed."
+        case .serviceGetTaddressTxidsFailed: return "LightWalletService.getTaddressTransactions failed."
         case .serviceGetMempoolStreamFailed: return "LightWalletService.getMempoolStream failed."
         case .torServiceMissingEndpoint: return "Endpoint is not provided"
         case .torServiceUnresolvedMode: return "Tor client fails to resolve ServiceMode"
@@ -1133,8 +1133,8 @@ public enum ZcashError: Equatable, Error {
         case .rustUpdateTransparentAddressTransactions: return .rustUpdateTransparentAddressTransactions
         case .rustFetchUTXOsByAddress: return .rustFetchUTXOsByAddress
         case .rustDeleteAccount: return .rustDeleteAccount
-        case .rustEip681Parse: return .rustEip681Parse
         case .rustTruncateToChainState: return .rustTruncateToChainState
+        case .rustEip681Parse: return .rustEip681Parse
         case .accountDAOGetAll: return .accountDAOGetAll
         case .accountDAOGetAllCantDecode: return .accountDAOGetAllCantDecode
         case .accountDAOFindBy: return .accountDAOFindBy
@@ -1232,11 +1232,5 @@ public enum ZcashError: Equatable, Error {
 
     public static func == (lhs: ZcashError, rhs: ZcashError) -> Bool {
         return lhs.code == rhs.code
-    }
-}
-
-extension ZcashError: LocalizedError {
-    public var errorDescription: String? {
-        "\(code.rawValue): \(message)"
     }
 }

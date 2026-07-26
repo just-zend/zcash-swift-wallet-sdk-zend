@@ -80,7 +80,7 @@ enum ZcashErrorDefinition {
     /// LightWalletService.getSubtreeRoots failed.
     // sourcery: code="ZSRVC0009"
     case serviceSubtreeRootsStreamFailed(_ error: LightWalletServiceError)
-    /// LightWalletService.getTaddressTxids failed.
+    /// LightWalletService.getTaddressTransactions failed.
     // sourcery: code="ZSRVC0010"
     case serviceGetTaddressTxidsFailed(_ error: LightWalletServiceError)
     /// LightWalletService.getMempoolStream failed.
