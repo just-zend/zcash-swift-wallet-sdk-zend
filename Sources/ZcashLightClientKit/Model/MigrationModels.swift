@@ -79,7 +79,10 @@ public struct NoteSplitProposal: Equatable, Sendable {
 public struct MigrationTransferProposal: Identifiable, Equatable, Sendable, Codable {
     /// The transfer's opaque, engine-issued id.
     public let id: String
-    /// The value that crosses the turnstile.
+    /// The value that crosses the turnstile: what this transfer adds to the destination pool, and
+    /// one of the round `{1,2,5}×10ⁿ` denominations the run was planned in. The note the transfer
+    /// spends is larger — it also carries the buffer that pays the transfer's own fee — but that
+    /// is a spend-side detail the user is not asked to approve.
     public let amount: Zatoshi
     /// The "now" reference height at proposal time (the chain tip). With ZIP 374 the real anchor
     /// is drawn per transfer and installed at proving time, so this field is NOT a commitment-tree

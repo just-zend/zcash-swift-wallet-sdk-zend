@@ -368,18 +368,38 @@ fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bloc
     }
 }
 
-/// The row set the platform sees for a plan's transfer schedule: `(engine tx id, amount, broadcast
-/// height, expiry height)`, sorted chronologically by broadcast height.
+/// What a transfer spending `funding_note` CROSSES into Ironwood: the note less the fee buffer
+/// that funds the transfer's own fee (the transfer has no change output, so the buffer is consumed
+/// exactly). This is the round `{1,2,5}×10ⁿ` denomination the user consented to and the amount
+/// their Ironwood balance will grow by — the funding note itself is a spend-side value that
+/// overstates it by one transfer fee.
 ///
-/// - Amounts pair with `funding_notes()` (the post-reconciliation values), NOT the note split's
-///   raw `crossing_values()` — the two differ whenever preparation fees drop the smallest
-///   denominations, and mispairing silently attaches wrong amounts to schedule heights.
+/// The engine builds every funding note as `crossing + buffer`, so the subtraction cannot
+/// underflow; a stored plan that violated that invariant saturates to zero rather than panicking
+/// across the FFI, and the zero is self-evidently wrong in the platform's display.
+// TODO: [#1806] Replace with the engine's own `transfer_crossing_value` /
+// `crossing_values` accessors (librustzcash #2767) when the pin moves to the next rc.
+fn crossing_amount(funding_note: Zatoshis, note_fee_buffer: Zatoshis) -> Zatoshis {
+    (funding_note - note_fee_buffer).unwrap_or(Zatoshis::ZERO)
+}
+
+/// The row set the platform sees for a plan's transfer schedule: `(engine tx id, crossing amount,
+/// broadcast height, expiry height)`, sorted chronologically by broadcast height.
+///
+/// - Amounts are what each transfer CROSSES (see [`crossing_amount`]), not the funding note it
+///   spends: serving the note overstates every row by one transfer fee and shows a value that is
+///   not a round denomination the user was asked to approve.
+/// - Rows still pair with `funding_notes()` (the post-reconciliation values), NOT the denomination
+///   plan's raw `crossing_values()` — the two differ whenever preparation fees drop the smallest
+///   denominations, and mispairing silently attaches wrong amounts to schedule heights. Taking the
+///   buffer off each paired row preserves that pairing.
 /// - The engine numbers every preparation transaction first, then transfers in `schedule()`
 ///   order, so transfer `i`'s real committed id is `prep_tx_count + i`.
 /// - The sort makes the platform's row order chronological: ZIP 318 SHUFFLE deliberately makes
 ///   funding-note order differ from broadcast order.
 fn schedule_rows(
     funding_notes: &[Zatoshis],
+    note_fee_buffer: Zatoshis,
     schedule: &[zcash_pool_migration::scheduling::Schedule],
     prep_tx_count: u32,
 ) -> anyhow::Result<Vec<(MigrationTxId, Zatoshis, BlockHeight, BlockHeight)>> {
@@ -394,10 +414,10 @@ fn schedule_rows(
         .iter()
         .zip(schedule.iter())
         .enumerate()
-        .map(|(i, (amount, entry))| {
+        .map(|(i, (funding_note, entry))| {
             (
                 MigrationTxId::new(prep_tx_count + i as u32),
-                *amount,
+                crossing_amount(*funding_note, note_fee_buffer),
                 entry.broadcast_height(),
                 entry.expiry_height(),
             )
@@ -442,7 +462,12 @@ fn encode_schedule_from_plan(
     now_reference: BlockHeight,
     plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
-    let rows = schedule_rows(&plan.funding_notes(), plan.schedule(), prep_tx_count(plan))?;
+    let rows = schedule_rows(
+        &plan.funding_notes(),
+        plan.note_split().note_fee_buffer(),
+        plan.schedule(),
+        prep_tx_count(plan),
+    )?;
     let transfers = rows
         .into_iter()
         .map(|(id, amount, broadcast, expiry)| {
@@ -906,11 +931,18 @@ fn derive_state(
     }
 }
 
-/// The amount a stored transfer crosses, from the run's funding notes (`Transfer { crossing }`
-/// indexes into them).
+/// The amount a stored transfer CROSSES: its funding note (`Transfer { crossing }` indexes into
+/// the run's funding notes) less the fee buffer that pays the transfer's own fee — see
+/// [`crossing_amount`]. `None` for a preparation transaction, which crosses nothing.
 fn transfer_amount(state: &MigrationState, tx: &MigrationTransaction) -> Option<Zatoshis> {
     match tx.kind() {
-        MigrationTxKind::Transfer { crossing } => state.funding_notes().get(crossing).copied(),
+        MigrationTxKind::Transfer { crossing } => {
+            let buffer = state.note_split().note_fee_buffer();
+            state
+                .funding_notes()
+                .get(crossing)
+                .map(|funding_note| crossing_amount(*funding_note, buffer))
+        }
         _ => None,
     }
 }
@@ -1961,8 +1993,12 @@ pub unsafe extern "C" fn zcashlc_migration_propose_immediate_transfers(
         match plan_and_cache(&mut ctx, true)? {
             Some((plan, reference_height, handle)) => {
                 // Preview mirrors the commit-time rewrite: every transfer due at the tip.
-                let rows =
-                    schedule_rows(&plan.funding_notes(), plan.schedule(), prep_tx_count(&plan))?;
+                let rows = schedule_rows(
+                    &plan.funding_notes(),
+                    plan.note_split().note_fee_buffer(),
+                    plan.schedule(),
+                    prep_tx_count(&plan),
+                )?;
                 let transfers = rows
                     .into_iter()
                     .map(|(id, amount, _, expiry)| {
@@ -3030,12 +3066,19 @@ mod tests {
         ));
     }
 
+    /// The fee buffer the row fixtures build their funding notes with; any nonzero value exercises
+    /// the crossing subtraction.
+    const TEST_BUFFER: u64 = 15_000;
+
     #[test]
     fn schedule_rows_sort_chronologically_with_prep_offset() {
         let mut rng = StdRng::seed_from_u64(7);
         let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng);
-        let amounts: Vec<Zatoshis> = (1..=5).map(|i| zat(i * 100_000_000)).collect();
-        let rows = schedule_rows(&amounts, &schedule, 3).unwrap();
+        // Funding notes, i.e. each crossing value PLUS the fee buffer, as the engine mints them.
+        let funding_notes: Vec<Zatoshis> = (1..=5)
+            .map(|i| zat(i * 100_000_000 + TEST_BUFFER))
+            .collect();
+        let rows = schedule_rows(&funding_notes, zat(TEST_BUFFER), &schedule, 3).unwrap();
         assert_eq!(rows.len(), 5);
         // Chronological by broadcast height.
         for pair in rows.windows(2) {
@@ -3045,19 +3088,41 @@ mod tests {
         let mut ids: Vec<u32> = rows.iter().map(|(id, _, _, _)| u32::from(*id)).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![3, 4, 5, 6, 7]);
-        // Amount pairing survives the sort: each id maps back to its crossing's amount.
+        // Amount pairing survives the sort, and each row carries the CROSSING value (the round
+        // denomination the user consented to), not the funding note that funds its fee.
         for (id, amount, _, _) in &rows {
             let crossing = u32::from(*id) - 3;
             assert_eq!(*amount, zat((u64::from(crossing) + 1) * 100_000_000));
         }
     }
 
+    /// A row reports what the transfer moves, never the note it spends: serving the funding note
+    /// would overstate every amount by one transfer fee and stop it being a round denomination.
+    #[test]
+    fn schedule_rows_report_the_crossing_value_not_the_funding_note() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 1, &mut rng);
+        let crossing = 500_000_000;
+        let rows = schedule_rows(
+            &[zat(crossing + TEST_BUFFER)],
+            zat(TEST_BUFFER),
+            &schedule,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            rows[0].1,
+            zat(crossing),
+            "the row must carry the crossing value, not the funding note"
+        );
+    }
+
     #[test]
     fn schedule_rows_reject_length_mismatch() {
         let mut rng = StdRng::seed_from_u64(7);
         let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 3, &mut rng);
-        let amounts = vec![zat(100)];
-        assert!(schedule_rows(&amounts, &schedule, 0).is_err());
+        let funding_notes = vec![zat(100)];
+        assert!(schedule_rows(&funding_notes, zat(0), &schedule, 0).is_err());
     }
 
     // ----- schedule-duration semantics (#1806): from `now` to the LAST scheduled broadcast -----
@@ -3648,9 +3713,11 @@ mod tests {
             .to_str()
             .expect("the row id is UTF-8");
         assert_eq!(row_id, "0", "the stored transfer's engine id");
-        // The state-side amount is the FUNDING NOTE (crossing + fee buffer), exactly what the
-        // consent echo compares (`expected_rows_from_state` uses the same `transfer_amount`).
-        assert_eq!(row.amount, 100_010_000);
+        // The state-side amount is what the transfer CROSSES: the fixture's funding note is
+        // 100_010_000 (crossing 100_000_000 plus the 10_000 fee buffer), and the row serves the
+        // crossing. The consent echo compares the same value (`expected_rows_from_state` uses the
+        // same `transfer_amount`), so platform and native still agree.
+        assert_eq!(row.amount, 100_000_000);
         assert_eq!(
             row.next_executable_after_height, 3_499_000,
             "the stored scheduled height is served unchanged"

@@ -46,7 +46,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   echoes, checked against the previewed plan (or, once committed, the stored
   state), with a mismatch surfacing `MIGRATION_PLAN_STALE`, so a stale or
   tampered display can never sign different values than the ones the user
-  approved. Ids, amounts, expiry heights, and the estimated duration are
+  approved. Every transfer amount the FFI reports (schedule rows, the pending
+  transfer proposal) is the value that CROSSES into Ironwood — the funding note
+  the transfer spends, less the buffer that pays that transfer's own fee — so it
+  is one of the round `{1,2,5}×10ⁿ` denominations the run was planned in and the
+  amount the destination balance grows by, not the larger spend-side note value.
+  Ids, amounts, expiry heights, and the estimated duration are
   always compared; next-executable heights are compared only against the
   previewed plan, never post-commit (the immediate lane's commit-time
   reschedule legitimately moves them away from an honest echo, with no way
