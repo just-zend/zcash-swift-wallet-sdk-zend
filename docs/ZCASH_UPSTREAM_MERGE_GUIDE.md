@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-21
+Last reviewed: 2026-07-25
 
 ## Remote and branch invariants
 
@@ -10,22 +10,27 @@ Last reviewed: 2026-07-21
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current monitor status (2026-07-21)
+## Current monitor status (2026-07-25)
 
 - After fetching both remotes, both default branches remain `main`; `origin/main` is
-  `8f85838b` and `upstream/main` is `89d85c49` (upstream PR `#1815`). The parity count is
-  `168 0`, and `upstream/main` is an ancestor of `origin/main`: Zend PR `#26` has merged.
-- The merged parity adopted the copyright-holder update and required-build-path change without
-  altering Zend artifacts, private-engine provenance, branding, or Ironwood behavior. Its
-  verification passed: `swift build` and `swift test --filter OfflineTests` (546 tests, 0 failures).
-- The 2026-07-21 force-pushes to the Orchard-to-Ironwood migration branches make the early-carry
-  case weaker, not stronger: the Synchronizer branch is 36 commits ahead / 93 files, the FFI branch
-  is 26 commits ahead / 79 files, and `michal/slipstream-support` is 45 commits ahead / 117 files.
-  Together they change public API, Rust/FFI, persistence, privacy gates, generated mocks, and the
-  engine family. Wait for upstream merge plus a Zend artifact/provenance reconciliation plan.
-- All other active upstream PRs remain in the existing wait-for-upstream classes:
-  draft, blocked/review-required, dirty, failed, or broad protocol/FFI/release work.
-  No early-carry candidate currently satisfies ready, useful, and low-risk.
+  `1f2bb517` and `upstream/main` is `769809a2`. The parity count is `172 0`, and
+  `upstream/main` is an ancestor of `origin/main`: Zend PR `#32` merged the six-commit upstream
+  delta, including `InitializationResult.seedNotRelevant` and upstream's new security guidance.
+- PR `#32` resolved documentation-only conflicts while preserving the Zend-specific guidance in
+  `AGENTS.md`; its Build and Run Offline Tests and SwiftLint checks passed. It also means Zend iOS
+  callers that exhaustively switch over initialization results need a `seedNotRelevant` arm when
+  they adopt this SDK revision. No new local Swift run is needed for this documentation refresh.
+- The refreshed early-carry scan still has no safe candidate. The coupled pool-migration branches
+  are now 83 commits / 96 files (Synchronizer) and 50 commits / 81 files (FFI) ahead of upstream
+  `main`; `michal/slipstream-support` is 119 commits / 123 files ahead. Together they change public
+  API, Rust/FFI, persistence, privacy gates, generated mocks, and the engine family. Wait for an
+  upstream merge plus a Zend artifact/provenance reconciliation plan.
+- Upstream PR `#1812` is conflicting; `#1813` is blocked and review-required; draft `#1818` layers
+  another 49-file Slipstream change on that stack. The new `#1852` lightwallet-protocol subtree
+  update is blocked, review-required, and still building against `maint/v2.7.x`; draft `#1848` is a
+  blocked 3.0.0 release line with a failing SwiftLint check. None is a ready, useful, low-risk
+  default-branch carry. Existing protocol, dependency, release, and older migration PRs remain in
+  their draft, blocked/review-required, dirty, failed, or broad-scope wait-for-upstream classes.
 
 ## Parity sync workflow (upstream default branch)
 
