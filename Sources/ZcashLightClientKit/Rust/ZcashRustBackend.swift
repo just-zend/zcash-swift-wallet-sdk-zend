@@ -1833,7 +1833,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationRecordTransferResult(
-        transferId: String,
+        transferId: UInt32,
         result: MigrationTransferResult,
         for account: AccountUUID
     ) async throws {
@@ -1866,7 +1866,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             dbData.1,
             account.id,
             networkType.networkId,
-            [CChar](transferId.utf8CString),
+            transferId,
             resultTag,
             txidBytes
         )
@@ -1991,9 +1991,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         _ signed: [MigrationSignedTransferPczt],
         for account: AccountUUID
     ) async throws -> PreparedMigrationTransfer {
-        let idsCStrings = makeCStrings(signed.map { $0.id })
-        defer { freeCStrings(idsCStrings) }
-        let idsConstPointers = constPointers(idsCStrings)
+        let ids: [UInt32] = signed.map { $0.id }
 
         // One owned buffer per pczt (see `migrationStoreSignedSchedulePczts` for the rationale).
         let pcztBuffers: [UnsafeMutablePointer<UInt8>] = signed.map { transfer in
@@ -2006,7 +2004,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         let pcztPointers: [UnsafePointer<UInt8>?] = pcztBuffers.map { UnsafePointer($0) }
         let pcztLens: [UInt] = signed.map { UInt($0.pczt.count) }
 
-        let preparedPtr = idsConstPointers.withUnsafeBufferPointer { idsPtr in
+        let preparedPtr = ids.withUnsafeBufferPointer { idsPtr in
             pcztPointers.withUnsafeBufferPointer { pcztsPtr in
                 pcztLens.withUnsafeBufferPointer { lensPtr in
                     zcashlc_migration_store_signed_note_split_pczts(
@@ -2080,9 +2078,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationStoreSignedSchedulePczts(_ signed: [MigrationSignedTransferPczt], for account: AccountUUID) async throws {
-        let idsCStrings = makeCStrings(signed.map { $0.id })
-        defer { freeCStrings(idsCStrings) }
-        let idsConstPointers = constPointers(idsCStrings)
+        let ids: [UInt32] = signed.map { $0.id }
 
         // One owned buffer per pczt, each populated with a single `copyBytes` call. The FFI call
         // needs every pczt's bytes alive as an independent buffer simultaneously (parallel
@@ -2099,7 +2095,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         let pcztPointers: [UnsafePointer<UInt8>?] = pcztBuffers.map { UnsafePointer($0) }
         let pcztLens: [UInt] = signed.map { UInt($0.pczt.count) }
 
-        let success = idsConstPointers.withUnsafeBufferPointer { idsPtr in
+        let success = ids.withUnsafeBufferPointer { idsPtr in
             pcztPointers.withUnsafeBufferPointer { pcztsPtr in
                 pcztLens.withUnsafeBufferPointer { lensPtr in
                     zcashlc_migration_store_signed_schedule_pczts(
@@ -2393,14 +2389,7 @@ extension FfiAttentionReason {
     func unsafeToMigrationAttentionReason() -> MigrationAttentionReason? {
         switch tag {
         case 0:
-            guard
-                let transferIdPtr = invalid_transfer.transfer_id,
-                let transferId = String(validatingUTF8: transferIdPtr)
-            else {
-                return nil
-            }
-
-            return .invalidTransfer(transferId: transferId)
+            return .invalidTransfer(transferId: invalid_transfer.transfer_id)
         case 1:
             return .transferExpired
         default:
@@ -2448,18 +2437,14 @@ extension FfiNoteSplitProposal {
 
 extension FfiPreparedTransfer {
     /// Converts an [`FfiPreparedTransfer`] into a [`PreparedMigrationTransfer`], or `nil` for the
-    /// "nothing due" sentinel (`id` and `pczt` both null).
+    /// "nothing due" sentinel (a null `pczt`, whose `id` is meaningless).
     func unsafeToPreparedMigrationTransfer() -> PreparedMigrationTransfer? {
-        guard
-            let idPtr = id,
-            let pcztPtr = pczt,
-            let transferId = String(validatingUTF8: idPtr)
-        else {
+        guard let pcztPtr = pczt else {
             return nil
         }
 
         return PreparedMigrationTransfer(
-            id: transferId,
+            id: id,
             txid: Data(FfiTxId(tuple: txid).array),
             pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
         )
@@ -2470,10 +2455,8 @@ extension FfiTransferProposal {
     /// Converts an [`FfiTransferProposal`] into a [`MigrationTransferProposal`], or `nil` for a
     /// missing `id` (should not happen; defensive only).
     func unsafeToMigrationTransferProposal() -> MigrationTransferProposal? {
-        guard let idPtr = id, let transferId = String(validatingUTF8: idPtr) else { return nil }
-
         return MigrationTransferProposal(
-            id: transferId,
+            id: id,
             amount: Zatoshi(amount),
             anchorHeight: BlockHeight(anchor_height),
             nextExecutableAfterHeight: BlockHeight(next_executable_after_height),
@@ -2531,18 +2514,14 @@ extension FfiMigrationRunEstimate {
 
 extension FfiUnsignedTransferPczt {
     /// Converts an [`FfiUnsignedTransferPczt`] into a [`MigrationUnsignedTransferPczt`], or `nil`
-    /// for a missing `id`/`pczt` (should not happen; defensive only).
+    /// for a missing `pczt` (should not happen; defensive only).
     func unsafeToMigrationUnsignedTransferPczt() -> MigrationUnsignedTransferPczt? {
-        guard
-            let idPtr = id,
-            let pcztPtr = pczt,
-            let transferId = String(validatingUTF8: idPtr)
-        else {
+        guard let pcztPtr = pczt else {
             return nil
         }
 
         return MigrationUnsignedTransferPczt(
-            id: transferId,
+            id: id,
             pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
         )
     }

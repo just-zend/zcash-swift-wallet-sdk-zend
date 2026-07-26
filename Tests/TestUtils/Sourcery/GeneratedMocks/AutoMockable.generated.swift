@@ -4529,10 +4529,10 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
     var migrationRecordTransferResultTransferIdResultForCalled: Bool {
         return migrationRecordTransferResultTransferIdResultForCallsCount > 0
     }
-    var migrationRecordTransferResultTransferIdResultForReceivedArguments: (transferId: String, result: MigrationTransferResult, account: AccountUUID)?
-    var migrationRecordTransferResultTransferIdResultForClosure: ((String, MigrationTransferResult, AccountUUID) async throws -> Void)?
+    var migrationRecordTransferResultTransferIdResultForReceivedArguments: (transferId: UInt32, result: MigrationTransferResult, account: AccountUUID)?
+    var migrationRecordTransferResultTransferIdResultForClosure: ((UInt32, MigrationTransferResult, AccountUUID) async throws -> Void)?
 
-    func migrationRecordTransferResult(transferId: String, result: MigrationTransferResult, for account: AccountUUID) async throws {
+    func migrationRecordTransferResult(transferId: UInt32, result: MigrationTransferResult, for account: AccountUUID) async throws {
         if let error = migrationRecordTransferResultTransferIdResultForThrowableError {
             throw error
         }

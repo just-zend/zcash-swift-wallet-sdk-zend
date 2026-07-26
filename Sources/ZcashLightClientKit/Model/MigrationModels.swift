@@ -77,8 +77,8 @@ public struct NoteSplitProposal: Equatable, Sendable {
 
 /// A single scheduled Orchard -> Ironwood transfer, as one element of a `MigrationSchedule`.
 public struct MigrationTransferProposal: Identifiable, Equatable, Sendable, Codable {
-    /// The transfer's opaque, engine-issued id.
-    public let id: String
+    /// The transfer's engine-issued id.
+    public let id: UInt32
     /// The value that crosses the turnstile: what this transfer adds to the destination pool, and
     /// one of the round `{1,2,5}×10ⁿ` denominations the run was planned in. The note the transfer
     /// spends is larger — it also carries the buffer that pays the transfer's own fee — but that
@@ -96,7 +96,7 @@ public struct MigrationTransferProposal: Identifiable, Equatable, Sendable, Coda
 
     /// Creates a `MigrationTransferProposal`.
     public init(
-        id: String,
+        id: UInt32,
         amount: Zatoshi,
         anchorHeight: BlockHeight,
         nextExecutableAfterHeight: BlockHeight,
@@ -264,8 +264,8 @@ public struct MigrationRunEstimate: Equatable, Sendable {
 /// A fully proven, signed migration transaction persisted by the engine, ready for the platform
 /// to broadcast (see `ZcashRustBackendWelding.migrationExtractBroadcastTx(pczt:for:)`).
 public struct PreparedMigrationTransfer: Equatable, Sendable {
-    /// The transfer's opaque, engine-issued id.
-    public let id: String
+    /// The transfer's engine-issued id.
+    public let id: UInt32
     /// The finalized transaction's id, in the SDK's raw/internal byte order (matching `TxId.id`,
     /// not the reversed display-hex order produced by `Data.toHexStringTxId()`). Zeroed when the
     /// value is a STORAGE RECEIPT (`migrationStoreSignedNoteSplitPczts`) whose transaction has not
@@ -275,7 +275,7 @@ public struct PreparedMigrationTransfer: Equatable, Sendable {
     public let pczt: Data
 
     /// Creates a `PreparedMigrationTransfer`.
-    public init(id: String, txid: Data, pczt: Data) {
+    public init(id: UInt32, txid: Data, pczt: Data) {
         self.id = id
         self.txid = txid
         self.pczt = pczt
@@ -304,7 +304,7 @@ public enum MigrationTransferResult: Equatable, Sendable {
 /// Why a migration requires user attention, as carried by `MigrationState.requiresAttention`.
 public enum MigrationAttentionReason: Equatable, Sendable {
     /// The input note funding `transferId` was spent externally before its transfer broadcast.
-    case invalidTransfer(transferId: String)
+    case invalidTransfer(transferId: UInt32)
     /// A transaction's anchor/expiry elapsed before it could be broadcast.
     case transferExpired
 }
@@ -312,13 +312,13 @@ public enum MigrationAttentionReason: Equatable, Sendable {
 /// An unsigned-but-proven PCZT for one scheduled transfer, awaiting an external signer (see
 /// `ZcashRustBackendWelding.migrationCreateUnsignedTransferPczts(for:for:)`).
 public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
-    /// The transfer's opaque, engine-issued id.
-    public let id: String
+    /// The transfer's engine-issued id.
+    public let id: UInt32
     /// The serialized, proven-but-unsigned PCZT.
     public let pczt: Data
 
     /// Creates a `MigrationUnsignedTransferPczt`.
-    public init(id: String, pczt: Data) {
+    public init(id: UInt32, pczt: Data) {
         self.id = id
         self.pczt = pczt
     }
@@ -327,15 +327,15 @@ public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
 /// An externally signed PCZT for one scheduled transfer, to be handed back to the engine via
 /// `ZcashRustBackendWelding.migrationStoreSignedSchedulePczts(_:for:)`.
 public struct MigrationSignedTransferPczt: Equatable, Sendable {
-    /// The transfer's opaque, engine-issued id (must match the corresponding
+    /// The transfer's engine-issued id (must match the corresponding
     /// `MigrationUnsignedTransferPczt.id`).
-    public let id: String
+    public let id: UInt32
     /// The serialized, signed PCZT.
     public let pczt: Data
 
     /// Creates a `MigrationSignedTransferPczt`. Apps construct this directly after routing the
     /// corresponding `MigrationUnsignedTransferPczt` through an external signer.
-    public init(id: String, pczt: Data) {
+    public init(id: UInt32, pczt: Data) {
         self.id = id
         self.pczt = pczt
     }

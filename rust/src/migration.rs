@@ -137,20 +137,6 @@ unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
     }
 }
 
-/// Decode a decimal transaction-id string (`MigrationTxId` raw value) from a C string.
-fn transfer_id_from_c(id: *const c_char) -> anyhow::Result<MigrationTxId> {
-    if id.is_null() {
-        return Err(anyhow!("transfer_id is null"));
-    }
-    let raw = unsafe { CStr::from_ptr(id) }
-        .to_str()
-        .map_err(|e| anyhow!("transfer id is not valid UTF-8: {e}"))?;
-    let idx: u32 = raw
-        .parse()
-        .map_err(|e| anyhow!("invalid transfer id {raw}: {e}"))?;
-    Ok(MigrationTxId::new(idx))
-}
-
 /// The common per-call context: the network parameters, the wallet handle, the migration-store
 /// connection (a second, independent connection to the same wallet database file — the
 /// account-keyed migration tables live inside it), and the raw path/account for the plan cache.
@@ -472,7 +458,7 @@ fn encode_schedule_from_plan(
         .into_iter()
         .map(|(id, amount, broadcast, expiry)| {
             Ok(FfiTransferProposal {
-                id: cstring_raw(&u32::from(id).to_string(), "transfer proposal id")?,
+                id: u32::from(id),
                 amount: zat_to_i64(amount),
                 anchor_height: i64::from(u32::from(now_reference)),
                 next_executable_after_height: i64::from(u32::from(broadcast)),
@@ -558,7 +544,7 @@ fn encode_schedule_from_state(
             let amount = transfer_amount(state, t)
                 .ok_or_else(|| anyhow!("stored transfer has no funding-note amount"))?;
             Ok(FfiTransferProposal {
-                id: cstring_raw(&u32::from(t.id()).to_string(), "transfer proposal id")?,
+                id: u32::from(t.id()),
                 amount: zat_to_i64(amount),
                 anchor_height: i64::from(u32::from(now_reference)),
                 next_executable_after_height: i64::from(u32::from(t.scheduled_height())),
@@ -988,10 +974,9 @@ impl FfiMigrationProgress {
 /// Why a migration requires user attention (payload of [`FfiMigrationState::RequiresAttention`]).
 #[repr(C, u8)]
 pub enum FfiAttentionReason {
-    /// The transfer identified by `transfer_id` was terminally rejected at broadcast (its input
-    /// note was spent externally, or the network refused it as invalid). `transfer_id` is an owned
-    /// C string, freed by [`zcashlc_free_migration_state`].
-    InvalidTransfer { transfer_id: *mut c_char },
+    /// The transfer identified by `transfer_id` (the engine's raw id) was terminally rejected at
+    /// broadcast: its input note was spent externally, or the network refused it as invalid.
+    InvalidTransfer { transfer_id: u32 },
     /// A transaction's expiry elapsed before it could be broadcast (or mined).
     TransferExpired,
 }
@@ -1036,9 +1021,9 @@ pub struct FfiNoteSplitProposal {
 /// `pczt` null) means "nothing is due" (as opposed to a NULL return, which signals an error).
 #[repr(C)]
 pub struct FfiPreparedTransfer {
-    /// The transaction's id (the engine's decimal id), as an owned C string (null only in the
-    /// "nothing due" sentinel).
-    pub id: *mut c_char,
+    /// The transaction's id (the engine's raw id). Meaningful only when `pczt` is non-null; the
+    /// "nothing due" sentinel leaves it `0`.
+    pub id: u32,
     /// The finalized transaction's id, as raw (internal-order) 32-byte value (zeroed when the
     /// value is a storage receipt whose transaction has not been proven yet).
     pub txid: [u8; 32],
@@ -1053,7 +1038,7 @@ impl FfiPreparedTransfer {
         txid: [u8; 32],
         pczt_bytes: Vec<u8>,
     ) -> anyhow::Result<*mut Self> {
-        let id = cstring_raw(&u32::from(id).to_string(), "prepared transfer id")?;
+        let id = u32::from(id);
         let (pczt, pczt_len) = ptr_from_vec(pczt_bytes);
         Ok(Box::into_raw(Box::new(FfiPreparedTransfer {
             id,
@@ -1065,7 +1050,7 @@ impl FfiPreparedTransfer {
 
     fn none() -> *mut Self {
         Box::into_raw(Box::new(FfiPreparedTransfer {
-            id: ptr::null_mut(),
+            id: 0,
             txid: [0u8; 32],
             pczt: ptr::null_mut(),
             pczt_len: 0,
@@ -1076,8 +1061,8 @@ impl FfiPreparedTransfer {
 /// A single scheduled Orchard→Ironwood transfer (element of [`FfiMigrationSchedule`]).
 #[repr(C)]
 pub struct FfiTransferProposal {
-    /// The transfer's id (the engine's decimal id), as an owned C string.
-    pub id: *mut c_char,
+    /// The transfer's id (the engine's raw id).
+    pub id: u32,
     /// The value (zatoshi) that crosses the turnstile.
     pub amount: i64,
     /// The "now" reference height at encode time (the chain tip). With ZIP 374 the real anchor is
@@ -1099,7 +1084,7 @@ impl FfiTransferProposal {
         expiry: BlockHeight,
     ) -> anyhow::Result<*mut Self> {
         Ok(Box::into_raw(Box::new(FfiTransferProposal {
-            id: cstring_raw(&u32::from(id).to_string(), "transfer proposal id")?,
+            id: u32::from(id),
             amount: zat_to_i64(amount),
             anchor_height: i64::from(u32::from(now_reference)),
             next_executable_after_height: i64::from(u32::from(next_executable_after)),
@@ -1159,8 +1144,8 @@ pub struct FfiMigrationRunEstimate {
 /// An unsigned PCZT awaiting an external signer (element of [`FfiUnsignedTransferPczts`]).
 #[repr(C)]
 pub struct FfiUnsignedTransferPczt {
-    /// The transaction's id (the engine's decimal id), as an owned C string.
-    pub id: *mut c_char,
+    /// The transaction's id (the engine's raw id).
+    pub id: u32,
     /// Heap `pczt_len`-byte serialized unsigned PCZT.
     pub pczt: *mut u8,
     pub pczt_len: usize,
@@ -1181,7 +1166,7 @@ impl FfiUnsignedTransferPczts {
         let items = pairs
             .into_iter()
             .map(|(id, bytes)| {
-                let id = cstring_raw(&u32::from(id).to_string(), "unsigned transfer pczt id")?;
+                let id = u32::from(id);
                 let (pczt, pczt_len) = ptr_from_vec(bytes);
                 Ok(FfiUnsignedTransferPczt { id, pczt, pczt_len })
             })
@@ -1283,15 +1268,9 @@ fn cstring_raw(s: &str, what: &str) -> anyhow::Result<*mut c_char> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_free_migration_state(ptr: *mut FfiMigrationState) {
     if !ptr.is_null() {
-        let boxed = unsafe { Box::from_raw(ptr) };
-        if let FfiMigrationState::RequiresAttention(FfiAttentionReason::InvalidTransfer {
-            transfer_id,
-        }) = &*boxed
-            && !transfer_id.is_null()
-        {
-            unsafe { zcashlc_string_free(*transfer_id) }
-        }
-        drop(boxed);
+        // Every payload is plain data (`InvalidTransfer` carries a `u32` id), so dropping the
+        // box is the whole of the cleanup.
+        drop(unsafe { Box::from_raw(ptr) });
     }
 }
 
@@ -1329,15 +1308,12 @@ pub unsafe extern "C" fn zcashlc_free_migration_note_split_proposal(
 pub unsafe extern "C" fn zcashlc_free_migration_prepared_transfer(ptr: *mut FfiPreparedTransfer) {
     if !ptr.is_null() {
         let boxed = unsafe { Box::from_raw(ptr) };
-        if !boxed.id.is_null() {
-            unsafe { zcashlc_string_free(boxed.id) }
-        }
         free_ptr_from_vec(boxed.pczt, boxed.pczt_len);
         drop(boxed);
     }
 }
 
-/// Frees a [`FfiMigrationSchedule`], including every transfer's id string.
+/// Frees a [`FfiMigrationSchedule`] and its transfer rows.
 ///
 /// # Safety
 /// `ptr` must be null or point to a [`FfiMigrationSchedule`] handed out by this module.
@@ -1345,28 +1321,22 @@ pub unsafe extern "C" fn zcashlc_free_migration_prepared_transfer(ptr: *mut FfiP
 pub unsafe extern "C" fn zcashlc_free_migration_schedule(ptr: *mut FfiMigrationSchedule) {
     if !ptr.is_null() {
         let boxed = unsafe { Box::from_raw(ptr) };
-        free_ptr_from_vec_with(boxed.transfers, boxed.transfers_len, |t| {
-            if !t.id.is_null() {
-                unsafe { zcashlc_string_free(t.id) }
-            }
-        });
+        // Every row is plain data (ids are `u32`), so freeing the row vector is enough.
+        free_ptr_from_vec(boxed.transfers, boxed.transfers_len);
         drop(boxed);
     }
 }
 
 /// Frees a standalone [`FfiTransferProposal`] (as returned by
-/// `zcashlc_migration_pending_transfer_proposal`), including its id string.
+/// `zcashlc_migration_pending_transfer_proposal`).
 ///
 /// # Safety
 /// `ptr` must be null or point to a [`FfiTransferProposal`] handed out by this module.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_free_migration_transfer_proposal(ptr: *mut FfiTransferProposal) {
     if !ptr.is_null() {
-        let boxed = unsafe { Box::from_raw(ptr) };
-        if !boxed.id.is_null() {
-            unsafe { zcashlc_string_free(boxed.id) }
-        }
-        drop(boxed);
+        // The id is a plain `u32`; dropping the box is the whole of the cleanup.
+        drop(unsafe { Box::from_raw(ptr) });
     }
 }
 
@@ -1394,9 +1364,6 @@ pub unsafe extern "C" fn zcashlc_free_migration_unsigned_transfer_pczts(
     if !ptr.is_null() {
         let boxed = unsafe { Box::from_raw(ptr) };
         free_ptr_from_vec_with(boxed.ptr, boxed.len, |u| {
-            if !u.id.is_null() {
-                unsafe { zcashlc_string_free(u.id) }
-            }
             free_ptr_from_vec(u.pczt, u.pczt_len);
         });
         drop(boxed);
@@ -1460,7 +1427,7 @@ fn marshal_state(
         }),
         DerivedState::InvalidTransfer(id) => {
             FfiMigrationState::RequiresAttention(FfiAttentionReason::InvalidTransfer {
-                transfer_id: cstring_raw(&id.to_string(), "attention transfer id")?,
+                transfer_id: id,
             })
         }
         DerivedState::TransferExpired => {
@@ -2003,7 +1970,7 @@ pub unsafe extern "C" fn zcashlc_migration_propose_immediate_transfers(
                     .into_iter()
                     .map(|(id, amount, _, expiry)| {
                         Ok(FfiTransferProposal {
-                            id: cstring_raw(&u32::from(id).to_string(), "transfer proposal id")?,
+                            id: u32::from(id),
                             amount: zat_to_i64(amount),
                             anchor_height: i64::from(u32::from(reference_height)),
                             next_executable_after_height: i64::from(u32::from(reference_height)),
@@ -2178,21 +2145,20 @@ pub unsafe extern "C" fn zcashlc_migration_extract_broadcast_tx(
 /// surfaces `RequiresAttention`.
 ///
 /// # Safety
-/// See [`open`]; `transfer_id` must be a valid C string; for tag 0, `txid_bytes` must be valid
-/// for reads of 32 bytes.
+/// See [`open`]; for tag 0, `txid_bytes` must be valid for reads of 32 bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
     db_data: *const u8,
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    transfer_id: *const c_char,
+    transfer_id: u32,
     result_tag: i32,
     txid_bytes: *const u8,
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let id = transfer_id_from_c(transfer_id)?;
+        let id = MigrationTxId::new(transfer_id);
         match result_tag {
             0 => {
                 if txid_bytes.is_null() {
@@ -2476,7 +2442,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    ids: *const *const c_char,
+    ids: *const u32,
     ids_len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
@@ -2573,7 +2539,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    ids: *const *const c_char,
+    ids: *const u32,
     ids_len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
@@ -2603,20 +2569,20 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
 /// Decode the platform's parallel `(id, pczt)` arrays into owned pairs.
 ///
 /// # Safety
-/// `ids`/`pczts`/`pczt_lens` must be valid for reads of `len` elements; every `ids[i]` must be a
-/// valid C string and every `pczts[i]` valid for `pczt_lens[i]` bytes.
+/// `ids`/`pczts`/`pczt_lens` must be valid for reads of `len` elements, and every `pczts[i]` valid
+/// for `pczt_lens[i]` bytes.
 unsafe fn decode_signed_pairs(
-    ids: *const *const c_char,
+    ids: *const u32,
     len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
 ) -> anyhow::Result<Vec<(MigrationTxId, Vec<u8>)>> {
-    let id_ptrs = unsafe { slice_or_empty(ids, len) };
+    let ids = unsafe { slice_or_empty(ids, len) };
     let pczt_ptrs = unsafe { slice_or_empty(pczts, len) };
     let lens = unsafe { slice_or_empty(pczt_lens, len) };
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
-        let id = transfer_id_from_c(id_ptrs[i])?;
+        let id = MigrationTxId::new(ids[i]);
         if pczt_ptrs[i].is_null() {
             return Err(anyhow!("signed pczt at index {i} is null"));
         }
@@ -2738,7 +2704,7 @@ pub unsafe extern "C" fn zcashlc_migration_keystone_decode_sign_batch_part(
 /// the returned pointer with [`zcashlc_free_migration_unsigned_transfer_pczts`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_keystone_apply_batch_signatures(
-    ids: *const *const c_char,
+    ids: *const u32,
     ids_len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
@@ -3709,10 +3675,7 @@ mod tests {
         );
         assert_eq!(schedule.estimated_duration_hours, 0);
         let row = unsafe { &*schedule.transfers };
-        let row_id = unsafe { CStr::from_ptr(row.id) }
-            .to_str()
-            .expect("the row id is UTF-8");
-        assert_eq!(row_id, "0", "the stored transfer's engine id");
+        assert_eq!(row.id, 0, "the stored transfer's engine id");
         // The state-side amount is what the transfer CROSSES: the fixture's funding note is
         // 100_010_000 (crossing 100_000_000 plus the 10_000 fee buffer), and the row serves the
         // crossing. The consent echo compares the same value (`expected_rows_from_state` uses the
