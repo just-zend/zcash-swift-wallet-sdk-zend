@@ -6,6 +6,22 @@ information stored.
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
 track failures on its own. Wallet developers would have to account for those.
 
+## The shielded voting API is removed
+
+The shielded voting API is removed: `VotingRustBackend`, the `Voting*` types,
+`PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe`, and the
+`zcashlc_voting_*` FFI symbols are gone. `zcash_voting` cannot resolve against the
+Ironwood `orchard` release, so voting is not shipped on this line (matching the
+Android SDK). Wallet developers using any of these types must remove those calls.
+
+## `AccountBalance` gained an Ironwood pool
+
+`AccountBalance` gains an `ironwoodBalance` pool for the Ironwood (NU6.3) shielded
+protocol. The initializer's new `ironwoodBalance` parameter defaults to `.zero`, so
+existing call sites keep compiling; code that reconstructs an `AccountBalance` from
+its fields should carry the new pool, and any exhaustive handling of the shielded
+pools should account for it. The value stays zero until NU6.3 activates.
+
 ## `Broadcaster` redesign (multi-server submission)
 
 The `Broadcaster` API introduced in the 2.6.0-alpha tags has changed:

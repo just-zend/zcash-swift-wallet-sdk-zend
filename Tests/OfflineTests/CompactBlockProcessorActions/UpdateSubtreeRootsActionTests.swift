@@ -72,6 +72,7 @@ final class UpdateSubtreeRootsActionTests: ZcashTestCase {
 
         tupple.rustBackendMock.putSaplingSubtreeRootsStartIndexRootsClosure = { _, _ in }
         tupple.rustBackendMock.putOrchardSubtreeRootsStartIndexRootsClosure = { _, _ in }
+        tupple.rustBackendMock.putIronwoodSubtreeRootsStartIndexRootsClosure = { _, _ in }
 
         do {
             let context = ActionContextMock.default()
@@ -79,7 +80,7 @@ final class UpdateSubtreeRootsActionTests: ZcashTestCase {
             let nextContext = try await updateSubtreeRootsActionAction.run(with: context) { _ in }
 
             let acResult = nextContext.checkStateIs(.updateChainTip)
-            XCTAssertTrue(acResult == .called(2), "Check of state failed with '\(acResult)'")
+            XCTAssertTrue(acResult == .called(3), "Check of state failed with '\(acResult)'")
         } catch {
             XCTFail("testUpdateSubtreeRootsAction_RootsAvailablePutRootsSuccess is not expected to fail. \(error)")
         }
@@ -144,6 +145,38 @@ final class UpdateSubtreeRootsActionTests: ZcashTestCase {
             // this is expected result of this test
         } catch {
             XCTFail("testUpdateSubtreeRootsAction_RootsAvailablePutRootsFailure is not expected to fail. \(error)")
+        }
+    }
+
+    func testUpdateSubtreeRootsAction_RootsAvailablePutIronwoodRootsFailure() async throws {
+        let loggerMock = LoggerMock()
+
+        loggerMock.infoFileFunctionLineClosure = { _, _, _, _ in }
+        loggerMock.debugFileFunctionLineClosure = { _, _, _, _ in }
+
+        let tupple = setupAction(loggerMock)
+        let updateSubtreeRootsActionAction = tupple.action
+        tupple.serviceMock.getSubtreeRootsModeClosure = { _, _ in
+            AsyncThrowingStream { continuation in
+                continuation.yield(SubtreeRoot())
+                continuation.finish()
+            }
+        }
+
+        tupple.rustBackendMock.putSaplingSubtreeRootsStartIndexRootsClosure = { _, _ in }
+        tupple.rustBackendMock.putOrchardSubtreeRootsStartIndexRootsClosure = { _, _ in }
+        tupple.rustBackendMock.putIronwoodSubtreeRootsStartIndexRootsThrowableError = "putIronwoodFailed"
+
+        do {
+            let context = ActionContextMock.default()
+
+            _ = try await updateSubtreeRootsActionAction.run(with: context) { _ in }
+
+            XCTFail("updateSubtreeRootsActionAction.run(with:) is excpected to fail but didn't.")
+        } catch ZcashError.compactBlockProcessorPutIronwoodSubtreeRoots {
+            // this is expected result of this test
+        } catch {
+            XCTFail("testUpdateSubtreeRootsAction_RootsAvailablePutIronwoodRootsFailure is not expected to fail. \(error)")
         }
     }
 

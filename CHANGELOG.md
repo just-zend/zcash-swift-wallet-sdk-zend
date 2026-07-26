@@ -9,8 +9,63 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Changed
 - `Initializer.initialize` / `Synchronizer.prepare` now return `InitializationResult.seedNotRelevant` instead of silently proceeding when the rust layer reports the provided seed is not relevant to the wallet database (breaking change: `InitializationResult` gained a new case, so exhaustive switches over it must add a case; see MIGRATING.md). Previously this case was indistinguishable from `.success`: account creation was skipped (accounts already existed) and callers proceeded as if they had prepared the wallet they expected, even when the database on disk belonged to a different wallet than the provided seed (e.g. a device-backup restore that brings back `data.db` without the matching keychain seed). Callers must now handle `.seedNotRelevant` the same way they already handle `.seedRequired`. (MOB-1512)
 
+- The lightwalletd protobuf definitions (`compact_formats.proto`,
+  `service.proto`) are now vendored from
+  https://github.com/zcash/lightwallet-protocol as a git subtree under
+  `lightwallet-protocol/`, currently at v0.5.0, and the generated Swift
+  sources have been regenerated from it. Future updates should use
+  `Scripts/update-lightwallet-protocol.sh <ref>`, which pulls the subtree and
+  regenerates the sources (a nix dev shell providing `protoc` is available
+  via the new `flake.nix`). Protocol v0.5.0 renames `CompactTx.hash` to
+  `CompactTx.txid`, removes `CompactTx.protoVersion`, and adds transparent
+  `vin`/`vout` data, the `PoolType` enum, `BlockRange.poolTypes`, and new
+  `LightdInfo` fields; these generated types are internal to the SDK, so the
+  public API is unchanged.
+- Transparent-address transaction enhancement now uses the
+  `GetTaddressTransactions` RPC in place of the deprecated (and otherwise
+  identical) `GetTaddressTxids`, so it requires a lightwalletd new enough to
+  serve lightwallet-protocol v0.3.6 (lightwalletd v0.4.18, 2025-05) or newer.
+  The public `ZcashError.serviceGetTaddressTxidsFailed` case is unchanged
+  aside from its message text.
+
 ## Fixed
 - Tor-layer errors (`rustTorConnectToLightwalletd`, `rustTorLwdGetInfo`, `rustTorLwdSubmit`, `rustTorLwdFetchTransaction`, `rustTorLwdLatestBlockHeight`, `rustTorLwdGetTreeState`) are now classified as retryable service errors in `CompactBlockProcessor`. Previously these errors bypassed the service-error retry path and went straight to a fatal sync failure, so a transient Tor circuit/stream issue (e.g. "remote hostname lookup failure", "Failed to obtain exit circuit for ports", "Tor network protocol violation") required a full app restart to recover. They now trigger the same reset-and-retry behavior (including tearing down cached Tor connections via `service.closeConnections()`) as other transport errors, up to `ZcashSDK.serviceFailureRetries` times.
+
+## Removed
+- The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
+  `PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe`, and the
+  `zcashlc_voting_*` FFI) has been removed, as it was on the 2.7.0-rc.1 release.
+  `zcash_voting` cannot resolve against the Ironwood `orchard` release, so voting
+  is not shipped until the voting crates support it. See MIGRATING.md.
+
+# 2.7.0-rc.1 - 2026-07-25
+
+## Added
+- Ironwood (NU6.3) receive/sync readiness. `AccountBalance.ironwoodBalance`
+  exposes the Ironwood (Orchard note-version V3) pool balance alongside sapling
+  and orchard (masked with them while the chain tip is stale). The lightwalletd
+  protocol gains the Ironwood fields (`CompactTx.ironwoodActions`,
+  `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
+  `ShieldedProtocol.ironwood`); `UpdateSubtreeRootsAction` fetches and stores
+  Ironwood subtree roots (best-effort, skipping when the server does not serve
+  them); and checkpoints can carry an `ironwoodTree` state. The path is dormant
+  until NU6.3 activates and a lightwalletd serves the fields.
+
+## Changed
+- Bumped the Rust dependency stack to the Ironwood (NU6.3) crates.io releases
+  (`orchard` 0.13→0.15, `zcash_client_backend` 0.23→0.24.0-rc.1,
+  `zcash_client_sqlite` 0.21→0.22.0-rc.1, `zcash_primitives`/`zcash_proofs`
+  0.28→0.29, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
+  `zcash_transparent` 0.8→0.9, `pczt` 0.7→0.8.0-rc.1, `zcash_keys` 0.14→0.15)
+  and dropped the `[patch.crates-io]` git overrides, matching the Android SDK's
+  2.5.x dependency set. `addProofsToPCZT` now also proves Ironwood bundles.
+
+## Removed
+- The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
+  `PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe`, and the
+  `zcashlc_voting_*` FFI). `zcash_voting` cannot resolve against the Ironwood
+  `orchard` release, so voting is not shipped on the 2.5.x line, matching the
+  Android SDK.
 
 # 2.6.0-alpha.6
 
@@ -89,7 +144,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4010000.json
 ...
 Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4030000.json
 ````
-
 # 2.5.1 - 2026-05-14
 
 ## Fixed
@@ -1038,7 +1092,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2450000.json
 Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2472500.json
 ````
 
-
 Testnet
 
 ````
@@ -1090,7 +1143,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2430000.json
 Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2447500.json
 ````
 
-
 Testnet
 
 ````
@@ -1130,7 +1182,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2402500.json
 ...
 Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2427500.json
 ````
-
 
 Testnet
 
@@ -1218,7 +1269,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2332500.json
 Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2382500.json
 ````
 
-
 Testnet
 
 ````
@@ -1262,7 +1312,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2270000.json
 Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2327500.json
 ````
 
-
 Testnet
 
 ````
@@ -1291,14 +1340,12 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2250000.json
 Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2267500.json
 ````
 
-
 Testnet
 
 ````
 Sources/ZcashLightClientKit/Resources/checkpoints/testnet/2540000.json
 Sources/ZcashLightClientKit/Resources/checkpoints/testnet/2550000.json
 ````
-
 
 # 2.0.2 - 2023-10-12
 
@@ -1390,7 +1437,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2085000.json
 Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2087500.json
 Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2090000.json
 ````
-
 
 Testnet
 
@@ -1610,7 +1656,6 @@ These methods are now async:
 
 `Initializer` no longer have methods to get balance. Use `SDKSynchronizer` (or it's alternative APIs) to get balance.
 
-
 # 0.20.0-beta
 
 ## Checkpoints:
@@ -1725,7 +1770,6 @@ documentation in the code to get more information.
 - Constructor of the `SDKSynchronizer` no longer throws exception.
 - Any value emitted from `lastState` stream before `SDKSynchronizer.prepare` is called has `latestScannedHeight` set to 0.
 - `Initializer.initialize` function isn't public anymore. To initialize SDK call `SDKSynchronizer.prepare` instead.
-
 
 # 0.19.1-beta
 
@@ -1911,7 +1955,6 @@ and SWIFT-NIO are. We don't have much of a choice.
 We've been communicating this for a long time. Although, if you really need Cocoapods,
 please let us know by opening an issue in our repo and we'll talk about it.
 
-
 ### Checkpoints added
 
 Mainnet
@@ -1964,7 +2007,6 @@ the `SDKSynchronizer` has now new methods to fetch those:
 
 ## CompactBlockProcessor is now internal
 ### [#671] Make CompactBlockProcessor Internal.
-
 
 The CompactBlockProcessor is no longer a public class/API. Any direct access will
 end up as a compiler error. Recommended way how to handle things is via `SDKSynchronizer`

@@ -434,12 +434,12 @@ class LightWalletGRPCService: LightWalletService {
         return try await compactTxStreamer.getTreeState(id)
     }
 
-    func getTaddressTxids(_ request: TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error> {
+    func getTaddressTransactions(_ request: TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error> {
         guard mode == .direct else {
             throw ZcashError.grpcServiceCalledWithTorMode
         }
 
-        let stream = compactTxStreamer.getTaddressTxids(
+        let stream = compactTxStreamer.getTaddressTransactions(
             request,
             callOptions: Self.callOptions(timeLimit: self.streamingCallTimeout)
         )
