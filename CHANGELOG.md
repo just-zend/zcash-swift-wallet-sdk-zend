@@ -29,13 +29,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message text.
 
 ## Fixed
-- Redacting a PCZT for an external signer now delegates to
-  `zcash_client_backend`'s `redact_pczt_for_signer` instead of a hand-rolled
-  reimplementation. This redacts the Ironwood bundle, which the previous
-  implementation left untouched — exposing its Merkle witnesses and wallet
-  output metadata to the signer — and additionally clears zk-proofs, binding
-  signature keys, dummy spend keys, and v6 anchors that the previous
-  implementation did not.
+- Redacting a PCZT for an external signer now requests
+  `zcash_client_backend`'s full (non-compacted) signer view, and the PCZT
+  encoding sent to the signer is the minimal version capable of representing
+  its content (v1 for v5 transactions). The compact signer view previously
+  adopted here requires receiver capabilities (v2 PCZT encoding,
+  compact-field resolution) that deployed hardware-signer firmware does not
+  provide in its ordinary signing flow, causing Keystone sends to fail at
+  finalization with a missing-signature error. The Ironwood bundle redaction
+  is preserved: the full view clears Ironwood spend witnesses and output
+  metadata alongside the other bundles.
 - Send-max proposals now spend from the Ironwood pool in addition to Sapling
   and Orchard, so a post-NU6.3 wallet's Ironwood funds are no longer silently
   excluded from a send-max. This affects only the general send-max proposal;
