@@ -24,7 +24,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-REPO_URL="git@github.com:zcash/lightwallet-protocol.git"
+REPO_URL="https://github.com/zcash/lightwallet-protocol.git"
 PREFIX="lightwallet-protocol"
 PROTO_DIR="$PREFIX/walletrpc"
 OUT_DIR="Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf"
