@@ -100,7 +100,7 @@ Generated files and `Tests/` are excluded from the main `.swiftlint.yml` (tests 
 - **String building**: use interpolation, not `+` concatenation (SwiftLint `string_concatenation` is severity `error`).
 - **TODOs**: format as `TODO: [#<issue_number>] ...` — bare `TODO:`/`FIXME:` warn.
 - **SwiftLint disables**: only the exceptions listed in `SWIFTLINT.md` are permitted, always scoped with `// swiftlint:disable:next` / `disable:previous` / region blocks.
-- **Commits and PRs**: every PR must reference an issue. Commit title format is `[#<issue_number>] <self-descriptive title>` (see `CONTRIBUTING.md`). PRs are typically squash-merged.
+- **Commits and PRs**: every PR must reference an issue. Commit title format is `[#<issue_number>] <self-descriptive title>` (see `CONTRIBUTING.md`). PRs are always landed with a merge commit, never squash-merged; keep branch commits tidy and self-contained.
 - **Breaking API changes**: document them in `MIGRATING.md`, and add a `CHANGELOG.md` entry for every user-visible change.
 - **Main branch policy**: `main` is development-stable (all merges build + tests pass) but clients must depend on published tags, never on `main`.
 - **Sync concurrency**: `CompactBlockProcessor` is a Swift actor. Callers without structured concurrency should hop to `@MainActor` contexts rather than blocking.

@@ -92,9 +92,10 @@ issue following the criteria described in the preceding sections.
 Every contribution must reference an existing Issue. This issue is important
 since it will be directly referenced in the title of your commit.
 
-Although we prefer small PR's. We encourage our contributors to use Squash
-commits extensively. Maintainers prefer avoiding _merge commits_ when possible.
-It is very much likely that _if accepted_, your contribution will be _squash merged_.
+We prefer small PR's, and PRs are always landed with a _merge commit_ —
+never squash-merged or rebased — so the branch's commits enter history
+exactly as reviewed. Because of this, we encourage contributors to squash
+their own work into a tidy series of self-contained commits before review.
 
 When squashing commits, use your best judgement. In some situations, a refactoring may
 be done before actual behavior changes are implemented. It is reasonable to keep such
