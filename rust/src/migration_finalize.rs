@@ -1,9 +1,13 @@
-//! Prove-at-broadcast-time support for the migration engine (ZIP 374 deferred anchor/witness).
+//! Prove-when-provable support for the migration engine (ZIP 374 deferred anchor/witness).
 //!
 //! The engine (`zcash_pool_migration`) commits every migration transaction fully built and
 //! signed, with its Orchard spend witnesses and anchors left unset — the durable artifact in
-//! `MigrationTransaction::pczt()` never changes after commit. At proving time this module routes
-//! each due transaction through the UPSTREAM prover: [`prove_due_transaction`] dispatches on the
+//! `MigrationTransaction::pczt()` never changes after commit. A transaction's anchor becomes
+//! resolvable long before its broadcast schedule arrives, and upstream separates the two selectors
+//! (`next_provable` / `next_broadcastable`) precisely so proving can happen in that window:
+//! `crate::migration`'s sweep proves opportunistically as the wallet scans, and the delivery lane
+//! only ever broadcasts what is already proved. This module is the proving step itself, routing
+//! each transaction through the UPSTREAM prover: [`prove_due_transaction`] dispatches on the
 //! transaction's kind into `engine::prove_transfer` / `engine::prove_preparation`, which drive a
 //! [`MigrationProver`] (in production the crate's own `wallet::WalletMigrationProver`, borrowing
 //! this SDK's wallet mutably for commitment-tree access) to install the real anchors and
@@ -17,15 +21,21 @@
 //!   (`MigrationTransaction::anchor_boundary()`): `engine::prove_transfer` reads the persisted
 //!   boundary and hands it to the prover, so transfers cluster into ZIP 318 anchor cohorts
 //!   instead of timestamping the wallet's recent activity with a fresh anchor. A transfer with no
-//!   stored boundary is a corrupt store and a HARD error — never a fallback to the natural
+//!   stored boundary is a corrupt store and a HARD error — never a fallback to the preparation
 //!   anchor. Boundary checkpoints stay durably witnessable because upstream anchor-checkpoint
 //!   retention (active from NU6.3 activation) keeps every boundary of the wallet's anchor
 //!   retention interval — necessarily the same grid the engine draws boundaries on, since the
 //!   engine reads that interval back off the wallet. [`crate::anchor_retention_interval`] is where
 //!   the SDK selects it per network.
-//! - PREPARATIONS carry no drawn boundary (they anchor to their already-mined dependencies, not
-//!   to a bucketed boundary) and prove against the wallet's current natural anchor
-//!   ([`natural_anchor_height`]) via `engine::prove_preparation`.
+//! - PREPARATIONS carry no drawn boundary and prove against the wallet's scanned tip
+//!   ([`preparation_anchor_height`]) via `engine::prove_preparation`, which is why that anchor is
+//!   supplied by this caller rather than read off the row. Anchoring at the tip is correct for
+//!   them: a preparation is a shielded self-send within the source pool that reveals no balance
+//!   and no pool crossing, so its anchor leaks nothing a migration participant needs hidden.
+//!   Bucketing is what pool-CROSSING transfers need, and only they carry a drawn boundary;
+//!   upstream deliberately keeps preparations off the bucket grid (they need only temporal
+//!   serialization behind their mined dependencies) because waiting for a boundary would add a
+//!   full bucket to every preparation layer.
 //!
 //! # Transient vs hard failures
 //!
@@ -50,7 +60,7 @@ use crate::migration_engine::MigrationWallet;
 /// sends use, via `get_target_and_anchor_heights`) — NOT "chain tip minus one", which is not
 /// necessarily checkpointed. Preparation transactions prove against this height; transfers never
 /// use it (they prove against their persisted boundary).
-pub(crate) fn natural_anchor_height(wallet: &MigrationWallet) -> anyhow::Result<BlockHeight> {
+pub(crate) fn preparation_anchor_height(wallet: &MigrationWallet) -> anyhow::Result<BlockHeight> {
     wallet
         .get_target_and_anchor_heights(std::num::NonZeroU32::MIN)
         .map_err(|e| anyhow!("anchor height lookup failed: {e}"))?
@@ -92,12 +102,12 @@ impl<TE, NE, RE> ProveErrorClass for WalletProveError<TE, NE, RE> {
 /// Proves ONE due, `Signed` migration transaction through the upstream engine, dispatching on its
 /// kind: a TRANSFER via [`engine::prove_transfer`] (the anchor comes from the transfer's
 /// persisted `anchor_boundary()`; a missing boundary is a corrupt store and a hard error), a
-/// PREPARATION via [`engine::prove_preparation`] with the caller-resolved `natural_anchor`. On
+/// PREPARATION via [`engine::prove_preparation`] with the caller-resolved `preparation_anchor`. On
 /// success the engine has stored the proven bytes into `state` (`Signed -> Proved` via
 /// `set_transaction_proved`); the caller persists `state` and re-reads the proven PCZT from it.
 ///
-/// `natural_anchor` is `Option`al because only a PREPARATION uses it — the caller resolves it
-/// lazily, per kind, so proving a transfer never depends on the natural anchor being resolvable
+/// `preparation_anchor` is `Option`al because only a PREPARATION uses it — the caller resolves it
+/// lazily, per kind, so proving a transfer never depends on the preparation anchor being resolvable
 /// (a wallet with a chain tip but no scanned blocks yet has none, and must still prove transfers
 /// against their persisted boundaries). A preparation reaching this function without one is a
 /// caller bug, surfaced as a hard error rather than a silent wrong anchor.
@@ -114,7 +124,7 @@ pub(crate) fn prove_due_transaction<P>(
     prover: &mut P,
     state: &mut MigrationState,
     id: MigrationTransferId,
-    natural_anchor: Option<BlockHeight>,
+    preparation_anchor: Option<BlockHeight>,
 ) -> anyhow::Result<Option<()>>
 where
     P: MigrationProver,
@@ -134,9 +144,9 @@ where
     let result = match kind {
         MigrationTxKind::Transfer { .. } => engine::prove_transfer(prover, state, id),
         MigrationTxKind::Preparation { .. } => {
-            let anchor = natural_anchor.ok_or_else(|| {
+            let anchor = preparation_anchor.ok_or_else(|| {
                 proving_unavailable(format!(
-                    "internal error: no natural anchor was resolved for preparation transaction {}",
+                    "internal error: no preparation anchor was resolved for preparation transaction {}",
                     u32::from(id)
                 ))
             })?;

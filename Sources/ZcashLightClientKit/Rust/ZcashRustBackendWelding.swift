@@ -551,9 +551,26 @@ protocol ZcashRustBackendWelding {
         for account: AccountUUID
     ) async throws
 
-    /// The next height-due pre-signed transfer, or `nil` when nothing is currently due.
+    /// Proves every migration transaction whose anchor the wallet can resolve right now,
+    /// persisting each proof, and returns how many were proved (`0` is the ordinary "nothing left
+    /// to prove" answer).
+    ///
+    /// Call this as the wallet scans, NOT when about to broadcast: a transaction's anchor becomes
+    /// witnessable long before its broadcast schedule arrives, and proving is expensive, so the
+    /// work belongs in the sync path. `migrationNextDueTransfer` deliberately does no proving, and
+    /// reports `.awaitingProof` for a due transaction whose proof has not been produced yet.
+    ///
+    /// A transaction the wallet cannot prove yet (its anchor not scanned/retained) is skipped and
+    /// retried by a later call, so this is safe to run on any schedule, including mid-sync.
+    /// - Throws: `migrationProvingUnavailable` when proving fails for a non-transient reason;
+    ///   `rustMigrationProvePending` for other rust-layer errors.
+    func migrationProvePending(for account: AccountUUID) async throws -> Int
+
+    /// The next height-due pre-signed transfer, if one is both due and already proved — see
+    /// `DueMigrationTransfer` for the three outcomes. Never proves; run `migrationProvePending`
+    /// for that.
     /// - Throws: `rustMigrationNextDueTransfer` if the rust layer returns an error.
-    func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedMigrationTransfer?
+    func migrationNextDueTransfer(for account: AccountUUID) async throws -> DueMigrationTransfer
 
     /// The next height-due scheduled transfer's full proposal (amount, anchor, timing) for the
     /// active run, or `nil` when nothing is currently pending (no active run, or only the note-split

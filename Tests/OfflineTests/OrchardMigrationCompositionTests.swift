@@ -151,7 +151,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     // MARK: - executeNextPendingTransfer composition
 
     func testExecuteNextPendingTransferReturnsNilWhenNothingDueWithNoBroadcastNoRecordNoGateChange() async throws {
-        welding.migrationNextDueTransferForReturnValue = nil
+        welding.migrationNextDueTransferForReturnValue = .nothingDue
         let broadcaster = ScriptedBroadcaster(script: .throwing(StubEngineError()))
         let migration = makeMigration(broadcaster: broadcaster)
 
@@ -165,7 +165,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
     func testExecuteNextPendingTransferSuccessPathRecordsAndMarksGate() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationNextDueTransferForReturnValue = prepared
+        welding.migrationNextDueTransferForReturnValue = .ready(prepared)
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
@@ -185,7 +185,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// composition level -- not just the pure `map` table already covered by MigrationLogicTests.
     func testExecuteNextPendingTransferInvalidNoteRejectionRecordsAndLeavesGateUntouched() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationNextDueTransferForReturnValue = prepared
+        welding.migrationNextDueTransferForReturnValue = .ready(prepared)
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.rejected(errorCode: -25, message: "missing inputs")))
@@ -204,7 +204,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// M5: seam-based coverage of the rejection branch's expiry message, at the composition level.
     func testExecuteNextPendingTransferExpiredRejectionRecordsAndLeavesGateUntouched() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationNextDueTransferForReturnValue = prepared
+        welding.migrationNextDueTransferForReturnValue = .ready(prepared)
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.rejected(errorCode: -26, message: "tx-expiring-soon")))
@@ -224,7 +224,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// submission endpoint.
     func testBroadcasterReceivesExactlyOneCallToTheResolvedEndpoint() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationNextDueTransferForReturnValue = prepared
+        welding.migrationNextDueTransferForReturnValue = .ready(prepared)
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let overrideEndpoint = LightWalletEndpoint(address: "override.example", port: 443)
@@ -258,7 +258,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let rawTxId: [UInt8] = (0..<32).map { UInt8($0) }
         let expectedDisplayTxId = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
         let prepared = PreparedMigrationTransfer(id: 1, txid: Data(rawTxId), pczt: Data([0x01, 0x02]))
-        welding.migrationNextDueTransferForReturnValue = prepared
+        welding.migrationNextDueTransferForReturnValue = .ready(prepared)
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
@@ -281,7 +281,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// `migrationRecordFailedAfterBroadcast` so the host knows the engine reconciles later.
     func testExecuteNextPendingTransferRecordThrowAfterSuccessfulBroadcastMarksGateAndThrowsWrapped() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationNextDueTransferForReturnValue = prepared
+        welding.migrationNextDueTransferForReturnValue = .ready(prepared)
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
@@ -330,7 +330,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// record-failed-after-broadcast contract is reserved for outcomes that map to success.
     func testExecuteNextPendingTransferRecordThrowOnTransportErrorPropagatesRawAndLeavesGateUntouched() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationNextDueTransferForReturnValue = prepared
+        welding.migrationNextDueTransferForReturnValue = .ready(prepared)
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
@@ -360,7 +360,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForClosure = { [welding] _ in
             // The engine contract: the transfer stays "next due" until its result is recorded.
-            welding?.migrationRecordTransferResultTransferIdResultForCalled == true ? nil : prepared
+            welding?.migrationRecordTransferResultTransferIdResultForCalled == true ? .nothingDue : .ready(prepared)
         }
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
@@ -405,7 +405,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let splitTransfer = makePreparedTransfer(id: 0)
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         welding.migrationNextDueTransferForClosure = { [welding] _ in
-            welding?.migrationRecordTransferResultTransferIdResultForCalled == true ? nil : dueTransfer
+            welding?.migrationRecordTransferResultTransferIdResultForCalled == true ? .nothingDue : .ready(dueTransfer)
         }
         welding.migrationSignNoteSplitProposalUskForClosure = { _, _, _ in
             recorder.record("sign")
@@ -458,7 +458,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testKeystoneFlowStoreSignedNoteSplitPCZTsThenExecuteNextBroadcastsThePrepTransfer() async throws {
         let prepTransfer = makePreparedTransfer(id: 0)
         welding.migrationStoreSignedNoteSplitPcztsForReturnValue = prepTransfer
-        welding.migrationNextDueTransferForReturnValue = prepTransfer
+        welding.migrationNextDueTransferForReturnValue = .ready(prepTransfer)
         welding.migrationExtractBroadcastTxPcztForClosure = { pczt, _ in
             XCTAssertEqual(pczt, prepTransfer.pczt)
             return Data([0x0A])

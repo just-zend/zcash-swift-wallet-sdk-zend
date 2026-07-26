@@ -976,7 +976,7 @@ final class MigrationLogicTests: ZcashTestCase {
             pczt: Data([0x01, 0x02])
         )
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationNextDueTransferForReturnValue = prepared
+        welding.migrationNextDueTransferForReturnValue = .ready(prepared)
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x03, 0x04])
         // A no-op closure: if the fail-closed guard regresses and this ends up called anyway, it
         // completes instead of crashing the process, so the call-count assertion below fails cleanly

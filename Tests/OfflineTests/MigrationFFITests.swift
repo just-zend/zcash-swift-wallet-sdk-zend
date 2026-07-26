@@ -106,7 +106,15 @@ final class MigrationFFITests: XCTestCase {
 
     func testFreshWalletHasNoNextDueTransfer() async throws {
         let nextDue = try await rustBackend.migrationNextDueTransfer(for: account)
-        XCTAssertNil(nextDue)
+        XCTAssertEqual(nextDue, .nothingDue)
+    }
+
+    /// The proving sweep is safe to run against a wallet with no migration run at all: there is
+    /// nothing to prove, which is the benign `0` — not a throw. This is what lets a host call it
+    /// unconditionally from its sync path without first asking whether a migration exists.
+    func testFreshWalletProvePendingProvesNothing() async throws {
+        let proved = try await rustBackend.migrationProvePending(for: account)
+        XCTAssertEqual(proved, 0)
     }
 
     /// Unlike `isNoteSplitNeeded`/`residualAfterMigration` (which read the spendable Orchard balance
@@ -416,10 +424,19 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertEqual(first, second)
     }
 
-    func testMigrationNextDueTransferNilIsStableAcrossRepeatedCalls() async throws {
+    func testMigrationNextDueTransferNothingDueIsStableAcrossRepeatedCalls() async throws {
         let first = try await rustBackend.migrationNextDueTransfer(for: account)
         let second = try await rustBackend.migrationNextDueTransfer(for: account)
-        XCTAssertNil(first)
+        XCTAssertEqual(first, .nothingDue)
+        XCTAssertEqual(first, second)
+    }
+
+    /// The sweep is idempotent on a wallet with nothing to prove: no accumulating side effect, so
+    /// a host may call it on every scan pass.
+    func testMigrationProvePendingIsStableAcrossRepeatedCalls() async throws {
+        let first = try await rustBackend.migrationProvePending(for: account)
+        let second = try await rustBackend.migrationProvePending(for: account)
+        XCTAssertEqual(first, 0)
         XCTAssertEqual(first, second)
     }
 

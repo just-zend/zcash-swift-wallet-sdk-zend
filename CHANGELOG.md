@@ -50,14 +50,20 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   `MigrationTransferProposal`, `MigrationTransferResult`, `MigrationRunEstimate` (and its
   `MigrationRunEstimate.Run`), `NoteSplitProposal`, `PreparedMigrationTransfer`,
   `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`, `MigrationTransactionStatus`,
-  `KeystoneBatchDecodeResult`, and `KeystoneFirmwareVersion`.
+  `DueMigrationTransfer`, `KeystoneBatchDecodeResult`, and `KeystoneFirmwareVersion`.
+- `DueMigrationTransfer` is what the delivery lane answers with: `.nothingDue`, `.ready` (a proven
+  transaction to broadcast), or `.awaitingProof` (a transaction is due but its proof has not been
+  produced yet). Proving is opportunistic and belongs to the sync path — a transaction's anchor
+  becomes witnessable long before its broadcast schedule arrives — so proofs are produced by a
+  separate sweep as blocks are scanned, and broadcasting stays a pure delivery step that never
+  proves.
 - Migration transaction ids are `UInt32` (the engine's own id type) rather than decimal strings,
   across `MigrationTransferProposal`, `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`,
   `MigrationSignedTransferPczt`, `MigrationAttentionReason.invalidTransfer`, and
   `migrationRecordTransferResult(transferId:result:for:)`.
 - These are the value types the `Synchronizer` migration group below produces and consumes.
 - New `ZcashError` cases for the migration surface: `ZRUST0098`–`ZRUST0106`, `ZRUST0108`, and
-  `ZRUST0111`–`ZRUST0138` (`ZRUST0107` was retired with the engine-backed immediate lane; see
+  `ZRUST0111`–`ZRUST0140` (`ZRUST0107` was retired with the engine-backed immediate lane; see
   `## Changed`).
 
 ### Orchard → Ironwood migration (`Synchronizer` surface)

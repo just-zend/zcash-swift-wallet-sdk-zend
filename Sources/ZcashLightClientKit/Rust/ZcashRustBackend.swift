@@ -1811,7 +1811,32 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedMigrationTransfer? {
+    func migrationProvePending(for account: AccountUUID) async throws -> Int {
+        // Unlike the ambiguous sentinels above, `-1` is never a legitimate count, so the return
+        // value alone decides success. The last-error is still cleared first so the message this
+        // reads on failure cannot be a leftover from an earlier call.
+        zcashlc_clear_last_error()
+
+        let proved = zcashlc_migration_prove_pending(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId
+        )
+
+        // `-1` is the error sentinel; every non-negative value is a legitimate count.
+        guard proved >= 0 else {
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationProvePending` failed with unknown error"),
+                fallback: ZcashError.rustMigrationProvePending
+            )
+        }
+
+        return Int(proved)
+    }
+
+    @DBActor
+    func migrationNextDueTransfer(for account: AccountUUID) async throws -> DueMigrationTransfer {
         let preparedPtr = zcashlc_migration_next_due_transfer(
             dbData.0,
             dbData.1,
@@ -1828,7 +1853,13 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         defer { zcashlc_free_migration_prepared_transfer(preparedPtr) }
 
-        return preparedPtr.pointee.unsafeToPreparedMigrationTransfer()
+        guard let due = preparedPtr.pointee.unsafeToDueMigrationTransfer() else {
+            throw ZcashError.rustMigrationNextDueTransfer(
+                lastErrorMessage(fallback: "`migrationNextDueTransfer` returned a malformed outcome")
+            )
+        }
+
+        return due
     }
 
     @DBActor
@@ -2782,8 +2813,9 @@ extension FfiNoteSplitProposal {
 }
 
 extension FfiPreparedTransfer {
-    /// Converts an [`FfiPreparedTransfer`] into a [`PreparedMigrationTransfer`], or `nil` for the
-    /// "nothing due" sentinel (a null `pczt`, whose `id` is meaningless).
+    /// Converts an [`FfiPreparedTransfer`] into a [`PreparedMigrationTransfer`], or `nil` when it
+    /// carries no broadcastable artifact (a null `pczt` — the "nothing due" sentinel and the
+    /// "awaiting proof" outcome both have one; their `id` is meaningless).
     func unsafeToPreparedMigrationTransfer() -> PreparedMigrationTransfer? {
         guard let pcztPtr = pczt else {
             return nil
@@ -2794,6 +2826,22 @@ extension FfiPreparedTransfer {
             txid: Data(FfiTxId(tuple: txid).array),
             pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
         )
+    }
+
+    /// Converts an [`FfiPreparedTransfer`] into the delivery lane's three-way outcome, or `nil`
+    /// when the rust side reported a status whose payload is malformed (a `Ready` without an
+    /// artifact, or an `AwaitingProof` without an id — should not happen; defensive only).
+    func unsafeToDueMigrationTransfer() -> DueMigrationTransfer? {
+        switch status {
+        case MigrationNothingDue:
+            return .nothingDue
+        case MigrationReady:
+            return unsafeToPreparedMigrationTransfer().map { .ready($0) }
+        case MigrationAwaitingProof:
+            return .awaitingProof(id: id)
+        default:
+            return nil
+        }
     }
 }
 

@@ -15,7 +15,7 @@
 //! witnesses needs mutable access to the wallet's note commitment tree, which the shared borrow
 //! this adapter holds cannot provide. The proving entry points instead construct the upstream
 //! `wallet::WalletMigrationProver` over a separate mutable wallet borrow, dispatched per
-//! transaction kind (boundary anchor for transfers, natural anchor for preparations) in
+//! transaction kind (boundary anchor for transfers, preparation anchor for preparations) in
 //! [`crate::migration_finalize`].
 
 use anyhow::anyhow;
