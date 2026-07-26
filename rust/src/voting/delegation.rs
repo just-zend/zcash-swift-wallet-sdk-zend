@@ -20,6 +20,7 @@ use super::db::VotingDatabaseHandle;
 use super::ffi_types::{FfiBundleSetupResult, FfiVotingHotkey};
 use super::helpers::{
     bytes_from_ptr, json_to_boxed_slice, open_wallet_db, str_from_ptr, voting_hotkey_to_ffi,
+    voting_network,
 };
 use super::json::{
     JsonDelegationPirPrecomputeResult, JsonDelegationProofResult, JsonDelegationSubmission,
@@ -60,30 +61,26 @@ fn validate_cached_tree_state_for_round(
 // VotingDatabase methods — Delegation proof
 // =============================================================================
 
-/// Generate a voting hotkey.
+/// Generate a new voting hotkey for `network_id`.
+///
+/// Voting hotkeys are app-owned random values, not wallet-seed derivations, so
+/// the caller must persist the returned `stored_secret`. It cannot be recovered
+/// from the wallet seed, and losing it forfeits the voting ability delegated to
+/// that hotkey. Every other field is derived from the secret and need not be
+/// stored.
 ///
 /// Returns a pointer to `FfiVotingHotkey` on success, or null on error.
 /// Call `zcashlc_voting_free_hotkey` to free the returned pointer.
 ///
 /// # Safety
 ///
-/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// No pointer parameters.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_voting_generate_hotkey(
-    db: *mut VotingDatabaseHandle,
-    seed: *const u8,
-    seed_len: usize,
-) -> *mut FfiVotingHotkey {
-    let db = AssertUnwindSafe(db);
+pub unsafe extern "C" fn zcashlc_voting_generate_hotkey(network_id: u32) -> *mut FfiVotingHotkey {
     let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let seed_bytes = unsafe { bytes_from_ptr(seed, seed_len) }?;
-
-        let hotkey = handle
-            .db
-            .generate_hotkey(seed_bytes)
-            .map_err(|e| anyhow!("generate_hotkey failed: {}", e))?;
+        let network = voting_network(network_id)?;
+        let hotkey = voting::hotkey::generate_random_voting_hotkey(network)
+            .map_err(|e| anyhow!("generate_random_voting_hotkey failed: {}", e))?;
 
         Ok(Box::into_raw(Box::new(voting_hotkey_to_ffi(hotkey)?)))
     });
@@ -117,14 +114,15 @@ pub unsafe extern "C" fn zcashlc_voting_setup_bundles(
         let json_notes: Vec<JsonNoteInfo> = serde_json::from_slice(notes_bytes)?;
         let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
 
-        let (count, weight) = handle
+        let layout = handle
             .db
-            .setup_bundles(&round_id_str, &core_notes)
-            .map_err(|e| anyhow!("setup_bundles failed: {}", e))?;
+            .ensure_bundles(&round_id_str, &core_notes)
+            .map_err(|e| anyhow!("ensure_bundles failed: {}", e))?;
 
         Ok(Box::into_raw(Box::new(FfiBundleSetupResult {
-            bundle_count: count,
-            eligible_weight: weight,
+            bundle_count: layout.bundle_count,
+            eligible_weight: layout.eligible_weight,
+            dropped_count: layout.dropped_count,
         })))
     });
     unwrap_exc_or_null(res)
@@ -162,6 +160,12 @@ pub unsafe extern "C" fn zcashlc_voting_get_bundle_count(
 ///
 /// `notes_json` is a JSON-encoded `Vec<NoteInfo>`.
 ///
+/// `hotkey_stored_secret` is the material returned as
+/// `FfiVotingHotkey::stored_secret`. The hotkey's Orchard address, address index
+/// and network are derived from it: `zcash_voting` only exposes a
+/// `VotingHotkey`-based constructor for delegation keys, so a raw hotkey address
+/// cannot be supplied directly.
+///
 /// Returns JSON-encoded `VotingPczt` as `*mut FfiBoxedSlice`, or null on error.
 ///
 /// # Safety
@@ -171,6 +175,7 @@ pub unsafe extern "C" fn zcashlc_voting_get_bundle_count(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_build_pczt(
     db: *mut VotingDatabaseHandle,
+    network_id: u32,
     round_id: *const u8,
     round_id_len: usize,
     bundle_index: u32,
@@ -178,16 +183,14 @@ pub unsafe extern "C" fn zcashlc_voting_build_pczt(
     notes_json_len: usize,
     fvk_bytes: *const u8,
     fvk_bytes_len: usize,
-    hotkey_raw_address: *const u8,
-    hotkey_raw_address_len: usize,
+    hotkey_stored_secret: *const u8,
+    hotkey_stored_secret_len: usize,
     consensus_branch_id: u32,
-    coin_type: u32,
     seed_fingerprint: *const u8,
     seed_fingerprint_len: usize,
     account_index: u32,
     round_name: *const u8,
     round_name_len: usize,
-    address_index: u32,
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
     let res = catch_panic(|| {
@@ -198,7 +201,8 @@ pub unsafe extern "C" fn zcashlc_voting_build_pczt(
         let json_notes: Vec<JsonNoteInfo> = serde_json::from_slice(notes_bytes)?;
         let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
         let fvk = unsafe { bytes_from_ptr(fvk_bytes, fvk_bytes_len) }?;
-        let hotkey_addr = unsafe { bytes_from_ptr(hotkey_raw_address, hotkey_raw_address_len) }?;
+        let hotkey_secret =
+            unsafe { bytes_from_ptr(hotkey_stored_secret, hotkey_stored_secret_len) }?;
         let seed_fp_bytes = unsafe { bytes_from_ptr(seed_fingerprint, seed_fingerprint_len) }?;
         let seed_fp_32: [u8; SEED_FINGERPRINT_LEN] = seed_fp_bytes.try_into().map_err(|_| {
             anyhow!(
@@ -209,20 +213,26 @@ pub unsafe extern "C" fn zcashlc_voting_build_pczt(
         })?;
         let round_name_str = unsafe { str_from_ptr(round_name, round_name_len) }?;
 
+        let hotkey =
+            voting::VotingHotkey::from_stored_secret(hotkey_secret, voting_network(network_id)?)
+                .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
+        let keys = voting::delegate::DelegationKeys::with_voting_hotkey(
+            fvk.to_vec(),
+            &hotkey,
+            seed_fp_32,
+            account_index,
+            round_name_str,
+        )
+        .map_err(|e| anyhow!("failed to build delegation keys: {}", e))?;
+
         let pczt = handle
             .db
             .build_governance_pczt(
                 &round_id_str,
                 bundle_index,
                 &core_notes,
-                fvk,
-                hotkey_addr,
+                &keys,
                 consensus_branch_id,
-                coin_type,
-                &seed_fp_32,
-                account_index,
-                &round_name_str,
-                address_index,
             )
             .map_err(|e| anyhow!("build_voting_pczt failed: {}", e))?;
 
@@ -461,7 +471,7 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
                 bundle_index,
                 &core_notes,
                 &pir_client,
-                network_id,
+                voting_network(network_id)?,
             )
             .map_err(|e| anyhow!("precompute_delegation_pir failed: {}", e))?;
 
@@ -496,8 +506,15 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
     bundle_index: u32,
     notes_json: *const u8,
     notes_json_len: usize,
-    hotkey_raw_address: *const u8,
-    hotkey_raw_address_len: usize,
+    fvk_bytes: *const u8,
+    fvk_bytes_len: usize,
+    hotkey_stored_secret: *const u8,
+    hotkey_stored_secret_len: usize,
+    seed_fingerprint: *const u8,
+    seed_fingerprint_len: usize,
+    account_index: u32,
+    round_name: *const u8,
+    round_name_len: usize,
     pir_server_url: *const u8,
     pir_server_url_len: usize,
     network_id: u32,
@@ -514,11 +531,39 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
         let notes_bytes = unsafe { bytes_from_ptr(notes_json, notes_json_len) }?;
         let json_notes: Vec<JsonNoteInfo> = serde_json::from_slice(notes_bytes)?;
         let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
-        let hotkey_addr = unsafe { bytes_from_ptr(hotkey_raw_address, hotkey_raw_address_len) }?;
+        let fvk = unsafe { bytes_from_ptr(fvk_bytes, fvk_bytes_len) }?;
+        let hotkey_secret =
+            unsafe { bytes_from_ptr(hotkey_stored_secret, hotkey_stored_secret_len) }?;
+        let seed_fp_bytes = unsafe { bytes_from_ptr(seed_fingerprint, seed_fingerprint_len) }?;
+        let seed_fp_32: [u8; SEED_FINGERPRINT_LEN] = seed_fp_bytes.try_into().map_err(|_| {
+            anyhow!(
+                "seed_fingerprint must be {} bytes, got {}",
+                SEED_FINGERPRINT_LEN,
+                seed_fp_bytes.len()
+            )
+        })?;
+        let round_name_str = unsafe { str_from_ptr(round_name, round_name_len) }?;
         let pir_url = unsafe { str_from_ptr(pir_server_url, pir_server_url_len) }?;
         let pir_client = connect_pir_client(&pir_url)?;
 
-        let reporter: Box<dyn voting::ProofProgressReporter> = match progress_callback {
+        let hotkey =
+            voting::VotingHotkey::from_stored_secret(hotkey_secret, voting_network(network_id)?)
+                .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
+        let keys = voting::delegate::DelegationKeys::with_voting_hotkey(
+            fvk.to_vec(),
+            &hotkey,
+            seed_fp_32,
+            account_index,
+            round_name_str,
+        )
+        .map_err(|e| anyhow!("failed to build delegation keys: {}", e))?;
+
+        // Boxed as the staged reporter that `build_and_prove_delegation` takes.
+        // `ProgressBridge` and `NoopProgressReporter` both satisfy it through
+        // `zcash_voting`'s blanket impl over `ProgressReporter`; a
+        // `dyn ProgressReporter` object would not, since trait objects do not
+        // coerce to one another.
+        let stages: Box<dyn voting::DelegationProgressReporter> = match progress_callback {
             Some(cb) => Box::new(ProgressBridge {
                 callback: cb,
                 context: *progress_context,
@@ -532,10 +577,9 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
                 &round_id_str,
                 bundle_index,
                 &core_notes,
-                hotkey_addr,
+                &keys,
                 &pir_client,
-                network_id,
-                reporter.as_ref(),
+                stages.as_ref(),
             )
             .map_err(|e| anyhow!("build_and_prove_delegation failed: {}", e))?;
 
@@ -545,7 +589,15 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
     unwrap_exc_or_null(res)
 }
 
-/// Get the delegation submission payload using a seed-derived signing key.
+/// Get the delegation submission payload using an externally produced signature.
+///
+/// This replaces both `zcashlc_voting_get_delegation_submission_with_keystone_sig`
+/// and the seed-derived `zcashlc_voting_get_delegation_submission`. `zcash_voting`
+/// no longer derives account keys or signs on the caller's behalf, so the only
+/// remaining path takes the SpendAuth signature and the ZIP-244 sighash that the
+/// wallet signer produced — whether that signer is a Keystone device or the
+/// wallet itself. The dropped seed-derived entry point therefore has no
+/// replacement, and `sender_seed`, `network_id` and `account_index` are gone.
 ///
 /// Returns JSON-encoded `DelegationSubmission` as `*mut FfiBoxedSlice`, or null on error.
 ///
@@ -553,44 +605,7 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
 ///
 /// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_voting_get_delegation_submission(
-    db: *mut VotingDatabaseHandle,
-    round_id: *const u8,
-    round_id_len: usize,
-    bundle_index: u32,
-    sender_seed: *const u8,
-    sender_seed_len: usize,
-    network_id: u32,
-    account_index: u32,
-) -> *mut crate::ffi::BoxedSlice {
-    let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        crate::parse_network(network_id)?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let seed = unsafe { bytes_from_ptr(sender_seed, sender_seed_len) }?;
-
-        let submission = handle
-            .db
-            .get_delegation_submission(&round_id_str, bundle_index, seed, network_id, account_index)
-            .map_err(|e| anyhow!("get_delegation_submission failed: {}", e))?;
-
-        let json_sub: JsonDelegationSubmission = submission.into();
-        json_to_boxed_slice(&json_sub)
-    });
-    unwrap_exc_or_null(res)
-}
-
-/// Get the delegation submission payload using a Keystone-provided signature.
-///
-/// Returns JSON-encoded `DelegationSubmission` as `*mut FfiBoxedSlice`, or null on error.
-///
-/// # Safety
-///
-/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_voting_get_delegation_submission_with_keystone_sig(
+pub unsafe extern "C" fn zcashlc_voting_get_delegation_submission_with_signature(
     db: *mut VotingDatabaseHandle,
     round_id: *const u8,
     round_id_len: usize,
@@ -610,13 +625,13 @@ pub unsafe extern "C" fn zcashlc_voting_get_delegation_submission_with_keystone_
 
         let submission = handle
             .db
-            .get_delegation_submission_with_keystone_sig(
+            .get_delegation_submission_with_signature(
                 &round_id_str,
                 bundle_index,
                 sig_bytes,
                 sighash_bytes,
             )
-            .map_err(|e| anyhow!("get_delegation_submission_with_keystone_sig failed: {}", e))?;
+            .map_err(|e| anyhow!("get_delegation_submission_with_signature failed: {}", e))?;
 
         let json_sub: JsonDelegationSubmission = submission.into();
         json_to_boxed_slice(&json_sub)
@@ -749,6 +764,8 @@ fn parse_path(bytes: &[u8]) -> anyhow::Result<[pallas::Base; PIR_PATH_ELEMENT_CO
 mod tests {
     use super::*;
 
+    use super::super::constants::HOTKEY_RAW_ADDRESS_LEN;
+
     use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
     use incrementalmerkletree::{Position, Retention};
     use orchard::tree::MerkleHashOrchard;
@@ -818,6 +835,7 @@ mod tests {
             time: 0,
             sapling_tree: String::new(),
             orchard_tree: String::new(),
+            ironwood_tree: String::new(),
         }
     }
 
@@ -868,7 +886,11 @@ mod tests {
         let handle = unsafe { db.as_ref() }.expect("db handle");
         handle
             .db
-            .init_round(&round_params(100, vec![7; 32]), None)
+            .init_round(
+                voting::Network::Mainnet,
+                &round_params(100, vec![7; 32]),
+                None,
+            )
             .expect("insert round");
     }
 
@@ -904,6 +926,7 @@ mod tests {
             time: 0,
             sapling_tree: String::new(),
             orchard_tree: bytes_to_hex(&orchard_tree_bytes),
+            ironwood_tree: String::new(),
         }
     }
 
@@ -991,7 +1014,14 @@ mod tests {
             .map(|position| u64::from(*position))
             .collect::<Vec<_>>();
 
-        queries::insert_round(&conn, TEST_WALLET_ID, &params, None).expect("insert round");
+        queries::insert_round(
+            &conn,
+            TEST_WALLET_ID,
+            voting::Network::Mainnet,
+            &params,
+            None,
+        )
+        .expect("insert round");
         queries::insert_bundle(
             &conn,
             TEST_ROUND_ID,
@@ -1122,12 +1152,6 @@ mod tests {
 
         assert!(
             unsafe {
-                zcashlc_voting_generate_hotkey(std::ptr::null_mut(), bytes.as_ptr(), bytes.len())
-            }
-            .is_null()
-        );
-        assert!(
-            unsafe {
                 zcashlc_voting_setup_bundles(
                     std::ptr::null_mut(),
                     round.as_ptr(),
@@ -1148,6 +1172,7 @@ mod tests {
             unsafe {
                 zcashlc_voting_build_pczt(
                     std::ptr::null_mut(),
+                    crate::NETWORK_ID_TESTNET,
                     round.as_ptr(),
                     round.len(),
                     0,
@@ -1158,13 +1183,11 @@ mod tests {
                     bytes.as_ptr(),
                     bytes.len(),
                     0,
-                    0,
                     bytes.as_ptr(),
                     bytes.len(),
                     0,
                     round.as_ptr(),
                     round.len(),
-                    0,
                 )
             }
             .is_null()
@@ -1192,6 +1215,13 @@ mod tests {
                     json.len(),
                     bytes.as_ptr(),
                     bytes.len(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    0,
+                    round.as_ptr(),
+                    round.len(),
                     round.as_ptr(),
                     round.len(),
                     crate::NETWORK_ID_TESTNET,
@@ -1203,22 +1233,7 @@ mod tests {
         );
         assert!(
             unsafe {
-                zcashlc_voting_get_delegation_submission(
-                    std::ptr::null_mut(),
-                    round.as_ptr(),
-                    round.len(),
-                    0,
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    crate::NETWORK_ID_TESTNET,
-                    0,
-                )
-            }
-            .is_null()
-        );
-        assert!(
-            unsafe {
-                zcashlc_voting_get_delegation_submission_with_keystone_sig(
+                zcashlc_voting_get_delegation_submission_with_signature(
                     std::ptr::null_mut(),
                     round.as_ptr(),
                     round.len(),
@@ -1247,34 +1262,61 @@ mod tests {
 
     #[test]
     fn generate_hotkey_returns_freeable_ffi_value() {
-        let db = open_memory_voting_db();
-        let seed = [7u8; 32];
-
-        let hotkey = unsafe { zcashlc_voting_generate_hotkey(db, seed.as_ptr(), seed.len()) };
+        let hotkey = unsafe { zcashlc_voting_generate_hotkey(crate::NETWORK_ID_MAINNET) };
 
         assert!(!hotkey.is_null());
         let hotkey_ref = unsafe { hotkey.as_ref() }.expect("hotkey");
-        assert_eq!(hotkey_ref.secret_key_len, 32);
-        assert_eq!(hotkey_ref.public_key_len, 32);
-        assert!(!hotkey_ref.secret_key.is_null());
-        assert!(!hotkey_ref.public_key.is_null());
-        assert!(!hotkey_ref.address.is_null());
+        assert_eq!(
+            hotkey_ref.stored_secret_len,
+            voting::hotkey::VOTING_HOTKEY_STORED_SECRET_LEN
+        );
+        assert_eq!(hotkey_ref.raw_orchard_address_len, HOTKEY_RAW_ADDRESS_LEN);
+        assert!(!hotkey_ref.stored_secret.is_null());
+        assert!(!hotkey_ref.raw_orchard_address.is_null());
 
-        unsafe {
-            zcashlc_voting_free_hotkey(hotkey);
-            zcashlc_voting_db_free(db);
-        }
+        unsafe { zcashlc_voting_free_hotkey(hotkey) };
     }
 
     #[test]
-    fn generate_hotkey_rejects_short_seed() {
-        let db = open_memory_voting_db();
-        let seed = [7u8; 31];
+    fn generate_hotkey_rejects_unknown_network_id() {
+        assert!(unsafe { zcashlc_voting_generate_hotkey(99) }.is_null());
+    }
 
-        let hotkey = unsafe { zcashlc_voting_generate_hotkey(db, seed.as_ptr(), seed.len()) };
+    #[test]
+    fn generated_hotkeys_are_random_and_reconstructible() {
+        let first = unsafe { zcashlc_voting_generate_hotkey(crate::NETWORK_ID_MAINNET) };
+        let second = unsafe { zcashlc_voting_generate_hotkey(crate::NETWORK_ID_MAINNET) };
+        let first_ref = unsafe { first.as_ref() }.expect("hotkey");
+        let second_ref = unsafe { second.as_ref() }.expect("hotkey");
 
-        assert!(hotkey.is_null());
-        unsafe { zcashlc_voting_db_free(db) };
+        let first_secret = unsafe {
+            std::slice::from_raw_parts(first_ref.stored_secret, first_ref.stored_secret_len)
+        };
+        let second_secret = unsafe {
+            std::slice::from_raw_parts(second_ref.stored_secret, second_ref.stored_secret_len)
+        };
+        assert_ne!(
+            first_secret, second_secret,
+            "hotkeys must be independently random"
+        );
+
+        // The stored secret is the only material the caller needs to keep: the
+        // address must be recoverable from it alone.
+        let recovered =
+            voting::VotingHotkey::from_stored_secret(first_secret, voting::Network::Mainnet)
+                .expect("stored secret round-trips");
+        let first_address = unsafe {
+            std::slice::from_raw_parts(
+                first_ref.raw_orchard_address,
+                first_ref.raw_orchard_address_len,
+            )
+        };
+        assert_eq!(recovered.raw_orchard_address(), first_address);
+
+        unsafe {
+            zcashlc_voting_free_hotkey(first);
+            zcashlc_voting_free_hotkey(second);
+        }
     }
 
     #[test]
@@ -1282,7 +1324,12 @@ mod tests {
         let db = open_memory_voting_db();
         init_test_round(db);
         let round = TEST_ROUND_ID.as_bytes();
-        let notes_json = b"[]";
+        // `zcash_voting` rejects an empty note set outright, so the round must be
+        // seeded with a note whose value clears the ballot-weight threshold for
+        // the bundle to survive planning.
+        let mut note = note_json_for(Position::from(0), merkle_hash(1));
+        note.value = 13_000_000;
+        let notes_json = serde_json::to_vec(&[note]).expect("serialize notes");
 
         let result = unsafe {
             zcashlc_voting_setup_bundles(
@@ -1296,11 +1343,13 @@ mod tests {
 
         assert!(!result.is_null());
         let result_ref = unsafe { result.as_ref() }.expect("bundle setup result");
-        assert_eq!(result_ref.bundle_count, 0);
-        assert_eq!(result_ref.eligible_weight, 0);
+        assert_eq!(result_ref.bundle_count, 1);
+        // The exact quantization of eligible weight is upstream bundle policy;
+        // this test only asserts that a surviving bundle carries weight.
+        assert!(result_ref.eligible_weight > 0);
         assert_eq!(
             unsafe { zcashlc_voting_get_bundle_count(db, round.as_ptr(), round.len()) },
-            0
+            1
         );
 
         unsafe {
@@ -1337,8 +1386,11 @@ mod tests {
         unsafe { zcashlc_voting_db_free(db) };
     }
 
+    // Only the proving call still takes a network id: the submission call now
+    // reconstructs the payload from a caller-supplied signature and no longer
+    // accepts a network, so there is no invalid network id left to reject there.
     #[test]
-    fn proof_and_submission_calls_reject_invalid_network_id_before_remote_work() {
+    fn proof_calls_reject_invalid_network_id_before_remote_work() {
         let db = open_memory_voting_db();
         let round = TEST_ROUND_ID.as_bytes();
         let notes_json = b"[]";
@@ -1355,26 +1407,18 @@ mod tests {
                     notes_json.len(),
                     bytes.as_ptr(),
                     bytes.len(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    0,
+                    round.as_ptr(),
+                    round.len(),
                     b"https://example.com/".as_ptr(),
                     20,
                     99,
                     None,
                     std::ptr::null_mut(),
-                )
-            }
-            .is_null()
-        );
-        assert!(
-            unsafe {
-                zcashlc_voting_get_delegation_submission(
-                    db,
-                    round.as_ptr(),
-                    round.len(),
-                    0,
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    99,
-                    0,
                 )
             }
             .is_null()

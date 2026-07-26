@@ -1,14 +1,12 @@
-use std::ffi::CString;
-
 use anyhow::anyhow;
 use serde::Serialize;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Network;
 use zcash_voting as voting;
-use zip32::{AccountId, Scope};
+use zip32::AccountId;
 
-use super::constants::{HOTKEY_RAW_ADDRESS_LEN, MIN_SEED_LEN};
+use super::constants::MIN_SEED_LEN;
 use super::ffi_types::FfiVotingHotkey;
 
 // =============================================================================
@@ -107,42 +105,48 @@ pub(super) struct HotkeySideInputs {
     pub(super) g_d_new_x: Vec<u8>,
     pub(super) pk_d_new_x: Vec<u8>,
     pub(super) hotkey_raw_address: Vec<u8>,
-    pub(super) hotkey_public_key: Vec<u8>,
-    pub(super) hotkey_address: String,
 }
 
+/// Map the SDK's numeric network id onto `zcash_voting`'s network selector.
+///
+/// `zcash_voting` replaced the numeric `network_id` convention with a typed
+/// enum, so every call into the crate needs this conversion at the boundary.
+pub(super) fn voting_network(network_id: u32) -> anyhow::Result<voting::Network> {
+    match network_id {
+        crate::NETWORK_ID_TESTNET => Ok(voting::Network::Testnet),
+        crate::NETWORK_ID_MAINNET => Ok(voting::Network::Mainnet),
+        other => Err(anyhow!(
+            "Invalid network type: {}. Expected either {} or {} for Testnet or Mainnet, respectively.",
+            other,
+            crate::NETWORK_ID_TESTNET,
+            crate::NETWORK_ID_MAINNET,
+        )),
+    }
+}
+
+/// Derive the delegation side inputs implied by a stored voting-hotkey secret.
+///
+/// `hotkey_stored_secret` is the app-owned random material previously returned
+/// as `FfiVotingHotkey::stored_secret`, not wallet seed material: `zcash_voting`
+/// derives the hotkey's Orchard address from it at a fixed account and address
+/// index, so no wallet key derivation is involved.
 pub(super) fn derive_hotkey_side_inputs(
-    hotkey_seed: &[u8],
+    hotkey_stored_secret: &[u8],
     network_id: u32,
-    hotkey_account: AccountId,
 ) -> anyhow::Result<HotkeySideInputs> {
-    let hotkey_usk = usk_from_seed(network_id, hotkey_seed, hotkey_account)
-        .map_err(|e| anyhow!("failed to derive hotkey UnifiedSpendingKey: {}", e))?;
+    let network = voting_network(network_id)?;
+    let hotkey = voting::VotingHotkey::from_stored_secret(hotkey_stored_secret, network)
+        .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
 
-    let hotkey_ufvk = hotkey_usk.to_unified_full_viewing_key();
-    let hotkey_orchard_fvk = hotkey_ufvk
-        .orchard()
-        .ok_or_else(|| anyhow!("hotkey UFVK is missing Orchard component"))?;
-
-    let app_hotkey = voting::hotkey::generate_hotkey(hotkey_seed)
-        .map_err(|e| anyhow!("generate_hotkey failed: {}", e))?;
-    let hotkey_addr = hotkey_orchard_fvk.address_at(0u32, Scope::External);
-    let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
-
-    let hotkey_addr_bytes: [u8; HOTKEY_RAW_ADDRESS_LEN] = hotkey_raw_address
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("address serialization must be {HOTKEY_RAW_ADDRESS_LEN} bytes"))?;
+    let hotkey_addr_bytes = hotkey.raw_orchard_address();
     let (g_d_new_x, pk_d_new_x) =
-        voting::action::derive_hotkey_x_coords_from_raw_address(&hotkey_addr_bytes)
+        voting::action::derive_hotkey_x_coords_from_raw_address(hotkey_addr_bytes)
             .map_err(|e| anyhow!("derive_hotkey_x_coords failed: {}", e))?;
 
     Ok(HotkeySideInputs {
         g_d_new_x: g_d_new_x.to_vec(),
         pk_d_new_x: pk_d_new_x.to_vec(),
-        hotkey_raw_address,
-        hotkey_public_key: app_hotkey.public_key,
-        hotkey_address: app_hotkey.address,
+        hotkey_raw_address: hotkey_addr_bytes.to_vec(),
     })
 }
 
@@ -151,21 +155,21 @@ pub(super) fn derive_hotkey_side_inputs(
 // =============================================================================
 
 /// Convert a `voting::VotingHotkey` to the FFI representation.
+///
+/// The caller owns the returned allocation and must release it with
+/// `zcashlc_voting_free_hotkey`, which zeroizes the secret.
 #[allow(dead_code)]
 pub(super) fn voting_hotkey_to_ffi(
     hotkey: voting::VotingHotkey,
 ) -> anyhow::Result<FfiVotingHotkey> {
-    let (sk_ptr, sk_len) = crate::ptr_from_vec(hotkey.secret_key);
-    let (pk_ptr, pk_len) = crate::ptr_from_vec(hotkey.public_key);
-    let address = CString::new(hotkey.address)
-        .map_err(|e| anyhow!("invalid hotkey address string: {}", e))?
-        .into_raw();
+    let (secret_ptr, secret_len) = crate::ptr_from_vec(hotkey.stored_secret().to_vec());
+    let (addr_ptr, addr_len) = crate::ptr_from_vec(hotkey.raw_orchard_address().to_vec());
     Ok(FfiVotingHotkey {
-        secret_key: sk_ptr,
-        secret_key_len: sk_len,
-        public_key: pk_ptr,
-        public_key_len: pk_len,
-        address,
+        stored_secret: secret_ptr,
+        stored_secret_len: secret_len,
+        raw_orchard_address: addr_ptr,
+        raw_orchard_address_len: addr_len,
+        address_index: hotkey.address_index(),
     })
 }
 

@@ -92,10 +92,6 @@ mod eip681;
 mod ffi;
 mod migration;
 mod tor;
-// Voting is gated off on the Ironwood (NU6.3) deps: zcash_voting cannot resolve
-// against orchard 0.15 (see Cargo.toml). Re-enable with the `voting` feature
-// once the voting crates support orchard 0.15.
-#[cfg(zcash_voting)]
 mod voting;
 
 #[cfg(target_vendor = "apple")]
