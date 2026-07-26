@@ -32,11 +32,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than hardcoding it. The resulting proofs are unchanged.
 
 ## Fixed
-- Redacting a PCZT for an external signer now also redacts the Ironwood
-  bundle (clearing spend witnesses and `output_info` output metadata),
-  matching the Orchard, Sapling, and transparent bundles; previously the
-  Ironwood bundle was left untouched, exposing its Merkle witnesses and
-  wallet output metadata to the signer.
+- Redacting a PCZT for an external signer now delegates to
+  `zcash_client_backend`'s `redact_pczt_for_signer` instead of a
+  hand-rolled reimplementation. This redacts the Ironwood bundle, which the
+  previous implementation left untouched (exposing its Merkle witnesses and
+  output metadata to the signer), and also clears zk-proofs, binding
+  signature keys, dummy spend keys, and v6 anchors that the previous
+  implementation did not.
 
 ## Fixed
 - Send-max proposals now spend from the Ironwood pool in addition to
