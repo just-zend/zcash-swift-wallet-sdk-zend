@@ -32,6 +32,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than hardcoding it. The resulting proofs are unchanged.
 
 ## Fixed
+- Hardware-wallet signing of post-NU6.3 (v6) transactions: the
+  wallet-controlled zero-value Orchard spends that pad such transactions now
+  carry ZIP 32 derivation metadata (via `zcash_client_backend 0.24.0-rc.4`),
+  so signers can identify and sign them. Previously these actions were
+  unsignable and v6 sends failed at finalization with a missing
+  spend-auth-signature error even though the device approved the
+  transaction.
 - Redacting a PCZT for an external signer now requests
   `zcash_client_backend`'s full (non-compacted) signer view, and the PCZT
   encoding sent to the signer is the minimal version capable of representing
