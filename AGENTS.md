@@ -125,6 +125,7 @@ Every public API parameter that carries a domain value — key material, seeds, 
 - **Commits and PRs**: every PR must reference an issue. Commit title format is `[#<issue_number>] <self-descriptive title>` (see `CONTRIBUTING.md`). PRs are always landed with a merge commit, never squash-merged; keep branch commits tidy and self-contained.
 - **Test plan**: every PR needs a documented test plan, including how to manually verify the change on testnet where applicable (see `CODE_REVIEW_GUIDELINES.md`).
 - **Docs location**: user-facing documentation belongs in `docs/`.
+- **Design docs and plans**: write them to `.plans/` at the repository root, which is gitignored. Design notes, implementation plans, and handoff documents are conversation artifacts, not repository history — never commit them.
 - **Rust formatting**: always run `cargo fmt` in `rust/` before committing changes to the Rust code. Consistent formatting keeps diffs minimal and avoids spurious conflicts when rebasing.
 - **Breaking API changes**: document them in `MIGRATING.md`, and add a `CHANGELOG.md` entry for every user-visible change.
 - **Main branch policy**: `main` is development-stable (all merges build + tests pass) but clients must depend on published tags, never on `main`.
