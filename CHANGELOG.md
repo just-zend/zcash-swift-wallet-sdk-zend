@@ -39,9 +39,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching the Orchard, Sapling, and transparent bundles; previously the
   Ironwood bundle was left untouched, exposing its Merkle witnesses and
   wallet output metadata to the signer.
-
-## Fixed
-- Tor-layer errors (`rustTorConnectToLightwalletd`, `rustTorLwdGetInfo`, `rustTorLwdSubmit`, `rustTorLwdFetchTransaction`, `rustTorLwdLatestBlockHeight`, `rustTorLwdGetTreeState`) are now classified as retryable service errors in `CompactBlockProcessor`. Previously these errors bypassed the service-error retry path and went straight to a fatal sync failure, so a transient Tor circuit/stream issue (e.g. "remote hostname lookup failure", "Failed to obtain exit circuit for ports", "Tor network protocol violation") required a full app restart to recover. They now trigger the same reset-and-retry behavior (including tearing down cached Tor connections via `service.closeConnections()`) as other transport errors, up to `ZcashSDK.serviceFailureRetries` times.
+- Tor-layer errors (`rustTorConnectToLightwalletd`, `rustTorLwdGetInfo`,
+- `rustTorLwdSubmit`, `rustTorLwdFetchTransaction`,
+- `rustTorLwdLatestBlockHeight`, `rustTorLwdGetTreeState`) are now classified
+- as retryable service errors in `CompactBlockProcessor`. Previously these
+- errors bypassed the service-error retry path and went straight to a fatal
+- sync failure, so a transient Tor circuit/stream issue (e.g. "remote hostname
+- lookup failure", "Failed to obtain exit circuit for ports", "Tor network
+- protocol violation") required a full app restart to recover. They now trigger
+- the same reset-and-retry behavior (including tearing down cached Tor
+- connections via `service.closeConnections()`) as other transport errors, up
+- to `ZcashSDK.serviceFailureRetries` times.
+- Send-max proposals now spend from the Ironwood pool in addition to
+  Sapling and Orchard, so a post-NU6.3 wallet's Ironwood funds are no
+  longer silently excluded from a send-max. This affects only the general
+  send-max proposal; the Orchard-to-Ironwood migration is unchanged.
 
 ## Removed
 - The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
