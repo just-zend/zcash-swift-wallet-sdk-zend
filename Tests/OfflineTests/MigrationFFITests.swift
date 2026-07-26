@@ -212,29 +212,38 @@ final class MigrationFFITests: XCTestCase {
         }
     }
 
-    /// Ported from the prototype's `testRecordTransferResultWithNoActiveRunThrows`: recording a
-    /// result against a transfer id with no active migration run throws
-    /// `MigrationError::InvalidState(NoActiveRun)` -- a deterministic, sync-independent throw (this
-    /// path never touches the wallet schema at all). Uses `.networkError` rather than `.success` to
-    /// keep the test focused on the "no active run" contract, sidestepping the unrelated txid-hex
-    /// validation `.success` carries (see `TxIdTests.testTxIdStringRoundTripsThroughRawBytesForAnAsymmetricFixture`
-    /// / `testTxIdRawBytesRoundTripThroughDisplayHexStringForAnAsymmetricFixture` for the conversion
-    /// helpers themselves, and
-    /// `OrchardMigrationCompositionTests.testExecuteNextPendingTransferRecordsTheDocumentedByteOrderForAnAsymmetricTxId`
-    /// for that validation exercised through this same welding record path).
+    /// Recording a SUCCESS against a transfer id with no active migration run throws: that path
+    /// must load the stored run to mark the transfer broadcast, and there is none. A deterministic,
+    /// sync-independent throw — it never touches the wallet schema.
+    ///
+    /// (Before transfer ids became `UInt32` this test passed `.networkError` with an unparseable
+    /// string id, so what threw was the id decode, not the missing run. `.networkError` records
+    /// nothing by design — see `testRecordTransferResultForANetworkErrorSucceedsWithNoActiveRun`
+    /// — so it can never exercise this contract.)
     func testRecordTransferResultWithNoActiveRunThrows() async throws {
         do {
             try await rustBackend.migrationRecordTransferResult(
-                transferId: "does-not-exist",
-                result: MigrationTransferResult.networkError(retryable: true),
+                transferId: 4_294_967_295,
+                result: MigrationTransferResult.success(txId: String(repeating: "ab", count: 32)),
                 for: account
             )
-            XCTFail("Expected recording a result with no active migration run to throw")
+            XCTFail("Expected recording a success with no active migration run to throw")
         } catch ZcashError.rustMigrationRecordTransferResult {
             // expected
         } catch {
             XCTFail("Expected rustMigrationRecordTransferResult but got \(error)")
         }
+    }
+
+    /// A network error is a Swift-level signal for the caller's own retry policy: the native side
+    /// records nothing and reports success, even with no active run. Documents the asymmetry the
+    /// test above depends on.
+    func testRecordTransferResultForANetworkErrorSucceedsWithNoActiveRun() async throws {
+        try await rustBackend.migrationRecordTransferResult(
+            transferId: 4_294_967_295,
+            result: MigrationTransferResult.networkError(retryable: true),
+            for: account
+        )
     }
 
     /// Ported from the prototype's `testExtractBroadcastTxWithInvalidPcztThrows`: garbage PCZT bytes
@@ -315,8 +324,8 @@ final class MigrationFFITests: XCTestCase {
 
         do {
             try await rustBackend.migrationRecordTransferResult(
-                transferId: "does-not-exist",
-                result: MigrationTransferResult.networkError(retryable: true),
+                transferId: 4_294_967_295,
+                result: MigrationTransferResult.success(txId: String(repeating: "ab", count: 32)),
                 for: account
             )
             XCTFail("Expected recording a result with no active migration run to throw")

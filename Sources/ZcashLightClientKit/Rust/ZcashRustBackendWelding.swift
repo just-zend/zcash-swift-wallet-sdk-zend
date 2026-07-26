@@ -533,7 +533,7 @@ protocol ZcashRustBackendWelding {
     ///           `migrationInvalidTxId` if `result` is `.success` and its `txId` does not decode
     ///           to a 32-byte transaction id.
     func migrationRecordTransferResult(
-        transferId: String,
+        transferId: UInt32,
         result: MigrationTransferResult,
         for account: AccountUUID
     ) async throws

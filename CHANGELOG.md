@@ -50,6 +50,10 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   `MigrationTransferProposal`, `MigrationTransferResult`, `MigrationRunEstimate` (and its
   `MigrationRunEstimate.Run`), `NoteSplitProposal`, `PreparedMigrationTransfer`,
   `MigrationUnsignedTransferPczt`, and `MigrationSignedTransferPczt`.
+- Migration transaction ids are `UInt32` (the engine's own id type) rather than decimal strings,
+  across `MigrationTransferProposal`, `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`,
+  `MigrationSignedTransferPczt`, `MigrationAttentionReason.invalidTransfer`, and
+  `migrationRecordTransferResult(transferId:result:for:)`.
 - These are the value types of the staged migration API; the `Synchronizer` methods that produce
   and consume them land in a follow-up release, so no migration can be driven from the public API
   yet.

@@ -137,20 +137,6 @@ unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
     }
 }
 
-/// Decode a decimal transaction-id string (`MigrationTxId` raw value) from a C string.
-fn transfer_id_from_c(id: *const c_char) -> anyhow::Result<MigrationTxId> {
-    if id.is_null() {
-        return Err(anyhow!("transfer_id is null"));
-    }
-    let raw = unsafe { CStr::from_ptr(id) }
-        .to_str()
-        .map_err(|e| anyhow!("transfer id is not valid UTF-8: {e}"))?;
-    let idx: u32 = raw
-        .parse()
-        .map_err(|e| anyhow!("invalid transfer id {raw}: {e}"))?;
-    Ok(MigrationTxId::new(idx))
-}
-
 /// The common per-call context: the network parameters, the wallet handle, the migration-store
 /// connection (a second, independent connection to the same wallet database file — the
 /// account-keyed migration tables live inside it), and the raw path/account for the plan cache.
@@ -368,18 +354,38 @@ fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bloc
     }
 }
 
-/// The row set the platform sees for a plan's transfer schedule: `(engine tx id, amount, broadcast
-/// height, expiry height)`, sorted chronologically by broadcast height.
+/// What a transfer spending `funding_note` CROSSES into Ironwood: the note less the fee buffer
+/// that funds the transfer's own fee (the transfer has no change output, so the buffer is consumed
+/// exactly). This is the round `{1,2,5}×10ⁿ` denomination the user consented to and the amount
+/// their Ironwood balance will grow by — the funding note itself is a spend-side value that
+/// overstates it by one transfer fee.
 ///
-/// - Amounts pair with `funding_notes()` (the post-reconciliation values), NOT the note split's
-///   raw `crossing_values()` — the two differ whenever preparation fees drop the smallest
-///   denominations, and mispairing silently attaches wrong amounts to schedule heights.
+/// The engine builds every funding note as `crossing + buffer`, so the subtraction cannot
+/// underflow; a stored plan that violated that invariant saturates to zero rather than panicking
+/// across the FFI, and the zero is self-evidently wrong in the platform's display.
+// TODO: [#1806] Replace with the engine's own `transfer_crossing_value` /
+// `crossing_values` accessors (librustzcash #2767) when the pin moves to the next rc.
+fn crossing_amount(funding_note: Zatoshis, note_fee_buffer: Zatoshis) -> Zatoshis {
+    (funding_note - note_fee_buffer).unwrap_or(Zatoshis::ZERO)
+}
+
+/// The row set the platform sees for a plan's transfer schedule: `(engine tx id, crossing amount,
+/// broadcast height, expiry height)`, sorted chronologically by broadcast height.
+///
+/// - Amounts are what each transfer CROSSES (see [`crossing_amount`]), not the funding note it
+///   spends: serving the note overstates every row by one transfer fee and shows a value that is
+///   not a round denomination the user was asked to approve.
+/// - Rows still pair with `funding_notes()` (the post-reconciliation values), NOT the denomination
+///   plan's raw `crossing_values()` — the two differ whenever preparation fees drop the smallest
+///   denominations, and mispairing silently attaches wrong amounts to schedule heights. Taking the
+///   buffer off each paired row preserves that pairing.
 /// - The engine numbers every preparation transaction first, then transfers in `schedule()`
 ///   order, so transfer `i`'s real committed id is `prep_tx_count + i`.
 /// - The sort makes the platform's row order chronological: ZIP 318 SHUFFLE deliberately makes
 ///   funding-note order differ from broadcast order.
 fn schedule_rows(
     funding_notes: &[Zatoshis],
+    note_fee_buffer: Zatoshis,
     schedule: &[zcash_pool_migration::scheduling::Schedule],
     prep_tx_count: u32,
 ) -> anyhow::Result<Vec<(MigrationTxId, Zatoshis, BlockHeight, BlockHeight)>> {
@@ -394,10 +400,10 @@ fn schedule_rows(
         .iter()
         .zip(schedule.iter())
         .enumerate()
-        .map(|(i, (amount, entry))| {
+        .map(|(i, (funding_note, entry))| {
             (
                 MigrationTxId::new(prep_tx_count + i as u32),
-                *amount,
+                crossing_amount(*funding_note, note_fee_buffer),
                 entry.broadcast_height(),
                 entry.expiry_height(),
             )
@@ -442,12 +448,17 @@ fn encode_schedule_from_plan(
     now_reference: BlockHeight,
     plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
-    let rows = schedule_rows(&plan.funding_notes(), plan.schedule(), prep_tx_count(plan))?;
+    let rows = schedule_rows(
+        &plan.funding_notes(),
+        plan.note_split().note_fee_buffer(),
+        plan.schedule(),
+        prep_tx_count(plan),
+    )?;
     let transfers = rows
         .into_iter()
         .map(|(id, amount, broadcast, expiry)| {
             Ok(FfiTransferProposal {
-                id: cstring_raw(&u32::from(id).to_string(), "transfer proposal id")?,
+                id: u32::from(id),
                 amount: zat_to_i64(amount),
                 anchor_height: i64::from(u32::from(now_reference)),
                 next_executable_after_height: i64::from(u32::from(broadcast)),
@@ -533,7 +544,7 @@ fn encode_schedule_from_state(
             let amount = transfer_amount(state, t)
                 .ok_or_else(|| anyhow!("stored transfer has no funding-note amount"))?;
             Ok(FfiTransferProposal {
-                id: cstring_raw(&u32::from(t.id()).to_string(), "transfer proposal id")?,
+                id: u32::from(t.id()),
                 amount: zat_to_i64(amount),
                 anchor_height: i64::from(u32::from(now_reference)),
                 next_executable_after_height: i64::from(u32::from(t.scheduled_height())),
@@ -906,11 +917,18 @@ fn derive_state(
     }
 }
 
-/// The amount a stored transfer crosses, from the run's funding notes (`Transfer { crossing }`
-/// indexes into them).
+/// The amount a stored transfer CROSSES: its funding note (`Transfer { crossing }` indexes into
+/// the run's funding notes) less the fee buffer that pays the transfer's own fee — see
+/// [`crossing_amount`]. `None` for a preparation transaction, which crosses nothing.
 fn transfer_amount(state: &MigrationState, tx: &MigrationTransaction) -> Option<Zatoshis> {
     match tx.kind() {
-        MigrationTxKind::Transfer { crossing } => state.funding_notes().get(crossing).copied(),
+        MigrationTxKind::Transfer { crossing } => {
+            let buffer = state.note_split().note_fee_buffer();
+            state
+                .funding_notes()
+                .get(crossing)
+                .map(|funding_note| crossing_amount(*funding_note, buffer))
+        }
         _ => None,
     }
 }
@@ -956,10 +974,9 @@ impl FfiMigrationProgress {
 /// Why a migration requires user attention (payload of [`FfiMigrationState::RequiresAttention`]).
 #[repr(C, u8)]
 pub enum FfiAttentionReason {
-    /// The transfer identified by `transfer_id` was terminally rejected at broadcast (its input
-    /// note was spent externally, or the network refused it as invalid). `transfer_id` is an owned
-    /// C string, freed by [`zcashlc_free_migration_state`].
-    InvalidTransfer { transfer_id: *mut c_char },
+    /// The transfer identified by `transfer_id` (the engine's raw id) was terminally rejected at
+    /// broadcast: its input note was spent externally, or the network refused it as invalid.
+    InvalidTransfer { transfer_id: u32 },
     /// A transaction's expiry elapsed before it could be broadcast (or mined).
     TransferExpired,
 }
@@ -1004,9 +1021,9 @@ pub struct FfiNoteSplitProposal {
 /// `pczt` null) means "nothing is due" (as opposed to a NULL return, which signals an error).
 #[repr(C)]
 pub struct FfiPreparedTransfer {
-    /// The transaction's id (the engine's decimal id), as an owned C string (null only in the
-    /// "nothing due" sentinel).
-    pub id: *mut c_char,
+    /// The transaction's id (the engine's raw id). Meaningful only when `pczt` is non-null; the
+    /// "nothing due" sentinel leaves it `0`.
+    pub id: u32,
     /// The finalized transaction's id, as raw (internal-order) 32-byte value (zeroed when the
     /// value is a storage receipt whose transaction has not been proven yet).
     pub txid: [u8; 32],
@@ -1021,7 +1038,7 @@ impl FfiPreparedTransfer {
         txid: [u8; 32],
         pczt_bytes: Vec<u8>,
     ) -> anyhow::Result<*mut Self> {
-        let id = cstring_raw(&u32::from(id).to_string(), "prepared transfer id")?;
+        let id = u32::from(id);
         let (pczt, pczt_len) = ptr_from_vec(pczt_bytes);
         Ok(Box::into_raw(Box::new(FfiPreparedTransfer {
             id,
@@ -1033,7 +1050,7 @@ impl FfiPreparedTransfer {
 
     fn none() -> *mut Self {
         Box::into_raw(Box::new(FfiPreparedTransfer {
-            id: ptr::null_mut(),
+            id: 0,
             txid: [0u8; 32],
             pczt: ptr::null_mut(),
             pczt_len: 0,
@@ -1044,8 +1061,8 @@ impl FfiPreparedTransfer {
 /// A single scheduled Orchard→Ironwood transfer (element of [`FfiMigrationSchedule`]).
 #[repr(C)]
 pub struct FfiTransferProposal {
-    /// The transfer's id (the engine's decimal id), as an owned C string.
-    pub id: *mut c_char,
+    /// The transfer's id (the engine's raw id).
+    pub id: u32,
     /// The value (zatoshi) that crosses the turnstile.
     pub amount: i64,
     /// The "now" reference height at encode time (the chain tip). With ZIP 374 the real anchor is
@@ -1067,7 +1084,7 @@ impl FfiTransferProposal {
         expiry: BlockHeight,
     ) -> anyhow::Result<*mut Self> {
         Ok(Box::into_raw(Box::new(FfiTransferProposal {
-            id: cstring_raw(&u32::from(id).to_string(), "transfer proposal id")?,
+            id: u32::from(id),
             amount: zat_to_i64(amount),
             anchor_height: i64::from(u32::from(now_reference)),
             next_executable_after_height: i64::from(u32::from(next_executable_after)),
@@ -1127,8 +1144,8 @@ pub struct FfiMigrationRunEstimate {
 /// An unsigned PCZT awaiting an external signer (element of [`FfiUnsignedTransferPczts`]).
 #[repr(C)]
 pub struct FfiUnsignedTransferPczt {
-    /// The transaction's id (the engine's decimal id), as an owned C string.
-    pub id: *mut c_char,
+    /// The transaction's id (the engine's raw id).
+    pub id: u32,
     /// Heap `pczt_len`-byte serialized unsigned PCZT.
     pub pczt: *mut u8,
     pub pczt_len: usize,
@@ -1149,7 +1166,7 @@ impl FfiUnsignedTransferPczts {
         let items = pairs
             .into_iter()
             .map(|(id, bytes)| {
-                let id = cstring_raw(&u32::from(id).to_string(), "unsigned transfer pczt id")?;
+                let id = u32::from(id);
                 let (pczt, pczt_len) = ptr_from_vec(bytes);
                 Ok(FfiUnsignedTransferPczt { id, pczt, pczt_len })
             })
@@ -1251,15 +1268,9 @@ fn cstring_raw(s: &str, what: &str) -> anyhow::Result<*mut c_char> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_free_migration_state(ptr: *mut FfiMigrationState) {
     if !ptr.is_null() {
-        let boxed = unsafe { Box::from_raw(ptr) };
-        if let FfiMigrationState::RequiresAttention(FfiAttentionReason::InvalidTransfer {
-            transfer_id,
-        }) = &*boxed
-            && !transfer_id.is_null()
-        {
-            unsafe { zcashlc_string_free(*transfer_id) }
-        }
-        drop(boxed);
+        // Every payload is plain data (`InvalidTransfer` carries a `u32` id), so dropping the
+        // box is the whole of the cleanup.
+        drop(unsafe { Box::from_raw(ptr) });
     }
 }
 
@@ -1297,15 +1308,12 @@ pub unsafe extern "C" fn zcashlc_free_migration_note_split_proposal(
 pub unsafe extern "C" fn zcashlc_free_migration_prepared_transfer(ptr: *mut FfiPreparedTransfer) {
     if !ptr.is_null() {
         let boxed = unsafe { Box::from_raw(ptr) };
-        if !boxed.id.is_null() {
-            unsafe { zcashlc_string_free(boxed.id) }
-        }
         free_ptr_from_vec(boxed.pczt, boxed.pczt_len);
         drop(boxed);
     }
 }
 
-/// Frees a [`FfiMigrationSchedule`], including every transfer's id string.
+/// Frees a [`FfiMigrationSchedule`] and its transfer rows.
 ///
 /// # Safety
 /// `ptr` must be null or point to a [`FfiMigrationSchedule`] handed out by this module.
@@ -1313,28 +1321,22 @@ pub unsafe extern "C" fn zcashlc_free_migration_prepared_transfer(ptr: *mut FfiP
 pub unsafe extern "C" fn zcashlc_free_migration_schedule(ptr: *mut FfiMigrationSchedule) {
     if !ptr.is_null() {
         let boxed = unsafe { Box::from_raw(ptr) };
-        free_ptr_from_vec_with(boxed.transfers, boxed.transfers_len, |t| {
-            if !t.id.is_null() {
-                unsafe { zcashlc_string_free(t.id) }
-            }
-        });
+        // Every row is plain data (ids are `u32`), so freeing the row vector is enough.
+        free_ptr_from_vec(boxed.transfers, boxed.transfers_len);
         drop(boxed);
     }
 }
 
 /// Frees a standalone [`FfiTransferProposal`] (as returned by
-/// `zcashlc_migration_pending_transfer_proposal`), including its id string.
+/// `zcashlc_migration_pending_transfer_proposal`).
 ///
 /// # Safety
 /// `ptr` must be null or point to a [`FfiTransferProposal`] handed out by this module.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_free_migration_transfer_proposal(ptr: *mut FfiTransferProposal) {
     if !ptr.is_null() {
-        let boxed = unsafe { Box::from_raw(ptr) };
-        if !boxed.id.is_null() {
-            unsafe { zcashlc_string_free(boxed.id) }
-        }
-        drop(boxed);
+        // The id is a plain `u32`; dropping the box is the whole of the cleanup.
+        drop(unsafe { Box::from_raw(ptr) });
     }
 }
 
@@ -1362,9 +1364,6 @@ pub unsafe extern "C" fn zcashlc_free_migration_unsigned_transfer_pczts(
     if !ptr.is_null() {
         let boxed = unsafe { Box::from_raw(ptr) };
         free_ptr_from_vec_with(boxed.ptr, boxed.len, |u| {
-            if !u.id.is_null() {
-                unsafe { zcashlc_string_free(u.id) }
-            }
             free_ptr_from_vec(u.pczt, u.pczt_len);
         });
         drop(boxed);
@@ -1428,7 +1427,7 @@ fn marshal_state(
         }),
         DerivedState::InvalidTransfer(id) => {
             FfiMigrationState::RequiresAttention(FfiAttentionReason::InvalidTransfer {
-                transfer_id: cstring_raw(&id.to_string(), "attention transfer id")?,
+                transfer_id: id,
             })
         }
         DerivedState::TransferExpired => {
@@ -1961,13 +1960,17 @@ pub unsafe extern "C" fn zcashlc_migration_propose_immediate_transfers(
         match plan_and_cache(&mut ctx, true)? {
             Some((plan, reference_height, handle)) => {
                 // Preview mirrors the commit-time rewrite: every transfer due at the tip.
-                let rows =
-                    schedule_rows(&plan.funding_notes(), plan.schedule(), prep_tx_count(&plan))?;
+                let rows = schedule_rows(
+                    &plan.funding_notes(),
+                    plan.note_split().note_fee_buffer(),
+                    plan.schedule(),
+                    prep_tx_count(&plan),
+                )?;
                 let transfers = rows
                     .into_iter()
                     .map(|(id, amount, _, expiry)| {
                         Ok(FfiTransferProposal {
-                            id: cstring_raw(&u32::from(id).to_string(), "transfer proposal id")?,
+                            id: u32::from(id),
                             amount: zat_to_i64(amount),
                             anchor_height: i64::from(u32::from(reference_height)),
                             next_executable_after_height: i64::from(u32::from(reference_height)),
@@ -2142,21 +2145,20 @@ pub unsafe extern "C" fn zcashlc_migration_extract_broadcast_tx(
 /// surfaces `RequiresAttention`.
 ///
 /// # Safety
-/// See [`open`]; `transfer_id` must be a valid C string; for tag 0, `txid_bytes` must be valid
-/// for reads of 32 bytes.
+/// See [`open`]; for tag 0, `txid_bytes` must be valid for reads of 32 bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
     db_data: *const u8,
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    transfer_id: *const c_char,
+    transfer_id: u32,
     result_tag: i32,
     txid_bytes: *const u8,
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let id = transfer_id_from_c(transfer_id)?;
+        let id = MigrationTxId::new(transfer_id);
         match result_tag {
             0 => {
                 if txid_bytes.is_null() {
@@ -2440,7 +2442,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    ids: *const *const c_char,
+    ids: *const u32,
     ids_len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
@@ -2537,7 +2539,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    ids: *const *const c_char,
+    ids: *const u32,
     ids_len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
@@ -2567,20 +2569,20 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
 /// Decode the platform's parallel `(id, pczt)` arrays into owned pairs.
 ///
 /// # Safety
-/// `ids`/`pczts`/`pczt_lens` must be valid for reads of `len` elements; every `ids[i]` must be a
-/// valid C string and every `pczts[i]` valid for `pczt_lens[i]` bytes.
+/// `ids`/`pczts`/`pczt_lens` must be valid for reads of `len` elements, and every `pczts[i]` valid
+/// for `pczt_lens[i]` bytes.
 unsafe fn decode_signed_pairs(
-    ids: *const *const c_char,
+    ids: *const u32,
     len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
 ) -> anyhow::Result<Vec<(MigrationTxId, Vec<u8>)>> {
-    let id_ptrs = unsafe { slice_or_empty(ids, len) };
+    let ids = unsafe { slice_or_empty(ids, len) };
     let pczt_ptrs = unsafe { slice_or_empty(pczts, len) };
     let lens = unsafe { slice_or_empty(pczt_lens, len) };
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
-        let id = transfer_id_from_c(id_ptrs[i])?;
+        let id = MigrationTxId::new(ids[i]);
         if pczt_ptrs[i].is_null() {
             return Err(anyhow!("signed pczt at index {i} is null"));
         }
@@ -2702,7 +2704,7 @@ pub unsafe extern "C" fn zcashlc_migration_keystone_decode_sign_batch_part(
 /// the returned pointer with [`zcashlc_free_migration_unsigned_transfer_pczts`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_keystone_apply_batch_signatures(
-    ids: *const *const c_char,
+    ids: *const u32,
     ids_len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
@@ -3030,12 +3032,19 @@ mod tests {
         ));
     }
 
+    /// The fee buffer the row fixtures build their funding notes with; any nonzero value exercises
+    /// the crossing subtraction.
+    const TEST_BUFFER: u64 = 15_000;
+
     #[test]
     fn schedule_rows_sort_chronologically_with_prep_offset() {
         let mut rng = StdRng::seed_from_u64(7);
         let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng);
-        let amounts: Vec<Zatoshis> = (1..=5).map(|i| zat(i * 100_000_000)).collect();
-        let rows = schedule_rows(&amounts, &schedule, 3).unwrap();
+        // Funding notes, i.e. each crossing value PLUS the fee buffer, as the engine mints them.
+        let funding_notes: Vec<Zatoshis> = (1..=5)
+            .map(|i| zat(i * 100_000_000 + TEST_BUFFER))
+            .collect();
+        let rows = schedule_rows(&funding_notes, zat(TEST_BUFFER), &schedule, 3).unwrap();
         assert_eq!(rows.len(), 5);
         // Chronological by broadcast height.
         for pair in rows.windows(2) {
@@ -3045,19 +3054,41 @@ mod tests {
         let mut ids: Vec<u32> = rows.iter().map(|(id, _, _, _)| u32::from(*id)).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![3, 4, 5, 6, 7]);
-        // Amount pairing survives the sort: each id maps back to its crossing's amount.
+        // Amount pairing survives the sort, and each row carries the CROSSING value (the round
+        // denomination the user consented to), not the funding note that funds its fee.
         for (id, amount, _, _) in &rows {
             let crossing = u32::from(*id) - 3;
             assert_eq!(*amount, zat((u64::from(crossing) + 1) * 100_000_000));
         }
     }
 
+    /// A row reports what the transfer moves, never the note it spends: serving the funding note
+    /// would overstate every amount by one transfer fee and stop it being a round denomination.
+    #[test]
+    fn schedule_rows_report_the_crossing_value_not_the_funding_note() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 1, &mut rng);
+        let crossing = 500_000_000;
+        let rows = schedule_rows(
+            &[zat(crossing + TEST_BUFFER)],
+            zat(TEST_BUFFER),
+            &schedule,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            rows[0].1,
+            zat(crossing),
+            "the row must carry the crossing value, not the funding note"
+        );
+    }
+
     #[test]
     fn schedule_rows_reject_length_mismatch() {
         let mut rng = StdRng::seed_from_u64(7);
         let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 3, &mut rng);
-        let amounts = vec![zat(100)];
-        assert!(schedule_rows(&amounts, &schedule, 0).is_err());
+        let funding_notes = vec![zat(100)];
+        assert!(schedule_rows(&funding_notes, zat(0), &schedule, 0).is_err());
     }
 
     // ----- schedule-duration semantics (#1806): from `now` to the LAST scheduled broadcast -----
@@ -3644,13 +3675,12 @@ mod tests {
         );
         assert_eq!(schedule.estimated_duration_hours, 0);
         let row = unsafe { &*schedule.transfers };
-        let row_id = unsafe { CStr::from_ptr(row.id) }
-            .to_str()
-            .expect("the row id is UTF-8");
-        assert_eq!(row_id, "0", "the stored transfer's engine id");
-        // The state-side amount is the FUNDING NOTE (crossing + fee buffer), exactly what the
-        // consent echo compares (`expected_rows_from_state` uses the same `transfer_amount`).
-        assert_eq!(row.amount, 100_010_000);
+        assert_eq!(row.id, 0, "the stored transfer's engine id");
+        // The state-side amount is what the transfer CROSSES: the fixture's funding note is
+        // 100_010_000 (crossing 100_000_000 plus the 10_000 fee buffer), and the row serves the
+        // crossing. The consent echo compares the same value (`expected_rows_from_state` uses the
+        // same `transfer_amount`), so platform and native still agree.
+        assert_eq!(row.amount, 100_000_000);
         assert_eq!(
             row.next_executable_after_height, 3_499_000,
             "the stored scheduled height is served unchanged"
