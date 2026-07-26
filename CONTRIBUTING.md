@@ -113,6 +113,14 @@ main          ───●───────────────●──
 
 ### Cutting a release
 
+`./Scripts/start-release.sh <remote> <version>` performs steps 1 through 4:
+it works out which release this one follows, creates and pushes the release
+branch, creates the review branch, and promotes the CHANGELOG. Pass
+`--dry-run` first to see what it will do. It does not touch `Package.swift` --
+the binary target's URL and checksum are written later by
+`Scripts/release.sh`, once the xcframework exists. The steps below are what it
+automates, and what to do by hand if a release needs to deviate.
+
 1. Create `release/X.Y.Z` **from the previous release tag** and push it to
    upstream. It starts out identical to the last release.
 2. Create `review/X.Y.Z` from the maintenance branch that contains all of the
