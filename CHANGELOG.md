@@ -50,6 +50,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - the same reset-and-retry behavior (including tearing down cached Tor
 - connections via `service.closeConnections()`) as other transport errors, up
 - to `ZcashSDK.serviceFailureRetries` times.
+- Redacting a PCZT for an external signer now delegates to
+  `zcash_client_backend`'s `redact_pczt_for_signer` instead of a
+  hand-rolled reimplementation. This redacts the Ironwood bundle, which the
+  previous implementation left untouched (exposing its Merkle witnesses and
+  output metadata to the signer), and also clears zk-proofs, binding
+  signature keys, dummy spend keys, and v6 anchors that the previous
+  implementation did not.
 - Send-max proposals now spend from the Ironwood pool in addition to
   Sapling and Orchard, so a post-NU6.3 wallet's Ironwood funds are no
   longer silently excluded from a send-max. This affects only the general
