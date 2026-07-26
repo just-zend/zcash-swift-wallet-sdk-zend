@@ -27,6 +27,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serve lightwallet-protocol v0.3.6 (lightwalletd v0.4.18, 2025-05) or newer.
   The public `ZcashError.serviceGetTaddressTxidsFailed` case is unchanged
   aside from its message text.
+- Adding proofs to a PCZT now reuses a cached Orchard-family proving key
+  across the Orchard and Ironwood proofs (both use the same PostNu6_3
+  circuit after NU6.3) instead of rebuilding the key for each, and derives
+  the Ironwood circuit version from the PCZT's consensus branch id rather
+  than hardcoding it. The resulting proofs are unchanged.
+
+## Fixed
+- Redacting a PCZT for an external signer now also redacts the Ironwood
+  bundle (clearing spend witnesses and `output_info` output metadata),
+  matching the Orchard, Sapling, and transparent bundles; previously the
+  Ironwood bundle was left untouched, exposing its Merkle witnesses and
+  wallet output metadata to the signer.
 
 ## Fixed
 - Tor-layer errors (`rustTorConnectToLightwalletd`, `rustTorLwdGetInfo`, `rustTorLwdSubmit`, `rustTorLwdFetchTransaction`, `rustTorLwdLatestBlockHeight`, `rustTorLwdGetTreeState`) are now classified as retryable service errors in `CompactBlockProcessor`. Previously these errors bypassed the service-error retry path and went straight to a fatal sync failure, so a transient Tor circuit/stream issue (e.g. "remote hostname lookup failure", "Failed to obtain exit circuit for ports", "Tor network protocol violation") required a full app restart to recover. They now trigger the same reset-and-retry behavior (including tearing down cached Tor connections via `service.closeConnections()`) as other transport errors, up to `ZcashSDK.serviceFailureRetries` times.

@@ -2879,6 +2879,12 @@ pub unsafe extern "C" fn zcashlc_redact_pczt_for_signer(
                     ar.redact_output_proprietary("zcash_client_backend:output_info");
                 })
             })
+            .redact_ironwood_with(|mut r| {
+                r.redact_actions(|mut ar| {
+                    ar.clear_spend_witness();
+                    ar.redact_output_proprietary("zcash_client_backend:output_info");
+                })
+            })
             .redact_sapling_with(|mut r| {
                 r.redact_spends(|mut sr| sr.clear_witness());
                 r.redact_outputs(|mut or| {
@@ -2994,37 +3000,45 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
 
         let mut prover = Prover::new(pczt);
 
+        // Orchard and Ironwood share the Orchard-family proving system. The circuit
+        // governing each pool under this PCZT's consensus branch selects the proving
+        // key; derive it from the branch id per pool. `cached_orchard_proving_key`
+        // returns a shared key per circuit version, so the Orchard and Ironwood
+        // proofs reuse one key once NU6.3 collapses both onto the PostNu6_3 circuit.
+        let circuit_version_for = |pool| {
+            zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
+                pczt_branch_id,
+                pool,
+            )
+            .map(|v| v.circuit_version())
+        };
+
         if prover.requires_orchard_proof() {
-            let orchard_circuit_version =
-                zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
-                    pczt_branch_id,
-                    orchard::ValuePool::Orchard,
-                )
-                .ok_or_else(|| {
+            let circuit_version =
+                circuit_version_for(orchard::ValuePool::Orchard).ok_or_else(|| {
                     anyhow!("PCZT's consensus branch does not support the Orchard pool")
-                })?
-                .circuit_version();
+                })?;
             prover = prover
-                .create_orchard_proof(&orchard::circuit::ProvingKey::build(
-                    orchard_circuit_version,
-                ))
+                .create_orchard_proof(
+                    zcash_primitives::transaction::builder::cached_orchard_proving_key(
+                        circuit_version,
+                    ),
+                )
                 .map_err(|e| anyhow!("Failed to create Orchard proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_orchard_proof());
 
         if prover.requires_ironwood_proof() {
-            // Post-NU6.3 proposals route orchard-receiver outputs and change
-            // into Ironwood bundles (the Orchard turnstile forbids adding value
-            // to Orchard once NU6.3 is active), so any PCZT built after
-            // activation can carry an Ironwood bundle that must be proven before
-            // extraction — otherwise a hardware-signed transaction fails at
-            // extract with MissingProof. The Ironwood bundle uses the PostNu6_3
-            // circuit (the fixed circuit plus the `disableCrossAddress`
-            // constraint), a distinct proving key from the Orchard pool's.
+            let circuit_version =
+                circuit_version_for(orchard::ValuePool::Ironwood).ok_or_else(|| {
+                    anyhow!("PCZT's consensus branch does not support the Ironwood pool")
+                })?;
             prover = prover
-                .create_ironwood_proof(&orchard::circuit::ProvingKey::build(
-                    orchard::circuit::OrchardCircuitVersion::PostNu6_3,
-                ))
+                .create_ironwood_proof(
+                    zcash_primitives::transaction::builder::cached_orchard_proving_key(
+                        circuit_version,
+                    ),
+                )
                 .map_err(|e| anyhow!("Failed to create Ironwood proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_ironwood_proof());
