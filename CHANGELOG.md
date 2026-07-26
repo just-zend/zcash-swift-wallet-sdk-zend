@@ -6,6 +6,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- `ZcashError.initializerSeedMismatch` (`ZINIT0006`): `prepare(with:walletBirthday:for:name:keySource:)`
+  now validates the provided seed against the wallet's existing seed-derived accounts and throws
+  instead of silently opening a wallet the seed cannot spend from. Restoring a different wallet
+  requires `wipe()` first. Wallets whose only accounts are imported (hardware-wallet UFVKs) are
+  exempt — the relevance check is delegated to the Rust core, which treats "there is no seed-derived
+  account to validate against" as relevant, so a hardware-wallet-only wallet is never bricked. See
+  `MIGRATING.md`.
+
 ## Changed
 - `Initializer.initialize` / `Synchronizer.prepare` now return `InitializationResult.seedNotRelevant` instead of silently proceeding when the rust layer reports the provided seed is not relevant to the wallet database (breaking change: `InitializationResult` gained a new case, so exhaustive switches over it must add a case; see MIGRATING.md). Previously this case was indistinguishable from `.success`: account creation was skipped (accounts already existed) and callers proceeded as if they had prepared the wallet they expected, even when the database on disk belonged to a different wallet than the provided seed (e.g. a device-backup restore that brings back `data.db` without the matching keychain seed). Callers must now handle `.seedNotRelevant` the same way they already handle `.seedRequired`. (MOB-1512)
 
