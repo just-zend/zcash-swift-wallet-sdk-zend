@@ -31,6 +31,10 @@ public enum ZcashError: Equatable, Error {
     /// Can't set `isExcludedFromBackup` flag to `generalStorageURL`.
     /// ZINIT0005
     case initializerCantSetNoBackupFlagToGeneralStorageURL(_ generalStorageURL: URL, _ error: Error)
+    /// The seed passed to `prepare` does not match the seed-derived account(s) already stored in `data.db`; restoring a different wallet requires wiping first.
+    /// Proceeding would desync the keychain seed from the on-disk account (funds shown/received for an address the seed cannot spend).
+    /// ZINIT0006
+    case initializerSeedMismatch
     /// Unknown GRPC Service error
     /// ZSRVC0001
     case serviceUnknownError(_ error: Error)
@@ -790,6 +794,7 @@ public enum ZcashError: Equatable, Error {
         case .initializerGeneralStorageExistsButIsFile: return "Object on disk at `generalStorageURL` path exists. But it file not directory."
         case .initializerGeneralStorageCantCreate: return "Can't create directory at `generalStorageURL` path."
         case .initializerCantSetNoBackupFlagToGeneralStorageURL: return "Can't set `isExcludedFromBackup` flag to `generalStorageURL`."
+        case .initializerSeedMismatch: return "The seed passed to `prepare` does not match the seed-derived account(s) already stored in `data.db`; restoring a different wallet requires wiping first."
         case .serviceUnknownError: return "Unknown GRPC Service error"
         case .serviceGetInfoFailed: return "LightWalletService.getInfo failed."
         case .serviceLatestBlockFailed: return "LightWalletService.latestBlock failed."
@@ -1014,6 +1019,7 @@ public enum ZcashError: Equatable, Error {
         case .initializerGeneralStorageExistsButIsFile: return .initializerGeneralStorageExistsButIsFile
         case .initializerGeneralStorageCantCreate: return .initializerGeneralStorageCantCreate
         case .initializerCantSetNoBackupFlagToGeneralStorageURL: return .initializerCantSetNoBackupFlagToGeneralStorageURL
+        case .initializerSeedMismatch: return .initializerSeedMismatch
         case .serviceUnknownError: return .serviceUnknownError
         case .serviceGetInfoFailed: return .serviceGetInfoFailed
         case .serviceLatestBlockFailed: return .serviceLatestBlockFailed
