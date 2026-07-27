@@ -461,7 +461,9 @@ public class Initializer {
         self.walletBirthday = checkpoint.height
 
         // If there are no accounts it must be created, the default amount of accounts is 1
-        if let seed, try await rustBackend.listAccounts().isEmpty {
+        let existingAccounts = try await rustBackend.listAccounts()
+        try await validateSeedAgainstExistingAccounts(seed, existingAccounts: existingAccounts)
+        if let seed, existingAccounts.isEmpty {
             var chainTip: UInt32?
             var accountTreeState = checkpoint.treeState()
 
@@ -503,6 +505,24 @@ public class Initializer {
         }
 
         return .success
+    }
+
+    /// Seed↔account integrity guard: `initialize` is idempotent for an existing wallet, so
+    /// restoring a DIFFERENT seed over existing accounts previously no-op'd silently — the
+    /// keychain held seed B while data.db kept seed A's account, the app showed A's balance AND
+    /// receive address (funds receivable but unspendable), and sends failed ZRUST0002. Validate
+    /// the caller's seed against the stored derived account(s) before opening.
+    ///
+    /// The relevance check is delegated to the Rust core, which reports the seed relevant when it
+    /// derives an existing account, when there are no accounts, or when there is no seed-derived
+    /// account to validate against — so imported-only wallets (hardware-wallet UFVKs) are exempt.
+    /// Only a genuine mismatch against existing seed-derived accounts throws. This must not use a
+    /// Swift-side heuristic on `seedFingerprint`/`hdAccountIndex`, since those are also populated
+    /// for imported-spending accounts and would falsely brick hardware-wallet-only wallets.
+    private func validateSeedAgainstExistingAccounts(_ seed: [UInt8]?, existingAccounts: [Account]) async throws {
+        guard let seed, !existingAccounts.isEmpty else { return }
+        let seedIsRelevant = try await rustBackend.isSeedRelevantToAnyDerivedAccount(seed: seed)
+        guard seedIsRelevant else { throw ZcashError.initializerSeedMismatch }
     }
 
     /**

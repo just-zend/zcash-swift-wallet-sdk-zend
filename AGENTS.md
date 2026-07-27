@@ -76,7 +76,7 @@ The `CompactBlockProcessor` downloads compact blocks via `Block/Download/`, stor
 
 ### Networking
 
-- gRPC lightwalletd client: `Modules/Service/GRPC/` (proto files under `ProtoBuf/proto/` — generated `*.pb.swift`/`*.grpc.swift` files are checked in and excluded from SwiftLint; regenerate them, don't hand-edit).
+- gRPC lightwalletd client: `Modules/Service/GRPC/`. The lightwalletd proto files are vendored from https://github.com/zcash/lightwallet-protocol as a git subtree under `lightwallet-protocol/`; update them with `Scripts/update-lightwallet-protocol.sh <ref>` (needs `protoc`, provided by `nix develop`), which also regenerates the checked-in `*.pb.swift`/`*.grpc.swift` sources (excluded from SwiftLint; regenerate, don't hand-edit). `ProtoBuf/proto/proposal.proto` is vendored from librustzcash, not the subtree.
 - Tor: `Modules/Service/Tor/` and `Tor/TorClient.swift`. A Tor directory is provisioned in the Initializer config.
 - `Modules/Service/LightWalletService.swift` is the service-level abstraction the rest of the SDK depends on.
 
@@ -122,9 +122,10 @@ Every public API parameter that carries a domain value — key material, seeds, 
 - **TODOs**: format as `TODO: [#<issue_number>] ...` — bare `TODO:`/`FIXME:` warn.
 - **SwiftLint disables**: only the exceptions listed in `SWIFTLINT.md` are permitted, always scoped with `// swiftlint:disable:next` / `disable:previous` / region blocks. `SWIFTLINT.md` also documents the required Xcode setting for trimming trailing whitespace (including whitespace-only lines) — configure it before editing.
 - **Comments**: properly punctuated prose sentences that explain *why*, not *what* (see `CONTRIBUTING.md`).
-- **Commits and PRs**: every PR must reference an issue. Commit title format is `[#<issue_number>] <self-descriptive title>` (see `CONTRIBUTING.md`). PRs are typically squash-merged.
+- **Commits and PRs**: every PR must reference an issue. Commit title format is `[#<issue_number>] <self-descriptive title>` (see `CONTRIBUTING.md`). PRs are always landed with a merge commit, never squash-merged; keep branch commits tidy and self-contained.
 - **Test plan**: every PR needs a documented test plan, including how to manually verify the change on testnet where applicable (see `CODE_REVIEW_GUIDELINES.md`).
 - **Docs location**: user-facing documentation belongs in `docs/`.
+- **Design docs and plans**: write them to `.plans/` at the repository root, which is gitignored. Design notes, implementation plans, and handoff documents are conversation artifacts, not repository history — never commit them. Create `.plans/` (and add it to the checked-in `.gitignore`) if it is absent, and report the full, untruncated path of anything written there so it can be copy-pasted.
 - **Rust formatting**: always run `cargo fmt` in `rust/` before committing changes to the Rust code. Consistent formatting keeps diffs minimal and avoids spurious conflicts when rebasing.
 - **Breaking API changes**: document them in `MIGRATING.md`, and add a `CHANGELOG.md` entry for every user-visible change.
 - **Main branch policy**: `main` is development-stable (all merges build + tests pass) but clients must depend on published tags, never on `main`.

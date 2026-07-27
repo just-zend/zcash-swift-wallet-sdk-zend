@@ -30,8 +30,8 @@ if useLocalFFI {
     targets.append(
         .binaryTarget(
             name: "libzcashlc",
-            url: "https://github.com/zcash/zcash-swift-wallet-sdk/releases/download/2.6.0-alpha.6/libzcashlc.xcframework.zip",
-            checksum: "c58c1714440f8fd40bed33eefa3be325896e58eb568ed8747c05a27dae3a74b2"
+            url: "https://github.com/zcash/zcash-swift-wallet-sdk/releases/download/2.8.0-rc.1/libzcashlc.xcframework.zip",
+            checksum: "b1e4196eb1a32c8f5c114766863876cbeda999ed62d5109d5164add57c6d280b"
         )
     )
     sdkDependencies.append("libzcashlc")
@@ -42,9 +42,7 @@ targets.append(contentsOf: [
         name: "ZcashLightClientKit",
         dependencies: sdkDependencies,
         exclude: [
-            "Modules/Service/GRPC/ProtoBuf/proto/compact_formats.proto",
             "Modules/Service/GRPC/ProtoBuf/proto/proposal.proto",
-            "Modules/Service/GRPC/ProtoBuf/proto/service.proto",
             "Error/Sourcery/"
         ],
         resources: [
