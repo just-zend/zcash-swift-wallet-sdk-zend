@@ -25,7 +25,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VotingNoteInfo`, `VotingPczt`, `VotingDelegationKeyInputs`) now conform to
   `Undescribable` so their contents cannot leak through logging or reflection.
 
-# v2.8.0-rc.1 - PLANNED
+# v2.8.0-rc.1 - 2026-07-26
 
 ## Added
 - `ZcashError.initializerSeedMismatch` (`ZINIT0006`):
