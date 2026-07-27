@@ -6,6 +6,54 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+- The lightwalletd protobuf definitions (`compact_formats.proto`,
+  `service.proto`) are now vendored from
+  https://github.com/zcash/lightwallet-protocol as a git subtree under
+  `lightwallet-protocol/`, currently at v0.5.0, and the generated Swift
+  sources have been regenerated from it. Future updates should use
+  `Scripts/update-lightwallet-protocol.sh <ref>`, which pulls the subtree and
+  regenerates the sources (a nix dev shell providing `protoc` is available
+  via the new `flake.nix`). Protocol v0.5.0 renames `CompactTx.hash` to
+  `CompactTx.txid`, removes `CompactTx.protoVersion`, and adds transparent
+  `vin`/`vout` data, the `PoolType` enum, `BlockRange.poolTypes`, and new
+  `LightdInfo` fields; these generated types are internal to the SDK, so the
+  public API is unchanged.
+- Transparent-address transaction enhancement now uses the
+  `GetTaddressTransactions` RPC in place of the deprecated (and otherwise
+  identical) `GetTaddressTxids`, so it requires a lightwalletd new enough to
+  serve lightwallet-protocol v0.3.6 (lightwalletd v0.4.18, 2025-05) or newer.
+  The public `ZcashError.serviceGetTaddressTxidsFailed` case is unchanged
+  aside from its message text.
+- Adding proofs to a PCZT now reuses a cached Orchard-family proving key
+  across the Orchard and Ironwood proofs (both use the same PostNu6_3
+  circuit after NU6.3) instead of rebuilding the key for each, and derives
+  the Ironwood circuit version from the PCZT's consensus branch id rather
+  than hardcoding it. The resulting proofs are unchanged.
+
+## Fixed
+- Hardware-wallet signing of post-NU6.3 (v6) transactions: the
+  wallet-controlled zero-value Orchard spends that pad such transactions now
+  carry ZIP 32 derivation metadata (via `zcash_client_backend 0.24.0-rc.4`),
+  so signers can identify and sign them. Previously these actions were
+  unsignable and v6 sends failed at finalization with a missing
+  spend-auth-signature error even though the device approved the
+  transaction.
+- Redacting a PCZT for an external signer now requests
+  `zcash_client_backend`'s full (non-compacted) signer view, and the PCZT
+  encoding sent to the signer is the minimal version capable of representing
+  its content (v1 for v5 transactions). The compact signer view previously
+  adopted here requires receiver capabilities (v2 PCZT encoding,
+  compact-field resolution) that deployed hardware-signer firmware does not
+  provide in its ordinary signing flow, causing Keystone sends to fail at
+  finalization with a missing-signature error. The Ironwood bundle redaction
+  is preserved: the full view clears Ironwood spend witnesses and output
+  metadata alongside the other bundles.
+- Send-max proposals now spend from the Ironwood pool in addition to
+  Sapling and Orchard, so a post-NU6.3 wallet's Ironwood funds are no
+  longer silently excluded from a send-max. This affects only the general
+  send-max proposal; the Orchard-to-Ironwood migration is unchanged.
+
 # 2.7.0-rc.1 - 2026-07-25
 
 ## Added
