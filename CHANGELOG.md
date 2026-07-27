@@ -15,6 +15,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account to validate against" as relevant, so a hardware-wallet-only wallet is never bricked. See
   `MIGRATING.md`.
 
+# 2.7.0-rc.2 - 2026-07-26
+
 ## Changed
 - `Initializer.initialize` and `Synchronizer.prepare` now return
   `InitializationResult.seedNotRelevant` instead of silently proceeding when
