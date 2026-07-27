@@ -319,6 +319,13 @@ pub struct Balance {
     /// confirmations to be spendable, or for which witnesses cannot yet be constructed without
     /// additional scanning.
     value_pending_spendability: i64,
+
+    /// The value in the account that is currently locked by an explicit output lock (e.g. the
+    /// migration residual locked via `zcashlc_migration_lock_residual`) and therefore excluded
+    /// from `spendable_value`. Locked value still belongs to the account: it is part of the
+    /// account's total (the sum of this struct's fields), it just cannot be selected for spending
+    /// until it is unlocked.
+    locked_value: i64,
 }
 
 impl Balance {
@@ -329,6 +336,7 @@ impl Balance {
                 .into(),
             value_pending_spendability: ZatBalance::from(balance.value_pending_spendability())
                 .into(),
+            locked_value: ZatBalance::from(balance.locked_value()).into(),
         }
     }
 }

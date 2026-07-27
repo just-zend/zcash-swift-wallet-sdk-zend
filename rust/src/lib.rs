@@ -42,6 +42,7 @@ use zcash_client_backend::{
         Account, AccountBirthday, AccountPurpose, CoinbaseFilter, InputSource, MaxSpendMode,
         SeedRelevance, TransactionDataRequest, TransactionStatus, TransparentKeyOrigin,
         WalletCommitmentTrees, WalletRead, WalletWrite, Zip32Derivation,
+        anchor_retention::AnchorRetentionInterval,
         chain::{CommitmentTreeRoot, scan_cached_blocks},
         scanning::ScanPriority,
         wallet::{
@@ -67,11 +68,12 @@ use zcash_client_sqlite::{
     chain::{BlockMeta, init::init_blockmeta_db},
     error::SqliteClientError,
     util::SystemClock,
-    wallet::init::{WalletMigrationError, init_wallet_db},
+    wallet::init::{WalletMigrationError, WalletMigrator},
 };
 use zcash_primitives::{
     block::BlockHash,
     merkle_tree::HashSer,
+    transaction::builder::BundlePadding,
     transaction::{Transaction, TxId},
 };
 use zcash_proofs::prover::LocalTxProver;
@@ -91,7 +93,13 @@ use zip32::fingerprint::SeedFingerprint;
 
 mod derivation;
 mod eip681;
+mod ext_schema;
 mod ffi;
+mod migration;
+mod migration_engine;
+mod migration_finalize;
+mod migration_keystone;
+mod migration_plan_cache;
 mod tor;
 // Voting stays UNGATED: the module compiles as honest-error stubs (15 C symbols preserved —
 // Zodl macOS links them; a cargo feature gate would drop them from the staticlib and break
@@ -120,7 +128,38 @@ where
     }
 }
 
+/// The anchor bucket interval used on every network other than production mainnet: 12 blocks, so
+/// that a ZIP 318 pool migration passes through enough anchor boundaries to be exercised end to
+/// end in a test run instead of over days of chain.
+///
+/// Shortening the grid also shortens the transfer and preparation delays, which the migration
+/// backend derives from it, so this is the only value to choose.
+const TEST_ANCHOR_RETENTION_INTERVAL: AnchorRetentionInterval =
+    AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("12 is nonzero"));
+
+/// The grid on which a wallet on `network` retains note commitment tree checkpoints as durable
+/// anchors, and correspondingly the grid its pool migrations anchor their transfers to.
+///
+/// Production mainnet gets the ZIP 318 interval, which every wallet on that network must share:
+/// the anonymity set a boundary anchor provides is exactly the set of transfers that chose the same
+/// boundary, so a wallet retaining a different grid than its peers is distinguishable from them.
+/// Testnet and custom-parameter networks — which exist to exercise the migration, not to hide in a
+/// crowd — get [`TEST_ANCHOR_RETENTION_INTERVAL`].
+pub(crate) fn anchor_retention_interval(network: NetworkParams) -> AnchorRetentionInterval {
+    match network {
+        NetworkParams::Standard(MainNetwork) => AnchorRetentionInterval::ZIP_318,
+        NetworkParams::Standard(TestNetwork) | NetworkParams::Custom { .. } => {
+            TEST_ANCHOR_RETENTION_INTERVAL
+        }
+    }
+}
+
 /// Helper method for construcing a WalletDb value from path data provided over the FFI.
+///
+/// The returned handle retains its durable anchor checkpoints on the interval
+/// [`anchor_retention_interval`] selects for `network`, which is also the grid the next pool
+/// migration planned over this wallet will anchor to. Every wallet handle the FFI hands out is
+/// built here, so the two cannot be configured inconsistently.
 ///
 /// # Safety
 ///
@@ -139,6 +178,7 @@ unsafe fn wallet_db(
         slice::from_raw_parts(db_data, db_data_len)
     }));
     WalletDb::for_path(db_data, network, SystemClock, OsRng)
+        .map(|db| db.with_anchor_retention_interval(anchor_retention_interval(network)))
         .map_err(|e| anyhow!("Error opening wallet database connection: {}", e))
 }
 
@@ -310,7 +350,13 @@ pub unsafe extern "C" fn zcashlc_init_data_database(
             ))
         };
 
-        match init_wallet_db(&mut db_data, seed) {
+        let migrator =
+            WalletMigrator::new().with_external_migrations(ext_schema::external_migrations());
+        let migrator = match seed {
+            Some(seed) => migrator.with_seed(seed),
+            None => migrator,
+        };
+        match migrator.init_or_migrate(&mut db_data) {
             Ok(_) => Ok(0),
             Err(e)
                 if matches!(
@@ -2702,6 +2748,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             &SpendingKeys::from_unified_spending_key(usk),
             OvkPolicy::Sender,
             &proposal,
+            // No expiry override: keep the builder-derived expiry the SDK has always used.
             None,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
@@ -2776,9 +2823,9 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
                 OvkPolicy::Sender,
                 &proposal,
                 // Use the transaction's default expiry height and the default Orchard
-                // bundle type; the SDK does not expose overrides for these.
+                // bundle padding; the SDK does not expose overrides for these.
                 None,
-                orchard::builder::BundleType::DEFAULT,
+                BundlePadding::DEFAULT,
             )
             .map_err(|e| anyhow!("Error creating PCZT from single-step proposal: {}", e))?;
 
@@ -4463,4 +4510,51 @@ pub(crate) fn parse_optional_height(value: i64) -> anyhow::Result<Option<BlockHe
         -1 => None,
         _ => Some(BlockHeight::try_from(value)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the production network gets the ZIP 318 grid, whose anonymity set depends on every
+    /// wallet sharing it. Testnet gets the shortened grid, so a migration passes through anchor
+    /// boundaries fast enough to be exercised.
+    #[test]
+    fn only_mainnet_retains_anchors_on_the_zip_318_grid() {
+        assert_eq!(
+            anchor_retention_interval(NetworkParams::Standard(MainNetwork)),
+            AnchorRetentionInterval::ZIP_318,
+        );
+        assert_eq!(
+            anchor_retention_interval(NetworkParams::Standard(TestNetwork)),
+            TEST_ANCHOR_RETENTION_INTERVAL,
+        );
+        assert_eq!(TEST_ANCHOR_RETENTION_INTERVAL.block_count().get(), 12);
+    }
+
+    /// A custom-parameter network is a test deployment even when it borrows mainnet's address
+    /// encoding, so it must not inherit the production grid along with that identity.
+    #[test]
+    fn a_mainnet_based_custom_network_is_not_the_production_network() {
+        let height = Some(BlockHeight::from_u32(1));
+        let custom = NetworkParams::Custom {
+            base: NetworkType::Main,
+            local: LocalNetwork {
+                overwinter: height,
+                sapling: height,
+                blossom: height,
+                heartwood: height,
+                canopy: height,
+                nu5: height,
+                nu6: height,
+                nu6_1: height,
+                nu6_2: height,
+                nu6_3: height,
+            },
+        };
+        assert_eq!(
+            anchor_retention_interval(custom),
+            TEST_ANCHOR_RETENTION_INTERVAL,
+        );
+    }
 }

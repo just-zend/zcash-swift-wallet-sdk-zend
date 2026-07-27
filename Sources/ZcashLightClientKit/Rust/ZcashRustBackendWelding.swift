@@ -403,4 +403,213 @@ protocol ZcashRustBackendWelding {
 
     /// Attempts to delete an account defined by UUID
     func deleteAccount(_ accountUUID: AccountUUID) async throws
+
+    // MARK: - Ironwood migration
+
+    /// Current Orchard -> Ironwood migration state for `account`. This is also the reconciliation
+    /// hub: call it on launch and after every migration-related operation.
+    /// - Throws: `rustMigrationState` if the rust layer returns an error.
+    func migrationState(for account: AccountUUID) async throws -> MigrationState
+
+    /// Live migration progress, or `nil` when no migration is in progress.
+    /// - Throws: `rustMigrationProgress` if the rust layer returns an error.
+    func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress?
+
+    /// Whether the Orchard notes must be split before migration.
+    ///
+    /// - Throws: `rustMigrationIsNoteSplitNeeded` if the rust layer returns an error. In particular,
+    ///   on a wallet that has never completed a sync (no chain tip known) this throws rather than
+    ///   returning `false`.
+    func migrationIsNoteSplitNeeded(for account: AccountUUID) async throws -> Bool
+
+    /// Whether any scheduled transfer is past its send height but not yet broadcast.
+    /// - Throws: `rustMigrationHasOverdueTransfers` if the rust layer returns an error.
+    func migrationHasOverdueTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// Whether the migration is in an invalid state (spendable Orchard remains but no scheduled
+    /// transfer covers it).
+    /// - Throws: `rustMigrationHasInvalidTransfers` if the rust layer returns an error.
+    func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool
+
+    /// The optimal note split for the spendable Orchard balance.
+    /// - Throws: `rustMigrationPrepareNoteSplit` if the rust layer returns an error.
+    func migrationPrepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
+
+    /// Builds, signs, and persists the note-split transaction; returns the broadcastable prepared
+    /// transfer. Only `proposal.proposalHandle` crosses to the native side — it identifies the
+    /// exact cached plan the user was shown, and the native side refuses to sign any other plan,
+    /// so a stale display cannot sign different values than the ones the user approved.
+    /// - Throws: `migrationPlanStale` when the identified plan is missing (process restart
+    ///   between propose and confirm) or superseded by a later propose/prepare call, and no
+    ///   resumable run is stored — re-propose and re-display; `rustMigrationSignNoteSplit` for
+    ///   other rust-layer errors.
+    func migrationSignNoteSplit(
+        proposal: NoteSplitProposal,
+        usk: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws -> PreparedMigrationTransfer
+
+    /// The leftover Orchard balance a migration would not cross, when it is large enough to be
+    /// worth offering the user a choice about; `nil` when there is no such residual.
+    ///
+    /// - Throws: `rustMigrationResidualAfterMigration` if the rust layer returns an error. In
+    ///   particular, on a wallet that has never completed a sync (no chain tip known) this throws
+    ///   rather than returning `nil`.
+    func migrationResidualAfterMigration(for account: AccountUUID) async throws -> Zatoshi?
+
+    /// Locks EVERY currently-spendable, not-already-locked legacy-Orchard note of the account
+    /// until explicit unlock and returns the total value locked (`Zatoshi(0)` when nothing was
+    /// spendable — a legitimate result). Intended to be called at migration `Complete` to lock
+    /// the sub-threshold residual that stays in Orchard (the "Lock balance" choice); the lock
+    /// never expires on its own, so only `unlockMigrationResidual` releases it. Already-locked
+    /// notes are excluded from selection, so repeating the call locks (and reports) only notes
+    /// that became spendable since. Locked value leaves `PoolBalance.spendableValue` but stays
+    /// in `PoolBalance.lockedValue` (and therefore in `total()`).
+    /// - Throws: `rustMigrationLockResidual` if the rust layer returns an error (including a
+    ///   concurrent-lock race, which the caller may retry).
+    func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi
+
+    /// Unlocks the account's locked outputs — the release half of `lockMigrationResidual` — and
+    /// returns the number of outputs unlocked (`0` when nothing was locked). Clears ALL locks
+    /// held for the account; that blanket clear is safe because the SDK never creates
+    /// proposal-scoped output locks.
+    /// - Throws: `rustMigrationUnlockResidual` if the rust layer returns an error.
+    func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int
+
+    /// Estimates how the account migrates its whole spendable Orchard balance: the number of
+    /// migration RUNS ("rounds") it takes, and for each run both what it migrates and what
+    /// preparing it costs, so the platform can preview and compare the two — including external-
+    /// signer session counts for any per-session capacity — before anything is planned or
+    /// committed. A zero (or fully sub-quantum) balance yields the ZERO-RUN estimate
+    /// (`runCount == 0`), a legitimate answer, not an error.
+    /// - Throws: `rustMigrationEstimateRuns` if the rust layer returns an error.
+    func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate
+
+    /// The full migration schedule for the spendable Orchard balance.
+    /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
+    func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// Proposes the immediate (single-transaction) migration: sweeps the whole spendable Orchard
+    /// balance into one Ironwood output, executable now.
+    /// - Throws: `rustMigrationProposeImmediateTransfers` if the rust layer returns an error.
+    func migrationProposeImmediateTransfers(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// Pre-signs and persists every transfer in `schedule` (a no-op when a matching non-terminal
+    /// run is already stored — the normal case, since the note-split submission commits the run).
+    /// Only `schedule.proposalHandle` crosses to the native side — the schedule's display fields
+    /// are never echoed back. A fresh commit signs exactly the cached plan the handle identifies;
+    /// the resume/no-op case does not consult the handle (the stored run is durable, already
+    /// handle-verified state).
+    /// - Throws: `migrationPlanStale` when nothing is committed and the identified plan is
+    ///   missing (process restart) or superseded by a later propose/prepare call — re-propose
+    ///   and re-display the new schedule before retrying; `rustMigrationSignAndStoreSchedule`
+    ///   for other rust-layer errors.
+    func migrationSignAndStoreSchedule(
+        _ schedule: MigrationSchedule,
+        usk: UnifiedSpendingKey,
+        for account: AccountUUID
+    ) async throws
+
+    /// The next height-due pre-signed transfer, or `nil` when nothing is currently due.
+    /// - Throws: `rustMigrationNextDueTransfer` if the rust layer returns an error.
+    func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedMigrationTransfer?
+
+    /// The next height-due scheduled transfer's full proposal (amount, anchor, timing) for the
+    /// active run, or `nil` when nothing is currently pending (no active run, or only the note-split
+    /// prep is pending). The proposal-level counterpart of `migrationNextDueTransfer`: it exposes the
+    /// heights (notably `nextExecutableAfterHeight`) so a host can re-arm its own background window
+    /// without parsing the signed PCZT.
+    /// - Throws: `rustMigrationPendingTransferProposal` if the rust layer returns an error.
+    func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal?
+
+    /// Extracts the broadcast-ready consensus transaction bytes from a signed PCZT (the
+    /// `PreparedMigrationTransfer.pczt` returned by `migrationNextDueTransfer` or
+    /// `migrationSignNoteSplit`).
+    /// - Throws: `rustMigrationExtractBroadcastTx` if the rust layer returns an error.
+    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data
+
+    /// Records the platform's broadcast outcome for `transferId`, advancing the engine's state.
+    /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error;
+    ///           `migrationInvalidTxId` if `result` is `.success` and its `txId` does not decode
+    ///           to a 32-byte transaction id.
+    func migrationRecordTransferResult(
+        transferId: UInt32,
+        result: MigrationTransferResult,
+        for account: AccountUUID
+    ) async throws
+
+    /// Cancels the stored run (its pre-signed transactions are abandoned; already-broadcast ones
+    /// are unaffected on-chain), clears the invalid marks, and previews a fresh schedule against
+    /// the live balance for the re-confirm lane.
+    /// - Throws: `rustMigrationRestartStep` if the rust layer returns an error.
+    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule
+
+    /// Rebuilds every EXPIRED transfer of the stored migration run in place through the engine:
+    /// each rebuilt transfer re-spends the SAME funding note (recovered from the expired PCZT by
+    /// nullifier identity, never an equal-value substitute) on a fresh schedule — a fresh
+    /// memoryless delay from the current tip, a fresh canonical expiry, and a freshly drawn
+    /// boundary anchor. Passing a spending key signs each rebuilt transfer anew in-process;
+    /// passing `nil` (an external-signer account, whose spend authority never exists on this
+    /// device) leaves it awaiting its signature, so the `migrationCreateUnsignedTransferPczts` /
+    /// `migrationStoreSignedSchedulePczts` ceremony re-serves and completes it.
+    ///
+    /// Returns the run's FULL transfer schedule as stored AFTER the refresh — the same shape
+    /// `migrationRestartStep` returns, here read from the persisted run (its `proposalHandle` is
+    /// `0`: a stored run is durable, already handle-verified state that commit-shaped calls
+    /// resume without consulting a handle). The rebuilt state persists all-or-nothing, and the
+    /// returned schedule is that atomically-persisted truth for the host to re-display (a
+    /// rebuilt transfer's fresh scheduled/expiry heights exist nowhere else). With nothing
+    /// expired the current stored schedule comes back unchanged; with no stored run, or a
+    /// terminal (completed or cancelled) one, the schedule is empty.
+    /// - Throws: `rustMigrationRefreshStaleTransfers` if the rust layer returns an error —
+    ///   notably when an expired transfer's funding note was spent outside the migration, where
+    ///   the message names `restartCurrentMigrationStep` (cancel and re-plan) as the remedy. On
+    ///   any throw nothing was persisted.
+    func migrationRefreshStaleTransfers(
+        usk: UnifiedSpendingKey?,
+        for account: AccountUUID
+    ) async throws -> MigrationSchedule
+
+    /// Builds the whole previewed migration UNSIGNED for an external signer — the run is created
+    /// by this call, with every transaction persisted awaiting its signature — and returns the
+    /// preparation (note-split) subset of the PCZTs for the signing ceremony. The transfer subset
+    /// of the same build is served by `migrationCreateUnsignedTransferPczts`. Resumes a stored
+    /// non-terminal run; replaces a terminal one (the sequential-runs path). Only
+    /// `schedule.proposalHandle` crosses to the native side: the run is built from exactly the
+    /// cached plan the user-reviewed schedule identifies.
+    /// - Throws: `migrationPlanStale` when the identified plan is missing (process restart) or
+    ///   superseded by a later propose/prepare call — re-propose and re-display;
+    ///   `rustMigrationCreateUnsignedNoteSplitPczt` for other rust-layer errors.
+    func migrationCreateUnsignedNoteSplitPczts(
+        for schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> [MigrationUnsignedTransferPczt]
+
+    /// Applies the ceremony's signatures to the run's preparation (note-split) transactions,
+    /// all-or-nothing: every element must match a stored transaction awaiting its signature or
+    /// nothing is persisted. Returns a STORAGE RECEIPT for the first preparation transaction (its
+    /// `txid` is zeroed — the broadcastable, proven value is served by the delivery lane).
+    /// - Throws: `rustMigrationStoreSignedNoteSplitPczt` if the rust layer returns an error.
+    func migrationStoreSignedNoteSplitPczts(
+        _ signed: [MigrationSignedTransferPczt],
+        for account: AccountUUID
+    ) async throws -> PreparedMigrationTransfer
+
+    /// Serves the TRANSFER subset of the unsigned build for the signing ceremony (see
+    /// `migrationCreateUnsignedNoteSplitPczts` — the run and every unsigned transaction already
+    /// exist, so the normal path here is the handle-free resume of the stored run;
+    /// `schedule.proposalHandle` only gates the fresh-build case where this call is the one
+    /// creating the run).
+    /// - Throws: `migrationPlanStale` when nothing is committed and the identified plan is
+    ///   missing or superseded — re-propose and re-display;
+    ///   `rustMigrationCreateUnsignedTransferPczts` for other rust-layer errors.
+    func migrationCreateUnsignedTransferPczts(
+        for schedule: MigrationSchedule,
+        for account: AccountUUID
+    ) async throws -> [MigrationUnsignedTransferPczt]
+
+    /// Accepts the full set of externally signed transfer PCZTs (all-or-nothing) and, if every
+    /// staged transfer is matched exactly, persists the committed schedule.
+    /// - Throws: `rustMigrationStoreSignedSchedulePczts` if the rust layer returns an error.
+    func migrationStoreSignedSchedulePczts(_ signed: [MigrationSignedTransferPczt], for account: AccountUUID) async throws
 }
