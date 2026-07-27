@@ -31,12 +31,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Fixed
 - Tor-layer errors (`rustTorConnectToLightwalletd`, `rustTorLwdGetInfo`, `rustTorLwdSubmit`, `rustTorLwdFetchTransaction`, `rustTorLwdLatestBlockHeight`, `rustTorLwdGetTreeState`) are now classified as retryable service errors in `CompactBlockProcessor`. Previously these errors bypassed the service-error retry path and went straight to a fatal sync failure, so a transient Tor circuit/stream issue (e.g. "remote hostname lookup failure", "Failed to obtain exit circuit for ports", "Tor network protocol violation") required a full app restart to recover. They now trigger the same reset-and-retry behavior (including tearing down cached Tor connections via `service.closeConnections()`) as other transport errors, up to `ZcashSDK.serviceFailureRetries` times.
 
-## Removed
+## Added
 - The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
   `PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe`, and the
-  `zcashlc_voting_*` FFI) has been removed, as it was on the 2.7.0-rc.1 release.
-  `zcash_voting` cannot resolve against the Ironwood `orchard` release, so voting
-  is not shipped until the voting crates support it. See MIGRATING.md.
+  `zcashlc_voting_*` FFI) is restored on the Ironwood (NU6.3) stack, having been
+  absent from 2.7.0-rc.1. The earlier removal recorded that `zcash_voting` could
+  not resolve against the Ironwood `orchard` release; that is true of the
+  crates.io release, which pins the pre-Ironwood librustzcash family, but not of
+  the git revision the workspace now patches in.
+
+  The API differs from the one that shipped before 2.7.0-rc.1, because
+  `zcash_voting` absorbed orchestration the SDK previously drove step by step.
+  Wallet developers upgrading from a pre-2.7.0-rc.1 version must read
+  MIGRATING.md; the most consequential change is that voting hotkeys are now
+  app-owned random values rather than wallet-seed derivations, so the
+  application must persist the hotkey's stored secret and cannot recover it from
+  the seed phrase. Types carrying key material or note secrets (`VotingHotkey`,
+  `VotingNoteInfo`, `VotingPczt`, `VotingDelegationKeyInputs`) now conform to
+  `Undescribable` so their contents cannot leak through logging or reflection.
 
 # 2.7.0-rc.1 - 2026-07-25
 

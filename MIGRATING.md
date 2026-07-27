@@ -6,13 +6,86 @@ information stored.
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
 track failures on its own. Wallet developers would have to account for those.
 
-## The shielded voting API is removed
+## The shielded voting API is back, with breaking changes
 
-The shielded voting API is removed: `VotingRustBackend`, the `Voting*` types,
-`PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe`, and the
-`zcashlc_voting_*` FFI symbols are gone. `zcash_voting` cannot resolve against the
-Ironwood `orchard` release, so voting is not shipped on this line (matching the
-Android SDK). Wallet developers using any of these types must remove those calls.
+The shielded voting API was removed on 2.7.0-rc.1 and is restored here on the
+Ironwood (NU6.3) stack. `VotingRustBackend`, the `Voting*` types and
+`PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe` are available
+again, but the API is not the one that shipped before 2.7.0-rc.1: `zcash_voting`
+absorbed orchestration the SDK used to drive step by step, and made the
+intermediate steps private. Wallet developers upgrading from a pre-2.7.0-rc.1
+version must make the changes below. Wallet developers coming from 2.7.0-rc.1,
+where voting was absent, can adopt the API as documented.
+
+### Voting hotkeys are no longer derived from the wallet seed
+
+This is the change most likely to affect a shipped wallet.
+
+A voting hotkey is now an app-owned random value. `generateHotkey` is a type
+method that takes only a network, and returns a `VotingHotkey` carrying a
+`storedSecret`, the `rawOrchardAddress` derived from it, and that address's
+`addressIndex`:
+
+```swift
+let hotkey = try VotingRustBackend.generateHotkey(networkId: networkId)
+// Persist hotkey.storedSecret. Nothing else in VotingHotkey needs storing.
+```
+
+**The application must persist `storedSecret`.** It cannot be re-derived from
+the wallet seed, so restoring a wallet from its seed phrase does not restore the
+ability to vote with a hotkey whose secret was lost, and any voting power already
+delegated to that hotkey becomes unusable. The SDK does not store it for you.
+Calling `generateHotkey` again produces an unrelated hotkey rather than
+recovering the previous one.
+
+Hotkeys derived from a wallet seed by an earlier SDK version do not carry over.
+Every API that previously took a hotkey seed now takes the stored secret instead.
+
+`VotingHotkey` no longer exposes `secretKey`, `publicKey` or `address`; upstream
+dropped the public key, and the address is now the raw Orchard address bytes.
+
+### Committing a vote is a single call
+
+`buildVoteCommitment`, `signCastVote`, `buildSharePayloads` and `encryptShares`
+are replaced by one `commitVote`, which builds the proof, signs the cast vote,
+derives the helper-share payloads and persists the recovery state. It is
+idempotent: calling it again for the same round, bundle and proposal returns the
+persisted result rather than rebuilding the proof.
+
+The encrypted shares it returns are the ciphertexts the vote proof commits to.
+There is no longer a standalone share-encryption step, because shares encrypted
+outside the commitment would not correspond to any vote.
+
+### Other API changes
+
+- `decomposeWeight` is removed. It has no replacement: share construction is now
+  entirely internal to the voting crate.
+- `initRound` takes a `networkId`, which is persisted with the round so that
+  governance PCZT consensus branch identifiers can be validated against it.
+- `buildPczt` and `buildAndProveDelegation` take the hotkey stored secret in
+  place of a raw hotkey address. `buildAndProveDelegation` additionally requires
+  the sender FVK, seed fingerprint, account index and round name, which the
+  voting crate now needs together in order to construct delegation keys.
+- `markVoteSubmitted` requires the cast-vote transaction hash. A vote is recorded
+  as submitted by persisting the transaction that carried it, so that a restarted
+  wallet resumes polling for that transaction instead of rebuilding the vote.
+- `recordShareDelegation` no longer accepts a nullifier. The voting crate derives
+  it from the vote's recovery state, so a caller can no longer record a nullifier
+  that disagrees with the share it belongs to.
+- `storeCommitmentBundle` is replaced by `recordVcPosition`.
+- `VotingBundleSetupResult` gained `droppedCount`, the number of notes the
+  canonical bundling policy discarded. A non-zero value means the wallet holds
+  voting notes that will not be voted with, which `eligibleWeight` alone does not
+  reveal.
+- `setupBundles` now rejects an empty note set instead of returning an empty
+  bundle layout.
+- Round identifiers must be 64 lowercase hexadecimal characters encoding a
+  canonical Pallas field element. Shorter or non-canonical identifiers are
+  rejected by `initRound`.
+- Types that carry key material or note secrets — `VotingHotkey`,
+  `VotingNoteInfo`, `VotingPczt` and `VotingDelegationKeyInputs` — now conform to
+  `Undescribable`, so they render as `--redacted--` rather than exposing their
+  contents through logging, string interpolation or reflection.
 
 ## `AccountBalance` gained an Ironwood pool
 
