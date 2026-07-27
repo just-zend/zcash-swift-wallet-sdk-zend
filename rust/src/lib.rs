@@ -20,7 +20,7 @@ use http_body_util::BodyExt;
 use nonempty::NonEmpty;
 use pczt::{
     Pczt,
-    roles::{combiner::Combiner, prover::Prover, redactor::Redactor},
+    roles::{combiner::Combiner, prover::Prover},
 };
 use prost::Message;
 use rand::rngs::OsRng;
@@ -45,10 +45,11 @@ use zcash_client_backend::{
         chain::{CommitmentTreeRoot, scan_cached_blocks},
         scanning::ScanPriority,
         wallet::{
-            self, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
-            decrypt_and_store_transaction, extract_and_store_transaction_from_pczt,
+            self, SignerView, SpendingKeys, create_pczt_from_proposal,
+            create_proposed_transactions, decrypt_and_store_transaction,
+            extract_and_store_transaction_from_pczt,
             input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
-            propose_send_max_transfer, propose_shielding, propose_transfer,
+            propose_send_max_transfer, propose_shielding, propose_transfer, redact_pczt_for_signer,
         },
     },
     encoding::AddressCodec,
@@ -2356,11 +2357,21 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         let locked_input_policy = LockedInputPolicy::Exclude;
         let lock_inputs = None;
 
+        // Send-max draws the entire spendable balance across every shielded pool,
+        // so Ironwood is included alongside Sapling and Orchard; omitting it would
+        // silently leave a post-NU6.3 wallet's Ironwood funds behind. Including it
+        // is a no-op when the account holds no Ironwood notes.
+        let spend_pools = [
+            ShieldedPool::Sapling,
+            ShieldedPool::Orchard,
+            ShieldedPool::Ironwood,
+        ];
+
         let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
             &mut db_data,
             &network,
             account_uuid,
-            &[ShieldedPool::Sapling, ShieldedPool::Orchard],
+            &spend_pools,
             &StandardFeeRule::Zip317,
             to,
             memo,
@@ -2867,26 +2878,14 @@ pub unsafe extern "C" fn zcashlc_redact_pczt_for_signer(
         let pczt_bytes = unsafe { slice::from_raw_parts(pczt_ptr, pczt_len) };
         let pczt = Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Invalid PCZT: {:?}", e))?;
 
-        let redacted_pczt = Redactor::new(pczt)
-            .redact_global_with(|mut r| r.redact_proprietary("zcash_client_backend:proposal_info"))
-            .redact_orchard_with(|mut r| {
-                r.redact_actions(|mut ar| {
-                    ar.clear_spend_witness();
-                    ar.redact_output_proprietary("zcash_client_backend:output_info");
-                })
-            })
-            .redact_sapling_with(|mut r| {
-                r.redact_spends(|mut sr| sr.clear_witness());
-                r.redact_outputs(|mut or| {
-                    or.redact_proprietary("zcash_client_backend:output_info")
-                });
-            })
-            .redact_transparent_with(|mut r| {
-                r.redact_outputs(|mut or| {
-                    or.redact_proprietary("zcash_client_backend:output_info")
-                });
-            })
-            .finish();
+        // Keystone's ordinary send flow signs the full (non-compacted) signer
+        // view: deployed firmware predates the compact view and, for v5
+        // transactions, the v2 PCZT encoding (which `Pczt::serialize` only
+        // selects when the content requires it). Do not switch this to
+        // `SignerView::Compact` without confirming the target signer supports
+        // it — the compact view here caused missing-signature failures at
+        // extraction (#1863 regression).
+        let redacted_pczt = redact_pczt_for_signer(&pczt, SignerView::Full);
 
         Ok(ffi::BoxedSlice::some(redacted_pczt.serialize().map_err(
             |e| anyhow!("Failed to serialize redacted PCZT: {:?}", e),
@@ -2990,37 +2989,45 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
 
         let mut prover = Prover::new(pczt);
 
+        // Orchard and Ironwood share the Orchard-family proving system. The circuit
+        // governing each pool under this PCZT's consensus branch selects the proving
+        // key; derive it from the branch id per pool. `cached_orchard_proving_key`
+        // returns a shared key per circuit version, so the Orchard and Ironwood
+        // proofs reuse one key once NU6.3 collapses both onto the PostNu6_3 circuit.
+        let circuit_version_for = |pool| {
+            zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
+                pczt_branch_id,
+                pool,
+            )
+            .map(|v| v.circuit_version())
+        };
+
         if prover.requires_orchard_proof() {
-            let orchard_circuit_version =
-                zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
-                    pczt_branch_id,
-                    orchard::ValuePool::Orchard,
-                )
-                .ok_or_else(|| {
+            let circuit_version =
+                circuit_version_for(orchard::ValuePool::Orchard).ok_or_else(|| {
                     anyhow!("PCZT's consensus branch does not support the Orchard pool")
-                })?
-                .circuit_version();
+                })?;
             prover = prover
-                .create_orchard_proof(&orchard::circuit::ProvingKey::build(
-                    orchard_circuit_version,
-                ))
+                .create_orchard_proof(
+                    zcash_primitives::transaction::builder::cached_orchard_proving_key(
+                        circuit_version,
+                    ),
+                )
                 .map_err(|e| anyhow!("Failed to create Orchard proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_orchard_proof());
 
         if prover.requires_ironwood_proof() {
-            // Post-NU6.3 proposals route orchard-receiver outputs and change
-            // into Ironwood bundles (the Orchard turnstile forbids adding value
-            // to Orchard once NU6.3 is active), so any PCZT built after
-            // activation can carry an Ironwood bundle that must be proven before
-            // extraction — otherwise a hardware-signed transaction fails at
-            // extract with MissingProof. The Ironwood bundle uses the PostNu6_3
-            // circuit (the fixed circuit plus the `disableCrossAddress`
-            // constraint), a distinct proving key from the Orchard pool's.
+            let circuit_version =
+                circuit_version_for(orchard::ValuePool::Ironwood).ok_or_else(|| {
+                    anyhow!("PCZT's consensus branch does not support the Ironwood pool")
+                })?;
             prover = prover
-                .create_ironwood_proof(&orchard::circuit::ProvingKey::build(
-                    orchard::circuit::OrchardCircuitVersion::PostNu6_3,
-                ))
+                .create_ironwood_proof(
+                    zcash_primitives::transaction::builder::cached_orchard_proving_key(
+                        circuit_version,
+                    ),
+                )
                 .map_err(|e| anyhow!("Failed to create Ironwood proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_ironwood_proof());
