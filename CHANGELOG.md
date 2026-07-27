@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 2.7.0-rc.2 - 2026-07-26
+
 ## Changed
 - The lightwalletd protobuf definitions (`compact_formats.proto`,
   `service.proto`) are now vendored from
