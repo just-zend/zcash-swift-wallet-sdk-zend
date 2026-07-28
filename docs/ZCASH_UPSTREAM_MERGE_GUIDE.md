@@ -2,13 +2,40 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-26
+Last reviewed: 2026-07-27
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Current monitor status (2026-07-27)
+
+- Fresh fetches confirm both defaults are `main`; `origin/main` is `4497fe9e` and
+  `upstream/main` is `f51ed74a`. The parity count is `174 87`: Zend is 174 commits
+  ahead, while upstream is 87 commits ahead, with merge base `769809a2`. No Zend
+  parity PR currently covers this newer upstream line.
+- The upstream delta is a broad `2.5.x`/`2.7.x`/`2.8.0-rc.1` release-and-Ironwood
+  lineage. It adds the lightwallet-protocol v0.5.0 subtree, replaces major Rust
+  migration and voting surfaces, updates generated gRPC code, and includes the
+  released RC FFI workflow. It cannot be treated as a routine source-only sync
+  because Zend's default branch has a separately reviewed, provenance-locked
+  Ironwood migration engine and committed three-slice XCFramework.
+- A no-commit merge into `codex/zcash-upstream-sync-2026-07-27` was intentionally
+  aborted after it exposed 19 conflicts: `Cargo.toml`, `Cargo.lock`, `Package.swift`,
+  `rust/src/lib.rs`, `rust/src/migration.rs`, `rust/src/tor.rs`, generated gRPC
+  sources/protos, generated errors/mocks, and the Zend Ironwood checkpoint, wallet,
+  and welding surfaces. Do not resolve these by choosing upstream or Zend wholesale.
+  First produce a provenance-verified FFI artifact that reconciles the exact migration
+  engine, librustzcash graph, public API, fixtures, and funded-device migration proof;
+  then re-run this merge with an explicit compatibility design.
+- No bleeding-edge early carry is safe. Upstream PR `#1885` is a draft, dirty,
+  81-file Ironwood/protocol/proving/voting stack; `#1818` is a clean but 49-file
+  Slipstream layer atop its own evolving base; and `#1872`/`#1853` are dirty child
+  branches of that migration family. Dependabot PRs remain blocked/review-required.
+  Wait for upstream convergence and Zend artifact reconciliation rather than splitting
+  individual fixes out of these coupled stacks.
 
 ## Current monitor status (2026-07-26)
 
