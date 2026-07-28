@@ -440,12 +440,18 @@ mod tests {
         base.serialize().expect("serialize")
     }
 
+    /// The batch request RETAINS a pre-existing Orchard `spend_auth_sig` rather than stripping it.
+    /// The only pre-signed actions in a wallet PCZT are the protocol padding dummies, which carry
+    /// no ZIP 32 derivation and whose `dummy_sk` the compact view has already cleared — stripping
+    /// their signature would leave an action neither the signer nor the wallet could ever
+    /// authorize. Upstream's `redact_pczt_for_batch_signer` states and enforces that contract; this
+    /// pins that we get the redacted request it produces.
     #[test]
-    fn build_sign_batch_qr_parts_strips_preexisting_orchard_spend_auth_sig() {
+    fn build_sign_batch_qr_parts_retains_the_dummy_orchard_spend_auth_sig() {
         let unsigned = build_single_pool_orchard_pczt();
 
-        // Sanity-check the premise: the IO-finalized PCZT already carries a dummy
-        // spend_auth_sig before redaction — this is what regressed without the fix.
+        // Sanity-check the premise: the IO-finalized PCZT already carries a dummy spend_auth_sig
+        // before redaction.
         let parsed = pczt::parse(&unsigned).expect("parse base pczt");
         assert!(
             parsed
@@ -484,12 +490,15 @@ mod tests {
         let request = BatchSignRequest::parse(batch.get_data()).expect("parse batch sign request");
 
         assert_eq!(request.pczts().len(), 1);
-        for action in request.pczts()[0].orchard().actions() {
-            assert!(
-                action.spend().spend_auth_sig().is_none(),
-                "batch request must not contain a pre-existing Orchard spend_auth_sig",
-            );
-        }
+        // The pre-signed dummy keeps its signature; the signer needs nothing further for it.
+        assert!(
+            request.pczts()[0]
+                .orchard()
+                .actions()
+                .iter()
+                .any(|action| action.spend().spend_auth_sig().is_some()),
+            "the dummy's signature must survive redaction",
+        );
     }
 
     #[test]

@@ -565,6 +565,7 @@ pub unsafe extern "C" fn zcashlc_create_account(
                 BirthdayError::Decode(e) => {
                     anyhow!("Invalid TreeState: Invalid frontier encoding: {}", e)
                 }
+                _ => anyhow!("Invalid TreeState: unrecognized birthday error"),
             })?;
 
         let account_name = unsafe { CStr::from_ptr(account_name).to_str()? };
@@ -655,6 +656,7 @@ pub unsafe extern "C" fn zcashlc_import_account_ufvk(
                 BirthdayError::Decode(e) => {
                     anyhow!("Invalid TreeState: Invalid frontier encoding: {}", e)
                 }
+                _ => anyhow!("Invalid TreeState: unrecognized birthday error"),
             })?;
 
         let hd_account_index = zip32::AccountId::try_from(hd_account_index_raw).ok();

@@ -67,7 +67,7 @@ use zcash_client_backend::data_api::wallet::{
     TargetHeight,
     input_selection::{LockFilter, LockedInputPolicy},
 };
-use zcash_client_backend::data_api::{InputSource, WalletRead, WalletWrite};
+use zcash_client_backend::data_api::{InputSource, OutputLockStore, WalletRead};
 use zcash_client_backend::wallet::{LockOwner, OutputRef};
 use zcash_client_sqlite::AccountUuid;
 use zcash_protocol::consensus::{
@@ -3328,6 +3328,7 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use zcash_client_backend::data_api::WalletWrite;
     use zcash_pool_migration::denomination::DenominationPlan;
     use zcash_pool_migration::preparation::PreparationPlan;
     use zcash_pool_migration::scheduling::{self, AnchorBucketInterval, SchedulingParams};
@@ -5426,6 +5427,7 @@ mod tests {
             &fvk,
             note,
             zat(crossing),
+            None,
             &mut rng,
         )
         .expect("the fixture transfer builds")

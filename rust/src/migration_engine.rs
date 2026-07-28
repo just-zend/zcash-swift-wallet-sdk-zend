@@ -32,7 +32,7 @@ use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::pool_migration::orchard_ironwood::PoolMigrations;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_pool_migration::build::sign_pczt;
+use zcash_pool_migration::build::{AccountDerivation, sign_pczt};
 use zcash_pool_migration::engine::{
     MigrationBackend, MigrationCrypto, MigrationState, MigrationTransferId, MigrationTxState,
     PoolMigrationRead, PoolMigrationWrite,
@@ -181,6 +181,24 @@ impl MigrationCrypto for Backend<'_> {
             .get(index)
             .ok_or_else(|| anyhow!("no spendable note at index {index}"))?;
         Ok(note)
+    }
+
+    /// The account's ZIP 32 derivation as the wallet records it, or `None` for an account held
+    /// only as a viewing key. The builders stamp this onto every spend still awaiting a
+    /// signature, which is how an external signer recognizes those spends as this account's;
+    /// returning it unconditionally (rather than only when signing is delegated) keeps the
+    /// in-process and hardware-wallet paths producing identical PCZTs.
+    fn account_derivation(&self) -> Result<Option<AccountDerivation>, Self::Error> {
+        Ok(self
+            .wallet
+            .get_account(self.account)
+            .map_err(|e| anyhow!("account lookup failed: {e}"))?
+            .and_then(|account| {
+                account
+                    .source()
+                    .key_derivation()
+                    .map(AccountDerivation::from)
+            }))
     }
 
     fn sign(&self, pczt: pczt::Pczt) -> Result<pczt::Pczt, Self::Error> {
