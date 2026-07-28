@@ -182,8 +182,7 @@ public class SDKSynchronizer: Synchronizer {
 
     public func prepare(
         with seed: [UInt8]?,
-        walletBirthday: BlockHeight,
-        for walletMode: WalletInitMode,
+        walletBirthday: BlockHeight?,
         name: String,
         keySource: String?
     ) async throws -> Initializer.InitializationResult {
@@ -196,7 +195,6 @@ public class SDKSynchronizer: Synchronizer {
         let initResult = try await self.initializer.initialize(
             with: seed,
             walletBirthday: walletBirthday,
-            for: walletMode,
             name: name,
             keySource: keySource
         )
@@ -546,6 +544,7 @@ public class SDKSynchronizer: Synchronizer {
             }
         })
     }
+
 
     public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal) async throws -> Pczt {
         try await initializer.rustBackend.createPCZTFromProposal(
@@ -1305,6 +1304,10 @@ public class SDKSynchronizer: Synchronizer {
 
     public func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
         try await migrationHost.migration(for: accountUUID).refreshStaleTransfers(usk: usk)
+    }
+
+    public func debugRescheduleMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
+        try await migrationHost.migration(for: accountUUID).debugRescheduleTransfers()
     }
 
     public func createUnsignedNoteSplitPCZTs(

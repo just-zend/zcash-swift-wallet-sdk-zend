@@ -50,6 +50,14 @@ public struct SynchronizerState: Equatable {
     /// snapshot — must gate on this, not on `latestBlockHeight`.
     public var fullyScannedHeight: BlockHeight
 
+    /// True while the wallet is in a deep recovery (a restore, or a new-account backfill) where the
+    /// balance and transaction history are still provisional: during recent-first sync a note can
+    /// appear unspent before the block that spends it has been scanned, transiently inflating both
+    /// the balance and the Activity list. Clients should treat balance/Activity as not-yet-final
+    /// (e.g. hold `0` and hold the Activity) until this is `false`. Derived from the wallet
+    /// backend's `recovery_progress`; `false` for light catch-ups and once fully synced.
+    public var isRecovering: Bool
+
     /// Represents a synchronizer that has made zero progress hasn't done a sync attempt
     public static var zero: SynchronizerState {
         SynchronizerState(
@@ -66,13 +74,15 @@ public struct SynchronizerState: Equatable {
         accountsBalances: [AccountUUID: AccountBalance],
         internalSyncStatus: InternalSyncStatus,
         latestBlockHeight: BlockHeight,
-        fullyScannedHeight: BlockHeight = .zero
+        fullyScannedHeight: BlockHeight = .zero,
+        isRecovering: Bool = false
     ) {
         self.syncSessionID = syncSessionID
         self.accountsBalances = accountsBalances
         self.internalSyncStatus = internalSyncStatus
         self.latestBlockHeight = latestBlockHeight
         self.fullyScannedHeight = fullyScannedHeight
+        self.isRecovering = isRecovering
         self.syncStatus = internalSyncStatus.mapToSyncStatus()
     }
 }
@@ -131,12 +141,13 @@ public protocol Synchronizer: AnyObject {
     ///
     /// - Parameters:
     ///   - seed: ZIP-32 Seed bytes for the wallet that will be initialized
-    ///   - walletBirthday: Birthday of wallet.
-    ///   - for: [walletMode] Set `.newWallet` when preparing synchronizer for a brand new generated wallet,
-    ///   `.restoreWallet` when wallet is about to be restored from a seed
-    ///   and  `.existingWallet` for all other scenarios.
+    ///   - walletBirthday: Birthday of the wallet to RESTORE from, or `nil` for a brand-new wallet (the
+    ///   SDK then picks a reorg-safe recent height). Ignored when an account already exists.
     ///   - name: name of the account.
     ///   - keySource: custom optional string for clients, used for example to help identify the type of the account.
+    /// - Note: The init flow (new / restore / existing) is DERIVED by the SDK — an existing account is
+    ///   opened, a `nil` birthday creates a new wallet, a past birthday restores from it. A deliberate
+    ///   re-scan/resync is the separate `rewind(_:)` action, not an init mode.
     /// - Throws:
     ///     - `aliasAlreadyInUse` if the Alias used to create this instance is already used by other instance.
     ///     - `cantUpdateURLWithAlias` if the updating of paths in `Initilizer` according to alias fails. When this happens it means that
@@ -145,8 +156,7 @@ public protocol Synchronizer: AnyObject {
     ///     - Some other `ZcashError` thrown by lower layer of the SDK.
     func prepare(
         with seed: [UInt8]?,
-        walletBirthday: BlockHeight,
-        for walletMode: WalletInitMode,
+        walletBirthday: BlockHeight?,
         name: String,
         keySource: String?
     ) async throws -> Initializer.InitializationResult
@@ -337,6 +347,9 @@ public protocol Synchronizer: AnyObject {
     ///
     // sourcery: mockedName="getTransactionOutputsForTransaction"
     func getTransactionOutputs(for transaction: ZcashTransaction.Overview) async -> [ZcashTransaction.Output]
+
+    /// Returns all transactions, most recent first.
+    func allTransactions() async throws -> [ZcashTransaction.Overview]
 
     /// Returns a list of confirmed transactions that preceed the given transaction with a limit count.
     /// - Parameters:
@@ -617,6 +630,9 @@ public protocol Synchronizer: AnyObject {
     func isNoteSplitNeeded(accountUUID: AccountUUID) async throws -> Bool
 
     /// The optimal note split for `accountUUID`'s spendable Orchard balance.
+    ///
+    /// Any subsequent propose/prepare call for the same account supersedes previously returned
+    /// proposal handles — commit calls carrying an older handle throw `ZcashError.migrationPlanStale`.
     /// - Parameter accountUUID: the account to prepare a note split for.
     func prepareNoteSplit(accountUUID: AccountUUID) async throws -> NoteSplitProposal
 
@@ -652,7 +668,9 @@ public protocol Synchronizer: AnyObject {
     /// The full migration schedule preview for `accountUUID`'s live spendable Orchard balance, in
     /// chronological broadcast order. Plans fresh (drawing new ZIP 318 schedule randomness) and
     /// caches the preview — a later commit signs exactly this plan, so always confirm the schedule
-    /// the user actually saw. An EMPTY schedule means there is nothing to migrate; after a
+    /// the user actually saw. Any subsequent propose/prepare call for the same account supersedes
+    /// previously returned proposal handles — commit calls carrying an older handle throw
+    /// `ZcashError.migrationPlanStale`. An EMPTY schedule means there is nothing to migrate; after a
     /// completed run this is the "does anything remain" answer of the sequential-runs contract.
     /// - Parameter accountUUID: the account to propose a migration schedule for.
     func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule
@@ -734,7 +752,9 @@ public protocol Synchronizer: AnyObject {
 
     /// Pre-signs and persists every transfer in `schedule` in the migration engine for `accountUUID`
     /// (a no-op when a matching non-terminal run is already stored for the account — the normal
-    /// case, since the note-split submission commits the run).
+    /// case, since the note-split submission commits the run). Any subsequent propose/prepare call
+    /// for the same account supersedes previously returned proposal handles — commit calls
+    /// carrying an older handle throw `ZcashError.migrationPlanStale`.
     ///
     /// The SDK does not retain the proposal list: hosts that need to render the committed schedule
     /// later must persist it themselves at confirmation time.
@@ -862,6 +882,17 @@ public protocol Synchronizer: AnyObject {
     ///   persists NONE of the batch's rebuilds, so a non-throwing return's schedule is exactly what
     ///   was atomically persisted, never a partial batch.
     func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule
+
+    /// DEBUG/QA ONLY — rewrites `accountUUID`'s committed migration schedule's transfer heights
+    /// (first due in ~2 blocks, then 4-block strides) and the earliest transfer's anchor boundary
+    /// so real broadcast delivery can be exercised without waiting out ZIP 318's privacy delay.
+    /// Not for production flows.
+    ///
+    /// Returns the number of transfers rescheduled (`0` when the account has no stored
+    /// migration). Already-broadcast and already-mined transfers, and every preparation
+    /// (note-split) transaction, are left untouched.
+    /// - Parameter accountUUID: the account whose schedule should be compressed.
+    func debugRescheduleMigrationTransfers(accountUUID: AccountUUID) async throws -> Int
 
     /// Builds `accountUUID`'s whole previewed migration UNSIGNED — the run is created by this
     /// call, with every transaction persisted awaiting its signature — and returns the preparation
@@ -1014,8 +1045,8 @@ private struct BroadcasterUnimplemented: LocalizedError {
 /// Error thrown by the default implementations of the throwing members of the migration group (see
 /// `public extension Synchronizer` below) when a conformer doesn't override them. One shared,
 /// member-parameterized type rather than one hoisted struct per member (as
-/// ``GetTreeStateUnimplemented``/``BroadcasterUnimplemented`` do): the migration group has 27
-/// throwing requirements, and duplicating that two-struct precedent 27 times over would be pure
+/// ``GetTreeStateUnimplemented``/``BroadcasterUnimplemented`` do): the migration group has 28
+/// throwing requirements, and duplicating that two-struct precedent 28 times over would be pure
 /// boilerplate for the same LocalizedError-conforming, "override this in your conformer" pattern.
 /// Hoisted to file scope for the same reason as those two — protocol-extension methods carry an
 /// implicit `Self` and so count as generic, and Swift forbids nesting concrete types with
@@ -1201,6 +1232,10 @@ public extension Synchronizer {
         throw MigrationUnimplemented(member: #function)
     }
 
+    func debugRescheduleMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
+        throw MigrationUnimplemented(member: #function)
+    }
+
     func createUnsignedNoteSplitPCZTs(accountUUID: AccountUUID, for schedule: MigrationSchedule) async throws -> [MigrationUnsignedTransferPczt] {
         throw MigrationUnimplemented(member: #function)
     }
@@ -1375,16 +1410,6 @@ enum InternalSyncStatus: Equatable {
         case .error: return "error"
         }
     }
-}
-
-/// Mode of the Synchronizer's initialization for the wallet.
-public enum WalletInitMode: Equatable {
-    /// For brand new wallet - typically when users creates a new wallet.
-    case newWallet
-    /// For a wallet that is about to be restored. Typically when a user wants to restore a wallet from a seed.
-    case restoreWallet
-    /// All other cases - typically when clients just start the process e.g. every regular app start for mobile apps.
-    case existingWallet
 }
 
 /// Kind of transactions handled by a Synchronizer

@@ -62,7 +62,7 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
 
 ### Orchard → Ironwood migration (`Synchronizer` surface)
 
-- Orchard→Ironwood pool-migration engine, exposed as a 31-member migration group on the
+- Orchard→Ironwood pool-migration engine, exposed as a 32-member migration group on the
   `Synchronizer` protocol, built over the pool-migration FFI/welding layer whose model types
   are listed above: the app talks only to `Synchronizer` — the per-account migration engine,
   broadcaster, and privacy gate behind it are internal. Account-scoped members take an
@@ -119,6 +119,8 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
     a MINED row's txid is NOT carried by the engine's own state model, so it is available only
     while a transaction is `broadcast` (in flight), not once mined. An empty array means no stored
     run or no transactions, not an error.
+  - DEBUG/QA-only `debugRescheduleMigrationTransfers(accountUUID:)` compresses a committed
+    migration schedule for fast broadcast testing (Android parity).
   - The Keystone batch-signing bridge carries the external-signer ceremony's PCZTs to a hardware
     signer over an animated multi-part QR UR, as four DB-free members:
     `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)` redacts every PCZT for the
@@ -150,6 +152,23 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
     bootstrap, the sync-gate ticker runs only while the blocked stream has subscribers, and the
     migration gate state file is excluded from device backups.
 
+### Slipstream sync engine
+
+- `SlipstreamSynchronizer` — an alternative, engine-driven implementation of `Synchronizer` backed
+  by the `slipstream-core` sync engine (consumed as a remote crate): non-linear Spend-before-Sync
+  scheduling, concurrent density-adaptive fetch, sparse commitment-tree persistence (byte-identical
+  to the upstream path, oracle-gated), an autonomous session with per-call Tor policy and server
+  failover, poll-model snapshots (`SynchronizerState.isRecovering`), and a stall watchdog. FFI
+  surface `zcashlc_slipstream_*` with error codes `ZRUST0093`–`ZRUST0097`. Hosts opt in by
+  constructing it; `SDKSynchronizer` remains the default engine. It also implements the
+  `Synchronizer` protocol's migration group (above) against its own `OrchardMigrationHost`, with
+  the same SDK-enforced start-gate/broadcast-guard session separation as `SDKSynchronizer`, and
+  forwards the Keystone batch-signing bridge the same way `SDKSynchronizer` does — straight to the
+  same rust backend instance, bypassing `OrchardMigrationHost` since the bridge is DB-free.
+- `Synchronizer.allTransactions()` is a formal protocol requirement, and
+  `TransactionRepository.unreconciledTxids()` exposes the read-side reconciliation view (defaults
+  to empty when the engine's view is absent).
+
 ### Shielded voting
 
 - The shielded voting surface returns, having been dropped in `2.7.0-rc.1`: `VotingRustBackend`,
@@ -174,7 +193,10 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   you already handle `.seedRequired`. (MOB-1512)
 - `NetworkType` gained a `.regtest` case. **Source-breaking** for exhaustive switches over
   `NetworkType`.
-- `prepare(with:walletBirthday:for:name:keySource:)` now throws `ZcashError.initializerSeedMismatch`
+- `prepare(with:walletBirthday:name:keySource:)` no longer takes a `WalletInitMode` — the SDK
+  derives new-vs-restore from the wallet state and the (now optional) birthday, and the enum is
+  removed. See `MIGRATING.md`.
+- `prepare(with:walletBirthday:name:keySource:)` now throws `ZcashError.initializerSeedMismatch`
   when the wallet already holds seed-derived accounts that the supplied seed cannot spend from.
   Restoring a different wallet into the same database requires `wipe()` first; wallets whose only
   accounts are imported (hardware-wallet UFVKs) are exempt.
@@ -195,6 +217,12 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
 - `Synchronizer.submitTransactions` re-checks a non-zero submit error against the same server and
   reports `TransactionSubmitResult.success` when the server already knows the transaction, instead
   of surfacing a spurious failure.
+- The wallet database opens with a 15 s SQLite `busy_timeout` (the engine can hold a short writer
+  lock during `deleteAccount`/`importAccount`; the legacy path has no concurrent writer, so the
+  timeout never engages there).
+- Scan-path tracing is quieter: `zcash_client_backend` spans are capped at WARN, since its
+  per-block/batch `#[instrument]` spans cost syscalls on the scan producer thread through
+  os_log/signpost (measured: production first pass 3.4 s → 0.5 s).
 - The immediate (single-transaction) migration lane leaves the engine:
   `proposeImmediateMigration(accountUUID:)` now returns an ordinary `ImmediateMigrationProposal` (a
   `Proposal` plus its decoded `amount`/`fee`) instead of a `MigrationSchedule`, executed through the
@@ -249,6 +277,15 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   after a single attempt and leaving the transaction unresolved.
 - Transaction resubmission no longer re-broadcasts a freshly submitted transaction during the first
   sync cycle of a session; its five-minute throttle now engages on first invocation.
+- `getAccountsBalances()` (and the migration-eligibility read that depends on it) no longer briefly
+  reports empty balances right after a wallet restore completes. When the engine flips out of
+  recovery, the upstream wallet summary can transiently report no balance data for up to ~30 s while
+  it finalizes the just-restored notes; the Slipstream unified summary was serving that gap as empty,
+  so the restored funds — and the "Migration Required" eligibility — flickered to zero. The summary
+  now holds the engine-owned reconciled recovery-view balances across that window: bounded to 120 s,
+  released the instant the upstream summary returns real balances (whose value then wins
+  unconditionally), and suppressed whenever a pending unmined outgoing spend could otherwise make the
+  held value over-show. A process restart inside the window falls back to the prior behavior.
 
 # 2.6.0-alpha.6
 

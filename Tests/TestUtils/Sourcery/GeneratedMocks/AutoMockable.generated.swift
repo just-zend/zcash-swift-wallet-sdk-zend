@@ -1592,25 +1592,25 @@ class SynchronizerMock: Synchronizer {
 
     // MARK: - prepare
 
-    var prepareWithWalletBirthdayForNameKeySourceThrowableError: Error?
-    var prepareWithWalletBirthdayForNameKeySourceCallsCount = 0
-    var prepareWithWalletBirthdayForNameKeySourceCalled: Bool {
-        return prepareWithWalletBirthdayForNameKeySourceCallsCount > 0
+    var prepareWithWalletBirthdayNameKeySourceThrowableError: Error?
+    var prepareWithWalletBirthdayNameKeySourceCallsCount = 0
+    var prepareWithWalletBirthdayNameKeySourceCalled: Bool {
+        return prepareWithWalletBirthdayNameKeySourceCallsCount > 0
     }
-    var prepareWithWalletBirthdayForNameKeySourceReceivedArguments: (seed: [UInt8]?, walletBirthday: BlockHeight, walletMode: WalletInitMode, name: String, keySource: String?)?
-    var prepareWithWalletBirthdayForNameKeySourceReturnValue: Initializer.InitializationResult!
-    var prepareWithWalletBirthdayForNameKeySourceClosure: (([UInt8]?, BlockHeight, WalletInitMode, String, String?) async throws -> Initializer.InitializationResult)?
+    var prepareWithWalletBirthdayNameKeySourceReceivedArguments: (seed: [UInt8]?, walletBirthday: BlockHeight?, name: String, keySource: String?)?
+    var prepareWithWalletBirthdayNameKeySourceReturnValue: Initializer.InitializationResult!
+    var prepareWithWalletBirthdayNameKeySourceClosure: (([UInt8]?, BlockHeight?, String, String?) async throws -> Initializer.InitializationResult)?
 
-    func prepare(with seed: [UInt8]?, walletBirthday: BlockHeight, for walletMode: WalletInitMode, name: String, keySource: String?) async throws -> Initializer.InitializationResult {
-        if let error = prepareWithWalletBirthdayForNameKeySourceThrowableError {
+    func prepare(with seed: [UInt8]?, walletBirthday: BlockHeight?, name: String, keySource: String?) async throws -> Initializer.InitializationResult {
+        if let error = prepareWithWalletBirthdayNameKeySourceThrowableError {
             throw error
         }
-        prepareWithWalletBirthdayForNameKeySourceCallsCount += 1
-        prepareWithWalletBirthdayForNameKeySourceReceivedArguments = (seed: seed, walletBirthday: walletBirthday, walletMode: walletMode, name: name, keySource: keySource)
-        if let closure = prepareWithWalletBirthdayForNameKeySourceClosure {
-            return try await closure(seed, walletBirthday, walletMode, name, keySource)
+        prepareWithWalletBirthdayNameKeySourceCallsCount += 1
+        prepareWithWalletBirthdayNameKeySourceReceivedArguments = (seed: seed, walletBirthday: walletBirthday, name: name, keySource: keySource)
+        if let closure = prepareWithWalletBirthdayNameKeySourceClosure {
+            return try await closure(seed, walletBirthday, name, keySource)
         } else {
-            return prepareWithWalletBirthdayForNameKeySourceReturnValue
+            return prepareWithWalletBirthdayNameKeySourceReturnValue
         }
     }
 
@@ -2059,6 +2059,28 @@ class SynchronizerMock: Synchronizer {
             return await closure(transaction)
         } else {
             return getTransactionOutputsForTransactionReturnValue
+        }
+    }
+
+    // MARK: - allTransactions
+
+    var allTransactionsThrowableError: Error?
+    var allTransactionsCallsCount = 0
+    var allTransactionsCalled: Bool {
+        return allTransactionsCallsCount > 0
+    }
+    var allTransactionsReturnValue: [ZcashTransaction.Overview]!
+    var allTransactionsClosure: (() async throws -> [ZcashTransaction.Overview])?
+
+    func allTransactions() async throws -> [ZcashTransaction.Overview] {
+        if let error = allTransactionsThrowableError {
+            throw error
+        }
+        allTransactionsCallsCount += 1
+        if let closure = allTransactionsClosure {
+            return try await closure()
+        } else {
+            return allTransactionsReturnValue
         }
     }
 
@@ -3143,6 +3165,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - debugRescheduleMigrationTransfers
+
+    var debugRescheduleMigrationTransfersAccountUUIDThrowableError: Error?
+    var debugRescheduleMigrationTransfersAccountUUIDCallsCount = 0
+    var debugRescheduleMigrationTransfersAccountUUIDCalled: Bool {
+        return debugRescheduleMigrationTransfersAccountUUIDCallsCount > 0
+    }
+    var debugRescheduleMigrationTransfersAccountUUIDReceivedAccountUUID: AccountUUID?
+    var debugRescheduleMigrationTransfersAccountUUIDReturnValue: Int!
+    var debugRescheduleMigrationTransfersAccountUUIDClosure: ((AccountUUID) async throws -> Int)?
+
+    func debugRescheduleMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
+        if let error = debugRescheduleMigrationTransfersAccountUUIDThrowableError {
+            throw error
+        }
+        debugRescheduleMigrationTransfersAccountUUIDCallsCount += 1
+        debugRescheduleMigrationTransfersAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = debugRescheduleMigrationTransfersAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return debugRescheduleMigrationTransfersAccountUUIDReturnValue
+        }
+    }
+
     // MARK: - createUnsignedNoteSplitPCZTs
 
     var createUnsignedNoteSplitPCZTsAccountUUIDForThrowableError: Error?
@@ -3735,6 +3781,28 @@ class TransactionRepositoryMock: TransactionRepository {
             return closure(sql)
         } else {
             return debugDatabaseSqlReturnValue
+        }
+    }
+
+    // MARK: - unreconciledTxids
+
+    var unreconciledTxidsThrowableError: Error?
+    var unreconciledTxidsCallsCount = 0
+    var unreconciledTxidsCalled: Bool {
+        return unreconciledTxidsCallsCount > 0
+    }
+    var unreconciledTxidsReturnValue: Set<Data>!
+    var unreconciledTxidsClosure: (() async throws -> Set<Data>)?
+
+    func unreconciledTxids() async throws -> Set<Data> {
+        if let error = unreconciledTxidsThrowableError {
+            throw error
+        }
+        unreconciledTxidsCallsCount += 1
+        if let closure = unreconciledTxidsClosure {
+            return try await closure()
+        } else {
+            return unreconciledTxidsReturnValue
         }
     }
 
@@ -5301,6 +5369,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(usk, account)
         } else {
             return migrationRefreshStaleTransfersUskForReturnValue
+        }
+    }
+
+    // MARK: - migrationDebugRescheduleTransfers
+
+    var migrationDebugRescheduleTransfersForThrowableError: Error?
+    var migrationDebugRescheduleTransfersForCallsCount = 0
+    var migrationDebugRescheduleTransfersForCalled: Bool {
+        return migrationDebugRescheduleTransfersForCallsCount > 0
+    }
+    var migrationDebugRescheduleTransfersForReceivedAccount: AccountUUID?
+    var migrationDebugRescheduleTransfersForReturnValue: Int!
+    var migrationDebugRescheduleTransfersForClosure: ((AccountUUID) async throws -> Int)?
+
+    func migrationDebugRescheduleTransfers(for account: AccountUUID) async throws -> Int {
+        if let error = migrationDebugRescheduleTransfersForThrowableError {
+            throw error
+        }
+        migrationDebugRescheduleTransfersForCallsCount += 1
+        migrationDebugRescheduleTransfersForReceivedAccount = account
+        if let closure = migrationDebugRescheduleTransfersForClosure {
+            return try await closure(account)
+        } else {
+            return migrationDebugRescheduleTransfersForReturnValue
         }
     }
 

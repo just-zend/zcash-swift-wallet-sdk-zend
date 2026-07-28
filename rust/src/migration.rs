@@ -55,7 +55,7 @@ use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 
@@ -164,6 +164,20 @@ struct CallCtx {
     account_bytes: [u8; 16],
 }
 
+/// Open the migration store connection: a second, independent connection into the same wallet
+/// database file as the wallet handle (`crate::wallet_db`), which the account-keyed migration
+/// tables live inside. Set to the same [`crate::WALLET_DB_BUSY_TIMEOUT`] the wallet handle uses --
+/// the slipstream engine's writer (write-behind commits, `deleteAccount`/`importAccount` mid-pass)
+/// can hold the file lock for seconds, and a migration call racing it must wait as long as the
+/// wallet handle would rather than failing fast on rusqlite's 5 s default.
+fn open_store_conn(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(db_path)
+        .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
+    conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
+        .map_err(|e| anyhow!("Error setting migration store busy_timeout: {e}"))?;
+    Ok(conn)
+}
+
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
 /// drops it at the end (no persistent handle). All tables are created by the wallet schema
 /// migrations during `init_data_db`: the engine's store tables by `zcash_client_sqlite`'s own
@@ -184,8 +198,7 @@ unsafe fn open(
         slice::from_raw_parts(db_data, db_data_len)
     }));
     let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network.clone())? };
-    let store_conn = Connection::open(&db_path)
-        .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
+    let store_conn = open_store_conn(&db_path)?;
     init_immediate_runs(&store_conn)
         .map_err(|e| anyhow!("Error initializing immediate-run table: {e}"))?;
     let account = account_uuid_from_bytes(account_uuid_bytes)
@@ -3178,6 +3191,133 @@ pub extern "C" fn zcashlc_ironwood_activation_height(network_id: u32) -> i64 {
     unwrap_exc_or(res, -1)
 }
 
+/// DEBUG ONLY: overrides this account's persisted migration schedule so its transfers become due
+/// in quick succession, for manually testing real broadcast execution without waiting out ZIP
+/// 318's privacy-motivated delay (mean ~3h between transfers — see `zcash_pool_migration_backend::
+/// scheduling`'s module doc: this is a deliberate anti-correlation choice, not a technical
+/// requirement). Not exposed to production users. Mirrors the Android SDK's
+/// `debugRescheduleTransfersNative` exactly (same table names, same query, same rewrite rule).
+///
+/// Both `scheduled_height` (which gates BROADCAST — see `next_broadcastable`) AND `anchor_boundary`
+/// (which gates PROVING — see `is_prove_ready`) are rewritten; dependency-mining is not touched or
+/// bypassed:
+/// - A transfer's `anchor_boundary`, as originally drawn at commit time
+///   (`scheduling::draw_anchor_boundary`), is a boundary in the past relative to the chain tip
+///   *at commit time* — normally already passed by the time the transfer's (much later,
+///   ZIP-318-delayed) `scheduled_height` arrives. This override exists precisely because this
+///   function moves `scheduled_height` to now, while the original `anchor_boundary` stays
+///   wherever it was drawn: the original boundary can still be far ahead of the current synced
+///   tip, since it was never meant to be reached this soon. Left alone, `is_prove_ready`
+///   (`boundary + 1 < target_height`) would keep failing regardless of how close
+///   `scheduled_height` is. So every rescheduled transfer's `anchor_boundary` is also rewritten,
+///   to `natural_anchor_height` — the SAME anchor ordinary non-migration sends use (guaranteed
+///   checkpointed/witnessed). NOT a full `BOUNDARY_MODULUS` bucket back like `draw_anchor_boundary`
+///   draws in production (that bucketing is a privacy measure, irrelevant here, and can land
+///   outside the checkpoint retention window), and NOT a hand-picked "tip minus N" guess either
+///   (also not guaranteed checkpointed — see `natural_anchor_height`'s own doc comment) — so
+///   proving can proceed as soon as the delivery lane next drives it.
+/// - Transfers do NOT depend on each other (`MigrationTransaction::depends_on` for a `Transfer`
+///   never lists another transfer's id, only the single preparation transaction that minted its
+///   own funding note, if any) — so every transfer can be staggered independently; there is no
+///   need to wait for transfer N to broadcast before N+1 becomes due.
+/// - A transfer whose funding note comes from an actual note-split (preparation) transaction still
+///   genuinely cannot broadcast until that preparation transaction is MINED (`deps_mined`) — this
+///   function does not and cannot bypass that; it only affects how soon a transfer becomes due and
+///   provable once its real dependencies are satisfied.
+///
+/// Every not-yet-broadcast/mined TRANSFER (preparation transactions are left alone) is
+/// rescheduled to `target + FIRST_DELAY_BLOCKS + i * STRIDE_BLOCKS`, in `i` = the transfers'
+/// existing relative order (by their current `scheduled_height`, so the engine's own ZIP 318
+/// shuffle order is preserved even though the absolute heights are now compressed) — the first
+/// becomes due in about `FIRST_DELAY_BLOCKS * 75s`, each subsequent one `STRIDE_BLOCKS * 75s`
+/// after that.
+///
+/// Returns the number of transfers rescheduled (`0` when the account has no stored migration),
+/// or a negative value on error (see `zcashlc_last_error_message`).
+///
+/// # Safety
+/// See [`open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_debug_reschedule_transfers(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> i64 {
+    // ~2.5 min to the first transfer, ~5 min between each subsequent one, at the ~75s/block
+    // testnet/mainnet target spacing.
+    const FIRST_DELAY_BLOCKS: u32 = 2;
+    const STRIDE_BLOCKS: u32 = 4;
+
+    let res = catch_panic(|| {
+        let ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let target = ctx.target()?;
+        // The wallet's real, currently-witnessable anchor — NOT a hand-picked "tip minus N"
+        // guess (see `natural_anchor_height`'s own doc comment for why that would be wrong).
+        let debug_anchor_boundary =
+            u32::from(migration_finalize::natural_anchor_height(&ctx.wallet)?);
+
+        let migration_id: Option<i64> = ctx
+            .store_conn
+            .query_row(
+                "SELECT m.id FROM orchard_ironwood_migrations m \
+                 JOIN accounts a ON a.id = m.account_id \
+                 WHERE a.uuid = ?1",
+                rusqlite::params![&ctx.account_bytes[..]],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| anyhow!("Error reading migration row: {e}"))?;
+        let Some(migration_id) = migration_id else {
+            return Ok(0i64);
+        };
+
+        let tx_ids: Vec<i64> = {
+            let mut stmt = ctx
+                .store_conn
+                .prepare(
+                    "SELECT tx_id FROM orchard_ironwood_migration_transactions \
+                     WHERE migration_id = ?1 AND kind = 'transfer' \
+                       AND state NOT IN ('broadcast', 'mined') \
+                     ORDER BY scheduled_height ASC",
+                )
+                .map_err(|e| anyhow!("Error preparing transfer query: {e}"))?;
+            stmt.query_map(rusqlite::params![migration_id], |row| row.get(0))
+                .map_err(|e| anyhow!("Error reading pending transfers: {e}"))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| anyhow!("Error reading pending transfers: {e}"))?
+        };
+
+        for (i, tx_id) in tx_ids.iter().enumerate() {
+            let new_height = u32::from(target) + FIRST_DELAY_BLOCKS + (i as u32) * STRIDE_BLOCKS;
+            // `is_prove_ready` gates purely on `anchor_boundary`, NOT on `scheduled_height` — so
+            // rewriting every transfer's anchor here would make ALL of them prove-ready in the
+            // same pass (an unrealistic proving batch this debug tool itself would have
+            // created). Only the earliest-due transfer (i==0, this loop's existing
+            // scheduled_height-ascending order) gets a valid anchor; the rest keep their
+            // original, still-in-the-future one, matching production's natural
+            // one-becomes-ready-at-a-time shape. Re-invoke this debug action once this transfer
+            // broadcasts to unlock the next one.
+            let anchor_boundary = if i == 0 {
+                Some(debug_anchor_boundary)
+            } else {
+                None
+            };
+            ctx.store_conn
+                .execute(
+                    "UPDATE orchard_ironwood_migration_transactions \
+                     SET scheduled_height = ?1, \
+                         anchor_boundary = COALESCE(?2, anchor_boundary) \
+                     WHERE migration_id = ?3 AND tx_id = ?4",
+                    rusqlite::params![new_height, anchor_boundary, migration_id, tx_id],
+                )
+                .map_err(|e| anyhow!("Error rescheduling transfer {tx_id}: {e}"))?;
+        }
+        Ok(tx_ids.len() as i64)
+    });
+    unwrap_exc_or(res, -1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4085,7 +4225,8 @@ mod tests {
     /// including the `0` "no plan" sentinel a state-encoded or empty schedule carries. A real
     /// plan is unconstructible here (no public constructor), so the `Superseded` arm — a cached
     /// plan under a DIFFERENT handle — is pinned structurally by `migration_plan_cache::get`'s
-    /// three-arm match and exercised end-to-end by the welding offline tests.
+    /// three-arm match here, and end-to-end (a real plan, genuinely superseded by a later one)
+    /// by [`commit_or_resume_rejects_a_superseded_handle_with_plan_stale`] below.
     #[test]
     fn plan_cache_lookup_misses_and_clear() {
         use migration_plan_cache::PlanLookupError;
@@ -4122,6 +4263,652 @@ mod tests {
         );
     }
 
+    // ----- plan-cache supersession contract, end-to-end against a REALLY funded wallet
+    // (#1806 / MOB-1458): `plan_and_cache`'s only input is `engine::plan_migration`, which has
+    // no test-only backdoor (see `plan_cache_lookup_misses_and_clear`'s doc: the plan type has
+    // no public constructor), so pinning the handle contract against a genuine plan means the
+    // fixture wallet must hold a genuine spendable Orchard note. `zcash_client_backend`'s own
+    // `TestBuilder` harness (the `test-dependencies` feature) would normally build one, but this
+    // crate does not enable that feature (and its `WalletDb<_, LocalNetwork, FixedClock,
+    // ChaChaRng>` is a different concrete type than this crate's own `MigrationWallet` /
+    // `NetworkParams` anyway) — so [`fund_fixture_account_with_orchard_note`] below drives the
+    // SAME production `scan_cached_blocks` entry point `zcashlc_scan_blocks` wraps, fed one
+    // in-memory synthetic compact block instead of the filesystem block cache, exactly mirroring
+    // (with only non-test-gated `orchard`/`zcash_client_backend` APIs) the `compact_orchard_action`
+    // recipe `zcash_client_backend::data_api::testing` itself uses under `test-dependencies`.
+
+    /// A [`chain::BlockSource`] over an in-memory list of compact blocks — the funding-fixture
+    /// counterpart of the filesystem-backed cache the real sync pipeline reads from
+    /// (`zcashlc_scan_blocks` / `crate::block_db`), avoiding that filesystem/metadata-db setup
+    /// for what is here a single synthetic block.
+    struct FixtureBlockSource(Vec<zcash_client_backend::proto::compact_formats::CompactBlock>);
+
+    impl zcash_client_backend::data_api::chain::BlockSource for FixtureBlockSource {
+        type Error = std::convert::Infallible;
+
+        fn with_blocks<F, WalletErrT>(
+            &self,
+            from_height: Option<BlockHeight>,
+            limit: Option<usize>,
+            mut with_block: F,
+        ) -> Result<(), zcash_client_backend::data_api::chain::error::Error<WalletErrT, Self::Error>>
+        where
+            F: FnMut(
+                zcash_client_backend::proto::compact_formats::CompactBlock,
+            ) -> Result<
+                (),
+                zcash_client_backend::data_api::chain::error::Error<WalletErrT, Self::Error>,
+            >,
+        {
+            let from = from_height.map(u32::from).unwrap_or(0);
+            let take = limit.unwrap_or(usize::MAX);
+            for block in self.0.iter().filter(|b| b.height as u32 >= from).take(take) {
+                with_block(block.clone())?;
+            }
+            Ok(())
+        }
+    }
+
+    /// A single real, trial-decryptable Orchard `CompactOrchardAction` paying `value_zat` to the
+    /// external address (diversifier index 0) of `usk`'s Orchard full viewing key — built
+    /// directly with `orchard`'s note-encryption primitives. Mirrors librustzcash's own
+    /// `compact_orchard_action` test helper (`zcash_client_backend::data_api::testing`, gated
+    /// behind the `test-dependencies` feature this crate does not enable) using only the
+    /// non-test-gated `orchard`/`zcash_note_encryption` APIs that helper itself is built from —
+    /// the same relationship [`fixture_transfer_pczt_bytes`] already has to a hand-built PCZT.
+    fn fixture_orchard_compact_action(
+        usk: &zcash_keys::keys::UnifiedSpendingKey,
+        value_zat: u64,
+    ) -> zcash_client_backend::proto::compact_formats::CompactOrchardAction {
+        use orchard::keys::{FullViewingKey, Scope};
+        use orchard::note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho};
+        use orchard::note_encryption::{OrchardDomain, OrchardNoteEncryption};
+        use orchard::value::NoteValue;
+        use rand::RngCore;
+        use zcash_client_backend::proto::compact_formats::CompactOrchardAction;
+        use zcash_note_encryption::Domain;
+
+        let fvk = FullViewingKey::from(usk.orchard());
+        let recipient = fvk.address_at(0u32, Scope::External);
+
+        let mut rng = StdRng::seed_from_u64(0x1806_0002);
+        // The wire `nullifier` field IS the spend half of this same action: by construction the
+        // new note's `rho` always equals the nullifier revealed by the action's spend
+        // (`Rho::from_nf_old(nf) == Rho(nf.inner())` -- same underlying field element, just
+        // distinct newtypes), and the compact plaintext deliberately omits `rho` because it is
+        // always recoverable this way. The scanner reconstructs `rho` from the wire nullifier and
+        // recomputes the commitment to verify the decrypted plaintext, so an unrelated random
+        // nullifier (independent of the note's actual `rho`) makes that recomputed commitment
+        // never match `cmx` -- silently dropping the note instead of erroring.
+        let mut nf_old = [0u8; 32];
+        let rho = loop {
+            rng.fill_bytes(&mut nf_old);
+            if let Some(rho) = Rho::from_bytes(&nf_old).into_option() {
+                break rho;
+            }
+        };
+        let rseed = loop {
+            let mut draw = [0u8; 32];
+            rng.fill_bytes(&mut draw);
+            if let Some(rseed) = RandomSeed::from_bytes(draw, &rho).into_option() {
+                break rseed;
+            }
+        };
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(value_zat),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .expect("valid fixture note parts");
+
+        // No outgoing viewing key: the wallet detects this note via its OWN incoming viewing
+        // key on trial decryption, which the compact ciphertext supports independent of OVK.
+        let encryptor = OrchardNoteEncryption::new(None, note, [0u8; 512]);
+        let cmx = ExtractedNoteCommitment::from(note.commitment());
+        let ephemeral_key = OrchardDomain::epk_bytes(encryptor.epk());
+        let enc_ciphertext = encryptor.encrypt_note_plaintext();
+
+        CompactOrchardAction {
+            nullifier: nf_old.to_vec(),
+            cmx: cmx.to_bytes().to_vec(),
+            ephemeral_key: ephemeral_key.0.to_vec(),
+            ciphertext: enc_ciphertext[..52].to_vec(),
+        }
+    }
+
+    /// Funds the account whose spending key is `usk_bytes` ([`Era::Orchard`]-encoded exactly as
+    /// [`create_fixture_account_with_usk`] returns it) with one real, spendable Orchard note of
+    /// `value_zat`, by scanning ONE synthetic compact block at height 1 — right after the empty
+    /// birthday frontier every [`create_fixture_account_with_usk`] fixture starts from — through
+    /// the production [`scan_cached_blocks`] entry point: the same trial-decryption and
+    /// commitment-tree insert the real sync pipeline runs, just fed an in-memory block instead of
+    /// the filesystem cache `zcashlc_scan_blocks` reads from (so no FS block-metadata-db setup is
+    /// needed for one block). `value_zat` should be an amount that is not itself a single
+    /// canonical ZIP 318 denomination (e.g. not an exact `{1,2,5}·10^k` ZEC amount), so the note
+    /// actually needs splitting — exercising preparation transactions, not just a transfer.
+    fn fund_fixture_account_with_orchard_note(
+        path: &std::path::Path,
+        usk_bytes: &[u8],
+        value_zat: u64,
+    ) {
+        use zcash_client_backend::data_api::chain::scan_cached_blocks;
+        use zcash_client_backend::proto::compact_formats::{
+            ChainMetadata, CompactBlock, CompactTx,
+        };
+        use zcash_client_backend::proto::service::TreeState;
+        use zcash_client_sqlite::WalletDb;
+        use zcash_client_sqlite::util::SystemClock;
+        use zcash_protocol::consensus::MAIN_NETWORK;
+
+        let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
+            .expect("the fixture usk decodes");
+        let action = fixture_orchard_compact_action(&usk, value_zat);
+
+        let ctx = CompactTx {
+            index: 1,
+            txid: vec![0xABu8; 32],
+            actions: vec![action],
+            ..Default::default()
+        };
+        let block = CompactBlock {
+            height: 1,
+            hash: vec![0x11u8; 32],
+            prev_hash: vec![0x00u8; 32],
+            vtx: vec![ctx],
+            chain_metadata: Some(ChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 1,
+                ironwood_commitment_tree_size: 0,
+            }),
+            ..Default::default()
+        };
+
+        let mut wallet = WalletDb::for_path(path, MAIN_NETWORK, SystemClock, OsRng)
+            .expect("the fixture wallet database must reopen");
+
+        // Height 0, empty frontier: the exact chain state `create_fixture_account_with_usk`'s
+        // all-default birthday treestate already commits the account to.
+        let from_state = TreeState {
+            hash: "00".repeat(32),
+            ..TreeState::default()
+        }
+        .to_chain_state()
+        .expect("the empty birthday treestate converts to a chain state");
+
+        let block_source = FixtureBlockSource(vec![block]);
+        let summary = scan_cached_blocks(
+            &MAIN_NETWORK,
+            &block_source,
+            &mut wallet,
+            h(1),
+            &from_state,
+            10,
+        )
+        .expect("scanning the one fixture block must succeed");
+        assert_eq!(
+            summary.received_orchard_note_count(),
+            1,
+            "the fixture block's one action must be detected as belonging to this wallet"
+        );
+    }
+
+    /// Item 1 of the plan-cache supersession contract: `plan_and_cache` → `commit_or_resume`
+    /// with the SAME returned handle signs exactly the cached plan and succeeds, committing the
+    /// plan's preparation and transfer transactions. This is the happy path `commit_or_resume`'s
+    /// doc promises ("signs exactly the identified plan") and the one every propose/commit FFI
+    /// pair (`zcashlc_migration_propose_transfers` + `zcashlc_migration_sign_and_store_schedule`,
+    /// `zcashlc_migration_prepare_note_split` + `zcashlc_migration_sign_note_split`) relies on.
+    #[test]
+    fn commit_or_resume_succeeds_with_the_cached_plans_own_handle() {
+        let path = init_fixture_db("zcashlc_migration_commit_with_own_handle");
+        let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_note(&path, &usk_bytes, 1_234_567_890);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+
+        let (plan, _reference_height, handle) = plan_and_cache(&mut ctx, false)
+            .expect("planning must succeed")
+            .expect("the funded account has a real migration plan");
+        assert_ne!(handle, 0, "a real cached plan must mint a non-zero handle");
+        assert!(
+            !plan.schedule().is_empty(),
+            "a funded account's plan must schedule at least one transfer"
+        );
+
+        let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
+            .expect("the fixture usk decodes");
+        let (state, unsigned) = commit_or_resume(&mut ctx, Some(usk), false, handle)
+            .expect("commit with the plan's own handle must succeed");
+        assert!(
+            unsigned.is_empty(),
+            "an in-process signed commit (usk present) returns no pending-signature pczts"
+        );
+        assert!(
+            !state.transactions().is_empty(),
+            "the committed state must carry the plan's preparation and transfer transactions"
+        );
+        assert!(
+            !state.is_terminal(),
+            "a freshly committed run is in progress, neither complete nor failed"
+        );
+
+        // The handle is consumed: `commit_or_resume` clears the slot, so the cache no longer
+        // answers for it (a repeat commit with the same handle would now be `Missing`, not a
+        // silent re-sign of an already-committed plan).
+        assert!(matches!(
+            migration_plan_cache::get(&ctx.db_path, ctx.account_bytes, handle),
+            Err(migration_plan_cache::PlanLookupError::Missing)
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Item 2: a later `plan_and_cache` call replaces the cached slot and mints a fresh handle,
+    /// superseding the earlier one. `zcashlc_migration_prepare_note_split` and
+    /// `zcashlc_migration_propose_transfers` both call this exact function with `immediate =
+    /// false`, so two calls in a row is precisely the cache-contract event either pairing
+    /// produces (propose-then-prepare, or a second propose): the FIRST handle's commit must fail
+    /// with the stable `MIGRATION_PLAN_STALE` prefix and `Superseded` semantics — the actual
+    /// MOB-1458 app bug is a UI restart replaying a stale first handle after the wallet has since
+    /// re-proposed.
+    #[test]
+    fn commit_or_resume_rejects_a_superseded_handle_with_plan_stale() {
+        let path = init_fixture_db("zcashlc_migration_commit_with_superseded_handle");
+        let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_note(&path, &usk_bytes, 1_234_567_890);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+
+        let (_plan1, _ref1, handle1) = plan_and_cache(&mut ctx, false)
+            .expect("the first planning call must succeed")
+            .expect("the funded account has a real migration plan");
+        let (_plan2, _ref2, handle2) = plan_and_cache(&mut ctx, false)
+            .expect("the second planning call must succeed")
+            .expect("the funded account still has a real migration plan (nothing was spent)");
+        assert_ne!(
+            handle1, handle2,
+            "each cached plan draws a fresh, distinct handle"
+        );
+
+        let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
+            .expect("the fixture usk decodes");
+        let err = commit_or_resume(&mut ctx, Some(usk), false, handle1)
+            .expect_err("committing with the SUPERSEDED first handle must fail");
+        let message = err.to_string();
+        assert!(
+            message.starts_with(PLAN_STALE_PREFIX),
+            "the error must carry the stable MIGRATION_PLAN_STALE prefix: {message}"
+        );
+        assert!(
+            message.contains("superseded"),
+            "the detail must be the Superseded arm's message, not Missing's: {message}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Item 3: a stored NON-terminal migration state takes the resume branch in
+    /// `commit_or_resume` BEFORE the handle is ever consulted, so a bogus (never-minted, and for
+    /// an account whose plan cache was never populated) handle does not stop the resume. This is
+    /// the retry path's whole point (see `commit_or_resume`'s doc): once anything is committed
+    /// the durable stored run is the truth, and the handle only ever protects the FIRST commit of
+    /// a fresh plan.
+    #[test]
+    fn commit_or_resume_resumes_a_stored_non_terminal_run_without_consulting_the_handle() {
+        let path = init_fixture_db("zcashlc_migration_commit_resumes_stored_run");
+        let account = create_fixture_account(&path);
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[
+                MigrationTxState::AwaitingSignature,
+                MigrationTxState::Signed,
+            ],
+            50,
+            10_000,
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+
+        // Never minted by `migration_plan_cache::set` for this or any account -- the cache is
+        // empty here (no `plan_and_cache` call ever ran), so this would fail with
+        // `PlanLookupError::Missing` if the handle were consulted at all.
+        let bogus_handle: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+        let (resumed, unsigned) = commit_or_resume(&mut ctx, None, false, bogus_handle)
+            .expect("a stored non-terminal run resumes regardless of the handle");
+
+        assert_eq!(
+            resumed.status(),
+            MigrationStatus::InProgress,
+            "resume returns the STORED state, untouched"
+        );
+        assert_eq!(
+            unsigned.len(),
+            1,
+            "resume surfaces the stored AwaitingSignature transaction's (id, pczt) pair"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- debug fast-reschedule FFI (#1806 / MOB-1513): `zcashlc_migration_debug_reschedule_
+    // transfers`, mirroring the Android SDK's `debugRescheduleTransfersNative` -----
+
+    /// Scans one EMPTY synthetic compact block at height 1 (no transactions) into the fixture
+    /// wallet — just enough to give it a real chain tip (height 1, so `CallCtx::target()` is a
+    /// small, deterministic `2`) AND a real note-commitment-tree checkpoint at that height, which
+    /// `WalletRead::get_target_and_anchor_heights` (via
+    /// [`migration_finalize::natural_anchor_height`], what the debug-reschedule FFI resolves its
+    /// override anchor from) needs to answer at all — confirmed empirically: on a freshly
+    /// initialized wallet with no scanned blocks it errors ("no anchor height yet"). Lighter than
+    /// [`fund_fixture_account_with_orchard_note`]: the debug-reschedule path never touches note
+    /// selection, so the block need not carry a real decryptable action, only a checkpoint.
+    fn scan_one_empty_fixture_block(path: &std::path::Path) {
+        use zcash_client_backend::data_api::chain::scan_cached_blocks;
+        use zcash_client_backend::proto::compact_formats::{ChainMetadata, CompactBlock};
+        use zcash_client_backend::proto::service::TreeState;
+        use zcash_client_sqlite::WalletDb;
+        use zcash_client_sqlite::util::SystemClock;
+        use zcash_protocol::consensus::MAIN_NETWORK;
+
+        let block = CompactBlock {
+            height: 1,
+            hash: vec![0x22u8; 32],
+            prev_hash: vec![0x00u8; 32],
+            chain_metadata: Some(ChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            }),
+            ..Default::default()
+        };
+        let mut wallet = WalletDb::for_path(path, MAIN_NETWORK, SystemClock, OsRng)
+            .expect("the fixture wallet database must reopen");
+        let from_state = TreeState {
+            hash: "00".repeat(32),
+            ..TreeState::default()
+        }
+        .to_chain_state()
+        .expect("the empty birthday treestate converts to a chain state");
+        let block_source = FixtureBlockSource(vec![block]);
+        scan_cached_blocks(
+            &MAIN_NETWORK,
+            &block_source,
+            &mut wallet,
+            h(1),
+            &from_state,
+            10,
+        )
+        .expect("scanning the one empty fixture block must succeed");
+    }
+
+    /// A stored migration with ONE preparation transaction and FIVE transfers spanning every
+    /// pre-broadcast state plus `Broadcast` and `Mined`, at scrambled `scheduled_height`s (NOT in
+    /// id or storage order) and distinct, individually identifiable `anchor_boundary`/
+    /// `expiry_height` values — the fixture `zcashlc_migration_debug_reschedule_transfers`'s
+    /// tests share, proving: only PENDING transfers (not broadcast/mined, not preparations) are
+    /// touched; the NEW order follows the transfers' EXISTING `scheduled_height` order, not their
+    /// id or storage order; only the earliest-due transfer's `anchor_boundary` is rewritten; and
+    /// `expiry_height` is never touched.
+    fn debug_reschedule_fixture_state() -> MigrationState {
+        let transactions = vec![
+            // A preparation: excluded by `kind = 'transfer'` alone, even though its state
+            // (Signed) would otherwise qualify as "pending".
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(0),
+                MigrationTxKind::Preparation { layer: 0, index: 0 },
+                vec![9u8],
+                Vec::new(),
+                h(500),
+                h(999_990),
+                None,
+                MigrationTxState::Signed,
+                None,
+            ),
+            // Pending transfers, stored latest-first (7000, 3000, 5000) -- the rescheduled order
+            // must come out ascending by the OLD scheduled_height (3000 < 5000 < 7000, i.e. ids
+            // 1, 2, 3 in that order), never storage order.
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(3),
+                MigrationTxKind::Transfer { crossing: 2 },
+                vec![3u8],
+                Vec::new(),
+                h(7000),
+                h(999_003),
+                Some(h(333)),
+                MigrationTxState::AwaitingSignature,
+                None,
+            ),
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(1),
+                MigrationTxKind::Transfer { crossing: 0 },
+                vec![1u8],
+                Vec::new(),
+                h(3000),
+                h(999_001),
+                Some(h(222)),
+                MigrationTxState::Signed,
+                None,
+            ),
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(2),
+                MigrationTxKind::Transfer { crossing: 1 },
+                vec![2u8],
+                Vec::new(),
+                h(5000),
+                h(999_002),
+                Some(h(111)),
+                MigrationTxState::Proved,
+                None,
+            ),
+            // Already broadcast: excluded by `state NOT IN ('broadcast', 'mined')`.
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(4),
+                MigrationTxKind::Transfer { crossing: 3 },
+                vec![4u8],
+                Vec::new(),
+                h(4000),
+                h(999_004),
+                Some(h(444)),
+                MigrationTxState::Broadcast {
+                    txid: TxId::from_bytes([4u8; 32]),
+                },
+                None,
+            ),
+            // Already mined: same exclusion.
+            MigrationTransaction::from_parts(
+                MigrationTxId::new(5),
+                MigrationTxKind::Transfer { crossing: 4 },
+                vec![5u8],
+                Vec::new(),
+                h(2000),
+                h(999_005),
+                Some(h(555)),
+                MigrationTxState::Mined { height: h(50) },
+                None,
+            ),
+        ];
+        let funding: Vec<Zatoshis> = (0..5).map(|_| zat(100_000_000)).collect();
+        MigrationState::from_parts(
+            MigrationStatus::InProgress,
+            NoteSplitPlan::from_stored_parts(
+                funding,
+                zat(10_000),
+                None,
+                zat(20_000),
+                zat(1_000_000_000),
+                zat(999_000_000),
+            )
+            .unwrap(),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            transactions,
+            AnchorBucketInterval::ZIP_318,
+        )
+    }
+
+    /// Items (a)-(f): pending transfers are rescheduled to `target + FIRST_DELAY_BLOCKS + i *
+    /// STRIDE_BLOCKS` in their EXISTING `scheduled_height` order (a); a broadcast and a mined
+    /// transfer are left completely untouched (b); the preparation row is left untouched (c);
+    /// only the earliest-due (`i == 0`) transfer's `anchor_boundary` is rewritten to the wallet's
+    /// natural anchor, the others keep their original, distinct values (d); `expiry_height` is
+    /// never touched on any row (e); the function returns the count of transfers it rescheduled,
+    /// 3 here (f).
+    #[test]
+    fn debug_reschedule_transfers_reschedules_pending_transfers_in_scheduled_height_order() {
+        let path = init_fixture_db("zcashlc_migration_debug_reschedule_pending");
+        let account = create_fixture_account(&path);
+        scan_one_empty_fixture_block(&path);
+        store_fixture_state(&path, &account, &debug_reschedule_fixture_state());
+
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        // Tip = 1 (the one scanned block), so target = 2: new heights are 2+2=4, 2+6=8, 2+10=12.
+        // The wallet's natural anchor at this same fixture state is BlockHeight(0) (see
+        // `scan_one_empty_fixture_block`'s doc).
+        let rescheduled = unsafe {
+            zcashlc_migration_debug_reschedule_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(rescheduled, 3, "(f) exactly the 3 pending transfers count");
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)
+            .expect("the fixture backend opens");
+        let state = backend
+            .get_migration()
+            .expect("reading the migration back must succeed")
+            .expect("the stored migration is still present");
+        let tx = |id: u32| {
+            state
+                .transactions()
+                .iter()
+                .find(|t| t.id() == MigrationTxId::new(id))
+                .unwrap_or_else(|| panic!("transaction {id} must still be present"))
+        };
+
+        // (a) + (d): earliest-due (id 1, was 3000) -> target+2, anchor rewritten to the natural
+        // anchor.
+        assert_eq!(tx(1).scheduled_height(), h(4));
+        assert_eq!(tx(1).anchor_boundary(), Some(h(0)));
+        // (a) + (d): middle (id 2, was 5000) -> target+6, anchor UNCHANGED.
+        assert_eq!(tx(2).scheduled_height(), h(8));
+        assert_eq!(tx(2).anchor_boundary(), Some(h(111)));
+        // (a) + (d): latest (id 3, was 7000) -> target+10, anchor UNCHANGED.
+        assert_eq!(tx(3).scheduled_height(), h(12));
+        assert_eq!(tx(3).anchor_boundary(), Some(h(333)));
+        // (e): expiry untouched on all three rescheduled rows.
+        assert_eq!(tx(1).expiry_height(), h(999_001));
+        assert_eq!(tx(2).expiry_height(), h(999_002));
+        assert_eq!(tx(3).expiry_height(), h(999_003));
+
+        // (b): broadcast and mined transfers are completely untouched.
+        assert_eq!(tx(4).scheduled_height(), h(4000));
+        assert_eq!(tx(4).anchor_boundary(), Some(h(444)));
+        assert_eq!(tx(4).expiry_height(), h(999_004));
+        assert!(matches!(tx(4).state(), MigrationTxState::Broadcast { .. }));
+        assert_eq!(tx(5).scheduled_height(), h(2000));
+        assert_eq!(tx(5).anchor_boundary(), Some(h(555)));
+        assert_eq!(tx(5).expiry_height(), h(999_005));
+        assert!(matches!(tx(5).state(), MigrationTxState::Mined { .. }));
+
+        // (c): the preparation is completely untouched.
+        assert_eq!(tx(0).scheduled_height(), h(500));
+        assert_eq!(tx(0).anchor_boundary(), None);
+        assert_eq!(tx(0).expiry_height(), h(999_990));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Item (g): no stored migration row for the account -- returns `0`, not an error (the tip
+    /// and natural-anchor lookups above the migration-row check must not themselves fail just
+    /// because there is nothing to reschedule).
+    #[test]
+    fn debug_reschedule_transfers_with_no_stored_migration_returns_zero() {
+        let path = init_fixture_db("zcashlc_migration_debug_reschedule_no_migration");
+        let account = create_fixture_account(&path);
+        scan_one_empty_fixture_block(&path);
+
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let rescheduled = unsafe {
+            zcashlc_migration_debug_reschedule_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(
+            rescheduled, 0,
+            "no migration row means nothing to reschedule"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Round-trips the invalid-transfer marks through the extension table that
     /// `zcashlc_init_data_database`'s external migrations create (exercising the whole chain:
     /// the `ext_zcashlc_*` schema migration, then the mediated extension-transaction access).
@@ -4144,6 +4931,37 @@ mod tests {
         clear_invalid_marks(&mut wallet, &account).unwrap();
         assert!(invalid_marks(&mut wallet, &account).unwrap().is_empty());
         assert_eq!(invalid_marks(&mut wallet, &other).unwrap(), vec![7]);
+    }
+
+    /// Regression pin: the migration store connection (a second, independent connection into the
+    /// same wallet database file the slipstream engine writes from) must wait for a held sqlite
+    /// lock exactly as long as the wallet handle does -- `crate::wallet_db` (lib.rs) sets
+    /// `crate::WALLET_DB_BUSY_TIMEOUT` (15 s, currently) because the engine's write-behind commits
+    /// can hold the file lock for seconds; upstream sets none. Before the fix, [`open`]'s store
+    /// connection was a bare `Connection::open` with no explicit timeout, silently falling back to
+    /// rusqlite's 5 s default -- a migration call racing a long engine write could hit
+    /// `database is locked` a full 10 s earlier than the wallet handle would have given up.
+    #[test]
+    fn store_conn_matches_wallet_db_busy_timeout() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_migration_store_conn_busy_timeout_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = open_store_conn(&path).expect("the store connection must open");
+        let busy_timeout: u32 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("PRAGMA busy_timeout must be readable");
+        // The literal (rather than comparing against `crate::WALLET_DB_BUSY_TIMEOUT` itself) is
+        // deliberate: this pins the actual wait time a caller experiences, so a future edit that
+        // changes the constant's value without meaning to still fails this test instead of
+        // silently redefining "correct".
+        assert_eq!(
+            busy_timeout, 15_000,
+            "the migration store connection must wait as long as the wallet handle \
+             (crate::WALLET_DB_BUSY_TIMEOUT in lib.rs, currently 15 s) before giving up on a held lock"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// On a freshly initialized wallet database with a chain tip but no spendable notes, locking

@@ -1,19 +1,40 @@
 //
-//  SDKSynchronizerMigrationTests.swift
+//  SlipstreamSynchronizerMigrationTests.swift
 //  OfflineTests
 //
-//  Tests `SDKSynchronizer`'s migration group (R4-B): the 32 `Synchronizer` protocol requirements,
-//  as thin forwards to a seamed `OrchardMigrationHost` -- except the DB-free, account-free Keystone
-//  batch-signing bridge (4 members, #1806), which forwards straight to `initializer.rustBackend`
-//  instead, bypassing the host entirely -- and the two SDK-enforced session-separation behaviors --
-//  the start() privacy gate and the submitNoteSplit/executeNextPendingMigrationTransfer broadcast
-//  guard. Driven through the host's injecting initializer + a scripted actor factory, mirroring
-//  R4-A's `OrchardMigrationHostTests` seam, with the host substituted into a real `SDKSynchronizer`
-//  via the container-mock seam (`container.mock(type: OrchardMigrationHost.self, ...)`) that
-//  `SDKSynchronizer.init` resolves against, same as `sdkFlags`/`submitPlanStore`.
+//  Tests `SlipstreamSynchronizer`'s migration group (R4-C): the same 32 `Synchronizer` protocol
+//  requirements `SDKSynchronizer` implements (see `SDKSynchronizerMigrationTests`), as thin forwards
+//  to a seamed `OrchardMigrationHost` -- except the DB-free, account-free Keystone batch-signing
+//  bridge (4 members, #1806), which forwards straight to `initializer.rustBackend` instead,
+//  bypassing the host entirely -- plus the two SDK-enforced session-separation behaviors -- the
+//  `start()` privacy gate and the `submitNoteSplit`/`executeNextPendingMigrationTransfer` broadcast
+//  guard -- mirrored onto the actor.
 //
-//  No network, no real FFI beyond local SQLite/key-derivation calls that `Initializer`/
-//  `TestsData` already make offline elsewhere in this suite.
+//  Driven through the host's injecting initializer + a scripted actor factory, exactly like
+//  `SDKSynchronizerMigrationTests`, with the host substituted into a real `SlipstreamSynchronizer` via
+//  the same container-mock seam (`container.mock(type: OrchardMigrationHost.self, ...)`) that
+//  `SlipstreamSynchronizer.init` resolves against.
+//
+//  The two enforcement suites need `latestState.internalSyncStatus` in a specific case (`.disconnected`
+//  to satisfy `start(retry:)`'s `isPrepared` guard; `.syncing` to exercise the broadcast guard) without
+//  going through `prepare()`/`start()` for real: unlike `SDKSynchronizer` (whose package-visible
+//  `updateStatus(_:)` its own tests reuse directly), `SlipstreamSynchronizer`'s only OTHER way to reach
+//  a non-`.unprepared` status is the real engine -- and driving `.syncing` through a genuine `start()`
+//  spawns the real background poll loop, whose `tickPoll()` calls `engine.walletSummary()` (documented
+//  as unsafe to call "mid-scan" -- it can run long against a wallet that is actively, unsuccessfully,
+//  trying to reach a server) on the SAME actor `engine.stop()` needs, so a leaked in-flight summary
+//  walk can block teardown well past any reasonable test deadline and bleed into whatever test the
+//  process runs next (this was caught empirically: an earlier version of this suite that drove state
+//  through real `prepare()`/`start()` calls intermittently starved
+//  `WalletTests.testWalletInitialization`, elsewhere in this same `OfflineTests` target, of its mocked
+//  service interaction). `SlipstreamSynchronizer.setInternalSyncStatusForTesting(_:)` -- a small
+//  `internal` seam added alongside this suite for exactly this purpose -- sidesteps all of that: it
+//  writes `stateSubject` directly, the same way `stopImpl()`/`tickPoll()` do internally, with no engine
+//  or poll-loop involvement at all.
+//
+//  No network, no real FFI beyond local SQLite/key-derivation calls that `Initializer`/`TestsData`
+//  already make offline elsewhere in this suite (see `WalletTests.testWalletInitialization` and
+//  `SlipstreamOfflineTests` for precedent).
 //
 
 import Combine
@@ -22,7 +43,7 @@ import Foundation
 import XCTest
 @testable import ZcashLightClientKit
 
-final class SDKSynchronizerMigrationTests: ZcashTestCase {
+final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
     private let accountUUID = AccountUUID(id: [UInt8](repeating: 0x0A, count: 16))
     private let submissionEndpoint = LightWalletEndpoint(address: "submit.example", port: 9067)
     private var cancellables: [AnyCancellable] = []
@@ -51,6 +72,29 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
         XCTAssertEqual(state, .notStarted)
         XCTAssertEqual(welding.migrationStateForReceivedAccount, accountUUID)
+    }
+
+    func testMigrationTransactionStatusesForwardsToTheAccountsActor() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let expected = [
+            MigrationTransactionStatus(
+                id: 3,
+                kind: MigrationTransactionStatus.Kind.transfer(crossing: 0),
+                state: MigrationTransactionStatus.State.signed,
+                scheduledHeight: 1_000_100,
+                expiryHeight: 1_069_220,
+                isReady: false,
+                nextAction: nil,
+                blockedOn: MigrationTransactionStatus.Blocker.schedule
+            )
+        ]
+        welding.migrationTransactionStatusesForReturnValue = expected
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+
+        let statuses = try await synchronizer.migrationTransactionStatuses(accountUUID: accountUUID)
+
+        XCTAssertEqual(statuses, expected)
+        XCTAssertEqual(welding.migrationTransactionStatusesForReceivedAccount, accountUUID)
     }
 
     func testPrepareNoteSplitForwardsToTheAccountsActor() async throws {
@@ -86,31 +130,6 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
         XCTAssertTrue(overdue)
         XCTAssertEqual(welding.migrationHasOverdueTransfersForReceivedAccount, accountUUID)
-    }
-
-    /// The live per-transaction status read behind `migrationProgress`'s aggregate summary --
-    /// forwards to the per-account actor and returns the engine's rows untouched.
-    func testMigrationTransactionStatusesForwardsToTheAccountsActor() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        let expected = [
-            MigrationTransactionStatus(
-                id: 3,
-                kind: .transfer(crossing: 0),
-                state: .awaitingSignature,
-                scheduledHeight: 3_000_000,
-                expiryHeight: 3_000_100,
-                isReady: true,
-                nextAction: .prove,
-                blockedOn: nil
-            )
-        ]
-        welding.migrationTransactionStatusesForReturnValue = expected
-        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-
-        let statuses = try await synchronizer.migrationTransactionStatuses(accountUUID: accountUUID)
-
-        XCTAssertEqual(statuses, expected)
-        XCTAssertEqual(welding.migrationTransactionStatusesForReceivedAccount, accountUUID)
     }
 
     /// `refreshStaleMigrationTransfers`'s external-signer (Keystone) lane: a `nil` usk must reach
@@ -168,7 +187,8 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     }
 
     /// #1806: `debugRescheduleMigrationTransfers` -- DEBUG/QA ONLY -- forwards to the per-account
-    /// actor and returns the engine's rescheduled-transfer count untouched.
+    /// actor and returns the engine's rescheduled-transfer count untouched. Mirrors
+    /// `SDKSynchronizerMigrationTests.testDebugRescheduleMigrationTransfersForwardsToTheAccountsActor`.
     func testDebugRescheduleMigrationTransfersForwardsToTheAccountsActor() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.migrationDebugRescheduleTransfersForReturnValue = 3
@@ -178,48 +198,6 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
         XCTAssertEqual(rescheduled, 3)
         XCTAssertEqual(welding.migrationDebugRescheduleTransfersForReceivedAccount, accountUUID)
-    }
-
-    /// The sequential-runs contract at the API level: `.complete` is per-run, and the authority
-    /// for "does anything remain to migrate" is a fresh propose — an empty schedule means no, a
-    /// non-empty one is the next run's proposal. Hosts must not latch "never migrate again" off
-    /// the state machine alone.
-    func testAfterCompleteProposeMigrationTransfersAnswersWhetherAnythingRemains() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        welding.migrationStateForReturnValue = .complete
-        welding.migrationProposeTransfersForReturnValue = MigrationSchedule(
-            transfers: [],
-            estimatedDurationHours: 0,
-            // The empty "nothing to migrate" answer carries handle 0 (no cached plan).
-            proposalHandle: 0
-        )
-        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-
-        let state = try await synchronizer.migrationState(accountUUID: accountUUID)
-        XCTAssertEqual(state, .complete)
-
-        let remains = try await synchronizer.proposeMigrationTransfers(accountUUID: accountUUID)
-        XCTAssertTrue(remains.transfers.isEmpty, "an empty schedule is the 'nothing remains' answer")
-
-        // Funds arrive later (or a large balance needed another round): the same call now answers
-        // with the next run's proposal.
-        let nextRun = MigrationSchedule(
-            transfers: [
-                MigrationTransferProposal(
-                    id: 3,
-                    amount: Zatoshi(100_000_000),
-                    anchorHeight: BlockHeight(1_000),
-                    nextExecutableAfterHeight: BlockHeight(1_010),
-                    expiryHeight: BlockHeight(70_000)
-                )
-            ],
-            estimatedDurationHours: 1,
-            // A freshly proposed, not-yet-committed plan: a live nonzero handle.
-            proposalHandle: 1
-        )
-        welding.migrationProposeTransfersForReturnValue = nextRun
-        let proposed = try await synchronizer.proposeMigrationTransfers(accountUUID: accountUUID)
-        XCTAssertEqual(proposed, nextRun, "a non-empty schedule is the next run's proposal")
     }
 
     /// #1806: `createUnsignedNoteSplitPCZTs` gained a required `schedule` parameter with the
@@ -377,12 +355,12 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
     // MARK: - Forwarding: Keystone batch-signing bridge (DB-free, no host)
     //
-    // Unlike the rest of this group, these four bypass `migrationHost.migration(for:)` entirely --
-    // DB-free and account-free, they forward straight to `initializer.rustBackend` (see
-    // `SDKSynchronizer.swift`'s own "ordinary PCZT operations" precedent: `createPCZTFromProposal`,
-    // `redactPCZTForSigner`, et al.), mirroring `SlipstreamSynchronizer`'s override of the same
-    // four. `ZcashRustBackendWelding` is substituted into the SAME container `SDKSynchronizer.init`
-    // resolves `initializer.rustBackend` from (mirrors
+    // #1806: unlike the rest of this group, these four bypass `migrationHost.migration(for:)`
+    // entirely -- DB-free and account-free, they forward straight to `initializer.rustBackend`,
+    // mirroring `SDKSynchronizer`'s own override of the same four (and this file's PCZT-section
+    // precedent in `SlipstreamSynchronizer.swift`: `createPCZTFromProposal`, `redactPCZTForSigner`,
+    // et al.). `ZcashRustBackendWelding` is substituted into the SAME container
+    // `SlipstreamSynchronizer.init` resolves `initializer.rustBackend` from (mirrors
     // `SynchronizerOfflineTests.testPreparePropagatesSeedNotRelevantFromRustBackend`'s seam), so
     // `welding` backs both the (here, unused) `OrchardMigrationHost` and the direct rust-backend
     // forward under test.
@@ -519,6 +497,26 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(synchronizer.migrationPrivacySyncBufferDuration, OrchardMigration.privacySyncBufferDuration)
     }
 
+    // MARK: - Defaults-override completeness
+
+    /// One representative throwing member, scripted to SUCCEED via the host: the protocol-extension
+    /// default (`public extension Synchronizer`) throws `MigrationUnimplemented` unconditionally for
+    /// every throwing member in the group, so succeeding at all here already proves this is
+    /// `SlipstreamSynchronizer`'s own witness, not the inert default falling through -- the whole
+    /// point of R4-C. The gate members' override-vs-default distinction is already pinned above
+    /// (`testIsMigrationSyncBlockedForwardsToHostPredicate` /
+    /// `testMigrationSyncBlockedStreamForwardsToHostStream`).
+    func testThrowingMigrationMemberIsSlipstreamSynchronizersOwnWitnessNotTheProtocolDefault() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationStateForReturnValue = .notStarted
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+
+        // If SlipstreamSynchronizer still fell through to the protocol default, this would throw
+        // `MigrationUnimplemented` instead of returning the host-scripted value.
+        let state = try await synchronizer.migrationState(accountUUID: accountUUID)
+        XCTAssertEqual(state, .notStarted)
+    }
+
     // MARK: - Enforcement: start() privacy gate
 
     func testStartThrowsMigrationSyncBlockedWhenHostReportsBlocked() async throws {
@@ -526,7 +524,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         welding.listAccountsReturnValue = [makeAccount(accountUUID)]
         welding.migrationHasOverdueTransfersForReturnValue = true
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-        await synchronizer.updateStatus(.stopped)
+        await synchronizer.setInternalSyncStatusForTesting(.disconnected)
 
         do {
             try await synchronizer.start(retry: false)
@@ -542,26 +540,31 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         }
     }
 
+    /// The gate passing is proven by NOT seeing `migrationSyncBlocked`: since this synchronizer's
+    /// engine handle was never `open()`ed (no real `prepare()` call -- see the file header for why),
+    /// `start()` proceeds past the gate straight into `engine.start(...)`, which throws the unrelated,
+    /// purely-local `rustSlipstreamNotOpen` -- exactly the kind of "unrelated offline failure" this
+    /// test already tolerates, and it never spawns the poll loop (the throw happens before
+    /// `startPolling()`), so there is nothing to clean up afterward.
     func testStartProceedsPastTheGateWhenHostReportsUnblocked() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = []
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-        await synchronizer.updateStatus(.stopped)
+        await synchronizer.setInternalSyncStatusForTesting(.disconnected)
 
         do {
             try await synchronizer.start(retry: false)
-            // Ideal outcome: the gate passed and start() ran to completion offline.
+            // Also an acceptable outcome, should the engine tolerate starting unopened.
         } catch let error as ZcashError {
             if case .migrationSyncBlocked = error {
                 XCTFail("start() must not report migrationSyncBlocked when the host reports unblocked")
             }
-            // Any other ZcashError is an unrelated offline failure (no live lightwalletd) and is
-            // acceptable here -- only the gate's behavior is under test.
+            // Any other ZcashError is an unrelated offline failure (expected: rustSlipstreamNotOpen,
+            // since this synchronizer's engine was never opened) and is acceptable here -- only the
+            // gate's behavior is under test.
         } catch {
             // Likewise tolerated as an unrelated offline failure.
         }
-
-        synchronizer.stop()
     }
 
     // MARK: - Enforcement: broadcast guard
@@ -570,7 +573,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         let welding = ZcashRustBackendWeldingMock()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
-        await synchronizer.updateStatus(.syncing(0.5, false))
+        await synchronizer.setInternalSyncStatusForTesting(.syncing(0.5, false))
 
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(1_000)], fee: Zatoshi(100), proposalHandle: 1)
         let usk = TestsData(networkType: .testnet).spendingKey
@@ -597,7 +600,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         let welding = ZcashRustBackendWeldingMock()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
-        await synchronizer.updateStatus(.syncing(0.5, false))
+        await synchronizer.setInternalSyncStatusForTesting(.syncing(0.5, false))
 
         let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint)
 
@@ -622,14 +625,16 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     /// really does reach the per-account actor's engine call -- by stubbing the engine's first
     /// broadcast-flow step to throw a distinctive, non-`ZcashError` failure and observing it
     /// propagate untouched (rather than seeing `migrationBroadcastDuringSync`, or a crash from an
-    /// unconfigured mock return value).
+    /// unconfigured mock return value). Deliberately does NOT call `setInternalSyncStatusForTesting`:
+    /// migration members work without `prepare()` (protocol doc, `Synchronizer.swift`), so the
+    /// synchronizer's default freshly-constructed `.unprepared` state already satisfies "not syncing"
+    /// for this guard.
     func testSubmitNoteSplitForwardsWhenNotSyncing() async throws {
         struct StubSigningFailure: Error, Equatable {}
         let welding = ZcashRustBackendWeldingMock()
         welding.migrationSignNoteSplitProposalUskForThrowableError = StubSigningFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
-        await synchronizer.updateStatus(.stopped)
 
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(1_000)], fee: Zatoshi(100), proposalHandle: 1)
         let usk = TestsData(networkType: .testnet).spendingKey
@@ -659,7 +664,6 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         welding.migrationNextDueTransferForThrowableError = StubNextDueTransferFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
-        await synchronizer.updateStatus(.stopped)
 
         let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint)
 
@@ -677,93 +681,12 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(recorder.callCount, 1, "the host must be consulted when the synchronizer is not syncing")
     }
 
-    // MARK: - Resource lifecycle: migration-host registration must not retain the Initializer
-
-    /// Regression test: `SDKSynchronizer.init` registers a factory closure for `OrchardMigrationHost`
-    /// on `initializer.container`. If that closure captures `initializer` with no capture list, the
-    /// result is a cycle -- `initializer` owns `container` (`Initializer.container: DIContainer`),
-    /// `container` stores the closure, and the closure captures `initializer` right back
-    /// (`initializer -> container -> closure -> initializer`). Once that happens, `initializer` (and
-    /// everything it owns: the container, the resolved `OrchardMigrationHost`, every per-account actor)
-    /// outlives the synchronizer that built it for as long as the container itself stays reachable --
-    /// e.g. this test's `mockContainer`, which `ZcashTestCase` keeps alive for the whole test method,
-    /// well past this test's own local scope.
-    ///
-    /// Deliberately does NOT go through `makeSynchronizer(migrationHost:)`/`makeHost(welding:)` like
-    /// every other test in this file: pre-mocking `OrchardMigrationHost` would mean `SDKSynchronizer.init`
-    /// resolves the *mock* dependency, and `DIContainer.resolve`'s singleton-cache write-back
-    /// (`dependencies[key] = Dependency(factory: dependency.factory, ...)`) always writes into the
-    /// non-mock `dependencies` dictionary, even when what it just resolved came from `mockedDependencies`
-    /// -- so a pre-registered mock overwrites (and thereby immediately releases) the real,
-    /// initializer-capturing closure before it is ever invoked, which would hide this exact bug. Letting
-    /// `SDKSynchronizer.init` register and resolve the real `OrchardMigrationHost(initializer:)` is what
-    /// exercises the production code path the bug lives in.
-    ///
-    /// Also deliberately does NOT go through `SDKSynchronizer.init(initializer:)` (the public convenience
-    /// initializer): that convenience initializer builds its `CompactBlockProcessor` with
-    /// `walletBirthdayProvider: { initializer.walletBirthday }`, an unrelated, pre-existing closure (predates
-    /// this migration work) that captures `initializer` and ends up retained by the container too, via
-    /// `Dependencies.setupCompactBlockProcessor`'s `UTXOFetcher` registration
-    /// (`UTXOFetcherConfig(walletBirthdayProvider: config.walletBirthdayProvider)`). That is a second,
-    /// independent container/`Initializer` cycle -- out of scope here (not part of the migration-host
-    /// registration this test targets) -- that would otherwise keep `initializer` alive regardless of
-    /// this fix and make the test unable to isolate the one cycle it exists to catch. Calling the
-    /// designated initializer directly, with a `walletBirthdayProvider` that returns a constant instead of
-    /// capturing `initializer`, sidesteps that unrelated cycle without touching any production code.
-    func testMigrationHostRegistrationDoesNotLeakTheInitializer() throws {
-        weak var weakInitializer: Initializer?
-        weak var weakSynchronizer: SDKSynchronizer?
-
-        func buildAndReleaseSynchronizer() throws {
-            let initializer = Initializer(
-                container: mockContainer,
-                cacheDbURL: nil,
-                fsBlockDbRoot: testTempDirectory,
-                generalStorageURL: testGeneralStorageDirectory,
-                dataDbURL: try __dataDbURL(),
-                torDirURL: try __torDirURL(),
-                endpoint: LightWalletEndpointBuilder.default,
-                network: ZcashNetworkBuilder.network(for: .testnet),
-                spendParamsURL: try __spendParamsURL(),
-                outputParamsURL: try __outputParamsURL(),
-                saplingParamsSourceURL: SaplingParamsSourceURL.tests,
-                isTorEnabled: false,
-                isExchangeRateEnabled: false
-            )
-            let blockProcessor = CompactBlockProcessor(
-                initializer: initializer,
-                walletBirthdayProvider: { 0 }
-            )
-            let synchronizer = SDKSynchronizer(
-                status: .unprepared,
-                initializer: initializer,
-                transactionEncoder: WalletTransactionEncoder(initializer: initializer),
-                transactionRepository: initializer.transactionRepository,
-                blockProcessor: blockProcessor,
-                syncSessionTicker: .live
-            )
-
-            weakInitializer = initializer
-            weakSynchronizer = synchronizer
-        }
-
-        try buildAndReleaseSynchronizer()
-
-        XCTAssertNil(weakSynchronizer, "SDKSynchronizer should deallocate once every strong reference to it goes out of scope")
-        XCTAssertNil(
-            weakInitializer,
-            """
-            Initializer should deallocate once its owning SDKSynchronizer is gone -- a non-nil value means the \
-            OrchardMigrationHost registration closure is still retaining it (initializer -> container -> closure -> initializer)
-            """
-        )
-    }
-
     // MARK: - Helpers
 
-    /// Builds an `SDKSynchronizer` whose one `OrchardMigrationHost` is `migrationHost`, substituted
-    /// via the same container-mock seam `SDKSynchronizer.init` resolves the production host through.
-    private func makeSynchronizer(migrationHost: OrchardMigrationHost) throws -> SDKSynchronizer {
+    /// Builds a `SlipstreamSynchronizer` whose one `OrchardMigrationHost` is `migrationHost`,
+    /// substituted via the same container-mock seam `SlipstreamSynchronizer.init` resolves the
+    /// production host through -- mirrors `SDKSynchronizerMigrationTests.makeSynchronizer(migrationHost:)`.
+    private func makeSynchronizer(migrationHost: OrchardMigrationHost) throws -> SlipstreamSynchronizer {
         mockContainer.mock(type: OrchardMigrationHost.self, isSingleton: true) { _ in migrationHost }
 
         let initializer = Initializer(
@@ -782,16 +705,15 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
             isExchangeRateEnabled: false
         )
 
-        return SDKSynchronizer(initializer: initializer)
+        return SlipstreamSynchronizer(initializer: initializer)
     }
 
-    /// Builds an `OrchardMigrationHost` via its injecting initializer, following R4-A's
-    /// `OrchardMigrationHostTests` seam: `welding` backs both the wallet-scope predicate and every
-    /// per-account actor the (scripted) `actorFactory` produces. `factoryRecorder`, when supplied,
-    /// counts every `actorFactory` invocation -- i.e. every time `migrationHost.migration(for:)`
-    /// actually built (or reused... no, `migration(for:)` caches, so this only fires once per
-    /// account) a per-account actor, which is what the broadcast guard's "never touched the host"
-    /// assertions pin.
+    /// Builds an `OrchardMigrationHost` via its injecting initializer, following R4-A/R4-B's seam
+    /// (`OrchardMigrationHostTests` / `SDKSynchronizerMigrationTests`): `welding` backs both the
+    /// wallet-scope predicate and every per-account actor the (scripted) `actorFactory` produces.
+    /// `factoryRecorder`, when supplied, counts every `actorFactory` invocation -- i.e. every time
+    /// `migrationHost.migration(for:)` actually built a per-account actor, which is what the
+    /// broadcast guard's "never touched the host" assertions pin.
     private func makeHost(
         welding: ZcashRustBackendWeldingMock,
         broadcaster: any MigrationBroadcasting = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),
@@ -840,11 +762,8 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     }
 }
 
-/// Records how many times a scripted `OrchardMigrationHost` `actorFactory` closure ran -- i.e. how
-/// many times `migrationHost.migration(for:)` actually had to build a per-account actor. Mutated
-/// synchronously from the (non-async) `actorFactory` closure, which this suite's tests only ever
-/// invoke serially -- mirroring how `ZcashRustBackendWeldingMock`'s own plain `CallsCount` fields
-/// are mutated in this codebase's generated mocks.
+/// Records how many times a scripted `OrchardMigrationHost` `actorFactory` closure ran -- mirrors
+/// `SDKSynchronizerMigrationTests`'s helper of the same name/purpose.
 private final class FactoryInvocationRecorder {
     private(set) var callCount = 0
 
