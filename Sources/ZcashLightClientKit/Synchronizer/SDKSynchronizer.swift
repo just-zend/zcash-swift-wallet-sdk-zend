@@ -12,10 +12,6 @@ import Combine
 /// Synchronizer implementation for UIKit and iOS 13+
 // swiftlint:disable type_body_length file_length
 public class SDKSynchronizer: Synchronizer {
-    private enum Constants {
-        static let fixWitnessesLastVersionCall = "ud_fixWitnessesLastVersionCall"
-    }
-
     public var alias: ZcashSynchronizerAlias { initializer.alias }
 
     private lazy var streamsUpdateQueue = { DispatchQueue(label: "streamsUpdateQueue_\(initializer.alias.description)") }()
@@ -293,62 +289,23 @@ public class SDKSynchronizer: Synchronizer {
 
     // MARK: Witnesses Fix
 
-    /// Decides whether the witnesses fix should run for `currentVersion`, given the
-    /// version recorded when the fix last ran.
-    ///
-    /// Versions are compared numerically component-wise ("2.10.0" is newer than
-    /// "2.9.0"); a plain String comparison would order them lexicographically and
-    /// skip the fix exactly on single→double-digit boundary upgrades. Missing
-    /// components count as zero ("3.8" equals "3.8.0"). The fix runs on the first
-    /// launch (nothing recorded), after an upgrade to a strictly newer version, and
-    /// whenever either version cannot be ordered numerically — except that a
-    /// recorded string identical to the current one never re-runs.
-    static func shouldRunWitnessesFix(lastRecordedVersion: String?, currentVersion: String) -> Bool {
-        guard let lastRecordedVersion else { return true }
-        guard lastRecordedVersion != currentVersion else { return false }
-
-        guard
-            let recorded = numericVersionComponents(lastRecordedVersion),
-            let current = numericVersionComponents(currentVersion)
-        else {
-            // Unorderable versions fail open: running the repair check is cheap
-            // and idempotent, skipping a needed repair is not.
-            return true
-        }
-
-        for index in 0..<max(recorded.count, current.count) {
-            let recordedComponent = index < recorded.count ? recorded[index] : 0
-            let currentComponent = index < current.count ? current[index] : 0
-            if currentComponent != recordedComponent {
-                return currentComponent > recordedComponent
-            }
-        }
-
-        // Numerically equal (e.g. "3.8" vs "3.8.0") — already ran for this version.
-        return false
-    }
-
-    private static func numericVersionComponents(_ version: String) -> [Int]? {
-        let components = version.split(separator: ".", omittingEmptySubsequences: false)
-        guard !components.isEmpty else { return nil }
-
-        var numbers: [Int] = []
-        for component in components {
-            guard let number = Int(component), number >= 0 else { return nil }
-            numbers.append(number)
-        }
-
-        return numbers
-    }
-
     private func resolveWitnessesFix() async {
-        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
-        let lastVersionCall = UserDefaults.standard.string(forKey: Constants.fixWitnessesLastVersionCall)
+        let gate = WitnessesFixGate(
+            currentVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+            userDefaults: UserDefaults.standard,
+            alias: initializer.alias
+        )
 
-        guard Self.shouldRunWitnessesFix(lastRecordedVersion: lastVersionCall, currentVersion: appVersion) else { return }
+        let decision = gate.decide()
+        logger.info("Witnesses fix: \(decision)")
 
-        UserDefaults.standard.set(appVersion, forKey: Constants.fixWitnessesLastVersionCall)
-        await initializer.rustBackend.fixWitnesses()
+        if decision.shouldRunFix {
+            await initializer.rustBackend.fixWitnesses()
+        }
+
+        // Recorded only once the repair has been attempted, so that a launch interrupted part-way
+        // through retries instead of recording a repair that never completed.
+        gate.recordCurrentVersion()
     }
 
     // MARK: Connectivity State
