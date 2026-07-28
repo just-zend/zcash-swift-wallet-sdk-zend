@@ -56,6 +56,17 @@ public class SDKSynchronizer: Synchronizer {
     var latestBlocksDataProvider: LatestBlocksDataProvider
     private let submitPlanStore: SubmitPlanStoring
 
+    /// The one migration host this synchronizer owns (see `OrchardMigrationHost`'s type doc: each
+    /// synchronizer holds exactly one). Resolved via `initializer.container`, following the same
+    /// pattern as `sdkFlags`/`submitPlanStore` above; unlike those, the *registration* also happens
+    /// here rather than in `Dependencies.setup`, because the host's only production initializer
+    /// takes a fully-built `Initializer`, which does not exist yet when `Dependencies.setup` runs
+    /// (it runs from `Initializer`'s own `static setup`, before the instance itself is constructed).
+    /// Registering immediately before resolving still gives tests the same override seam as every
+    /// other container-resolved dependency: `container.mock(type: OrchardMigrationHost.self, ...)`
+    /// before building the `Initializer` under test.
+    private let migrationHost: OrchardMigrationHost
+
     private var broadcasterStorage: SDKBroadcaster?
     public var broadcaster: Broadcaster { sdkBroadcaster }
     private var sdkBroadcaster: SDKBroadcaster {
@@ -104,6 +115,20 @@ public class SDKSynchronizer: Synchronizer {
         self.latestBlocksDataProvider = initializer.container.resolve(LatestBlocksDataProvider.self)
         self.sdkFlags = initializer.container.resolve(SDKFlags.self)
         self.submitPlanStore = initializer.container.resolve(SubmitPlanStoring.self)
+
+        // `[weak initializer]` breaks the initializer -> container -> closure -> initializer cycle
+        // (`initializer` owns `container`, and `container` would otherwise hold this closure -- and
+        // therefore `initializer` -- for its own lifetime). The `nil` branch is unreachable: this
+        // closure only ever runs synchronously from `resolve`, on the next line, while `initializer`
+        // is still alive; by the time anything could resolve this singleton again, `resolve` has
+        // already cached the instance and will not invoke the factory a second time.
+        initializer.container.register(type: OrchardMigrationHost.self, isSingleton: true) { [weak initializer] _ in
+            guard let initializer else {
+                preconditionFailure("OrchardMigrationHost resolved after its Initializer was released")
+            }
+            return OrchardMigrationHost(initializer: initializer)
+        }
+        self.migrationHost = initializer.container.resolve(OrchardMigrationHost.self)
 
         self.broadcasterStorage = SDKBroadcaster(
             transactionEncoder: transactionEncoder,
@@ -210,6 +235,10 @@ public class SDKSynchronizer: Synchronizer {
             await blockProcessor.start(retry: retry)
 
         case .stopped, .synced, .disconnected, .error:
+            if await migrationHost.isSyncBlocked() {
+                throw ZcashError.migrationSyncBlocked
+            }
+
             await sdkFlags.sdkStarted()
             let walletSummary = try? await initializer.rustBackend.getWalletSummary()
             let recoveryProgress = walletSummary?.recoveryProgress
@@ -1165,6 +1194,185 @@ public class SDKSynchronizer: Synchronizer {
 
     public func deleteAccount(_ accountUUID: AccountUUID) async throws {
         try await initializer.rustBackend.deleteAccount(accountUUID)
+    }
+
+    // MARK: Migration (Orchard -> Ironwood)
+    //
+    // Thin forwards to `migrationHost.migration(for:)`'s per-account `OrchardMigration` actor (or,
+    // for the three wallet-scope gate members, to the host itself). The two members that can
+    // broadcast (`submitNoteSplit`, `executeNextPendingMigrationTransfer`) are guarded here by
+    // `throwIfSyncingForMigrationBroadcast()` — an advisory point-in-time check, not a hard
+    // mutual-exclusion lock: sync and migration broadcasts must never share a session, and hosts
+    // still sequence sessions themselves.
+
+    public func migrationState(accountUUID: AccountUUID) async throws -> MigrationState {
+        try await migrationHost.migration(for: accountUUID).migrationState()
+    }
+
+    public func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress? {
+        try await migrationHost.migration(for: accountUUID).migrationProgress()
+    }
+
+    public func migrationTransactionStatuses(accountUUID: AccountUUID) async throws -> [MigrationTransactionStatus] {
+        try await migrationHost.migration(for: accountUUID).transactionStatuses()
+    }
+
+    public func isNoteSplitNeeded(accountUUID: AccountUUID) async throws -> Bool {
+        try await migrationHost.migration(for: accountUUID).isNoteSplitNeeded()
+    }
+
+    public func prepareNoteSplit(accountUUID: AccountUUID) async throws -> NoteSplitProposal {
+        try await migrationHost.migration(for: accountUUID).prepareNoteSplit()
+    }
+
+    public func submitNoteSplit(
+        accountUUID: AccountUUID,
+        proposal: NoteSplitProposal,
+        usk: UnifiedSpendingKey,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferResult {
+        try await throwIfSyncingForMigrationBroadcast()
+        return try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
+    }
+
+    public func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule {
+        try await migrationHost.migration(for: accountUUID).proposeMigrationTransfers()
+    }
+
+    public func proposeImmediateMigration(accountUUID: AccountUUID) async throws -> ImmediateMigrationProposal {
+        try await migrationHost.migration(for: accountUUID).proposeImmediateMigration()
+    }
+
+    public func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws {
+        try await migrationHost.migration(for: accountUUID).recordImmediateMigration(txid: txid)
+    }
+
+    public func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi? {
+        try await migrationHost.migration(for: accountUUID).residualAfterMigration()
+    }
+
+    public func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi {
+        try await migrationHost.migration(for: accountUUID).lockMigrationResidual()
+    }
+
+    public func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int {
+        try await migrationHost.migration(for: accountUUID).unlockMigrationResidual()
+    }
+
+    public func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate {
+        try await migrationHost.migration(for: accountUUID).estimateMigrationRuns()
+    }
+
+    public func signAndStoreMigrationSchedule(accountUUID: AccountUUID, _ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws {
+        try await migrationHost.migration(for: accountUUID).signAndStoreMigrationSchedule(schedule, usk: usk)
+    }
+
+    public func executeNextPendingMigrationTransfer(
+        accountUUID: AccountUUID,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferResult? {
+        try await throwIfSyncingForMigrationBroadcast()
+        return try await migrationHost.migration(for: accountUUID).executeNextPendingTransfer(options: options)
+    }
+
+    public func isMigrationSyncBlocked() async -> Bool {
+        await migrationHost.isSyncBlocked()
+    }
+
+    public var migrationSyncBlockedStream: AnyPublisher<Bool, Never> {
+        migrationHost.syncBlockedStream
+    }
+
+    public var migrationPrivacySyncBufferDuration: TimeInterval {
+        migrationHost.privacySyncBufferDuration
+    }
+
+    public func hasOverdueMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
+        try await migrationHost.migration(for: accountUUID).hasOverdueTransfers()
+    }
+
+    public func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
+        try await migrationHost.migration(for: accountUUID).hasInvalidTransfers()
+    }
+
+    public func rescheduleOverdueMigrationTransfer(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
+        try await migrationHost.migration(for: accountUUID).rescheduleOverdueTransfer()
+    }
+
+    public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
+        try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
+    }
+
+    public func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
+        try await migrationHost.migration(for: accountUUID).refreshStaleTransfers(usk: usk)
+    }
+
+    public func createUnsignedNoteSplitPCZTs(
+        accountUUID: AccountUUID,
+        for schedule: MigrationSchedule
+    ) async throws -> [MigrationUnsignedTransferPczt] {
+        try await migrationHost.migration(for: accountUUID).createUnsignedNoteSplitPCZTs(for: schedule)
+    }
+
+    public func storeSignedNoteSplitPCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws -> PreparedMigrationTransfer {
+        try await migrationHost.migration(for: accountUUID).storeSignedNoteSplitPCZTs(signed)
+    }
+
+    public func createUnsignedMigrationTransferPCZTs(
+        accountUUID: AccountUUID,
+        for schedule: MigrationSchedule
+    ) async throws -> [MigrationUnsignedTransferPczt] {
+        try await migrationHost.migration(for: accountUUID).createUnsignedTransferPCZTs(for: schedule)
+    }
+
+    public func storeSignedMigrationSchedulePCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws {
+        try await migrationHost.migration(for: accountUUID).storeSignedSchedulePCZTs(signed)
+    }
+
+    // MARK: Migration Keystone batch-signing (external signer ceremony)
+    //
+    // DB-free, account-free: unlike the migration group above, these four forward straight to
+    // `initializer.rustBackend` (no `migrationHost.migration(for:)` per-account actor), the same
+    // way the ordinary PCZT operations do (`createPCZTFromProposal`, `redactPCZTForSigner`, ...).
+
+    public func buildKeystoneSignBatchQRParts(
+        requestId: Data,
+        pczts: [MigrationUnsignedTransferPczt],
+        maxFragmentLen: Int
+    ) async throws -> [String] {
+        try await initializer.rustBackend.migrationKeystoneBuildSignBatchQrParts(
+            requestId: requestId,
+            pczts: pczts,
+            maxFragmentLen: maxFragmentLen
+        )
+    }
+
+    public func resetKeystoneSignBatchDecoder() async {
+        await initializer.rustBackend.migrationKeystoneResetSignBatchDecoder()
+    }
+
+    public func decodeKeystoneSignBatchPart(_ part: String, expectedRequestId: Data) async throws -> KeystoneBatchDecodeResult {
+        try await initializer.rustBackend.migrationKeystoneDecodeSignBatchPart(part, expectedRequestId: expectedRequestId)
+    }
+
+    public func applyKeystoneBatchSignatures(
+        pczts: [MigrationUnsignedTransferPczt],
+        batchSignResponse: Data
+    ) async throws -> [MigrationSignedTransferPczt] {
+        try await initializer.rustBackend.migrationKeystoneApplyBatchSignatures(pczts: pczts, batchSignResponse: batchSignResponse)
+    }
+
+    /// Throws ``ZcashError/migrationBroadcastDuringSync`` when the synchronizer is actively syncing.
+    ///
+    /// Guards the two migration entry points that broadcast (``submitNoteSplit(accountUUID:proposal:usk:options:)``
+    /// and ``executeNextPendingMigrationTransfer(accountUUID:options:)``): sync and migration
+    /// broadcasts must never share a session. Reads `status` -- the same source `start(retry:)`
+    /// switches on -- so the guard triggers on the syncing case only; stopped/synced/disconnected/
+    /// error/unprepared all proceed.
+    private func throwIfSyncingForMigrationBroadcast() async throws {
+        if case .syncing = await status {
+            throw ZcashError.migrationBroadcastDuringSync
+        }
     }
 
     // MARK: Server switch

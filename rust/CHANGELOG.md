@@ -12,8 +12,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcash_client_sqlite::pool_migration`, both on librustzcash main; the family pin
   targets a plain main rev — boundary-anchor proving (#2710) and owner-keyed
   note locking (#2716) are both merged, nothing unmerged remains):
-  22 entry points plus their `#[repr(C)]` return types and
-  `zcashlc_free_migration_*` destructors. Each call opens the wallet database and
+  21 of the 24 `zcashlc_migration_*` entry points (the residual-locking pair
+  and the run-count estimate ride their own entries below) plus the
+  `zcashlc_ironwood_activation_height` helper, with their `#[repr(C)]` return
+  types and `zcashlc_free_migration_*` destructors. Each call opens the wallet database and
   the account-keyed migration store (a second connection into the same file) from
   the wallet-db path, 16-byte account uuid, and network id, and reports failures
   through the thread-local last-error channel (`NULL` / `false` / `-1` sentinels),
@@ -67,11 +69,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `zcashlc_migration_sign_note_split`.
   - Proposal/commit: `zcashlc_migration_residual_after_migration`,
     `zcashlc_migration_propose_transfers`,
-    `zcashlc_migration_propose_immediate_transfers`,
     `zcashlc_migration_sign_and_store_schedule`.
   - Delivery: `zcashlc_migration_next_due_transfer`,
     `zcashlc_migration_extract_broadcast_tx`,
-    `zcashlc_migration_record_transfer_result`.
+    `zcashlc_migration_record_transfer_result`,
+    `zcashlc_migration_record_immediate_run` (records a broadcast
+    immediate-migration sweep — an ordinary send-max transaction built
+    outside the engine — so the migration state machine reports it).
   - Recovery: `zcashlc_migration_restart_step` (cancel and re-plan), and
     `zcashlc_migration_refresh_stale_transfers` — rebuilds every expired
     transfer of the stored run in place through the engine's
@@ -160,7 +164,28 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     after `commit_or_resume` so both a freshly built AND a resumed (already-committed) run get
     annotated.
 
+- Live per-transaction migration status read: `zcashlc_migration_transaction_statuses`
+  marshals the engine's own `MigrationState::transaction_statuses(target)` verbatim —
+  one row per committed migration transaction, keyed by its stable id (durable across
+  reads and stale-transfer rebuilds), carrying kind, lifecycle state, scheduled/expiry
+  heights, mined height, the broadcast txid while in-mempool, readiness, the next
+  action, and the blocking reason. Mined-transaction reconciliation runs first, per the
+  read-path convention, and a wallet with no stored run gets an empty container. Freed
+  with `zcashlc_free_migration_transaction_statuses`. This is the engine-delegated
+  equivalent of the platform-side "refresh a cached transfer's display state after a
+  reschedule" reads other SDKs hand-roll over the store's SQL.
+
 ### Changed
+- Immediate-migration state derivation (`zcashlc_migration_state` /
+  `zcashlc_migration_progress`): a MINED immediate (send-max) run is now CONSUMED —
+  it derives no migration state (the derivation falls through to `NotStarted`) and
+  masks a stale engine `Complete` left by an earlier engine-tracked run, so the app
+  goes fully quiet once the sweep mines instead of showing a per-run `Complete`. An
+  UNMINED, unexpired immediate run still derives `InProgress` of one, and the
+  expired-unmined re-offer is unchanged. To let the app keep the immediate
+  aftermath quiet, `FfiMigrationProgress` gains a trailing `is_immediate` boolean —
+  `true` for the immediate lane, `false` for engine-tracked runs (and for the
+  absent sentinel). Part of the still-unreleased migration surface above.
 - The librustzcash family pin advanced to current main, which now carries both
   the boundary-anchor proving of #2710 (on the 144-block retention grid) and
   the merged owner-keyed note locking of #2716 — nothing unmerged remains, so
@@ -186,6 +211,36 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcash_pool_migration_backend`) and is consumed from crates.io through the
   same `[patch.crates-io]` family pin as the rest of librustzcash, rather than
   as a standalone git dependency.
+
+### Fixed
+- Migration due-ness and expiry are now evaluated on the engine's target-height
+  contract (`chain tip + 1`, the height of the next block) everywhere, matching
+  `zcash_pool_migration_backend`'s `MigrationState` queries. The read paths
+  (`zcashlc_migration_state`/`_progress` state derivation,
+  `zcashlc_migration_has_overdue_transfers`, `zcashlc_migration_has_invalid_transfers`,
+  `zcashlc_migration_next_due_transfer`, `zcashlc_migration_pending_transfer_proposal`)
+  previously passed the raw tip and two sites hand-rolled the expiry predicate as
+  `tip > expiry_height` with no "never expires" (`expiry_height == 0`) guard — so at
+  `tip == expiry_height` the SDK still reported a transfer in progress (and could
+  serve its doomed broadcast, recording a spurious terminal `expired` mark) while
+  the refresh lane, already on engine semantics, considered it expired and rebuilt
+  it. The hand-rolled checks are replaced by the engine's own
+  `expired_transactions(target)`; transfers now become due and expire exactly one
+  block earlier, consistently across every read.
+- Transfer amounts are now read from the engine's authoritative
+  `NoteSplitPlan::crossing_values()` (on both the previewed plan and the stored
+  state) instead of re-deriving them as `funding_notes()[i] − note_fee_buffer` at
+  three marshal sites. The values are identical by construction at the pinned
+  engine (`funding_notes()` is exactly `crossing_values()[i] + buffer`, 1:1 —
+  the old comment's "post-reconciliation divergence" described a retired
+  pre-finalization engine and no longer exists), so this removes the duplicated
+  formula rather than changing any displayed number; a test pins the identity
+  both ways.
+- `FfiMigrationProgress.next_transfer_ready_at_height` no longer reports the
+  height of a transfer that is already in the mempool: the minimum is taken over
+  transfers still awaiting broadcast (`AwaitingSignature`/`Signed`/`Proved`)
+  instead of merely "not yet mined", matching the field's documented contract
+  ("the height at which the next transfer becomes broadcastable").
 
 ## 2.6.0-alpha.6 - 2026-06-26
 

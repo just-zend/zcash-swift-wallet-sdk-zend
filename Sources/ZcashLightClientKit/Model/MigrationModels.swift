@@ -37,18 +37,133 @@ public struct MigrationProgress: Equatable, Sendable {
     public let remainingOrchard: Zatoshi
     /// The height at which the next transfer becomes broadcastable, or `nil` if none is scheduled.
     public let nextTransferReadyAtHeight: BlockHeight?
+    /// Whether this snapshot belongs to the immediate (single-transaction) send-max migration lane
+    /// rather than an engine-tracked schedule. The app uses it to keep the immediate aftermath
+    /// quiet (no per-transfer progress UI). Engine-tracked runs report `false`.
+    public let isImmediate: Bool
 
     /// Creates a `MigrationProgress`.
     public init(
         completedTransfers: Int,
         totalTransfers: Int,
         remainingOrchard: Zatoshi,
-        nextTransferReadyAtHeight: BlockHeight?
+        nextTransferReadyAtHeight: BlockHeight?,
+        isImmediate: Bool = false
     ) {
         self.completedTransfers = completedTransfers
         self.totalTransfers = totalTransfers
         self.remainingOrchard = remainingOrchard
         self.nextTransferReadyAtHeight = nextTransferReadyAtHeight
+        self.isImmediate = isImmediate
+    }
+}
+
+/// One migration transaction's LIVE status, as the engine computes it — an element of the array
+/// returned by `ZcashRustBackendWelding.migrationTransactionStatuses(for:)` /
+/// `Synchronizer.migrationTransactionStatuses(accountUUID:)`. A verbatim marshal of the engine's
+/// own `MigrationState::transaction_statuses`: nothing here is derived independently of the
+/// engine's view, and it is reconciled against mined transactions at every read (the same
+/// read-path convention as `MigrationState`), so a transaction the wallet's own scan has since
+/// observed mined is reported `.mined` here even if the stored run still marks it broadcast.
+public struct MigrationTransactionStatus: Equatable, Sendable {
+    /// This transaction's kind: a note-PREPARATION at a given dependency-layer/index, or a
+    /// phase-2 pool-crossing TRANSFER at a given funding-note crossing index.
+    public enum Kind: Equatable, Sendable {
+        /// A note-preparation transaction: `layer` is its dependency-layer index, `index` its
+        /// position within that layer.
+        case preparation(layer: Int, index: Int)
+        /// A pool-crossing transfer: `crossing` is its funding-note crossing index.
+        case transfer(crossing: Int)
+    }
+
+    /// This transaction's lifecycle state. `broadcast`/`mined` fold the engine's `txid`/
+    /// `mined_height` payloads into the matching case, so illegal combinations (a mined row still
+    /// carrying a broadcast txid, or a broadcast row with none) are unrepresentable.
+    ///
+    /// - Note: A MINED row's txid is NOT carried by this state model: the engine's own `Mined`
+    ///   state carries only the height, so the txid is available only while a transaction is
+    ///   in flight (`.broadcast`), not once it is mined. A caller that needs a mined
+    ///   transaction's id should look it up through transaction history instead.
+    public enum State: Equatable, Sendable {
+        /// Built but not yet signed.
+        case awaitingSignature
+        /// Signed but not yet proven.
+        case signed
+        /// Proven and ready to broadcast.
+        case proved
+        /// Broadcast to the network as `txid` (the SDK's raw/internal byte order), not yet
+        /// observed mined.
+        case broadcast(txid: Data)
+        /// Mined at `height`.
+        case mined(height: BlockHeight)
+    }
+
+    /// The action available now, when `isReady` is `true`.
+    public enum NextAction: Equatable, Sendable {
+        /// Signed and ready to be proven.
+        case prove
+        /// Proven and ready to be broadcast.
+        case broadcast
+    }
+
+    /// Why this transaction is not yet actionable, when it is waiting (and not already broadcast
+    /// or mined).
+    public enum Blocker: Equatable, Sendable {
+        /// Waiting on another transaction of the same run it depends on.
+        case dependencies
+        /// Waiting for its scheduled height.
+        case schedule
+        /// Waiting for a boundary anchor it can prove against.
+        case anchorBoundary
+        /// Waiting for its signature.
+        case signature
+        /// Its expiry height has elapsed.
+        case expired
+    }
+
+    /// This transaction's stable id (the engine's own raw ordinal). Stable across reads and
+    /// across a stale-transfer rebuild (a rebuilt transfer keeps its id; only its state and
+    /// heights change), so a wallet may use it as a durable row key. It is the same ordinal the
+    /// schedule surfaces carry as their opaque string id — `String(status.id)` equals
+    /// ``MigrationTransferProposal/id`` / ``PreparedMigrationTransfer/id`` for the same
+    /// transaction — so status rows (which carry no amount) join to their schedule row by id.
+    public let id: UInt32
+    /// This transaction's kind and per-kind payload.
+    public let kind: Kind
+    /// This transaction's lifecycle state.
+    public let state: State
+    /// The height at or after which this transaction is due to broadcast.
+    public let scheduledHeight: BlockHeight
+    /// The height after which this transaction can no longer be mined (ZIP 203); `nil` when it
+    /// never expires (the engine's own `0` sentinel).
+    public let expiryHeight: BlockHeight?
+    /// Whether the wallet can act on this transaction right now.
+    public let isReady: Bool
+    /// The action available now, when `isReady` is `true`; `nil` otherwise.
+    public let nextAction: NextAction?
+    /// Why this transaction is not yet actionable, when waiting (and not already broadcast or
+    /// mined); `nil` otherwise.
+    public let blockedOn: Blocker?
+
+    /// Creates a `MigrationTransactionStatus`.
+    public init(
+        id: UInt32,
+        kind: Kind,
+        state: State,
+        scheduledHeight: BlockHeight,
+        expiryHeight: BlockHeight?,
+        isReady: Bool,
+        nextAction: NextAction?,
+        blockedOn: Blocker?
+    ) {
+        self.id = id
+        self.kind = kind
+        self.state = state
+        self.scheduledHeight = scheduledHeight
+        self.expiryHeight = expiryHeight
+        self.isReady = isReady
+        self.nextAction = nextAction
+        self.blockedOn = blockedOn
     }
 }
 
@@ -261,6 +376,30 @@ public struct MigrationRunEstimate: Equatable, Sendable {
     }
 }
 
+/// The proposal for the immediate (single-transaction) Orchard -> Ironwood migration, as returned
+/// by `Synchronizer.proposeImmediateMigration(accountUUID:)`: an ordinary send-max transaction that
+/// sweeps the account's whole spendable Orchard balance to its own address. Unlike
+/// `MigrationSchedule`, this is held entirely by the caller -- there is no engine plan cache behind
+/// it, so nothing about it can go stale beyond the proposal's own validity window.
+public struct ImmediateMigrationProposal: Equatable {
+    /// The underlying proposal: feed to `Synchronizer.createProposedTransactions(proposal:spendingKey:)`
+    /// (software accounts) or `Synchronizer.createPCZTFromProposal(accountUUID:proposal:)` (Keystone
+    /// accounts) exactly like any other ordinary transfer.
+    public let proposal: Proposal
+    /// The net swept amount -- what arrives in the Ironwood pool once mined. The proposal's single
+    /// payment value: the account's spendable Orchard notes, minus `fee`.
+    public let amount: Zatoshi
+    /// The fee this proposal pays, per `Proposal.totalFeeRequired()`.
+    public let fee: Zatoshi
+
+    /// Creates an `ImmediateMigrationProposal`.
+    public init(proposal: Proposal, amount: Zatoshi, fee: Zatoshi) {
+        self.proposal = proposal
+        self.amount = amount
+        self.fee = fee
+    }
+}
+
 /// A fully proven, signed migration transaction persisted by the engine, ready for the platform
 /// to broadcast (see `ZcashRustBackendWelding.migrationExtractBroadcastTx(pczt:for:)`).
 public struct PreparedMigrationTransfer: Equatable, Sendable {
@@ -313,6 +452,14 @@ public enum MigrationAttentionReason: Equatable, Sendable {
 /// `ZcashRustBackendWelding.migrationCreateUnsignedTransferPczts(for:for:)`).
 public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
     /// The transfer's engine-issued id.
+    ///
+    /// The two signed-PCZT STORE calls (`storeSignedNoteSplitPCZTs` /
+    /// `storeSignedMigrationSchedulePCZTs`) look the transaction up by it, so it must be the id
+    /// the engine issued. The Keystone batch-signing bridge, by contrast, never looks it up:
+    /// `applyKeystoneBatchSignatures` echoes each id back onto the returned signed pair
+    /// positionally, so on that path the id is a pure correlation label. Callers that need to
+    /// tell a preparation PCZT from a schedule transfer keep that mapping themselves — the batch
+    /// is positional, and engine ids number every preparation transaction before the transfers.
     public let id: UInt32
     /// The serialized, proven-but-unsigned PCZT.
     public let pczt: Data
@@ -328,7 +475,9 @@ public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
 /// `ZcashRustBackendWelding.migrationStoreSignedSchedulePczts(_:for:)`.
 public struct MigrationSignedTransferPczt: Equatable, Sendable {
     /// The transfer's engine-issued id (must match the corresponding
-    /// `MigrationUnsignedTransferPczt.id`).
+    /// `MigrationUnsignedTransferPczt.id` — the STORE calls consuming this type look the
+    /// transaction up by it, while `applyKeystoneBatchSignatures` produces these pairs with
+    /// whatever ids it was given, echoed back positionally).
     public let id: UInt32
     /// The serialized, signed PCZT.
     public let pczt: Data
@@ -338,5 +487,69 @@ public struct MigrationSignedTransferPczt: Equatable, Sendable {
     public init(id: UInt32, pczt: Data) {
         self.id = id
         self.pczt = pczt
+    }
+}
+
+/// A signing device's firmware version, as reported in a Keystone batch-signing response envelope
+/// (see `KeystoneBatchDecodeResult.firmwareVersion`).
+///
+/// `Comparable` lexicographically (major, then minor, then build) so a host can gate a feature on
+/// a minimum device firmware version.
+public struct KeystoneFirmwareVersion: Equatable, Sendable, Comparable {
+    public let major: UInt8
+    public let minor: UInt8
+    public let build: UInt8
+
+    /// Creates a `KeystoneFirmwareVersion`.
+    public init(major: UInt8, minor: UInt8, build: UInt8) {
+        self.major = major
+        self.minor = minor
+        self.build = build
+    }
+
+    public static func < (lhs: KeystoneFirmwareVersion, rhs: KeystoneFirmwareVersion) -> Bool {
+        if lhs.major != rhs.major {
+            return lhs.major < rhs.major
+        }
+        if lhs.minor != rhs.minor {
+            return lhs.minor < rhs.minor
+        }
+        return lhs.build < rhs.build
+    }
+}
+
+/// The result of feeding one scanned QR frame to
+/// `Synchronizer.decodeKeystoneSignBatchPart(_:expectedRequestId:)`.
+///
+/// `complete == false` means more frames are needed: `progress` is the 0-100 completion
+/// percentage so far, and `data`/`firmwareVersion` are `nil`. `complete == true` means `data`
+/// holds the serialized batch-signature response to pass to
+/// `Synchronizer.applyKeystoneBatchSignatures(pczts:batchSignResponse:)` -- the response is
+/// signatures-only, no PCZT is echoed back by the device.
+///
+/// - Note: `firmwareVersion` comes from the response envelope itself (the signing device's own
+///   reported firmware version), not from any field recovered from a signed PCZT. It is set only
+///   once `complete`, and only when the envelope carried it; it is the ONLY way to learn the
+///   signing device's firmware version in the batch flow -- `applyKeystoneBatchSignatures`
+///   reconstructs each "signed" PCZT from the caller's own retained unsigned bytes plus the
+///   response's signatures, never from device-returned PCZT bytes, so there is no PCZT-embedded
+///   firmware stamp to fall back on here (unlike the single-transaction Keystone sign flow).
+public struct KeystoneBatchDecodeResult: Equatable, Sendable {
+    /// Whether the full multi-part response has been decoded. `false` means feed more frames.
+    public let complete: Bool
+    /// The 0-100 decode completion percentage. Meaningful while `!complete`; `100` once complete.
+    public let progress: Int
+    /// The serialized batch-signature response, once `complete`; `nil` otherwise.
+    public let data: Data?
+    /// The signing device's reported firmware version, once `complete` and when the response
+    /// envelope carried it; `nil` otherwise. See this type's provenance note above.
+    public let firmwareVersion: KeystoneFirmwareVersion?
+
+    /// Creates a `KeystoneBatchDecodeResult`.
+    public init(complete: Bool, progress: Int, data: Data?, firmwareVersion: KeystoneFirmwareVersion?) {
+        self.complete = complete
+        self.progress = progress
+        self.data = data
+        self.firmwareVersion = firmwareVersion
     }
 }

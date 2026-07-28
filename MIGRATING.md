@@ -1,5 +1,189 @@
 # Migrating from previous versions to _Unreleased_
 
+## The pool-migration surface rides the final engine
+
+The Orchard→Ironwood migration group (never in a released SDK) is rewired onto the final engine
+crates (`zcash_pool_migration_backend` + `zcash_pool_migration_sqlite`). For integrators tracking
+the unreleased surface:
+
+- **The external-signer note-split pair went plural.** The engine builds N preparation
+  transactions, not one split transaction, so
+  `createUnsignedNoteSplitPCZT(accountUUID:) -> Data` is now
+  `createUnsignedNoteSplitPCZTs(accountUUID:for:) -> [MigrationUnsignedTransferPczt]` (it also
+  creates the run, persisted unsigned -- `schedule`, from `proposeMigrationTransfers`, identifies
+  the cached plan to build from by its opaque `proposalHandle` when this call is the one creating
+  the run; a stored non-terminal run resumes handle-free), and
+  `storeSignedNoteSplitPCZT(accountUUID:_: Data)` is now
+  `storeSignedNoteSplitPCZTs(accountUUID:_: [MigrationSignedTransferPczt])` (all-or-nothing; the
+  returned `PreparedMigrationTransfer` is a storage receipt with a zeroed `txid` — the
+  broadcastable value is served by the delivery lane). One signing ceremony still covers the whole
+  migration together with `createUnsignedMigrationTransferPCZTs`.
+- **`MigrationState.complete` is PER-RUN.** It means "the stored run is fully mined", never
+  "nothing left to migrate": ask `proposeMigrationTransfers` whether anything remains (an empty
+  schedule means no), and only then treat the account as done. Sequential runs are first-class — a
+  new commit over a completed run starts the next one.
+- **`MigrationState.readyToPropose` and `MigrationAttentionReason.syncRequiredBeforeNext` are
+  removed** (not merely unreachable): the note split and the schedule commit atomically, so
+  neither case ever had a real value to carry. This is source-breaking for an exhaustive `switch`
+  over either enum — drop the corresponding `case`.
+- **`includeResidual` is removed** from `proposeMigrationTransfers`, `restartCurrentMigrationStep`,
+  and `refreshStaleMigrationTransfers`: the engine plans canonically and ZIP 318 keeps the residual
+  in Orchard, so the parameter never had a real choice behind it. **`isSyncRequiredBeforeNextMigrationTransfer`
+  is removed entirely** for the same reason: the note split and the schedule commit atomically, so
+  a sync-required gate before the next transfer never had a use.
+- **`refreshStaleMigrationTransfers(accountUUID:usk:)` really rebuilds expired transfers.** It
+  rebuilds every EXPIRED transfer of the stored run in place: each rebuilt transfer re-spends the
+  SAME funding note (recovered by nullifier identity, never an equal-value substitute) on a fresh
+  schedule — a fresh memoryless delay from the current tip, a fresh canonical expiry, and a
+  freshly drawn boundary anchor — and returns the run's full `MigrationSchedule` as stored AFTER
+  the refresh (the current stored schedule when nothing had expired; empty when no run is stored
+  or the run is terminal), persisted ALL-OR-NOTHING: a mid-refresh failure persists NONE of the
+  batch's rebuilds, so a successful return's schedule is exactly what was atomically committed,
+  never a partial batch. The rebuilt rows' fresh scheduled/expiry heights exist nowhere but in
+  that returned schedule — re-display it and use it for every later consent echo; a pre-refresh
+  copy fails the verified echo with `migrationPlanStale` from then on. `usk` is now
+  `UnifiedSpendingKey?`: pass a spending key to sign each rebuilt transfer anew in-process, or
+  `nil` for the external-signer (Keystone) lane, which leaves the rebuilt transfers awaiting their
+  signature so the existing `createUnsignedMigrationTransferPCZTs` / `storeSignedMigrationSchedulePCZTs`
+  ceremony re-serves and completes them. A `FundingNoteUnavailable`-class failure (the expired
+  transfer's exact funding note was spent outside the migration) throws naming
+  `restartCurrentMigrationStep` (cancel and re-plan the remaining balance) as the remedy.
+- **Two new errors:** `migrationPlanStale` (ZRUST0128 — the schedule/note-split consent echo no
+  longer matches what is about to be signed; the echo is VERIFIED, never inert display data.
+  Recovery depends on when it fires: BEFORE a run is committed, the mismatch is against the
+  previewed plan — propose again and re-display. AFTER a run is committed, the mismatch is
+  against the stored run itself, and re-proposing cannot converge (proposals re-randomize and
+  never touch the committed run) — instead re-read the current stored schedule, which
+  `refreshStaleMigrationTransfers(accountUUID:usk:)` returns and the unsigned-transfer PCZT
+  serve path works from, and re-display that) and `migrationProvingUnavailable` (ZRUST0127 —
+  proving failed hard).
+- **`MigrationTransferProposal.anchorHeight` is a reference height** (the proposal-time tip), not
+  a commitment-tree anchor: ZIP 374 defers real anchors to proving time.
+
+## The immediate migration lane leaves the engine
+
+The immediate (single-transaction) Orchard→Ironwood migration is no longer proposed or tracked by
+the migration engine's own schedule/commit machinery. It is now an ordinary send-max transfer that
+the app executes through the normal transaction pipeline, with one new call to record the outcome:
+
+- **`proposeImmediateMigration(accountUUID:) async throws -> MigrationSchedule` is now
+  `proposeImmediateMigration(accountUUID:) async throws -> ImmediateMigrationProposal`.**
+  `ImmediateMigrationProposal` carries an ordinary `Proposal` — feed it to
+  `createProposedTransactions(proposal:spendingKey:)` (software accounts) or
+  `createPCZTFromProposal(accountUUID:proposal:)` (Keystone accounts) exactly like any other
+  transfer — plus the decoded `amount` (the net value crossing into Ironwood) and `fee`. There is
+  no engine plan cache behind it: nothing about the returned proposal can go stale the way a
+  `MigrationSchedule` preview can, and `signAndStoreMigrationSchedule` is not part of this lane (it
+  remains for `proposeMigrationTransfers`'s gradual path).
+- **New: `recordImmediateMigration(accountUUID:txid:) async throws`.** Call it after a successful
+  broadcast (software or Keystone lane) so the platform migration state machine reports the sweep:
+  `InProgress(0 of 1)` while unmined, then a quiet `NotStarted` once it mines. A MINED immediate
+  sweep is CONSUMED — it is NOT surfaced as `Complete`, so there is nothing for the user to
+  acknowledge and no per-run completion screen (the sweep zeroes the spendable Orchard balance, so
+  the balance-gated "Migration Required" prompt does not re-offer unless new Orchard funds arrive
+  later; an unmined sweep that expires likewise falls back to `NotStarted` so the prompt re-offers
+  while funds remain). One row per account — a new record supersedes any previous one. Not
+  broadcast-sensitive itself (no `migrationBroadcastDuringSync` guard): the actual broadcast already
+  rides the guarded `createProposedTransactions`/`createTransactionFromPCZT` path.
+- **`MigrationProgress` gains `isImmediate: Bool`** (additive — the public memberwise initializer
+  defaults it to `false`, so existing `MigrationProgress(...)` construction sites keep compiling
+  unchanged). It is `true` only while the immediate (send-max) lane's sweep is in progress and
+  `false` for engine-tracked schedule runs, letting the app keep the immediate aftermath quiet (no
+  per-transfer progress UI).
+- **Removed** (internal welding surface, never reachable from outside the SDK):
+  `ZcashRustBackendWelding.migrationProposeImmediateTransfers` and its FFI,
+  `zcashlc_migration_propose_immediate_transfers`. Replaced by the general-purpose
+  `proposeSendMaxTransfer(accountUUID:recipient:memo:orchardOnly:)` (called with `orchardOnly: true`
+  and `recipient` set to the account's own address, `memo: nil`) — a plain "spend everything to one
+  recipient" primitive the migration engine itself never touches.
+- **`MigrationSchedule` itself is unaffected** and still backs `proposeMigrationTransfers` /
+  `signAndStoreMigrationSchedule` (the gradual, privacy-path schedule).
+
+## Residual locking and the run-count estimate join the migration group
+
+The `Synchronizer` migration group gains three account-scoped requirements. Like the rest of the
+group they come with protocol-extension defaults that throw an "unimplemented" `LocalizedError`, so
+a custom `Synchronizer` conformer keeps compiling — but it must override them to offer the real
+behavior (`SDKSynchronizer` does):
+
+- **New: `lockMigrationResidual(accountUUID:) async throws -> Zatoshi`.** The "Lock balance" choice
+  at migration `Complete`: locks every currently-spendable, not-already-locked legacy-Orchard note
+  until explicit unlock and returns the total locked (`Zatoshi(0)` is legitimate — nothing was
+  spendable). The lock never expires on its own; locked value leaves `PoolBalance.spendableValue`
+  but stays in `PoolBalance.lockedValue` (and therefore in `total()`). Idempotent-additive:
+  repeating the call locks (and reports) only notes that became spendable since. A concurrent-lock
+  race throws (`rustMigrationLockResidual`, ZRUST0132) and may be retried.
+- **New: `unlockMigrationResidual(accountUUID:) async throws -> Int`.** The release half: clears
+  ALL of the account's output locks and returns the cleared count (safe — the SDK never creates
+  proposal-scoped output locks). "Migrate anyway" over a locked residual composes as this call
+  followed by `proposeImmediateMigration(accountUUID:)`; locked notes are excluded from note
+  selection, so the unlock must come first.
+- **New: `estimateMigrationRuns(accountUUID:) async throws -> MigrationRunEstimate`.** The rounds
+  preview for the multi-round migration UI: how many migration RUNS ("rounds") migrating the whole
+  spendable Orchard balance takes, per run both what it migrates and what preparing it costs, and
+  the final residual that never migrates. External-signer session counts are a query on the result
+  (`totalSigningSessions(maxTransactionsPerSession:)`), not a parameter. The zero-run estimate is a
+  legitimate answer, not an error.
+
+## The live per-transaction migration status read joins the migration group
+
+The `Synchronizer` migration group gains one account-scoped requirement. Like the rest of the
+group it comes with a protocol-extension default that throws an "unimplemented" `LocalizedError`,
+so a custom `Synchronizer` conformer keeps compiling — but it must override it to offer the real
+behavior (`SDKSynchronizer` does):
+
+- **New: `migrationTransactionStatuses(accountUUID:) async throws -> [MigrationTransactionStatus]`.**
+  The live per-transaction detail view behind `migrationProgress(accountUUID:)`'s aggregate
+  summary: every committed migration transaction's kind (preparation layer/index or transfer
+  crossing), lifecycle state (`broadcast`/`mined` fold the engine's txid/mined-height payload into
+  the matching case, so illegal combinations are unrepresentable — a MINED row's txid is NOT
+  carried by the engine's own state model), scheduled/expiry heights, readiness, and next
+  action/blocker, keyed by a stable id. A verbatim marshal of the engine's own
+  `MigrationState::transaction_statuses`, mined-reconciled at read like every sibling; an empty
+  array means no stored run or no transactions, not an error. New error code
+  `rustMigrationTransactionStatuses` (ZRUST0135).
+
+## The Keystone batch-signing bridge joins the migration group
+
+The `Synchronizer` migration group gains four DB-free, account-free requirements — no
+`accountUUID` parameter, since all four operate purely on caller-held PCZT bytes and a scanned
+device response, never the wallet database or the migration engine. Like the rest of the group,
+the three throwing members come with a protocol-extension default that throws an "unimplemented"
+`LocalizedError`, so a custom `Synchronizer` conformer keeps compiling; the fourth
+(`resetKeystoneSignBatchDecoder()`) is non-throwing and gets an inert no-op default instead
+(mirroring `isMigrationSyncBlocked()`'s treatment). `SDKSynchronizer` overrides all four with real
+behavior, forwarding straight to the rust backend rather than through the per-account migration
+actor:
+
+- **New: `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:) async throws -> [String]`.**
+  Builds the animated multi-part QR frames for a Keystone batch-signing request covering `pczts`
+  (preparation PCZTs first, then transfer PCZTs, in schedule order). Every PCZT is redacted for
+  the batch-Signer role INSIDE this call before it reaches the wire — callers must NOT pre-redact,
+  and must retain their own unredacted `pczts`: those bytes, in the SAME order, are what
+  `applyKeystoneBatchSignatures(pczts:batchSignResponse:)` applies the device's signatures onto.
+- **New: `resetKeystoneSignBatchDecoder() async`.** Discards any in-flight multi-part scan
+  session. Only one decode session exists at a time; call this on scan-screen entry, retry, and
+  exit. Non-throwing and infallible.
+- **New: `decodeKeystoneSignBatchPart(_:expectedRequestId:) async throws -> KeystoneBatchDecodeResult`.**
+  Feeds one scanned QR frame to the active (or freshly started) decode session. Returns the new
+  public `KeystoneBatchDecodeResult` model: `complete`/`progress` while more frames are needed;
+  once complete, the signatures-only response bytes (no PCZT is echoed by the device) and, when
+  the response envelope carried it, the new public `KeystoneFirmwareVersion` — the ONLY way to
+  learn the signing device's firmware version in this batch flow, since the "signed" PCZTs are
+  reconstructed from caller-held bytes plus signatures, never from device-returned PCZT bytes. A
+  request-id mismatch at completion throws (a stale/unrelated scan).
+- **New: `applyKeystoneBatchSignatures(pczts:batchSignResponse:) async throws -> [MigrationSignedTransferPczt]`.**
+  Applies the ceremony's Keystone batch signatures to `pczts`, positionally — `pczts` MUST be the
+  SAME array, in the SAME order (including the SAME unredacted bytes), passed to
+  `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)`. Returns one signed PCZT per
+  element, ready for the existing `storeSignedNoteSplitPCZTs(accountUUID:_:)` /
+  `storeSignedMigrationSchedulePCZTs(accountUUID:_:)` calls.
+
+New error codes `rustMigrationKeystoneBuildSignBatchQrParts` (ZRUST0136),
+`rustMigrationKeystoneDecodeSignBatchPart` (ZRUST0137), and
+`rustMigrationKeystoneApplyBatchSignatures` (ZRUST0138). Like the rest of the migration group, the
+Closure/Combine wrapper synchronizers do not mirror these four members.
+
 ## `prepare` now validates the seed against the existing wallet
 
 If the wallet database already contains seed-derived account(s) and the seed passed to `prepare`

@@ -49,16 +49,106 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
 - `MigrationState`, `MigrationProgress`, `MigrationAttentionReason`, `MigrationSchedule`,
   `MigrationTransferProposal`, `MigrationTransferResult`, `MigrationRunEstimate` (and its
   `MigrationRunEstimate.Run`), `NoteSplitProposal`, `PreparedMigrationTransfer`,
-  `MigrationUnsignedTransferPczt`, and `MigrationSignedTransferPczt`.
+  `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`, `MigrationTransactionStatus`,
+  `KeystoneBatchDecodeResult`, and `KeystoneFirmwareVersion`.
 - Migration transaction ids are `UInt32` (the engine's own id type) rather than decimal strings,
   across `MigrationTransferProposal`, `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`,
   `MigrationSignedTransferPczt`, `MigrationAttentionReason.invalidTransfer`, and
   `migrationRecordTransferResult(transferId:result:for:)`.
-- These are the value types of the staged migration API; the `Synchronizer` methods that produce
-  and consume them land in a follow-up release, so no migration can be driven from the public API
-  yet.
-- New `ZcashError` cases for the migration surface: `ZRUST0098`–`ZRUST0108`, `ZRUST0111`–`ZRUST0128`,
-  and `ZRUST0132`–`ZRUST0134`.
+- These are the value types the `Synchronizer` migration group below produces and consumes.
+- New `ZcashError` cases for the migration surface: `ZRUST0098`–`ZRUST0106`, `ZRUST0108`, and
+  `ZRUST0111`–`ZRUST0138` (`ZRUST0107` was retired with the engine-backed immediate lane; see
+  `## Changed`).
+
+### Orchard → Ironwood migration (`Synchronizer` surface)
+
+- Orchard→Ironwood pool-migration engine, exposed as a 31-member migration group on the
+  `Synchronizer` protocol, built over the pool-migration FFI/welding layer whose model types
+  are listed above: the app talks only to `Synchronizer` — the per-account migration engine,
+  broadcaster, and privacy gate behind it are internal. Account-scoped members take an
+  `AccountUUID`, and two migrations can run concurrently (for example a software account and a
+  hardware-wallet account): all engine state is account-keyed, per-account broadcasts stay
+  single-flight without cross-account serialization, and every account shares one dedicated
+  migration Tor runtime. The group covers the migration state machine and progress, note-split
+  propose/sign/submit, a gradual (randomized-cadence) schedule proposal with one-confirmation
+  `signAndStoreMigrationSchedule`, height-gated background delivery
+  (`executeNextPendingMigrationTransfer` — migration members work without `prepare()`, so a
+  background session can broadcast without starting sync; the delivery lane serves preparation
+  transactions and transfers alike, proving each at broadcast time per ZIP 374), overdue/invalid
+  detection with the stored-run reschedule accessor, cancel-and-replan restart recovery
+  (`restartCurrentMigrationStep`), and rebuild-on-expiry recovery
+  (`refreshStaleMigrationTransfers(accountUUID:usk:)` rebuilds every EXPIRED transfer of the stored
+  run in place — the same funding note on a fresh schedule/expiry/boundary — with an optional `usk`
+  selecting the in-process-sign or external-signer (Keystone) lane, persisted ALL-OR-NOTHING (a
+  mid-refresh failure persists none of the batch); a funding note spent outside the migration
+  surfaces an error naming `restartCurrentMigrationStep` as the remedy),
+  the per-run `complete` + fresh-propose sequential-runs contract, and an external-signer (PCZT)
+  path for hardware wallets (`createUnsignedNoteSplitPCZTs` / `storeSignedNoteSplitPCZTs` — plural:
+  the engine builds N preparation transactions, and one ceremony signs them together with
+  `createUnsignedMigrationTransferPCZTs` / `storeSignedMigrationSchedulePCZTs`). Migration broadcasts run over a dedicated Tor runtime (own
+  state directory `<torDir>/migration_tor`, fresh isolated circuit per submission, one bootstrap
+  shared across accounts, independent of the global `tor(enabled:)` toggle) with fail-closed
+  semantics — Tor requested but unavailable throws `ZcashError.migrationTorUnavailable`, never a
+  silent clearnet fallback — to exactly one submission endpoint per attempt
+  (`MigrationNetworkPrivacyOptions.submissionEndpoint` is required: the host picks the submission
+  server explicitly per broadcast, and the SDK never falls back to the sync server), with no
+  multi-endpoint fan-out and no post-broadcast txid polling: confirmation comes from block
+  scanning alone. Session separation is SDK-enforced in both directions: `start()` throws
+  `ZcashError.migrationSyncBlocked` (ZRUST0125) while the wallet-scope 10-minute broadcast→sync
+  privacy gate is active (`isMigrationSyncBlocked()` / `migrationSyncBlockedStream` /
+  `migrationPrivacySyncBufferDuration`, aggregated across every account including dormant ones),
+  and the broadcast-performing migration methods throw `ZcashError.migrationBroadcastDuringSync`
+  (ZRUST0126) while a sync runs — an advisory point-in-time check, not a hard lock.
+  `ZcashNetwork.ironwoodActivationHeight` exposes the NU6.3 activation height so hosts can stop
+  hardcoding it. Schedule persistence after commit is the host's responsibility: the SDK
+  deliberately keeps no local copy of the committed proposal list. The Closure/Combine wrapper
+  synchronizers deliberately do not mirror the migration group.
+  - The residual-lock pair and the rounds preview are group members too:
+    `lockMigrationResidual(accountUUID:)` (the "Lock balance" choice at migration `Complete` —
+    locks every currently-spendable, not-already-locked legacy-Orchard note until explicit unlock
+    and returns the total locked), `unlockMigrationResidual(accountUUID:)` (the release half,
+    returning the number of locks cleared), and `estimateMigrationRuns(accountUUID:)` (the
+    `MigrationRunEstimate` behind the multi-round UI). "Migrate anyway" over a locked residual
+    composes as `unlockMigrationResidual` then `proposeImmediateMigration`, in that order, since
+    locked notes are excluded from note selection.
+  - `migrationTransactionStatuses(accountUUID:)` serves the LIVE per-transaction rows behind
+    `migrationProgress`'s aggregate summary: every committed migration transaction's kind
+    (preparation layer/index or transfer crossing), lifecycle state, scheduled/expiry heights,
+    readiness, and next action/blocker, keyed by a stable id. `broadcast`/`mined` fold the engine's
+    txid/mined-height payload into the matching case so illegal combinations are unrepresentable —
+    a MINED row's txid is NOT carried by the engine's own state model, so it is available only
+    while a transaction is `broadcast` (in flight), not once mined. An empty array means no stored
+    run or no transactions, not an error.
+  - The Keystone batch-signing bridge carries the external-signer ceremony's PCZTs to a hardware
+    signer over an animated multi-part QR UR, as four DB-free members:
+    `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)` redacts every PCZT for the
+    batch-Signer role and returns the animated QR frames (callers retain their own unredacted
+    PCZTs — those are what applying signatures signs, and must be passed back in the SAME order);
+    `resetKeystoneSignBatchDecoder()` discards any in-flight scan session (infallible — call on
+    scan-screen entry/retry/exit, since only one session exists at a time);
+    `decodeKeystoneSignBatchPart(_:expectedRequestId:)` feeds one scanned frame to the session and
+    returns a `KeystoneBatchDecodeResult` (`complete`/`progress`; on completion, the
+    signatures-only response bytes and — the ONLY way to learn it in this flow — the signing
+    device's `KeystoneFirmwareVersion`, sourced from the response envelope, not any PCZT field; a
+    request-id mismatch at completion throws, rejecting a stale or unrelated scan); and
+    `applyKeystoneBatchSignatures(pczts:batchSignResponse:)` applies the device's positional
+    signatures onto the caller-held unredacted PCZTs, returning `[MigrationSignedTransferPczt]`
+    ready for `storeSignedNoteSplitPCZTs` / `storeSignedMigrationSchedulePCZTs`.
+  - Duplicate re-submissions self-heal: a submit rejection identifying the transaction as already
+    known (zcashd's already-in-chain code −27, or the already-in-block-chain/mempool-duplicate
+    reject messages) is recorded as success, so a retried broadcast whose first attempt actually
+    landed completes the transfer instead of parking the migration on a bogus failure.
+  - A record failure after a successful broadcast no longer skips the 10-minute privacy buffer:
+    the sync gate marks the moment the submit outcome is a success, before the engine records the
+    result, and the call then throws the distinguishable
+    `ZcashError.migrationRecordFailedAfterBroadcast` (ZRUST0124) — transient, since a later
+    execution window self-heals via the duplicate-rejection→success mapping.
+  - Migration works on custom (regtest-style) networks without a prior `Initializer`: the internal
+    engine registers the configured custom activation heights itself.
+  - Hardened per the adversarial review: sync-gate emissions are serialized behind a
+    re-entrancy-safe two-lock design, concurrent migration broadcasts share a single-flight Tor
+    bootstrap, the sync-gate ticker runs only while the blocked stream has subscribers, and the
+    migration gate state file is excluded from device backups.
 
 ### Shielded voting
 
@@ -105,6 +195,21 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
 - `Synchronizer.submitTransactions` re-checks a non-zero submit error against the same server and
   reports `TransactionSubmitResult.success` when the server already knows the transaction, instead
   of surfacing a spurious failure.
+- The immediate (single-transaction) migration lane leaves the engine:
+  `proposeImmediateMigration(accountUUID:)` now returns an ordinary `ImmediateMigrationProposal` (a
+  `Proposal` plus its decoded `amount`/`fee`) instead of a `MigrationSchedule`, executed through the
+  normal transfer pipeline (`createProposedTransactions` / `createPCZTFromProposal`) rather than the
+  engine's schedule/commit machinery; a new `recordImmediateMigration(accountUUID:txid:)` folds a
+  successful broadcast into the same platform state machine (`InProgress` while unmined, then quiet
+  once mined — see the immediate-aftermath entry below). See `MIGRATING.md`.
+- The immediate-migration aftermath goes quiet, and `MigrationProgress` gains `isImmediate: Bool`:
+  once an immediate (send-max) sweep recorded via `recordImmediateMigration(accountUUID:txid:)`
+  mines, the migration state machine no longer reports `.complete` for it — the mined run is consumed
+  and the state falls back to `.notStarted` (nothing to acknowledge; the balance-gated "Migration
+  Required" prompt re-offers only if new Orchard funds arrive later). `MigrationProgress.isImmediate`
+  is `true` only for an in-progress immediate sweep and `false` for engine-tracked runs, so the app
+  can suppress per-transfer progress UI during the immediate lane; the public initializer defaults
+  `isImmediate` to `false`, so it is source-compatible. (MOB-1513)
 
 ## Removed
 
@@ -114,6 +219,14 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   above.
 
 ## Fixed
+- The Keystone batch-signing apply (`Synchronizer.applyKeystoneBatchSignatures`) no longer
+  looks its PCZT ids up: the apply step only echoes them back positionally, so ids on this call
+  are correlation labels, not engine lookups. A batch whose ids were not engine-numeric used to
+  fail after every successful device scan (an app labelling its preparation entries, for
+  example); ids now cross the FFI as the engine's own `UInt32`, so there is no id decode left to
+  fail. The two signed-PCZT store calls do still look transactions up by that id, and the
+  `MigrationUnsignedTransferPczt.id` / `MigrationSignedTransferPczt.id` documentation spells the
+  split out.
 
 - Transient Tor transport failures no longer end a sync session fatally. Tor-layer errors are now
   classified as retryable service errors, so a circuit or stream failure triggers the usual
