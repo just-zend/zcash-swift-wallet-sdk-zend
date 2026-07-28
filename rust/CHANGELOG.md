@@ -6,6 +6,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+- Migrated to `zcash_protocol 0.10.2`, `zcash_client_backend 0.24.0-rc.5`,
+  `zcash_client_sqlite 0.22.0-rc.5`
+
 ### Fixed
 - `build.rs` now watches the whole `rust/src` directory. It previously named
   only `lib.rs`, `voting.rs` and `voting/`, and emitting any `rerun-if-changed`
