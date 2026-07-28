@@ -6,6 +6,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Removed
+- The `zcashlc_voting_*` FFI is no longer compiled. The `voting` module is gated behind
+  `#[cfg(zcash_voting)]` and the `zcash_voting` dependency is commented out in `Cargo.toml`
+  (`zcash_keys` and `incrementalmerkletree` stay: the pool-migration engine uses them too).
+  The module sources are retained so the surface can be reinstated by re-enabling the
+  dependency.
+
 ### Added
 - Pool-migration (Orchard→Ironwood) FFI surface over the final engine
   (`zcash_pool_migration_backend` + the account-keyed store inside

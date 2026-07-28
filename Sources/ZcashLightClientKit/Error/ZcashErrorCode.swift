@@ -43,7 +43,7 @@ public enum ZcashErrorCode: String {
     case serviceBlockStreamFailed = "ZSRVC0000"
     /// LightWalletService.getSubtreeRoots failed.
     case serviceSubtreeRootsStreamFailed = "ZSRVC0009"
-    /// LightWalletService.getTaddressTxids failed.
+    /// LightWalletService.getTaddressTransactions failed.
     case serviceGetTaddressTxidsFailed = "ZSRVC0010"
     /// LightWalletService.getMempoolStream failed.
     case serviceGetMempoolStreamFailed = "ZSRVC0011"

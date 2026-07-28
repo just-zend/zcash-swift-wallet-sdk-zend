@@ -24,7 +24,7 @@ use super::progress::ProgressBridge;
 
 /// Wallet-derived delegation inputs assembled for one FFI call.
 ///
-/// zcash_voting 1.0 derives delegation keys and selects snapshot-eligible
+/// zcash_voting 2.0 derives delegation keys and selects snapshot-eligible
 /// notes from the wallet database itself (the crate owns note selection and
 /// key material shaping), so the delegation lanes take the wallet DB path and
 /// account UUID instead of caller-supplied note/key blobs.
@@ -83,7 +83,7 @@ unsafe fn gather_ffi_delegation_inputs(
     .map_err(|e| anyhow!("failed to gather delegation wallet inputs: {}", e))
 }
 
-/// JSON shape for the delegation PCZT setup result (zcash_voting 1.0).
+/// JSON shape for the delegation PCZT setup result (zcash_voting 2.0).
 #[derive(serde::Serialize)]
 struct JsonDelegationSetup {
     pczt_bytes: Vec<u8>,
@@ -110,7 +110,7 @@ fn hotkey_network_params(network: voting::types::Network) -> zcash_protocol::con
 
 /// Generate or reconstruct an app-owned voting hotkey.
 ///
-/// zcash_voting 1.0 uses app-owned hotkeys. Pass an empty `stored_secret` to
+/// zcash_voting 2.0 uses app-owned hotkeys. Pass an empty `stored_secret` to
 /// generate a fresh random hotkey, or a previously stored 64-byte secret to
 /// deterministically reconstruct the same hotkey; any other length is an
 /// error. The caller must persist `secret_key` (the stored secret) — it is
@@ -243,7 +243,7 @@ pub unsafe extern "C" fn zcashlc_voting_get_bundle_count(
 
 /// Build the governance PCZT for one delegation bundle.
 ///
-/// zcash_voting 1.0 selects snapshot-eligible notes and shapes key material
+/// zcash_voting 2.0 selects snapshot-eligible notes and shapes key material
 /// from the wallet database itself, so this takes the wallet DB path and
 /// account UUID plus the app-owned hotkey stored secret.
 ///
@@ -397,7 +397,7 @@ pub unsafe extern "C" fn zcashlc_voting_generate_note_witnesses(
         };
         let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
 
-        // zcash_voting 1.0 owns shielded-protocol-aware witness generation: it
+        // zcash_voting 2.0 owns shielded-protocol-aware witness generation: it
         // loads the cached round snapshot tree state, resolves the Ironwood
         // pool at the round height, reads the Ironwood note-commitment tree
         // (not Orchard), generates historical Ironwood witnesses, and validates
@@ -490,7 +490,7 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
 /// Generate and persist the delegation proof for one bundle.
 ///
 /// Witnesses and PIR precompute data must already be present. zcash_voting
-/// 1.0 shapes key material from the wallet database, so this takes the wallet
+/// 2.0 shapes key material from the wallet database, so this takes the wallet
 /// DB path, account UUID, and app-owned hotkey stored secret.
 ///
 /// Returns JSON-encoded `JsonDelegationProofResult`, or null on error.

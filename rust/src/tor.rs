@@ -93,8 +93,12 @@ impl TorRuntime {
     pub(crate) fn connect_to_lightwalletd(&self, endpoint: Uri) -> anyhow::Result<LwdConn> {
         let Self { runtime, client } = self.isolated_client();
 
-        let conn =
-            runtime.block_on(async { client.connect_to_lightwalletd(endpoint, false).await })?;
+        let allow_onion_services = false;
+        let conn = runtime.block_on(async {
+            client
+                .connect_to_lightwalletd(endpoint, allow_onion_services)
+                .await
+        })?;
 
         Ok(LwdConn {
             runtime,
@@ -199,8 +203,6 @@ impl LwdConn {
     /// Discovers UTXOs received by the given transparent address in the provided block range, and
     /// invokes the provided callback with the [`WalletTransparentOutput`] corresponding to that
     /// UTXO.
-    // [IW-1 SPIKE] the ironwood-era `WalletTransparentOutput` is generic over the
-    // wallet's account id; the callback's store binds `A` (sqlite → `AccountUuid`).
     pub(crate) fn with_taddress_utxos<A>(
         &mut self,
         params: &impl consensus::Parameters,
@@ -227,9 +229,10 @@ impl LwdConn {
                 .into_inner();
 
             while let Some(result) = utxos.message().await? {
-                // [IW-1 SPIKE] the ironwood-era API adds optional recipient/funding
-                // attribution params — `None` defers to the store's own
-                // address→account resolution (the pre-existing behavior here).
+                let recipient_account = None;
+                let key_scope = None;
+                let funding_account = None;
+
                 f(WalletTransparentOutput::from_parts(
                     OutPoint::new(result.txid[..].try_into()?, result.index.try_into()?),
                     TxOut::new(
@@ -237,11 +240,9 @@ impl LwdConn {
                         Script(script::Code(result.script)),
                     ),
                     Some(BlockHeight::from(u32::try_from(result.height)?)),
-                    // These UTXOs are discovered by scanning lightwalletd for an address;
-                    // the wallet has no account association or key scope for them here.
-                    None,
-                    None,
-                    None,
+                    recipient_account,
+                    key_scope,
+                    funding_account,
                 )
                 .ok_or(anyhow!(
                     "Received UTXO that doesn't correspond to a valid P2PKH or P2SH address"

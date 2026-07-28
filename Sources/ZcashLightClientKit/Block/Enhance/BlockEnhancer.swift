@@ -164,7 +164,7 @@ extension BlockEnhancerImpl: BlockEnhancer {
                             }
 
                             // ServiceMode to resolve
-                            let stream = try service.getTaddressTxids(filter, mode: .direct)
+                            let stream = try service.getTaddressTransactions(filter, mode: .direct)
 
                             for try await rawTransaction in stream {
                                 let minedHeight = (rawTransaction.height == 0 || rawTransaction.height > UInt32.max)

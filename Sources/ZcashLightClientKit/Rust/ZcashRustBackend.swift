@@ -367,6 +367,34 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> FfiProposal {
+        let dbDataPtr = dbData.0
+        let dbDataLen = dbData.1
+        let account = accountUUID.id
+        let networkId = networkType.networkId
+
+        let proposal = zcashlc_propose_orchard_to_ironwood_migration(
+            dbDataPtr,
+            dbDataLen,
+            account,
+            networkId
+        )
+
+        guard let proposal else {
+            throw ZcashError.rustCreateToAddress(
+                lastErrorMessage(fallback: "`proposeOrchardToIronwoodMigration` failed with unknown error")
+            )
+        }
+
+        defer { zcashlc_free_boxed_slice(proposal) }
+
+        return try FfiProposal(serializedBytes: Data(
+            bytes: proposal.pointee.ptr,
+            count: Int(proposal.pointee.len)
+        ))
+    }
+
+    @DBActor
     func proposeTransferFromURI(
         _ uri: String,
         accountUUID: AccountUUID

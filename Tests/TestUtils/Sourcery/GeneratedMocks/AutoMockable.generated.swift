@@ -1132,27 +1132,27 @@ class LightWalletServiceMock: LightWalletService {
         }
     }
 
-    // MARK: - getTaddressTxids
+    // MARK: - getTaddressTransactions
 
-    var getTaddressTxidsModeThrowableError: Error?
-    var getTaddressTxidsModeCallsCount = 0
-    var getTaddressTxidsModeCalled: Bool {
-        return getTaddressTxidsModeCallsCount > 0
+    var getTaddressTransactionsModeThrowableError: Error?
+    var getTaddressTransactionsModeCallsCount = 0
+    var getTaddressTransactionsModeCalled: Bool {
+        return getTaddressTransactionsModeCallsCount > 0
     }
-    var getTaddressTxidsModeReceivedArguments: (request: TransparentAddressBlockFilter, mode: ServiceMode)?
-    var getTaddressTxidsModeReturnValue: AsyncThrowingStream<RawTransaction, Error>!
-    var getTaddressTxidsModeClosure: ((TransparentAddressBlockFilter, ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error>)?
+    var getTaddressTransactionsModeReceivedArguments: (request: TransparentAddressBlockFilter, mode: ServiceMode)?
+    var getTaddressTransactionsModeReturnValue: AsyncThrowingStream<RawTransaction, Error>!
+    var getTaddressTransactionsModeClosure: ((TransparentAddressBlockFilter, ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error>)?
 
-    func getTaddressTxids(_ request: TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error> {
-        if let error = getTaddressTxidsModeThrowableError {
+    func getTaddressTransactions(_ request: TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error> {
+        if let error = getTaddressTransactionsModeThrowableError {
             throw error
         }
-        getTaddressTxidsModeCallsCount += 1
-        getTaddressTxidsModeReceivedArguments = (request: request, mode: mode)
-        if let closure = getTaddressTxidsModeClosure {
+        getTaddressTransactionsModeCallsCount += 1
+        getTaddressTransactionsModeReceivedArguments = (request: request, mode: mode)
+        if let closure = getTaddressTransactionsModeClosure {
             return try closure(request, mode)
         } else {
-            return getTaddressTxidsModeReturnValue
+            return getTaddressTransactionsModeReturnValue
         }
     }
 
@@ -1763,6 +1763,30 @@ class SynchronizerMock: Synchronizer {
             return try await closure(accountUUID, recipient, amount, memo)
         } else {
             return proposeTransferAccountUUIDRecipientAmountMemoReturnValue
+        }
+    }
+
+    // MARK: - proposeOrchardToIronwoodMigration
+
+    var proposeOrchardToIronwoodMigrationAccountUUIDThrowableError: Error?
+    var proposeOrchardToIronwoodMigrationAccountUUIDCallsCount = 0
+    var proposeOrchardToIronwoodMigrationAccountUUIDCalled: Bool {
+        return proposeOrchardToIronwoodMigrationAccountUUIDCallsCount > 0
+    }
+    var proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID: AccountUUID?
+    var proposeOrchardToIronwoodMigrationAccountUUIDReturnValue: Proposal!
+    var proposeOrchardToIronwoodMigrationAccountUUIDClosure: ((AccountUUID) async throws -> Proposal)?
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
+        if let error = proposeOrchardToIronwoodMigrationAccountUUIDThrowableError {
+            throw error
+        }
+        proposeOrchardToIronwoodMigrationAccountUUIDCallsCount += 1
+        proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = proposeOrchardToIronwoodMigrationAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return proposeOrchardToIronwoodMigrationAccountUUIDReturnValue
         }
     }
 
@@ -4489,6 +4513,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(accountUUID, address, value, memo)
         } else {
             return proposeTransferAccountUUIDToValueMemoReturnValue
+        }
+    }
+
+    // MARK: - proposeOrchardToIronwoodMigration
+
+    var proposeOrchardToIronwoodMigrationAccountUUIDThrowableError: Error?
+    var proposeOrchardToIronwoodMigrationAccountUUIDCallsCount = 0
+    var proposeOrchardToIronwoodMigrationAccountUUIDCalled: Bool {
+        return proposeOrchardToIronwoodMigrationAccountUUIDCallsCount > 0
+    }
+    var proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID: AccountUUID?
+    var proposeOrchardToIronwoodMigrationAccountUUIDReturnValue: FfiProposal!
+    var proposeOrchardToIronwoodMigrationAccountUUIDClosure: ((AccountUUID) async throws -> FfiProposal)?
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> FfiProposal {
+        if let error = proposeOrchardToIronwoodMigrationAccountUUIDThrowableError {
+            throw error
+        }
+        proposeOrchardToIronwoodMigrationAccountUUIDCallsCount += 1
+        proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = proposeOrchardToIronwoodMigrationAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return proposeOrchardToIronwoodMigrationAccountUUIDReturnValue
         }
     }
 

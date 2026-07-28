@@ -264,6 +264,15 @@ protocol ZcashRustBackendWelding {
         memo: MemoBytes?
     ) async throws -> FfiProposal
 
+    /// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
+    ///
+    /// Sends the maximum from Orchard to the account's own internal receiver so nothing is
+    /// stranded when the Orchard turnstile closes at NU6.3. Fails unless NU6.3 is active.
+    ///
+    /// - Parameter accountUUID: the account whose Orchard balance is migrated.
+    /// - Throws: `rustCreateToAddress`.
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> FfiProposal
+
     /// Select transaction inputs, compute fees, and construct a proposal for a transaction
     /// that can then be authorized and made ready for submission to the network with
     /// `createProposedTransaction` from a valid [ZIP-321](https://zips.z.cash/zip-0321) Payment Request UR

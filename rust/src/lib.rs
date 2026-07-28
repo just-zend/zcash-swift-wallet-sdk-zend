@@ -20,7 +20,7 @@ use http_body_util::BodyExt;
 use nonempty::NonEmpty;
 use pczt::{
     Pczt,
-    roles::{combiner::Combiner, prover::Prover, redactor::Redactor},
+    roles::{combiner::Combiner, prover::Prover},
 };
 use prost::Message;
 use rand::rngs::OsRng;
@@ -46,10 +46,11 @@ use zcash_client_backend::{
         chain::{CommitmentTreeRoot, scan_cached_blocks},
         scanning::ScanPriority,
         wallet::{
-            self, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
-            decrypt_and_store_transaction, extract_and_store_transaction_from_pczt,
+            self, SignerView, SpendingKeys, create_pczt_from_proposal,
+            create_proposed_transactions, decrypt_and_store_transaction,
+            extract_and_store_transaction_from_pczt,
             input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
-            propose_send_max_transfer, propose_shielding, propose_transfer,
+            propose_send_max_transfer, propose_shielding, propose_transfer, redact_pczt_for_signer,
         },
     },
     encoding::AddressCodec,
@@ -100,10 +101,12 @@ mod migration_engine;
 mod migration_finalize;
 mod migration_keystone;
 mod migration_plan_cache;
+mod migration_turnstile;
 mod tor;
-// Voting stays UNGATED: the module compiles as honest-error stubs (15 C symbols preserved —
-// Zodl macOS links them; a cargo feature gate would drop them from the staticlib and break
-// that link). Voting rides upstream zcash_voting with real implementations.
+// Voting is gated off on this line: the `zcash_voting` dependency is commented out in
+// Cargo.toml (see there), so the module and its `zcashlc_voting_*` symbols are not compiled.
+// The sources are retained so the surface can be reinstated by re-enabling the dependency.
+#[cfg(zcash_voting)]
 mod voting;
 
 #[cfg(target_vendor = "apple")]
@@ -1123,7 +1126,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance(
                 target,
                 confirmations_policy,
                 CoinbaseFilter::AllTransparentOutputs,
-                LockFilter::Unfiltered,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map_err(|e| anyhow!("Error while fetching verified transparent balance: {}", e))?;
         let amount = utxos
@@ -1188,7 +1191,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
                         target,
                         confirmations_policy,
                         CoinbaseFilter::AllTransparentOutputs,
-                        LockFilter::Unfiltered,
+                        LockFilter::Policy(&LockedInputPolicy::Exclude),
                     )
                     .map_err(|e| {
                         anyhow!("Error while fetching verified transparent balance: {}", e)
@@ -1240,7 +1243,7 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance(
                 target,
                 wallet::ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
                 CoinbaseFilter::AllTransparentOutputs,
-                LockFilter::Unfiltered,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map_err(|e| anyhow!("Error while fetching total transparent balance: {}", e))?
             .iter()
@@ -1989,9 +1992,12 @@ pub unsafe extern "C" fn zcashlc_put_utxo(
         let script_bytes = unsafe { slice::from_raw_parts(script_bytes, script_bytes_len) };
         let script_pubkey = transparent::address::Script(script::Code(script_bytes.to_vec()));
 
-        // [IW-1 SPIKE] the ironwood-era API adds optional recipient/funding
-        // attribution params — `None` defers to the store's own address→account
-        // resolution (the pre-existing behavior of this ingest path).
+        // The ironwood-era API adds optional recipient/funding attribution
+        // params — `None` defers to the store's own address→account resolution
+        // (the pre-existing behavior of this ingest path).
+        let recipient_account = None;
+        let key_scope = None;
+        let funding_account = None;
         let output = WalletTransparentOutput::from_parts(
             OutPoint::new(txid, index as u32),
             TxOut::new(
@@ -1999,10 +2005,9 @@ pub unsafe extern "C" fn zcashlc_put_utxo(
                 script_pubkey,
             ),
             Some(BlockHeight::from(height as u32)),
-            // This UTXO is supplied by the caller with no account association or key scope.
-            None,
-            None,
-            None,
+            recipient_account,
+            key_scope,
+            funding_account,
         )
         .ok_or_else(|| {
             anyhow!(
@@ -2327,6 +2332,9 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
         ])
         .map_err(|e| anyhow!("Error creating transaction request: {:?}", e))?;
 
+        let spend_policy = SpendPolicy::default();
+        let lock_inputs = None;
+        let proposed_version = None;
         let proposal = propose_transfer::<_, _, _, _, Infallible>(
             &mut db_data,
             &network,
@@ -2335,9 +2343,9 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             &change_strategy,
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
-            &SpendPolicy::default(),
-            None,
-            None,
+            &spend_policy,
+            lock_inputs,
+            proposed_version,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2409,30 +2417,86 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         };
 
         let confirmation_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
+        let locked_input_policy = LockedInputPolicy::Exclude;
+        let lock_inputs = None;
 
-        let pools: &[ShieldedPool] = if orchard_only {
+        // Send-max draws the entire spendable balance across every shielded pool,
+        // so Ironwood is included alongside Sapling and Orchard; omitting it would
+        // silently leave a post-NU6.3 wallet's Ironwood funds behind. Including it
+        // is a no-op when the account holds no Ironwood notes.
+        //
+        // `orchard_only` narrows that to Orchard alone: the immediate migration lane
+        // sweeps what the turnstile is for, and must not drag Sapling value (or value
+        // already sitting in Ironwood) along with it.
+        let spend_pools: &[ShieldedPool] = if orchard_only {
             &[ShieldedPool::Orchard]
         } else {
-            &[ShieldedPool::Sapling, ShieldedPool::Orchard]
+            &[
+                ShieldedPool::Sapling,
+                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
+            ]
         };
 
         let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
             &mut db_data,
             &network,
             account_uuid,
-            pools,
+            spend_pools,
             &StandardFeeRule::Zip317,
             to,
             memo,
             mode,
             confirmation_policy,
-            &LockedInputPolicy::Exclude,
-            None,
+            &locked_input_policy,
+            lock_inputs,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
+        Ok(ffi::BoxedSlice::some(encoded))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
+///
+/// Sends the maximum from Orchard to the account's own internal Orchard receiver,
+/// with the fee computed so nothing is left over. Fails unless NU6.3 is active at
+/// the chain tip. See [`crate::migration_turnstile::propose_orchard_to_ironwood`].
+///
+/// This is the single-transaction sweep released in 2.8.0-rc.1, NOT the staged migration
+/// engine (`zcashlc_migration_*`), which is what migrates a real Orchard balance.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an alignment
+///   of `1`.
+/// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+///   pointer when done using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_propose_orchard_to_ironwood_migration(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+        let proposal =
+            migration_turnstile::propose_orchard_to_ironwood(&mut db_data, &network, account_uuid)?;
+
+        let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
         Ok(ffi::BoxedSlice::some(encoded))
     });
     unwrap_exc_or_null(res)
@@ -2481,6 +2545,9 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
         let req = TransactionRequest::from_uri(payment_uri_str)
             .map_err(|e| anyhow!("Error creating transaction request: {:?}", e))?;
 
+        let spend_policy = SpendPolicy::default();
+        let lock_inputs = None;
+        let proposed_version = None;
         let proposal = propose_transfer::<_, _, _, _, Infallible>(
             &mut db_data,
             &network,
@@ -2489,9 +2556,9 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             &change_strategy,
             req,
             wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
-            &SpendPolicy::default(),
-            None,
-            None,
+            &spend_policy,
+            lock_inputs,
+            proposed_version,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2689,6 +2756,7 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
         };
 
         let (change_strategy, input_selector) = zip317_helper(Some(memo_bytes));
+        let lock_inputs = None;
         let proposal = propose_shielding::<_, _, _, _, Infallible>(
             &mut db_data,
             &network,
@@ -2699,7 +2767,7 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
             account_uuid,
             confirmations_policy,
             CoinbaseFilter::AllTransparentOutputs,
-            None,
+            lock_inputs,
         )
         .map_err(|e| anyhow!("Error while shielding transaction: {}", e))?;
 
@@ -2792,6 +2860,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
         }));
 
         let prover = LocalTxProver::new(spend_params, output_params);
+        let expiry_height = None;
 
         let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
             &mut db_data,
@@ -2801,8 +2870,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             &SpendingKeys::from_unified_spending_key(usk),
             OvkPolicy::Sender,
             &proposal,
-            // No expiry override: keep the builder-derived expiry the SDK has always used.
-            None,
+            expiry_height,
         )
         .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
 
@@ -2869,16 +2937,16 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         if proposal.steps().len() == 1 {
+            let target_expiry_height = None;
+            let orchard_pool_padding = BundlePadding::DEFAULT;
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
                 &mut db_data,
                 &network,
                 account_uuid,
                 OvkPolicy::Sender,
                 &proposal,
-                // Use the transaction's default expiry height and the default Orchard
-                // bundle padding; the SDK does not expose overrides for these.
-                None,
-                BundlePadding::DEFAULT,
+                target_expiry_height,
+                orchard_pool_padding,
             )
             .map_err(|e| anyhow!("Error creating PCZT from single-step proposal: {}", e))?;
 
@@ -2922,26 +2990,14 @@ pub unsafe extern "C" fn zcashlc_redact_pczt_for_signer(
         let pczt_bytes = unsafe { slice::from_raw_parts(pczt_ptr, pczt_len) };
         let pczt = Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Invalid PCZT: {:?}", e))?;
 
-        let redacted_pczt = Redactor::new(pczt)
-            .redact_global_with(|mut r| r.redact_proprietary("zcash_client_backend:proposal_info"))
-            .redact_orchard_with(|mut r| {
-                r.redact_actions(|mut ar| {
-                    ar.clear_spend_witness();
-                    ar.redact_output_proprietary("zcash_client_backend:output_info");
-                })
-            })
-            .redact_sapling_with(|mut r| {
-                r.redact_spends(|mut sr| sr.clear_witness());
-                r.redact_outputs(|mut or| {
-                    or.redact_proprietary("zcash_client_backend:output_info")
-                });
-            })
-            .redact_transparent_with(|mut r| {
-                r.redact_outputs(|mut or| {
-                    or.redact_proprietary("zcash_client_backend:output_info")
-                });
-            })
-            .finish();
+        // Keystone's ordinary send flow signs the full (non-compacted) signer
+        // view: deployed firmware predates the compact view and, for v5
+        // transactions, the v2 PCZT encoding (which `Pczt::serialize` only
+        // selects when the content requires it). Do not switch this to
+        // `SignerView::Compact` without confirming the target signer supports
+        // it — the compact view here caused missing-signature failures at
+        // extraction (#1863 regression).
+        let redacted_pczt = redact_pczt_for_signer(&pczt, SignerView::Full);
 
         Ok(ffi::BoxedSlice::some(redacted_pczt.serialize().map_err(
             |e| anyhow!("Failed to serialize redacted PCZT: {:?}", e),
@@ -3045,20 +3101,30 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
 
         let mut prover = Prover::new(pczt);
 
+        // Orchard and Ironwood share the Orchard-family proving system. The circuit
+        // governing each pool under this PCZT's consensus branch selects the proving
+        // key; derive it from the branch id per pool. `cached_orchard_proving_key`
+        // returns a shared key per circuit version, so the Orchard and Ironwood
+        // proofs reuse one key once NU6.3 collapses both onto the PostNu6_3 circuit.
+        let circuit_version_for = |pool| {
+            zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
+                pczt_branch_id,
+                pool,
+            )
+            .map(|v| v.circuit_version())
+        };
+
         if prover.requires_orchard_proof() {
-            let orchard_circuit_version =
-                zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
-                    pczt_branch_id,
-                    orchard::ValuePool::Orchard,
-                )
-                .ok_or_else(|| {
+            let circuit_version =
+                circuit_version_for(orchard::ValuePool::Orchard).ok_or_else(|| {
                     anyhow!("PCZT's consensus branch does not support the Orchard pool")
-                })?
-                .circuit_version();
+                })?;
             prover = prover
-                .create_orchard_proof(&orchard::circuit::ProvingKey::build(
-                    orchard_circuit_version,
-                ))
+                .create_orchard_proof(
+                    zcash_primitives::transaction::builder::cached_orchard_proving_key(
+                        circuit_version,
+                    ),
+                )
                 .map_err(|e| anyhow!("Failed to create Orchard proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_orchard_proof());
@@ -3072,10 +3138,16 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
             // extract with MissingProof. The Ironwood bundle uses the PostNu6_3
             // circuit (the fixed circuit plus the `disableCrossAddress`
             // constraint), a distinct proving key from the Orchard pool's.
+            let circuit_version =
+                circuit_version_for(orchard::ValuePool::Ironwood).ok_or_else(|| {
+                    anyhow!("PCZT's consensus branch does not support the Ironwood pool")
+                })?;
             prover = prover
-                .create_ironwood_proof(&orchard::circuit::ProvingKey::build(
-                    orchard::circuit::OrchardCircuitVersion::PostNu6_3,
-                ))
+                .create_ironwood_proof(
+                    zcash_primitives::transaction::builder::cached_orchard_proving_key(
+                        circuit_version,
+                    ),
+                )
                 .map_err(|e| anyhow!("Failed to create Ironwood proof for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_ironwood_proof());

@@ -158,4 +158,214 @@ class WalletTests: ZcashTestCase {
             return
         }
     }
+
+    /// Pins the `initialize` seed/account integrity guard: `initialize` is idempotent for an existing wallet, so if the
+    /// rust layer reports that the caller's seed doesn't derive any account already stored in `data.db` (for example,
+    /// `data.db` was restored from a device backup belonging to a different wallet than the seed currently held in the
+    /// keychain), `initialize` must throw `ZcashError.initializerSeedMismatch` instead of silently returning `.success`.
+    /// Without this guard the wallet opens against the wrong account: the UI would show that account's balance and
+    /// receive address (funds receivable but unspendable with the caller's seed) while sends fail downstream. Account
+    /// creation must also be skipped entirely in this case, since accounts already exist for this database.
+    func testInitializeThrowsSeedMismatchWhenSeedIsNotRelevantToDerivedAccounts() async throws {
+        let existingAccount = Account(
+            id: TestsData.mockedAccountUUID,
+            name: nil,
+            keySource: nil,
+            seedFingerprint: nil,
+            hdAccountIndex: nil,
+            ufvk: nil,
+            uivk: nil
+        )
+
+        let rustBackendMock = ZcashRustBackendWeldingMock()
+        rustBackendMock.initBlockMetadataDbClosure = { }
+        rustBackendMock.initDataDbSeedClosure = { _ in DbInitResult.success }
+        rustBackendMock.listAccountsClosure = { [existingAccount] }
+        rustBackendMock.isSeedRelevantToAnyDerivedAccountSeedReturnValue = false
+
+        mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in rustBackendMock }
+
+        let initializer = Initializer(
+            container: mockContainer,
+            cacheDbURL: nil,
+            fsBlockDbRoot: testTempDirectory,
+            generalStorageURL: testGeneralStorageDirectory,
+            dataDbURL: try __dataDbURL(),
+            torDirURL: try __torDirURL(),
+            endpoint: LightWalletEndpointBuilder.default,
+            network: network,
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            isTorEnabled: false,
+            isExchangeRateEnabled: false
+        )
+
+        do {
+            _ = try await initializer.initialize(
+                with: seedData.bytes,
+                walletBirthday: 663194,
+                name: ""
+            )
+            XCTFail("Expected `initialize` to throw `ZcashError.initializerSeedMismatch` when the seed isn't relevant to any existing account.")
+        } catch {
+            guard let zcashError = error as? ZcashError, case .initializerSeedMismatch = zcashError else {
+                XCTFail("Expected `ZcashError.initializerSeedMismatch`, got \(error) instead.")
+                return
+            }
+        }
+
+        XCTAssertEqual(rustBackendMock.createAccountSeedTreeStateRecoverUntilNameKeySourceCallsCount, 0)
+    }
+
+    /// Companion regression test for `testInitializeThrowsSeedMismatchWhenSeedIsNotRelevantToDerivedAccounts`: the seed/
+    /// account guard must not false-positive on the ordinary "reopen the same wallet" path. When the rust layer reports
+    /// the seed IS relevant to an already-stored account, `initialize` must still return `.success` — otherwise every
+    /// normal app relaunch against an existing wallet would be bricked by the new check.
+    func testInitializeSucceedsWhenSeedIsRelevantToExistingAccounts() async throws {
+        let existingAccount = Account(
+            id: TestsData.mockedAccountUUID,
+            name: nil,
+            keySource: nil,
+            seedFingerprint: nil,
+            hdAccountIndex: nil,
+            ufvk: nil,
+            uivk: nil
+        )
+
+        let rustBackendMock = ZcashRustBackendWeldingMock()
+        rustBackendMock.initBlockMetadataDbClosure = { }
+        rustBackendMock.initDataDbSeedClosure = { _ in DbInitResult.success }
+        rustBackendMock.listAccountsClosure = { [existingAccount] }
+        rustBackendMock.isSeedRelevantToAnyDerivedAccountSeedReturnValue = true
+
+        mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in rustBackendMock }
+
+        let initializer = Initializer(
+            container: mockContainer,
+            cacheDbURL: nil,
+            fsBlockDbRoot: testTempDirectory,
+            generalStorageURL: testGeneralStorageDirectory,
+            dataDbURL: try __dataDbURL(),
+            torDirURL: try __torDirURL(),
+            endpoint: LightWalletEndpointBuilder.default,
+            network: network,
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            isTorEnabled: false,
+            isExchangeRateEnabled: false
+        )
+
+        let result = try await initializer.initialize(
+            with: seedData.bytes,
+            walletBirthday: 663194,
+            name: ""
+        )
+
+        guard case .success = result else {
+            XCTFail("Expected `.success` when the seed is relevant to an existing account, got \(result) instead.")
+            return
+        }
+
+        XCTAssertEqual(rustBackendMock.createAccountSeedTreeStateRecoverUntilNameKeySourceCallsCount, 0)
+    }
+
+    /// Companion regression test: the seed/account guard must be skipped entirely for a brand-new wallet. When
+    /// `listAccounts` returns no accounts there is nothing yet to validate the seed against, so `initialize` must go
+    /// straight to account creation instead of consulting `isSeedRelevantToAnyDerivedAccount` — a relevance check with
+    /// nothing to compare against must never gate first-time wallet creation or restore.
+    func testInitializeSkipsSeedRelevanceCheckForEmptyWallet() async throws {
+        let rustBackendMock = ZcashRustBackendWeldingMock()
+        rustBackendMock.initBlockMetadataDbClosure = { }
+        rustBackendMock.initDataDbSeedClosure = { _ in DbInitResult.success }
+        rustBackendMock.listAccountsClosure = { [] }
+        rustBackendMock.createAccountSeedTreeStateRecoverUntilNameKeySourceReturnValue = UnifiedSpendingKey(
+            network: network.networkType,
+            bytes: []
+        )
+
+        mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in rustBackendMock }
+
+        let initializer = Initializer(
+            container: mockContainer,
+            cacheDbURL: nil,
+            fsBlockDbRoot: testTempDirectory,
+            generalStorageURL: testGeneralStorageDirectory,
+            dataDbURL: try __dataDbURL(),
+            torDirURL: try __torDirURL(),
+            endpoint: LightWalletEndpointBuilder.default,
+            network: network,
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            isTorEnabled: false,
+            isExchangeRateEnabled: false
+        )
+
+        let result = try await initializer.initialize(
+            with: seedData.bytes,
+            walletBirthday: 663194,
+            name: ""
+        )
+
+        guard case .success = result else {
+            XCTFail("Expected `.success` for a fresh wallet with no existing accounts, got \(result) instead.")
+            return
+        }
+
+        XCTAssertFalse(rustBackendMock.isSeedRelevantToAnyDerivedAccountSeedCalled)
+    }
+
+    /// Companion regression test: the seed/account guard requires a seed to validate against, so it must be skipped
+    /// when no seed is supplied at all. View-only wallets and callers that can't fetch the seed from secure storage
+    /// (e.g. background tasks) pass `nil` here; they must keep working unaffected by the new check instead of being
+    /// gated on a relevance test that has no seed to test.
+    func testInitializeSkipsSeedRelevanceCheckWithoutSeed() async throws {
+        let existingAccount = Account(
+            id: TestsData.mockedAccountUUID,
+            name: nil,
+            keySource: nil,
+            seedFingerprint: nil,
+            hdAccountIndex: nil,
+            ufvk: nil,
+            uivk: nil
+        )
+
+        let rustBackendMock = ZcashRustBackendWeldingMock()
+        rustBackendMock.initBlockMetadataDbClosure = { }
+        rustBackendMock.initDataDbSeedClosure = { _ in DbInitResult.success }
+        rustBackendMock.listAccountsClosure = { [existingAccount] }
+
+        mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in rustBackendMock }
+
+        let initializer = Initializer(
+            container: mockContainer,
+            cacheDbURL: nil,
+            fsBlockDbRoot: testTempDirectory,
+            generalStorageURL: testGeneralStorageDirectory,
+            dataDbURL: try __dataDbURL(),
+            torDirURL: try __torDirURL(),
+            endpoint: LightWalletEndpointBuilder.default,
+            network: network,
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            isTorEnabled: false,
+            isExchangeRateEnabled: false
+        )
+
+        let result = try await initializer.initialize(
+            with: nil,
+            walletBirthday: 663194,
+            name: ""
+        )
+
+        guard case .success = result else {
+            XCTFail("Expected `.success` when no seed is provided, got \(result) instead.")
+            return
+        }
+
+        XCTAssertFalse(rustBackendMock.isSeedRelevantToAnyDerivedAccountSeedCalled)
+    }
 }

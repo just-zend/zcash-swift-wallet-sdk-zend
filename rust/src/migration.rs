@@ -77,8 +77,8 @@ use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
 
 use zcash_pool_migration::engine::{
-    self, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction, MigrationTxId,
-    MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
+    self, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction,
+    MigrationTransferId, MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
 use zcash_pool_migration::state::{Blocker, NextAction, TransactionStatus};
 use zcash_pool_migration::wallet::WalletMigrationProver;
@@ -252,7 +252,7 @@ impl CallCtx {
 fn insert_invalid_mark(
     wallet: &mut MigrationWallet,
     account: &[u8; 16],
-    id: MigrationTxId,
+    id: MigrationTransferId,
     reason: &str,
 ) -> anyhow::Result<()> {
     wallet.transactionally_with_extension(|_wdb, ext| {
@@ -419,7 +419,7 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
     if state.is_terminal() {
         return Ok(Some(state));
     }
-    let broadcast: Vec<(MigrationTxId, [u8; 32])> = state
+    let broadcast: Vec<(MigrationTransferId, [u8; 32])> = state
         .transactions()
         .iter()
         .filter_map(|t| match t.state() {
@@ -502,7 +502,7 @@ fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bloc
 /// their Ironwood balance will grow by — the funding note itself is a spend-side value that
 /// overstates it by one transfer fee.
 ///
-/// - `amount` is the engine's authoritative crossing value — `NoteSplitPlan::crossing_values()[i]`
+/// - `amount` is the engine's authoritative crossing value — `DenominationPlan::crossing_values()[i]`
 ///   (F3) — the NET value that crosses the turnstile when the funding note at the same index is
 ///   spent (see `crossing_values`'s doc: "the denomination values ... that will cross the
 ///   turnstile ... when the note at the same index is spent"). It is index-aligned with
@@ -518,7 +518,7 @@ fn schedule_rows(
     crossing_values: &[Zatoshis],
     schedule: &[zcash_pool_migration::scheduling::Schedule],
     prep_tx_count: u32,
-) -> anyhow::Result<Vec<(MigrationTxId, Zatoshis, BlockHeight, BlockHeight)>> {
+) -> anyhow::Result<Vec<(MigrationTransferId, Zatoshis, BlockHeight, BlockHeight)>> {
     if crossing_values.len() != schedule.len() {
         return Err(anyhow!(
             "migration plan invariant violated: {} crossing values but {} schedule entries",
@@ -532,7 +532,7 @@ fn schedule_rows(
         .enumerate()
         .map(|(i, (crossing_value, entry))| {
             (
-                MigrationTxId::new(prep_tx_count + i as u32),
+                MigrationTransferId::new(prep_tx_count + i as u32),
                 *crossing_value,
                 entry.broadcast_height(),
                 entry.expiry_height(),
@@ -579,7 +579,7 @@ fn encode_schedule_from_plan(
     plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
     let rows = schedule_rows(
-        plan.note_split().crossing_values(),
+        plan.denominations().crossing_values(),
         plan.schedule(),
         prep_tx_count(plan),
     )?;
@@ -708,7 +708,7 @@ fn commit_or_resume(
     usk: Option<zcash_keys::keys::UnifiedSpendingKey>,
     unsigned_out: bool,
     plan_handle: migration_plan_cache::PlanHandle,
-) -> anyhow::Result<(MigrationState, Vec<(MigrationTxId, Vec<u8>)>)> {
+) -> anyhow::Result<(MigrationState, Vec<(MigrationTransferId, Vec<u8>)>)> {
     {
         let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         if let Some(state) = backend.get_migration()? {
@@ -792,7 +792,7 @@ fn map_rebuild_err(e: engine::RebuildError<anyhow::Error>) -> anyhow::Error {
 fn prove_if_needed(
     ctx: &mut CallCtx,
     state: &mut MigrationState,
-    id: MigrationTxId,
+    id: MigrationTransferId,
 ) -> anyhow::Result<Option<(Vec<u8>, [u8; 32])>> {
     let tx = state
         .transactions()
@@ -879,9 +879,9 @@ fn drive_and_serve_next_due(
     target: BlockHeight,
     mut prove: impl FnMut(
         &mut MigrationState,
-        MigrationTxId,
+        MigrationTransferId,
     ) -> anyhow::Result<Option<(Vec<u8>, [u8; 32])>>,
-) -> anyhow::Result<Option<(MigrationTxId, [u8; 32], Vec<u8>)>> {
+) -> anyhow::Result<Option<(MigrationTransferId, [u8; 32], Vec<u8>)>> {
     while state.next_broadcastable(target).is_none() {
         let Some(provable) = state.next_provable(target) else {
             return Ok(None);
@@ -910,7 +910,10 @@ fn drive_and_serve_next_due(
 /// transiently unwitnessable anchor (a restored wallet mid-sync) defers the actual delivery, not
 /// the report — the due work exists either way, and the delivery call stays the one place that
 /// consults the prover.
-fn due_assuming_proving(state: &MigrationState, target: BlockHeight) -> Option<MigrationTxId> {
+fn due_assuming_proving(
+    state: &MigrationState,
+    target: BlockHeight,
+) -> Option<MigrationTransferId> {
     if let Some(id) = state.next_broadcastable(target) {
         return Some(id);
     }
@@ -1112,9 +1115,11 @@ fn derive_state(
 /// index is out of range.
 fn transfer_amount(state: &MigrationState, tx: &MigrationTransaction) -> Option<Zatoshis> {
     match tx.kind() {
-        MigrationTxKind::Transfer { crossing } => {
-            state.note_split().crossing_values().get(crossing).copied()
-        }
+        MigrationTxKind::Transfer { crossing } => state
+            .denominations()
+            .crossing_values()
+            .get(crossing)
+            .copied(),
         _ => None,
     }
 }
@@ -1228,7 +1233,7 @@ pub struct FfiPreparedTransfer {
 
 impl FfiPreparedTransfer {
     fn from_parts(
-        id: MigrationTxId,
+        id: MigrationTransferId,
         txid: [u8; 32],
         pczt_bytes: Vec<u8>,
     ) -> anyhow::Result<*mut Self> {
@@ -1271,7 +1276,7 @@ pub struct FfiTransferProposal {
 
 impl FfiTransferProposal {
     fn boxed(
-        id: MigrationTxId,
+        id: MigrationTransferId,
         amount: Zatoshis,
         now_reference: BlockHeight,
         next_executable_after: BlockHeight,
@@ -1356,7 +1361,7 @@ pub struct FfiUnsignedTransferPczts {
 }
 
 impl FfiUnsignedTransferPczts {
-    fn from_pairs(pairs: Vec<(MigrationTxId, Vec<u8>)>) -> anyhow::Result<*mut Self> {
+    fn from_pairs(pairs: Vec<(MigrationTransferId, Vec<u8>)>) -> anyhow::Result<*mut Self> {
         let items = pairs
             .into_iter()
             .map(|(id, bytes)| {
@@ -1382,7 +1387,7 @@ impl FfiUnsignedTransferPczts {
 /// [`zcashlc_migration_transaction_statuses`]).
 #[repr(C)]
 pub struct FfiMigrationTransactionStatus {
-    /// This transaction's stable id (`MigrationTxId`'s raw ordinal). Stable across reads and
+    /// This transaction's stable id (`MigrationTransferId`'s raw ordinal). Stable across reads and
     /// across a stale-transfer rebuild (a rebuilt transfer keeps its id; only its PCZT and
     /// heights change), so a wallet may use it as a durable row key.
     pub id: u32,
@@ -2028,7 +2033,7 @@ pub unsafe extern "C" fn zcashlc_migration_prepare_note_split(
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let (values, fee, proposal_handle) = match plan_and_cache(&mut ctx, false)? {
             Some((plan, _, handle)) => {
-                let split = plan.note_split();
+                let split = plan.denominations();
                 let values: Vec<i64> = split
                     .migration_outputs()
                     .iter()
@@ -2126,14 +2131,14 @@ pub unsafe extern "C" fn zcashlc_migration_residual_after_migration(
             let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
             if let Some(state) = backend.get_migration()? {
                 if !state.is_terminal() {
-                    return Ok(state.note_split().change().map_or(-1, zat_to_i64));
+                    return Ok(state.denominations().change().map_or(-1, zat_to_i64));
                 }
             }
         }
         // `compute_plan`, NOT `plan_and_cache`: this is a pure peek — caching its throwaway plan
         // would supersede the handle of a proposal the user is currently reviewing.
         Ok(match compute_plan(&mut ctx)? {
-            Some((plan, _)) => plan.note_split().change().map_or(-1, zat_to_i64),
+            Some((plan, _)) => plan.denominations().change().map_or(-1, zat_to_i64),
             None => -1,
         })
     });
@@ -2360,7 +2365,7 @@ pub unsafe extern "C" fn zcashlc_migration_propose_immediate_transfers(
             Some((plan, reference_height, handle)) => {
                 // Preview mirrors the commit-time rewrite: every transfer due at the tip.
                 let rows = schedule_rows(
-                    plan.note_split().crossing_values(),
+                    plan.denominations().crossing_values(),
                     plan.schedule(),
                     prep_tx_count(&plan),
                 )?;
@@ -2560,7 +2565,7 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let id = MigrationTxId::new(transfer_id);
+        let id = MigrationTransferId::new(transfer_id);
         match result_tag {
             0 => {
                 if txid_bytes.is_null() {
@@ -2649,7 +2654,7 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
                 if !state.is_terminal() {
                     let cancelled = MigrationState::from_parts(
                         MigrationStatus::Failed,
-                        state.note_split().clone(),
+                        state.denominations().clone(),
                         state.preparation().clone(),
                         state.transactions().clone(),
                         state.anchor_bucket_interval(),
@@ -2832,7 +2837,7 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczts(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let (state, unsigned) = commit_or_resume(&mut ctx, None, true, proposal_handle)?;
-        let prep_ids: HashSet<MigrationTxId> = state
+        let prep_ids: HashSet<MigrationTransferId> = state
             .transactions()
             .iter()
             .filter(|t| matches!(t.kind(), MigrationTxKind::Preparation { .. }))
@@ -2889,7 +2894,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
         let mut state = backend
             .get_migration()?
             .ok_or_else(|| anyhow!("no migration is committed yet"))?;
-        let mut first: Option<(MigrationTxId, Vec<u8>)> = None;
+        let mut first: Option<(MigrationTransferId, Vec<u8>)> = None;
         for (id, bytes) in signed {
             if first.is_none() {
                 first = Some((id, bytes.clone()));
@@ -2936,7 +2941,7 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_transfer_pczts(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let (state, unsigned) = commit_or_resume(&mut ctx, None, true, proposal_handle)?;
-        let transfer_ids: HashSet<MigrationTxId> = state
+        let transfer_ids: HashSet<MigrationTransferId> = state
             .transactions()
             .iter()
             .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }))
@@ -3005,7 +3010,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
 }
 
 /// Decode the platform's parallel `(id, pczt)` arrays into owned pairs, parsing every id as an
-/// engine [`MigrationTxId`].
+/// engine [`MigrationTransferId`].
 ///
 /// The two store externs ([`zcashlc_migration_store_signed_note_split_pczts`] and
 /// [`zcashlc_migration_store_signed_schedule_pczts`]) look transactions up by that id;
@@ -3021,13 +3026,13 @@ unsafe fn decode_signed_pairs(
     len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
-) -> anyhow::Result<Vec<(MigrationTxId, Vec<u8>)>> {
+) -> anyhow::Result<Vec<(MigrationTransferId, Vec<u8>)>> {
     let ids = unsafe { slice_or_empty(ids, len) };
     let pczt_ptrs = unsafe { slice_or_empty(pczts, len) };
     let lens = unsafe { slice_or_empty(pczt_lens, len) };
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
-        let id = MigrationTxId::new(ids[i]);
+        let id = MigrationTransferId::new(ids[i]);
         if pczt_ptrs[i].is_null() {
             return Err(anyhow!("signed pczt at index {i} is null"));
         }
@@ -3161,7 +3166,7 @@ pub unsafe extern "C" fn zcashlc_migration_keystone_apply_batch_signatures(
 ) -> *mut FfiUnsignedTransferPczts {
     let res = catch_panic(|| {
         let unsigned = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
-        let (ids, pczts): (Vec<MigrationTxId>, Vec<Vec<u8>>) = unsigned.into_iter().unzip();
+        let (ids, pczts): (Vec<MigrationTransferId>, Vec<Vec<u8>>) = unsigned.into_iter().unzip();
         let response = unsafe { slice_or_empty(response, response_len) };
         let signed = crate::migration_keystone::apply_batch_signatures(&pczts, response)
             .map_err(|e| anyhow!("Error applying Keystone batch signatures: {e}"))?;
@@ -3323,7 +3328,7 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use zcash_pool_migration::note_splitting::NoteSplitPlan;
+    use zcash_pool_migration::denomination::DenominationPlan;
     use zcash_pool_migration::preparation::PreparationPlan;
     use zcash_pool_migration::scheduling::{self, AnchorBucketInterval, SchedulingParams};
 
@@ -3509,7 +3514,7 @@ mod tests {
         let mut transactions = Vec::new();
         for (i, s) in prep_states.iter().enumerate() {
             transactions.push(MigrationTransaction::from_parts(
-                MigrationTxId::new(i as u32),
+                MigrationTransferId::new(i as u32),
                 MigrationTxKind::Preparation { layer: 0, index: i },
                 vec![0u8],
                 Vec::new(),
@@ -3523,7 +3528,7 @@ mod tests {
         let offset = prep_states.len() as u32;
         for (i, s) in transfer_states.iter().enumerate() {
             transactions.push(MigrationTransaction::from_parts(
-                MigrationTxId::new(offset + i as u32),
+                MigrationTransferId::new(offset + i as u32),
                 MigrationTxKind::Transfer { crossing: i },
                 vec![0u8],
                 Vec::new(),
@@ -3537,7 +3542,7 @@ mod tests {
         let funding: Vec<Zatoshis> = transfer_states.iter().map(|_| zat(100_000_000)).collect();
         MigrationState::from_parts(
             status,
-            NoteSplitPlan::from_stored_parts(
+            DenominationPlan::from_stored_parts(
                 funding.clone(),
                 zat(10_000),
                 None,
@@ -3643,7 +3648,7 @@ mod tests {
         let transactions = vec![
             // Broadcast (in-mempool) at the LOW height — must be excluded.
             MigrationTransaction::from_parts(
-                MigrationTxId::new(0),
+                MigrationTransferId::new(0),
                 MigrationTxKind::Transfer { crossing: 0 },
                 vec![0u8],
                 Vec::new(),
@@ -3657,7 +3662,7 @@ mod tests {
             ),
             // Signed (still awaiting broadcast) at the HIGHER height — must win.
             MigrationTransaction::from_parts(
-                MigrationTxId::new(1),
+                MigrationTransferId::new(1),
                 MigrationTxKind::Transfer { crossing: 1 },
                 vec![0u8],
                 Vec::new(),
@@ -3670,7 +3675,7 @@ mod tests {
         ];
         let state = MigrationState::from_parts(
             MigrationStatus::InProgress,
-            NoteSplitPlan::from_stored_parts(
+            DenominationPlan::from_stored_parts(
                 vec![zat(100_000_000), zat(100_000_000)],
                 zat(10_000),
                 None,
@@ -3706,7 +3711,7 @@ mod tests {
     fn derive_next_ready_height_is_none_when_all_transfers_are_broadcast_or_mined() {
         let transactions = vec![
             MigrationTransaction::from_parts(
-                MigrationTxId::new(0),
+                MigrationTransferId::new(0),
                 MigrationTxKind::Transfer { crossing: 0 },
                 vec![0u8],
                 Vec::new(),
@@ -3719,7 +3724,7 @@ mod tests {
                 None,
             ),
             MigrationTransaction::from_parts(
-                MigrationTxId::new(1),
+                MigrationTransferId::new(1),
                 MigrationTxKind::Transfer { crossing: 1 },
                 vec![0u8],
                 Vec::new(),
@@ -3732,7 +3737,7 @@ mod tests {
         ];
         let state = MigrationState::from_parts(
             MigrationStatus::InProgress,
-            NoteSplitPlan::from_stored_parts(
+            DenominationPlan::from_stored_parts(
                 vec![zat(100_000_000), zat(100_000_000)],
                 zat(10_000),
                 None,
@@ -4065,13 +4070,13 @@ mod tests {
     /// F3 pin: `schedule_rows`' amount is BOTH the engine's authoritative
     /// `note_split().crossing_values()[crossing]` (trivially — that is now its input) AND the
     /// legacy `funding_notes()[crossing] - note_fee_buffer` computation it replaces, proven equal
-    /// for a real `NoteSplitPlan`. Pure refactor: values are identical, so this is green
+    /// for a real `DenominationPlan`. Pure refactor: values are identical, so this is green
     /// immediately (no red phase — see F3's task doc).
     #[test]
     fn schedule_rows_amount_matches_engine_crossing_values_and_legacy_subtraction() {
         let mut rng = StdRng::seed_from_u64(11);
         let crossing_values = vec![zat(100_000_000), zat(250_000_000), zat(40_000_000)];
-        let note_split = NoteSplitPlan::from_stored_parts(
+        let note_split = DenominationPlan::from_stored_parts(
             crossing_values.clone(),
             zat(10_000),
             None,
@@ -4138,7 +4143,7 @@ mod tests {
     /// suffices.
     fn transfer_at(id: u32, scheduled: u32) -> MigrationTransaction {
         MigrationTransaction::from_parts(
-            MigrationTxId::new(id),
+            MigrationTransferId::new(id),
             MigrationTxKind::Transfer { crossing: 0 },
             vec![0u8],
             Vec::new(),
@@ -4176,7 +4181,7 @@ mod tests {
     fn encode_schedule_from_state_measures_duration_from_now_reference() {
         let transactions = vec![
             MigrationTransaction::from_parts(
-                MigrationTxId::new(0),
+                MigrationTransferId::new(0),
                 MigrationTxKind::Transfer { crossing: 0 },
                 vec![0u8],
                 Vec::new(),
@@ -4187,7 +4192,7 @@ mod tests {
                 None,
             ),
             MigrationTransaction::from_parts(
-                MigrationTxId::new(1),
+                MigrationTransferId::new(1),
                 MigrationTxKind::Transfer { crossing: 1 },
                 vec![0u8],
                 Vec::new(),
@@ -4200,7 +4205,7 @@ mod tests {
         ];
         let state = MigrationState::from_parts(
             MigrationStatus::InProgress,
-            NoteSplitPlan::from_stored_parts(
+            DenominationPlan::from_stored_parts(
                 vec![zat(100_000_000), zat(100_000_000)],
                 zat(0),
                 None,
@@ -4708,7 +4713,7 @@ mod tests {
             // A preparation: excluded by `kind = 'transfer'` alone, even though its state
             // (Signed) would otherwise qualify as "pending".
             MigrationTransaction::from_parts(
-                MigrationTxId::new(0),
+                MigrationTransferId::new(0),
                 MigrationTxKind::Preparation { layer: 0, index: 0 },
                 vec![9u8],
                 Vec::new(),
@@ -4722,7 +4727,7 @@ mod tests {
             // must come out ascending by the OLD scheduled_height (3000 < 5000 < 7000, i.e. ids
             // 1, 2, 3 in that order), never storage order.
             MigrationTransaction::from_parts(
-                MigrationTxId::new(3),
+                MigrationTransferId::new(3),
                 MigrationTxKind::Transfer { crossing: 2 },
                 vec![3u8],
                 Vec::new(),
@@ -4733,7 +4738,7 @@ mod tests {
                 None,
             ),
             MigrationTransaction::from_parts(
-                MigrationTxId::new(1),
+                MigrationTransferId::new(1),
                 MigrationTxKind::Transfer { crossing: 0 },
                 vec![1u8],
                 Vec::new(),
@@ -4744,7 +4749,7 @@ mod tests {
                 None,
             ),
             MigrationTransaction::from_parts(
-                MigrationTxId::new(2),
+                MigrationTransferId::new(2),
                 MigrationTxKind::Transfer { crossing: 1 },
                 vec![2u8],
                 Vec::new(),
@@ -4756,7 +4761,7 @@ mod tests {
             ),
             // Already broadcast: excluded by `state NOT IN ('broadcast', 'mined')`.
             MigrationTransaction::from_parts(
-                MigrationTxId::new(4),
+                MigrationTransferId::new(4),
                 MigrationTxKind::Transfer { crossing: 3 },
                 vec![4u8],
                 Vec::new(),
@@ -4770,7 +4775,7 @@ mod tests {
             ),
             // Already mined: same exclusion.
             MigrationTransaction::from_parts(
-                MigrationTxId::new(5),
+                MigrationTransferId::new(5),
                 MigrationTxKind::Transfer { crossing: 4 },
                 vec![5u8],
                 Vec::new(),
@@ -4784,7 +4789,7 @@ mod tests {
         let funding: Vec<Zatoshis> = (0..5).map(|_| zat(100_000_000)).collect();
         MigrationState::from_parts(
             MigrationStatus::InProgress,
-            NoteSplitPlan::from_stored_parts(
+            DenominationPlan::from_stored_parts(
                 funding,
                 zat(10_000),
                 None,
@@ -4846,7 +4851,7 @@ mod tests {
             state
                 .transactions()
                 .iter()
-                .find(|t| t.id() == MigrationTxId::new(id))
+                .find(|t| t.id() == MigrationTransferId::new(id))
                 .unwrap_or_else(|| panic!("transaction {id} must still be present"))
         };
 
@@ -4924,9 +4929,27 @@ mod tests {
         let account = [9u8; 16];
         let other = [8u8; 16];
         assert!(invalid_marks(&mut wallet, &account).unwrap().is_empty());
-        insert_invalid_mark(&mut wallet, &account, MigrationTxId::new(4), "invalid_note").unwrap();
-        insert_invalid_mark(&mut wallet, &account, MigrationTxId::new(2), "expired").unwrap();
-        insert_invalid_mark(&mut wallet, &other, MigrationTxId::new(7), "invalid_note").unwrap();
+        insert_invalid_mark(
+            &mut wallet,
+            &account,
+            MigrationTransferId::new(4),
+            "invalid_note",
+        )
+        .unwrap();
+        insert_invalid_mark(
+            &mut wallet,
+            &account,
+            MigrationTransferId::new(2),
+            "expired",
+        )
+        .unwrap();
+        insert_invalid_mark(
+            &mut wallet,
+            &other,
+            MigrationTransferId::new(7),
+            "invalid_note",
+        )
+        .unwrap();
         assert_eq!(invalid_marks(&mut wallet, &account).unwrap(), vec![2, 4]);
         clear_invalid_marks(&mut wallet, &account).unwrap();
         assert!(invalid_marks(&mut wallet, &account).unwrap().is_empty());
@@ -5610,7 +5633,7 @@ mod tests {
             .collect();
         let state = MigrationState::from_parts(
             base.status(),
-            base.note_split().clone(),
+            base.denominations().clone(),
             base.preparation().clone(),
             transactions,
             base.anchor_bucket_interval(),
@@ -5795,7 +5818,7 @@ mod tests {
             .collect();
         MigrationState::from_parts(
             base.status(),
-            base.note_split().clone(),
+            base.denominations().clone(),
             base.preparation().clone(),
             transactions,
             base.anchor_bucket_interval(),
@@ -5813,7 +5836,7 @@ mod tests {
         let res = migration_finalize::prove_due_transaction(
             &mut prover,
             &mut state,
-            MigrationTxId::new(1),
+            MigrationTransferId::new(1),
             None,
         )
         .expect("a boundary-carrying transfer proves");
@@ -5826,7 +5849,7 @@ mod tests {
         let tx = state
             .transactions()
             .iter()
-            .find(|t| t.id() == MigrationTxId::new(1))
+            .find(|t| t.id() == MigrationTransferId::new(1))
             .expect("the transfer row remains");
         assert!(
             matches!(tx.state(), MigrationTxState::Proved),
@@ -5856,7 +5879,7 @@ mod tests {
         let res = migration_finalize::prove_due_transaction(
             &mut prover,
             &mut state,
-            MigrationTxId::new(0),
+            MigrationTransferId::new(0),
             Some(h(777)),
         )
         .expect("a signed preparation proves");
@@ -5869,7 +5892,7 @@ mod tests {
         let tx = state
             .transactions()
             .iter()
-            .find(|t| t.id() == MigrationTxId::new(0))
+            .find(|t| t.id() == MigrationTransferId::new(0))
             .expect("the preparation row remains");
         assert!(
             matches!(tx.state(), MigrationTxState::Proved),
@@ -5887,7 +5910,7 @@ mod tests {
         let err = migration_finalize::prove_due_transaction(
             &mut prover,
             &mut state,
-            MigrationTxId::new(1),
+            MigrationTransferId::new(1),
             None,
         )
         .expect_err("a boundary-less transfer must not prove");
@@ -5902,7 +5925,7 @@ mod tests {
         let tx = state
             .transactions()
             .iter()
-            .find(|t| t.id() == MigrationTxId::new(1))
+            .find(|t| t.id() == MigrationTransferId::new(1))
             .expect("the transfer row remains");
         assert!(
             matches!(tx.state(), MigrationTxState::Signed),
@@ -5929,7 +5952,7 @@ mod tests {
             let res = migration_finalize::prove_due_transaction(
                 &mut prover,
                 &mut state,
-                MigrationTxId::new(1),
+                MigrationTransferId::new(1),
                 None,
             )
             .unwrap_or_else(|e| panic!("{label} must be transient, got hard error: {e}"));
@@ -5937,7 +5960,7 @@ mod tests {
             let tx = state
                 .transactions()
                 .iter()
-                .find(|t| t.id() == MigrationTxId::new(1))
+                .find(|t| t.id() == MigrationTransferId::new(1))
                 .expect("the transfer row remains");
             assert!(
                 matches!(tx.state(), MigrationTxState::Signed),
@@ -5967,7 +5990,7 @@ mod tests {
             let err = migration_finalize::prove_due_transaction(
                 &mut prover,
                 &mut state,
-                MigrationTxId::new(1),
+                MigrationTransferId::new(1),
                 None,
             )
             .expect_err(&format!("{label} must be a hard error"));
@@ -5993,7 +6016,7 @@ mod tests {
         let err = migration_finalize::prove_due_transaction(
             &mut prover,
             &mut state,
-            MigrationTxId::new(0),
+            MigrationTransferId::new(0),
             None,
         )
         .expect_err("a preparation without a natural anchor must not prove");
@@ -6056,7 +6079,7 @@ mod tests {
             .collect();
         MigrationState::from_parts(
             base.status(),
-            base.note_split().clone(),
+            base.denominations().clone(),
             base.preparation().clone(),
             transactions,
             base.anchor_bucket_interval(),
@@ -6074,7 +6097,7 @@ mod tests {
         account: &[u8; 16],
         prover: &mut P,
         state: &mut MigrationState,
-        id: MigrationTxId,
+        id: MigrationTransferId,
     ) -> anyhow::Result<Option<(Vec<u8>, [u8; 32])>>
     where
         P: MigrationProver,
@@ -6145,7 +6168,11 @@ mod tests {
         .expect("driving a provable, due transfer must not fail");
 
         let (id, _txid, bytes) = served.expect("the due Signed transfer must be served");
-        assert_eq!(id, MigrationTxId::new(1), "the transfer row must be served");
+        assert_eq!(
+            id,
+            MigrationTransferId::new(1),
+            "the transfer row must be served"
+        );
         assert_eq!(
             prover.calls,
             vec![ProveCall::Transfer(h(1440))],
@@ -6155,7 +6182,7 @@ mod tests {
         let tx = stored
             .transactions()
             .iter()
-            .find(|t| t.id() == MigrationTxId::new(1))
+            .find(|t| t.id() == MigrationTransferId::new(1))
             .expect("the transfer row remains stored");
         assert!(
             matches!(tx.state(), MigrationTxState::Proved),
@@ -6199,7 +6226,7 @@ mod tests {
         let tx = stored
             .transactions()
             .iter()
-            .find(|t| t.id() == MigrationTxId::new(1))
+            .find(|t| t.id() == MigrationTransferId::new(1))
             .expect("the transfer row remains stored");
         assert!(
             matches!(tx.state(), MigrationTxState::Signed),
@@ -6235,7 +6262,7 @@ mod tests {
         let (id, _, _) = served.expect("the due transfer behind the undue one must be served");
         assert_eq!(
             id,
-            MigrationTxId::new(2),
+            MigrationTransferId::new(2),
             "the schedule-due transfer must be the one served"
         );
         let stored = read_fixture_state(&path, &account);
@@ -6243,7 +6270,7 @@ mod tests {
             let tx = stored
                 .transactions()
                 .iter()
-                .find(|t| t.id() == MigrationTxId::new(expect_id))
+                .find(|t| t.id() == MigrationTransferId::new(expect_id))
                 .expect("the transfer row remains stored");
             assert!(
                 matches!(tx.state(), MigrationTxState::Proved),
@@ -6268,7 +6295,7 @@ mod tests {
         );
         assert_eq!(
             due_assuming_proving(&state, h(100)),
-            Some(MigrationTxId::new(2)),
+            Some(MigrationTransferId::new(2)),
             "a due-but-unproved transfer is due delivery work"
         );
         assert!(
@@ -6294,7 +6321,7 @@ mod tests {
         let proved = scheduled_state(&[MINED], &[(MigrationTxState::Proved, 90, Some(h(40)))]);
         assert_eq!(
             due_assuming_proving(&proved, h(100)),
-            Some(MigrationTxId::new(1))
+            Some(MigrationTransferId::new(1))
         );
     }
 
@@ -6541,10 +6568,13 @@ mod tests {
         state: MigrationTxState,
     ) -> MigrationTransaction {
         MigrationTransaction::from_parts(
-            MigrationTxId::new(id),
+            MigrationTransferId::new(id),
             kind,
             vec![0u8],
-            depends_on.iter().map(|&d| MigrationTxId::new(d)).collect(),
+            depends_on
+                .iter()
+                .map(|&d| MigrationTransferId::new(d))
+                .collect(),
             h(scheduled),
             h(expiry),
             anchor_boundary.map(h),
@@ -6564,7 +6594,7 @@ mod tests {
             .collect();
         MigrationState::from_parts(
             status,
-            NoteSplitPlan::from_stored_parts(
+            DenominationPlan::from_stored_parts(
                 funding,
                 zat(10_000),
                 None,
@@ -6903,7 +6933,7 @@ mod tests {
         let stored_tx = stored
             .transactions()
             .iter()
-            .find(|t| t.id() == MigrationTxId::new(0))
+            .find(|t| t.id() == MigrationTransferId::new(0))
             .expect("the row remains stored");
         assert!(
             matches!(

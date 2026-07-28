@@ -7,20 +7,6 @@ use zcash_voting as voting;
 // Helper functions
 // =============================================================================
 
-/// Converts the FFI `network_id` convention (`0` = testnet, `1` = mainnet) into the
-/// [`zcash_voting::Network`] value now required by the voting database API.
-pub(super) fn voting_network(network_id: u32) -> anyhow::Result<voting::Network> {
-    match network_id {
-        crate::NETWORK_ID_TESTNET => Ok(voting::Network::Testnet),
-        crate::NETWORK_ID_MAINNET => Ok(voting::Network::Mainnet),
-        other => Err(anyhow!(
-            "Invalid network id: {other}. Expected {} (testnet) or {} (mainnet).",
-            crate::NETWORK_ID_TESTNET,
-            crate::NETWORK_ID_MAINNET,
-        )),
-    }
-}
-
 /// Borrow a byte slice from a raw `(ptr, len)` pair.
 ///
 /// When `len == 0`, returns an empty slice without reading `ptr`, so `ptr` may be null.
