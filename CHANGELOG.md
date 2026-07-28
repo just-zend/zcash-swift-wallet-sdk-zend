@@ -144,6 +144,13 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- `ZcashRustBackend.decryptAndStoreTransaction` misread the FFI's -1 error sentinel as success (the
+  FFI returns 1 on success and -1 on error, never 0, so the `result != 0` guard could not fire). A
+  failed decrypt-and-store now throws `ZcashError.rustDecryptAndStoreTransaction` with the
+  underlying Rust error instead of silently returning an all-zero txid — previously such failures
+  were treated as completed work by transaction enhancement, the mempool monitor, and
+  `enhanceTransactionBy`, hiding missing transaction data (memos, transparent history) without any
+  error or retry.
 - Memos on Ironwood outputs are retrievable; a note id in the Ironwood pool was rejected as an
   unrecognized shielded protocol.
 - `getAccountsBalances()` no longer reports empty balances for up to ~30 s after a restore completes,

@@ -582,7 +582,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             )
         }
 
-        guard result != 0 else {
+        // The FFI returns 1 on success and -1 on error; it never returns 0. Only a
+        // returned 1 means the transaction was stored and the txid buffer was written.
+        guard result == 1 else {
             throw ZcashError.rustDecryptAndStoreTransaction(lastErrorMessage(fallback: "`decryptAndStoreTransaction` failed with unknown error"))
         }
 
