@@ -125,6 +125,25 @@ All of the following were picked up from the librustzcash update:
   was previously treated as plaintext HTTP; a URL with no scheme at all was,
   and remains, rejected.
 
+## Fixed
+- `SynchronizerEvent.minedTransaction` fires again. `BlockEnhancerImpl` had stopped invoking its
+  `didEnhance` callback when transaction data requests were adopted, silently killing the event in
+  production — client apps never received the signal that a pending sent transaction was mined.
+  The event is now emitted exactly once per unmined→mined transition of a sent transaction, from
+  the enhancement path (scanning-originated — the path shielded transactions take) and from a
+  mined `GetStatus` answer (fully-transparent transactions).
+- `ZcashRustBackend.setTransactionStatus` failures are no longer silently ignored: the FFI now
+  reports success, and the Swift side throws the new `ZcashError.rustSetTransactionStatus`
+  (`ZRUST0111`), feeding the block enhancer's existing retry and logging instead of vanishing.
+
+## Added
+- Server validation now fails loudly with the new
+  `ZcashError.compactBlockProcessorServerMissingIronwoodSupport` (`ZCBPEO0024`) when the chain is
+  on the NU6.3 ("Ironwood") consensus branch but the connected lightwalletd serves no Ironwood
+  tree state. Compact-block scanning is what detects the wallet's shielded transactions, and a
+  server missing Ironwood data would previously let scanning pass silently while never detecting
+  anything in that pool.
+
 # 2.7.0-rc.2 - 2026-07-26
 
 ## Changed
