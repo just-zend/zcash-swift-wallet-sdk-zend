@@ -44,9 +44,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wallet::WalletMigrationProver`): transfers prove against the boundary anchor
   their schedule drew and persisted (ZIP 318 anchor cohorts; upstream retention,
   librustzcash #2700/#2710, keeps the matching 144-block boundary grid durably
-  witnessable from NU6.3 activation), preparations against the wallet's natural
-  anchor, and a boundary the wallet has not scanned or retained yet surfaces as
-  the transient nothing-due, not an error — and leaves broadcasting,
+  witnessable from NU6.3 activation), preparations against the wallet's scanned
+  tip (correct for a shielded self-send that crosses no pool and reveals no
+  balance; only pool-crossing transfers need the bucket grid). Proving is
+  OPPORTUNISTIC and belongs to the sync path, not the broadcast path: a
+  transaction's anchor becomes witnessable long before its broadcast schedule
+  arrives, so `zcashlc_migration_prove_pending` proves everything currently
+  provable as the wallet scans (skipping — never failing on — a row whose anchor
+  is not scanned or retained yet, and returning how many it proved), while
+  `zcashlc_migration_next_due_transfer` never proves and only broadcasts what is
+  already proved. This leaves broadcasting,
   mined-reconciliation, rejection classification (the
   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table, created
   by the wallet schema migrations via `WalletMigrator::with_external_migrations`
@@ -86,7 +93,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Proposal/commit: `zcashlc_migration_residual_after_migration`,
     `zcashlc_migration_propose_transfers`,
     `zcashlc_migration_sign_and_store_schedule`.
-  - Delivery: `zcashlc_migration_next_due_transfer`,
+  - Proving: `zcashlc_migration_prove_pending` (proves every currently-provable
+    transaction, persisting each; returns the count proved, `-1` = error).
+  - Delivery: `zcashlc_migration_next_due_transfer` — whose `FfiPreparedTransfer`
+    carries a `status` (`MigrationNothingDue` / `MigrationReady` /
+    `MigrationAwaitingProof`) so "nothing is due" stays distinct from "due, but
+    its proof has not been produced yet" (the latter names the waiting row and is
+    cleared by `zcashlc_migration_prove_pending`) —
     `zcashlc_migration_extract_broadcast_tx`,
     `zcashlc_migration_record_transfer_result`,
     `zcashlc_migration_record_immediate_run` (records a broadcast

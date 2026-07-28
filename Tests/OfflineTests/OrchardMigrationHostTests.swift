@@ -83,7 +83,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         // A fresh mock per account keeps the two concurrent broadcast flows off a shared mutable mock.
         let perAccountFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { [testGeneralStorageDirectory, buffer, clock] accountUUID, broadcaster in
             let accountWelding = ZcashRustBackendWeldingMock()
-            accountWelding.migrationNextDueTransferForReturnValue = prepared
+            accountWelding.migrationNextDueTransferForReturnValue = .ready(prepared)
             accountWelding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
             accountWelding.migrationHasOverdueTransfersForReturnValue = false
             return OrchardMigration(
@@ -205,11 +205,11 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA)]
         welding.migrationHasOverdueTransfersForReturnValue = false
-        welding.migrationNextDueTransferForReturnValue = PreparedMigrationTransfer(
+        welding.migrationNextDueTransferForReturnValue = .ready(PreparedMigrationTransfer(
             id: 0,
             txid: Data(repeating: 0xAB, count: 32),
             pczt: Data([0x01, 0x02])
-        )
+        ))
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
 

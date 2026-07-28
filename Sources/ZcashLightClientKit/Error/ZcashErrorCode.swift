@@ -351,6 +351,8 @@ public enum ZcashErrorCode: String {
     case rustMigrationKeystoneApplyBatchSignatures = "ZRUST0138"
     /// Error from rust layer when calling ZcashRustBackend.migrationDebugRescheduleTransfers
     case rustMigrationDebugRescheduleTransfers = "ZRUST0139"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProvePending
+    case rustMigrationProvePending = "ZRUST0140"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.

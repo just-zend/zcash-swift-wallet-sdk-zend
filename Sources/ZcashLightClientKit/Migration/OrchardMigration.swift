@@ -430,10 +430,17 @@ actor OrchardMigration {
     ///   advances to the scheduled transfers.
     func executeNextPendingTransfer(options: MigrationNetworkPrivacyOptions) async throws -> MigrationTransferResult? {
         try await serializedBroadcastFlow { () async throws -> MigrationTransferResult? in
-            guard let prepared = try await welding.migrationNextDueTransfer(for: accountUUID) else {
+            switch try await welding.migrationNextDueTransfer(for: accountUUID) {
+            case .nothingDue:
+                return nil
+            case .ready(let prepared):
+                return try await broadcastAndRecord(prepared: prepared, options: options)
+            case .awaitingProof(let id):
+                // Due, but the opportunistic prove sweep has not produced its proof yet. Nothing to
+                // broadcast this window; the caller retries and the sweep clears it.
+                logger.debug("migration transfer \(id) is due but awaiting its proof; nothing broadcast")
                 return nil
             }
-            return try await broadcastAndRecord(prepared: prepared, options: options)
         }
     }
 

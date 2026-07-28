@@ -5262,6 +5262,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         try await migrationSignAndStoreScheduleUskForClosure!(schedule, usk, account)
     }
 
+    // MARK: - migrationProvePending
+
+    var migrationProvePendingForThrowableError: Error?
+    var migrationProvePendingForCallsCount = 0
+    var migrationProvePendingForCalled: Bool {
+        return migrationProvePendingForCallsCount > 0
+    }
+    var migrationProvePendingForReceivedAccount: AccountUUID?
+    var migrationProvePendingForReturnValue: Int!
+    var migrationProvePendingForClosure: ((AccountUUID) async throws -> Int)?
+
+    func migrationProvePending(for account: AccountUUID) async throws -> Int {
+        if let error = migrationProvePendingForThrowableError {
+            throw error
+        }
+        migrationProvePendingForCallsCount += 1
+        migrationProvePendingForReceivedAccount = account
+        if let closure = migrationProvePendingForClosure {
+            return try await closure(account)
+        } else {
+            return migrationProvePendingForReturnValue
+        }
+    }
+
     // MARK: - migrationNextDueTransfer
 
     var migrationNextDueTransferForThrowableError: Error?
@@ -5270,10 +5294,10 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         return migrationNextDueTransferForCallsCount > 0
     }
     var migrationNextDueTransferForReceivedAccount: AccountUUID?
-    var migrationNextDueTransferForReturnValue: PreparedMigrationTransfer?
-    var migrationNextDueTransferForClosure: ((AccountUUID) async throws -> PreparedMigrationTransfer?)?
+    var migrationNextDueTransferForReturnValue: DueMigrationTransfer!
+    var migrationNextDueTransferForClosure: ((AccountUUID) async throws -> DueMigrationTransfer)?
 
-    func migrationNextDueTransfer(for account: AccountUUID) async throws -> PreparedMigrationTransfer? {
+    func migrationNextDueTransfer(for account: AccountUUID) async throws -> DueMigrationTransfer {
         if let error = migrationNextDueTransferForThrowableError {
             throw error
         }

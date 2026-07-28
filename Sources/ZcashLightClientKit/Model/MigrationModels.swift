@@ -423,6 +423,23 @@ public struct PreparedMigrationTransfer: Equatable, Sendable {
     }
 }
 
+/// What the migration delivery lane has to offer right now.
+///
+/// The delivery lane never proves: proofs are produced opportunistically by
+/// `ZcashRustBackendWelding.migrationProvePending(for:)` while the wallet scans, so broadcasting is
+/// a pure delivery step. That makes "a transaction is due but its proof does not exist yet" a
+/// distinct outcome from "nothing is due" — the former is cleared by running the proving sweep.
+public enum DueMigrationTransfer: Equatable, Sendable {
+    /// Nothing is due: nothing scheduled yet, dependencies unmined, rows awaiting an external
+    /// signature, or everything already broadcast.
+    case nothingDue
+    /// A proven transaction, ready for the platform to broadcast.
+    case ready(PreparedMigrationTransfer)
+    /// The transaction identified by `id` is due but has not been proved yet. Run
+    /// `migrationProvePending(for:)` and ask again.
+    case awaitingProof(id: UInt32)
+}
+
 /// The platform's outcome of broadcasting (or attempting to broadcast) a prepared migration
 /// transfer, reported back to the migration engine via
 /// `ZcashRustBackendWelding.migrationRecordTransferResult(transferId:result:for:)`.
