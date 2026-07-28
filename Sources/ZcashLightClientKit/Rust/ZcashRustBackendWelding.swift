@@ -115,7 +115,7 @@ protocol ZcashRustBackendWelding {
 
     /// Get memo from note.
     /// - parameter txId: ID of transaction containing the note
-    /// - parameter outputPool: output pool identifier (2 = Sapling, 3 = Orchard)
+    /// - parameter outputPool: output pool identifier (2 = Sapling, 3 = Orchard, 4 = Ironwood)
     /// - parameter outputIndex: output index of note
     func getMemo(txId: Data, outputPool: UInt32, outputIndex: UInt16) async throws -> Memo?
 

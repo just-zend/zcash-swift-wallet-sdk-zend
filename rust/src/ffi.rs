@@ -405,26 +405,42 @@ impl AccountBalance {
         &self.account_uuid
     }
 
-    /// [Slipstream API v2 §0-5] Recovery override — the SDK's field-validated "Direction B"
-    /// mapping, mirrored exactly (SlipstreamSynchronizer+PureHelpers.recoveryAccountBalance):
-    /// during a restore the only safe number is the per-account Σ of FINAL (reconciled) tx
-    /// deltas, so the whole net (clamped ≥ 0) is surfaced as orchard `spendable_value` —
-    /// `total()` == net for every consumer — and the per-pool breakdown is deliberately
-    /// collapsed for the duration of recovery (headline correctness over breakdown fidelity).
-    /// Transparent is already folded into the delta sum, so `unshielded` is zeroed to avoid
-    /// double-counting.
-    pub(crate) fn override_with_recovery_net(&mut self, net_zat: i64) {
+    /// [Slipstream API v2 §0-5] Recovery override — during a restore the only safe number is the
+    /// per-account Σ of FINAL (reconciled) tx deltas, which the engine's recovery view reports
+    /// WITHOUT a pool breakdown. So the whole net (clamped ≥ 0) is surfaced as one pool's
+    /// `spendable_value` — `total()` == net for every consumer — and the per-pool breakdown is
+    /// deliberately collapsed for the duration of recovery (headline correctness over breakdown
+    /// fidelity). Transparent is already folded into the delta sum, so `unshielded` is zeroed to
+    /// avoid double-counting.
+    ///
+    /// WHICH pool carries it matters once Ironwood exists, because hosts gate the "Migration
+    /// Required" prompt on a nonzero ORCHARD balance. Post-activation the split is genuinely
+    /// unknown here — a restored legacy wallet's value is Orchard, a post-activation wallet's is
+    /// Ironwood — so the collapse goes to Ironwood, which fails safe: the prompt stays quiet
+    /// during the (≤120 s) recovery window rather than telling a user to migrate on the strength
+    /// of a guess, and the genuine prompt arrives with the real per-pool summary moments later.
+    /// Before activation there is no Ironwood and no migration, so the net stays in Orchard.
+    pub(crate) fn override_with_recovery_net(&mut self, net_zat: i64, ironwood_active: bool) {
+        let net = Balance::from_spendable(net_zat.max(0));
         self.sapling_balance = Balance::zero();
-        self.orchard_balance = Balance::from_spendable(net_zat.max(0));
-        self.ironwood_balance = Balance::zero();
+        if ironwood_active {
+            self.orchard_balance = Balance::zero();
+            self.ironwood_balance = net;
+        } else {
+            self.orchard_balance = net;
+            self.ironwood_balance = Balance::zero();
+        }
         self.unshielded = 0;
     }
 
     /// [#1806] Build a balance carrying ONLY the recovery-view net, for the post-restore hold's
     /// synthesized summary (see [`WalletSummary::recovery_hold`]). Mirrors
-    /// [`Self::override_with_recovery_net`]: the whole clamped net becomes orchard
-    /// `spendable_value`, every other pool zero.
-    pub(crate) fn recovery_only(account_uuid: [u8; 16], net_zat: i64) -> Self {
+    /// [`Self::override_with_recovery_net`], including which pool carries the collapsed net.
+    pub(crate) fn recovery_only(
+        account_uuid: [u8; 16],
+        net_zat: i64,
+        ironwood_active: bool,
+    ) -> Self {
         let mut balance = Self {
             account_uuid,
             sapling_balance: Balance::zero(),
@@ -432,7 +448,7 @@ impl AccountBalance {
             ironwood_balance: Balance::zero(),
             unshielded: 0,
         };
-        balance.override_with_recovery_net(net_zat);
+        balance.override_with_recovery_net(net_zat, ironwood_active);
         balance
     }
 }
@@ -1419,8 +1435,8 @@ mod recovery_hold_tests {
     use super::*;
 
     #[test]
-    fn recovery_only_puts_clamped_net_in_orchard_spendable() {
-        let b = AccountBalance::recovery_only([7u8; 16], 12_345);
+    fn recovery_only_puts_clamped_net_in_orchard_spendable_before_activation() {
+        let b = AccountBalance::recovery_only([7u8; 16], 12_345, false);
         assert_eq!(b.uuid_bytes(), &[7u8; 16]);
         assert_eq!(b.orchard_balance.spendable_value, 12_345);
         assert_eq!(b.orchard_balance.value_pending_spendability, 0);
@@ -1429,17 +1445,29 @@ mod recovery_hold_tests {
         assert_eq!(b.unshielded, 0);
     }
 
+    /// Post-activation the collapsed net goes to Ironwood, so a host gating "Migration Required"
+    /// on a nonzero ORCHARD balance is not told to migrate on the strength of a guess (the
+    /// recovery view has no pool breakdown to make an honest one from).
+    #[test]
+    fn recovery_only_puts_clamped_net_in_ironwood_after_activation() {
+        let b = AccountBalance::recovery_only([7u8; 16], 12_345, true);
+        assert_eq!(b.ironwood_balance.spendable_value, 12_345);
+        assert_eq!(b.orchard_balance.spendable_value, 0);
+        assert_eq!(b.sapling_balance.spendable_value, 0);
+        assert_eq!(b.unshielded, 0);
+    }
+
     #[test]
     fn recovery_only_clamps_negative_net_to_zero() {
-        let b = AccountBalance::recovery_only([1u8; 16], -5);
+        let b = AccountBalance::recovery_only([1u8; 16], -5, false);
         assert_eq!(b.orchard_balance.spendable_value, 0);
     }
 
     #[test]
     fn recovery_hold_synthesizes_balances_with_nonnegative_scanned_height() {
         let entries = vec![
-            AccountBalance::recovery_only([1u8; 16], 100),
-            AccountBalance::recovery_only([2u8; 16], 200),
+            AccountBalance::recovery_only([1u8; 16], 100, false),
+            AccountBalance::recovery_only([2u8; 16], 200, false),
         ];
         let ptr = WalletSummary::recovery_hold(entries, 2_800_000, 2_799_900);
         // SAFETY: freshly built by `recovery_hold`; freed below.
@@ -1531,7 +1559,7 @@ mod recovery_hold_tests {
     /// decision is `Upstream`/`RecoveringOverride`, so tests can tell it from a synthesized hold.
     fn sentinel_upstream() -> anyhow::Result<*mut WalletSummary> {
         Ok(WalletSummary::recovery_hold(
-            vec![AccountBalance::recovery_only(acct(0xEE), 999)],
+            vec![AccountBalance::recovery_only(acct(0xEE), 999, false)],
             100,
             90,
         ))
@@ -1551,6 +1579,7 @@ mod recovery_hold_tests {
         let kind = classify_upstream(true, true);
         assert_eq!(kind, UpstreamKind::StaleSome);
         let (latch, ptr) = serve_wallet_summary(
+            false,
             false,
             kind,
             Some((100, 90)),
@@ -1584,6 +1613,7 @@ mod recovery_hold_tests {
         let base = Instant::now();
         let (latch, ptr) = serve_wallet_summary(
             false,
+            false,
             UpstreamKind::None,
             Some((100, 90)),
             Some(false),
@@ -1608,6 +1638,7 @@ mod recovery_hold_tests {
         let cache = std::sync::Mutex::new(None);
         let base = Instant::now();
         let (latch, ptr) = serve_wallet_summary(
+            false,
             false,
             UpstreamKind::FreshSome,
             Some((100, 90)),
@@ -1639,6 +1670,7 @@ mod recovery_hold_tests {
         let base = Instant::now();
         let (latch, ptr) = serve_wallet_summary(
             false,
+            false,
             UpstreamKind::None,
             Some((100, 90)),
             Some(false),
@@ -1667,6 +1699,7 @@ mod recovery_hold_tests {
         let base = Instant::now();
         let (latch, ptr) = serve_wallet_summary(
             true,
+            false,
             UpstreamKind::StaleSome,
             Some((100, 90)),
             Some(true),
@@ -1677,7 +1710,7 @@ mod recovery_hold_tests {
             &cache,
             || {
                 Ok(WalletSummary::recovery_hold(
-                    vec![AccountBalance::recovery_only(acct(1), 111)],
+                    vec![AccountBalance::recovery_only(acct(1), 111, false)],
                     100,
                     90,
                 ))
@@ -1706,6 +1739,7 @@ mod recovery_hold_tests {
         let base = Instant::now();
         let bogus = std::path::Path::new("/nonexistent/e2fix/does_not_exist.db");
         let (latch, ptr) = serve_wallet_summary(
+            false,
             false,
             UpstreamKind::None,
             None,

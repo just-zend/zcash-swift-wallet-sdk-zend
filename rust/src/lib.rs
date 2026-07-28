@@ -1308,10 +1308,14 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance_for_account(
     unwrap_exc_or(res, -1)
 }
 
+/// Decodes a wallet-database pool code (`zcash_client_sqlite`'s `pool_code`) into its shielded
+/// protocol. Transparent (0) has no shielded protocol and yields `None`, as does any code the
+/// wallet database does not use.
 fn parse_protocol(code: u32) -> Option<ShieldedPool> {
     match code {
         2 => Some(ShieldedPool::Sapling),
         3 => Some(ShieldedPool::Orchard),
+        4 => Some(ShieldedPool::Ironwood),
         _ => None,
     }
 }
@@ -5897,6 +5901,9 @@ fn read_unmined_spend_accounts(
 /// sentinel) and is invoked ONLY for the `Upstream`/`RecoveringOverride` decisions — never for a
 /// synthesized hold. The DB reads (recovery-view nets, unmined-spend gate) run against `db_path`.
 ///
+/// `ironwood_active` says whether NU6.3 is active at the chain tip; it selects which pool carries
+/// the collapsed recovery net (see [`ffi::AccountBalance::override_with_recovery_net`]).
+///
 /// I1: the unmined-spend query and the `prior_recovery_nonzero` scan run ONLY when the hold could
 /// actually serve this tick (engaged-or-engaging, within cap, upstream not `FreshSome`) — never on
 /// an ordinary `None`-serving tick with an idle/released latch — so there is no per-tick DB hit or
@@ -5904,6 +5911,7 @@ fn read_unmined_spend_accounts(
 #[allow(clippy::too_many_arguments)]
 fn serve_wallet_summary(
     is_recovering: bool,
+    ironwood_active: bool,
     upstream: UpstreamKind,
     hold_heights: Option<(i32, i32)>,
     last_is_recovering: Option<bool>,
@@ -6026,7 +6034,7 @@ fn serve_wallet_summary(
             let summary_mut = unsafe { &mut *ptr };
             for balance in summary_mut.account_balances_mut() {
                 let net = nets.get(balance.uuid_bytes()).copied().unwrap_or(0);
-                balance.override_with_recovery_net(net);
+                balance.override_with_recovery_net(net, ironwood_active);
             }
             ptr
         }
@@ -6035,14 +6043,17 @@ fn serve_wallet_summary(
         // empty sentinel — never the stale raw upstream, and never fabricate a height.
         // (M2) The synthesis carries one slot per recovery-view row, so an account with no recovery
         // row is present-as-ABSENT during the hold (reads 0 via the SDK's `?? .zero`), not
-        // present-as-zero. Benign for the migration read (it only asks whether Orchard > 0), so the
-        // hold deliberately does not re-plumb full account enumeration.
+        // present-as-zero. Benign for the host's migration read (it only asks whether Orchard > 0
+        // — which the collapsed net deliberately does not answer post-activation), so the hold
+        // does not re-plumb full account enumeration.
         SummaryServe::HoldOverride => match hold_heights {
             Some((chain_tip_h, fully_scanned_h)) => {
                 let nets = resolve_recovery_nets();
                 let entries: Vec<ffi::AccountBalance> = nets
                     .iter()
-                    .map(|(uuid, net)| ffi::AccountBalance::recovery_only(*uuid, *net))
+                    .map(|(uuid, net)| {
+                        ffi::AccountBalance::recovery_only(*uuid, *net, ironwood_active)
+                    })
                     .collect();
                 ffi::WalletSummary::recovery_hold(entries, chain_tip_h, fully_scanned_h)
             }
@@ -6232,8 +6243,14 @@ pub unsafe extern "C" fn zcashlc_slipstream_wallet_summary(
         let hold_heights = resolved_heights.or(last_heights);
         let now = std::time::Instant::now();
 
+        // NU6.3 active at the tip decides which pool the collapsed recovery net lands in.
+        let ironwood_active = network
+            .activation_height(NetworkUpgrade::Nu6_3)
+            .is_some_and(|h| snap.chain_tip >= u64::from(u32::from(h)));
+
         let (latch_after, summary_ptr) = serve_wallet_summary(
             is_recovering,
+            ironwood_active,
             upstream_kind,
             hold_heights,
             last_is_recovering,

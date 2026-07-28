@@ -78,6 +78,10 @@ public enum ZcashTransaction {
             case transaparent
             case sapling
             case orchard
+            /// The Ironwood (NU6.3) shielded pool. Every shielded output a wallet receives after
+            /// NU6.3 activation lands here, so this is the common case post-activation — before
+            /// it existed, such outputs decoded as `.other(4)`.
+            case ironwood
             case other(Int)
             init(rawValue: Int) {
                 switch rawValue {
@@ -87,6 +91,8 @@ public enum ZcashTransaction {
                     self = .sapling
                 case 3:
                     self = .orchard
+                case 4:
+                    self = .ironwood
                 default:
                     self = .other(rawValue)
                 }

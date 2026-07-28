@@ -152,6 +152,12 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
     bootstrap, the sync-gate ticker runs only while the blocked stream has subscribers, and the
     migration gate state file is excluded from device backups.
 
+### Ironwood pool coverage
+
+- `ZcashTransaction.Output.Pool.ironwood`: outputs in the Ironwood (NU6.3) pool now decode to
+  their own case instead of `.other(4)`. **Source-breaking** only for switches that lack a
+  `default` — which `.other` already required.
+
 ### Slipstream sync engine
 
 - `SlipstreamSynchronizer` — an alternative, engine-driven implementation of `Synchronizer` backed
@@ -233,6 +239,16 @@ implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
   `isImmediate` to `false`, so it is source-compatible. (MOB-1513)
 
 ## Fixed
+- Memos on Ironwood (NU6.3) outputs are retrievable: the FFI's pool-code decode recognized only
+  Sapling and Orchard, so a note id in the Ironwood pool was rejected as an unrecognized shielded
+  protocol.
+- During a restore (and the bounded post-restore hold), the Slipstream summary no longer reports
+  its collapsed recovery balance as ORCHARD value once NU6.3 is active. The engine's recovery view
+  is a per-account net with no pool breakdown, so the whole net is surfaced in one pool; reporting
+  it as Orchard told a host gating "Migration Required" on a nonzero Orchard balance to prompt a
+  wallet that may hold nothing in Orchard. Post-activation the net now lands in Ironwood, so the
+  prompt stays quiet for the (≤120 s) recovery window and the genuine prompt arrives with the real
+  per-pool summary. Totals (`AccountBalance.shieldedTotal()`, `total()`) are unchanged either way.
 - The Keystone batch-signing apply (`Synchronizer.applyKeystoneBatchSignatures`) no longer
   looks its PCZT ids up: the apply step only echoes them back positionally, so ids on this call
   are correlation labels, not engine lookups. A batch whose ids were not engine-numeric used to
