@@ -144,6 +144,13 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- The witnesses-fix gate compared the recorded and current app versions with a plain String
+  comparison, which orders versions lexicographically: crossing a single→double-digit boundary (for
+  example 2.9.0 → 2.10.0, or 2.4.9 → 2.4.10) read as a downgrade and silently skipped the
+  note-commitment-witness repair check — and kept skipping it until some later version sorted above
+  the stale recorded string. Versions are now compared numerically component-wise (missing
+  components count as zero), downgrades still skip, and versions that cannot be ordered numerically
+  run the check rather than risk missing a repair.
 - Memos on Ironwood outputs are retrievable; a note id in the Ironwood pool was rejected as an
   unrecognized shielded protocol.
 - `getAccountsBalances()` no longer reports empty balances for up to ~30 s after a restore completes,
