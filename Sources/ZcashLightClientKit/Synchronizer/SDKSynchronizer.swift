@@ -468,6 +468,12 @@ public class SDKSynchronizer: Synchronizer {
         return proposal
     }
 
+    public func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
+        try throwIfUnprepared()
+
+        return try await transactionEncoder.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
+    }
+
     public func proposeShielding(
         accountUUID: AccountUUID,
         shieldingThreshold: Zatoshi,

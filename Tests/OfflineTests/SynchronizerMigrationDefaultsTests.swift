@@ -283,6 +283,8 @@ private final class NonMigratingSynchronizer: Synchronizer {
 
     func proposeTransfer(accountUUID: AccountUUID, recipient: Recipient, amount: Zatoshi, memo: Memo?) async throws -> Proposal { Self.unused() }
 
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal { Self.unused() }
+
     func proposeShielding(
         accountUUID: AccountUUID,
         shieldingThreshold: Zatoshi,

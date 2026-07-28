@@ -6,6 +6,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Removed
+- The `zcashlc_voting_*` FFI is no longer compiled. The `voting` module is gated behind
+  `#[cfg(zcash_voting)]` and the `zcash_voting` dependency is commented out in `Cargo.toml`
+  (`zcash_keys` and `incrementalmerkletree` stay: the pool-migration engine uses them too).
+  The module sources are retained so the surface can be reinstated by re-enabling the
+  dependency.
+
+### Fixed
+- `zcashlc_get_memo` accepts an Ironwood (NU6.3) output pool code (4). The decode recognized only
+  Sapling (2) and Orchard (3), so an Ironwood note id was rejected as an unrecognized shielded
+  protocol.
+- `zcashlc_slipstream_wallet_summary` no longer reports its collapsed recovery balance as ORCHARD
+  value once NU6.3 is active at the chain tip. The engine's recovery view carries no pool
+  breakdown, so the net lands in a single pool; post-activation that pool is now Ironwood, which
+  keeps a host's Orchard-gated migration prompt from firing on a guess during the restore window.
+
 ### Added
 - Pool-migration (Orchard→Ironwood) FFI surface over the final engine
   (`zcash_pool_migration_backend` + the account-keyed store inside

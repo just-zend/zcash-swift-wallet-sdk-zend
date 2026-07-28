@@ -216,22 +216,6 @@ offer the real behavior (`SDKSynchronizer` does):
   number of transfers rescheduled (`0` when the account has no stored migration);
   already-broadcast/mined transfers and preparations are left untouched. New error code
   `rustMigrationDebugRescheduleTransfers` (ZRUST0139).
-
-## `prepare` now validates the seed against the existing wallet
-
-If the wallet database already contains seed-derived account(s) and the seed passed to `prepare`
-does not match them, `prepare` throws `ZcashError.initializerSeedMismatch` (`ZINIT0006`) instead of
-silently opening the old wallet (which desynced the app's stored seed from the on-disk account).
-Restoring a different wallet requires `wipe()` first. Wallets whose only accounts are imported
-(hardware-wallet UFVKs) are exempt — there is no seed-derived account to compare.
-
-PendingDb is no longer used. Wallet developers should take care about deleting
-the database file since the SDK will no longer require it or any of the
-information stored. 
-
-Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't 
-track failures on its own. Wallet developers would have to account for those.
-
 ## Custom (regtest-style) networks and `NetworkType.regtest`
 
 `NetworkType` gained a third case, `regtest`. **This is a source-breaking change for exhaustive
@@ -262,28 +246,43 @@ Anything that resolves the custom network id before that registration — e.g. a
 process-globally while earlier instances keep their own per-instance state (checkpoint sources,
 constants), so the two desynchronize — the registration call reports this (and asserts in debug).
 
-## Voting: submission contract and pre-1.0 database reset
+# Migrating from previous versions to v2.8.0-rc.1
 
-The voting stack now rides upstream `zcash_voting` 1.0 (see the CHANGELOG for the full surface).
-Two changes affect callers of the voting API directly:
+## `prepare` now validates the seed against the existing wallet
 
-- **`storeVoteTxHash` is what records submission.** Persisting the on-chain transaction hash now
-  marks the vote submitted (submission state is derived from the stored hash and written atomically).
-  Call `storeVoteTxHash` once the vote transaction is broadcast. `markVoteSubmitted` no longer stands
-  alone — it re-applies that state idempotently (rejecting a conflicting hash) and throws if no hash
-  has been stored yet. Any flow that previously called `markVoteSubmitted` as the submission mark must
-  call `storeVoteTxHash` first.
-- **Alpha-era voting databases are reset on open.** The voting database schema was rebuilt for 1.0;
-  opening a voting database created by a 2.6.0-alpha build drops and recreates every voting table
-  (rounds, votes, bundles, proofs, witnesses, share delegations, …). In-progress votes from an alpha
-  build do not survive the upgrade and must be re-cast. This is the separate voting database only —
-  wallet balances and the main wallet database are unaffected.
+If the wallet database already contains seed-derived account(s) and the seed passed to `prepare`
+does not match them, `prepare` throws `ZcashError.initializerSeedMismatch` (`ZINIT0006`) instead of
+silently opening the old wallet (which desynced the app's stored seed from the on-disk account).
+Restoring a different wallet requires `wipe()` first. Wallets whose only accounts are imported
+(hardware-wallet UFVKs) are exempt — there is no seed-derived account to compare.
 
-The voting hotkey contract also changed: `generateHotkey` takes `storedSecret:` (an app-owned
-opaque secret) instead of `seed:`. Passing an empty array mints a fresh random hotkey; passing a
-previously stored 64-byte secret deterministically reconstructs the same hotkey. Persisting that
-secret is the only way to recover the same hotkey — the pre-1.0 seed-derived derivation is not
-reproducible under 1.0.
+## PendingDb is no longer used
+
+PendingDb is no longer used. Wallet developers should take care about deleting
+the database file since the SDK will no longer require it or any of the
+information stored.
+
+Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't
+track failures on its own. Wallet developers would have to account for those.
+
+## The shielded voting API is removed
+
+The shielded voting API is removed: `VotingRustBackend`, the `Voting*` types,
+`PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe`, and the
+`zcashlc_voting_*` FFI symbols are gone. `zcash_voting` cannot resolve against the
+Ironwood `orchard` release, so voting is not shipped on this line (matching the
+Android SDK). Wallet developers using any of these types must remove those calls.
+
+## `AccountBalance` gained an Ironwood pool
+
+`AccountBalance` gains a public `ironwoodBalance` pool for the Ironwood (NU6.3) shielded protocol,
+alongside `saplingBalance` and `orchardBalance`. Reading code keeps compiling, but any place that
+enumerates the shielded pools by hand — totalling them, rendering a per-pool breakdown, deciding
+whether a balance is fully shielded — needs to account for the third pool or it will silently
+under-report once NU6.3 activates. The value stays zero until then.
+
+`AccountBalance` and `PoolBalance` have no public initializer, so this cannot break construction in
+your code; balances are only ever produced by the SDK.
 
 ## `Broadcaster` redesign (multi-server submission)
 
@@ -301,13 +300,48 @@ let outcome = await synchronizer.broadcaster.submit(
 
 `submit` no longer throws — it returns a `TransactionSubmissionOutcome` (`accepted(by:)`, `rejected(code:message:)`, `unreachable`, `timedOut`, `notAttempted`, `cancelled`). Treat `timedOut` as pending: the transaction may still have been broadcast.
 
-- Retry semantics: the endpoint list passed to `submit` is persisted as the transaction's retry plan. The SDK's background resubmission retries pending transactions through those endpoints (sequentially) instead of the synchronizer's default endpoint, and never auto-submits transactions created through `Broadcaster` that the app hasn't submitted yet. If the plan store cannot be read, background resubmission skips the affected transactions rather than falling back to the default endpoint. Plans are kept until the transaction expires (so a chain reorg cannot detach a transaction from its recorded endpoints), and `Synchronizer.wipe()` deletes the plan database file.
+- Retry semantics: the endpoint list passed to `submit` is persisted as the transaction's retry plan. The SDK's background resubmission retries pending transactions through those endpoints (sequentially) instead of the synchronizer's default endpoint, and never auto-submits transactions created through `Broadcaster` that the app hasn't submitted yet. If the plan store cannot be read, background resubmission skips the affected transactions rather than falling back to the default endpoint. Transactions the store has no plan for at all — anything sent through `Synchronizer` rather than `Broadcaster`, including everything created before this release — keep the previous behaviour and are retried against the synchronizer's endpoint. Plans are kept until the transaction expires (so a chain reorg cannot detach a transaction from its recorded endpoints), and `Synchronizer.wipe()` deletes the plan database file.
 - The retry plan is recorded before any network attempt and stays recorded when `submit` returns `.cancelled` or `.timedOut`: background resubmission may still broadcast the transaction later. Treat those outcomes as "outcome unknown", not as "not sent".
 - `LightWalletEndpoint` now conforms to `Equatable`. If your app declared that conformance retroactively, remove your declaration.
 
 ## `Initializer.InitializationResult` gained `.seedNotRelevant`
 
 `Initializer.InitializationResult` (returned by `Initializer.initialize` and `Synchronizer.prepare`) gained a new case, `.seedNotRelevant`, returned when the rust layer reports that the provided seed does not match the accounts already present in the wallet database. Any exhaustive `switch` over `InitializationResult` must add a case for it. `prepare`/`initialize` can now return `.seedNotRelevant` in situations where they previously returned `.success` over a mismatched database — handle it the same way you already handle `.seedRequired`.
+
+## Unmined transactions past their expiry are reported as `.expired`
+
+`ZcashTransaction.Overview.getState(for:)` now returns `.expired` for an unmined transaction whose
+expiry height is non-zero and at or below the height you pass in, even when the wallet database's
+`expired_unmined` flag has not been set. These transactions previously stayed `.pending`
+indefinitely — most visibly sends that were unmined when the wallet migrated across a
+consensus-rule change. Transactions with no expiry height (`0`) are unaffected and still report
+`.pending` while unmined.
+
+This is a behavioural change with no compile-time signal. Apps that key UI, retry, or bookkeeping off
+`.pending` will now see those transactions move to `.expired`, which is the state they should already
+have been in. Verify that your `.expired` handling is reachable and does something sensible; a
+transaction can now arrive there without the database flag ever flipping.
+
+## Already-accepted transactions no longer report a submit failure
+
+`Synchronizer.createProposedTransactions` and `Synchronizer.createTransactionFromPCZT` emit
+`TransactionSubmitResult.success` instead of `.submitFailure` when the submit RPC rejects a
+transaction the server turns out to already hold. On a non-zero error code the SDK asks the same
+lightwalletd whether the txid is in mempool or chain, and trusts that answer over the rejection.
+
+Apps that surfaced every `.submitFailure` as a failed send will show fewer of them. If you matched on
+specific error codes or message text to recognise "already in mempool" / "already in chain" yourself
+(Zebra's `MempoolError::InMempool` and `AlreadyQueued`, zcashd's `RPC_VERIFY_ALREADY_IN_CHAIN`),
+remove that special-casing — the SDK now resolves those cases before you see them.
+
+## New wallets get a server-derived birthday
+
+For `WalletInitMode.newWallet`, the birthday is taken from a lightwalletd tree state one reorg
+horizon below the chain tip rather than from the bundled checkpoint, so first launch scans far less
+history. `Initializer.walletBirthday` therefore reflects the server's tree state height, not a
+checkpoint height, and the two will not agree. Apps that persist, display, or assert on the birthday
+should read it back from the initializer after `prepare` instead of assuming a bundled checkpoint
+value. If the server is unreachable the bundled checkpoint is still used.
 
 # Migrating from previous versions to 0.20.0-beta
 The `SDKSynchronizer` no longer uses `NotificationCenter` to send notifications.

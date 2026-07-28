@@ -721,6 +721,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         )
     }
 
+    public func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
+        try await transactionEncoder.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
+    }
+
     public func proposeShielding(
         accountUUID: AccountUUID,
         shieldingThreshold: Zatoshi,

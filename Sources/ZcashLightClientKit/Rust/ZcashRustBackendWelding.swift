@@ -115,7 +115,7 @@ protocol ZcashRustBackendWelding {
 
     /// Get memo from note.
     /// - parameter txId: ID of transaction containing the note
-    /// - parameter outputPool: output pool identifier (2 = Sapling, 3 = Orchard)
+    /// - parameter outputPool: output pool identifier (2 = Sapling, 3 = Orchard, 4 = Ironwood)
     /// - parameter outputIndex: output index of note
     func getMemo(txId: Data, outputPool: UInt32, outputIndex: UInt16) async throws -> Memo?
 
@@ -263,6 +263,15 @@ protocol ZcashRustBackendWelding {
         value: Int64,
         memo: MemoBytes?
     ) async throws -> FfiProposal
+
+    /// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
+    ///
+    /// Sends the maximum from Orchard to the account's own internal receiver so nothing is
+    /// stranded when the Orchard turnstile closes at NU6.3. Fails unless NU6.3 is active.
+    ///
+    /// - Parameter accountUUID: the account whose Orchard balance is migrated.
+    /// - Throws: `rustCreateToAddress`.
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> FfiProposal
 
     /// Select transaction inputs, compute fees, and construct a proposal for a transaction
     /// that can then be authorized and made ready for submission to the network with

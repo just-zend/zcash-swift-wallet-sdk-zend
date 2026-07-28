@@ -56,6 +56,13 @@ public protocol ClosureSynchronizer {
         completion: @escaping (Result<Proposal, Error>) -> Void
     )
 
+    /// Creates a proposal that migrates the account's entire Orchard balance into the Ironwood pool.
+    /// Fails unless NU6.3 is active at the chain tip.
+    func proposeOrchardToIronwoodMigration(
+        accountUUID: AccountUUID,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    )
+
     /// Creates a proposal for shielding any transparent funds received by the given account.
     ///
     /// - Parameter accountUUID: the account from which to shield funds.
