@@ -39,7 +39,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   script. The cbindgen-generated `target/Headers/zcashlc.h` could therefore go
   stale, leaving a newly added FFI function absent from the header or a changed
   signature unreflected.
->>>>>>> maint/v2.7.x
 
 ## 2.5.0 - 2026-05-11
 
