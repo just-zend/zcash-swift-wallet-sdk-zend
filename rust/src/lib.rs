@@ -565,6 +565,9 @@ pub unsafe extern "C" fn zcashlc_create_account(
                 BirthdayError::Decode(e) => {
                     anyhow!("Invalid TreeState: Invalid frontier encoding: {}", e)
                 }
+                // `BirthdayError` is `#[non_exhaustive]`; this arm is unreachable
+                // against enum versions that expose only the variants above.
+                #[allow(unreachable_patterns)]
                 _ => anyhow!("Invalid TreeState: unrecognized birthday error"),
             })?;
 
@@ -656,6 +659,9 @@ pub unsafe extern "C" fn zcashlc_import_account_ufvk(
                 BirthdayError::Decode(e) => {
                     anyhow!("Invalid TreeState: Invalid frontier encoding: {}", e)
                 }
+                // `BirthdayError` is `#[non_exhaustive]`; this arm is unreachable
+                // against enum versions that expose only the variants above.
+                #[allow(unreachable_patterns)]
                 _ => anyhow!("Invalid TreeState: unrecognized birthday error"),
             })?;
 

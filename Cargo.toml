@@ -21,7 +21,7 @@ ff = "0.13"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
 transparent = { package = "zcash_transparent", version = "0.10", default-features = false }
 zcash_address = { version = "0.13" }
-zcash_client_backend = { version = "0.24.0-rc.4", features = [
+zcash_client_backend = { version = "0.24.0-rc.5", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "pczt",
@@ -29,12 +29,11 @@ zcash_client_backend = { version = "0.24.0-rc.4", features = [
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "0.22.0-rc.4", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "0.22.0-rc.5", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.30"
 zcash_proofs = "0.30"
-zcash_protocol = { version = "0.10", features = ["local-consensus"] }
-# The pool-migration engine (its SQLite store lives in `zcash_client_sqlite::pool_migration`).
+zcash_protocol = { version = "0.10.2", features = ["local-consensus"] }
 zcash_pool_migration = { version = "0.1.0-rc.3", features = ["wallet"] }
 zcash_script = "0.4"
 zip32 = "0.2"
@@ -125,14 +124,6 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 slipstream-core = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 
-[features]
-default = []
-#voting = ["dep:zcash_voting"]
-# GPU-accelerated Orchard subtree building in the engine (wgpu). OFF by
-# default — the released libzcashlc links zero wgpu. Enable for local device
-# builds via Scripts/init-local-ffi.sh --gpu / rebuild-local-ffi.sh --gpu.
-gpu = ["slipstream-core/gpu"]
-
 [dev-dependencies]
 hex = "0.4"
 
@@ -140,6 +131,16 @@ hex = "0.4"
 bindgen = "0.72"
 cbindgen = "0.29"
 cc = "1.0"
+
+[features]
+default = []
+
+#voting = ["dep:zcash_voting"]
+# GPU-accelerated Orchard subtree building in the engine (wgpu). OFF by
+# default — the released libzcashlc links zero wgpu. Enable for local device
+# builds via Scripts/init-local-ffi.sh --gpu / rebuild-local-ffi.sh --gpu.
+
+gpu = ["slipstream-core/gpu"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_voting)'] }
@@ -152,27 +153,25 @@ crate-type = ["staticlib"]
 [profile.release]
 lto = true
 
+[patch.crates-io]
 # The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
 # repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a
 # build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep it in step with
 # the librustzcash generation the versions above declare: a rev built against an older generation
 # cannot resolve against them.
-#
-# The librustzcash family is back on a git rev: this generation carries APIs that are not in the
-# published release candidates (`OutputLockStore`, `MigrationCrypto::account_derivation`). Bump the
-# rev in one place to advance the whole stack, and drop the stanzas again at the next release.
-[patch.crates-io]
-slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "f134aa625a92c5085f1e42d5f75d7178a1ea9999" }
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
+slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "bf5c1227b6f5be23eefd88122ecac03715fd5cb5" }
+
+#pczt = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+#zip321 = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+
 # Reinstate together with the voting dependencies above:
 # zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "e53e74487d31ad0f5713580fb2f0222b53ae9db8" }

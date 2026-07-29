@@ -10,6 +10,18 @@ IOS_DEVICE_ARCHS = aarch64-apple-ios
 IOS_SIM_ARCHS_STABLE = x86_64-apple-ios  aarch64-apple-ios-sim
 MACOS_ARCHS = x86_64-apple-darwin aarch64-apple-darwin
 IOS_SIM_ARCHS = $(IOS_SIM_ARCHS_STABLE)
+ALL_ARCHS = $(IOS_DEVICE_ARCHS) $(IOS_SIM_ARCHS) $(MACOS_ARCHS)
+
+# Cargo serialises concurrent invocations behind a lock on the shared host
+# artifact directory (../target/release), so running one `cargo build --target X`
+# per architecture cannot overlap them — `make -j` does not help. That matters
+# most for the link step: `lto = true` is a single-threaded whole-program pass
+# costing roughly two minutes per architecture, so five of them run back to back.
+#
+# Passing several `--target` flags to one invocation puts every architecture in a
+# single job graph, letting those passes run concurrently.
+CARGO_BUILD = RUSTUP_TOOLCHAIN=stable cargo build --manifest-path ../Cargo.toml --release
+cargo_targets = $(addprefix --target ,$(1))
 
 RUST_SRCS = $(shell find ../rust -name "*.rs") ../Cargo.toml
 STATIC_LIBS = $(shell find ../target -name "libzcashlc.a")
@@ -23,15 +35,26 @@ install:
 release: clean xcframework
 .PHONY: release
 
+# Discard assembled build products. ../target is deliberately preserved so that
+# cargo's fingerprints (and CI's restored Rust cache) still apply; cargo decides
+# what genuinely needs rebuilding. Every framework under products/ is rebuilt
+# from scratch, so no stale slice can survive this.
 clean:
 	rm -rf products
-	rm -rf ../target
 .PHONY: clean
+
+# Additionally discard the cargo target directory, forcing a from-scratch build.
+distclean: clean
+	rm -rf ../target
+.PHONY: distclean
 
 xcframework: products/libzcashlc.xcframework
 .PHONY: xcframework
 
-products/libzcashlc.xcframework: $(PLATFORMS)
+# cargo-all is listed first so a full build compiles every architecture in one
+# invocation. The per-platform cargo rules below then find their work already
+# done and reduce to a fingerprint check.
+products/libzcashlc.xcframework: cargo-all $(PLATFORMS)
 	rm -rf $@
 	mkdir -p $@
 	cp -R products/ios-device/frameworks $@/ios-arm64
@@ -68,20 +91,35 @@ products/ios-device/universal/libzcashlc.a: $(IOS_DEVICE_ARCHS)
 	mkdir -p $(@D)
 	lipo -create $(shell find products/ios-device/static-libraries -name "libzcashlc.a") -output $@
 
-$(MACOS_ARCHS): %: stable-%
+$(MACOS_ARCHS): %: cargo-macos
 	mkdir -p products/macos/static-libraries/$*
 	cp ../target/$*/release/libzcashlc.a products/macos/static-libraries/$*
 .PHONY: $(MACOS_ARCHS)
 
-$(IOS_DEVICE_ARCHS): %: stable-%
+$(IOS_DEVICE_ARCHS): %: cargo-ios-device
 	mkdir -p products/ios-device/static-libraries/$*
 	cp ../target/$*/release/libzcashlc.a products/ios-device/static-libraries/$*
 .PHONY: $(IOS_DEVICE_ARCHS)
 
-$(IOS_SIM_ARCHS_STABLE): %: stable-%
+$(IOS_SIM_ARCHS_STABLE): %: cargo-ios-simulator
 	mkdir -p products/ios-simulator/static-libraries/$*
 	cp ../target/$*/release/libzcashlc.a products/ios-simulator/static-libraries/$*
 .PHONY: $(IOS_SIM_ARCHS_STABLE)
 
-stable-%: # target/%/release/libzcashlc.a:
-	sh -c "RUSTUP_TOOLCHAIN=stable cargo build --manifest-path ../Cargo.toml --target $* --release"
+# Each platform builds only its own architectures, so `make macos` still needs
+# just the macOS rustup targets installed.
+cargo-all:
+	$(CARGO_BUILD) $(call cargo_targets,$(ALL_ARCHS))
+.PHONY: cargo-all
+
+cargo-macos:
+	$(CARGO_BUILD) $(call cargo_targets,$(MACOS_ARCHS))
+.PHONY: cargo-macos
+
+cargo-ios-device:
+	$(CARGO_BUILD) $(call cargo_targets,$(IOS_DEVICE_ARCHS))
+.PHONY: cargo-ios-device
+
+cargo-ios-simulator:
+	$(CARGO_BUILD) $(call cargo_targets,$(IOS_SIM_ARCHS))
+.PHONY: cargo-ios-simulator

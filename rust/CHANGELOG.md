@@ -6,6 +6,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+- Migrated to `zcash_protocol 0.10.2`, `zcash_client_backend 0.24.0-rc.5`,
+  `zcash_client_sqlite 0.22.0-rc.5`
+
 ### Removed
 - The `zcashlc_voting_*` FFI is no longer compiled. The `voting` module is gated behind
   `#[cfg(zcash_voting)]` and the `zcash_voting` dependency is commented out in `Cargo.toml`
@@ -295,6 +299,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Added dependency `zcash_voting 0.10` & supporting FFI methods.
+
+### Changed
+- Migrated to `zcash_protocol 0.10.2`, `zcash_client_backend 0.24.0-rc.5`,
+  `zcash_client_sqlite 0.22.0-rc.5`
+
+### Fixed
+- `build.rs` now watches the whole `rust/src` directory. It previously named
+  only `lib.rs`, `voting.rs` and `voting/`, and emitting any `rerun-if-changed`
+  disables cargo's default whole-package watching, so edits to any other module
+  (`ffi.rs` in particular) recompiled the crate without rerunning the build
+  script. The cbindgen-generated `target/Headers/zcashlc.h` could therefore go
+  stale, leaving a newly added FFI function absent from the header or a changed
+  signature unreflected.
+>>>>>>> maint/v2.7.x
 
 ## 2.5.0 - 2026-05-11
 
