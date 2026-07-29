@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-27
+Last reviewed: 2026-07-28
 
 ## Remote and branch invariants
 
@@ -36,6 +36,23 @@ Last reviewed: 2026-07-27
   branches of that migration family. Dependabot PRs remain blocked/review-required.
   Wait for upstream convergence and Zend artifact reconciliation rather than splitting
   individual fixes out of these coupled stacks.
+
+## Bleeding-edge refresh (2026-07-28)
+
+- Default-branch heads remain `origin/main=4497fe9e` and `upstream/main=f51ed74a`;
+  the `174 87` parity gap and the reconciliation gate above are unchanged. Zend draft PR
+  `#33` remains the single clean documentation vehicle for that blocker.
+- New upstream maintenance-line fixes are not early carries. `#1896` (decrypt-and-store
+  FFI error sentinel) and `#1897` (witnesses-fix version gate) are each dirty and
+  review-required against `maint/v2.7.x`; `#1904` explicitly must not merge, is blocked,
+  and its build fails while pinning a different `librustzcash` revision. `#1905` is also
+  dirty and review-required against `maint/v2.7.x`.
+- `#1898` (sequential submissions with Tor off) is clean, approved, and green, but is
+  still a draft against `maint/v2.8.x` and changes multi-endpoint submission semantics.
+  Wait for its upstream release-line decision and a compatibility review rather than
+  cherry-picking it into Zend's provenance-locked Ironwood baseline. Draft `#1900` is
+  likewise dirty despite green checks, and `#1895` is dirty atop the Slipstream/Ironwood
+  branch. None satisfies the ready, useful, and low-risk early-carry threshold.
 
 ## Current monitor status (2026-07-26)
 
