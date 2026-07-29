@@ -3,9 +3,11 @@ extern crate cbindgen;
 use std::{env, path::PathBuf};
 
 fn main() {
-    println!("cargo:rerun-if-changed=rust/src/lib.rs");
-    println!("cargo:rerun-if-changed=rust/src/voting.rs");
-    println!("cargo:rerun-if-changed=rust/src/voting");
+    // cbindgen parses the whole crate to produce target/Headers/zcashlc.h, so
+    // every module is an input to the generated header. Watch the source
+    // directory as a whole: naming individual files here silently left the
+    // header stale after edits to any module that was not listed.
+    println!("cargo:rerun-if-changed=rust/src");
     println!("cargo:rerun-if-changed=rust/wrapper.c");
     println!("cargo:rerun-if-changed=rust/wrapper.h");
 
