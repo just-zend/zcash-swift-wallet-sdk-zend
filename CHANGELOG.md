@@ -151,12 +151,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 - Bumped the Rust dependency stack to the Ironwood (NU6.3) crates.io releases
-  (`orchard` 0.13→0.15, `zcash_client_backend` 0.23→0.24.0-rc.1,
-  `zcash_client_sqlite` 0.21→0.22.0-rc.1, `zcash_primitives`/`zcash_proofs`
-  0.28→0.29, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
-  `zcash_transparent` 0.8→0.9, `pczt` 0.7→0.8.0-rc.1, `zcash_keys` 0.14→0.15)
+  (`orchard` 0.14→0.15, `zcash_client_backend` 0.23→0.24.0-rc.2,
+  `zcash_client_sqlite` 0.21→0.22.0-rc.2, `zcash_primitives`/`zcash_proofs`
+  0.28→0.30, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
+  `zcash_transparent` 0.8→0.10, `pczt` 0.7→0.8, `zcash_keys` 0.14→0.16)
   and dropped the `[patch.crates-io]` git overrides, matching the Android SDK's
   2.5.x dependency set. `addProofsToPCZT` now also proves Ironwood bundles.
+- Once NU6.3 activates, a payment to an Orchard receiver is delivered through
+  the Ironwood bundle of a version 6 transaction rather than as an Orchard
+  output: a `Proposal` reports such payments and the change from Ironwood
+  spends as Ironwood-pool outputs, and `createProposedTransactions` and
+  `createPCZTFromProposal` build the version 6 transaction that carries them.
+- Fee and change calculation derive the Orchard bundle version from the
+  proposal's target height instead of always applying the pre-NU6.3 policy, so
+  a proposal targeting a height at or beyond NU6.3 activation is charged one
+  ZIP 317 action per Orchard spend or output rather than
+  `max(spends, outputs)`, and Ironwood spends, outputs and change are charged
+  against the separate Ironwood bundle. Proposals below the activation height
+  are unaffected.
 
 ## Removed
 - The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
@@ -164,6 +176,25 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcashlc_voting_*` FFI). `zcash_voting` cannot resolve against the Ironwood
   `orchard` release, so voting is not shipped on the 2.5.x line, matching the
   Android SDK.
+
+## Fixed
+- `deleteAccount(_:)` no longer fails with a rusqlite
+  `InvalidParameterName(":address")` error when the account being deleted is
+  recorded as the recipient of one of its own sent outputs, as happens after
+  an internal transfer to that account.
+
+# 2.5.2 - 2026-06-03
+
+## Changed
+- Updated the Rust dependency stack to released crates.io versions
+  (`orchard` 0.13.1→0.14, `zcash_client_backend` 0.22→0.23,
+  `zcash_client_sqlite` 0.20.2→0.21, `zcash_keys` 0.13→0.14,
+  `zcash_primitives`/`zcash_proofs` 0.27→0.28, `zcash_protocol` 0.8→0.9,
+  `zcash_address` 0.11→0.12, `zcash_transparent` 0.7→0.8, `pczt` 0.6→0.7).
+  `zcash_protocol` 0.9 carries the NU6.2 activation heights (mainnet 3364600,
+  testnet 4052000), so transactions targeting those heights and above are now
+  built against the NU6.2 consensus branch id. The public Swift API is
+  unchanged.
 
 # 2.5.1 - 2026-05-14
 
