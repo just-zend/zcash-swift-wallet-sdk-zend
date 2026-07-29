@@ -131,10 +131,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finalization with a missing-signature error. The Ironwood bundle redaction
   is preserved: the full view clears Ironwood spend witnesses and output
   metadata alongside the other bundles.
-- Send-max proposals now spend from the Ironwood pool in addition to
-  Sapling and Orchard, so a post-NU6.3 wallet's Ironwood funds are no
-  longer silently excluded from a send-max. This affects only the general
-  send-max proposal; the Orchard-to-Ironwood migration is unchanged.
 
 # 2.7.0-rc.1 - 2026-07-25
 

@@ -78,12 +78,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after NU6.3) instead of rebuilding it for each, and derives the Ironwood
   circuit version from the PCZT's consensus branch id rather than hardcoding
   it. The resulting proofs are unchanged.
-- `zcashlc_propose_send_max_transfer` includes the Ironwood pool in its spend
-  set alongside Sapling and Orchard, so a post-NU6.3 wallet's Ironwood funds
-  are no longer excluded from a send-max. The spend set used by
-  `zcashlc_propose_orchard_to_ironwood_migration` is unchanged.
 
 ### Fixed
+- `zcashlc_propose_send_max_transfer` now spends from the Ironwood pool in
+  addition to Sapling and Orchard, so a post-NU6.3 wallet's Ironwood funds are
+  no longer silently excluded from a send-max. This affects only the general
+  send-max proposal; the spend set used by
+  `zcashlc_propose_orchard_to_ironwood_migration` is unchanged. There is no
+  Swift API for the general send-max proposal; `zcashlc_propose_send_max_transfer`
+  is reachable only through the C FFI.
 - PCZTs created by `zcashlc_create_pczt_from_proposal` for post-NU6.3 (v6)
   transactions carry ZIP 32 derivation metadata on the wallet-controlled
   zero-value Orchard spends that pad them (via
