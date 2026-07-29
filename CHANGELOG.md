@@ -6,7 +6,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 2.7.0-rc.3 - 2026-07-28
+
 ## Changed
+- Once NU6.3 has activated, `proposeTransfer` and `proposefulfillingPaymentURI`
+  propose a single payment whose value is a canonical ZIP 318 denomination (a
+  `{1, 2, 5} * 10^k` amount between 0.01 ZEC and 10,000 ZEC) that crosses the
+  Orchard turnstile as a ZIP 318 canonical crossing: funded from a single
+  Orchard note, anchored on the wallet's ZIP 318 anchor bucket grid, given the
+  ZIP 318 rolling expiry height, and built with one unpadded Ironwood action
+  instead of two. Such a proposal therefore pays one fewer ZIP 317
+  marginal-fee action, and requires up to two bucket intervals of
+  confirmations on its inputs beyond the `ConfirmationsPolicy` the caller
+  supplied. When the wallet cannot fund the payment that way, an ordinary
+  transaction is proposed instead, as before.
 - The FFI xcframework build now compiles every Apple architecture in a single
   multi-target `cargo build` invocation rather than one invocation per
   architecture. Concurrent cargo invocations serialize on a lock over the
@@ -18,6 +31,60 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory; the new `make distclean` goal does. This lets a restored Rust
   dependency cache survive a release build, which previously deleted it before
   compiling.
+- The bundled `libzcashlc` XCFramework is built against
+  `zcash_client_backend 0.24.0-rc.5`, `zcash_client_sqlite 0.22.0-rc.5` and
+  `zcash_protocol 0.10.2`, which are the source of the proposal behavior above
+  and of the fixes below.
+
+## Fixed
+- An Ironwood note received on an account's internal address is now classified
+  as change once the wallet learns that the same account funded the
+  transaction. This was previously applied to Sapling and Orchard notes only,
+  so an Ironwood note that was recorded before its transaction's spends could
+  be linked to the wallet kept the wrong classification permanently:
+  `ZcashTransaction.Overview.hasChange` was `false` while the note was instead
+  counted in `receivedNoteCount` and `sentNoteCount`, and the corresponding
+  `ZcashTransaction.Output.isChange` was `false`, presenting the account's own
+  change as a recipient of the user's transaction. Balances were not affected.
+  Notes already recorded with the wrong classification are repaired by a
+  database migration on upgrade; no rescan is required.
+- An address that had received only Ironwood notes was treated as never having
+  been used: the transparent address gap-limit search still considered it
+  unused, so `getCustomUnifiedAddress(accountUUID:receivers:)` could hand it
+  out again, and the account that received the note was not reported as being
+  involved in the transaction that paid it. Since NU6.3 every payment to an
+  Orchard receiver is delivered in the Ironwood bundle, so this affected
+  ordinary received payments. A database migration corrects the affected data
+  on upgrade.
+- The funding account reported for a transparent output now takes value spent
+  from the Ironwood pool into account. Ironwood inputs were not counted, so a
+  transparent output whose creating transaction was funded entirely from
+  Ironwood was attributed to no account and so was absent from the outputs
+  `getTransactionOutputs(for:)` reports for that transaction, and an output
+  funded from several pools could be attributed to an account other than the
+  largest contributor. Post-NU6.3 wallets hold their shielded value in
+  Ironwood, so this affected ordinary spends rather than only unusual ones.
+- Transaction status is now requested during enhancement on the basis of
+  durable observation intent recorded when a transaction is stored, rather
+  than synthesized from the presence of a shielded bundle. A sent transaction
+  is queried by txid when this wallet cannot observe one of its shielded
+  spends or outputs — including a transaction funded entirely by transparent
+  inputs whose shielded outputs all belong to another wallet, whose mined or
+  expired status the wallet could not previously learn. Intent remains dormant
+  while a transaction is mined and becomes active again after a chain rewind;
+  redundant status requests for transactions the wallet can observe by
+  scanning are no longer produced.
+- Requests made over Tor now bound how long each network operation may take.
+  A server that accepted a connection and then never responded previously left
+  the request pending indefinitely, stalling the calling SDK operation: this
+  affects `Synchronizer.refreshExchangeRateUSD()` and
+  `TorClient.getExchangeRateUSD()`, which aggregate several exchange servers,
+  as well as every lightwalletd call the SDK routes over Tor. Requests that
+  exceed a deadline now fail with an error instead of hanging.
+- `TorClient.httpRequest(for:retryLimit:)` now rejects a `URLRequest` whose URL
+  scheme is neither `http` nor `https` (for example `ftp` or `ws`). Such a URL
+  was previously treated as plaintext HTTP; a URL with no scheme at all was,
+  and remains, rejected.
 
 # 2.7.0-rc.2 - 2026-07-26
 
@@ -64,10 +131,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finalization with a missing-signature error. The Ironwood bundle redaction
   is preserved: the full view clears Ironwood spend witnesses and output
   metadata alongside the other bundles.
-- Send-max proposals now spend from the Ironwood pool in addition to
-  Sapling and Orchard, so a post-NU6.3 wallet's Ironwood funds are no
-  longer silently excluded from a send-max. This affects only the general
-  send-max proposal; the Orchard-to-Ironwood migration is unchanged.
 
 # 2.7.0-rc.1 - 2026-07-25
 
@@ -84,12 +147,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 - Bumped the Rust dependency stack to the Ironwood (NU6.3) crates.io releases
-  (`orchard` 0.13→0.15, `zcash_client_backend` 0.23→0.24.0-rc.1,
-  `zcash_client_sqlite` 0.21→0.22.0-rc.1, `zcash_primitives`/`zcash_proofs`
-  0.28→0.29, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
-  `zcash_transparent` 0.8→0.9, `pczt` 0.7→0.8.0-rc.1, `zcash_keys` 0.14→0.15)
+  (`orchard` 0.14→0.15, `zcash_client_backend` 0.23→0.24.0-rc.2,
+  `zcash_client_sqlite` 0.21→0.22.0-rc.2, `zcash_primitives`/`zcash_proofs`
+  0.28→0.30, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
+  `zcash_transparent` 0.8→0.10, `pczt` 0.7→0.8, `zcash_keys` 0.14→0.16)
   and dropped the `[patch.crates-io]` git overrides, matching the Android SDK's
   2.5.x dependency set. `addProofsToPCZT` now also proves Ironwood bundles.
+- Once NU6.3 activates, a payment to an Orchard receiver is delivered through
+  the Ironwood bundle of a version 6 transaction rather than as an Orchard
+  output: a `Proposal` reports such payments and the change from Ironwood
+  spends as Ironwood-pool outputs, and `createProposedTransactions` and
+  `createPCZTFromProposal` build the version 6 transaction that carries them.
+- Fee and change calculation derive the Orchard bundle version from the
+  proposal's target height instead of always applying the pre-NU6.3 policy, so
+  a proposal targeting a height at or beyond NU6.3 activation is charged one
+  ZIP 317 action per Orchard spend or output rather than
+  `max(spends, outputs)`, and Ironwood spends, outputs and change are charged
+  against the separate Ironwood bundle. Proposals below the activation height
+  are unaffected.
 
 ## Removed
 - The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
@@ -97,6 +172,25 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcashlc_voting_*` FFI). `zcash_voting` cannot resolve against the Ironwood
   `orchard` release, so voting is not shipped on the 2.5.x line, matching the
   Android SDK.
+
+## Fixed
+- `deleteAccount(_:)` no longer fails with a rusqlite
+  `InvalidParameterName(":address")` error when the account being deleted is
+  recorded as the recipient of one of its own sent outputs, as happens after
+  an internal transfer to that account.
+
+# 2.5.2 - 2026-06-03
+
+## Changed
+- Updated the Rust dependency stack to released crates.io versions
+  (`orchard` 0.13.1→0.14, `zcash_client_backend` 0.22→0.23,
+  `zcash_client_sqlite` 0.20.2→0.21, `zcash_keys` 0.13→0.14,
+  `zcash_primitives`/`zcash_proofs` 0.27→0.28, `zcash_protocol` 0.8→0.9,
+  `zcash_address` 0.11→0.12, `zcash_transparent` 0.7→0.8, `pczt` 0.6→0.7).
+  `zcash_protocol` 0.9 carries the NU6.2 activation heights (mainnet 3364600,
+  testnet 4052000), so transactions targeting those heights and above are now
+  built against the NU6.2 consensus branch id. The public Swift API is
+  unchanged.
 
 # 2.5.1 - 2026-05-14
 
