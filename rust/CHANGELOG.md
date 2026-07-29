@@ -9,8 +9,50 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Migrated to `zcash_protocol 0.10.2`, `zcash_client_backend 0.24.0-rc.5`,
   `zcash_client_sqlite 0.22.0-rc.5`
+- Once NU6.3 has activated, `zcashlc_propose_transfer` and
+  `zcashlc_propose_transfer_from_uri` propose a single payment of a canonical
+  ZIP 318 denomination that crosses the Orchard turnstile as a ZIP 318
+  canonical crossing: funded from a single Orchard note, anchored on the
+  wallet's ZIP 318 anchor bucket grid, given the ZIP 318 rolling expiry
+  height, and built with one unpadded Ironwood action instead of two. Such a
+  proposal pays one fewer ZIP 317 marginal-fee action, and requires up to two
+  bucket intervals of confirmations on its inputs beyond the
+  `confirmations_policy` argument. When the wallet cannot fund the payment
+  that way, an ordinary transaction is proposed instead.
+- `zcashlc_init_data_database` applies new `zcash_client_sqlite` migrations
+  that repair the Ironwood change classification and address-use data
+  described under Fixed below. No rescan is required.
 
 ### Fixed
+- Ironwood notes received on an account's internal address are now classified
+  as change once the wallet learns that the same account funded the
+  transaction, as was already the case for Sapling and Orchard notes, so
+  `v_transactions.has_change` and `v_tx_outputs.is_change` no longer report an
+  account's own change as a recipient of its transaction. Balances were not
+  affected.
+- An address that had received only Ironwood notes is now treated as used, so
+  it is no longer handed out again by `zcashlc_get_next_available_address` and
+  the receiving account is reported as involved in the transaction that paid
+  it. Since NU6.3 every payment to an Orchard receiver is delivered in the
+  Ironwood bundle, so this affected ordinary received payments.
+- The funding account recorded for a transparent output now counts value spent
+  from the Ironwood pool, so an output whose creating transaction was funded
+  entirely from Ironwood is attributed to the funding account rather than to
+  none, and one funded from several pools is attributed to the largest
+  contributor.
+- `zcashlc_transaction_data_requests` now derives transaction status requests
+  from durable observation intent recorded when a transaction is stored: a
+  sent transaction is queried by txid when the wallet cannot observe one of
+  its shielded spends or outputs, intent goes dormant while a transaction is
+  mined and revives after a rewind, and redundant requests for
+  wallet-observable shielded transactions are no longer produced.
+- The Tor HTTP and gRPC transports bound how long each network operation may
+  take, so `zcashlc_get_exchange_rate_usd`, `zcashlc_tor_http_get` /
+  `zcashlc_tor_http_post` and the `zcashlc_tor_lwd_conn_*` calls fail with an
+  error instead of hanging indefinitely against a server that accepts a
+  connection and then never responds. Those transports also now reject a URL
+  whose scheme is neither `http` nor `https`, which was previously treated as
+  plaintext HTTP.
 - `build.rs` now watches the whole `rust/src` directory. It previously named
   only `lib.rs`, `voting.rs` and `voting/`, and emitting any `rerun-if-changed`
   disables cargo's default whole-package watching, so edits to any other module
