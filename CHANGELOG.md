@@ -6,6 +6,23 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 2.7.0-rc.3 - 2026-07-28
+
+## Changed
+- The FFI xcframework build now compiles every Apple architecture in a single
+  multi-target `cargo build` invocation rather than one invocation per
+  architecture. Concurrent cargo invocations serialize on a lock over the
+  shared host artifact directory, so the single-threaded fat-LTO pass for each
+  architecture previously ran one after another; they now overlap. The
+  per-platform goals (`make macos`, `make ios-device`, `make ios-simulator`)
+  still build only their own architectures.
+- `make clean` in `BuildSupport/` no longer removes the cargo `target`
+  directory; the new `make distclean` goal does. This lets a restored Rust
+  dependency cache survive a release build, which previously deleted it before
+  compiling.
+
+# 2.7.0-rc.2 - 2026-07-26
+
 ## Changed
 - The lightwalletd protobuf definitions (`compact_formats.proto`,
   `service.proto`) are now vendored from
