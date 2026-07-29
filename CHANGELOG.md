@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 2.7.0-rc.3 - 2026-07-28
+
 ## Changed
 - The FFI xcframework build now compiles every Apple architecture in a single
   multi-target `cargo build` invocation rather than one invocation per
