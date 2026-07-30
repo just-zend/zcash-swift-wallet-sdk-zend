@@ -158,9 +158,10 @@ impl MigrationBackend for Backend<'_> {
 
     /// The anchor bucket grid is the wallet's own anchor retention interval (selected per network
     /// in [`crate::wallet_db`]), so a transfer can only anchor to a boundary whose checkpoint this
-    /// wallet retains; the delay distributions are derived from that interval by the ZIP 318
-    /// ratios, which reproduces the specified schedule exactly on the standard 144-block grid and
-    /// compresses it by the same factor on a shortened one.
+    /// wallet retains; the delay distributions scale each ZIP 318 delay mean and cap by the ratio
+    /// of the interval to the 144-block ZIP 318 one, which reproduces the specified schedule
+    /// exactly on the standard 144-block grid and compresses it by the same factor on a shortened
+    /// one.
     fn scheduling_params(&self) -> SchedulingParams {
         SchedulingParams::new_with_default_distributions(
             self.wallet.anchor_retention_interval().into(),

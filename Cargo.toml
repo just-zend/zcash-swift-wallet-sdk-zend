@@ -34,7 +34,7 @@ zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.30"
 zcash_proofs = "0.30"
 zcash_protocol = { version = "0.10.2", features = ["local-consensus"] }
-zcash_pool_migration = { version = "0.1.0-rc.3", features = ["wallet"] }
+zcash_pool_migration = { version = "0.1.0-rc.5", features = ["wallet"] }
 zcash_script = "0.4"
 zip32 = "0.2"
 pczt = { version = "0.9", features = ["prover", "orchard", "sapling", "signer"] }

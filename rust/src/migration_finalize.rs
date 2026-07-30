@@ -82,19 +82,25 @@ pub(crate) trait ProveErrorClass {
 }
 
 impl<TE, NE, RE> ProveErrorClass for WalletProveError<TE, NE, RE> {
-    /// The transient set, exactly: no root at the anchor checkpoint yet (`AnchorNotFound`), the
-    /// spent note not witnessable there yet (`WitnessNotFound`), no chain data at all
-    /// (`ChainTipUnknown`), or no Ironwood destination tree yet (`IronwoodTreeUnavailable`) — all
-    /// resolve themselves as the wallet syncs past the boundary. Everything else (an unknown
-    /// spent note, note-enumeration or tree-query failures, proof-creation failures, malformed
-    /// PCZT data) is a hard error.
+    /// Transient = "not scanned/retained yet or transiently unqueryable — resolves as the wallet
+    /// syncs": no spendable note yet matches the spend's revealed nullifier (`UnknownSpentNote` —
+    /// a late-mining dependency's note the wallet has not seen yet), no root at the anchor
+    /// checkpoint yet (`AnchorNotFound`), the spent note not witnessable there yet
+    /// (`WitnessNotFound`), a commitment-tree query failure (`Tree` — shard-tree query races
+    /// during sync; this exact variant crash-looped a prove batch on Android on 2026-07-28), or no
+    /// chain data at all (`ChainTipUnknown`).
+    ///
+    /// Hard = genuinely unrecoverable, must not be swallowed: everything else, including
+    /// `IronwoodTreeUnavailable` explicitly — the backend tracks no Ironwood commitment tree at
+    /// all, which no amount of syncing produces.
     fn is_transient(&self) -> bool {
         matches!(
             self,
-            WalletProveError::AnchorNotFound(_)
+            WalletProveError::UnknownSpentNote(_)
+                | WalletProveError::AnchorNotFound(_)
                 | WalletProveError::WitnessNotFound(_)
+                | WalletProveError::Tree(_)
                 | WalletProveError::ChainTipUnknown
-                | WalletProveError::IronwoodTreeUnavailable
         )
     }
 }
