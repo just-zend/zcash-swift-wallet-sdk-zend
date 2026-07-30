@@ -2,13 +2,17 @@
 //  MigrationRunEstimateTests.swift
 //  OfflineTests
 //
-//  Pure model math for `MigrationRunEstimate`: the per-run transaction and signing-session
-//  arithmetic, the cross-run totals, and — the semantically load-bearing part — that
-//  `totalSigningSessions(maxTransactionsPerSession:)` sums per-run sessions instead of pooling
-//  transactions across runs (sessions cannot span runs: a later run's transactions spend notes an
-//  earlier run must mine first). Mirrors the upstream `RunEstimate::signing_sessions` /
-//  `MigrationRunEstimate::total_signing_sessions` semantics. The FFI decode of the estimate is
-//  exercised through the real welding in MigrationFFITests.swift.
+//  Pure model math for `MigrationRunEstimate`: the per-run transaction-count arithmetic
+//  (`Run.transactions`) and the cross-run totals -- including `totalActions` /
+//  `totalKeystoneSigningSessions`, which are plain SUMS of each run's own precomputed (upstream
+//  `MinRounds`-packed) fields, never a Swift-side re-derivation or re-packing across runs (a later
+//  run's transactions spend notes an earlier run must mine first, so nothing can be pooled across
+//  runs -- see `MigrationRunEstimate`'s doc). The count-based
+//  `signingSessions(maxTransactionsPerSession:)` / `totalSigningSessions(...)` this file used to
+//  pin were deleted along with their Swift-side ceiling math: `keystoneSigningSessions` is now a
+//  verbatim passthrough of the engine's own optimal packing, so these tests assert passthrough, not
+//  arithmetic. The FFI decode of the estimate is exercised through the real welding in
+//  MigrationFFITests.swift.
 //
 
 import XCTest
@@ -16,54 +20,37 @@ import XCTest
 
 final class MigrationRunEstimateTests: XCTestCase {
     /// `transactions` is the run's preparation transactions plus one crossing transfer per
-    /// funding note.
+    /// funding note. `actions`/`keystoneSigningSessions` are unrelated inputs the run carries
+    /// verbatim -- this fixture mirrors the type doc's own worked example: 6 preparations + 1
+    /// transfer is 99 actions, one Keystone round over the 96-action budget, so 2 rounds.
     func testRunTransactionsIsPreparationPlusCrossings() {
         let run = MigrationRunEstimate.Run(
             migratable: Zatoshi(100),
-            crossings: 3,
+            crossings: 1,
             preparationLayers: 2,
-            preparationTransactions: 4
+            preparationTransactions: 6,
+            actions: 99,
+            keystoneSigningSessions: 2
         )
 
         XCTAssertEqual(run.transactions, 7)
     }
 
-    /// When the transaction count divides the session capacity exactly, no session is wasted.
-    func testRunSigningSessionsOnAnExactMultiple() {
-        let run = MigrationRunEstimate.Run(
-            migratable: Zatoshi(100),
-            crossings: 2,
-            preparationLayers: 1,
-            preparationTransactions: 4
-        )
-
-        // 6 transactions at 3 per session: exactly 2 sessions.
-        XCTAssertEqual(run.signingSessions(maxTransactionsPerSession: 3), 2)
-    }
-
-    /// A remainder costs one extra (partially filled) session: ceil division, not floor.
-    func testRunSigningSessionsWithARemainder() {
+    /// `actions` and `keystoneSigningSessions` are stored and read back verbatim -- the Swift side
+    /// performs no packing of its own (see `MigrationRunEstimate`'s doc: the upstream engine's
+    /// optimal `MinRounds` packing already computed them).
+    func testRunActionsAndKeystoneSigningSessionsPassThroughVerbatim() {
         let run = MigrationRunEstimate.Run(
             migratable: Zatoshi(100),
             crossings: 3,
             preparationLayers: 2,
-            preparationTransactions: 4
+            preparationTransactions: 4,
+            actions: 77,
+            keystoneSigningSessions: 5
         )
 
-        // 7 transactions at 3 per session: 2 full sessions + 1 for the remainder.
-        XCTAssertEqual(run.signingSessions(maxTransactionsPerSession: 3), 3)
-    }
-
-    /// A capacity of one transaction per session degenerates to one session per transaction.
-    func testRunSigningSessionsAtOnePerSession() {
-        let run = MigrationRunEstimate.Run(
-            migratable: Zatoshi(100),
-            crossings: 2,
-            preparationLayers: 1,
-            preparationTransactions: 3
-        )
-
-        XCTAssertEqual(run.signingSessions(maxTransactionsPerSession: 1), 5)
+        XCTAssertEqual(run.actions, 77)
+        XCTAssertEqual(run.keystoneSigningSessions, 5)
     }
 
     /// The totals are plain sums across runs, and `totalTransactions` equals
@@ -75,13 +62,17 @@ final class MigrationRunEstimateTests: XCTestCase {
                     migratable: Zatoshi(500),
                     crossings: 2,
                     preparationLayers: 1,
-                    preparationTransactions: 3
+                    preparationTransactions: 3,
+                    actions: 54, // 3 preparations * 16 + 2 crossings * 3
+                    keystoneSigningSessions: 1
                 ),
                 MigrationRunEstimate.Run(
                     migratable: Zatoshi(250),
                     crossings: 3,
                     preparationLayers: 2,
-                    preparationTransactions: 2
+                    preparationTransactions: 2,
+                    actions: 41, // 2 preparations * 16 + 3 crossings * 3
+                    keystoneSigningSessions: 1
                 )
             ],
             finalResidual: Zatoshi(7)
@@ -93,45 +84,51 @@ final class MigrationRunEstimateTests: XCTestCase {
         XCTAssertEqual(estimate.totalPreparationLayers, 3)
         XCTAssertEqual(estimate.totalPreparationTransactions, 5)
         XCTAssertEqual(estimate.totalTransactions, 10)
+        XCTAssertEqual(estimate.totalActions, 95)
+        XCTAssertEqual(estimate.totalKeystoneSigningSessions, 2)
         XCTAssertEqual(estimate.finalResidual, Zatoshi(7))
     }
 
-    /// The load-bearing session semantics: `totalSigningSessions` is the SUM of per-run session
-    /// counts, NOT `ceil(totalTransactions / max)` — a later run's transactions spend notes an
-    /// earlier run must mine first, so the spare capacity in a run's last session cannot be
-    /// filled with the next run's transactions. This fixture is chosen so the two answers differ.
-    func testTotalSigningSessionsDoNotPoolAcrossRuns() {
+    /// The load-bearing session semantics: `totalKeystoneSigningSessions` is the SUM of each run's
+    /// OWN precomputed `keystoneSigningSessions`, never a Swift-side re-pack across runs. This
+    /// fixture's two runs together total only 95 actions (under the 96-action Keystone budget), so
+    /// a repacking implementation could wrongly claim a single round; the real per-run sessions (2
+    /// + 2) show neither run's leftover capacity is usable by the other, because a later run's
+    /// inputs are not even minable until the earlier run has broadcast.
+    func testTotalKeystoneSigningSessionsSumsPerRunSessionsWithoutRepacking() {
         let estimate = MigrationRunEstimate(
             runs: [
                 MigrationRunEstimate.Run(
                     migratable: Zatoshi(500),
                     crossings: 2,
                     preparationLayers: 1,
-                    preparationTransactions: 3
+                    preparationTransactions: 3,
+                    actions: 54,
+                    keystoneSigningSessions: 2
                 ),
                 MigrationRunEstimate.Run(
                     migratable: Zatoshi(250),
                     crossings: 3,
                     preparationLayers: 2,
-                    preparationTransactions: 2
+                    preparationTransactions: 2,
+                    actions: 41,
+                    keystoneSigningSessions: 2
                 )
             ],
             finalResidual: Zatoshi.zero
         )
 
-        // 5 + 5 transactions at 4 per session: per-run ceil gives 2 + 2 = 4 sessions,
-        // while the naive pooled ceil(10 / 4) would claim only 3.
-        XCTAssertEqual(estimate.totalTransactions, 10)
-        XCTAssertEqual(estimate.totalSigningSessions(maxTransactionsPerSession: 4), 4)
+        XCTAssertEqual(estimate.totalActions, 95)
+        XCTAssertEqual(estimate.totalKeystoneSigningSessions, 4)
         XCTAssertNotEqual(
-            estimate.totalSigningSessions(maxTransactionsPerSession: 4),
-            (estimate.totalTransactions + 3) / 4,
-            "per-run sessions must not collapse into the pooled ceiling"
+            estimate.totalKeystoneSigningSessions,
+            1,
+            "per-run sessions must not collapse into a pooled repack of the total action count"
         )
     }
 
-    /// The zero-run estimate (nothing migrates) has all-zero totals and needs no signing
-    /// sessions — a legitimate answer, mirroring the FFI's non-error empty marshaling.
+    /// The zero-run estimate (nothing migrates) has all-zero totals -- a legitimate answer,
+    /// mirroring the FFI's non-error empty marshaling.
     func testZeroRunEstimateHasAllZeroTotals() {
         let estimate = MigrationRunEstimate(runs: [], finalResidual: Zatoshi.zero)
 
@@ -141,7 +138,8 @@ final class MigrationRunEstimateTests: XCTestCase {
         XCTAssertEqual(estimate.totalPreparationLayers, 0)
         XCTAssertEqual(estimate.totalPreparationTransactions, 0)
         XCTAssertEqual(estimate.totalTransactions, 0)
-        XCTAssertEqual(estimate.totalSigningSessions(maxTransactionsPerSession: 1), 0)
+        XCTAssertEqual(estimate.totalActions, 0)
+        XCTAssertEqual(estimate.totalKeystoneSigningSessions, 0)
         XCTAssertEqual(estimate.finalResidual, .zero)
     }
 }

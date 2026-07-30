@@ -10,12 +10,12 @@
 //  ZcashRustBackend) is exercised through the real libzcashlc, so a marshaling regression (wrong
 //  sentinel, wrong error mapping, wrong tag) shows up here rather than only downstream.
 //
-//  Ports Tests/OfflineTests/MigrationFFITests.swift from the michal/MOB-1455-ironwood-migration-
-//  prototype-ffi branch (commit 86450d54) to the committed API: method names/signatures changed
-//  (ZcashRustBackendWelding.migrationState(for:) etc.), MigrationTransferResult.success now takes
-//  `txId:` (display-hex) rather than `txid:`, and there is no `migrationInitializePostUpgrade` in
-//  the committed surface -- account creation now goes through the standard `createAccount` fixture
-//  pattern instead.
+//  Ported from the michal/MOB-1455-ironwood-migration-prototype-ffi branch (commit 86450d54) to the
+//  committed API, then updated again when the SDK-side `MigrationState`/`migrationState(for:)` state
+//  machine was replaced by the verbatim `migrationAdvanceStep(for:)` conduit:
+//  `MigrationTransferResult.success` takes `txId:` (display-hex) rather than `txid:`, and there is no
+//  `migrationInitializePostUpgrade` in the committed surface -- account creation goes through the
+//  standard `createAccount` fixture pattern instead.
 //
 //  The balance-bearing paths (note splitting, proposing/signing transfers) need a seeded, synced
 //  wallet with a real Orchard balance -- a documented integration gap, consistent with every other
@@ -77,9 +77,11 @@ final class MigrationFFITests: XCTestCase {
 
     // MARK: - Empty-DB state machine
 
-    func testFreshWalletMigrationStateIsNotStarted() async throws {
-        let state = try await rustBackend.migrationState(for: account)
-        XCTAssertEqual(state, MigrationState.notStarted)
+    /// A fresh wallet has no committed run at all, so there is nothing to advance: `nil`, not the
+    /// terminal `.complete` case (which is reserved for a run that WAS stored).
+    func testFreshWalletMigrationAdvanceStepIsNil() async throws {
+        let step = try await rustBackend.migrationAdvanceStep(for: account)
+        XCTAssertNil(step, "a fresh wallet with no stored run has nothing to advance")
     }
 
     func testFreshWalletMigrationProgressIsNil() async throws {
@@ -88,7 +90,7 @@ final class MigrationFFITests: XCTestCase {
     }
 
     func testFreshWalletHasNoOverdueTransfers() async throws {
-        let hasOverdue = try await rustBackend.migrationHasOverdueTransfers(for: account)
+        let hasOverdue = try await rustBackend.migrationHasOverdueTransfers(for: account, estimatedTip: nil)
         XCTAssertFalse(hasOverdue)
     }
 
@@ -105,7 +107,7 @@ final class MigrationFFITests: XCTestCase {
     }
 
     func testFreshWalletHasNoNextDueTransfer() async throws {
-        let nextDue = try await rustBackend.migrationNextDueTransfer(for: account)
+        let nextDue = try await rustBackend.migrationNextDueTransfer(for: account, estimatedTip: nil)
         XCTAssertEqual(nextDue, .nothingDue)
     }
 
@@ -185,7 +187,8 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertEqual(estimate.runCount, 0)
         XCTAssertTrue(estimate.runs.isEmpty)
         XCTAssertEqual(estimate.finalResidual, .zero)
-        XCTAssertEqual(estimate.totalSigningSessions(maxTransactionsPerSession: 1), 0)
+        XCTAssertEqual(estimate.totalActions, 0)
+        XCTAssertEqual(estimate.totalKeystoneSigningSessions, 0)
     }
 
     // MARK: - Invalid-state transitions
@@ -197,7 +200,7 @@ final class MigrationFFITests: XCTestCase {
     /// must surface `migrationPlanStale`, the actionable "propose again" signal, not a generic
     /// failure.
     func testSignAndStoreWithoutAPreviewedPlanThrowsPlanStale() async throws {
-        let emptySchedule = MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 0)
+        let emptySchedule = MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 0, preparations: [])
         do {
             try await rustBackend.migrationSignAndStoreSchedule(emptySchedule, usk: usk, for: account)
             XCTFail("Expected committing without a previewed plan to throw")
@@ -216,7 +219,8 @@ final class MigrationFFITests: XCTestCase {
         let staleSchedule = MigrationSchedule(
             transfers: [],
             estimatedDurationHours: 0,
-            proposalHandle: 0xDEAD_BEEF
+            proposalHandle: 0xDEAD_BEEF,
+            preparations: []
         )
         do {
             try await rustBackend.migrationSignAndStoreSchedule(staleSchedule, usk: usk, for: account)
@@ -298,25 +302,31 @@ final class MigrationFFITests: XCTestCase {
     /// (the documented "no chain tip yet" failure mode applies before any account has been created
     /// at all, which this offline suite's setup always provides). This exercises the real FFI
     /// marshaling end-to-end (db/account bytes, the fixed 32-byte txid buffer, the boolean success
-    /// mapping) and the `derive_state` fold reading it straight back: an unmined, unrecognized txid
-    /// falls into the documented fallback-pending bucket (`recorded_at_height + 40`, not yet
-    /// elapsed), so the state machine reports `InProgress(0 of 1)`, not a re-offer.
-    func testMigrationRecordImmediateRunThenMigrationStateReportsInProgress() async throws {
+    /// mapping) and `migrationProgress`'s read reading it straight back: an unmined, unrecognized
+    /// txid falls into the documented fallback-pending bucket (`recorded_at_height + 40`, not yet
+    /// elapsed), so progress reports `0 of 1`, flagged `isImmediate`, not `nil`. The immediate lane
+    /// is entirely outside the migration engine (see `MigrationProgress.isImmediate`'s doc), so
+    /// `migrationAdvanceStep` -- which answers for the STORED (engine-tracked) run only -- must stay
+    /// `nil` throughout: the two surfaces are orthogonal.
+    func testMigrationRecordImmediateRunThenMigrationProgressReportsInProgress() async throws {
         let txid = Data(repeating: 0xAB, count: 32)
 
         try await rustBackend.migrationRecordImmediateRun(txid: txid, for: account)
 
-        let state = try await rustBackend.migrationState(for: account)
-        guard case .inProgress(let progress) = state else {
-            XCTFail("Expected .inProgress after recording an immediate run with an unmined txid, got \(state)")
-            return
-        }
-        XCTAssertEqual(progress.completedTransfers, 0)
-        XCTAssertEqual(progress.totalTransfers, 1)
+        let progress = try await rustBackend.migrationProgress(for: account)
+        let unwrappedProgress = try XCTUnwrap(
+            progress,
+            "an unmined recorded immediate run must report a live progress snapshot, not nil"
+        )
+        XCTAssertEqual(unwrappedProgress.completedTransfers, 0)
+        XCTAssertEqual(unwrappedProgress.totalTransfers, 1)
         XCTAssertTrue(
-            progress.isImmediate,
+            unwrappedProgress.isImmediate,
             "a recorded immediate-lane run must map to isImmediate = true through the real FFI"
         )
+
+        let step = try await rustBackend.migrationAdvanceStep(for: account)
+        XCTAssertNil(step, "the immediate lane records no engine-tracked run, so there is still nothing to advance")
     }
 
     /// MOB-1513 R2: the FFI→model mapping (`FfiMigrationProgress.unsafeToMigrationProgress()`) must
@@ -326,7 +336,7 @@ final class MigrationFFITests: XCTestCase {
     /// engine-tracked InProgress — the only real-FFI `is_immediate == false` source — needs a
     /// seeded, synced Orchard balance this offline suite does not have. The `true` path is
     /// additionally covered end-to-end over the real FFI by
-    /// `testMigrationRecordImmediateRunThenMigrationStateReportsInProgress` above.
+    /// `testMigrationRecordImmediateRunThenMigrationProgressReportsInProgress` above.
     func testMigrationProgressMappingCarriesIsImmediateBothWays() throws {
         let immediate = FfiMigrationProgress(
             is_present: true,
@@ -425,8 +435,8 @@ final class MigrationFFITests: XCTestCase {
     }
 
     func testMigrationNextDueTransferNothingDueIsStableAcrossRepeatedCalls() async throws {
-        let first = try await rustBackend.migrationNextDueTransfer(for: account)
-        let second = try await rustBackend.migrationNextDueTransfer(for: account)
+        let first = try await rustBackend.migrationNextDueTransfer(for: account, estimatedTip: nil)
+        let second = try await rustBackend.migrationNextDueTransfer(for: account, estimatedTip: nil)
         XCTAssertEqual(first, .nothingDue)
         XCTAssertEqual(first, second)
     }
@@ -483,7 +493,7 @@ final class MigrationFFITests: XCTestCase {
     /// `testRecordTransferResultWithNoActiveRunThrows`) — now that `refreshStaleTransfers`
     /// legitimately returns the empty schedule on this fixture instead of throwing.
     func testHasOverdueTransfersIsUnaffectedByAPrecedingThrowingMigrationCall() async throws {
-        let before = try await rustBackend.migrationHasOverdueTransfers(for: account)
+        let before = try await rustBackend.migrationHasOverdueTransfers(for: account, estimatedTip: nil)
         XCTAssertFalse(before)
 
         do {
@@ -498,7 +508,7 @@ final class MigrationFFITests: XCTestCase {
             // testRecordTransferResultWithNoActiveRunThrows above.
         }
 
-        let after = try await rustBackend.migrationHasOverdueTransfers(for: account)
+        let after = try await rustBackend.migrationHasOverdueTransfers(for: account, estimatedTip: nil)
         XCTAssertFalse(after)
         XCTAssertEqual(before, after)
     }
@@ -514,7 +524,7 @@ final class MigrationFFITests: XCTestCase {
         let staleProducerResult = ZcashRustBackend.ironwoodActivationHeight(networkType: .regtest)
         XCTAssertNil(staleProducerResult, "regtest has no fixed NU6.3 height; `-1` must still map to nil")
 
-        let hasOverdue = try await rustBackend.migrationHasOverdueTransfers(for: account)
+        let hasOverdue = try await rustBackend.migrationHasOverdueTransfers(for: account, estimatedTip: nil)
         XCTAssertFalse(hasOverdue)
     }
 
@@ -681,16 +691,50 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertNil(decoded, "a malformed row anywhere in the array must fail the whole decode")
     }
 
+    /// `dependsOn` copies the heap array pointed to by `depends_on`/`depends_on_len` straight
+    /// through, preserving order.
+    func testDecodeMapsDependsOnIds() throws {
+        var ids: [UInt32] = [3, 7, 9]
+        let decoded = ids.withUnsafeMutableBufferPointer { buffer -> MigrationTransactionStatus? in
+            makeStatus(dependsOnPtr: buffer.baseAddress, dependsOnLen: UInt(buffer.count)).unsafeToMigrationTransactionStatus()
+        }
+        XCTAssertEqual(try XCTUnwrap(decoded).dependsOn, [3, 7, 9])
+    }
+
+    /// The default (no dependencies) row -- `depends_on == nil`, `depends_on_len == 0` -- decodes
+    /// to an EMPTY array, not `nil`: `MigrationTransactionStatus.dependsOn` is non-optional.
+    func testDecodeMapsNoDependsOnToAnEmptyArray() throws {
+        let decoded = try XCTUnwrap(makeStatus().unsafeToMigrationTransactionStatus())
+        XCTAssertEqual(decoded.dependsOn, [])
+    }
+
+    /// A non-negative `anchor_boundary` on a TRANSFER row decodes straight through.
+    func testDecodeMapsAnchorBoundaryHeightForATransfer() throws {
+        let ffi = makeStatus(isTransfer: true, crossing: 2, anchorBoundary: 3_200_000)
+        let decoded = try XCTUnwrap(ffi.unsafeToMigrationTransactionStatus())
+        XCTAssertEqual(decoded.anchorBoundaryHeight, 3_200_000)
+    }
+
+    /// The engine's `-1` "no drawn boundary" sentinel decodes to `nil` -- the default `makeStatus()`
+    /// row's value, and always so for a PREPARATION (which anchors near-tip at proving time instead
+    /// of a drawn boundary; see `MigrationTransactionStatus.anchorBoundaryHeight`'s doc).
+    func testDecodeMapsNegativeAnchorBoundarySentinelToNilForAPreparation() throws {
+        let ffi = makeStatus(isTransfer: false, prepLayer: 0, prepIndex: 0)
+        let decoded = try XCTUnwrap(ffi.unsafeToMigrationTransactionStatus())
+        XCTAssertNil(decoded.anchorBoundaryHeight, "a preparation never carries a drawn boundary")
+    }
+
     // MARK: - Actor integration over real FFI (nil paths)
 
     /// Constructs a real `OrchardMigration` via the injecting initializer, wired to the SAME
     /// real-FFI-backed welding as the rest of this file (not a mock) plus a real, temp-file-backed
-    /// `MigrationSyncGate`. On this fresh wallet `migrationNextDueTransfer` legitimately returns
-    /// `nil`, so `executeNextPendingTransfer` must short-circuit before ever reaching the broadcaster
-    /// -- proven here with a fake that fails the assertion (via a non-zero call count) rather than
-    /// the test itself if that contract regresses. `rescheduleOverdueTransfer` likewise resolves
-    /// `nil` (no active run), exercising the engine-backed pending-proposal accessor over real FFI.
-    func testFreshWalletActorNextPendingTransferAndRescheduleAreNilOverRealFFI() async throws {
+    /// `MigrationSyncGate`. On this fresh wallet `migrationNextDueTransfer` legitimately reports
+    /// nothing due, so `executeNextPendingTransfer` must short-circuit to `.nothingDue` before ever
+    /// reaching the broadcaster -- proven here with a fake that fails the assertion (via a non-zero
+    /// call count) rather than the test itself if that contract regresses. `pendingTransferProposal`
+    /// (the renamed `rescheduleOverdueTransfer`) likewise resolves `nil` (no active run), exercising
+    /// the engine-backed pending-proposal accessor over real FFI.
+    func testFreshWalletActorExecuteNextPendingTransferAndPendingTransferProposalOverRealFFI() async throws {
         let storageDirectory = try makeUniqueStorageDirectory()
         defer { try? FileManager.default.removeItem(at: storageDirectory) }
 
@@ -714,13 +758,14 @@ final class MigrationFFITests: XCTestCase {
             options: MigrationNetworkPrivacyOptions(
                 useTor: false,
                 submissionEndpoint: LightWalletEndpoint(address: "default.example", port: 9067)
-            )
+            ),
+            useEstimatedTip: false
         )
-        XCTAssertNil(result)
+        XCTAssertEqual(result, .nothingDue)
         XCTAssertEqual(broadcaster.receivedCalls.count, 0)
 
-        let rescheduled = try await migration.rescheduleOverdueTransfer()
-        XCTAssertNil(rescheduled)
+        let pending = try await migration.pendingTransferProposal()
+        XCTAssertNil(pending)
     }
 
     // MARK: - Custom network registration
@@ -730,9 +775,9 @@ final class MigrationFFITests: XCTestCase {
     /// activation heights with the Rust core itself; nothing else does it on this path. Pre-fix,
     /// every migration FFI call on a `.regtest`/custom network id (2) throws "custom network (id 2)
     /// used before it was configured" (see `rust/src/lib.rs`'s `parse_network`), which
-    /// `migrationState()` surfaces as `rustMigrationState`, and which `isSyncBlocked()`/the gate's
-    /// `overdueProvider` silently swallow via `try?` instead (finding 5's "migration dead on
-    /// .custom/.regtest").
+    /// `migrationAdvanceStep()` surfaces as `rustMigrationAdvanceStep`, and which
+    /// `isSyncBlocked()`/the gate's `overdueProvider` silently swallow via `try?` instead (finding
+    /// 5's "migration dead on .custom/.regtest").
     ///
     /// `NetworkActivationHeights` here intentionally matches
     /// `RegtestActivationHeightsTests.testRegtestConsensusBranchIdReflectsCustomActivationHeights`'s
@@ -744,12 +789,12 @@ final class MigrationFFITests: XCTestCase {
     /// The engine's store tables ride the wallet schema migrations (the FFI no longer creates
     /// them on first touch), so the fixture initializes the wallet database first — exactly like
     /// a real caller, whose `Initializer`/`prepare` runs `initDataDb` before any migration read —
-    /// and then verifies `migrationState()` reads `NotStarted` over the custom network the
-    /// `OrchardMigration` initializer registered.
+    /// and then verifies `migrationAdvanceStep()` reads `nil` (no stored run yet) over the custom
+    /// network the `OrchardMigration` initializer registered.
     ///
-    /// `migrationState()` opens the account-scoped migration store, which requires a real `accounts`
-    /// row (mirroring this file's class-wide `setUp()` and its own "representative of real usage"
-    /// rationale). The FIRST `OrchardMigration.init(config:)` below registers the custom network as
+    /// `migrationAdvanceStep()` opens the account-scoped migration store, which requires a real
+    /// `accounts` row (mirroring this file's class-wide `setUp()` and its own "representative of
+    /// real usage" rationale). The FIRST `OrchardMigration.init(config:)` below registers the custom network as
     /// a side effect (the behavior under test; its placeholder `accountUUID` is never queried) --
     /// only once that registration has happened can any other FFI call on this network id succeed,
     /// so `initDataDb`/`createAccount` (which discover the REAL `AccountUUID` the wallet assigns)
@@ -815,10 +860,10 @@ final class MigrationFFITests: XCTestCase {
         let migration = OrchardMigration(config: makeConfig(accountUUID: accountUUID))
 
         do {
-            let state = try await migration.migrationState()
-            XCTAssertEqual(state, MigrationState.notStarted)
+            let step = try await migration.advanceStep()
+            XCTAssertNil(step, "a fresh account on the custom network has no stored run yet")
         } catch {
-            XCTFail("Expected migrationState() to succeed once the custom network is registered by init(config:); got \(error)")
+            XCTFail("Expected advanceStep() to succeed once the custom network is registered by init(config:); got \(error)")
         }
     }
 
@@ -849,9 +894,16 @@ final class MigrationFFITests: XCTestCase {
     }
 
     /// Builds a valid row -- transfer 0, awaiting signature, ready, no next action, not blocked,
-    /// no txid -- with every field defaulted; override only the field(s) under test. Mirrors
-    /// `FfiMigrationTransactionStatus`'s field-by-field contract (see `rust/src/migration.rs`'s
-    /// doc comments).
+    /// no txid, no dependencies, no drawn anchor boundary -- with every field defaulted; override
+    /// only the field(s) under test. Mirrors `FfiMigrationTransactionStatus`'s field-by-field
+    /// contract (see `rust/src/migration.rs`'s doc comments).
+    ///
+    /// - Note: `dependsOnPtr`/`dependsOnLen` default to `nil`/`0` (no dependencies -- the C side's
+    ///   own "empty" encoding, not a null-vs-empty distinction the decode makes). A test exercising
+    ///   a non-empty `dependsOn` must supply a pointer that stays valid for the call's duration --
+    ///   see `testDecodeMapsDependsOnIds` below, which scopes one via
+    ///   `withUnsafeMutableBufferPointer`, mirroring `testDecodeContainerMapsMultipleRowsInEngineOrder`'s
+    ///   existing pattern for the outer container.
     private func makeStatus(
         id: UInt32 = 7,
         isTransfer: Bool = true,
@@ -866,7 +918,10 @@ final class MigrationFFITests: XCTestCase {
         hasTxid: Bool = false,
         ready: Bool = true,
         action: UInt8 = 0,
-        blockedOn: UInt8 = 0
+        blockedOn: UInt8 = 0,
+        dependsOnPtr: UnsafeMutablePointer<UInt32>? = nil,
+        dependsOnLen: UInt = 0,
+        anchorBoundary: Int64 = -1
     ) -> FfiMigrationTransactionStatus {
         FfiMigrationTransactionStatus(
             id: id,
@@ -882,7 +937,10 @@ final class MigrationFFITests: XCTestCase {
             has_txid: hasTxid,
             ready: ready,
             action: action,
-            blocked_on: blockedOn
+            blocked_on: blockedOn,
+            depends_on: dependsOnPtr,
+            depends_on_len: dependsOnLen,
+            anchor_boundary: anchorBoundary
         )
     }
 }

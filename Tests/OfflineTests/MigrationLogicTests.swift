@@ -24,28 +24,89 @@ final class MigrationLogicTests: ZcashTestCase {
     func testGateBlockedImmediatelyAfterMark() {
         // The +600 s buffer starts at `now`, so `now` itself is inside the blocked window.
         let resumeAt = referenceDate.addingTimeInterval(buffer)
-        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, hasOverdue: false, resumeAt: resumeAt))
+        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, hasOverdue: false, resumeAt: resumeAt, inFlightUntil: nil))
     }
 
     func testGateUnblocksAtExactlyBufferBoundary() {
         // At exactly `resumeAt` the buffer has elapsed: `now < resumeAt` is false.
         let resumeAt = referenceDate.addingTimeInterval(buffer)
-        XCTAssertFalse(MigrationSyncGate.isBlocked(now: resumeAt, hasOverdue: false, resumeAt: resumeAt))
+        XCTAssertFalse(MigrationSyncGate.isBlocked(now: resumeAt, hasOverdue: false, resumeAt: resumeAt, inFlightUntil: nil))
     }
 
     func testGateOverdueForcesBlockedEvenAfterBufferElapsed() {
         let resumeAt = referenceDate.addingTimeInterval(buffer)
         let afterBuffer = resumeAt.addingTimeInterval(1)
-        XCTAssertTrue(MigrationSyncGate.isBlocked(now: afterBuffer, hasOverdue: true, resumeAt: resumeAt))
+        XCTAssertTrue(MigrationSyncGate.isBlocked(now: afterBuffer, hasOverdue: true, resumeAt: resumeAt, inFlightUntil: nil))
     }
 
     func testGateOverdueForcesBlockedWithoutAnyBuffer() {
-        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, hasOverdue: true, resumeAt: nil))
+        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, hasOverdue: true, resumeAt: nil, inFlightUntil: nil))
     }
 
     func testGateCorruptOrMissingFileUnblockedWhenNoOverdue() {
         // Corrupt/missing file resolves to `resumeAt == nil`, which is "no gate".
-        XCTAssertFalse(MigrationSyncGate.isBlocked(now: referenceDate, hasOverdue: false, resumeAt: nil))
+        XCTAssertFalse(MigrationSyncGate.isBlocked(now: referenceDate, hasOverdue: false, resumeAt: nil, inFlightUntil: nil))
+    }
+
+    // MARK: - Gate math: broadcast in-flight marker
+
+    /// An unexpired in-flight marker blocks sync even with no overdue transfer and no privacy
+    /// buffer -- the third, independent reason the gate blocks (see `MigrationSyncGate`'s type doc).
+    func testGateBlockedWhileInFlightMarkerUnexpired() {
+        let inFlightUntil = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration)
+        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, hasOverdue: false, resumeAt: nil, inFlightUntil: inFlightUntil))
+    }
+
+    /// At exactly `inFlightUntil` the marker has elapsed: `now < inFlightUntil` is false, mirroring
+    /// the privacy buffer's own boundary rule.
+    func testGateUnblocksAtExactlyInFlightMarkerBoundary() {
+        let inFlightUntil = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration)
+        XCTAssertFalse(MigrationSyncGate.isBlocked(now: inFlightUntil, hasOverdue: false, resumeAt: nil, inFlightUntil: inFlightUntil))
+    }
+
+    /// `markBroadcastInFlight()` blocks sync immediately; `clearBroadcastInFlight()` releases it
+    /// again -- without either an overdue transfer or a privacy buffer in play.
+    func testMarkBroadcastInFlightBlocksAndClearReleases() {
+        let gate = makeGate(account: accountA, clock: TestClock(referenceDate))
+        XCTAssertFalse(gate.currentlyBlocked(hasOverdue: false), "precondition: fresh gate is unblocked")
+
+        gate.markBroadcastInFlight()
+
+        XCTAssertTrue(gate.currentlyBlocked(hasOverdue: false))
+        XCTAssertNotNil(gate.currentInFlightUntil())
+
+        gate.clearBroadcastInFlight()
+
+        XCTAssertFalse(gate.currentlyBlocked(hasOverdue: false))
+        XCTAssertNil(gate.currentInFlightUntil())
+    }
+
+    /// The in-flight marker self-expires after `broadcastInFlightGuardDuration` even without an
+    /// explicit `clearBroadcastInFlight()` -- the leak-safety a crash between submit and record
+    /// relies on.
+    func testInFlightMarkerSelfExpiresAfterGuardDuration() {
+        let clock = TestClock(referenceDate)
+        let gate = makeGate(account: accountA, clock: clock)
+
+        gate.markBroadcastInFlight()
+        XCTAssertTrue(gate.currentlyBlocked(hasOverdue: false))
+
+        clock.now = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration + 1)
+
+        XCTAssertFalse(gate.currentlyBlocked(hasOverdue: false), "an expired in-flight marker must stop blocking sync")
+    }
+
+    /// `markBroadcastInFlight()` preserves an already-running privacy buffer (they are independent,
+    /// concurrently-armable reasons to block -- see `markBroadcast()`'s doc).
+    func testMarkBroadcastInFlightPreservesAnExistingPrivacyBuffer() {
+        let gate = makeGate(account: accountA, clock: TestClock(referenceDate))
+        gate.markBroadcast()
+        let resumeAtBeforeInFlight = gate.currentResumeAt()
+
+        gate.markBroadcastInFlight()
+
+        XCTAssertEqual(gate.currentResumeAt(), resumeAtBeforeInFlight, "the privacy buffer must survive arming the in-flight marker")
+        XCTAssertNotNil(gate.currentInFlightUntil())
     }
 
     // MARK: - Gate file round-trip
@@ -121,6 +182,78 @@ final class MigrationLogicTests: ZcashTestCase {
 
         XCTAssertEqual(secondLaunchGate.currentResumeAt(), persistedResumeAt)
         XCTAssertTrue(secondLaunchGate.currentlyBlocked(hasOverdue: false))
+    }
+
+    /// The in-flight marker persists exactly like `resumeAt`: a fresh gate instance over the same
+    /// file (standing in for a relaunch mid-broadcast) honors an unexpired marker a prior instance
+    /// wrote, both through the instance API and through the file-only wallet-scope reader
+    /// `persistedGateInputs`.
+    func testPersistedInFlightMarkerRoundTripsThroughAFreshGateInstance() throws {
+        let clock = TestClock(referenceDate)
+        let firstLaunchGate = makeGate(account: accountA, clock: clock)
+        firstLaunchGate.markBroadcastInFlight()
+        let persistedInFlightUntil = try XCTUnwrap(firstLaunchGate.currentInFlightUntil())
+
+        let secondLaunchGate = makeGate(account: accountA, clock: clock)
+
+        XCTAssertEqual(secondLaunchGate.currentInFlightUntil(), persistedInFlightUntil)
+        XCTAssertTrue(secondLaunchGate.currentlyBlocked(hasOverdue: false))
+
+        let fileOnlyInputs = MigrationSyncGate.persistedGateInputs(directory: testGeneralStorageDirectory, accountUUID: accountA, logger: logger)
+        XCTAssertEqual(fileOnlyInputs.inFlightUntil, persistedInFlightUntil)
+        XCTAssertNil(fileOnlyInputs.resumeAt, "markBroadcastInFlight() alone must not start the privacy buffer")
+    }
+
+    /// `clearBroadcastInFlight()`'s file write is durable too: a fresh gate instance constructed
+    /// after the clear must not see a stale marker.
+    func testClearedInFlightMarkerStaysClearedForAFreshGateInstance() throws {
+        let clock = TestClock(referenceDate)
+        let firstLaunchGate = makeGate(account: accountA, clock: clock)
+        firstLaunchGate.markBroadcastInFlight()
+        firstLaunchGate.clearBroadcastInFlight()
+
+        let secondLaunchGate = makeGate(account: accountA, clock: clock)
+
+        XCTAssertNil(secondLaunchGate.currentInFlightUntil())
+        XCTAssertFalse(secondLaunchGate.currentlyBlocked(hasOverdue: false))
+    }
+
+    /// Back-compat: a gate file persisted before the in-flight marker existed never carries an
+    /// `inFlightUntilEpochSeconds` key at all (not merely a `null` value) -- the synthesized
+    /// `Codable` conformance must still decode it via `decodeIfPresent`, reading a live `resumeAt`
+    /// and an absent-but-harmless `inFlightUntil`.
+    func testOldGateFileWithoutInFlightFieldStillDecodes() throws {
+        let fileURL = testGeneralStorageDirectory.appendingPathComponent(MigrationSyncGate.fileName(accountUUID: accountA))
+        let resumeAtEpochSeconds = referenceDate.addingTimeInterval(buffer).timeIntervalSince1970
+        let legacyJSON = "{\"version\":1,\"resumeAtEpochSeconds\":\(resumeAtEpochSeconds)}"
+        try Data(legacyJSON.utf8).write(to: fileURL)
+
+        let gate = makeGate(account: accountA, clock: TestClock(referenceDate))
+
+        XCTAssertEqual(gate.currentResumeAt(), referenceDate.addingTimeInterval(buffer))
+        XCTAssertNil(gate.currentInFlightUntil())
+        XCTAssertTrue(gate.currentlyBlocked(hasOverdue: false))
+    }
+
+    // MARK: - Network-scaled privacy buffer
+
+    /// The privacy buffer is 600 s on mainnet -- the production privacy requirement.
+    func testPrivacySyncBufferDurationIsSixHundredSecondsOnMainnet() {
+        XCTAssertEqual(OrchardMigration.privacySyncBufferDuration(for: .mainnet), 600)
+    }
+
+    /// Testnet and regtest share the shorter 180 s buffer -- traffic-correlation privacy is moot
+    /// there, and the full 10 minutes only slows QA cycles down.
+    func testPrivacySyncBufferDurationIsOneHundredEightySecondsOnTestnetAndRegtest() {
+        XCTAssertEqual(OrchardMigration.privacySyncBufferDuration(for: .testnet), 180)
+        XCTAssertEqual(OrchardMigration.privacySyncBufferDuration(for: .regtest), 180)
+    }
+
+    /// The network-less `Synchronizer.migrationPrivacySyncBufferDuration` default constant forwards
+    /// the mainnet value verbatim -- it has no network to scale by (real synchronizers forward
+    /// their host's network-scaled value instead; see `SynchronizerMigrationDefaultsTests`).
+    func testStaticPrivacySyncBufferDurationConstantMatchesMainnet() {
+        XCTAssertEqual(OrchardMigration.privacySyncBufferDuration, OrchardMigration.privacySyncBufferDuration(for: .mainnet))
     }
 
     // MARK: - Storage provisioning (backup exclusion)
@@ -697,43 +830,43 @@ final class MigrationLogicTests: ZcashTestCase {
         )
     }
 
-    // MARK: - Reschedule delegation
+    // MARK: - Pending transfer proposal delegation
 
-    /// `rescheduleOverdueTransfer()` is now a straight delegation to the engine-backed welding
-    /// accessor: the proposal the welding returns is passed through untouched (no local
-    /// time-shifting of `nextExecutableAfterHeight`), the bound account is forwarded, and a `nil`
-    /// answer becomes `nil` out.
-    func testRescheduleOverdueTransferReturnsWeldingProposalUntouched() async throws {
+    /// `pendingTransferProposal()` (the renamed `rescheduleOverdueTransfer()`) is a straight
+    /// delegation to the engine-backed welding accessor: the proposal the welding returns is
+    /// passed through untouched (no local time-shifting of `nextExecutableAfterHeight`), the bound
+    /// account is forwarded, and a `nil` answer becomes `nil` out.
+    func testPendingTransferProposalReturnsWeldingProposalUntouched() async throws {
         let welding = ZcashRustBackendWeldingMock()
         let proposal = Self.makeSchedule(count: 3).transfers[1]
         welding.migrationPendingTransferProposalForReturnValue = proposal
         let migration = makeMigration(welding: welding, account: accountA)
 
-        let rescheduled = try await migration.rescheduleOverdueTransfer()
+        let pending = try await migration.pendingTransferProposal()
 
-        XCTAssertEqual(rescheduled, proposal)
+        XCTAssertEqual(pending, proposal)
         XCTAssertEqual(welding.migrationPendingTransferProposalForReceivedAccount, accountA)
     }
 
-    func testRescheduleOverdueTransferReturnsNilWhenWeldingReturnsNil() async throws {
+    func testPendingTransferProposalReturnsNilWhenWeldingReturnsNil() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.migrationPendingTransferProposalForReturnValue = nil
         let migration = makeMigration(welding: welding, account: accountA)
 
-        let rescheduled = try await migration.rescheduleOverdueTransfer()
+        let pending = try await migration.pendingTransferProposal()
 
-        XCTAssertNil(rescheduled)
+        XCTAssertNil(pending)
     }
 
-    func testRescheduleOverdueTransferRethrowsWhenWeldingThrows() async throws {
+    func testPendingTransferProposalRethrowsWhenWeldingThrows() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.migrationPendingTransferProposalForThrowableError =
             ZcashError.rustMigrationPendingTransferProposal("boom")
         let migration = makeMigration(welding: welding, account: accountA)
 
         do {
-            _ = try await migration.rescheduleOverdueTransfer()
-            XCTFail("Expected rescheduleOverdueTransfer to rethrow the welding error")
+            _ = try await migration.pendingTransferProposal()
+            XCTFail("Expected pendingTransferProposal to rethrow the welding error")
         } catch ZcashError.rustMigrationPendingTransferProposal {
             // expected
         } catch {
@@ -976,7 +1109,7 @@ final class MigrationLogicTests: ZcashTestCase {
             pczt: Data([0x01, 0x02])
         )
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationNextDueTransferForReturnValue = .ready(prepared)
+        welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x03, 0x04])
         // A no-op closure: if the fail-closed guard regresses and this ends up called anyway, it
         // completes instead of crashing the process, so the call-count assertion below fails cleanly
@@ -999,7 +1132,8 @@ final class MigrationLogicTests: ZcashTestCase {
                 options: MigrationNetworkPrivacyOptions(
                     useTor: true,
                     submissionEndpoint: LightWalletEndpoint(address: "default.example", port: 9067)
-                )
+                ),
+                useEstimatedTip: false
             )
             XCTFail("Expected migrationTorUnavailable to be thrown")
         } catch ZcashError.migrationTorUnavailable {
@@ -1056,7 +1190,7 @@ final class MigrationLogicTests: ZcashTestCase {
             )
             transfers.append(transfer)
         }
-        return MigrationSchedule(transfers: transfers, estimatedDurationHours: count * 6, proposalHandle: 1)
+        return MigrationSchedule(transfers: transfers, estimatedDurationHours: count * 6, proposalHandle: 1, preparations: [])
     }
 
     /// Builds a deliberately non-trivial `MigrationRunEstimate` fixture: two runs whose fields are
@@ -1069,13 +1203,17 @@ final class MigrationLogicTests: ZcashTestCase {
                     migratable: Zatoshi(75_000_000),
                     crossings: 15,
                     preparationLayers: 2,
-                    preparationTransactions: 5
+                    preparationTransactions: 5,
+                    actions: 125,
+                    keystoneSigningSessions: 2
                 ),
                 MigrationRunEstimate.Run(
                     migratable: Zatoshi(1_200_000),
                     crossings: 3,
                     preparationLayers: 1,
-                    preparationTransactions: 1
+                    preparationTransactions: 1,
+                    actions: 25,
+                    keystoneSigningSessions: 1
                 )
             ],
             finalResidual: Zatoshi(42_000)

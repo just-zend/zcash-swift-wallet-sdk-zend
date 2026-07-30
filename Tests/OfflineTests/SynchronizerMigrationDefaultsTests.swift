@@ -34,12 +34,32 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
 
     // MARK: - Throwing defaults
 
-    func testMigrationStateDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationState(accountUUID: self.accountUUID) }
+    func testMigrationAdvanceStepDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationAdvanceStep(accountUUID: self.accountUUID) }
     }
 
     func testMigrationProgressDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationProgress(accountUUID: self.accountUUID) }
+    }
+
+    func testFinalizeReadyMigrationTransfersDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.finalizeReadyMigrationTransfers(accountUUID: self.accountUUID) }
+    }
+
+    func testReconcileMigrationInvalidationsDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.reconcileMigrationInvalidations(accountUUID: self.accountUUID) }
+    }
+
+    func testMigrationSyncWakeupsDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationSyncWakeups(accountUUID: self.accountUUID) }
+    }
+
+    func testEstimatedMigrationChainTipDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.estimatedMigrationChainTip(accountUUID: self.accountUUID) }
+    }
+
+    func testEstimatedMigrationSecondsPerBlockDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.estimatedMigrationSecondsPerBlock(accountUUID: self.accountUUID) }
     }
 
     func testMigrationTransactionStatusesDefaultThrowsUnimplemented() async {
@@ -96,30 +116,51 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
     }
 
     func testSignAndStoreMigrationScheduleDefaultThrowsUnimplemented() async {
-        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1, proposalHandle: 0)
+        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1, proposalHandle: 0, preparations: [])
         let usk = TestsData(networkType: .testnet).spendingKey
         await assertThrowsMigrationUnimplemented {
             try await self.synchronizer.signAndStoreMigrationSchedule(accountUUID: self.accountUUID, schedule, usk: usk)
         }
     }
 
-    func testExecuteNextPendingMigrationTransferDefaultThrowsUnimplemented() async {
+    /// The two-argument convenience overload (`useEstimatedTip` defaulted to `false`) must reach
+    /// the same protocol-extension default as the three-argument requirement it forwards to.
+    func testExecuteNextPendingMigrationTransferTwoArgOverloadDefaultThrowsUnimplemented() async {
         let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067))
         await assertThrowsMigrationUnimplemented {
             _ = try await self.synchronizer.executeNextPendingMigrationTransfer(accountUUID: self.accountUUID, options: options)
         }
     }
 
-    func testHasOverdueMigrationTransfersDefaultThrowsUnimplemented() async {
+    func testExecuteNextPendingMigrationTransferDefaultThrowsUnimplemented() async {
+        let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067))
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.executeNextPendingMigrationTransfer(
+                accountUUID: self.accountUUID,
+                options: options,
+                useEstimatedTip: true
+            )
+        }
+    }
+
+    /// The one-argument convenience overload (`useEstimatedTip` defaulted to `false`) must reach the
+    /// same protocol-extension default as the two-argument requirement it forwards to.
+    func testHasOverdueMigrationTransfersOneArgOverloadDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.hasOverdueMigrationTransfers(accountUUID: self.accountUUID) }
+    }
+
+    func testHasOverdueMigrationTransfersDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.hasOverdueMigrationTransfers(accountUUID: self.accountUUID, useEstimatedTip: true)
+        }
     }
 
     func testHasInvalidMigrationTransfersDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.hasInvalidMigrationTransfers(accountUUID: self.accountUUID) }
     }
 
-    func testRescheduleOverdueMigrationTransferDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.rescheduleOverdueMigrationTransfer(accountUUID: self.accountUUID) }
+    func testPendingMigrationTransferProposalDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.pendingMigrationTransferProposal(accountUUID: self.accountUUID) }
     }
 
     func testRestartCurrentMigrationStepDefaultThrowsUnimplemented() async {
@@ -144,7 +185,7 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
     }
 
     func testCreateUnsignedNoteSplitPCZTsDefaultThrowsUnimplemented() async {
-        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1, proposalHandle: 0)
+        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1, proposalHandle: 0, preparations: [])
         await assertThrowsMigrationUnimplemented {
             _ = try await self.synchronizer.createUnsignedNoteSplitPCZTs(accountUUID: self.accountUUID, for: schedule)
         }
@@ -160,7 +201,7 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
     }
 
     func testCreateUnsignedMigrationTransferPCZTsDefaultThrowsUnimplemented() async {
-        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1, proposalHandle: 0)
+        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 1, proposalHandle: 0, preparations: [])
         await assertThrowsMigrationUnimplemented {
             _ = try await self.synchronizer.createUnsignedMigrationTransferPCZTs(accountUUID: self.accountUUID, for: schedule)
         }
@@ -173,8 +214,15 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         }
     }
 
+    func testBatchMigrationPcztsForSigningDefaultThrowsUnimplemented() async {
+        let pczts = [MigrationUnsignedTransferPczt(id: 0, pczt: Data([0x01, 0x02]), actions: 3)]
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.batchMigrationPcztsForSigning(pczts, maxActionsPerSession: MigrationSigningBudget.keystone)
+        }
+    }
+
     func testBuildKeystoneSignBatchQRPartsDefaultThrowsUnimplemented() async {
-        let pczts = [MigrationUnsignedTransferPczt(id: 0, pczt: Data([0x01, 0x02]))]
+        let pczts = [MigrationUnsignedTransferPczt(id: 0, pczt: Data([0x01, 0x02]), actions: 3)]
         await assertThrowsMigrationUnimplemented {
             _ = try await self.synchronizer.buildKeystoneSignBatchQRParts(requestId: Data([0xAB]), pczts: pczts, maxFragmentLen: 200)
         }
@@ -187,7 +235,7 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
     }
 
     func testApplyKeystoneBatchSignaturesDefaultThrowsUnimplemented() async {
-        let pczts = [MigrationUnsignedTransferPczt(id: 0, pczt: Data([0x01, 0x02]))]
+        let pczts = [MigrationUnsignedTransferPczt(id: 0, pczt: Data([0x01, 0x02]), actions: 3)]
         await assertThrowsMigrationUnimplemented {
             _ = try await self.synchronizer.applyKeystoneBatchSignatures(pczts: pczts, batchSignResponse: Data([0x03, 0x04]))
         }

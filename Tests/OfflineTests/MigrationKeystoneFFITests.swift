@@ -75,7 +75,7 @@ final class MigrationKeystoneFFITests: XCTestCase {
     /// A byte blob that is not a serialized PCZT must fail `pczt::parse` inside the build step,
     /// before redaction or UR/QR encoding are ever attempted.
     func testBuildSignBatchQRPartsWithNonPcztByteBlobThrows() async {
-        let pczts = [MigrationUnsignedTransferPczt(id: 1, pczt: Data([0, 1, 2, 3]))]
+        let pczts = [MigrationUnsignedTransferPczt(id: 1, pczt: Data([0, 1, 2, 3]), actions: 3)]
 
         do {
             _ = try await rustBackend.migrationKeystoneBuildSignBatchQrParts(
@@ -99,7 +99,7 @@ final class MigrationKeystoneFFITests: XCTestCase {
     /// documented failure modes of `apply_batch_signatures`, and both surface through the same
     /// `ZcashError` case.
     func testApplyBatchSignaturesWithInvalidPcztAndResponseThrows() async {
-        let pczts = [MigrationUnsignedTransferPczt(id: 1, pczt: Data([0, 1, 2, 3]))]
+        let pczts = [MigrationUnsignedTransferPczt(id: 1, pczt: Data([0, 1, 2, 3]), actions: 3)]
 
         do {
             _ = try await rustBackend.migrationKeystoneApplyBatchSignatures(

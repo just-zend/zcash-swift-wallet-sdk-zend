@@ -42,8 +42,8 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     /// driving each actor reaches the welding with that actor's own account UUID.
     func testMigrationForAccountCachesPerAccountAndRoutesTheRightUUID() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationStateForReturnValue = MigrationState.notStarted
-        welding.migrationHasOverdueTransfersForReturnValue = false
+        welding.migrationAdvanceStepForReturnValue = .waiting
+        welding.migrationHasOverdueTransfersForEstimatedTipReturnValue = false
         let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
 
         let firstA = await host.migration(for: accountA)
@@ -54,10 +54,10 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         XCTAssertFalse(firstA === firstB, "distinct accounts must get distinct actors")
 
         // Driving each actor (sequentially) reaches the welding with that actor's own account UUID.
-        _ = try await firstA.migrationState()
-        XCTAssertEqual(welding.migrationStateForReceivedAccount, accountA)
-        _ = try await firstB.migrationState()
-        XCTAssertEqual(welding.migrationStateForReceivedAccount, accountB)
+        _ = try await firstA.advanceStep()
+        XCTAssertEqual(welding.migrationAdvanceStepForReceivedAccount, accountA)
+        _ = try await firstB.advanceStep()
+        XCTAssertEqual(welding.migrationAdvanceStepForReceivedAccount, accountB)
     }
 
     // MARK: - Shared broadcaster (single Tor bootstrap across accounts)
@@ -80,12 +80,23 @@ final class OrchardMigrationHostTests: ZcashTestCase {
             txid: Data(repeating: 0xAB, count: 32),
             pczt: Data([0x01, 0x02])
         )
+        // Fulfilled from account B's own actor, right before it hands off to the shared broadcaster
+        // (its next step, `syncGate.markBroadcastInFlight()`, is synchronous, so this fires at most
+        // one actor-hop before B's `dedicatedTorClient()` cache check) -- a much tighter, and
+        // therefore far less flaky, synchronization point than counting `Task.yield()`s from B's
+        // Task start, which has to cross B's own mocked `migrationNextDueTransfer` call first too.
+        let accountBReachedTheBroadcaster = expectation(description: "account B's actor reached the point just before calling the shared broadcaster")
         // A fresh mock per account keeps the two concurrent broadcast flows off a shared mutable mock.
-        let perAccountFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { [testGeneralStorageDirectory, buffer, clock] accountUUID, broadcaster in
+        let perAccountFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { [testGeneralStorageDirectory, buffer, clock, accountB] accountUUID, broadcaster in
             let accountWelding = ZcashRustBackendWeldingMock()
-            accountWelding.migrationNextDueTransferForReturnValue = .ready(prepared)
-            accountWelding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
-            accountWelding.migrationHasOverdueTransfersForReturnValue = false
+            accountWelding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+            accountWelding.migrationExtractBroadcastTxPcztForClosure = { _, _ in
+                if accountUUID == accountB {
+                    accountBReachedTheBroadcaster.fulfill()
+                }
+                return Data([0x07])
+            }
+            accountWelding.migrationHasOverdueTransfersForEstimatedTipReturnValue = false
             return OrchardMigration(
                 welding: accountWelding,
                 accountUUID: accountUUID,
@@ -118,14 +129,21 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         let migrationB = await host.migration(for: accountB)
         let options = MigrationNetworkPrivacyOptions(useTor: true, submissionEndpoint: submissionEndpoint)
 
-        let taskA = Task { try await migrationA.executeNextPendingTransfer(options: options) }
+        let taskA = Task { try await migrationA.executeNextPendingTransfer(options: options, useEstimatedTip: false) }
         // Wait for account A's broadcast to have started the (single) bootstrap.
         await factory.awaitCallsStarted(1)
-        let taskB = Task { try await migrationB.executeNextPendingTransfer(options: options) }
-        // Scheduling aid only: let B reach the shared broadcaster's cached bootstrap while A holds it.
-        for _ in 0..<50 {
-            await Task.yield()
-        }
+        let taskB = Task { try await migrationB.executeNextPendingTransfer(options: options, useEstimatedTip: false) }
+        // Deterministic: B has reached its own extract step, one short hop from the shared
+        // broadcaster's cache check.
+        await fulfillment(of: [accountBReachedTheBroadcaster], timeout: 5)
+        // The one remaining hop is NOT purely cooperative: `MigrationSyncGate.markBroadcastInFlight()`
+        // -- B's very next step -- does a real synchronous, atomic file write (finding 14's
+        // durability requirement), which can genuinely block its worker thread on I/O rather than
+        // merely being an unscheduled `Task`; `Task.yield()` only reorders cooperatively-ready work
+        // and cannot wait out that write. A short real sleep is the honest bridge for that non-
+        // cooperative gap (the test's own correctness comes from `countWhileInFlight`/`finalCount`
+        // below, not from this duration).
+        try await Task.sleep(nanoseconds: 200_000_000)
 
         let countWhileInFlight = await factory.callCount
         XCTAssertEqual(countWhileInFlight, 1, "two accounts must share ONE Tor bootstrap through the host's shared broadcaster")
@@ -159,7 +177,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
 
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA), makeAccount(accountB)]
-        welding.migrationHasOverdueTransfersForReturnValue = false
+        welding.migrationHasOverdueTransfersForEstimatedTipReturnValue = false
         let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
 
         let blockedWhileBuffered = await host.isSyncBlocked()
@@ -204,8 +222,8 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     func testSyncBlockedStreamEmitsTrueAfterAHostedActorBroadcasts() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA)]
-        welding.migrationHasOverdueTransfersForReturnValue = false
-        welding.migrationNextDueTransferForReturnValue = .ready(PreparedMigrationTransfer(
+        welding.migrationHasOverdueTransfersForEstimatedTipReturnValue = false
+        welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(PreparedMigrationTransfer(
             id: 0,
             txid: Data(repeating: 0xAB, count: 32),
             pczt: Data([0x01, 0x02])
@@ -234,7 +252,8 @@ final class OrchardMigrationHostTests: ZcashTestCase {
 
         let migration = await host.migration(for: accountA)
         _ = try await migration.executeNextPendingTransfer(
-            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint)
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint),
+            useEstimatedTip: false
         )
 
         await fulfillment(of: [blockedEmitted], timeout: 5)
@@ -259,7 +278,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
 
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountD)]
-        welding.migrationHasOverdueTransfersForReturnValue = false
+        welding.migrationHasOverdueTransfersForEstimatedTipReturnValue = false
         let host = makeHost(
             welding: welding,
             broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),
@@ -326,6 +345,14 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         tickInterval: TimeInterval = 3600,
         gateTickInterval: TimeInterval = 3600
     ) -> OrchardMigrationHost {
+        // `isSyncBlocked()`/`syncBlockedStream` unconditionally read `migrationBlockRateSamples`
+        // (`ChainTipEstimator`'s raw input) while computing the wallet-scope predicate; default it
+        // to "no samples" so a test that never cares about the estimate does not crash on the
+        // mock's un-stubbed, implicitly-unwrapped `ReturnValue` -- a test that DOES care sets it
+        // itself before calling this helper, which this guard leaves untouched.
+        if welding.migrationBlockRateSamplesWindowReturnValue == nil {
+            welding.migrationBlockRateSamplesWindowReturnValue = []
+        }
         let clockValue = clock!
         return OrchardMigrationHost(
             welding: welding,
@@ -356,7 +383,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
                     bufferDuration: bufferDuration,
                     tickInterval: gateTickInterval,
                     now: { clockValue.now },
-                    overdueProvider: { (try? await welding.migrationHasOverdueTransfers(for: accountUUID)) ?? false },
+                    overdueProvider: { (try? await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: nil)) ?? false },
                     logger: logger
                 ),
                 logger: logger
@@ -376,7 +403,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         )
     }
 
-    private func assertThrowsMigrationTorUnavailable(_ task: Task<MigrationTransferResult?, Error>) async {
+    private func assertThrowsMigrationTorUnavailable(_ task: Task<MigrationTransferAttempt, Error>) async {
         do {
             _ = try await task.value
             XCTFail("Expected migrationTorUnavailable to be thrown")
