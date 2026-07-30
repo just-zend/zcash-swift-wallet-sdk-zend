@@ -126,7 +126,10 @@ class TransactionRepositoryTests: XCTestCase {
             value: Zatoshi(-1000),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)
@@ -159,7 +162,10 @@ class TransactionRepositoryTests: XCTestCase {
             value: .zero,
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)
@@ -187,7 +193,10 @@ class TransactionRepositoryTests: XCTestCase {
             value: .zero,
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)

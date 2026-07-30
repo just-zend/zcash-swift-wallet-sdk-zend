@@ -63,6 +63,19 @@ public enum ZcashTransaction {
         public let isExpiredUmined: Bool?
         public let totalSpent: Zatoshi?
         public let totalReceived: Zatoshi?
+        /// Number of the account's own notes this transaction spent.
+        public let spentNoteCount: Int
+        /// The value that crossed shielded pools when this transaction is a
+        /// wallet-internal transfer between them, such as an Orchard to
+        /// Ironwood migration; `nil` when it is not such a transfer.
+        ///
+        /// For such a transaction `value` is just the negated fee, so this is
+        /// the amount to present to a user rather than the balance delta.
+        public let poolCrossingValue: Zatoshi?
+        /// Whether this transaction is considered trusted, meaning its outputs
+        /// are spendable after the trusted confirmation count rather than the
+        /// untrusted one.
+        public let isTrusted: Bool
         public var state: State?
     }
 
@@ -71,6 +84,7 @@ public enum ZcashTransaction {
             case transaparent
             case sapling
             case orchard
+            case ironwood
             case other(Int)
             init(rawValue: Int) {
                 switch rawValue {
@@ -80,6 +94,8 @@ public enum ZcashTransaction {
                     self = .sapling
                 case 3:
                     self = .orchard
+                case 4:
+                    self = .ironwood
                 default:
                     self = .other(rawValue)
                 }
@@ -173,6 +189,9 @@ extension ZcashTransaction.Overview {
         static let expiredUnmined = SQLite.Expression<Bool?>("expired_unmined")
         static let totalSpent = SQLite.Expression<Int64?>("total_spent")
         static let totalReceived = SQLite.Expression<Int64?>("total_received")
+        static let spentNoteCount = SQLite.Expression<Int>("spent_note_count")
+        static let poolCrossingValue = SQLite.Expression<Int64?>("pool_crossing_value")
+        static let trustStatus = SQLite.Expression<Bool>("trust_status")
     }
 
     init(row: Row) throws {
@@ -189,6 +208,14 @@ extension ZcashTransaction.Overview {
             self.sentNoteCount = try row.get(Column.sentNoteCount)
             self.value = Zatoshi(try row.get(Column.value))
             self.isExpiredUmined = try row.get(Column.expiredUnmined)
+            self.spentNoteCount = try row.get(Column.spentNoteCount)
+            self.isTrusted = try row.get(Column.trustStatus)
+
+            if let poolCrossingValue = try row.get(Column.poolCrossingValue) {
+                self.poolCrossingValue = Zatoshi(poolCrossingValue)
+            } else {
+                self.poolCrossingValue = nil
+            }
             
             if let blockTime = try row.get(Column.blockTime) {
                 self.blockTime = TimeInterval(blockTime)

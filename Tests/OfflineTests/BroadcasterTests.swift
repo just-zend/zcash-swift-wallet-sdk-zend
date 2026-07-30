@@ -324,7 +324,10 @@ final class BroadcasterTests: ZcashTestCase {
             value: Zatoshi(-1_000),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false
         )
     }
 
