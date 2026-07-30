@@ -6,309 +6,213 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
-Changes are relative to `2.7.0-rc.1`, the most recent release preceding this one. Only the Swift
-API and behaviour an app can observe is listed here; the Rust core and its FFI are an
-implementation detail of the SDK and are documented in `rust/CHANGELOG.md`.
+Changes are relative to `2.8.0-rc.2`.
 
 ## Added
 
 ### Custom (regtest-style) networks
 
-- `NetworkActivationHeights`: per-upgrade activation heights (`sapling` through `nu6_3`), plus
-  `NetworkActivationHeights.allActiveFromGenesis`.
-- `NetworkType.regtest`.
-- `ZcashNetworkBuilder.regtest(activationHeights:)` and
-  `ZcashNetworkBuilder.custom(base:activationHeights:)`.
-- `ZcashSDKRegtestConstants`.
-- `ZcashNetwork.saplingActivationHeight`, `ZcashNetwork.customActivationHeights`, and
-  `ZcashNetwork.customNetworkBase`. Default implementations keep existing `ZcashNetwork` conformers
-  source-compatible.
-- Custom networks skip the chain-name and consensus-branch-ID server checks (in sync validation and
-  in `evaluateBestOf(endpoints:)`); the Sapling-activation-height check still applies. Registration
-  is process-global and ordering-sensitive — see `MIGRATING.md`.
+- `NetworkActivationHeights` (per-upgrade heights `sapling` through `nu6_3`, plus
+  `.allActiveFromGenesis`), `ZcashNetworkBuilder.regtest(activationHeights:)`,
+  `ZcashNetworkBuilder.custom(base:activationHeights:)`, and `ZcashSDKRegtestConstants`.
+- `ZcashNetwork.saplingActivationHeight`, `.customActivationHeights`, and `.customNetworkBase`.
+  Default implementations keep existing `ZcashNetwork` conformers source-compatible.
+- A custom network skips the chain-name and consensus-branch-id server checks, in sync validation and
+  in `evaluateBestOf(endpoints:)`; the Sapling-activation-height check still applies. Registration is
+  process-global and ordering-sensitive — see `MIGRATING.md`.
 
 ### Transaction submission
 
-- `CreatedTransaction`, `SubmissionTiming`, `TransactionSubmissionOutcome`, and
-  `TransactionSubmissionReport`.
-- `Broadcaster.submit(transaction:to:timing:)` and `Broadcaster.submit(transactions:to:timing:)`,
-  each with a `timing`-less convenience overload defaulting to `SubmissionTiming.default`.
-- `LightWalletEndpoint` now conforms to `Equatable`.
+- `timing`-less overloads of `Broadcaster.submit(transaction:to:)` and
+  `Broadcaster.submit(transactions:to:)`, defaulting to `SubmissionTiming.default`.
 
 ### Balances
 
-- `PoolBalance.lockedValue`: value held by an explicit output lock, excluded from `spendableValue`
-  but still owned by the account.
-- `AccountBalance.shieldedSpendableValue`, `AccountBalance.shieldedTotal()`,
-  `AccountBalance.shieldedChangePendingConfirmation`, and
-  `AccountBalance.shieldedValuePendingSpendability`: sums across every shielded pool, so call sites
-  do not hand-sum pools and pick up future pools automatically.
+- `PoolBalance.lockedValue`: value held by an output lock, excluded from `spendableValue` but still
+  owned by the account.
+- `AccountBalance.shieldedSpendableValue`, `.shieldedTotal()`, `.shieldedChangePendingConfirmation`,
+  and `.shieldedValuePendingSpendability`: sums over every shielded pool, so call sites need not
+  hand-sum pools and pick up future pools automatically.
 
-### Orchard → Ironwood migration models
+### Ironwood pool
 
-- `MigrationState`, `MigrationProgress`, `MigrationAttentionReason`, `MigrationSchedule`,
-  `MigrationTransferProposal`, `MigrationTransferResult`, `MigrationRunEstimate` (and its
-  `MigrationRunEstimate.Run`), `NoteSplitProposal`, `PreparedMigrationTransfer`,
-  `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`, `MigrationTransactionStatus`,
-  `DueMigrationTransfer`, `KeystoneBatchDecodeResult`, and `KeystoneFirmwareVersion`.
-- `DueMigrationTransfer` is what the delivery lane answers with: `.nothingDue`, `.ready` (a proven
-  transaction to broadcast), or `.awaitingProof` (a transaction is due but its proof has not been
-  produced yet). Proving is opportunistic and belongs to the sync path — a transaction's anchor
-  becomes witnessable long before its broadcast schedule arrives — so proofs are produced by a
-  separate sweep as blocks are scanned, and broadcasting stays a pure delivery step that never
-  proves.
-- Migration transaction ids are `UInt32` (the engine's own id type) rather than decimal strings,
-  across `MigrationTransferProposal`, `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`,
-  `MigrationSignedTransferPczt`, `MigrationAttentionReason.invalidTransfer`, and
-  `migrationRecordTransferResult(transferId:result:for:)`.
-- These are the value types the `Synchronizer` migration group below produces and consumes.
-- New `ZcashError` cases for the migration surface: `ZRUST0098`–`ZRUST0106`, `ZRUST0108`, and
-  `ZRUST0111`–`ZRUST0140` (`ZRUST0107` was retired with the engine-backed immediate lane; see
-  `## Changed`).
+- `ZcashTransaction.Output.Pool.ironwood`: Ironwood outputs decode to their own case instead of
+  `.other(4)`. A `switch` over `Pool` with no `default` stops compiling until the case is handled.
+- `ZcashNetwork.ironwoodActivationHeight`.
 
-### Orchard → Ironwood migration (`Synchronizer` surface)
+### Orchard → Ironwood migration
 
-- Orchard→Ironwood pool-migration engine, exposed as a 32-member migration group on the
-  `Synchronizer` protocol, built over the pool-migration FFI/welding layer whose model types
-  are listed above: the app talks only to `Synchronizer` — the per-account migration engine,
-  broadcaster, and privacy gate behind it are internal. Account-scoped members take an
-  `AccountUUID`, and two migrations can run concurrently (for example a software account and a
-  hardware-wallet account): all engine state is account-keyed, per-account broadcasts stay
-  single-flight without cross-account serialization, and every account shares one dedicated
-  migration Tor runtime. The group covers the migration state machine and progress, note-split
-  propose/sign/submit, a gradual (randomized-cadence) schedule proposal with one-confirmation
-  `signAndStoreMigrationSchedule`, height-gated background delivery
-  (`executeNextPendingMigrationTransfer` — migration members work without `prepare()`, so a
-  background session can broadcast without starting sync; the delivery lane serves preparation
-  transactions and transfers alike, proving each at broadcast time per ZIP 374), overdue/invalid
-  detection with the stored-run reschedule accessor, cancel-and-replan restart recovery
-  (`restartCurrentMigrationStep`), and rebuild-on-expiry recovery
-  (`refreshStaleMigrationTransfers(accountUUID:usk:)` rebuilds every EXPIRED transfer of the stored
-  run in place — the same funding note on a fresh schedule/expiry/boundary — with an optional `usk`
-  selecting the in-process-sign or external-signer (Keystone) lane, persisted ALL-OR-NOTHING (a
-  mid-refresh failure persists none of the batch); a funding note spent outside the migration
-  surfaces an error naming `restartCurrentMigrationStep` as the remedy),
-  the per-run `complete` + fresh-propose sequential-runs contract, and an external-signer (PCZT)
-  path for hardware wallets (`createUnsignedNoteSplitPCZTs` / `storeSignedNoteSplitPCZTs` — plural:
-  the engine builds N preparation transactions, and one ceremony signs them together with
-  `createUnsignedMigrationTransferPCZTs` / `storeSignedMigrationSchedulePCZTs`). Migration broadcasts run over a dedicated Tor runtime (own
-  state directory `<torDir>/migration_tor`, fresh isolated circuit per submission, one bootstrap
-  shared across accounts, independent of the global `tor(enabled:)` toggle) with fail-closed
-  semantics — Tor requested but unavailable throws `ZcashError.migrationTorUnavailable`, never a
-  silent clearnet fallback — to exactly one submission endpoint per attempt
-  (`MigrationNetworkPrivacyOptions.submissionEndpoint` is required: the host picks the submission
-  server explicitly per broadcast, and the SDK never falls back to the sync server), with no
-  multi-endpoint fan-out and no post-broadcast txid polling: confirmation comes from block
-  scanning alone. Session separation is SDK-enforced in both directions: `start()` throws
-  `ZcashError.migrationSyncBlocked` (ZRUST0125) while the wallet-scope 10-minute broadcast→sync
-  privacy gate is active (`isMigrationSyncBlocked()` / `migrationSyncBlockedStream` /
-  `migrationPrivacySyncBufferDuration`, aggregated across every account including dormant ones),
-  and the broadcast-performing migration methods throw `ZcashError.migrationBroadcastDuringSync`
-  (ZRUST0126) while a sync runs — an advisory point-in-time check, not a hard lock.
-  `ZcashNetwork.ironwoodActivationHeight` exposes the NU6.3 activation height so hosts can stop
-  hardcoding it. Schedule persistence after commit is the host's responsibility: the SDK
-  deliberately keeps no local copy of the committed proposal list. The Closure/Combine wrapper
-  synchronizers deliberately do not mirror the migration group.
-  - The residual-lock pair and the rounds preview are group members too:
-    `lockMigrationResidual(accountUUID:)` (the "Lock balance" choice at migration `Complete` —
-    locks every currently-spendable, not-already-locked legacy-Orchard note until explicit unlock
-    and returns the total locked), `unlockMigrationResidual(accountUUID:)` (the release half,
-    returning the number of locks cleared), and `estimateMigrationRuns(accountUUID:)` (the
-    `MigrationRunEstimate` behind the multi-round UI). "Migrate anyway" over a locked residual
-    composes as `unlockMigrationResidual` then `proposeImmediateMigration`, in that order, since
-    locked notes are excluded from note selection.
-  - `migrationTransactionStatuses(accountUUID:)` serves the LIVE per-transaction rows behind
-    `migrationProgress`'s aggregate summary: every committed migration transaction's kind
-    (preparation layer/index or transfer crossing), lifecycle state, scheduled/expiry heights,
-    readiness, and next action/blocker, keyed by a stable id. `broadcast`/`mined` fold the engine's
-    txid/mined-height payload into the matching case so illegal combinations are unrepresentable —
-    a MINED row's txid is NOT carried by the engine's own state model, so it is available only
-    while a transaction is `broadcast` (in flight), not once mined. An empty array means no stored
-    run or no transactions, not an error.
-  - DEBUG/QA-only `debugRescheduleMigrationTransfers(accountUUID:)` compresses a committed
-    migration schedule for fast broadcast testing (Android parity).
-  - The Keystone batch-signing bridge carries the external-signer ceremony's PCZTs to a hardware
-    signer over an animated multi-part QR UR, as four DB-free members:
-    `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)` redacts every PCZT for the
-    batch-Signer role and returns the animated QR frames (callers retain their own unredacted
-    PCZTs — those are what applying signatures signs, and must be passed back in the SAME order);
-    `resetKeystoneSignBatchDecoder()` discards any in-flight scan session (infallible — call on
-    scan-screen entry/retry/exit, since only one session exists at a time);
-    `decodeKeystoneSignBatchPart(_:expectedRequestId:)` feeds one scanned frame to the session and
-    returns a `KeystoneBatchDecodeResult` (`complete`/`progress`; on completion, the
-    signatures-only response bytes and — the ONLY way to learn it in this flow — the signing
-    device's `KeystoneFirmwareVersion`, sourced from the response envelope, not any PCZT field; a
-    request-id mismatch at completion throws, rejecting a stale or unrelated scan); and
-    `applyKeystoneBatchSignatures(pczts:batchSignResponse:)` applies the device's positional
-    signatures onto the caller-held unredacted PCZTs, returning `[MigrationSignedTransferPczt]`
-    ready for `storeSignedNoteSplitPCZTs` / `storeSignedMigrationSchedulePCZTs`.
-  - Duplicate re-submissions self-heal: a submit rejection identifying the transaction as already
-    known (zcashd's already-in-chain code −27, or the already-in-block-chain/mempool-duplicate
-    reject messages) is recorded as success, so a retried broadcast whose first attempt actually
-    landed completes the transfer instead of parking the migration on a bogus failure.
-  - A record failure after a successful broadcast no longer skips the 10-minute privacy buffer:
-    the sync gate marks the moment the submit outcome is a success, before the engine records the
-    result, and the call then throws the distinguishable
-    `ZcashError.migrationRecordFailedAfterBroadcast` (ZRUST0124) — transient, since a later
-    execution window self-heals via the duplicate-rejection→success mapping.
-  - Migration works on custom (regtest-style) networks without a prior `Initializer`: the internal
-    engine registers the configured custom activation heights itself.
-  - Hardened per the adversarial review: sync-gate emissions are serialized behind a
-    re-entrancy-safe two-lock design, concurrent migration broadcasts share a single-flight Tor
-    bootstrap, the sync-gate ticker runs only while the blocked stream has subscribers, and the
-    migration gate state file is excluded from device backups.
-
-### Ironwood pool coverage
-
-- `ZcashTransaction.Output.Pool.ironwood`: outputs in the Ironwood (NU6.3) pool now decode to
-  their own case instead of `.other(4)`. **Source-breaking** only for switches that lack a
-  `default` — which `.other` already required.
+- A 32-member migration group on the `Synchronizer` protocol, account-scoped by `AccountUUID`. Two
+  accounts (for example one software and one hardware-wallet account) can migrate concurrently. Its
+  members work without `prepare()`, so a background session can deliver a transfer without starting
+  sync, and on custom networks without a prior `Initializer`. `ClosureSynchronizer` and
+  `CombineSynchronizer` do not mirror the group.
+- Value types: `MigrationState`, `MigrationProgress`, `MigrationAttentionReason`,
+  `MigrationSchedule`, `MigrationTransferProposal`, `MigrationTransferResult`,
+  `MigrationRunEstimate` (with `MigrationRunEstimate.Run`), `NoteSplitProposal`,
+  `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`,
+  `MigrationTransactionStatus`, `DueMigrationTransfer`, `KeystoneBatchDecodeResult`, and
+  `KeystoneFirmwareVersion`. Migration transaction ids are `UInt32`.
+- Planning and delivery: a randomized-cadence schedule proposal committed by
+  `signAndStoreMigrationSchedule`, then height-gated background delivery through
+  `executeNextPendingMigrationTransfer`, which answers `DueMigrationTransfer.nothingDue`, `.ready`,
+  or `.awaitingProof` — a transfer can be due before its proof exists, and broadcasting never proves.
+  A submit rejection identifying the transaction as already known is recorded as success, so a
+  retried broadcast whose first attempt landed completes the transfer.
+- Recovery: `restartCurrentMigrationStep` cancels and re-plans;
+  `refreshStaleMigrationTransfers(accountUUID:usk:)` rebuilds every expired transfer of the stored
+  run, all-or-nothing, with `usk` selecting in-process signing or the external-signer lane. A funding
+  note spent outside the migration throws, naming `restartCurrentMigrationStep` as the remedy.
+- External signer: `createUnsignedNoteSplitPCZTs` / `storeSignedNoteSplitPCZTs` and
+  `createUnsignedMigrationTransferPCZTs` / `storeSignedMigrationSchedulePCZTs`. All are plural: a run
+  has N preparation transactions, and one signing ceremony covers them together.
+- Keystone batch signing: `buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)`,
+  `resetKeystoneSignBatchDecoder()`, `decodeKeystoneSignBatchPart(_:expectedRequestId:)`, and
+  `applyKeystoneBatchSignatures(pczts:batchSignResponse:)`. Retain your own unredacted PCZTs and pass
+  them back in the same order — signatures align by position. A completed scan is the only place the
+  device's `KeystoneFirmwareVersion` is reported; a request-id mismatch throws.
+- Residual and estimation: `lockMigrationResidual(accountUUID:)` locks every spendable
+  legacy-Orchard note until explicit unlock and returns the total locked;
+  `unlockMigrationResidual(accountUUID:)` returns the number of locks cleared; and
+  `estimateMigrationRuns(accountUUID:)` returns the `MigrationRunEstimate` behind a multi-round UI.
+  Migrating a locked residual anyway is `unlockMigrationResidual` then `proposeImmediateMigration`,
+  in that order, since locked notes are excluded from selection.
+- `migrationTransactionStatuses(accountUUID:)`: the live per-transaction rows behind
+  `migrationProgress`'s summary — kind, lifecycle state, scheduled and expiry heights, readiness, and
+  next action, keyed by a stable id. A txid is available only while a transaction is `broadcast`, not
+  once mined. An empty array means no stored run, not an error.
+- Privacy and cost contract the host must build confirmation UI around: broadcasts go over a
+  dedicated Tor runtime, independent of the global `tor(enabled:)` toggle, and fail closed — Tor
+  requested but unavailable throws `ZcashError.migrationTorUnavailable`, never a silent clearnet
+  fallback. `MigrationNetworkPrivacyOptions.submissionEndpoint` is required: exactly one server per
+  attempt, chosen by the host, and confirmation comes from block scanning rather than txid polling.
+  `start()` throws `ZcashError.migrationSyncBlocked` while the wallet-wide 10-minute broadcast→sync
+  window is open (`isMigrationSyncBlocked()`, `migrationSyncBlockedStream`,
+  `migrationPrivacySyncBufferDuration`), and the broadcasting members throw
+  `ZcashError.migrationBroadcastDuringSync` while a sync runs. A record failure after a successful
+  broadcast throws the distinguishable `ZcashError.migrationRecordFailedAfterBroadcast`, which a
+  later execution window heals.
+- Persisting the committed schedule is the host's responsibility; the SDK keeps no copy.
+- `debugRescheduleMigrationTransfers(accountUUID:)` (DEBUG builds only) compresses a committed
+  schedule for broadcast testing.
+- New `ZcashError` cases: `ZRUST0098`–`ZRUST0106`, `ZRUST0108`, and `ZRUST0111`–`ZRUST0140`.
 
 ### Slipstream sync engine
 
-- `SlipstreamSynchronizer` — an alternative, engine-driven implementation of `Synchronizer` backed
-  by the `slipstream-core` sync engine (consumed as a remote crate): non-linear Spend-before-Sync
-  scheduling, concurrent density-adaptive fetch, sparse commitment-tree persistence (byte-identical
-  to the upstream path, oracle-gated), an autonomous session with per-call Tor policy and server
-  failover, poll-model snapshots (`SynchronizerState.isRecovering`), and a stall watchdog. FFI
-  surface `zcashlc_slipstream_*` with error codes `ZRUST0093`–`ZRUST0097`. Hosts opt in by
-  constructing it; `SDKSynchronizer` remains the default engine. It also implements the
-  `Synchronizer` protocol's migration group (above) against its own `OrchardMigrationHost`, with
-  the same SDK-enforced start-gate/broadcast-guard session separation as `SDKSynchronizer`, and
-  forwards the Keystone batch-signing bridge the same way `SDKSynchronizer` does — straight to the
-  same rust backend instance, bypassing `OrchardMigrationHost` since the bridge is DB-free.
-- `Synchronizer.allTransactions()` is a formal protocol requirement, and
-  `TransactionRepository.unreconciledTxids()` exposes the read-side reconciliation view (defaults
-  to empty when the engine's view is absent).
-
-### Errors
-
-- `ZcashError.initializerSeedMismatch` (`ZINIT0006`).
+- `SlipstreamSynchronizer`, an alternative `Synchronizer` implementation with non-linear
+  Spend-before-Sync scheduling, concurrent density-adaptive fetch, per-call Tor policy with server
+  failover, and a stall watchdog. Hosts opt in by constructing it; `SDKSynchronizer` remains the
+  default. It implements the migration group above with the same session separation. Error codes
+  `ZRUST0093`–`ZRUST0097`.
+- `SynchronizerState.isRecovering`.
+- `Synchronizer.allTransactions()` is now a protocol requirement, and
+  `TransactionRepository.unreconciledTxids()` exposes the read-side reconciliation view, defaulting
+  to empty where the engine's view is absent.
 
 ## Changed
 
-- `InitializationResult` gained a `.seedNotRelevant` case, returned by `Initializer.initialize` /
-  `Synchronizer.prepare` when the provided seed does not belong to the wallet database rather than
-  proceeding as if preparation succeeded. **Source-breaking** for exhaustive switches; handle it as
-  you already handle `.seedRequired`. (MOB-1512)
-- `NetworkType` gained a `.regtest` case. **Source-breaking** for exhaustive switches over
-  `NetworkType`.
-- `prepare(with:walletBirthday:name:keySource:)` no longer takes a `WalletInitMode` — the SDK
-  derives new-vs-restore from the wallet state and the (now optional) birthday, and the enum is
-  removed. See `MIGRATING.md`.
-- `prepare(with:walletBirthday:name:keySource:)` now throws `ZcashError.initializerSeedMismatch`
-  when the wallet already holds seed-derived accounts that the supplied seed cannot spend from.
-  Restoring a different wallet into the same database requires `wipe()` first; wallets whose only
-  accounts are imported (hardware-wallet UFVKs) are exempt.
-- `Broadcaster` is redesigned for multi-server submission (see `MIGRATING.md`):
-  - `createProposedTransactions` and `createTransactionFromPCZT` return `[CreatedTransaction]`
-    (non-optional raw bytes) instead of `[ZcashTransaction.Overview]`.
-  - `submit(_:to:)` (raw bytes, single endpoint, throwing) is replaced by
-    `submit(transaction:to:timing:)`, which races several endpoints, resolves to a
-    `TransactionSubmissionOutcome` instead of throwing, and resolves `.cancelled` promptly when the
-    awaiting task is cancelled. `submit(transactions:to:timing:)` submits a batch sequentially,
-    stopping at the first transaction that is not accepted.
-  - The endpoints used are recorded as the transaction's retry plan and reused by background
-    resubmission until the transaction expires; `Synchronizer.wipe()` deletes the plan database.
-  - With Tor enabled, each endpoint submission uses an isolated Tor client.
-- `PoolBalance.total()` now includes `lockedValue`, so locked funds remain visible in account sums.
-- New wallets take their birthday from a recent lightwalletd tree state (below the reorg horizon)
-  instead of the bundled checkpoint, falling back to the checkpoint when the server is unreachable.
-- `Synchronizer.submitTransactions` re-checks a non-zero submit error against the same server and
-  reports `TransactionSubmitResult.success` when the server already knows the transaction, instead
-  of surfacing a spurious failure.
-- `Synchronizer.proposeOrchardToIronwoodMigration(accountUUID:)` (shipped in 2.8.0-rc.1) is no
-  longer the migration story: it sweeps whatever fits in ONE transaction, which cannot migrate a
-  real Orchard balance. It stays for callers already using it — and is now built over the same
-  send-max primitive the migration group's immediate lane uses — but new integrations should
-  drive the staged migration group above.
-- The wallet database opens with a 15 s SQLite `busy_timeout` (the engine can hold a short writer
-  lock during `deleteAccount`/`importAccount`; the legacy path has no concurrent writer, so the
-  timeout never engages there).
-- Scan-path tracing is quieter: `zcash_client_backend` spans are capped at WARN, since its
-  per-block/batch `#[instrument]` spans cost syscalls on the scan producer thread through
-  os_log/signpost (measured: production first pass 3.4 s → 0.5 s).
-- The immediate (single-transaction) migration lane leaves the engine:
-  `proposeImmediateMigration(accountUUID:)` now returns an ordinary `ImmediateMigrationProposal` (a
-  `Proposal` plus its decoded `amount`/`fee`) instead of a `MigrationSchedule`, executed through the
-  normal transfer pipeline (`createProposedTransactions` / `createPCZTFromProposal`) rather than the
-  engine's schedule/commit machinery; a new `recordImmediateMigration(accountUUID:txid:)` folds a
-  successful broadcast into the same platform state machine (`InProgress` while unmined, then quiet
-  once mined — see the immediate-aftermath entry below). See `MIGRATING.md`.
-- The immediate-migration aftermath goes quiet, and `MigrationProgress` gains `isImmediate: Bool`:
-  once an immediate (send-max) sweep recorded via `recordImmediateMigration(accountUUID:txid:)`
-  mines, the migration state machine no longer reports `.complete` for it — the mined run is consumed
-  and the state falls back to `.notStarted` (nothing to acknowledge; the balance-gated "Migration
-  Required" prompt re-offers only if new Orchard funds arrive later). `MigrationProgress.isImmediate`
-  is `true` only for an in-progress immediate sweep and `false` for engine-tracked runs, so the app
-  can suppress per-transfer progress UI during the immediate lane; the public initializer defaults
-  `isImmediate` to `false`, so it is source-compatible. (MOB-1513)
+- `NetworkType` gained a `.regtest` case: an exhaustive `switch` over it stops compiling until the
+  case is handled.
+- `prepare(with:walletBirthday:name:keySource:)` no longer takes a `WalletInitMode`, and that enum is
+  removed — the SDK derives new-versus-restore from the wallet state and the now-optional birthday.
+  Drop the argument; see `MIGRATING.md`.
+- `PoolBalance.total()` now includes `lockedValue`, so locked funds stay visible in account sums.
+- `proposeImmediateMigration(accountUUID:)` returns an `ImmediateMigrationProposal` (a `Proposal`
+  plus its decoded `amount` and `fee`) instead of a `MigrationSchedule`, and executes through the
+  ordinary `createProposedTransactions` / `createPCZTFromProposal` pipeline. Record the broadcast with
+  the new `recordImmediateMigration(accountUUID:txid:)` so the migration state machine reports it.
+  See `MIGRATING.md`.
+- Once an immediate sweep recorded that way mines, the state machine reports `.notStarted` rather
+  than `.complete`: there is nothing for the user to acknowledge, and a balance-gated prompt re-offers
+  only if new Orchard funds arrive. `MigrationProgress.isImmediate` distinguishes an in-progress
+  immediate sweep from an engine-tracked run; its initializer defaults the field, so existing
+  construction still compiles.
+- `proposeOrchardToIronwoodMigration(accountUUID:)` remains for existing callers, but it sweeps only
+  what fits in one transaction and cannot migrate a realistic Orchard balance; new integrations
+  should drive the migration group above.
+- The wallet database opens with a 15 s SQLite `busy_timeout`, so contention with a concurrent writer
+  surfaces as a wait rather than an immediate `database is locked`.
 
 ## Fixed
-- Memos on Ironwood (NU6.3) outputs are retrievable: the FFI's pool-code decode recognized only
-  Sapling and Orchard, so a note id in the Ironwood pool was rejected as an unrecognized shielded
-  protocol.
-- During a restore (and the bounded post-restore hold), the Slipstream summary no longer reports
-  its collapsed recovery balance as ORCHARD value once NU6.3 is active. The engine's recovery view
-  is a per-account net with no pool breakdown, so the whole net is surfaced in one pool; reporting
-  it as Orchard told a host gating "Migration Required" on a nonzero Orchard balance to prompt a
-  wallet that may hold nothing in Orchard. Post-activation the net now lands in Ironwood, so the
-  prompt stays quiet for the (≤120 s) recovery window and the genuine prompt arrives with the real
-  per-pool summary. Totals (`AccountBalance.shieldedTotal()`, `total()`) are unchanged either way.
-- The Keystone batch-signing apply (`Synchronizer.applyKeystoneBatchSignatures`) no longer
-  looks its PCZT ids up: the apply step only echoes them back positionally, so ids on this call
-  are correlation labels, not engine lookups. A batch whose ids were not engine-numeric used to
-  fail after every successful device scan (an app labelling its preparation entries, for
-  example); ids now cross the FFI as the engine's own `UInt32`, so there is no id decode left to
-  fail. The two signed-PCZT store calls do still look transactions up by that id, and the
-  `MigrationUnsignedTransferPczt.id` / `MigrationSignedTransferPczt.id` documentation spells the
-  split out.
 
-- Transient Tor transport failures no longer end a sync session fatally. Tor-layer errors are now
-  classified as retryable service errors, so a circuit or stream failure triggers the usual
-  reset-and-retry (up to `ZcashSDK.serviceFailureRetries`) instead of requiring an app restart.
-- A malformed or hostile lightwalletd subtree-roots response can no longer crash the process: an
-  out-of-range `completingBlockHeight` is rejected rather than trapping on conversion.
+- Memos on Ironwood outputs are retrievable; a note id in the Ironwood pool was rejected as an
+  unrecognized shielded protocol.
+- `getAccountsBalances()` no longer reports empty balances for up to ~30 s after a restore completes,
+  which briefly zeroed the restored funds and any migration eligibility derived from them.
+- Under `SlipstreamSynchronizer`, the collapsed balance reported during a restore lands in the
+  Ironwood pool once NU6.3 is active rather than in Orchard, so a host gating a migration prompt on a
+  nonzero Orchard balance is no longer prompted on a guess. Totals are unchanged.
+- `applyKeystoneBatchSignatures(pczts:batchSignResponse:)` accepts a batch whose PCZT ids are not
+  engine-numeric; it previously failed after an otherwise successful device scan.
+- A malformed or hostile lightwalletd subtree-roots response no longer crashes the process on an
+  out-of-range `completingBlockHeight`.
 - A stalled Ironwood subtree-roots stream is retried like the Sapling and Orchard streams instead of
-  being swallowed, so a server that black-holes it no longer adds the full streaming deadline
-  (~100 s) to every sync pass. Genuine "Ironwood not supported" responses are still skipped.
-- Server-streaming gRPC calls use the streaming-call timeout rather than the shorter single-call
-  timeout, fixing premature `[ZUTXO0001]` failures and the same latent timeout on the subtree-root,
-  transparent-address-txid, and block-range streams.
-- `LightWalletGRPCService` shuts down its NIO event loop group in `stop()`, fixing a thread leak per
-  ephemeral connection.
-- An unmined transaction whose `expiryHeight` has passed is reported as
-  `ZcashTransaction.Overview.State.expired` even when the database's `expiredUnmined` column has not
-  been flipped, so transactions left unmined across a consensus-rule change no longer stay `.pending`
-  indefinitely.
-- Block enhancement retries the write step that follows a transaction fetch, instead of giving up
-  after a single attempt and leaving the transaction unresolved.
-- Transaction resubmission no longer re-broadcasts a freshly submitted transaction during the first
-  sync cycle of a session; its five-minute throttle now engages on first invocation.
-- `getAccountsBalances()` (and the migration-eligibility read that depends on it) no longer briefly
-  reports empty balances right after a wallet restore completes. When the engine flips out of
-  recovery, the upstream wallet summary can transiently report no balance data for up to ~30 s while
-  it finalizes the just-restored notes; the Slipstream unified summary was serving that gap as empty,
-  so the restored funds — and the "Migration Required" eligibility — flickered to zero. The summary
-  now holds the engine-owned reconciled recovery-view balances across that window: bounded to 120 s,
-  released the instant the upstream summary returns real balances (whose value then wins
-  unconditionally), and suppressed whenever a pending unmined outgoing spend could otherwise make the
-  held value over-show. A process restart inside the window falls back to the prior behavior.
+  adding the full streaming deadline to every sync pass. Genuine "Ironwood not supported" responses
+  are still skipped.
 
 # 2.8.0-rc.2 - 2026-07-28
 
 ## Changed
-- The FFI xcframework build now compiles every Apple architecture in a single
-  multi-target `cargo build` invocation rather than one invocation per
-  architecture. Concurrent cargo invocations serialize on a lock over the
-  shared host artifact directory, so the single-threaded fat-LTO pass for each
-  architecture previously ran one after another; they now overlap. The
-  per-platform goals (`make macos`, `make ios-device`, `make ios-simulator`)
-  still build only their own architectures.
-- `make clean` in `BuildSupport/` no longer removes the cargo `target`
-  directory; the new `make distclean` goal does. This lets a restored Rust
-  dependency cache survive a release build, which previously deleted it before
-  compiling.
+- `proposeTransfer` and `proposefulfillingPaymentURI`: once NU6.3 is active, a single payment whose
+  value is a canonical ZIP 318 denomination (a `{1, 2, 5} * 10^k` amount from 0.01 to 10,000 ZEC)
+  crossing the Orchard turnstile is proposed as a canonical crossing. Such a proposal pays one fewer
+  ZIP 317 marginal-fee action, and requires up to two anchor-bucket intervals of confirmations on its
+  inputs beyond the `ConfirmationsPolicy` you passed. No call-site change: a payment the wallet
+  cannot fund that way is proposed as an ordinary transaction, as before.
+
+## Fixed
+- An Ironwood note received on an account's internal address is reported as change.
+  `ZcashTransaction.Overview.hasChange` was `false` while the note was counted in `receivedNoteCount`
+  and `sentNoteCount`, and `ZcashTransaction.Output.isChange` presented the account's own change as a
+  recipient of the user's transaction. Balances were unaffected. Existing rows are repaired on
+  upgrade; no rescan is required.
+- An address that had received only Ironwood notes counted as unused, so
+  `getCustomUnifiedAddress(accountUUID:receivers:)` could hand it out again and the receiving account
+  was not reported as involved in the transaction that paid it. Since NU6.3 delivers every payment to
+  an Orchard receiver in the Ironwood bundle, this affected ordinary receives. Repaired on upgrade.
+- `getTransactionOutputs(for:)` omitted the transparent outputs of a transaction funded entirely from
+  the Ironwood pool, and could attribute an output funded from several pools to an account other than
+  the largest contributor.
+- A sent transaction whose shielded spends and outputs this wallet cannot observe — one funded
+  entirely by transparent inputs whose shielded outputs belong to another wallet — now has its mined
+  or expired status resolved during enhancement.
+- Calls routed over Tor time out instead of hanging indefinitely against a server that accepts a
+  connection and then never responds: `Synchronizer.refreshExchangeRateUSD()`,
+  `TorClient.getExchangeRateUSD()`, and every lightwalletd call the SDK sends over Tor.
+- `TorClient.httpRequest(for:retryLimit:)` rejects a `URLRequest` whose URL scheme is neither `http`
+  nor `https` instead of sending it as plaintext HTTP.
+
+# 2.7.0-rc.3 - 2026-07-28
+
+## Changed
+- `proposeTransfer` and `proposefulfillingPaymentURI`: once NU6.3 is active, a single payment whose
+  value is a canonical ZIP 318 denomination (a `{1, 2, 5} * 10^k` amount from 0.01 to 10,000 ZEC)
+  crossing the Orchard turnstile is proposed as a canonical crossing. Such a proposal pays one fewer
+  ZIP 317 marginal-fee action, and requires up to two anchor-bucket intervals of confirmations on its
+  inputs beyond the `ConfirmationsPolicy` you passed. No call-site change: a payment the wallet
+  cannot fund that way is proposed as an ordinary transaction, as before.
+
+## Fixed
+- An Ironwood note received on an account's internal address is reported as change.
+  `ZcashTransaction.Overview.hasChange` was `false` while the note was counted in `receivedNoteCount`
+  and `sentNoteCount`, and `ZcashTransaction.Output.isChange` presented the account's own change as a
+  recipient of the user's transaction. Balances were unaffected. Existing rows are repaired on
+  upgrade; no rescan is required.
+- An address that had received only Ironwood notes counted as unused, so
+  `getCustomUnifiedAddress(accountUUID:receivers:)` could hand it out again and the receiving account
+  was not reported as involved in the transaction that paid it. Since NU6.3 delivers every payment to
+  an Orchard receiver in the Ironwood bundle, this affected ordinary receives. Repaired on upgrade.
+- `getTransactionOutputs(for:)` omitted the transparent outputs of a transaction funded entirely from
+  the Ironwood pool, and could attribute an output funded from several pools to an account other than
+  the largest contributor.
+- A sent transaction whose shielded spends and outputs this wallet cannot observe — one funded
+  entirely by transparent inputs whose shielded outputs belong to another wallet — now has its mined
+  or expired status resolved during enhancement.
+- Calls routed over Tor time out instead of hanging indefinitely against a server that accepts a
+  connection and then never responds: `Synchronizer.refreshExchangeRateUSD()`,
+  `TorClient.getExchangeRateUSD()`, and every lightwalletd call the SDK sends over Tor.
+- `TorClient.httpRequest(for:retryLimit:)` rejects a `URLRequest` whose URL scheme is neither `http`
+  nor `https` instead of sending it as plaintext HTTP.
 
 # v2.8.0-rc.1 - 2026-07-26
 
@@ -477,10 +381,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4090000.json
   finalization with a missing-signature error. The Ironwood bundle redaction
   is preserved: the full view clears Ironwood spend witnesses and output
   metadata alongside the other bundles.
-- Send-max proposals now spend from the Ironwood pool in addition to Sapling
-  and Orchard, so a post-NU6.3 wallet's Ironwood funds are no longer silently
-  excluded from a send-max. This affects only the general send-max proposal;
-  the Orchard-to-Ironwood migration is unchanged.
 
 # 2.7.0-rc.1 - 2026-07-25
 
@@ -497,12 +397,24 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4090000.json
 
 ## Changed
 - Bumped the Rust dependency stack to the Ironwood (NU6.3) crates.io releases
-  (`orchard` 0.13→0.15, `zcash_client_backend` 0.23→0.24.0-rc.1,
-  `zcash_client_sqlite` 0.21→0.22.0-rc.1, `zcash_primitives`/`zcash_proofs`
-  0.28→0.29, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
-  `zcash_transparent` 0.8→0.9, `pczt` 0.7→0.8.0-rc.1, `zcash_keys` 0.14→0.15)
+  (`orchard` 0.14→0.15, `zcash_client_backend` 0.23→0.24.0-rc.2,
+  `zcash_client_sqlite` 0.21→0.22.0-rc.2, `zcash_primitives`/`zcash_proofs`
+  0.28→0.30, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
+  `zcash_transparent` 0.8→0.10, `pczt` 0.7→0.8, `zcash_keys` 0.14→0.16)
   and dropped the `[patch.crates-io]` git overrides, matching the Android SDK's
   2.5.x dependency set. `addProofsToPCZT` now also proves Ironwood bundles.
+- Once NU6.3 activates, a payment to an Orchard receiver is delivered through
+  the Ironwood bundle of a version 6 transaction rather than as an Orchard
+  output: a `Proposal` reports such payments and the change from Ironwood
+  spends as Ironwood-pool outputs, and `createProposedTransactions` and
+  `createPCZTFromProposal` build the version 6 transaction that carries them.
+- Fee and change calculation derive the Orchard bundle version from the
+  proposal's target height instead of always applying the pre-NU6.3 policy, so
+  a proposal targeting a height at or beyond NU6.3 activation is charged one
+  ZIP 317 action per Orchard spend or output rather than
+  `max(spends, outputs)`, and Ironwood spends, outputs and change are charged
+  against the separate Ironwood bundle. Proposals below the activation height
+  are unaffected.
 
 ## Removed
 - The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
@@ -511,7 +423,14 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4090000.json
   `orchard` release, so voting is not shipped on the 2.5.x line, matching the
   Android SDK.
 
-# 2.6.0-alpha.6
+## Fixed
+- `deleteAccount(_:)` no longer fails with a rusqlite
+  `InvalidParameterName(":address")` error when the account being deleted is
+  recorded as the recipient of one of its own sent outputs, as happens after
+  an internal transfer to that account. Wallets on the 2.6 line received this
+  fix in 2.6.0-alpha.6.
+
+# 2.6.0-alpha.6 - 2026-06-26
 
 ## Added
 - `BlockEnhancer` now emits structured diagnostic logs at each step of an enhance cycle — cycle start with request count, per-request type and attempt, fetch response shape (status, whether a tx was returned, whether a `minedHeight` was set), the decision taken (`setTransactionStatus` or `decryptAndStoreTransaction`), per-attempt errors with error type, retry exhaustion, and cycle completion. Logs use opaque per-request correlation IDs (no transaction ids, addresses, or other PII) so production logs are debuggable for future stuck-transaction reports without exposing user-identifying data.
@@ -566,10 +485,36 @@ other server-streaming gRPC calls (`[ZUTXO0001]`).
   streams): these server-streaming gRPC calls now use the streaming-call timeout
   instead of the shorter single-call timeout.
 
-# 2.6.0-alpha.4
+# 2.6.0-alpha.4 - 2026-06-04
 
 This release updates from 2.6.0-alpha.3 to integrate support for the NU6.2
 network upgrade.
+
+## Changed
+- Updated the Rust dependency stack to the released crates.io versions carried
+  by 2.5.2 below, including `zcash_protocol` 0.9, which sets the NU6.2
+  activation heights (mainnet 3364600, testnet 4052000). Transactions
+  targeting those heights and above are built against the NU6.2 consensus
+  branch id.
+
+# 2.5.2 - 2026-06-03
+
+## Changed
+- Updated the Rust dependency stack to released crates.io versions
+  (`orchard` 0.13.1→0.14, `zcash_client_backend` 0.22→0.23,
+  `zcash_client_sqlite` 0.20.2→0.21, `zcash_keys` 0.13→0.14,
+  `zcash_primitives`/`zcash_proofs` 0.27→0.28, `zcash_protocol` 0.8→0.9,
+  `zcash_address` 0.11→0.12, `zcash_transparent` 0.7→0.8, `pczt` 0.6→0.7).
+  `zcash_protocol` 0.9 carries the NU6.2 activation heights (mainnet 3364600,
+  testnet 4052000), so transactions targeting those heights and above are now
+  built against the NU6.2 consensus branch id. The public Swift API is
+  unchanged.
+
+# 2.6.0-alpha.3 - 2026-05-27
+
+## Changed
+- Updated `zcash_voting` to 0.10.1, taken from the released crate rather than a
+  git revision.
 
 ## Checkpoints
 
@@ -588,11 +533,33 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4010000.json
 ...
 Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4030000.json
 ````
+
+# 2.6.0-alpha.2 - 2026-05-18
+
+## Added
+- `VotingRustBackend.generateHotkey(seed:)`, deriving a `VotingHotkey` from the
+  wallet seed.
+
+## Changed
+- Updated `zcash_voting` to 0.8.1 (from 0.6.0).
+
 # 2.5.1 - 2026-05-14
 
 ## Fixed
 - Fixed a bug that could cause transactions shielding more than 150 transparent
   P2PKH inputs to fail due to incorrect fee computation.
+
+# 2.6.0-alpha.1 - 2026-05-12
+
+## Added
+- A Swift wrapper over the `zcashlc_voting_*` FFI introduced in 2.5.0:
+  `VotingRustBackend` (voting-database handle, round setup and state, vote
+  commitment and share-payload construction, share encryption, delegation PIR
+  precomputation, vote-tree sync, VAN and note witness generation, and the
+  vote/delegation transaction-hash store), the public `Voting*` value types,
+  and `PirSnapshotResolver` / `PirSnapshotProbing` / `HTTPPirSnapshotProbe` for
+  selecting a PIR snapshot server. This surface was removed again in
+  2.7.0-rc.1.
 
 # 2.5.0 - 2026-05-11
 
