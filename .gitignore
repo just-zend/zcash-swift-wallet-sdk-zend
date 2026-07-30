@@ -90,6 +90,9 @@ BuildSupport/products/
 .claude/settings.local.json
 .plans/
 .remember/
-.worktrees/
 
 **/*.pyc
+
+# Design and planning notes: working artifacts, not repository history
+.plans/
+.worktrees/
