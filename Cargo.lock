@@ -2605,7 +2605,7 @@ dependencies = [
 
 [[package]]
 name = "libzcashlc"
-version = "2.8.0-rc.1"
+version = "2.8.0-rc.2"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -6305,8 +6305,8 @@ checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 
 [[package]]
 name = "vote-commitment-tree"
-version = "0.3.2"
-source = "git+https://github.com/zodl-inc/zcash_voting?rev=bde9ee0283ff3e23995bd6996dff3ba1f8969076#bde9ee0283ff3e23995bd6996dff3ba1f8969076"
+version = "0.4.0-rc.1"
+source = "git+https://github.com/zodl-inc/zcash_voting?rev=3c9900e56081966b74dd57a0c880c782f4f602bb#3c9900e56081966b74dd57a0c880c782f4f602bb"
 dependencies = [
  "anyhow",
  "ff",
@@ -6321,8 +6321,8 @@ dependencies = [
 
 [[package]]
 name = "vote-commitment-tree-client"
-version = "0.5.2"
-source = "git+https://github.com/zodl-inc/zcash_voting?rev=bde9ee0283ff3e23995bd6996dff3ba1f8969076#bde9ee0283ff3e23995bd6996dff3ba1f8969076"
+version = "0.6.0-rc.1"
+source = "git+https://github.com/zodl-inc/zcash_voting?rev=3c9900e56081966b74dd57a0c880c782f4f602bb#3c9900e56081966b74dd57a0c880c782f4f602bb"
 dependencies = [
  "base64",
  "ff",
@@ -6889,9 +6889,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_client_backend"
-version = "0.24.0-rc.4"
+version = "0.24.0-rc.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e019c2adb1eb2c3479603f4556e85c01022723f14ce8837a3bb225cb2af4d3f"
+checksum = "832ace878c125814bb9e82228d3661499124c6f2936e60fc1df3c6876eb54624"
 dependencies = [
  "arti-client",
  "base64",
@@ -6957,9 +6957,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_client_sqlite"
-version = "0.22.0-rc.4"
+version = "0.22.0-rc.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a496ad83b77e790bd0ea1013db14961b3ff825550097a2658837dc7e92a23d53"
+checksum = "c4a789c0038359968f93bfe3952d2b942e3bae5582f79c2f31137c6fd736a225"
 dependencies = [
  "bip32",
  "bitflags",
@@ -7016,9 +7016,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_keys"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc842e024fe37e52cfd3920826c4a28cc2a023fc9d77351d9c0f310becae3eb7"
+checksum = "def800f128e459eedebc900f36f408eaf0687634128dcf64ecfeaeebc3e16c14"
 dependencies = [
  "bech32",
  "bip32",
@@ -7059,9 +7059,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_pool_migration"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7e4169a96a25de216d4a7265fe772003aaeea05ed2566b14cfc0b8146b1f99e"
+checksum = "9010904169a92805128b3a8eab0dd4ff79fd164dd416af68aaeac5c7ebbd2522"
 dependencies = [
  "corez",
  "getset",
@@ -7075,6 +7075,7 @@ dependencies = [
  "zcash_keys",
  "zcash_primitives",
  "zcash_protocol",
+ "zip32",
 ]
 
 [[package]]
@@ -7132,9 +7133,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_protocol"
-version = "0.10.1"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4034db33a1ce58416430e065b01474b958e4649caa3e06e20654683a95149710"
+checksum = "9f074493fff337207e28bcfa5bbdf0e2a125c4203a4bdd07e72067eea81e9e7b"
 dependencies = [
  "corez",
  "document-features",
@@ -7196,8 +7197,8 @@ dependencies = [
 
 [[package]]
 name = "zcash_voting"
-version = "2.0.0-rc.1"
-source = "git+https://github.com/zodl-inc/zcash_voting?rev=bde9ee0283ff3e23995bd6996dff3ba1f8969076#bde9ee0283ff3e23995bd6996dff3ba1f8969076"
+version = "2.0.0-rc.2"
+source = "git+https://github.com/zodl-inc/zcash_voting?rev=3c9900e56081966b74dd57a0c880c782f4f602bb#3c9900e56081966b74dd57a0c880c782f4f602bb"
 dependencies = [
  "anyhow",
  "base64",

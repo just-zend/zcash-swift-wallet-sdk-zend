@@ -51,15 +51,201 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `FfiVotingHotkey` and `FfiBundleSetupResult` changed shape; the latter gained
     `dropped_count`, exposing notes the canonical bundling policy discarded.
 
+## 2.8.0-rc.2 - 2026-07-28
+
+### Changed
+- Migrated to `zcash_protocol 0.10.2`, `zcash_client_backend 0.24.0-rc.5`,
+  `zcash_client_sqlite 0.22.0-rc.5`
+- Once NU6.3 has activated, `zcashlc_propose_transfer` and
+  `zcashlc_propose_transfer_from_uri` propose a single payment of a canonical
+  ZIP 318 denomination that crosses the Orchard turnstile as a ZIP 318
+  canonical crossing: funded from a single Orchard note, anchored on the
+  wallet's ZIP 318 anchor bucket grid, given the ZIP 318 rolling expiry
+  height, and built with one unpadded Ironwood action instead of two. Such a
+  proposal pays one fewer ZIP 317 marginal-fee action, and requires up to two
+  bucket intervals of confirmations on its inputs beyond the
+  `confirmations_policy` argument. When the wallet cannot fund the payment
+  that way, an ordinary transaction is proposed instead.
+- `zcashlc_init_data_database` applies new `zcash_client_sqlite` migrations
+  that repair the Ironwood change classification and address-use data
+  described under Fixed below. No rescan is required.
+
+### Fixed
+- Ironwood notes received on an account's internal address are now classified
+  as change once the wallet learns that the same account funded the
+  transaction, as was already the case for Sapling and Orchard notes, so
+  `v_transactions.has_change` and `v_tx_outputs.is_change` no longer report an
+  account's own change as a recipient of its transaction. Balances were not
+  affected.
+- An address that had received only Ironwood notes is now treated as used, so
+  it is no longer handed out again by `zcashlc_get_next_available_address` and
+  the receiving account is reported as involved in the transaction that paid
+  it. Since NU6.3 every payment to an Orchard receiver is delivered in the
+  Ironwood bundle, so this affected ordinary received payments.
+- The funding account recorded for a transparent output now counts value spent
+  from the Ironwood pool, so an output whose creating transaction was funded
+  entirely from Ironwood is attributed to the funding account rather than to
+  none, and one funded from several pools is attributed to the largest
+  contributor.
+- `zcashlc_transaction_data_requests` now derives transaction status requests
+  from durable observation intent recorded when a transaction is stored: a
+  sent transaction is queried by txid when the wallet cannot observe one of
+  its shielded spends or outputs, intent goes dormant while a transaction is
+  mined and revives after a rewind, and redundant requests for
+  wallet-observable shielded transactions are no longer produced.
+- The Tor HTTP and gRPC transports bound how long each network operation may
+  take, so `zcashlc_get_exchange_rate_usd`, `zcashlc_tor_http_get` /
+  `zcashlc_tor_http_post` and the `zcashlc_tor_lwd_conn_*` calls fail with an
+  error instead of hanging indefinitely against a server that accepts a
+  connection and then never responds. Those transports also now reject a URL
+  whose scheme is neither `http` nor `https`, which was previously treated as
+  plaintext HTTP.
+- `build.rs` now watches the whole `rust/src` directory. It previously named
+  only `lib.rs`, `voting.rs` and `voting/`, and emitting any `rerun-if-changed`
+  disables cargo's default whole-package watching, so edits to any other module
+  (`ffi.rs` in particular) recompiled the crate without rerunning the build
+  script. The cbindgen-generated `target/Headers/zcashlc.h` could therefore go
+  stale, leaving a newly added FFI function absent from the header or a changed
+  signature unreflected.
+
+## 2.7.0-rc.3 - 2026-07-28
+
+The 2.7 maintenance line's release of the changes listed under 2.8.0-rc.2
+above; it carries those and nothing else.
+
+## 2.7.0-rc.2 - 2026-07-26
+
+### Changed
+- Migrated to `zcash_client_backend 0.24.0-rc.4`,
+  `zcash_client_sqlite 0.22.0-rc.4`, `pczt 0.9.1`.
+- `zcashlc_redact_pczt_for_signer` requests `zcash_client_backend`'s full
+  (non-compacted) signer view rather than the compact one, and the PCZT it
+  returns is serialized at the minimal encoding version capable of
+  representing its content (v1 for a v5 transaction) rather than always v2.
+  Deployed hardware signers do not provide the receiver capabilities the
+  compact view and v2 encoding require. The full view also clears Ironwood
+  spend witnesses and output metadata alongside the other bundles.
+- `zcashlc_add_proofs_to_pczt` reuses a cached Orchard-family proving key
+  across the Orchard and Ironwood proofs (both use the same PostNu6_3 circuit
+  after NU6.3) instead of rebuilding it for each, and derives the Ironwood
+  circuit version from the PCZT's consensus branch id rather than hardcoding
+  it. The resulting proofs are unchanged.
+
+### Fixed
+- `zcashlc_propose_send_max_transfer` now spends from the Ironwood pool in
+  addition to Sapling and Orchard, so a post-NU6.3 wallet's Ironwood funds are
+  no longer silently excluded from a send-max. This affects only the general
+  send-max proposal; the spend set used by
+  `zcashlc_propose_orchard_to_ironwood_migration` is unchanged. There is no
+  Swift API for the general send-max proposal; `zcashlc_propose_send_max_transfer`
+  is reachable only through the C FFI.
+- PCZTs created by `zcashlc_create_pczt_from_proposal` for post-NU6.3 (v6)
+  transactions carry ZIP 32 derivation metadata on the wallet-controlled
+  zero-value Orchard spends that pad them (via
+  `zcash_client_backend 0.24.0-rc.4`), so external Signers can identify and
+  sign them. Previously those actions were unsignable and extraction failed
+  with a missing spend-auth signature.
+
+## 2.7.0-rc.1 - 2026-07-25
+
+### Added
+- `zcashlc_put_ironwood_subtree_roots`: Store Ironwood subtree roots in the
+  wallet database, mirroring the Sapling and Orchard entry points.
+- `zcashlc_propose_orchard_to_ironwood_migration`: Propose migrating an
+  account's entire Orchard balance into the Ironwood pool.
+- The wallet-summary FFI structs gained `ironwood_balance` on the per-account
+  balance and `next_ironwood_subtree_index` on the summary.
+
+### Changed
+- Migrated to the Ironwood (NU6.3) releases: `orchard` 0.14→0.15,
+  `zcash_client_backend` 0.23→0.24.0-rc.2, `zcash_client_sqlite`
+  0.21→0.22.0-rc.2, `zcash_primitives`/`zcash_proofs` 0.28→0.30,
+  `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13, `zcash_transparent`
+  0.8→0.10, `pczt` 0.7→0.8, `zcash_keys` 0.14→0.16; the `[patch.crates-io]`
+  git overrides were dropped.
+- `zcashlc_add_proofs_to_pczt` also proves Ironwood bundles.
+- Once NU6.3 activates, a payment to an Orchard receiver is delivered through
+  the Ironwood bundle of a version 6 transaction: proposals returned by
+  `zcashlc_propose_transfer` report such payments and the change from Ironwood
+  spends as Ironwood-pool outputs, and `zcashlc_create_proposed_transactions`
+  and `zcashlc_create_pczt_from_proposal` build the version 6 transaction.
+  Fee and change calculation derive the Orchard bundle version from the
+  proposal's target height, charging one ZIP 317 action per Orchard spend or
+  output at or beyond activation rather than `max(spends, outputs)`, with
+  Ironwood spends, outputs and change charged against the Ironwood bundle.
+
+### Removed
+- The `zcashlc_voting_*` FFI is no longer compiled. `zcash_voting` cannot
+  resolve against the Ironwood (NU6.3) `orchard` release, so the `voting`
+  module is gated behind `#[cfg(zcash_voting)]` and the
+  `zcash_voting`/`zcash_keys` dependencies are commented out in `Cargo.toml`.
+  The module sources are retained so the surface can be reinstated once the
+  voting crates support the Ironwood dependency stack.
+
+### Fixed
+- `zcashlc_delete_account` no longer fails with a rusqlite
+  `InvalidParameterName(":address")` error when the account being deleted is
+  recorded as the recipient of one of its own sent outputs. Wallets on the 2.6
+  line received this fix in 2.6.0-alpha.6.
+
 ## 2.6.0-alpha.6 - 2026-06-26
 
 ### Fixed
 - Updated `zcash_client_sqlite` to 0.21.1, fixing an `InvalidParameterName` error in `delete_account` when the account being deleted is referenced by a `sent_notes` row via its `to_account_id` column (i.e. an account involved in a cross-account transfer) ([librustzcash#2426](https://github.com/zcash/librustzcash/pull/2426)).
 
+## 2.6.0-alpha.4 - 2026-06-04
+
+### Changed
+- Migrated to the released crates.io versions listed under 2.5.2 below,
+  including `zcash_protocol` 0.9, which sets the NU6.2 activation heights
+  (mainnet 3364600, testnet 4052000). The FFI surface is unchanged.
+
+## 2.5.2 - 2026-06-03
+
+### Changed
+- Migrated to released crates.io versions of the Zcash crates: `orchard`
+  0.13.1→0.14, `zcash_client_backend` 0.22→0.23, `zcash_client_sqlite`
+  0.20.2→0.21, `zcash_keys` 0.13→0.14, `zcash_primitives`/`zcash_proofs`
+  0.27→0.28, `zcash_protocol` 0.8→0.9, `zcash_address` 0.11→0.12,
+  `zcash_transparent` 0.7→0.8, `pczt` 0.6→0.7. `zcash_protocol` 0.9 carries
+  the NU6.2 activation heights (mainnet 3364600, testnet 4052000), so
+  transactions targeting those heights and above are built against the NU6.2
+  consensus branch id. The FFI surface is unchanged.
+
 ## 2.6.0-alpha.3 - 2026-05-27
 
+### Changed
+- Updated `zcash_voting` to 0.10.1, taken from the released crate rather than a
+  git revision. No `zcashlc_voting_*` entry points were added or removed.
+
+## 2.6.0-alpha.2 - 2026-05-18
+
+### Changed
+- Updated `zcash_voting` to 0.8.1 (from 0.6.0). No `zcashlc_voting_*` entry
+  points were added or removed.
+
+## 2.5.1 - 2026-05-15
+
+### Changed
+- Replaced the `[patch.crates-io]` git pin on the librustzcash crates with
+  their published releases: `zcash_client_backend 0.22.0`,
+  `zcash_client_sqlite 0.20.2`, `zcash_keys 0.13.0`, `pczt 0.6.0`,
+  `zcash_primitives`/`zcash_proofs 0.27.1`, `zcash_protocol 0.8.0`,
+  `zcash_address 0.11.0`, `zcash_transparent 0.7.0`.
+
+### Fixed
+- Proposing a transaction that shields more than 150 transparent P2PKH inputs
+  no longer fails from an incorrect fee computation.
+
+## 2.6.0-alpha.1 - 2026-05-12
+
 ### Added
-- Added dependency `zcash_voting 0.10` & supporting FFI methods.
+- The `zcashlc_voting_*` surface grew from the 11 entry points added in 2.5.0
+  to 59, covering the voting-database handle, round setup and state, vote
+  commitment and share-payload construction, share encryption, delegation PIR
+  precomputation, vote-tree sync, VAN and note witness generation, and the
+  vote/delegation transaction-hash store. All of them were removed again in
+  2.7.0-rc.1.
 
 ## 2.5.0 - 2026-05-11
 
