@@ -21,7 +21,7 @@ ff = "0.13"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
 transparent = { package = "zcash_transparent", version = "0.10", default-features = false }
 zcash_address = { version = "0.13" }
-zcash_client_backend = { version = "0.24.0-rc.5", features = [
+zcash_client_backend = { version = "0.24.0-rc.6", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "pczt",
@@ -29,7 +29,7 @@ zcash_client_backend = { version = "0.24.0-rc.5", features = [
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "0.22.0-rc.5", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "0.22.0-rc.6", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.30"
 zcash_proofs = "0.30"
@@ -159,7 +159,7 @@ lto = true
 # build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep it in step with
 # the librustzcash generation the versions above declare: a rev built against an older generation
 # cannot resolve against them.
-slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "bf5c1227b6f5be23eefd88122ecac03715fd5cb5" }
+slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "3f35d41273ebceb5784978c8c1942b09def7ee68" }
 
 #pczt = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
 #zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
