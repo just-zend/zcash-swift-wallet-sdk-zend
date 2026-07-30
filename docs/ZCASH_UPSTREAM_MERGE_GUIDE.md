@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-28
+Last reviewed: 2026-07-29
 
 ## Remote and branch invariants
 
@@ -36,6 +36,32 @@ Last reviewed: 2026-07-28
   branches of that migration family. Dependabot PRs remain blocked/review-required.
   Wait for upstream convergence and Zend artifact reconciliation rather than splitting
   individual fixes out of these coupled stacks.
+
+## Bleeding-edge refresh (2026-07-29)
+
+- Fresh fetches leave the default branches unchanged: `origin/main=4497fe9e` and
+  `upstream/main=f51ed74a`, with `174 87` commits in `origin/main...upstream/main`
+  and merge base `769809a2`. `upstream/main` is still not an ancestor of Zend's
+  default branch. Draft Zend PR `#33` remains the single clean reconciliation tracker;
+  it does not claim to contain the 87 upstream-only commits.
+- Upstream's release and maintenance lines advanced to `2.7.0-rc.3` and
+  `2.8.0-rc.2`, including `release/ffi-2.8.0-rc.2`, while `upstream/main` did not
+  advance. These branches are part of the same versioned Ironwood/FFI release family,
+  not a substitute for a Zend-compatible source or artifact reconciliation.
+- No newly reviewed early carry meets the ready, useful, and low-risk gate. `#1905`
+  is dirty with changes requested against `maint/v2.7.x`; `#1896` and `#1897` are
+  likewise dirty and review-required. Draft `#1900` remains review-required, and
+  draft `#1898` is dirty despite approval and green checks; its Tor-off sequential
+  submission change alters multi-endpoint submission semantics on `maint/v2.8.x`.
+- The Ironwood line is still explicitly out of scope for an isolated carry: `#1895`
+  is dirty atop `feature/ironwood-slipstream`, while draft `#1893` is blocked and
+  review-required for the Orchard-to-Ironwood/Slipstream stack. Blocked Dependabot,
+  Tor/privacy, release, and older FFI branches also lack the required upstream
+  stabilization or narrow Zend-compatible surface. Preserve the provenance-locked
+  migration engine and committed XCFramework until upstream convergence, a compatible
+  artifact rebuild, and funded-device migration proof are available.
+- This update is documentation-only. It deliberately does not rerun `swift build` or
+  `swift test --filter OfflineTests`; no SDK source or FFI artifact changed.
 
 ## Bleeding-edge refresh (2026-07-28)
 
