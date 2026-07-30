@@ -9,30 +9,46 @@ import Foundation
 /// The persisted, per-account gate that decides whether ordinary wallet sync must pause for the
 /// benefit of an in-flight migration.
 ///
-/// Two independent reasons block sync:
+/// Three independent reasons block sync:
 /// 1. **Overdue transfers** — a scheduled transfer is past its send height but not yet broadcast.
 ///    This is engine-derived (`migrationHasOverdueTransfers`) and passed in as `hasOverdue`.
 /// 2. **Privacy buffer** — for a fixed window after each broadcast, sync stays paused so the
 ///    broadcast is not correlated with a fresh sync. This is the `resumeAt` timestamp persisted here.
+/// 3. **Broadcast in flight** — from just before a migration submit hits the network until its
+///    outcome is recorded, sync must not run: the reconciliation probe
+///    (`migrationReconcileInvalidations`) would otherwise treat the not-yet-visible broadcast as a
+///    submit crash. This is the `inFlightUntil` timestamp persisted here; a crash between submit
+///    and record leaves the marker behind, and it self-expires
+///    ``broadcastInFlightGuardDuration`` (120 s) after it was set.
 ///
-/// The gate owns only the privacy-buffer half; the overdue half is supplied by the caller (and, for
-/// the reactive `blockedStream`, by an injected `overdueProvider`). State is durably persisted to an
-/// atomically written JSON file, but every read in this process is served from an in-memory cache
-/// (see `cachedResumeAt`) -- the file exists for durability across launches, not as the read path.
-/// The other in-memory mutable state is the subscriber-gated ticker task (see `subscriberAttached()`,
-/// guarded by `subscriptionLock`) and the send-generation counters (see `publish(_:generation:)`,
-/// guarded by `emissionLock`); all of it is guarded by one lock or the other, so a `final class` is
-/// `@unchecked Sendable` without needing an actor hop to read the reactive stream. A corrupt or
-/// missing file reads as "no buffer".
+/// The gate owns the privacy-buffer and in-flight halves; the overdue half is supplied by the caller
+/// (and, for the reactive `blockedStream`, by an injected `overdueProvider`). State is durably
+/// persisted to an atomically written JSON file, but every read in this process is served from an
+/// in-memory cache (see `cachedResumeAt`/`cachedInFlightUntil`) -- the file exists for durability
+/// across launches, not as the read path. The other in-memory mutable state is the subscriber-gated
+/// ticker task (see `subscriberAttached()`, guarded by `subscriptionLock`) and the send-generation
+/// counters (see `publish(_:generation:)`, guarded by `emissionLock`); all of it is guarded by one
+/// lock or the other, so a `final class` is `@unchecked Sendable` without needing an actor hop to
+/// read the reactive stream. A corrupt or missing file reads as "no buffer".
 final class MigrationSyncGate: @unchecked Sendable {
-    /// The persisted envelope: a schema version plus the epoch-seconds instant at which the privacy
-    /// buffer elapses.
+    /// The persisted envelope: a schema version plus the epoch-seconds instants at which the
+    /// privacy buffer elapses and the in-flight broadcast marker expires. Both instants are
+    /// OPTIONAL (synthesized `Codable` decodes them via `decodeIfPresent`), and the version int is
+    /// unchanged: files persisted before the in-flight marker existed — which always carry
+    /// `resumeAtEpochSeconds` and never `inFlightUntilEpochSeconds` — stay readable.
     private struct GateState: Codable {
         let version: Int
-        let resumeAtEpochSeconds: Double
+        let resumeAtEpochSeconds: Double?
+        let inFlightUntilEpochSeconds: Double?
     }
 
     private static let currentVersion = 1
+
+    /// How long the in-flight broadcast marker set by ``markBroadcastInFlight()`` lives before it
+    /// self-expires: long enough to cover a submit's network round-trip plus the result record,
+    /// short enough that a crash mid-broadcast does not wedge sync — the marker's whole point is
+    /// to be safe to leak.
+    static let broadcastInFlightGuardDuration: TimeInterval = 120
 
     private let fileURL: URL
     private let bufferDuration: TimeInterval
@@ -65,10 +81,18 @@ final class MigrationSyncGate: @unchecked Sendable {
     /// the file.
     ///
     /// A plain lock-guarded value suffices here, unlike `publish(_:generation:)`'s generation
-    /// ordering: `markBroadcast()` is this gate's only writer, under the standing single-writer
-    /// assumption that there is one `MigrationSyncGate` instance per account per process, so there is
-    /// never a fresher write for a slower one to clobber.
+    /// ordering: the writers (`markBroadcast()`, `markBroadcastInFlight()`,
+    /// `clearBroadcastInFlight()`) all run inside `OrchardMigration`'s single-flight broadcast flow
+    /// -- and there is one `MigrationSyncGate` instance per account per process (the standing
+    /// single-writer assumption) -- so there is never a fresher write for a slower one to clobber.
     private var cachedResumeAt: Date?
+
+    /// The in-memory cache of the persisted in-flight broadcast marker's expiry, guarded by
+    /// `emissionLock` exactly like `cachedResumeAt` (same load-at-init, write-file-first
+    /// discipline). `nil` when no marker is set; an instant in the past is an expired marker a
+    /// crash left behind (equivalent to none for blocking purposes, and overwritten by the next
+    /// `markBroadcastInFlight()`/`clearBroadcastInFlight()` write).
+    private var cachedInFlightUntil: Date?
 
     /// Guards the subscriber count and the ticker task's start/stop state -- the bookkeeping for
     /// `blockedStream`'s subscription lifecycle. Deliberately a SEPARATE lock from `emissionLock`:
@@ -139,14 +163,21 @@ final class MigrationSyncGate: @unchecked Sendable {
             logger.warn("MigrationSyncGate: failed to provision the storage directory (backup exclusion may be missing): \(error)")
         }
 
-        // Load the in-memory `resumeAt` cache from the file exactly once, here -- every subsequent
-        // read in this process serves this cache (see `cachedResumeAt`), never the file again, until
-        // `markBroadcast()` updates it. Also seeds the synchronous subscribe-time value (buffer only
-        // -- see `blockedStream`'s documented caveat: the first tick refines it with the real overdue
-        // signal) so subscribers get an immediate value.
-        let initialResumeAt = Self.readResumeAt(fileURL: url, logger: logger)
-        self.cachedResumeAt = initialResumeAt
-        let initialBlocked = Self.isBlocked(now: now(), hasOverdue: false, resumeAt: initialResumeAt)
+        // Load the in-memory `resumeAt`/`inFlightUntil` caches from the file exactly once, here --
+        // every subsequent read in this process serves these caches (see `cachedResumeAt`), never
+        // the file again, until a marking call updates them. Also seeds the synchronous
+        // subscribe-time value (buffer + in-flight only -- see `blockedStream`'s documented caveat:
+        // the first tick refines it with the real overdue signal) so subscribers get an immediate
+        // value.
+        let initialInputs = Self.readGateInputs(fileURL: url, logger: logger)
+        self.cachedResumeAt = initialInputs.resumeAt
+        self.cachedInFlightUntil = initialInputs.inFlightUntil
+        let initialBlocked = Self.isBlocked(
+            now: now(),
+            hasOverdue: false,
+            resumeAt: initialInputs.resumeAt,
+            inFlightUntil: initialInputs.inFlightUntil
+        )
         self.blockedSubject = CurrentValueSubject(initialBlocked)
         self.tickerTask = nil
 
@@ -163,23 +194,32 @@ final class MigrationSyncGate: @unchecked Sendable {
         "migration_sync_gate_\(Data(accountUUID.id).hexEncodedString()).json"
     }
 
-    /// The persisted privacy-buffer expiry for `accountUUID`, read directly from its gate file under
-    /// `directory`, without constructing a gate instance. A corrupt or missing file reads as `nil`
-    /// ("no buffer"), exactly like an instance's init-time load.
+    /// The persisted gate inputs for `accountUUID` — the privacy-buffer expiry and the in-flight
+    /// broadcast marker's expiry — read directly from its gate file under `directory`, without
+    /// constructing a gate instance. A corrupt or missing file reads as `(nil, nil)` ("no buffer,
+    /// nothing in flight"), exactly like an instance's init-time load.
     ///
-    /// The wallet-scope path a host uses to answer "is any account still inside its privacy buffer?"
-    /// after a fresh launch, when the per-account gate for a dormant account has not been (and must
-    /// not need to be) constructed. Reuses the same envelope-read path (`readResumeAt`) as the
+    /// The wallet-scope path a host uses to answer "is any account still inside its gate?" after a
+    /// fresh launch, when the per-account gate for a dormant account has not been (and must not
+    /// need to be) constructed. Reuses the same envelope-read path (`readGateInputs`) as the
     /// instance's own init so the on-disk format has a single reader.
-    static func persistedResumeAt(directory: URL, accountUUID: AccountUUID, logger: Logger) -> Date? {
+    static func persistedGateInputs(
+        directory: URL,
+        accountUUID: AccountUUID,
+        logger: Logger
+    ) -> (resumeAt: Date?, inFlightUntil: Date?) {
         let fileURL = directory.appendingPathComponent(fileName(accountUUID: accountUUID))
-        return readResumeAt(fileURL: fileURL, logger: logger)
+        return readGateInputs(fileURL: fileURL, logger: logger)
     }
 
-    /// The gate's core predicate: sync is blocked when a transfer is overdue, or while the privacy
-    /// buffer has not yet elapsed. Pure, so it is exhaustively table-testable.
-    static func isBlocked(now: Date, hasOverdue: Bool, resumeAt: Date?) -> Bool {
+    /// The gate's core predicate: sync is blocked when a transfer is overdue, while the privacy
+    /// buffer has not yet elapsed, or while an unexpired in-flight broadcast marker exists. Pure,
+    /// so it is exhaustively table-testable.
+    static func isBlocked(now: Date, hasOverdue: Bool, resumeAt: Date?, inFlightUntil: Date?) -> Bool {
         if hasOverdue {
+            return true
+        }
+        if let inFlightUntil, now < inFlightUntil {
             return true
         }
         guard let resumeAt else {
@@ -190,28 +230,62 @@ final class MigrationSyncGate: @unchecked Sendable {
 
     /// Starts (or restarts) the privacy buffer: persists `resumeAt = now + bufferDuration` to the
     /// gate file FIRST, then updates the in-memory `resumeAt` cache, then pushes a fresh value to
-    /// the reactive stream. Call after every successful migration broadcast.
+    /// the reactive stream. Call after every successful migration broadcast. Preserves the
+    /// in-flight marker (`markBroadcast()` fires mid-flow, between submit and record).
     ///
     /// The file write must land before the cache update, not after. `OrchardMigrationHost`'s
-    /// wallet-scope predicate reads the FILE (`persistedResumeAt`), while the gate's own recomputes
-    /// (and therefore `blockedStream`) read the in-memory cache. If the cache updated first, a
-    /// recompute could observe the fresh cache and publish `true` before the file write lands; that
-    /// emission can trigger a wallet-scope recompute that reads the still-stale file, computes
-    /// `false`, and publishes it with a later generation -- the later, correct `true` (once the file
-    /// does land) then collapses into that stale `false` as a consecutive duplicate under
-    /// `removeDuplicates()`, leaving the wallet-scope stream stuck at `false` until the next
+    /// wallet-scope predicate reads the FILE (`persistedGateInputs`), while the gate's own
+    /// recomputes (and therefore `blockedStream`) read the in-memory cache. If the cache updated
+    /// first, a recompute could observe the fresh cache and publish `true` before the file write
+    /// lands; that emission can trigger a wallet-scope recompute that reads the still-stale file,
+    /// computes `false`, and publishes it with a later generation -- the later, correct `true`
+    /// (once the file does land) then collapses into that stale `false` as a consecutive duplicate
+    /// under `removeDuplicates()`, leaving the wallet-scope stream stuck at `false` until the next
     /// periodic tick. Persisting first closes that window: the file is never observably behind the
-    /// cache.
+    /// cache. The same write-file-before-cache discipline applies to `markBroadcastInFlight()` and
+    /// `clearBroadcastInFlight()`.
     ///
-    /// A failed write (`write(resumeAt:)` only logs, never throws) still updates the cache
-    /// afterward, so in-process gating never depends on the write having actually landed on disk.
+    /// A failed write (`write(resumeAt:inFlightUntil:)` only logs, never throws) still updates the
+    /// cache afterward, so in-process gating never depends on the write having actually landed on
+    /// disk.
     func markBroadcast() {
         let resumeAt = now().addingTimeInterval(bufferDuration)
 
-        write(resumeAt: resumeAt)
+        write(resumeAt: resumeAt, inFlightUntil: currentInFlightUntil())
 
         emissionLock.lock()
         cachedResumeAt = resumeAt
+        emissionLock.unlock()
+
+        recomputeAsync()
+    }
+
+    /// Persists the in-flight broadcast marker (`inFlightUntil = now +`
+    /// ``broadcastInFlightGuardDuration``), file first, then cache, then a reactive recompute —
+    /// the same write-file-before-cache discipline as ``markBroadcast()``. Call just before a
+    /// migration submit hits the network; pair with ``clearBroadcastInFlight()`` once the
+    /// outcome is recorded. A crash (or a record failure) between the two leaves the marker
+    /// behind, and it self-expires on its own — that leak-safety is the point of the deadline.
+    func markBroadcastInFlight() {
+        let inFlightUntil = now().addingTimeInterval(Self.broadcastInFlightGuardDuration)
+
+        write(resumeAt: currentResumeAt(), inFlightUntil: inFlightUntil)
+
+        emissionLock.lock()
+        cachedInFlightUntil = inFlightUntil
+        emissionLock.unlock()
+
+        recomputeAsync()
+    }
+
+    /// Clears the in-flight broadcast marker (file first, then cache, then a reactive recompute)
+    /// — the release half of ``markBroadcastInFlight()``, called once the broadcast's outcome is
+    /// recorded, or when the submit never happened at all (a fail-closed pre-submit throw).
+    func clearBroadcastInFlight() {
+        write(resumeAt: currentResumeAt(), inFlightUntil: nil)
+
+        emissionLock.lock()
+        cachedInFlightUntil = nil
         emissionLock.unlock()
 
         recomputeAsync()
@@ -226,10 +300,24 @@ final class MigrationSyncGate: @unchecked Sendable {
         return cachedResumeAt
     }
 
+    /// The in-memory cached in-flight broadcast marker's expiry (see `cachedInFlightUntil`), or
+    /// `nil` when none is set. Reflects the gate file's contents as of the last init or
+    /// mark/clear in THIS process, not a fresh file read.
+    func currentInFlightUntil() -> Date? {
+        emissionLock.lock()
+        defer { emissionLock.unlock() }
+        return cachedInFlightUntil
+    }
+
     /// Whether sync is currently blocked, combining the supplied `hasOverdue` with the persisted
-    /// privacy buffer. Never throws.
+    /// privacy buffer and in-flight broadcast marker. Never throws.
     func currentlyBlocked(hasOverdue: Bool) -> Bool {
-        Self.isBlocked(now: now(), hasOverdue: hasOverdue, resumeAt: currentResumeAt())
+        Self.isBlocked(
+            now: now(),
+            hasOverdue: hasOverdue,
+            resumeAt: currentResumeAt(),
+            inFlightUntil: currentInFlightUntil()
+        )
     }
 
     /// A stream of the blocked flag: emits the current value on subscribe, re-evaluates every
@@ -316,7 +404,12 @@ final class MigrationSyncGate: @unchecked Sendable {
         let generation = drawNextGeneration()
 
         let hasOverdue = await overdueProvider()
-        let blocked = Self.isBlocked(now: now(), hasOverdue: hasOverdue, resumeAt: currentResumeAt())
+        let blocked = Self.isBlocked(
+            now: now(),
+            hasOverdue: hasOverdue,
+            resumeAt: currentResumeAt(),
+            inFlightUntil: currentInFlightUntil()
+        )
         publish(blocked, generation: generation)
     }
 
@@ -362,9 +455,16 @@ final class MigrationSyncGate: @unchecked Sendable {
         blockedSubject.send(blocked)
     }
 
-    private func write(resumeAt: Date) {
+    /// Persists the full gate envelope atomically. Every writer passes BOTH fields — the one it
+    /// changes and the other's current cached value — so the file always carries the whole state
+    /// (the fields have independent writers: `markBroadcast()` vs the in-flight pair).
+    private func write(resumeAt: Date?, inFlightUntil: Date?) {
         do {
-            let state = GateState(version: Self.currentVersion, resumeAtEpochSeconds: resumeAt.timeIntervalSince1970)
+            let state = GateState(
+                version: Self.currentVersion,
+                resumeAtEpochSeconds: resumeAt?.timeIntervalSince1970,
+                inFlightUntilEpochSeconds: inFlightUntil?.timeIntervalSince1970
+            )
             let data = try JSONEncoder().encode(state)
             try data.write(to: fileURL, options: .atomic)
         } catch {
@@ -372,9 +472,9 @@ final class MigrationSyncGate: @unchecked Sendable {
         }
     }
 
-    private static func readResumeAt(fileURL: URL, logger: Logger) -> Date? {
+    private static func readGateInputs(fileURL: URL, logger: Logger) -> (resumeAt: Date?, inFlightUntil: Date?) {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            return nil
+            return (nil, nil)
         }
 
         do {
@@ -382,12 +482,15 @@ final class MigrationSyncGate: @unchecked Sendable {
             let state = try JSONDecoder().decode(GateState.self, from: data)
             guard state.version == Self.currentVersion else {
                 logger.warn("MigrationSyncGate: ignoring sync-gate file with unknown version \(state.version)")
-                return nil
+                return (nil, nil)
             }
-            return Date(timeIntervalSince1970: state.resumeAtEpochSeconds)
+            return (
+                state.resumeAtEpochSeconds.map { Date(timeIntervalSince1970: $0) },
+                state.inFlightUntilEpochSeconds.map { Date(timeIntervalSince1970: $0) }
+            )
         } catch {
             logger.warn("MigrationSyncGate: ignoring corrupt sync-gate file: \(error)")
-            return nil
+            return (nil, nil)
         }
     }
 }

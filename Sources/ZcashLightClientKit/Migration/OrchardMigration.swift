@@ -44,8 +44,9 @@ public struct MigrationNetworkPrivacyOptions: Equatable {
 /// (``Config/accountUUID``).
 ///
 /// It composes three collaborators: the migration welding (the Rust engine surface), a fail-closed
-/// ``MigrationBroadcaster``, and a persisted ``MigrationSyncGate`` (the 10-minute post-broadcast
-/// privacy buffer plus the overdue-transfer block). The engine owns all migration state, including
+/// ``MigrationBroadcaster``, and a persisted ``MigrationSyncGate`` (the network-scaled
+/// post-broadcast privacy buffer, the in-flight broadcast marker, plus the overdue-transfer
+/// block). The engine owns all migration state, including
 /// the committed schedule; the SDK keeps no local copy of the proposal list.
 actor OrchardMigration {
     /// The immutable configuration an ``OrchardMigration`` is built from.
@@ -120,8 +121,24 @@ actor OrchardMigration {
         }
     }
 
-    /// The post-broadcast privacy buffer: how long sync stays paused after a migration broadcast so
-    /// the broadcast is not correlated with a fresh sync. A fixed production value.
+    /// The post-broadcast privacy buffer for `networkType`: how long sync stays paused after a
+    /// migration broadcast so the broadcast is not correlated with a fresh sync. Network-scaled:
+    /// 600 s on mainnet (the production privacy requirement), 180 s on testnet/regtest — where
+    /// traffic-correlation privacy is moot and the full 10 minutes only slows QA cycles down.
+    static func privacySyncBufferDuration(for networkType: NetworkType) -> TimeInterval {
+        switch networkType {
+        case .mainnet:
+            return 600
+        case .testnet, .regtest:
+            return 180
+        }
+    }
+
+    /// The mainnet post-broadcast privacy buffer — the value of
+    /// ``privacySyncBufferDuration(for:)`` for `.mainnet`, kept as a static constant for the
+    /// network-less contexts that need one (the `Synchronizer` protocol's default
+    /// `migrationPrivacySyncBufferDuration`, which has no network to scale by; real synchronizers
+    /// forward their host's network-scaled value instead).
     static let privacySyncBufferDuration: TimeInterval = 600
 
     /// The NU6.3 (Ironwood) activation height for `networkType`, or `nil` when NU6.3 is unset for
@@ -215,10 +232,14 @@ actor OrchardMigration {
         self.syncGate = MigrationSyncGate(
             directory: config.generalStorageURL,
             accountUUID: accountUUID,
-            bufferDuration: OrchardMigration.privacySyncBufferDuration,
+            bufferDuration: OrchardMigration.privacySyncBufferDuration(for: config.network.networkType),
             overdueProvider: {
-                // Degrade to "not overdue" on any engine error so the reactive gate never crashes.
-                (try? await welding.migrationHasOverdueTransfers(for: accountUUID)) ?? false
+                // Estimate-aware, like every gate-side overdue read: the wall-clock tip estimate
+                // may only accelerate due-ness, and an estimator failure degrades to a nil
+                // estimate (scanned-tip behavior) rather than blocking the gate. Degrade to "not
+                // overdue" on any engine error so the reactive gate never crashes.
+                let estimatedTip = await OrchardMigration.gatingEstimatedTip(welding: welding)
+                return (try? await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: estimatedTip)) ?? false
             },
             logger: logger
         )
@@ -242,13 +263,17 @@ actor OrchardMigration {
 
     // MARK: - State
 
-    /// The current Orchard -> Ironwood migration state. Also the reconciliation hub: call it on
-    /// launch and after every migration operation.
-    func migrationState() async throws -> MigrationState {
-        try await welding.migrationState(for: accountUUID)
+    /// The engine's next step to advance the stored run — a verbatim conduit of the upstream
+    /// engine's own `next_step`, evaluated at the SCANNED tip. `nil` means no run is stored; a
+    /// terminal (complete or cancelled) run reports ``MigrationAdvanceStep/complete``. See
+    /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping.
+    func advanceStep() async throws -> MigrationAdvanceStep? {
+        try await welding.migrationAdvanceStep(for: accountUUID)
     }
 
-    /// Live migration progress, or `nil` when no migration is in progress.
+    /// Live migration progress, or `nil` when no snapshot is reportable: present only while an
+    /// engine run is ACTIVE or a recorded immediate sweep is pending (unmined and unexpired);
+    /// terminal — complete or cancelled — runs report `nil`.
     func migrationProgress() async throws -> MigrationProgress? {
         try await welding.migrationProgress(for: accountUUID)
     }
@@ -257,6 +282,81 @@ actor OrchardMigration {
     /// per-transaction detail view behind ``migrationProgress()``'s aggregate summary.
     func transactionStatuses() async throws -> [MigrationTransactionStatus] {
         try await welding.migrationTransactionStatuses(for: accountUUID)
+    }
+
+    /// The stored run's sync/proving wake-up schedule as of the scanned tip — the heights at
+    /// which the host should wake, sync, and run ``finalizeReadyTransfers()``, plus the transfer
+    /// ids each wake-up covers. Jitter is re-drawn on every call; recompute (and re-register with
+    /// the OS) after any state change rather than caching. Empty when there is nothing left to
+    /// prove.
+    func syncWakeups() async throws -> [MigrationSyncWakeup] {
+        try await welding.migrationSyncWakeups(for: accountUUID)
+    }
+
+    /// Reconciles the committed run against local on-chain truth and records an invalid mark when
+    /// a pending transfer's funding note was spent by a foreign transaction; returns whether this
+    /// call recorded an invalidation. Local-database only — never touches the network — so it is
+    /// safe in a sync session; the complementary 120-second in-flight-broadcast guard (during
+    /// which a just-broadcast transfer must not be probed) is enforced by the sync gate the
+    /// broadcast path arms, not by this call.
+    func reconcileInvalidations() async throws -> Bool {
+        try await welding.migrationReconcileInvalidations(for: accountUUID)
+    }
+
+    /// Proves every migration transaction whose anchor the wallet can resolve right now and
+    /// returns how many were proved (`0` is the ordinary "nothing left to prove" answer). Run it
+    /// at sync wake-ups (``syncWakeups()``), never on the broadcast path — proving needs the
+    /// wallet's commitment tree and takes real time, while a broadcast session must stay a pure
+    /// delivery step. A straight delegation to the welding proving sweep, bound to this actor's
+    /// own account.
+    func finalizeReadyTransfers() async throws -> Int {
+        try await welding.migrationProvePending(for: accountUUID)
+    }
+
+    // MARK: - Chain-tip estimation
+
+    /// The wall-clock ESTIMATED chain tip: the ``ChainTipEstimator`` projection over the most
+    /// recently scanned blocks' `(height, header time)` samples. With no samples at all (a wallet
+    /// whose `blocks` table is empty — e.g. one restored from a checkpoint that has not scanned
+    /// since), this falls back to the wallet's max SCANNED height verbatim (the honest "no data
+    /// to project from" answer: welding's `maxScannedHeight` is the only height the wallet knows
+    /// without the network), and throws ``ZcashError/migrationChainTipUnavailable`` when even
+    /// that is unknown because the wallet has never scanned.
+    func estimatedChainTip() async throws -> BlockHeight {
+        let estimator = ChainTipEstimator(
+            samples: try await welding.migrationBlockRateSamples(window: UInt32(ChainTipEstimator.sampleWindow))
+        )
+        if let estimated = estimator.estimatedTip(now: Date()) {
+            return estimated
+        }
+        guard let scannedTip = try await welding.maxScannedHeight() else {
+            throw ZcashError.migrationChainTipUnavailable
+        }
+        return scannedTip
+    }
+
+    /// The measured seconds-per-block over the most recently scanned blocks (see
+    /// ``ChainTipEstimator/secondsPerBlock()``): the mean of the last up-to-100 consecutive
+    /// header-time deltas, clamped to [5, 150] s, falling back to 75 s (the target spacing) when
+    /// fewer than two samples exist. A host uses it to convert wake-up heights into wall-clock
+    /// OS timers.
+    func estimatedSecondsPerBlock() async throws -> Double {
+        let estimator = ChainTipEstimator(
+            samples: try await welding.migrationBlockRateSamples(window: UInt32(ChainTipEstimator.sampleWindow))
+        )
+        return estimator.secondsPerBlock()
+    }
+
+    /// The estimated tip for gate/delivery due-ness checks: the estimator's projection, degraded
+    /// to `nil` (scanned-tip behavior) on ANY failure — sample read errors included — so the
+    /// estimate can only ever accelerate, never block or crash, the paths that consult it.
+    /// Static (welding passed in) so the init-time `overdueProvider` closure can share it before
+    /// `self` exists.
+    private static func gatingEstimatedTip(welding: ZcashRustBackendWelding) async -> BlockHeight? {
+        guard let samples = try? await welding.migrationBlockRateSamples(window: UInt32(ChainTipEstimator.sampleWindow)) else {
+            return nil
+        }
+        return ChainTipEstimator(samples: samples).estimatedTip(now: Date())
     }
 
     // MARK: - Note splitting
@@ -291,7 +391,7 @@ actor OrchardMigration {
     /// draws a duplicate rejection, which records as success).
     ///
     /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
-    /// (this method or ``executeNextPendingTransfer(options:)``) is in flight, this call first waits
+    /// (this method or ``executeNextPendingTransfer(options:useEstimatedTip:)``) is in flight, this call first waits
     /// for it to finish — it never broadcasts concurrently with it and never throws on contention.
     func submitNoteSplit(
         proposal: NoteSplitProposal,
@@ -331,9 +431,11 @@ actor OrchardMigration {
         return ImmediateMigrationProposal(proposal: proposal, amount: amount, fee: fee)
     }
 
-    /// Records a broadcast immediate-migration sweep so the platform migration state machine
-    /// reports it: `InProgress` (0 of 1) while unmined, `Complete` once mined, or a re-offer
-    /// (`NotStarted`) if it expires unmined. Not broadcast-performing itself (the broadcast rides
+    /// Records a broadcast immediate-migration sweep. The immediate lane surfaces ONLY through
+    /// ``migrationProgress()`` — no engine state machine is involved: while the recorded sweep is
+    /// unmined and unexpired, progress reports a `0` of `1` snapshot flagged
+    /// ``MigrationProgress/isImmediate``; once it mines (consumed) or expires (the offer
+    /// re-arms), progress reports `nil`. Not broadcast-performing itself (the broadcast rides
     /// the ordinary `createProposedTransactions`/`createTransactionFromPCZT` pipeline, already
     /// guarded there) -- this only records the outcome, so it is not gated by
     /// ``serializedBroadcastFlow(_:)``.
@@ -401,10 +503,19 @@ actor OrchardMigration {
 
     // MARK: - Background execution
 
-    /// Broadcasts the next height-due transfer, or returns `nil` when nothing is currently due.
+    /// Broadcasts the next height-due, ALREADY-PROVEN transaction, or reports why nothing was
+    /// broadcast — see ``MigrationTransferAttempt`` for the three outcomes. BROADCAST-ONLY: this
+    /// call never proves (``MigrationTransferAttempt/awaitingProof(id:)`` is cleared by
+    /// ``finalizeReadyTransfers()`` at a sync wake-up, never here), so a broadcast session stays a
+    /// pure delivery step.
+    ///
+    /// `useEstimatedTip` opts the due-ness check into the wall-clock chain-tip estimate (see
+    /// ``ChainTipEstimator``): the estimate may only ACCELERATE scheduled-height due-ness — expiry
+    /// is always evaluated against the scanned tip — and an estimator failure degrades to the
+    /// scanned-tip behavior rather than blocking the attempt.
     ///
     /// Composition mirrors ``submitNoteSplit(proposal:usk:options:)``: fetch the next due transfer
-    /// (nil ⇒ return nil, leaving the gate untouched), extract, broadcast once, and — only on a
+    /// (empty outcomes leave the gate untouched), extract, broadcast once, and — only on a
     /// success outcome — start the privacy buffer, *before* recording the mapped result: the gate
     /// marks on submit success, independent of record bookkeeping. Transport/rejection outcomes are
     /// returned (recorded first, gate untouched). Pre-broadcast failures throw untouched; a record
@@ -416,30 +527,36 @@ actor OrchardMigration {
     /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
     /// (this method or ``submitNoteSplit(proposal:usk:options:)``) is in flight, this call first
     /// waits for it to finish and only then fetches the next due transfer — so a concurrent call
-    /// can never re-broadcast the in-flight transfer, and typically returns nil once the in-flight
-    /// flow has recorded. It never throws on contention.
+    /// can never re-broadcast the in-flight transfer, and typically reports
+    /// ``MigrationTransferAttempt/nothingDue`` once the in-flight flow has recorded. It never
+    /// throws on contention.
     ///
     /// - Important: This method must run only in a session that does **not** also sync. This actor
     ///   does not check sync state itself; the `Synchronizer` surface in front of it adds an
     ///   advisory point-in-time guard (``ZcashError/migrationBroadcastDuringSync``) plus the
-    ///   10-minute privacy gate (see ``isSyncBlocked()``) — neither is a hard mutual-exclusion
+    ///   privacy gate (see ``isSyncBlocked()``) — neither is a hard mutual-exclusion
     ///   lock, so hosts must still sequence sync and broadcast sessions.
-    /// - Note: Immediately after ``storeSignedNoteSplitPCZT(_:)``, the engine treats the pending note
-    ///   split as the next due transfer, so this method broadcasts that split first — it keeps
-    ///   returning the split's prepared transfer until the split is reported broadcast, and only then
-    ///   advances to the scheduled transfers.
-    func executeNextPendingTransfer(options: MigrationNetworkPrivacyOptions) async throws -> MigrationTransferResult? {
-        try await serializedBroadcastFlow { () async throws -> MigrationTransferResult? in
-            switch try await welding.migrationNextDueTransfer(for: accountUUID) {
+    /// - Note: The engine serves preparation transactions and transfers alike, in scheduled
+    ///   order — after an external-signer store, the pending preparations are what comes due
+    ///   first, and only once they are broadcast (and mined) do the scheduled transfers follow.
+    func executeNextPendingTransfer(
+        options: MigrationNetworkPrivacyOptions,
+        useEstimatedTip: Bool
+    ) async throws -> MigrationTransferAttempt {
+        try await serializedBroadcastFlow { () async throws -> MigrationTransferAttempt in
+            // The estimate only ever accelerates due-ness; estimator failure degrades to nil
+            // (scanned-tip behavior) and never blocks the attempt.
+            let estimatedTip = useEstimatedTip ? await OrchardMigration.gatingEstimatedTip(welding: welding) : nil
+            switch try await welding.migrationNextDueTransfer(for: accountUUID, estimatedTip: estimatedTip) {
             case .nothingDue:
-                return nil
+                return .nothingDue
             case .ready(let prepared):
-                return try await broadcastAndRecord(prepared: prepared, options: options)
+                return .executed(try await broadcastAndRecord(prepared: prepared, options: options))
             case .awaitingProof(let id):
-                // Due, but the opportunistic prove sweep has not produced its proof yet. Nothing to
-                // broadcast this window; the caller retries and the sweep clears it.
+                // Due, but the proving sweep has not produced its proof yet. Nothing to broadcast
+                // this window; `finalizeReadyTransfers()` at a sync wake-up clears it.
                 logger.debug("migration transfer \(id) is due but awaiting its proof; nothing broadcast")
-                return nil
+                return .awaitingProof(id: id)
             }
         }
     }
@@ -458,7 +575,10 @@ actor OrchardMigration {
     ///   ``syncBlockedStream``'s synchronous subscribe-time seed -- see that property's documented
     ///   caveat about the two briefly disagreeing right after relaunch.
     func isSyncBlocked() async -> Bool {
-        let hasOverdue = (try? await welding.migrationHasOverdueTransfers(for: accountUUID)) ?? false
+        // Estimate-aware, matching the reactive gate's overdueProvider: the estimate only
+        // accelerates due-ness, and any estimator failure degrades to a nil estimate.
+        let estimatedTip = await OrchardMigration.gatingEstimatedTip(welding: welding)
+        let hasOverdue = (try? await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: estimatedTip)) ?? false
         return syncGate.currentlyBlocked(hasOverdue: hasOverdue)
     }
 
@@ -486,8 +606,14 @@ actor OrchardMigration {
     // MARK: - On-launch reconciliation
 
     /// Whether any scheduled transfer is past its send height but not yet broadcast.
-    func hasOverdueTransfers() async throws -> Bool {
-        try await welding.migrationHasOverdueTransfers(for: accountUUID)
+    ///
+    /// `useEstimatedTip` opts the check into the wall-clock chain-tip estimate: the estimate may
+    /// only ACCELERATE due-ness (expiry stays scanned-tip), and an estimator failure degrades to
+    /// the scanned-tip behavior — the same plumbing as
+    /// ``executeNextPendingTransfer(options:useEstimatedTip:)``.
+    func hasOverdueTransfers(useEstimatedTip: Bool) async throws -> Bool {
+        let estimatedTip = useEstimatedTip ? await OrchardMigration.gatingEstimatedTip(welding: welding) : nil
+        return try await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: estimatedTip)
     }
 
     /// Whether the migration is in an invalid state (spendable Orchard remains but no scheduled
@@ -497,18 +623,19 @@ actor OrchardMigration {
     }
 
     /// The migration engine's next height-due pending transfer proposal, or `nil` when nothing is
-    /// pending.
+    /// pending — a straight readback of the stored run's next due-and-unbroadcast transfer
+    /// (`zcashlc_migration_pending_transfer_proposal`).
     ///
-    /// A straight readback of the stored run's next due-and-unbroadcast transfer — deliberately
-    /// with **no** local time-shifting of `nextExecutableAfterHeight` (the Android implementation
-    /// clamps it to `now + interval` with a known unit bug the SDK does not port). The host re-arms
-    /// its own background execution window from the returned proposal's heights; the local decision
-    /// not to broadcast before that window *is* the reschedule, and the ZIP 318 "re-spread the
-    /// remainder" property is carried by the delivery machinery itself (one broadcast per session,
-    /// the 10-minute privacy buffer between sessions). `nil` means there is nothing to re-arm (no
-    /// stored run, the run is terminal, or only preparation transactions are pending).
+    /// Deliberately with **no** local time-shifting of `nextExecutableAfterHeight` (the Android
+    /// implementation clamps it to `now + interval` with a known unit bug the SDK does not port).
+    /// The host re-arms its own background execution window from the returned proposal's heights;
+    /// the local decision not to broadcast before that window *is* the reschedule, and the ZIP 318
+    /// "re-spread the remainder" property is carried by the delivery machinery itself (one
+    /// broadcast per session, the privacy buffer between sessions). `nil` means there is nothing
+    /// to re-arm (no stored run, the run is terminal, or only preparation transactions are
+    /// pending).
     /// - Throws: `rustMigrationPendingTransferProposal` if the engine returns an error.
-    func rescheduleOverdueTransfer() async throws -> MigrationTransferProposal? {
+    func pendingTransferProposal() async throws -> MigrationTransferProposal? {
         try await welding.migrationPendingTransferProposal(for: accountUUID)
     }
 
@@ -601,6 +728,52 @@ actor OrchardMigration {
         try await welding.migrationStoreSignedSchedulePczts(signed, for: accountUUID)
     }
 
+    /// Splits an ORDERED unsigned-PCZT batch into signer sessions bounded by
+    /// `maxActionsPerSession` actions, preserving order — see the shared
+    /// ``batchPcztsForSigning(welding:pczts:maxActionsPerSession:)`` for the contract.
+    func batchPcztsForSigning(
+        _ pczts: [MigrationUnsignedTransferPczt],
+        maxActionsPerSession: Int
+    ) async throws -> [[MigrationUnsignedTransferPczt]] {
+        try await OrchardMigration.batchPcztsForSigning(welding: welding, pczts: pczts, maxActionsPerSession: maxActionsPerSession)
+    }
+
+    /// The shared order-preserving session split behind ``batchPcztsForSigning(_:maxActionsPerSession:)``
+    /// and the synchronizers' account-free `batchMigrationPcztsForSigning`: the welding computes
+    /// the per-session COUNTS from the rows' action weights (`MigrationUnsignedTransferPczt.actions`;
+    /// upstream `NextFit` — order-preserving greedy, never the estimate's reorder-free optimal
+    /// packing), and this re-slices the caller's own ordered array by them, so ids/bytes never
+    /// round-trip through the FFI. Static (welding passed in) because the split is account-free —
+    /// it weighs caller-held rows, never the wallet database.
+    static func batchPcztsForSigning(
+        welding: ZcashRustBackendWelding,
+        pczts: [MigrationUnsignedTransferPczt],
+        maxActionsPerSession: Int
+    ) async throws -> [[MigrationUnsignedTransferPczt]] {
+        let sizes = try await welding.migrationBatchPcztsByActions(
+            actions: pczts.map { UInt32($0.actions) },
+            maxActionsPerSession: maxActionsPerSession
+        )
+
+        // The FFI contract guarantees the per-session counts sum to the input length; guard it
+        // anyway (defensive, like the marshal-layer decode guards) so a drift can never crash the
+        // re-slice below with an out-of-bounds range.
+        guard sizes.reduce(0, +) == pczts.count else {
+            throw ZcashError.rustMigrationBatchPcztsByActions(
+                "`migrationBatchPcztsByActions` returned session sizes that do not sum to the batch size"
+            )
+        }
+
+        var sessions: [[MigrationUnsignedTransferPczt]] = []
+        sessions.reserveCapacity(sizes.count)
+        var nextIndex = 0
+        for size in sizes {
+            sessions.append(Array(pczts[nextIndex ..< nextIndex + size]))
+            nextIndex += size
+        }
+        return sessions
+    }
+
     // MARK: - Private
 
     /// Runs `flow` as the only broadcast-performing flow on this actor.
@@ -644,16 +817,41 @@ actor OrchardMigration {
     /// ``ZcashError/migrationRecordFailedAfterBroadcast(_:)``. Non-success outcomes are recorded
     /// first and returned with the gate untouched (only success outcomes mark it, unchanged); only
     /// pre-broadcast failures throw untouched.
+    ///
+    /// The whole submit-to-record window is additionally bracketed by the sync gate's persisted
+    /// in-flight marker (``MigrationSyncGate/markBroadcastInFlight()``): armed just before the
+    /// network submit, cleared once the outcome is recorded (success or mapped failure) — or
+    /// immediately when the broadcaster throws before submitting anything (its fail-closed
+    /// contract: a throw means nothing reached the network). A crash — or a record throw —
+    /// between submit and record leaves the marker behind, and it self-expires at
+    /// ``MigrationSyncGate/broadcastInFlightGuardDuration`` (120 s); while it lives, sync (and
+    /// with it the reconciliation probe that must not observe a just-broadcast transfer) stays
+    /// blocked.
     private func broadcastAndRecord(
         prepared: PreparedMigrationTransfer,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
         let rawTransaction = try await welding.migrationExtractBroadcastTx(pczt: prepared.pczt, for: accountUUID)
-        let outcome = try await broadcaster.broadcast(
-            rawTransaction: rawTransaction,
-            to: options.submissionEndpoint,
-            useTor: options.useTor
-        )
+
+        // Arm the in-flight marker before the submit can reach the network; a crash from here
+        // until the record lands leaves it to self-expire.
+        syncGate.markBroadcastInFlight()
+
+        let outcome: MigrationBroadcastOutcome
+        do {
+            outcome = try await broadcaster.broadcast(
+                rawTransaction: rawTransaction,
+                to: options.submissionEndpoint,
+                useTor: options.useTor
+            )
+        } catch {
+            // The broadcaster throws only when nothing was submitted (fail-closed Tor, a
+            // pre-connect failure): nothing is in flight, so clear the marker rather than
+            // leaving sync blocked for the full self-expiry window.
+            syncGate.clearBroadcastInFlight()
+            throw error
+        }
+
         let result = MigrationBroadcaster.map(outcome: outcome, successTxId: prepared.txid.toHexStringTxId())
         if case MigrationTransferResult.success = result {
             // The broadcast landed (or a duplicate rejection proved an earlier one did): start the
@@ -662,12 +860,17 @@ actor OrchardMigration {
             do {
                 try await welding.migrationRecordTransferResult(transferId: prepared.id, result: result, for: accountUUID)
             } catch {
+                // Deliberately NOT clearing the in-flight marker: the result was never recorded,
+                // which is exactly the submit-to-record gap the marker guards; it self-expires.
                 logger.error("OrchardMigration: failed to record a successfully submitted broadcast: \(error)")
                 throw ZcashError.migrationRecordFailedAfterBroadcast(error)
             }
         } else {
             try await welding.migrationRecordTransferResult(transferId: prepared.id, result: result, for: accountUUID)
         }
+
+        // The outcome is durably recorded: the submit-to-record window is closed.
+        syncGate.clearBroadcastInFlight()
         return result
     }
 }

@@ -1438,25 +1438,153 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     // MARK: - Ironwood migration
 
     @DBActor
-    func migrationState(for account: AccountUUID) async throws -> MigrationState {
-        let statePtr = zcashlc_migration_state(
+    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep? {
+        // Clear any stale, unconsumed last-error before this sentinel read (see
+        // `migrationIsNoteSplitNeeded` below): a NULL return overloads "no stored run" and
+        // "error", and only a recorded last-error distinguishes the two.
+        zcashlc_clear_last_error()
+
+        let stepPtr = zcashlc_migration_advance_step(
             dbData.0,
             dbData.1,
             account.id,
             networkType.networkId
         )
 
-        guard let statePtr else {
-            throw ZcashError.rustMigrationState(lastErrorMessage(fallback: "`migrationState` failed with unknown error"))
+        // NULL with no recorded error is the benign "no migration run is stored" answer (the
+        // pointer analog of `migrationPendingTransferProposal`'s NULL sentinel).
+        guard let stepPtr else {
+            if zcashlc_last_error_length() > 0 {
+                throw ZcashError.rustMigrationAdvanceStep(
+                    lastErrorMessage(fallback: "`migrationAdvanceStep` failed with unknown error")
+                )
+            }
+
+            return nil
         }
 
-        defer { zcashlc_free_migration_state(statePtr) }
+        defer { zcashlc_free_migration_advance_step(stepPtr) }
 
-        guard let state = statePtr.pointee.unsafeToMigrationState() else {
-            throw ZcashError.rustMigrationState(lastErrorMessage(fallback: "`migrationState` returned a malformed state"))
+        guard let step = stepPtr.pointee.unsafeToMigrationAdvanceStep() else {
+            throw ZcashError.rustMigrationAdvanceStep(
+                lastErrorMessage(fallback: "`migrationAdvanceStep` returned a malformed step")
+            )
         }
 
-        return state
+        return step
+    }
+
+    @DBActor
+    func migrationSyncWakeups(for account: AccountUUID) async throws -> [MigrationSyncWakeup] {
+        let wakeupsPtr = zcashlc_migration_sync_wakeups(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId
+        )
+
+        guard let wakeupsPtr else {
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationSyncWakeups` failed with unknown error"),
+                fallback: ZcashError.rustMigrationSyncWakeups
+            )
+        }
+
+        defer { zcashlc_free_migration_sync_wakeups(wakeupsPtr) }
+
+        var wakeups: [MigrationSyncWakeup] = []
+        wakeups.reserveCapacity(Int(wakeupsPtr.pointee.len))
+
+        for index in 0 ..< Int(wakeupsPtr.pointee.len) {
+            let row = wakeupsPtr.pointee.rows.advanced(by: index).pointee
+            var covers: [UInt32] = []
+            covers.reserveCapacity(Int(row.covers_len))
+            if let coversPtr = row.covers {
+                for coverIndex in 0 ..< Int(row.covers_len) {
+                    covers.append(coversPtr.advanced(by: coverIndex).pointee)
+                }
+            }
+            wakeups.append(MigrationSyncWakeup(height: BlockHeight(row.height), coversTransferIds: covers))
+        }
+
+        return wakeups
+    }
+
+    @DBActor
+    func migrationBlockRateSamples(window: UInt32) async throws -> [MigrationBlockRateSample] {
+        let samplesPtr = zcashlc_migration_block_rate_samples(
+            dbData.0,
+            dbData.1,
+            networkType.networkId,
+            window
+        )
+
+        guard let samplesPtr else {
+            throw ZcashError.rustMigrationBlockRateSamples(
+                lastErrorMessage(fallback: "`migrationBlockRateSamples` failed with unknown error")
+            )
+        }
+
+        defer { zcashlc_free_block_rate_samples(samplesPtr) }
+
+        var samples: [MigrationBlockRateSample] = []
+        samples.reserveCapacity(Int(samplesPtr.pointee.len))
+
+        for index in 0 ..< Int(samplesPtr.pointee.len) {
+            let row = samplesPtr.pointee.rows.advanced(by: index).pointee
+            samples.append(MigrationBlockRateSample(height: BlockHeight(row.height), unixTime: row.unix_time))
+        }
+
+        return samples
+    }
+
+    @DBActor
+    func migrationReconcileInvalidations(for account: AccountUUID) async throws -> Bool {
+        let outcome = zcashlc_migration_reconcile_invalidations(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId
+        )
+
+        // `-1` means only "error" (`0` = nothing invalidated / `1` = invalidation recorded are
+        // the two legitimate outcomes).
+        guard outcome >= 0 else {
+            throw ZcashError.rustMigrationReconcileInvalidations(
+                lastErrorMessage(fallback: "`migrationReconcileInvalidations` failed with unknown error")
+            )
+        }
+
+        return outcome == 1
+    }
+
+    // DB-free: a pure split over the caller's action weights (mirrors the Keystone UR bridge
+    // below), so unlike the wallet-db migration methods this is not `@DBActor`.
+    func migrationBatchPcztsByActions(actions: [UInt32], maxActionsPerSession: Int) async throws -> [Int] {
+        let sizesPtr = actions.withUnsafeBufferPointer { actionsPtr in
+            zcashlc_migration_batch_pczts_by_actions(
+                actionsPtr.baseAddress,
+                UInt(actionsPtr.count),
+                UInt32(maxActionsPerSession)
+            )
+        }
+
+        guard let sizesPtr else {
+            throw ZcashError.rustMigrationBatchPcztsByActions(
+                lastErrorMessage(fallback: "`migrationBatchPcztsByActions` failed with unknown error")
+            )
+        }
+
+        defer { zcashlc_free_migration_batch_sizes(sizesPtr) }
+
+        var sizes: [Int] = []
+        sizes.reserveCapacity(Int(sizesPtr.pointee.len))
+
+        for index in 0 ..< Int(sizesPtr.pointee.len) {
+            sizes.append(Int(sizesPtr.pointee.ptr.advanced(by: index).pointee))
+        }
+
+        return sizes
     }
 
     @DBActor
@@ -1530,7 +1658,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationHasOverdueTransfers(for account: AccountUUID) async throws -> Bool {
+    func migrationHasOverdueTransfers(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
         // Clear any stale, unconsumed last-error before this sentinel read (see
         // `migrationIsNoteSplitNeeded` above).
         zcashlc_clear_last_error()
@@ -1539,7 +1667,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             dbData.0,
             dbData.1,
             account.id,
-            networkType.networkId
+            networkType.networkId,
+            // `-1` disables the estimate on the rust side.
+            estimatedTip.map(Int64.init) ?? -1
         )
 
         // `false` overloads "legitimately none overdue" and "error"; check last-error to disambiguate.
@@ -1596,15 +1726,26 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     /// Routes the rust layer's stable error prefixes to their dedicated `ZcashError` cases:
-    /// `MIGRATION_PLAN_STALE` -> `.migrationPlanStale` (re-propose) and
-    /// `MIGRATION_PROVING_UNAVAILABLE` -> `.migrationProvingUnavailable` (proving failed hard).
-    /// Anything else falls back to the member's own case.
+    /// `MIGRATION_PLAN_STALE` -> `.migrationPlanStale` (re-propose),
+    /// `MIGRATION_PROVING_UNAVAILABLE` -> `.migrationProvingUnavailable` (proving failed hard),
+    /// and `MIGRATION_WAKEUP_INFEASIBLE:<id>` -> `.migrationWakeupInfeasible(id)` (an
+    /// inconsistent stored schedule; the id names the offending transfer). Anything else —
+    /// including a `MIGRATION_WAKEUP_INFEASIBLE` whose id does not parse — falls back to the
+    /// member's own case.
     nonisolated private func migrationRoutedError(_ message: String, fallback: (String) -> ZcashError) -> ZcashError {
         if message.hasPrefix("MIGRATION_PLAN_STALE") {
             return .migrationPlanStale
         }
         if message.hasPrefix("MIGRATION_PROVING_UNAVAILABLE") {
             return .migrationProvingUnavailable(message)
+        }
+        if message.hasPrefix("MIGRATION_WAKEUP_INFEASIBLE:") {
+            // The rust side emits exactly `MIGRATION_WAKEUP_INFEASIBLE:<id>`; an unparseable id
+            // (a contract drift) degrades to the generic fallback rather than fabricating one.
+            let rawId = message.dropFirst("MIGRATION_WAKEUP_INFEASIBLE:".count)
+            if let transferId = UInt32(rawId) {
+                return .migrationWakeupInfeasible(transferId)
+            }
         }
         return fallback(message)
     }
@@ -1836,12 +1977,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationNextDueTransfer(for account: AccountUUID) async throws -> DueMigrationTransfer {
+    func migrationNextDueTransfer(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> DueMigrationTransfer {
         let preparedPtr = zcashlc_migration_next_due_transfer(
             dbData.0,
             dbData.1,
             account.id,
-            networkType.networkId
+            networkType.networkId,
+            // `-1` disables the estimate on the rust side.
+            estimatedTip.map(Int64.init) ?? -1
         )
 
         guard let preparedPtr else {
@@ -2726,6 +2869,14 @@ extension FfiMigrationTransactionStatus {
             return nil
         }
 
+        var decodedDependsOn: [UInt32] = []
+        decodedDependsOn.reserveCapacity(Int(depends_on_len))
+        if let dependsOnPtr = depends_on {
+            for index in 0 ..< Int(depends_on_len) {
+                decodedDependsOn.append(dependsOnPtr.advanced(by: index).pointee)
+            }
+        }
+
         return MigrationTransactionStatus(
             id: id,
             kind: kind,
@@ -2734,7 +2885,11 @@ extension FfiMigrationTransactionStatus {
             expiryHeight: expiry_height == 0 ? nil : BlockHeight(expiry_height),
             isReady: ready,
             nextAction: decodedNextAction,
-            blockedOn: decodedBlockedOn
+            blockedOn: decodedBlockedOn,
+            dependsOn: decodedDependsOn,
+            // `-1` is the "no drawn boundary" sentinel — always so for a preparation, which
+            // anchors near-tip at proving time instead.
+            anchorBoundaryHeight: anchor_boundary >= 0 ? BlockHeight(anchor_boundary) : nil
         )
     }
 }
@@ -2760,36 +2915,24 @@ extension FfiMigrationTransactionStatuses {
     }
 }
 
-extension FfiAttentionReason {
-    /// Converts an [`FfiAttentionReason`] into a [`MigrationAttentionReason`], or `nil` for an
-    /// unrecognized tag or a missing `transfer_id` (should not happen; defensive only).
-    func unsafeToMigrationAttentionReason() -> MigrationAttentionReason? {
-        switch tag {
+extension FfiMigrationAdvanceStep {
+    /// Converts an [`FfiMigrationAdvanceStep`] into a [`MigrationAdvanceStep`], or `nil` for an
+    /// unrecognized step discriminant (should not happen; defensive only). The per-kind payload
+    /// fields (`kind_layer`/`kind_index`/`kind_crossing`) are meaningful only for the Prove step
+    /// and are zeroed otherwise — a verbatim mirror of the FFI contract.
+    func unsafeToMigrationAdvanceStep() -> MigrationAdvanceStep? {
+        switch step {
         case 0:
-            return .invalidTransfer(transferId: invalid_transfer.transfer_id)
+            let kind: MigrationTransactionStatus.Kind = kind_is_preparation
+                ? .preparation(layer: Int(kind_layer), index: Int(kind_index))
+                : .transfer(crossing: Int(kind_crossing))
+            return .prove(id: id, kind: kind)
         case 1:
-            return .transferExpired
-        default:
-            return nil
-        }
-    }
-}
-
-extension FfiMigrationState {
-    /// Converts an [`FfiMigrationState`] into a [`MigrationState`], or `nil` for an unrecognized
-    /// tag or malformed payload (should not happen; defensive only).
-    func unsafeToMigrationState() -> MigrationState? {
-        switch tag {
-        case 0:
-            return .notStarted
-        case 1:
-            return .splitPendingConfirmation
+            return .broadcast(id: id)
         case 2:
-            guard let progress = in_progress.unsafeToMigrationProgress() else { return nil }
-            return .inProgress(progress)
+            return .rebuild(id: id)
         case 3:
-            guard let reason = requires_attention.unsafeToMigrationAttentionReason() else { return nil }
-            return .requiresAttention(reason)
+            return .waiting
         case 4:
             return .complete
         default:
@@ -2874,10 +3017,34 @@ extension FfiMigrationSchedule {
             proposals.append(proposal)
         }
 
+        var preparationSteps: [MigrationPreparationStep] = []
+        preparationSteps.reserveCapacity(Int(preparations_len))
+
+        for index in 0 ..< Int(preparations_len) {
+            let row = preparations.advanced(by: index).pointee
+            var dependsOn: [UInt32] = []
+            dependsOn.reserveCapacity(Int(row.depends_on_len))
+            if let dependsOnPtr = row.depends_on {
+                for dependencyIndex in 0 ..< Int(row.depends_on_len) {
+                    dependsOn.append(dependsOnPtr.advanced(by: dependencyIndex).pointee)
+                }
+            }
+            preparationSteps.append(
+                MigrationPreparationStep(
+                    id: row.id,
+                    layer: Int(row.layer),
+                    index: Int(row.index),
+                    broadcastHeight: BlockHeight(row.broadcast_height),
+                    dependsOn: dependsOn
+                )
+            )
+        }
+
         return MigrationSchedule(
             transfers: proposals,
             estimatedDurationHours: Int(estimated_duration_hours),
-            proposalHandle: proposal_handle
+            proposalHandle: proposal_handle,
+            preparations: preparationSteps
         )
     }
 }
@@ -2897,7 +3064,9 @@ extension FfiMigrationRunEstimate {
                     migratable: Zatoshi(run.migratable),
                     crossings: Int(run.crossings),
                     preparationLayers: Int(run.prep_layers),
-                    preparationTransactions: Int(run.prep_transactions)
+                    preparationTransactions: Int(run.prep_transactions),
+                    actions: Int(run.actions),
+                    keystoneSigningSessions: Int(run.keystone_rounds)
                 )
             )
         }
@@ -2916,7 +3085,8 @@ extension FfiUnsignedTransferPczt {
 
         return MigrationUnsignedTransferPczt(
             id: id,
-            pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
+            pczt: Data(bytes: pcztPtr, count: Int(pczt_len)),
+            actions: Int(actions)
         )
     }
 

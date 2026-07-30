@@ -415,21 +415,73 @@ protocol ZcashRustBackendWelding {
 
     // MARK: - Ironwood migration
 
-    /// Current Orchard -> Ironwood migration state for `account`. This is also the reconciliation
-    /// hub: call it on launch and after every migration-related operation.
-    /// - Throws: `rustMigrationState` if the rust layer returns an error.
-    func migrationState(for account: AccountUUID) async throws -> MigrationState
+    /// The engine's next step to advance `account`'s stored migration run — a VERBATIM conduit of
+    /// the upstream engine's `MigrationState::next_step`, evaluated at the SCANNED tip (the
+    /// estimated tip never enters this decision), with mined transactions reconciled first like
+    /// every other read. `nil` means NO run is stored at all (nothing to advance); a stored
+    /// TERMINAL run — complete or cancelled — reports ``MigrationAdvanceStep/complete`` verbatim
+    /// and is never driven further. See ``MigrationAdvanceStep`` for the step semantics and the
+    /// discharge mapping.
+    /// - Throws: `rustMigrationAdvanceStep` if the rust layer returns an error.
+    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep?
 
-    /// Live migration progress, or `nil` when no migration is in progress.
+    /// Live migration progress, or `nil` when no snapshot is reportable: present only while an
+    /// engine run is ACTIVE (not terminal) or a recorded immediate sweep is pending (unmined and
+    /// unexpired); a terminal — complete or cancelled — run reports `nil`.
     /// - Throws: `rustMigrationProgress` if the rust layer returns an error.
     func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress?
+
+    /// The stored run's minimal sync/proving wake-up schedule as of the SCANNED chain tip: each
+    /// row is a height at which to wake, sync, and prove, plus the transfer ids it covers. A
+    /// verbatim marshal of the upstream engine's `sync_wakeup_schedule`. Jitter is re-drawn on
+    /// every call — two calls may legitimately differ — so recompute (and re-register with the
+    /// OS) after any state change rather than caching. No stored run, a terminal run, or no
+    /// transfer still needing a proof returns the EMPTY schedule — not an error.
+    /// - Throws: `migrationWakeupInfeasible` when a stored transfer admits no valid wake-up
+    ///   height (an inconsistent stored schedule); `rustMigrationSyncWakeups` for other
+    ///   rust-layer errors.
+    func migrationSyncWakeups(for account: AccountUUID) async throws -> [MigrationSyncWakeup]
+
+    /// The most recently scanned blocks' `(height, header time)` samples, at most `window` rows,
+    /// ASCENDING by height — the raw inputs ``ChainTipEstimator`` projects an ESTIMATED chain tip
+    /// from (fed back into ``migrationHasOverdueTransfers(for:estimatedTip:)`` /
+    /// ``migrationNextDueTransfer(for:estimatedTip:)``). A read-only, best-effort read of
+    /// scanned-block metadata: a wallet with no scanned blocks yet returns the EMPTY list, never
+    /// an error. Wallet-scoped, not account-scoped — the blocks table is shared.
+    /// - Throws: `rustMigrationBlockRateSamples` if the rust layer returns an error.
+    func migrationBlockRateSamples(window: UInt32) async throws -> [MigrationBlockRateSample]
+
+    /// Reconciles `account`'s committed run against LOCAL on-chain truth (own-broadcast/mined
+    /// promotion, a submit-crash probe on proved rows, then the foreign-spend nullifier check)
+    /// and records an invalid mark when a pending transfer's funding note was spent by a foreign
+    /// transaction. Touches only the local wallet database, never the network. Returns `true`
+    /// when this call recorded an invalidation, `false` when nothing was invalidated (no stored
+    /// run, a terminal run, or every pending transfer's funding notes check out).
+    ///
+    /// The 120-second in-flight-broadcast guard (during which a just-broadcast transfer must not
+    /// be probed) is the caller's job — see ``MigrationSyncGate``'s in-flight marker — not this
+    /// function's.
+    /// - Throws: `rustMigrationReconcileInvalidations` if the rust layer returns an error.
+    func migrationReconcileInvalidations(for account: AccountUUID) async throws -> Bool
+
+    /// Splits an ORDERED list of transaction action-weights (`MigrationUnsignedTransferPczt.actions`)
+    /// into signer sessions bounded by `maxActionsPerSession`, preserving order, and returns the
+    /// per-session transaction COUNTS (summing to `actions.count`): the caller re-slices its own
+    /// ordered PCZT list by them. An order-preserving greedy split (the upstream `NextFit`
+    /// strategy) — NOT the optimal packing behind `MigrationRunEstimate.Run.keystoneSigningSessions`,
+    /// which is free to reorder; this call's caller generally cannot. Pure — no wallet database.
+    /// - Throws: `rustMigrationBatchPcztsByActions` if the rust layer returns an error — notably
+    ///   when any element of `actions` is not exactly 16 (preparation) or 3 (transfer), or when
+    ///   `maxActionsPerSession` is below 16 (the minimum any signer must support, a single
+    ///   preparation transaction). Both are caller bugs, not signer conditions.
+    func migrationBatchPcztsByActions(actions: [UInt32], maxActionsPerSession: Int) async throws -> [Int]
 
     /// The LIVE status of every committed migration transaction for `account`, keyed by its
     /// stable id. A verbatim marshal of the engine's own `MigrationState::transaction_statuses`:
     /// nothing here is derived independently of the engine's view, and each row's `id` is STABLE
     /// across reads and across a stale-transfer rebuild (a rebuilt transfer keeps its id; only
     /// its state and heights change). Reconciles mined transactions first (the same read-path
-    /// convention as `migrationState(for:)`), so a transaction the wallet's own scan has since
+    /// convention as `migrationAdvanceStep(for:)`), so a transaction the wallet's own scan has since
     /// observed mined is reported `.mined` here even if the stored run still marks it broadcast.
     /// No stored run, or a stored run with no transactions, returns an EMPTY array — not an error.
     /// - Throws: `rustMigrationTransactionStatuses` if the rust layer returns an error.
@@ -442,9 +494,16 @@ protocol ZcashRustBackendWelding {
     ///   returning `false`.
     func migrationIsNoteSplitNeeded(for account: AccountUUID) async throws -> Bool
 
-    /// Whether any scheduled transfer is past its send height but not yet broadcast.
+    /// Whether any scheduled transfer is past its send height but not yet broadcast — that is,
+    /// whether the delivery lane has actionable work (an already-proved due transaction, or a
+    /// due, dependency-satisfied prove-ready one the delivery call would drive through proving).
+    ///
+    /// `estimatedTip` (`nil` = disabled) is the platform's wall-clock chain-tip projection (see
+    /// ``ChainTipEstimator``). It may only ACCELERATE scheduled-height due-ness — the effective
+    /// tip is `max(scanned, estimated)`, so an estimate below the scanned tip is ignored — and
+    /// EXPIRY is always evaluated against the SCANNED tip, never the estimate.
     /// - Throws: `rustMigrationHasOverdueTransfers` if the rust layer returns an error.
-    func migrationHasOverdueTransfers(for account: AccountUUID) async throws -> Bool
+    func migrationHasOverdueTransfers(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool
 
     /// Whether the migration is in an invalid state (spendable Orchard remains but no scheduled
     /// transfer covers it).
@@ -501,8 +560,8 @@ protocol ZcashRustBackendWelding {
 
     /// Estimates how the account migrates its whole spendable Orchard balance: the number of
     /// migration RUNS ("rounds") it takes, and for each run both what it migrates and what
-    /// preparing it costs, so the platform can preview and compare the two — including external-
-    /// signer session counts for any per-session capacity — before anything is planned or
+    /// preparing it costs — including the signer ACTION workload and the precomputed Keystone
+    /// signing-round count (see `MigrationRunEstimate`) — before anything is planned or
     /// committed. A zero (or fully sub-quantum) balance yields the ZERO-RUN estimate
     /// (`runCount == 0`), a legitimate answer, not an error.
     /// - Throws: `rustMigrationEstimateRuns` if the rust layer returns an error.
@@ -569,8 +628,12 @@ protocol ZcashRustBackendWelding {
     /// The next height-due pre-signed transfer, if one is both due and already proved — see
     /// `DueMigrationTransfer` for the three outcomes. Never proves; run `migrationProvePending`
     /// for that.
+    ///
+    /// `estimatedTip` (`nil` = disabled) may only ACCELERATE scheduled-height due-ness; expiry is
+    /// always evaluated against the SCANNED tip — the same rule as
+    /// ``migrationHasOverdueTransfers(for:estimatedTip:)``.
     /// - Throws: `rustMigrationNextDueTransfer` if the rust layer returns an error.
-    func migrationNextDueTransfer(for account: AccountUUID) async throws -> DueMigrationTransfer
+    func migrationNextDueTransfer(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> DueMigrationTransfer
 
     /// The next height-due scheduled transfer's full proposal (amount, anchor, timing) for the
     /// active run, or `nil` when nothing is currently pending (no active run, or only the note-split

@@ -26,6 +26,12 @@ actor OrchardMigrationHost {
     private let now: @Sendable () -> Date
     private let logger: Logger
 
+    /// The network-scaled post-broadcast privacy buffer this host's synchronizer exposes —
+    /// resolved once at construction (from the initializer's network in production) since the
+    /// host's network never changes. Stored rather than forwarded so the nonisolated accessor
+    /// needs no network plumbing of its own.
+    private nonisolated let resolvedPrivacySyncBufferDuration: TimeInterval
+
     /// Builds a per-account ``OrchardMigration`` bound to `accountUUID`, wired to the given shared
     /// broadcaster. Injected so tests can substitute mock-welded actors; production builds each from
     /// the initializer's config via ``OrchardMigration/init(config:sharedBroadcaster:)``.
@@ -79,13 +85,16 @@ actor OrchardMigrationHost {
             tickInterval: 15,
             now: { Date() },
             logger: logger,
-            actorFactory: factory
+            actorFactory: factory,
+            privacySyncBufferDuration: OrchardMigration.privacySyncBufferDuration(for: network.networkType)
         )
     }
 
     /// Injecting initializer for tests: supply the welding, the shared broadcaster, the storage
     /// directory the gate files live in, the ticker interval and clock, the logger, and the
     /// per-account actor factory directly — mirroring ``OrchardMigration``'s own injecting init.
+    /// `privacySyncBufferDuration` defaults to the mainnet value; production resolves it from the
+    /// initializer's network (see ``init(initializer:)``).
     init(
         welding: ZcashRustBackendWelding,
         sharedBroadcaster: any MigrationBroadcasting,
@@ -93,7 +102,8 @@ actor OrchardMigrationHost {
         tickInterval: TimeInterval,
         now: @escaping @Sendable () -> Date,
         logger: Logger,
-        actorFactory: @escaping (AccountUUID, any MigrationBroadcasting) -> OrchardMigration
+        actorFactory: @escaping (AccountUUID, any MigrationBroadcasting) -> OrchardMigration,
+        privacySyncBufferDuration: TimeInterval = OrchardMigration.privacySyncBufferDuration
     ) {
         self.welding = welding
         self.sharedBroadcaster = sharedBroadcaster
@@ -101,6 +111,7 @@ actor OrchardMigrationHost {
         self.now = now
         self.logger = logger
         self.actorFactory = actorFactory
+        self.resolvedPrivacySyncBufferDuration = privacySyncBufferDuration
 
         let predicate: @Sendable () async -> Bool = {
             await OrchardMigrationHost.computeSyncBlocked(
@@ -118,9 +129,10 @@ actor OrchardMigrationHost {
         )
     }
 
-    /// The post-broadcast privacy buffer duration, forwarding ``OrchardMigration/privacySyncBufferDuration``.
+    /// The post-broadcast privacy buffer duration — the network-scaled
+    /// ``OrchardMigration/privacySyncBufferDuration(for:)`` value resolved at construction.
     nonisolated var privacySyncBufferDuration: TimeInterval {
-        OrchardMigration.privacySyncBufferDuration
+        resolvedPrivacySyncBufferDuration
     }
 
     /// The ``OrchardMigration`` bound to `accountUUID`, lazily created and cached on first request.
@@ -181,6 +193,11 @@ actor OrchardMigrationHost {
     /// The wallet-scope blocked predicate, factored out so both ``isSyncBlocked()`` and
     /// ``syncBlockedStream``'s recompute share one implementation and neither consults the lazy actor
     /// cache. Non-throwing; degrades open (to "unblocked") on any enumeration/db error.
+    ///
+    /// Estimate-aware like the per-account gates: the wall-clock chain-tip estimate is projected
+    /// ONCE (the block-rate samples are wallet-scoped, not per-account) and fed into every
+    /// account's overdue query, where it may only accelerate due-ness; an estimator/sample
+    /// failure degrades to a nil estimate (scanned-tip behavior), never to "blocked".
     private static func computeSyncBlocked(
         welding: ZcashRustBackendWelding,
         generalStorageURL: URL,
@@ -196,15 +213,28 @@ actor OrchardMigrationHost {
         }
 
         let evaluatedAt = now()
+        let estimatedTip: BlockHeight?
+        if let samples = try? await welding.migrationBlockRateSamples(window: UInt32(ChainTipEstimator.sampleWindow)) {
+            estimatedTip = ChainTipEstimator(samples: samples).estimatedTip(now: evaluatedAt)
+        } else {
+            estimatedTip = nil
+        }
+
         for account in accounts {
             // Degrade to "not overdue" on any engine error, exactly like OrchardMigration.isSyncBlocked().
-            let hasOverdue = (try? await welding.migrationHasOverdueTransfers(for: account.id)) ?? false
-            let resumeAt = MigrationSyncGate.persistedResumeAt(
+            let hasOverdue = (try? await welding.migrationHasOverdueTransfers(for: account.id, estimatedTip: estimatedTip)) ?? false
+            let gateInputs = MigrationSyncGate.persistedGateInputs(
                 directory: generalStorageURL,
                 accountUUID: account.id,
                 logger: logger
             )
-            if MigrationSyncGate.isBlocked(now: evaluatedAt, hasOverdue: hasOverdue, resumeAt: resumeAt) {
+            let blocked = MigrationSyncGate.isBlocked(
+                now: evaluatedAt,
+                hasOverdue: hasOverdue,
+                resumeAt: gateInputs.resumeAt,
+                inFlightUntil: gateInputs.inFlightUntil
+            )
+            if blocked {
                 return true
             }
         }
