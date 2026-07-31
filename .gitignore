@@ -70,7 +70,7 @@ iOSInjectionProject/
 .AppleDouble
 .LSOverride
 
-#ignore Pods directory for example project 
+#ignore Pods directory for example project
 Pods
 
 # do not commit generated libraries to this repo
@@ -88,9 +88,8 @@ BuildSupport/products/
 
 # Claude code
 .claude/settings.local.json
+.plans/
 .remember/
 .worktrees/
 
-# Design docs, implementation plans, and other working notes. These are
-# conversation artifacts rather than repository history.
-.plans/
+**/*.pyc
