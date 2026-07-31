@@ -605,15 +605,25 @@ public protocol Synchronizer: AnyObject {
 
     /// The migration engine's next step to advance `accountUUID`'s stored run — the replacement
     /// for the removed SDK-side migration state machine, and a VERBATIM conduit of the upstream
-    /// engine's own `next_step`. Call it on launch and after every migration operation.
+    /// engine's own `next_step`: no SDK ordering shims, no carve-outs — the attention step, the
+    /// broadcast-first ordering, and the prove step's kind are all the engine's own answer,
+    /// marshaled field-for-field. Call it on launch and after every migration operation.
     ///
     /// `nil` means NO run is stored (none was ever committed) — nothing to advance, nothing to
     /// poll. Evaluated on the SCANNED tip only (the estimated tip never enters this decision),
-    /// with the engine's broadcast > prove > rebuild priority, and memoryless about sessions:
-    /// it reports what the run needs next, while session policy (one broadcast per session, no
-    /// sync in a broadcast session) stays with the caller and the sync gate.
+    /// with the engine's attend > broadcast > prove > rebuild priority, and memoryless about
+    /// sessions: it reports what the run needs next, while session policy (one broadcast per
+    /// session, no sync in a broadcast session) stays with the caller and the sync gate.
     ///
     /// Discharging each step (see ``MigrationAdvanceStep`` for the full contract):
+    /// - `.requiresAttention` — surfaced FIRST, before any actionable step, when a transaction of
+    ///   the run is ``MigrationTransactionStatus/State/invalid(reason:)`` (funding note spent
+    ///   outside the migration, or a network-rejected broadcast) →
+    ///   ``reconcileMigrationInvalidations(accountUUID:)``, surface the attention UX over the
+    ///   invalid status row(s), then ``restartCurrentMigrationStep(accountUUID:)``. Invalid rows
+    ///   are excluded from delivery (never served by
+    ///   ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``) and from
+    ///   the sync gate (a dead transfer gates nothing).
     /// - `.broadcast` → ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``
     ///   — submit and END the session (no sync).
     /// - `.prove` with a `.transfer` kind → ``finalizeReadyMigrationTransfers(accountUUID:)`` at a
@@ -634,7 +644,7 @@ public protocol Synchronizer: AnyObject {
     /// still confirming" is `isPreparationPhaseComplete` over
     /// ``migrationTransactionStatuses(accountUUID:)``, live progress is
     /// ``migrationProgress(accountUUID:)``, and invalid/expired transfers surface through
-    /// ``hasInvalidMigrationTransfers(accountUUID:)`` and per-row `blockedOn` values.
+    /// ``hasInvalidMigrationTransfers(accountUUID:)`` and per-row `state`/`blockedOn` values.
     /// - Parameter accountUUID: the account whose next step is of interest.
     func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep?
 
@@ -675,7 +685,7 @@ public protocol Synchronizer: AnyObject {
     /// SCANNED chain tip: each row is a height at which to wake, sync, and run
     /// ``finalizeReadyMigrationTransfers(accountUUID:)``, plus the transfer ids it covers.
     /// Register OS wake-ups from these heights (converted to wall clock via
-    /// ``estimatedMigrationSecondsPerBlock(accountUUID:)``) plus each status row's
+    /// ``estimatedMigrationSecondsPerBlock()``) plus each status row's
     /// `scheduledHeight` for the broadcast windows. Jitter is re-drawn on every call — recompute
     /// (and re-register) after any state change rather than caching. Empty when there is nothing
     /// left to prove (including no stored or a terminal run).
@@ -686,20 +696,20 @@ public protocol Synchronizer: AnyObject {
 
     /// The wall-clock ESTIMATED chain tip, projected from the most recently scanned blocks'
     /// header times (the measured-block-rate estimator behind `useEstimatedTip`). Falls back to
-    /// the wallet's max SCANNED height when no samples exist.
-    /// - Parameter accountUUID: the account asking (the projection itself reads wallet-scoped
-    ///   scan data).
+    /// the wallet's max SCANNED height when no samples exist. WALLET-scoped, like the batching
+    /// group: the projection reads the shared blocks table, so it takes no account — one answer
+    /// serves every account.
     /// - Throws: ``ZcashError/migrationChainTipUnavailable`` when the wallet has never scanned a
     ///   block, so no tip exists to estimate from.
-    func estimatedMigrationChainTip(accountUUID: AccountUUID) async throws -> BlockHeight
+    func estimatedMigrationChainTip() async throws -> BlockHeight
 
     /// The measured seconds-per-block over the most recently scanned blocks: the mean of the last
     /// up-to-100 consecutive header-time deltas, clamped to [5, 150] s, falling back to 75 s (the
     /// target spacing) when fewer than two samples exist. Use it to convert
-    /// ``migrationSyncWakeups(accountUUID:)`` heights into wall-clock OS timers.
-    /// - Parameter accountUUID: the account asking (the measurement itself reads wallet-scoped
-    ///   scan data).
-    func estimatedMigrationSecondsPerBlock(accountUUID: AccountUUID) async throws -> Double
+    /// ``migrationSyncWakeups(accountUUID:)`` heights into wall-clock OS timers. WALLET-scoped
+    /// like ``estimatedMigrationChainTip()`` — the measurement reads the shared blocks table, so
+    /// it takes no account.
+    func estimatedMigrationSecondsPerBlock() async throws -> Double
 
     /// The LIVE status of every committed migration transaction for `accountUUID`, keyed by its
     /// stable id — the per-transaction detail view behind ``migrationProgress(accountUUID:)``'s
@@ -881,7 +891,7 @@ public protocol Synchronizer: AnyObject {
     ///   - accountUUID: the account whose next transfer should execute.
     ///   - options: network-privacy options (Tor, submission endpoint) for this broadcast.
     ///   - useEstimatedTip: opts the due-ness check into the wall-clock chain-tip estimate (see
-    ///     ``estimatedMigrationChainTip(accountUUID:)``). The estimate may only ACCELERATE
+    ///     ``estimatedMigrationChainTip()``). The estimate may only ACCELERATE
     ///     scheduled-height due-ness — the engine takes `max(scanned, estimated)` and always
     ///     evaluates EXPIRY against the scanned tip — so a wallet that wakes between syncs can
     ///     deliver an already-due transfer without first paying for a sync; an estimator failure
@@ -911,13 +921,25 @@ public protocol Synchronizer: AnyObject {
     /// active for any account in the wallet — including an account with no live activity this
     /// session (a persisted gate file from a previous launch still counts).
     ///
+    /// The predicate, per account: the post-broadcast privacy buffer has not elapsed, OR a
+    /// broadcast's 120 s in-flight marker is live, OR a READY broadcast is waiting — a PROVED,
+    /// schedule-due, unexpired, valid transfer the wallet should serve
+    /// (``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``) instead of
+    /// syncing. The ready-broadcast clause is estimate-accelerated (the wall-clock chain-tip
+    /// estimate may only bring due-ness FORWARD; the scanned tip is asked first) and never counts
+    /// a `Signed` or awaiting-proof row — those need MORE syncing, so
+    /// ``hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)``'s broader answer
+    /// deliberately does not gate sync.
+    ///
     /// Non-throwing: degrades open (returns `false`, i.e. sync allowed) if the check itself fails
     /// rather than blocking sync on an internal error. ``start(retry:)`` consults this and throws
     /// ``ZcashError/migrationSyncBlocked`` while it is `true`.
     func isMigrationSyncBlocked() async -> Bool
 
     /// A stream of ``isMigrationSyncBlocked()`` at wallet scope: emits the current value on subscribe
-    /// and re-evaluates reactively thereafter.
+    /// and re-evaluates reactively thereafter. The predicate is ``isMigrationSyncBlocked()``'s —
+    /// privacy buffer, in-flight marker, or an estimate-accelerated READY broadcast (proved, due,
+    /// unexpired, valid; never a `Signed`/awaiting-proof row).
     ///
     /// - Important: The value delivered synchronously on subscribe is a conservative `false` seed; it
     ///   is corrected by the first asynchronous re-evaluation. A subscriber that must be correct from
@@ -930,7 +952,12 @@ public protocol Synchronizer: AnyObject {
     var migrationPrivacySyncBufferDuration: TimeInterval { get }
 
     /// Whether `accountUUID` has any scheduled transfer that is past its send height but not yet
-    /// broadcast.
+    /// broadcast — the delivery lane's "is there actionable work" query, counting an
+    /// already-proved due transaction AND a due, dependency-satisfied `Signed` one the delivery
+    /// call would drive through proving. Informational (re-arm background execution, launch
+    /// reconciliation): it is deliberately NOT the sync-gate predicate —
+    /// ``isMigrationSyncBlocked()`` asks the narrower ready-broadcast question instead, because a
+    /// due-but-unproved row needs MORE syncing and must never block sync.
     /// - Parameters:
     ///   - accountUUID: the account to check.
     ///   - useEstimatedTip: opts the check into the wall-clock chain-tip estimate, which may only
@@ -1296,11 +1323,11 @@ public extension Synchronizer {
         throw MigrationUnimplemented(member: #function)
     }
 
-    func estimatedMigrationChainTip(accountUUID: AccountUUID) async throws -> BlockHeight {
+    func estimatedMigrationChainTip() async throws -> BlockHeight {
         throw MigrationUnimplemented(member: #function)
     }
 
-    func estimatedMigrationSecondsPerBlock(accountUUID: AccountUUID) async throws -> Double {
+    func estimatedMigrationSecondsPerBlock() async throws -> Double {
         throw MigrationUnimplemented(member: #function)
     }
 

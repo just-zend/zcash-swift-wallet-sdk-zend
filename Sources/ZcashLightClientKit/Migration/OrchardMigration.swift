@@ -45,7 +45,7 @@ public struct MigrationNetworkPrivacyOptions: Equatable {
 ///
 /// It composes three collaborators: the migration welding (the Rust engine surface), a fail-closed
 /// ``MigrationBroadcaster``, and a persisted ``MigrationSyncGate`` (the network-scaled
-/// post-broadcast privacy buffer, the in-flight broadcast marker, plus the overdue-transfer
+/// post-broadcast privacy buffer, the in-flight broadcast marker, plus the ready-broadcast
 /// block). The engine owns all migration state, including
 /// the committed schedule; the SDK keeps no local copy of the proposal list.
 actor OrchardMigration {
@@ -134,12 +134,12 @@ actor OrchardMigration {
         }
     }
 
-    /// The mainnet post-broadcast privacy buffer — the value of
-    /// ``privacySyncBufferDuration(for:)`` for `.mainnet`, kept as a static constant for the
-    /// network-less contexts that need one (the `Synchronizer` protocol's default
-    /// `migrationPrivacySyncBufferDuration`, which has no network to scale by; real synchronizers
-    /// forward their host's network-scaled value instead).
-    static let privacySyncBufferDuration: TimeInterval = 600
+    /// The mainnet post-broadcast privacy buffer — DERIVED from
+    /// ``privacySyncBufferDuration(for:)`` for `.mainnet` (never an independently maintained
+    /// number), kept as a static constant for the network-less contexts that need one (the
+    /// `Synchronizer` protocol's default `migrationPrivacySyncBufferDuration`, which has no
+    /// network to scale by; real synchronizers forward their host's network-scaled value instead).
+    static let privacySyncBufferDuration: TimeInterval = privacySyncBufferDuration(for: .mainnet)
 
     /// The NU6.3 (Ironwood) activation height for `networkType`, or `nil` when NU6.3 is unset for
     /// that network. Stateless — no database access, and safe to call before constructing an
@@ -161,6 +161,11 @@ actor OrchardMigration {
     private let broadcaster: any MigrationBroadcasting
     private let syncGate: MigrationSyncGate
     private let logger: Logger
+
+    /// The clock every estimate-consulting path on this actor reads (mirroring
+    /// ``OrchardMigrationHost``'s injected `now`), so tests can drive the wall-clock tip
+    /// projection deterministically. Production passes the real clock.
+    private let now: @Sendable () -> Date
 
     /// Whether a broadcast-performing flow is currently in flight. Together with
     /// `broadcastFlowWaiters`, this implements ``serializedBroadcastFlow(_:)``'s single-flight
@@ -224,41 +229,47 @@ actor OrchardMigration {
             sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
         )
         let accountUUID = config.accountUUID
+        let now: @Sendable () -> Date = { Date() }
 
         self.welding = welding
         self.accountUUID = accountUUID
         self.logger = logger
         self.broadcaster = sharedBroadcaster
+        self.now = now
         self.syncGate = MigrationSyncGate(
             directory: config.generalStorageURL,
             accountUUID: accountUUID,
             bufferDuration: OrchardMigration.privacySyncBufferDuration(for: config.network.networkType),
-            overdueProvider: {
-                // Estimate-aware, like every gate-side overdue read: the wall-clock tip estimate
-                // may only accelerate due-ness, and an estimator failure degrades to a nil
-                // estimate (scanned-tip behavior) rather than blocking the gate. Degrade to "not
-                // overdue" on any engine error so the reactive gate never crashes.
-                let estimatedTip = await OrchardMigration.gatingEstimatedTip(welding: welding)
-                return (try? await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: estimatedTip)) ?? false
+            readyBroadcastProvider: {
+                // The gate's work-pending clause (D1): a PROVED, due, unexpired, valid transfer
+                // servable right now — never the broader overdue query, whose due-but-unproved
+                // `Signed` rows need MORE syncing rather than a broadcast session. Estimate-aware
+                // with the scanned tip asked FIRST (U8), degrading to "no ready broadcast" on any
+                // engine error so the reactive gate never crashes.
+                await OrchardMigration.gateReadyBroadcast(welding: welding, accountUUID: accountUUID, now: now)
             },
             logger: logger
         )
     }
 
     /// Injecting initializer for tests: supply the welding, broadcaster, sync gate (with its test
-    /// clock/ticker), and logger directly.
+    /// clock/ticker), logger, and — for the actor's own estimate-consulting paths — a clock,
+    /// directly. `now` defaults to the real clock so call sites that do not exercise the
+    /// estimate stay unchanged.
     init(
         welding: ZcashRustBackendWelding,
         accountUUID: AccountUUID,
         broadcaster: any MigrationBroadcasting,
         syncGate: MigrationSyncGate,
-        logger: Logger
+        logger: Logger,
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.welding = welding
         self.accountUUID = accountUUID
         self.broadcaster = broadcaster
         self.syncGate = syncGate
         self.logger = logger
+        self.now = now
     }
 
     // MARK: - State
@@ -296,11 +307,20 @@ actor OrchardMigration {
     /// Reconciles the committed run against local on-chain truth and records an invalid mark when
     /// a pending transfer's funding note was spent by a foreign transaction; returns whether this
     /// call recorded an invalidation. Local-database only — never touches the network — so it is
-    /// safe in a sync session; the complementary 120-second in-flight-broadcast guard (during
-    /// which a just-broadcast transfer must not be probed) is enforced by the sync gate the
-    /// broadcast path arms, not by this call.
+    /// safe in a sync session; the 120-second in-flight-broadcast guard (during which a
+    /// just-broadcast transfer must not be probed) is primarily enforced by the sync gate the
+    /// broadcast path arms, and — as optional hardening — honored here directly too: while the
+    /// persisted in-flight marker is live this call no-ops (returns `false` without touching the
+    /// engine), so a caller that bypasses the gate cannot drive the probe into the
+    /// submit-to-record window either.
     func reconcileInvalidations() async throws -> Bool {
-        try await welding.migrationReconcileInvalidations(for: accountUUID)
+        // Optional hardening (belt to the sync gate's suspenders): the probe's own crash
+        // heuristics are the primary defense, but there is no reason to let it observe a
+        // just-broadcast transfer at all while the submit-to-record window is provably open.
+        if syncGate.isBroadcastInFlight() {
+            return false
+        }
+        return try await welding.migrationReconcileInvalidations(for: accountUUID)
     }
 
     /// Proves every migration transaction whose anchor the wallet can resolve right now and
@@ -314,49 +334,36 @@ actor OrchardMigration {
     }
 
     // MARK: - Chain-tip estimation
+    //
+    // The public estimated-tip members (`estimatedMigrationChainTip()` /
+    // `estimatedMigrationSecondsPerBlock()`) are WALLET-scoped, not account-scoped, so they live
+    // on `OrchardMigrationHost` rather than on this per-account actor; this actor consults the
+    // same shared `MigrationTipEstimation` composition only for its gate/delivery due-ness
+    // checks below.
 
-    /// The wall-clock ESTIMATED chain tip: the ``ChainTipEstimator`` projection over the most
-    /// recently scanned blocks' `(height, header time)` samples. With no samples at all (a wallet
-    /// whose `blocks` table is empty — e.g. one restored from a checkpoint that has not scanned
-    /// since), this falls back to the wallet's max SCANNED height verbatim (the honest "no data
-    /// to project from" answer: welding's `maxScannedHeight` is the only height the wallet knows
-    /// without the network), and throws ``ZcashError/migrationChainTipUnavailable`` when even
-    /// that is unknown because the wallet has never scanned.
-    func estimatedChainTip() async throws -> BlockHeight {
-        let estimator = ChainTipEstimator(
-            samples: try await welding.migrationBlockRateSamples(window: UInt32(ChainTipEstimator.sampleWindow))
-        )
-        if let estimated = estimator.estimatedTip(now: Date()) {
-            return estimated
-        }
-        guard let scannedTip = try await welding.maxScannedHeight() else {
-            throw ZcashError.migrationChainTipUnavailable
-        }
-        return scannedTip
-    }
-
-    /// The measured seconds-per-block over the most recently scanned blocks (see
-    /// ``ChainTipEstimator/secondsPerBlock()``): the mean of the last up-to-100 consecutive
-    /// header-time deltas, clamped to [5, 150] s, falling back to 75 s (the target spacing) when
-    /// fewer than two samples exist. A host uses it to convert wake-up heights into wall-clock
-    /// OS timers.
-    func estimatedSecondsPerBlock() async throws -> Double {
-        let estimator = ChainTipEstimator(
-            samples: try await welding.migrationBlockRateSamples(window: UInt32(ChainTipEstimator.sampleWindow))
-        )
-        return estimator.secondsPerBlock()
-    }
-
-    /// The estimated tip for gate/delivery due-ness checks: the estimator's projection, degraded
-    /// to `nil` (scanned-tip behavior) on ANY failure — sample read errors included — so the
-    /// estimate can only ever accelerate, never block or crash, the paths that consult it.
-    /// Static (welding passed in) so the init-time `overdueProvider` closure can share it before
+    /// The gate's estimate-aware work-pending clause (D1): whether a PROVED, schedule-due,
+    /// unexpired, valid transfer is servable RIGHT NOW — the one situation where the wallet
+    /// should broadcast instead of syncing. Never the broader overdue query: a due-but-unproved
+    /// `Signed` row needs MORE syncing, so it must never block sync.
+    ///
+    /// Asks at the SCANNED tip first (U8): the estimate may only ACCELERATE due-ness, so a `true`
+    /// scanned answer is final and the sample read is skipped entirely; only a `false` answer
+    /// pays for the projection and re-asks with the estimate. Any engine or estimator failure
+    /// degrades to `false`/`nil` (never blocks, never crashes the gate). Static (welding and
+    /// clock passed in) so the init-time `readyBroadcastProvider` closure can share it before
     /// `self` exists.
-    private static func gatingEstimatedTip(welding: ZcashRustBackendWelding) async -> BlockHeight? {
-        guard let samples = try? await welding.migrationBlockRateSamples(window: UInt32(ChainTipEstimator.sampleWindow)) else {
-            return nil
+    private static func gateReadyBroadcast(
+        welding: ZcashRustBackendWelding,
+        accountUUID: AccountUUID,
+        now: @Sendable () -> Date
+    ) async -> Bool {
+        if (try? await welding.migrationHasReadyBroadcast(for: accountUUID, estimatedTip: nil)) ?? false {
+            return true
         }
-        return ChainTipEstimator(samples: samples).estimatedTip(now: Date())
+        guard let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now()) else {
+            return false
+        }
+        return (try? await welding.migrationHasReadyBroadcast(for: accountUUID, estimatedTip: estimatedTip)) ?? false
     }
 
     // MARK: - Note splitting
@@ -443,25 +450,6 @@ actor OrchardMigration {
         try await welding.migrationRecordImmediateRun(txid: txid, for: accountUUID)
     }
 
-    /// The net value swept by an immediate-migration `FfiProposal` before its fee is subtracted:
-    /// the total value of the notes it consumes, minus any declared change. A send-max proposal
-    /// declares no change (there is nothing left to return), so this is ordinarily just the input
-    /// total; the change subtraction is defensive rather than load-bearing.
-    private static func sweptPaymentValue(of proposal: FfiProposal) -> Zatoshi {
-        proposal.steps.reduce(Zatoshi.zero) { total, step in
-            let stepInput = step.inputs.reduce(Zatoshi.zero) { inputTotal, input in
-                guard case .receivedOutput(let output) = input.value else {
-                    return inputTotal
-                }
-                return inputTotal + Zatoshi(Int64(output.value))
-            }
-            let stepChange = step.balance.proposedChange.reduce(Zatoshi.zero) { changeTotal, change in
-                changeTotal + Zatoshi(Int64(change.value))
-            }
-            return total + stepInput - stepChange
-        }
-    }
-
     /// The leftover Orchard balance a migration would not cross, when large enough to be worth
     /// offering the user a choice about; `nil` when there is no such residual.
     ///
@@ -546,7 +534,7 @@ actor OrchardMigration {
         try await serializedBroadcastFlow { () async throws -> MigrationTransferAttempt in
             // The estimate only ever accelerates due-ness; estimator failure degrades to nil
             // (scanned-tip behavior) and never blocks the attempt.
-            let estimatedTip = useEstimatedTip ? await OrchardMigration.gatingEstimatedTip(welding: welding) : nil
+            let estimatedTip = useEstimatedTip ? await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now()) : nil
             switch try await welding.migrationNextDueTransfer(for: accountUUID, estimatedTip: estimatedTip) {
             case .nothingDue:
                 return .nothingDue
@@ -565,21 +553,22 @@ actor OrchardMigration {
 
     /// Whether ordinary wallet sync should currently be paused for this migration.
     ///
-    /// `true` when a transfer is overdue **or** the post-broadcast privacy buffer has not yet
-    /// elapsed. The overdue query is engine-backed; if it throws, this degrades to the persisted
-    /// gate-file (privacy-buffer) state rather than crashing the app's sync gating.
+    /// `true` when a READY broadcast is waiting (a proved, schedule-due, unexpired, valid
+    /// transfer the wallet should serve instead of syncing — never a `Signed` or awaiting-proof
+    /// row, which needs MORE syncing), **or** the post-broadcast privacy buffer has not yet
+    /// elapsed, **or** an in-flight broadcast marker is live. The ready-broadcast query is
+    /// engine-backed and estimate-aware (scanned tip asked first — U8); if it throws, this
+    /// degrades to the persisted gate-file (privacy-buffer/in-flight) state rather than crashing
+    /// the app's sync gating.
     ///
     /// - Note: The gate is per-account (by file name). An app running several migrating accounts must
     ///   consult each account's `OrchardMigration`; this instance answers only for its bound account.
-    /// - Note: Always consults the overdue query fresh (`await`s the engine), unlike
+    /// - Note: Always consults the ready-broadcast query fresh (`await`s the engine), unlike
     ///   ``syncBlockedStream``'s synchronous subscribe-time seed -- see that property's documented
     ///   caveat about the two briefly disagreeing right after relaunch.
     func isSyncBlocked() async -> Bool {
-        // Estimate-aware, matching the reactive gate's overdueProvider: the estimate only
-        // accelerates due-ness, and any estimator failure degrades to a nil estimate.
-        let estimatedTip = await OrchardMigration.gatingEstimatedTip(welding: welding)
-        let hasOverdue = (try? await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: estimatedTip)) ?? false
-        return syncGate.currentlyBlocked(hasOverdue: hasOverdue)
+        let hasReadyBroadcast = await OrchardMigration.gateReadyBroadcast(welding: welding, accountUUID: accountUUID, now: now)
+        return syncGate.currentlyBlocked(hasReadyBroadcast: hasReadyBroadcast)
     }
 
     /// A stream of ``isSyncBlocked()``: emits the current value on subscribe, re-evaluates every 15 s
@@ -593,26 +582,44 @@ actor OrchardMigration {
     /// stale one overwriting a fresher one.
     ///
     /// - Important: The value delivered synchronously on subscribe reflects only the persisted
-    ///   privacy buffer, not overdue transfers -- overdue detection needs the engine query, which is
-    ///   asynchronous. On relaunch with an overdue transfer and no active buffer, that first emission
-    ///   can therefore briefly read `false` while ``isSyncBlocked()`` already reads `true`; the stream
-    ///   corrects itself with its first asynchronous re-evaluation (the next tick, or sooner if a
-    ///   broadcast happens first). A subscriber that must be correct from its very first value should
-    ///   pair this stream with an initial ``isSyncBlocked()`` call rather than trusting the seed alone.
+    ///   privacy buffer and in-flight marker, not ready broadcasts -- ready-broadcast detection
+    ///   needs the engine query, which is asynchronous. On relaunch with a ready broadcast and no
+    ///   active buffer, that first emission can therefore briefly read `false` while
+    ///   ``isSyncBlocked()`` already reads `true`; the stream corrects itself with its first
+    ///   asynchronous re-evaluation (the next tick, or sooner if a broadcast happens first). A
+    ///   subscriber that must be correct from its very first value should pair this stream with
+    ///   an initial ``isSyncBlocked()`` call rather than trusting the seed alone.
     nonisolated var syncBlockedStream: AnyPublisher<Bool, Never> {
         syncGate.blockedStream
     }
 
+    /// The sync gate's LIVE in-memory inputs — the privacy-buffer expiry and the (clamped)
+    /// in-flight marker expiry — for the host's wallet-scope predicate (A8): the gate persists
+    /// file-first, but a FAILED file write still updates the cache, so the wallet-scope reader
+    /// must consult this live view alongside the file and let blocked win, or a full disk (or any
+    /// write failure) would silently blind it to a mark this process just made. `nonisolated`
+    /// (the gate is internally lock-synchronized) so the host can read it without awaiting the
+    /// actor.
+    nonisolated func liveGateInputs() -> (resumeAt: Date?, inFlightUntil: Date?) {
+        (syncGate.currentResumeAt(), syncGate.currentInFlightUntil())
+    }
+
     // MARK: - On-launch reconciliation
 
-    /// Whether any scheduled transfer is past its send height but not yet broadcast.
+    /// Whether any scheduled transfer is past its send height but not yet broadcast — the
+    /// delivery lane's "is there actionable work" query, counting an already-proved due
+    /// transaction AND a due, dependency-satisfied `Signed` one the delivery call would drive
+    /// through proving. An informational query for hosts (re-arm background execution, launch
+    /// reconciliation); deliberately NOT consulted by any sync-gate path, which asks the
+    /// narrower ready-broadcast predicate instead (a due-but-unproved row must never block
+    /// sync — see ``isSyncBlocked()``).
     ///
     /// `useEstimatedTip` opts the check into the wall-clock chain-tip estimate: the estimate may
     /// only ACCELERATE due-ness (expiry stays scanned-tip), and an estimator failure degrades to
     /// the scanned-tip behavior — the same plumbing as
     /// ``executeNextPendingTransfer(options:useEstimatedTip:)``.
     func hasOverdueTransfers(useEstimatedTip: Bool) async throws -> Bool {
-        let estimatedTip = useEstimatedTip ? await OrchardMigration.gatingEstimatedTip(welding: welding) : nil
+        let estimatedTip = useEstimatedTip ? await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now()) : nil
         return try await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: estimatedTip)
     }
 
@@ -728,52 +735,6 @@ actor OrchardMigration {
         try await welding.migrationStoreSignedSchedulePczts(signed, for: accountUUID)
     }
 
-    /// Splits an ORDERED unsigned-PCZT batch into signer sessions bounded by
-    /// `maxActionsPerSession` actions, preserving order — see the shared
-    /// ``batchPcztsForSigning(welding:pczts:maxActionsPerSession:)`` for the contract.
-    func batchPcztsForSigning(
-        _ pczts: [MigrationUnsignedTransferPczt],
-        maxActionsPerSession: Int
-    ) async throws -> [[MigrationUnsignedTransferPczt]] {
-        try await OrchardMigration.batchPcztsForSigning(welding: welding, pczts: pczts, maxActionsPerSession: maxActionsPerSession)
-    }
-
-    /// The shared order-preserving session split behind ``batchPcztsForSigning(_:maxActionsPerSession:)``
-    /// and the synchronizers' account-free `batchMigrationPcztsForSigning`: the welding computes
-    /// the per-session COUNTS from the rows' action weights (`MigrationUnsignedTransferPczt.actions`;
-    /// upstream `NextFit` — order-preserving greedy, never the estimate's reorder-free optimal
-    /// packing), and this re-slices the caller's own ordered array by them, so ids/bytes never
-    /// round-trip through the FFI. Static (welding passed in) because the split is account-free —
-    /// it weighs caller-held rows, never the wallet database.
-    static func batchPcztsForSigning(
-        welding: ZcashRustBackendWelding,
-        pczts: [MigrationUnsignedTransferPczt],
-        maxActionsPerSession: Int
-    ) async throws -> [[MigrationUnsignedTransferPczt]] {
-        let sizes = try await welding.migrationBatchPcztsByActions(
-            actions: pczts.map { UInt32($0.actions) },
-            maxActionsPerSession: maxActionsPerSession
-        )
-
-        // The FFI contract guarantees the per-session counts sum to the input length; guard it
-        // anyway (defensive, like the marshal-layer decode guards) so a drift can never crash the
-        // re-slice below with an out-of-bounds range.
-        guard sizes.reduce(0, +) == pczts.count else {
-            throw ZcashError.rustMigrationBatchPcztsByActions(
-                "`migrationBatchPcztsByActions` returned session sizes that do not sum to the batch size"
-            )
-        }
-
-        var sessions: [[MigrationUnsignedTransferPczt]] = []
-        sessions.reserveCapacity(sizes.count)
-        var nextIndex = 0
-        for size in sizes {
-            sessions.append(Array(pczts[nextIndex ..< nextIndex + size]))
-            nextIndex += size
-        }
-        return sessions
-    }
-
     // MARK: - Private
 
     /// Runs `flow` as the only broadcast-performing flow on this actor.
@@ -815,15 +776,23 @@ actor OrchardMigration {
     /// is a non-throwing local write, and a record failure after a real broadcast must never skip
     /// the buffer; a record failure on that path throws
     /// ``ZcashError/migrationRecordFailedAfterBroadcast(_:)``. Non-success outcomes are recorded
-    /// first and returned with the gate untouched (only success outcomes mark it, unchanged); only
-    /// pre-broadcast failures throw untouched.
+    /// first and returned with the gate untouched (only success outcomes mark it, unchanged); a
+    /// record throw on that path clears the in-flight marker first only for a DEFINITIVE
+    /// rejection (`.expired`/`.invalidNote` — the server's answer proves nothing landed, so the
+    /// window is over), while a `.networkError` record throw keeps the marker (protective: a
+    /// transport failure cannot prove the submit did not land, exactly the ambiguity the marker
+    /// exists for) — the raw record error rethrows either way. Only pre-broadcast failures throw
+    /// untouched.
     ///
     /// The whole submit-to-record window is additionally bracketed by the sync gate's persisted
-    /// in-flight marker (``MigrationSyncGate/markBroadcastInFlight()``): armed just before the
-    /// network submit, cleared once the outcome is recorded (success or mapped failure) — or
-    /// immediately when the broadcaster throws before submitting anything (its fail-closed
-    /// contract: a throw means nothing reached the network). A crash — or a record throw —
-    /// between submit and record leaves the marker behind, and it self-expires at
+    /// in-flight marker (``MigrationSyncGate/markBroadcastInFlight()``): armed before the flow as
+    /// a belt, RE-armed at the last instant before the submit RPC via the broadcaster's
+    /// `onWillSubmit` hook (A9 — after the Tor bootstrap/connection setup, which can take many
+    /// seconds and would otherwise burn the marker's 120 s window before anything reached the
+    /// network), and cleared once the outcome is recorded — or immediately when the broadcaster
+    /// throws before submitting anything (its fail-closed contract: a throw means nothing reached
+    /// the network). A crash — or a record throw the rules above retain it for — between submit
+    /// and record leaves the marker behind, and it self-expires at
     /// ``MigrationSyncGate/broadcastInFlightGuardDuration`` (120 s); while it lives, sync (and
     /// with it the reconciliation probe that must not observe a just-broadcast transfer) stays
     /// blocked.
@@ -833,16 +802,20 @@ actor OrchardMigration {
     ) async throws -> MigrationTransferResult {
         let rawTransaction = try await welding.migrationExtractBroadcastTx(pczt: prepared.pczt, for: accountUUID)
 
-        // Arm the in-flight marker before the submit can reach the network; a crash from here
-        // until the record lands leaves it to self-expire.
+        // Arm the in-flight marker before the submit can reach the network (belt); the
+        // broadcaster's onWillSubmit hook re-arms it at the last pre-submit instant so the 120 s
+        // window covers the actual submit-to-record span rather than the Tor bootstrap. A crash
+        // from the submit until the record lands leaves it to self-expire.
         syncGate.markBroadcastInFlight()
 
         let outcome: MigrationBroadcastOutcome
         do {
+            let syncGate = self.syncGate
             outcome = try await broadcaster.broadcast(
                 rawTransaction: rawTransaction,
                 to: options.submissionEndpoint,
-                useTor: options.useTor
+                useTor: options.useTor,
+                onWillSubmit: { syncGate.markBroadcastInFlight() }
             )
         } catch {
             // The broadcaster throws only when nothing was submitted (fail-closed Tor, a
@@ -866,11 +839,102 @@ actor OrchardMigration {
                 throw ZcashError.migrationRecordFailedAfterBroadcast(error)
             }
         } else {
-            try await welding.migrationRecordTransferResult(transferId: prepared.id, result: result, for: accountUUID)
+            do {
+                try await welding.migrationRecordTransferResult(transferId: prepared.id, result: result, for: accountUUID)
+            } catch {
+                // A11: the record failed, so the engine still thinks the transfer is pending.
+                // For a DEFINITIVE rejection the server's answer proves nothing landed — the
+                // submit-to-record ambiguity is over, so clear the marker rather than blocking
+                // sync for the full self-expiry window. A network error proves nothing (the
+                // submit may have landed and the response been lost), so the marker stays —
+                // mirroring the success path's retained-marker rationale above.
+                switch result {
+                case .expired, .invalidNote:
+                    syncGate.clearBroadcastInFlight()
+                case .networkError, .success:
+                    break
+                }
+                throw error
+            }
         }
 
         // The outcome is durably recorded: the submit-to-record window is closed.
         syncGate.clearBroadcastInFlight()
         return result
+    }
+}
+
+// MARK: - Account-free static utilities
+
+// Hosted in an extension rather than the actor body: neither touches per-account state (both take
+// everything they need as parameters), so they sit with the actor for discoverability without
+// growing its stateful core.
+extension OrchardMigration {
+    /// The order-preserving session split behind the synchronizers' account-free
+    /// `batchMigrationPcztsForSigning(_:maxActionsPerSession:)`: the welding computes
+    /// the per-session COUNTS from the rows' action weights (`MigrationUnsignedTransferPczt.actions`;
+    /// upstream `NextFit` — order-preserving greedy, never the estimate's reorder-free optimal
+    /// packing), and this re-slices the caller's own ordered array by them, so ids/bytes never
+    /// round-trip through the FFI. Static (welding passed in) because the split is account-free —
+    /// it weighs caller-held rows, never the wallet database — so it has no per-account instance
+    /// counterpart on this actor.
+    static func batchPcztsForSigning(
+        welding: ZcashRustBackendWelding,
+        pczts: [MigrationUnsignedTransferPczt],
+        maxActionsPerSession: Int
+    ) async throws -> [[MigrationUnsignedTransferPczt]] {
+        // A row's `actions` weight outside `UInt32`'s range can only be a caller-constructed
+        // value (the CREATE/RE-SERVE rows carry 16/3): reject it as the same caller bug the
+        // welding reports for a wrong weight, never trap on the conversion (A7).
+        let actionWeights = try pczts.map { pczt -> UInt32 in
+            guard let actions = UInt32(exactly: pczt.actions) else {
+                throw ZcashError.rustMigrationBatchPcztsByActions(
+                    "`batchPcztsForSigning` was given a PCZT row whose `actions` weight (\(pczt.actions)) is outside the FFI's UInt32 range"
+                )
+            }
+            return actions
+        }
+
+        let sizes = try await welding.migrationBatchPcztsByActions(
+            actions: actionWeights,
+            maxActionsPerSession: maxActionsPerSession
+        )
+
+        // The FFI contract guarantees the per-session counts sum to the input length; guard it
+        // anyway (defensive, like the marshal-layer decode guards) so a drift can never crash the
+        // re-slice below with an out-of-bounds range.
+        guard sizes.reduce(0, +) == pczts.count else {
+            throw ZcashError.rustMigrationBatchPcztsByActions(
+                "`migrationBatchPcztsByActions` returned session sizes that do not sum to the batch size"
+            )
+        }
+
+        var sessions: [[MigrationUnsignedTransferPczt]] = []
+        sessions.reserveCapacity(sizes.count)
+        var nextIndex = 0
+        for size in sizes {
+            sessions.append(Array(pczts[nextIndex ..< nextIndex + size]))
+            nextIndex += size
+        }
+        return sessions
+    }
+
+    /// The net value swept by an immediate-migration `FfiProposal` before its fee is subtracted:
+    /// the total value of the notes it consumes, minus any declared change. A send-max proposal
+    /// declares no change (there is nothing left to return), so this is ordinarily just the input
+    /// total; the change subtraction is defensive rather than load-bearing.
+    private static func sweptPaymentValue(of proposal: FfiProposal) -> Zatoshi {
+        proposal.steps.reduce(Zatoshi.zero) { total, step in
+            let stepInput = step.inputs.reduce(Zatoshi.zero) { inputTotal, input in
+                guard case .receivedOutput(let output) = input.value else {
+                    return inputTotal
+                }
+                return inputTotal + Zatoshi(Int64(output.value))
+            }
+            let stepChange = step.balance.proposedChange.reduce(Zatoshi.zero) { changeTotal, change in
+                changeTotal + Zatoshi(Int64(change.value))
+            }
+            return total + stepInput - stepChange
+        }
     }
 }

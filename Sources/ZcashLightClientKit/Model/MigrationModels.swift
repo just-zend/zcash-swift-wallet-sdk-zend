@@ -10,11 +10,16 @@ import Foundation
 /// `ZcashRustBackendWelding.migrationAdvanceStep(for:)`.
 ///
 /// A VERBATIM conduit of the upstream engine's own `MigrationState::next_step`: the SDK adds no
-/// state machine of its own on top. `nil` at the API level (the call returns an optional) means no
-/// migration run is stored at all — none was ever committed for the account — so there is nothing
-/// to advance and nothing to poll. The engine's priority order is broadcast > prove > rebuild: a
-/// proven, due transaction broadcasts ahead of any new proving work (its broadcast window is the
-/// scarcer resource; proving can happen on any later wake-up).
+/// state machine, no ordering shims, and no carve-outs of its own on top — upstream `next_step`
+/// natively carries the attention step, the broadcast-first ordering, and the prove step's kind
+/// (upstream PR #2873), so every case below is the engine's answer marshaled field-for-field.
+/// `nil` at the API level (the call returns an optional) means no migration run is stored at all —
+/// none was ever committed for the account — so there is nothing to advance and nothing to poll.
+/// The engine's priority order is attend > broadcast > prove > rebuild:
+/// ``requiresAttention(id:)`` outranks every actionable step (a run holding an invalid
+/// transaction is not driven further until resolved), and a proven, due transaction broadcasts
+/// ahead of any new proving work (its broadcast window is the scarcer resource; proving can
+/// happen on any later wake-up).
 ///
 /// Evaluated against the SCANNED chain tip only — the wall-clock tip ESTIMATE
 /// (`estimatedMigrationChainTip`) never enters this decision. It is also memoryless about
@@ -23,6 +28,11 @@ import Foundation
 /// post-broadcast privacy buffer) belongs to the caller and the sync gate, not to this value.
 ///
 /// Discharging each step:
+/// - ``requiresAttention(id:)`` → `reconcileMigrationInvalidations(accountUUID:)` (so the marks
+///   reflect the latest local truth), surface the attention UX over the
+///   ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
+///   `restartCurrentMigrationStep(accountUUID:)` — cancel and re-plan is the out-of-band
+///   resolution the invalid state asks for.
 /// - ``broadcast(id:)`` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`:
 ///   submit the served transaction and end the session — a broadcast session must not sync.
 /// - ``prove(id:kind:)`` with a ``MigrationTransactionStatus/Kind/transfer(crossing:)`` kind →
@@ -59,6 +69,13 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     case waiting
     /// The stored run is terminal (fully mined, or cancelled): stop polling it.
     case complete
+    /// The transaction identified by `id` is marked
+    /// ``MigrationTransactionStatus/State/invalid(reason:)`` — its funding note was spent outside
+    /// the migration, or the network terminally rejected its broadcast — and no automatic step
+    /// can advance the run. Surfaced FIRST, before any actionable step, exactly as upstream
+    /// `next_step` orders it. Discharge: `reconcileMigrationInvalidations(accountUUID:)` →
+    /// attention UX → `restartCurrentMigrationStep(accountUUID:)` (see the type doc's mapping).
+    case requiresAttention(id: UInt32)
 }
 
 /// The outcome of one broadcast-lane delivery attempt
@@ -104,7 +121,7 @@ public struct MigrationSyncWakeup: Equatable, Sendable {
 /// One scanned block's `(height, header time)` sample from the wallet database, as returned by
 /// `ZcashRustBackendWelding.migrationBlockRateSamples(window:)` — the raw input of
 /// ``ChainTipEstimator``'s measured-block-rate chain-tip projection. Internal: apps consume the
-/// projection (`Synchronizer.estimatedMigrationChainTip(accountUUID:)`), never the samples.
+/// projection (`Synchronizer.estimatedMigrationChainTip()`), never the samples.
 struct MigrationBlockRateSample: Equatable, Sendable {
     /// The scanned block's height.
     let height: BlockHeight
@@ -200,6 +217,23 @@ public struct MigrationProgress: Equatable, Sendable {
     }
 }
 
+/// Why a migration transaction was marked ``MigrationTransactionStatus/State/invalid(reason:)``
+/// — the engine's own `Invalid` payload, recorded by upstream `mark_invalid` when the death was
+/// OBSERVED as an event (never inferred from a chain condition alone). Chain inclusion outranks
+/// every one of these: a row the wallet's scan has observed mined reports `.mined`, never
+/// `.invalid`.
+public enum MigrationInvalidReason: Equatable, Sendable {
+    /// A funding note this transaction spends was spent outside the migration (detected by
+    /// `reconcileMigrationInvalidations`), so the transaction can never mine.
+    case fundingSpent
+    /// A node terminally rejected the broadcast as invalid (recorded from a
+    /// ``MigrationTransferResult/invalidNote`` outcome).
+    case rejectedInvalid
+    /// A node rejected the broadcast as expired (recorded from a
+    /// ``MigrationTransferResult/expired`` outcome).
+    case rejectedExpired
+}
+
 /// One migration transaction's LIVE status, as the engine computes it — an element of the array
 /// returned by `ZcashRustBackendWelding.migrationTransactionStatuses(for:)` /
 /// `Synchronizer.migrationTransactionStatuses(accountUUID:)`. A verbatim marshal of the engine's
@@ -218,9 +252,10 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         case transfer(crossing: Int)
     }
 
-    /// This transaction's lifecycle state. `broadcast`/`mined` fold the engine's `txid`/
-    /// `mined_height` payloads into the matching case, so illegal combinations (a mined row still
-    /// carrying a broadcast txid, or a broadcast row with none) are unrepresentable.
+    /// This transaction's lifecycle state. `broadcast`/`mined`/`invalid` fold the engine's
+    /// `txid`/`mined_height`/`invalid_reason` payloads into the matching case, so illegal
+    /// combinations (a mined row still carrying a broadcast txid, a broadcast row with none, or
+    /// an invalid row without its reason) are unrepresentable.
     ///
     /// - Note: A MINED row's txid is NOT carried by this state model: the engine's own `Mined`
     ///   state carries only the height, so the txid is available only while a transaction is
@@ -238,6 +273,16 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         case broadcast(txid: Data)
         /// Mined at `height`.
         case mined(height: BlockHeight)
+        /// Dead by OBSERVED EVENT — the engine's own `Invalid` state, recorded via upstream
+        /// `mark_invalid` when a funding note was spent outside the migration
+        /// (`reconcileMigrationInvalidations`) or the network terminally rejected the broadcast
+        /// (`migrationRecordTransferResult`'s `.invalidNote`/`.expired` outcomes); `reason` says
+        /// which. Never derived from a chain condition alone, and chain inclusion OUTRANKS it: a
+        /// row the wallet's scan has observed mined reports `.mined`, never `.invalid` — a stale
+        /// verdict cannot shadow a landed transaction. Resolved out-of-band via the
+        /// ``MigrationAdvanceStep/requiresAttention(id:)`` discharge mapping (typically
+        /// `restartCurrentMigrationStep`).
+        case invalid(reason: MigrationInvalidReason)
     }
 
     /// The action available now, when `isReady` is `true`.
@@ -261,6 +306,11 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         case signature
         /// Its expiry height has elapsed.
         case expired
+        /// Marked dead by an observed event (its state is
+        /// ``MigrationTransactionStatus/State/invalid(reason:)``): no chain condition makes it
+        /// actionable again — resolution is out-of-band, via the
+        /// ``MigrationAdvanceStep/requiresAttention(id:)`` discharge mapping.
+        case invalid
     }
 
     /// This transaction's stable id (the engine's own raw ordinal). Stable across reads and
@@ -428,6 +478,16 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
     /// time; the stored run's persisted rows on re-serve.
     public let preparations: [MigrationPreparationStep]
 
+    /// The persisted-envelope keys. Explicit (the compiler stops synthesizing `CodingKeys` once
+    /// BOTH `init(from:)` and `encode(to:)` are hand-written), with the raw names the synthesized
+    /// conformance used — existing persisted copies keep decoding unchanged.
+    private enum CodingKeys: String, CodingKey {
+        case transfers
+        case estimatedDurationHours
+        case proposalHandle
+        case preparations
+    }
+
     /// Creates a `MigrationSchedule`.
     public init(
         transfers: [MigrationTransferProposal],
@@ -447,11 +507,24 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
         self.estimatedDurationHours = try container.decode(Int.self, forKey: .estimatedDurationHours)
         // Absent in copies persisted before the handle existed — and a persisted handle could
         // not identify a live plan anyway (the native cache is process-lifetime), so `0` ("no
-        // plan") is the honest decode either way.
+        // plan") is the honest decode either way. `encode(to:)` below never writes the key, so
+        // this branch is also what every round-tripped copy takes.
         self.proposalHandle = try container.decodeIfPresent(UInt64.self, forKey: .proposalHandle) ?? 0
         // Absent in copies persisted before the preparations rows existed; an empty list is the
         // honest decode (the persisted copy simply never carried them).
         self.preparations = try container.decodeIfPresent([MigrationPreparationStep].self, forKey: .preparations) ?? []
+    }
+
+    /// Encodes everything EXCEPT `proposalHandle`: the handle identifies a PROCESS-LIFETIME native
+    /// plan cache entry, so a persisted copy could never identify a live plan — persisting the raw
+    /// number would only invite a later launch to present it as meaningful. Omitting it makes the
+    /// documented decode contract (`init(from:)` above reads an absent handle as `0`, "no plan")
+    /// true of every persisted copy by construction, not just of pre-handle legacy files.
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(transfers, forKey: .transfers)
+        try container.encode(estimatedDurationHours, forKey: .estimatedDurationHours)
+        try container.encode(preparations, forKey: .preparations)
     }
 }
 

@@ -416,12 +416,14 @@ protocol ZcashRustBackendWelding {
     // MARK: - Ironwood migration
 
     /// The engine's next step to advance `account`'s stored migration run — a VERBATIM conduit of
-    /// the upstream engine's `MigrationState::next_step`, evaluated at the SCANNED tip (the
-    /// estimated tip never enters this decision), with mined transactions reconciled first like
-    /// every other read. `nil` means NO run is stored at all (nothing to advance); a stored
-    /// TERMINAL run — complete or cancelled — reports ``MigrationAdvanceStep/complete`` verbatim
-    /// and is never driven further. See ``MigrationAdvanceStep`` for the step semantics and the
-    /// discharge mapping.
+    /// the upstream engine's `MigrationState::next_step` (no ordering shims, no carve-outs: the
+    /// engine's own answer — ``MigrationAdvanceStep/requiresAttention(id:)`` ahead of everything,
+    /// then broadcast, then prove carrying its kind, then rebuild — marshaled field-for-field),
+    /// evaluated at the SCANNED tip (the estimated tip never enters this decision), with mined
+    /// transactions reconciled first like every other read. `nil` means NO run is stored at all
+    /// (nothing to advance); a stored TERMINAL run — complete or cancelled — reports
+    /// ``MigrationAdvanceStep/complete`` verbatim and is never driven further. See
+    /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping.
     /// - Throws: `rustMigrationAdvanceStep` if the rust layer returns an error.
     func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep?
 
@@ -482,8 +484,11 @@ protocol ZcashRustBackendWelding {
     /// across reads and across a stale-transfer rebuild (a rebuilt transfer keeps its id; only
     /// its state and heights change). Reconciles mined transactions first (the same read-path
     /// convention as `migrationAdvanceStep(for:)`), so a transaction the wallet's own scan has since
-    /// observed mined is reported `.mined` here even if the stored run still marks it broadcast.
-    /// No stored run, or a stored run with no transactions, returns an EMPTY array — not an error.
+    /// observed mined is reported `.mined` here even if the stored run still marks it broadcast —
+    /// or invalid: chain inclusion outranks an event-recorded
+    /// ``MigrationTransactionStatus/State/invalid(reason:)`` verdict, so a mined row never
+    /// reports invalid. No stored run, or a stored run with no transactions, returns an EMPTY
+    /// array — not an error.
     /// - Throws: `rustMigrationTransactionStatuses` if the rust layer returns an error.
     func migrationTransactionStatuses(for account: AccountUUID) async throws -> [MigrationTransactionStatus]
 
@@ -498,15 +503,43 @@ protocol ZcashRustBackendWelding {
     /// whether the delivery lane has actionable work (an already-proved due transaction, or a
     /// due, dependency-satisfied prove-ready one the delivery call would drive through proving).
     ///
+    /// NOT the sync-gate's work-pending predicate: a due-but-unproved `Signed` row this query
+    /// counts needs MORE syncing (its proof is produced at sync wake-ups), so it must never hold
+    /// sync hostage — the gate asks ``migrationHasReadyBroadcast(for:estimatedTip:)`` instead.
+    ///
     /// `estimatedTip` (`nil` = disabled) is the platform's wall-clock chain-tip projection (see
     /// ``ChainTipEstimator``). It may only ACCELERATE scheduled-height due-ness — the effective
     /// tip is `max(scanned, estimated)`, so an estimate below the scanned tip is ignored — and
-    /// EXPIRY is always evaluated against the SCANNED tip, never the estimate.
+    /// EXPIRY is always evaluated against the SCANNED tip, never the estimate (the upstream
+    /// engine's own dual-target `DuenessTargets` rule).
     /// - Throws: `rustMigrationHasOverdueTransfers` if the rust layer returns an error.
     func migrationHasOverdueTransfers(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool
 
-    /// Whether the migration is in an invalid state (spendable Orchard remains but no scheduled
-    /// transfer covers it).
+    /// Whether `account`'s stored, NON-TERMINAL run has a broadcast the platform could serve
+    /// RIGHT NOW: a PROVED, schedule-due, dependency-mined, unexpired, valid transaction per the
+    /// upstream engine's own `next_broadcastable_at` — the sync-gate's work-pending predicate
+    /// (`true` means exactly "broadcast instead of syncing", ZIP 318's broadcast-or-sync session
+    /// split). `Signed` rows — even due ones — and rows awaiting a proof or an external
+    /// signature never count (they need MORE syncing or other work, not a broadcast session),
+    /// which is why the gate cannot be derived from
+    /// ``migrationHasOverdueTransfers(for:estimatedTip:)``; rows marked invalid are excluded
+    /// upstream (a dead transfer gates nothing), and so is a broadcast whose expiry only the
+    /// ESTIMATED target has passed (upstream's protective withhold — served again once the
+    /// scanned tip proves it either way). No stored run and a terminal run answer `false`.
+    ///
+    /// `estimatedTip` (`nil` = disabled) follows the same dual-target rule as
+    /// ``migrationHasOverdueTransfers(for:estimatedTip:)``: it may only ACCELERATE
+    /// scheduled-height due-ness, never decide expiry or boundary settledness.
+    /// - Throws: `rustMigrationHasReadyBroadcast` if the rust layer returns an error.
+    func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool
+
+    /// Whether `account`'s stored, NON-TERMINAL run has a transaction that cannot proceed: one
+    /// marked ``MigrationTransactionStatus/State/invalid(reason:)`` in the engine state (a
+    /// terminal broadcast rejection recorded by
+    /// `migrationRecordTransferResult(transferId:result:for:)`, or a foreign spend detected by
+    /// `migrationReconcileInvalidations(for:)`), or an expired, unmined one. A terminal run —
+    /// complete, or failed/cancelled — answers `false`: its attention lifecycle is over
+    /// (cancelling IS the out-of-band resolution the invalid state asks for).
     /// - Throws: `rustMigrationHasInvalidTransfers` if the rust layer returns an error.
     func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool
 

@@ -16,9 +16,11 @@ import Foundation
 ///
 /// The per-account actors resolve everything from the wallet's paths and hold their own Rust backend
 /// (see ``OrchardMigration``); the host itself borrows the synchronizer's welding
-/// (`Initializer.rustBackend`) only for the wallet-scope predicate — enumerating every account and
-/// reading each account's persisted gate file directly, so a dormant account (one whose actor has
-/// never been created this launch) still counts.
+/// (`Initializer.rustBackend`) only for the WALLET-scope members — the sync-blocked predicate
+/// (enumerating every account and reading each account's persisted gate file directly, so a
+/// dormant account whose actor has never been created this launch still counts) and the
+/// account-free chain-tip estimation pair (``estimatedChainTip()`` /
+/// ``estimatedSecondsPerBlock()``, which read the shared blocks table).
 actor OrchardMigrationHost {
     private let welding: ZcashRustBackendWelding
     private let sharedBroadcaster: any MigrationBroadcasting
@@ -40,6 +42,14 @@ actor OrchardMigrationHost {
     /// The wallet-scope reactive stream machinery. A separate, self-synchronized object (like
     /// ``MigrationSyncGate``) so ``syncBlockedStream`` can be `nonisolated`.
     private let blockedPublisher: HostSyncBlockedPublisher
+
+    /// The live per-account gate views the wallet-scope predicate consults ALONGSIDE the persisted
+    /// gate files (A8): each actor ``migration(for:)`` creates registers its gate's in-memory
+    /// inputs here, so a failed gate-file write (full disk, sandbox hiccup) cannot blind
+    /// ``isSyncBlocked()`` to a mark this process just made — the predicate evaluates both views
+    /// and lets blocked win. A separate lock-synchronized object (not actor state) because the
+    /// predicate closure is built in `init`, before `self` exists, and runs off-actor.
+    private let liveGateRegistry: MigrationLiveGateRegistry
 
     /// The lazily-created, cached per-account actors. Actor isolation is the synchronization: a given
     /// account resolves to the same instance for the host's lifetime.
@@ -113,10 +123,14 @@ actor OrchardMigrationHost {
         self.actorFactory = actorFactory
         self.resolvedPrivacySyncBufferDuration = privacySyncBufferDuration
 
+        let liveGateRegistry = MigrationLiveGateRegistry()
+        self.liveGateRegistry = liveGateRegistry
+
         let predicate: @Sendable () async -> Bool = {
             await OrchardMigrationHost.computeSyncBlocked(
                 welding: welding,
                 generalStorageURL: generalStorageURL,
+                liveGateRegistry: liveGateRegistry,
                 now: now,
                 logger: logger
             )
@@ -140,7 +154,8 @@ actor OrchardMigrationHost {
     /// The same account resolves to the same instance thereafter; distinct accounts get distinct
     /// actors, each sharing the host's single ``MigrationBroadcaster``. A newly created actor's
     /// per-account blocked stream is registered with ``syncBlockedStream`` so a broadcast on it
-    /// re-evaluates the wallet-scope value immediately.
+    /// re-evaluates the wallet-scope value immediately, and its live gate view is registered with
+    /// the wallet-scope predicate so a failed gate-file write cannot hide its marks (A8).
     func migration(for accountUUID: AccountUUID) -> OrchardMigration {
         if let existing = migrations[accountUUID] {
             return existing
@@ -149,23 +164,55 @@ actor OrchardMigrationHost {
         let migration = actorFactory(accountUUID, sharedBroadcaster)
         migrations[accountUUID] = migration
         blockedPublisher.watchBroadcastSignal(migration.syncBlockedStream)
+        liveGateRegistry.register(accountUUID) { migration.liveGateInputs() }
         return migration
     }
 
     /// Whether ordinary wallet sync should currently be paused for *any* migrating account.
     ///
     /// Enumerates every wallet account via the welding (not the lazy actor cache, so a dormant
-    /// account with a persisted gate file or overdue transfers still counts after a fresh launch)
-    /// and blocks if any account is overdue or still inside its privacy buffer. Non-throwing: an
-    /// account enumeration failure logs and degrades to "unblocked" (sync allowed), and a per-account
-    /// overdue-query failure contributes "not overdue" — matching ``OrchardMigration/isSyncBlocked()``.
+    /// account with a persisted gate file or a ready broadcast still counts after a fresh launch)
+    /// and blocks if any account has a ready broadcast waiting or is still inside its privacy
+    /// buffer / in-flight window. Non-throwing: an account enumeration failure logs and degrades
+    /// to "unblocked" (sync allowed), and a per-account ready-broadcast-query failure contributes
+    /// "no ready broadcast" — matching ``OrchardMigration/isSyncBlocked()``.
     func isSyncBlocked() async -> Bool {
         await Self.computeSyncBlocked(
             welding: welding,
             generalStorageURL: generalStorageURL,
+            liveGateRegistry: liveGateRegistry,
             now: now,
             logger: logger
         )
+    }
+
+    /// The wall-clock ESTIMATED chain tip: the ``ChainTipEstimator`` projection over the most
+    /// recently scanned blocks' `(height, header time)` samples. WALLET-scoped (the samples come
+    /// from the shared blocks table), hence hosted here rather than on a per-account actor. With
+    /// no samples at all (a wallet whose `blocks` table is empty — e.g. one restored from a
+    /// checkpoint that has not scanned since), this falls back to the wallet's max SCANNED height
+    /// verbatim (the honest "no data to project from" answer: welding's `maxScannedHeight` is the
+    /// only height the wallet knows without the network), and throws
+    /// ``ZcashError/migrationChainTipUnavailable`` when even that is unknown because the wallet
+    /// has never scanned.
+    func estimatedChainTip() async throws -> BlockHeight {
+        let projection = try await MigrationTipEstimation.project(welding: welding, now: now())
+        if let estimated = projection.estimatedTip {
+            return estimated
+        }
+        guard let scannedTip = try await welding.maxScannedHeight() else {
+            throw ZcashError.migrationChainTipUnavailable
+        }
+        return scannedTip
+    }
+
+    /// The measured seconds-per-block over the most recently scanned blocks (see
+    /// ``ChainTipEstimator/secondsPerBlock()``): the mean of the last up-to-100 consecutive
+    /// header-time deltas, clamped to [5, 150] s, falling back to 75 s (the target spacing) when
+    /// fewer than two samples exist. WALLET-scoped like ``estimatedChainTip()``. A host uses it
+    /// to convert wake-up heights into wall-clock OS timers.
+    func estimatedSecondsPerBlock() async throws -> Double {
+        try await MigrationTipEstimation.project(welding: welding, now: now()).secondsPerBlock
     }
 
     /// A stream of ``isSyncBlocked()`` at wallet scope: emits the current value on subscribe,
@@ -194,13 +241,22 @@ actor OrchardMigrationHost {
     /// ``syncBlockedStream``'s recompute share one implementation and neither consults the lazy actor
     /// cache. Non-throwing; degrades open (to "unblocked") on any enumeration/db error.
     ///
-    /// Estimate-aware like the per-account gates: the wall-clock chain-tip estimate is projected
-    /// ONCE (the block-rate samples are wallet-scoped, not per-account) and fed into every
-    /// account's overdue query, where it may only accelerate due-ness; an estimator/sample
-    /// failure degrades to a nil estimate (scanned-tip behavior), never to "blocked".
+    /// Per account, the gate state is evaluated over BOTH views and blocked wins (A8): the
+    /// persisted gate file (covers dormant accounts from previous launches) and — when the
+    /// account's actor exists this launch — its live in-memory gate inputs from
+    /// `liveGateRegistry`, so a failed gate-file write cannot hide a mark this process just made.
+    ///
+    /// The work-pending clause is the ready-broadcast predicate (D1; never the broader overdue
+    /// query, whose due-but-unproved rows must not block sync), asked at the SCANNED tip for
+    /// every account FIRST (U8): a `true` scanned answer is final, so the estimate projection —
+    /// computed at most ONCE, the block-rate samples being wallet-scoped — is paid for only when
+    /// every scanned answer came back `false`, and it may only accelerate due-ness; an
+    /// estimator/sample failure degrades to a nil estimate (scanned-tip behavior), never to
+    /// "blocked".
     private static func computeSyncBlocked(
         welding: ZcashRustBackendWelding,
         generalStorageURL: URL,
+        liveGateRegistry: MigrationLiveGateRegistry,
         now: @Sendable () -> Date,
         logger: Logger
     ) async -> Bool {
@@ -213,32 +269,76 @@ actor OrchardMigrationHost {
         }
 
         let evaluatedAt = now()
-        let estimatedTip: BlockHeight?
-        if let samples = try? await welding.migrationBlockRateSamples(window: UInt32(ChainTipEstimator.sampleWindow)) {
-            estimatedTip = ChainTipEstimator(samples: samples).estimatedTip(now: evaluatedAt)
-        } else {
-            estimatedTip = nil
-        }
 
+        // Pass 1 — no estimate: gate files, live gate views, and the SCANNED-tip ready-broadcast
+        // answer. Any block here makes the estimate unnecessary (it can only accelerate).
         for account in accounts {
-            // Degrade to "not overdue" on any engine error, exactly like OrchardMigration.isSyncBlocked().
-            let hasOverdue = (try? await welding.migrationHasOverdueTransfers(for: account.id, estimatedTip: estimatedTip)) ?? false
-            let gateInputs = MigrationSyncGate.persistedGateInputs(
+            // Degrade to "no ready broadcast" on any engine error, exactly like
+            // OrchardMigration.isSyncBlocked().
+            let hasReadyBroadcast = (try? await welding.migrationHasReadyBroadcast(for: account.id, estimatedTip: nil)) ?? false
+            let fileInputs = MigrationSyncGate.persistedGateInputs(
                 directory: generalStorageURL,
                 accountUUID: account.id,
                 logger: logger
             )
-            let blocked = MigrationSyncGate.isBlocked(
+            let fileBlocked = MigrationSyncGate.isBlocked(
                 now: evaluatedAt,
-                hasOverdue: hasOverdue,
-                resumeAt: gateInputs.resumeAt,
-                inFlightUntil: gateInputs.inFlightUntil
+                hasReadyBroadcast: hasReadyBroadcast,
+                resumeAt: fileInputs.resumeAt,
+                inFlightUntil: fileInputs.inFlightUntil
             )
-            if blocked {
+            // A8: the live view exists only for accounts whose actor was created this launch;
+            // evaluating it separately (rather than merging timestamps) keeps "blocked wins"
+            // exact under the in-flight plausible-window rule.
+            let liveBlocked = liveGateRegistry.inputs(for: account.id).map { liveInputs in
+                MigrationSyncGate.isBlocked(
+                    now: evaluatedAt,
+                    hasReadyBroadcast: hasReadyBroadcast,
+                    resumeAt: liveInputs.resumeAt,
+                    inFlightUntil: liveInputs.inFlightUntil
+                )
+            } ?? false
+            if fileBlocked || liveBlocked {
                 return true
             }
         }
+
+        // Pass 2 — nothing blocked at the scanned tip: project the estimate ONCE and re-ask the
+        // ready-broadcast question per account (U8). Only a `false` scanned answer can flip.
+        guard let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: evaluatedAt) else {
+            return false
+        }
+        for account in accounts where (try? await welding.migrationHasReadyBroadcast(for: account.id, estimatedTip: estimatedTip)) ?? false {
+            return true
+        }
         return false
+    }
+}
+
+/// The lock-synchronized registry of live per-account gate views behind
+/// ``OrchardMigrationHost``'s A8 defense: `register(_:provider:)` is called from the host actor as
+/// each per-account ``OrchardMigration`` is created, and `inputs(for:)` is read by the
+/// wallet-scope predicate closure off-actor. The lock guards only the dictionary; a provider (a
+/// tiny nonisolated read — `OrchardMigration.liveGateInputs()`, itself lock-guarded) is invoked
+/// AFTER release, so the two locks never nest.
+final class MigrationLiveGateRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var providers: [AccountUUID: @Sendable () -> (resumeAt: Date?, inFlightUntil: Date?)] = [:]
+
+    /// Registers (or replaces) `accountUUID`'s live gate view.
+    func register(_ accountUUID: AccountUUID, provider: @escaping @Sendable () -> (resumeAt: Date?, inFlightUntil: Date?)) {
+        lock.lock()
+        providers[accountUUID] = provider
+        lock.unlock()
+    }
+
+    /// The live gate inputs for `accountUUID`, or `nil` when no actor (and therefore no live
+    /// gate) exists for it this launch — the dormant case the persisted gate file covers alone.
+    func inputs(for accountUUID: AccountUUID) -> (resumeAt: Date?, inFlightUntil: Date?)? {
+        lock.lock()
+        let provider = providers[accountUUID]
+        lock.unlock()
+        return provider?()
     }
 }
 

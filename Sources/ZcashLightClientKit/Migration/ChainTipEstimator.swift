@@ -79,3 +79,39 @@ struct ChainTipEstimator {
         return latest.height + advancedBlocks
     }
 }
+
+/// The ONE shared read-and-project composition behind every migration tip-estimate consumer: read
+/// the welding's block-rate samples over ``ChainTipEstimator/sampleWindow`` and run
+/// ``ChainTipEstimator`` at an INJECTED instant. Both `OrchardMigration` and
+/// `OrchardMigrationHost` — the gate/delivery paths and the public
+/// `estimatedMigrationChainTip()`/`estimatedMigrationSecondsPerBlock()` members — go through
+/// here, so the window constant, the estimator wiring, and the clock injection cannot drift apart
+/// between call sites.
+enum MigrationTipEstimation {
+    /// One projection over one samples read: the estimated tip (`nil` with no samples at all —
+    /// the wallet has never scanned) and the measured seconds-per-block (the estimator's
+    /// fallback when fewer than two samples exist).
+    struct Projection {
+        /// The wall-clock estimated chain tip, or `nil` when there are no samples to project from.
+        let estimatedTip: BlockHeight?
+        /// The measured seconds-per-block (see ``ChainTipEstimator/secondsPerBlock()``).
+        let secondsPerBlock: Double
+    }
+
+    /// Reads the samples and projects at `now`. THROWING: a sample-read failure propagates — this
+    /// is the core the public estimated members surface errors from; gate paths use
+    /// ``gatingEstimatedTip(welding:now:)`` instead, which degrades.
+    static func project(welding: ZcashRustBackendWelding, now: Date) async throws -> Projection {
+        let estimator = ChainTipEstimator(
+            samples: try await welding.migrationBlockRateSamples(window: UInt32(ChainTipEstimator.sampleWindow))
+        )
+        return Projection(estimatedTip: estimator.estimatedTip(now: now), secondsPerBlock: estimator.secondsPerBlock())
+    }
+
+    /// The estimated tip for gate/delivery due-ness checks: ``project(welding:now:)``'s tip,
+    /// degraded to `nil` (scanned-tip behavior) on ANY failure — sample read errors included — so
+    /// the estimate can only ever accelerate, never block or crash, the paths that consult it.
+    static func gatingEstimatedTip(welding: ZcashRustBackendWelding, now: Date) async -> BlockHeight? {
+        (try? await project(welding: welding, now: now))?.estimatedTip
+    }
+}

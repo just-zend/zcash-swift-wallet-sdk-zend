@@ -1162,12 +1162,14 @@ public actor SlipstreamSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).syncWakeups()
     }
 
-    public func estimatedMigrationChainTip(accountUUID: AccountUUID) async throws -> BlockHeight {
-        try await migrationHost.migration(for: accountUUID).estimatedChainTip()
+    public func estimatedMigrationChainTip() async throws -> BlockHeight {
+        // Wallet-scoped (the samples come from the shared blocks table), so this lives on the
+        // host, not on a per-account actor.
+        try await migrationHost.estimatedChainTip()
     }
 
-    public func estimatedMigrationSecondsPerBlock(accountUUID: AccountUUID) async throws -> Double {
-        try await migrationHost.migration(for: accountUUID).estimatedSecondsPerBlock()
+    public func estimatedMigrationSecondsPerBlock() async throws -> Double {
+        try await migrationHost.estimatedSecondsPerBlock()
     }
 
     public func migrationTransactionStatuses(accountUUID: AccountUUID) async throws -> [MigrationTransactionStatus] {

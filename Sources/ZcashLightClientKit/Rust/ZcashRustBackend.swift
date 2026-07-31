@@ -1561,11 +1561,21 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     // DB-free: a pure split over the caller's action weights (mirrors the Keystone UR bridge
     // below), so unlike the wallet-db migration methods this is not `@DBActor`.
     func migrationBatchPcztsByActions(actions: [UInt32], maxActionsPerSession: Int) async throws -> [Int] {
+        // A budget outside `UInt32`'s range (negative, or absurdly huge on 64-bit `Int`) is the
+        // same caller bug the rust side reports for a sub-16 budget: throw it, never trap on the
+        // conversion (A7) — this is reachable from the public
+        // `batchMigrationPcztsForSigning(_:maxActionsPerSession:)`.
+        guard let sessionBudget = UInt32(exactly: maxActionsPerSession) else {
+            throw ZcashError.rustMigrationBatchPcztsByActions(
+                "`migrationBatchPcztsByActions` was given a `maxActionsPerSession` (\(maxActionsPerSession)) outside the FFI's UInt32 range"
+            )
+        }
+
         let sizesPtr = actions.withUnsafeBufferPointer { actionsPtr in
             zcashlc_migration_batch_pczts_by_actions(
                 actionsPtr.baseAddress,
                 UInt(actionsPtr.count),
-                UInt32(maxActionsPerSession)
+                sessionBudget
             )
         }
 
@@ -1683,6 +1693,28 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
+    func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
+        let outcome = zcashlc_migration_has_ready_broadcast(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            // `-1` disables the estimate on the rust side.
+            estimatedTip.map(Int64.init) ?? -1
+        )
+
+        // A dedicated `-1` error sentinel (unlike the bool-returning sentinel reads above), so no
+        // last-error disambiguation dance is needed.
+        guard outcome >= 0 else {
+            throw ZcashError.rustMigrationHasReadyBroadcast(
+                lastErrorMessage(fallback: "`migrationHasReadyBroadcast` failed with unknown error")
+            )
+        }
+
+        return outcome == 1
+    }
+
+    @DBActor
     func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool {
         // Clear any stale, unconsumed last-error before this sentinel read (see
         // `migrationIsNoteSplitNeeded` above).
@@ -1732,7 +1764,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     /// inconsistent stored schedule; the id names the offending transfer). Anything else —
     /// including a `MIGRATION_WAKEUP_INFEASIBLE` whose id does not parse — falls back to the
     /// member's own case.
-    nonisolated private func migrationRoutedError(_ message: String, fallback: (String) -> ZcashError) -> ZcashError {
+    ///
+    /// Internal (not `private`) so the parse/degrade branches are pinned by unit tests directly —
+    /// driving each prefix through a real FFI failure is not reachable from an offline test.
+    nonisolated func migrationRoutedError(_ message: String, fallback: (String) -> ZcashError) -> ZcashError {
         if message.hasPrefix("MIGRATION_PLAN_STALE") {
             return .migrationPlanStale
         }
@@ -2835,6 +2870,19 @@ extension FfiMigrationTransactionStatus {
         case 4:
             guard mined_height >= 0 else { return nil }
             decodedState = .mined(height: BlockHeight(mined_height))
+        case 5:
+            // The Invalid state carries its reason the way Mined carries its height: a row
+            // claiming invalidity without one is malformed.
+            switch invalid_reason {
+            case 0:
+                decodedState = .invalid(reason: .fundingSpent)
+            case 1:
+                decodedState = .invalid(reason: .rejectedInvalid)
+            case 2:
+                decodedState = .invalid(reason: .rejectedExpired)
+            default:
+                return nil
+            }
         default:
             return nil
         }
@@ -2865,6 +2913,8 @@ extension FfiMigrationTransactionStatus {
             decodedBlockedOn = .signature
         case 5:
             decodedBlockedOn = .expired
+        case 6:
+            decodedBlockedOn = .invalid
         default:
             return nil
         }
@@ -2919,22 +2969,26 @@ extension FfiMigrationAdvanceStep {
     /// Converts an [`FfiMigrationAdvanceStep`] into a [`MigrationAdvanceStep`], or `nil` for an
     /// unrecognized step discriminant (should not happen; defensive only). The per-kind payload
     /// fields (`kind_layer`/`kind_index`/`kind_crossing`) are meaningful only for the Prove step
-    /// and are zeroed otherwise — a verbatim mirror of the FFI contract.
+    /// and are zeroed otherwise — a verbatim mirror of the FFI contract. The step discriminants
+    /// are matched against the header's exported `ZCASHLC_ADVANCE_STEP_*` constants (U3), so this
+    /// marshal and the rust side share one set of names instead of re-hardcoding the numbers.
     func unsafeToMigrationAdvanceStep() -> MigrationAdvanceStep? {
-        switch step {
-        case 0:
+        switch Int32(bitPattern: step) {
+        case ZCASHLC_ADVANCE_STEP_PROVE:
             let kind: MigrationTransactionStatus.Kind = kind_is_preparation
                 ? .preparation(layer: Int(kind_layer), index: Int(kind_index))
                 : .transfer(crossing: Int(kind_crossing))
             return .prove(id: id, kind: kind)
-        case 1:
+        case ZCASHLC_ADVANCE_STEP_BROADCAST:
             return .broadcast(id: id)
-        case 2:
+        case ZCASHLC_ADVANCE_STEP_REBUILD:
             return .rebuild(id: id)
-        case 3:
+        case ZCASHLC_ADVANCE_STEP_WAITING:
             return .waiting
-        case 4:
+        case ZCASHLC_ADVANCE_STEP_COMPLETE:
             return .complete
+        case ZCASHLC_ADVANCE_STEP_ATTEND:
+            return .requiresAttention(id: id)
         default:
             return nil
         }
