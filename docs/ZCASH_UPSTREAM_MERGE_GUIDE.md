@@ -2,13 +2,42 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-29
+Last reviewed: 2026-07-30
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Bleeding-edge refresh (2026-07-30)
+
+- Fresh fetches leave the default branches unchanged: `origin/main=4497fe9e` and
+  `upstream/main=f51ed74a`. The parity relationship remains `174 87` at merge base
+  `769809a2`; `upstream/main` is not an ancestor of Zend `main`. Draft Zend PR `#33`
+  remains the sole clean reconciliation tracker and deliberately does not claim to
+  carry the 87 upstream-only commits.
+- Upstream published `2.7.0-rc.4` and `2.8.0-rc.3` release/FFI branches and advanced
+  `maint/v2.7.x`, `maint/v2.8.x`, and `feature/ironwood-slipstream`. These versioned
+  lines remain part of the blocked migration/FFI reconciliation, not a compatible
+  Zend source or artifact update. Upstream PR `#1914`, which would merge the v2.8
+  maintenance line to `main`, is still blocked and review-required despite green
+  checks.
+- No early carry meets the ready, useful, and low-risk gate. Upstream PR `#1923` is a
+  32-file migration-state-machine rewrite with a failing build, atop the 154-commit
+  Ironwood/Slipstream branch. PR `#1922` is clean and green but stacked on 24 commits
+  of the `2.7.0-rc.3` and Ironwood/FFI family; its apparently small change exposes
+  `v_transactions` fields (`poolCrossingValue`, `isTrusted`, and Ironwood) that must
+  be supplied by the reconciled Rust schema and FFI artifact, so it cannot safely be
+  cherry-picked into Zend's provenance-locked baseline.
+- The related AGENTS.md/CLAUDE.md stacked PRs `#1917` through `#1919` are blocked or
+  changes-requested, while the older maintenance fixes (`#1896`, `#1897`, `#1900`, and
+  draft/dirty `#1898`) remain unsuitable in isolation. PR `#1895` is dirty on the
+  Ironwood branch and draft `#1893` remains the broad, blocked Slipstream migration
+  stack. Preserve Zend's exact engine revision and committed XCFramework until the
+  combined source/artifact reconstruction and funded-device migration proof are done.
+- This is a documentation-only decision record. No SDK source or artifact changed, so
+  `swift build` and `swift test --filter OfflineTests` were intentionally not rerun.
 
 ## Current monitor status (2026-07-27)
 
