@@ -129,7 +129,8 @@ class TransactionRepositoryTests: XCTestCase {
             totalReceived: nil,
             spentNoteCount: 0,
             poolCrossingValue: nil,
-            isTrusted: false
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)
@@ -165,7 +166,8 @@ class TransactionRepositoryTests: XCTestCase {
             totalReceived: nil,
             spentNoteCount: 0,
             poolCrossingValue: nil,
-            isTrusted: false
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)
@@ -196,7 +198,8 @@ class TransactionRepositoryTests: XCTestCase {
             totalReceived: nil,
             spentNoteCount: 0,
             poolCrossingValue: nil,
-            isTrusted: false
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)

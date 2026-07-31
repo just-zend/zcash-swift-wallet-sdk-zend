@@ -162,7 +162,8 @@ final class EnhanceActionTests: ZcashTestCase {
             totalReceived: nil,
             spentNoteCount: 0,
             poolCrossingValue: nil,
-            isTrusted: false
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
         
         blockEnhancerMock.enhanceAtDidEnhanceClosure = { _, didEnhance in
@@ -225,7 +226,8 @@ final class EnhanceActionTests: ZcashTestCase {
             totalReceived: nil,
             spentNoteCount: 0,
             poolCrossingValue: nil,
-            isTrusted: false
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
         
         blockEnhancerMock.enhanceAtDidEnhanceClosure = { _, didEnhance in
@@ -292,7 +294,8 @@ final class EnhanceActionTests: ZcashTestCase {
             totalReceived: nil,
             spentNoteCount: 0,
             poolCrossingValue: nil,
-            isTrusted: false
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         blockEnhancerMock.enhanceAtDidEnhanceClosure = { _, didEnhance in

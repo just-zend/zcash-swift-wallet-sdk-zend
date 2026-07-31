@@ -43,6 +43,42 @@ public enum ZcashTransaction {
             }
         }
         
+        /// How a transaction classifies against ZIP 318, the Orchard to Ironwood
+        /// pool migration. This is a conformance class and never a provenance: it
+        /// cannot establish that a transaction came from this wallet's own
+        /// migration run. The encoding is stable and append-only.
+        public enum ZIP318Kind: Equatable {
+            /// Not classified. Either the transaction predates this column or the
+            /// wallet has not decrypted it yet; deciding requires rescanning the
+            /// transaction. This is the absence of a decision, not the decision
+            /// that the transaction is not a ZIP 318 one, so present no label for
+            /// it. An unrecognized encoding decodes here as well, because an SDK
+            /// that does not know a code has learned nothing about the
+            /// transaction.
+            case notClassified
+            /// Classified, and not a ZIP 318 transaction.
+            case nonconforming
+            /// A note-preparation self-send that a migration run makes before it
+            /// crosses.
+            case preparation
+            /// A pool crossing paying the account's own internal address, so a
+            /// migration transfer.
+            case transfer
+
+            init(rawValue: Int) {
+                switch rawValue {
+                case 1:
+                    self = .nonconforming
+                case 2:
+                    self = .preparation
+                case 3:
+                    self = .transfer
+                default:
+                    self = .notClassified
+                }
+            }
+        }
+
         public var id: Data { rawID }
 
         public let accountUUID: AccountUUID
@@ -76,6 +112,10 @@ public enum ZcashTransaction {
         /// are spendable after the trusted confirmation count rather than the
         /// untrusted one.
         public let isTrusted: Bool
+        /// How this transaction classifies against ZIP 318, the Orchard to
+        /// Ironwood pool migration. Only `preparation` and `transfer` are a
+        /// migration this account made.
+        public let zip318Kind: ZIP318Kind
         public var state: State?
     }
 
@@ -192,6 +232,7 @@ extension ZcashTransaction.Overview {
         static let spentNoteCount = SQLite.Expression<Int>("spent_note_count")
         static let poolCrossingValue = SQLite.Expression<Int64?>("pool_crossing_value")
         static let trustStatus = SQLite.Expression<Bool>("trust_status")
+        static let zip318Kind = SQLite.Expression<Int>("zip318_kind")
     }
 
     init(row: Row) throws {
@@ -210,6 +251,7 @@ extension ZcashTransaction.Overview {
             self.isExpiredUmined = try row.get(Column.expiredUnmined)
             self.spentNoteCount = try row.get(Column.spentNoteCount)
             self.isTrusted = try row.get(Column.trustStatus)
+            self.zip318Kind = .init(rawValue: try row.get(Column.zip318Kind))
 
             if let poolCrossingValue = try row.get(Column.poolCrossingValue) {
                 self.poolCrossingValue = Zatoshi(poolCrossingValue)
