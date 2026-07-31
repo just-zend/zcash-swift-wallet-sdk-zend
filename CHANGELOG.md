@@ -56,10 +56,14 @@ Changes are relative to `2.8.0-rc.3`.
   `KeystoneFirmwareVersion`. Migration transaction ids are `UInt32`.
 - State: `migrationAdvanceStep(accountUUID:)` is a VERBATIM conduit of the migration engine's own
   next-step decision, evaluated at the scanned chain tip — `nil` when no run is stored, otherwise
-  `.prove(id:kind:)`, `.broadcast(id:)`, `.rebuild(id:)`, `.waiting`, or the terminal `.complete`
-  (per-run, including a cancelled run — never "nothing left to migrate"; ask
-  `proposeMigrationTransfers` for that). The SDK adds no state machine of its own on top of the
-  engine's answer.
+  `.requiresAttention(id:)` (a transaction of the run is invalid — surfaced FIRST, ahead of any
+  actionable step; discharge via `reconcileMigrationInvalidations`, attention UX, then
+  `restartCurrentMigrationStep`), `.prove(id:kind:)`, `.broadcast(id:)`, `.rebuild(id:)`,
+  `.waiting`, or the terminal `.complete` (per-run, including a cancelled run — never "nothing
+  left to migrate"; ask `proposeMigrationTransfers` for that). The SDK adds no state machine, no
+  ordering shims, and no carve-outs of its own on top of the engine's answer — the attention step
+  and the broadcast-first ordering are native to the pinned librustzcash revision (upstream PR
+  #2873).
 - Planning and delivery: a randomized-cadence schedule proposal committed by
   `signAndStoreMigrationSchedule`, proved opportunistically during sync by the new
   `finalizeReadyMigrationTransfers(accountUUID:)`, then delivered by
@@ -71,10 +75,11 @@ Changes are relative to `2.8.0-rc.3`.
   transfer.
 - New: `migrationSyncWakeups(accountUUID:)` — the stored run's minimal sync/proving wake-up
   schedule (heights at which to wake, sync, and call `finalizeReadyMigrationTransfers`, plus the
-  transfer ids each wake-up covers) — and `estimatedMigrationChainTip(accountUUID:)` /
-  `estimatedMigrationSecondsPerBlock(accountUUID:)`, a measured-block-rate wall-clock chain-tip
+  transfer ids each wake-up covers) — and `estimatedMigrationChainTip()` /
+  `estimatedMigrationSecondsPerBlock()`, a measured-block-rate wall-clock chain-tip
   projection (Android-SDK-parity constants: a window of the last 100 scanned blocks, a 5–150 s
-  per-delta/result clamp, a 75 s fallback with fewer than two samples). `executeNextPendingMigrationTransfer`
+  per-delta/result clamp, a 75 s fallback with fewer than two samples; wallet-scoped — the
+  projection reads the shared blocks table, so the pair takes no account). `executeNextPendingMigrationTransfer`
   and `hasOverdueMigrationTransfers(accountUUID:)` gain a `useEstimatedTip: Bool` parameter
   (one/two-argument convenience overloads default it to `false`) that lets the estimated tip only
   ACCELERATE scheduled-height due-ness; expiry always evaluates against the scanned tip, and an
@@ -117,8 +122,12 @@ Changes are relative to `2.8.0-rc.3`.
   `migrationProgress`'s summary — kind, lifecycle state, scheduled and expiry heights, readiness,
   next action/blocker, `dependsOn` (the ids of the same run's transactions that must mine first), and
   `anchorBoundaryHeight` (the bucketed boundary a TRANSFER's anchor was drawn against; always `nil`
-  for a preparation), keyed by a stable id. A txid is available only while a transaction is
-  `broadcast`, not once mined. An empty array means no stored run, not an error. New:
+  for a preparation), keyed by a stable id. The lifecycle state includes
+  `.invalid(reason: MigrationInvalidReason)` (`fundingSpent` / `rejectedInvalid` /
+  `rejectedExpired`) with the matching `Blocker.invalid` — the engine's event-recorded death
+  states, which chain inclusion outranks (a mined row never reports invalid). A txid is available
+  only while a transaction is `broadcast`, not once mined. An empty array means no stored run, not
+  an error. New:
   `Array<MigrationTransactionStatus>.isPreparationPhaseComplete` — `true` iff every preparation-kind
   row is mined (vacuously `true` when the run needs no preparations).
 - Privacy and cost contract the host must build confirmation UI around: broadcasts go over a
@@ -126,21 +135,27 @@ Changes are relative to `2.8.0-rc.3`.
   requested but unavailable throws `ZcashError.migrationTorUnavailable`, never a silent clearnet
   fallback. `MigrationNetworkPrivacyOptions.submissionEndpoint` is required: exactly one server per
   attempt, chosen by the host, and confirmation comes from block scanning rather than txid polling.
-  `start()` throws `ZcashError.migrationSyncBlocked` while a per-account privacy gate is open —
-  network-scaled: 600 s on mainnet, 180 s on testnet/regtest — after a broadcast, or while a broadcast
-  is in flight (a 120 s self-expiring marker guards the submit-to-record window so the reconciliation
-  probe above never treats a just-broadcast transfer as a submit crash) — see `isMigrationSyncBlocked()`,
-  `migrationSyncBlockedStream`, `migrationPrivacySyncBufferDuration`. The broadcasting members throw
+  `start()` throws `ZcashError.migrationSyncBlocked` while a per-account privacy gate is open: for
+  the network-scaled buffer (600 s on mainnet, 180 s on testnet/regtest) after a broadcast, while a
+  broadcast is in flight (a 120 s self-expiring marker — re-armed at the last pre-submit instant,
+  after the Tor bootstrap — guards the submit-to-record window so the reconciliation probe above
+  never treats a just-broadcast transfer as a submit crash), or while a READY broadcast is waiting
+  (a proved, schedule-due, unexpired, valid transfer the wallet should serve instead of syncing;
+  estimate-accelerated, and never a `Signed`/awaiting-proof row — those need MORE syncing, so the
+  broader `hasOverdueMigrationTransfers` answer deliberately does not gate sync) — see
+  `isMigrationSyncBlocked()`, `migrationSyncBlockedStream`, `migrationPrivacySyncBufferDuration`. The broadcasting members throw
   `ZcashError.migrationBroadcastDuringSync` while a sync runs. A record failure after a successful
   broadcast throws the distinguishable `ZcashError.migrationRecordFailedAfterBroadcast`, which a
   later execution window heals.
 - Persisting the committed schedule is the host's responsibility; the SDK keeps no copy.
   `MigrationSchedule` gains `preparations: [MigrationPreparationStep]` — the note-preparation
   transactions of the same plan the transfer rows alone do not surface — decoded as an empty array
-  from a copy persisted before the field existed.
+  from a copy persisted before the field existed. Its `encode(to:)` omits `proposalHandle` (a
+  process-lifetime plan-cache key no persisted copy could honor), so every decoded copy carries
+  handle `0` — re-propose instead of committing a persisted schedule.
 - `debugRescheduleMigrationTransfers(accountUUID:)` (DEBUG builds only) compresses a committed
   schedule for broadcast testing.
-- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, and `ZRUST0111`–`ZRUST0147`
+- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, and `ZRUST0111`–`ZRUST0148`
   (`ZRUST0098`, `rustMigrationState`, was retired pre-release with the SDK-side migration state
   machine it served — the code is not reused).
 
