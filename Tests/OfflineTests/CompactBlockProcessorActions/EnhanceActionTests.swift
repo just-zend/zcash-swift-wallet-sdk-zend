@@ -159,7 +159,10 @@ final class EnhanceActionTests: ZcashTestCase {
             value: Zatoshi(100000),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false
         )
         
         blockEnhancerMock.enhanceAtDidEnhanceClosure = { _, didEnhance in
@@ -219,7 +222,10 @@ final class EnhanceActionTests: ZcashTestCase {
             value: Zatoshi(100000),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false
         )
         
         blockEnhancerMock.enhanceAtDidEnhanceClosure = { _, didEnhance in
@@ -283,7 +289,10 @@ final class EnhanceActionTests: ZcashTestCase {
             value: Zatoshi(100000),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false
         )
 
         blockEnhancerMock.enhanceAtDidEnhanceClosure = { _, didEnhance in
