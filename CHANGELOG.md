@@ -175,6 +175,12 @@ Changes are relative to `2.8.0-rc.3`.
 - `Synchronizer.allTransactions()` is now a protocol requirement, and
   `TransactionRepository.unreconciledTxids()` exposes the read-side reconciliation view, defaulting
   to empty where the engine's view is absent.
+- `Proposal.spendsLegacyOrchardFunds` — whether the proposal spends notes from
+  the legacy Orchard pool, so wallets can warn before a turnstile-crossing send.
+  `Proposal.testOnlyFakeProposal(totalFee:spendsLegacyOrchardFunds:)` gained a
+  defaulted parameter for building test fixtures.
+
+# 2.8.0-rc.3 - 2026-07-29
 
 ## Changed
 
