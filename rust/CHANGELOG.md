@@ -17,21 +17,32 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MIGRATION_PROVING_UNAVAILABLE`.
   - State: `zcashlc_migration_advance_step` (a verbatim marshal of the upstream engine's own
     `MigrationState::next_step` — `FfiMigrationAdvanceStep`, freed by
-    `zcashlc_free_migration_advance_step`; `NULL` with no last error means no run is stored),
-    `_progress`, `_is_note_split_needed`, `_has_overdue_transfers`, `_has_invalid_transfers`,
-    `_pending_transfer_proposal`. `_has_overdue_transfers` and `_next_due_transfer` (below) take an
-    `estimated_tip: i64` parameter (`-1` = disabled): it may only ACCELERATE scheduled-height
-    due-ness — the effective tip is `max(scanned, estimated)` — and expiry is always evaluated
-    against the SCANNED tip.
+    `zcashlc_free_migration_advance_step`; `NULL` with no last error means no run is stored; the
+    step discriminants are exported as `ZCASHLC_ADVANCE_STEP_*` constants, including `_ATTEND` for
+    a run holding an invalid transaction, surfaced ahead of all actionable work), `_progress`,
+    `_is_note_split_needed`, `_has_overdue_transfers`, `_has_invalid_transfers` (true iff the
+    NON-terminal stored run holds an engine-`Invalid` or expired-unmined transaction; a cancelled
+    run answers `false`), `_has_ready_broadcast` (the sync-gate's work-pending predicate:
+    `1`/`0`/`-1`, true iff a PROVED, due, unexpired, valid transaction is servable right now —
+    `Signed` or awaiting-proof rows never gate sync), and `_pending_transfer_proposal`.
+    `_has_overdue_transfers`, `_has_ready_broadcast` and `_next_due_transfer` (below) take an
+    `estimated_tip: i64` parameter (`-1` = disabled) evaluated under the upstream engine's
+    `DuenessTargets` rule: the estimate may only ACCELERATE scheduled-height due-ness, expiry and
+    boundary settledness stay on the SCANNED tip, and a broadcast whose expiry only the ESTIMATED
+    target has passed is withheld (protective, reversible) without ever being treated as expired.
   - Sync scheduling: `zcashlc_migration_sync_wakeups` returns `FfiMigrationSyncWakeups` (freed by
     `zcashlc_free_migration_sync_wakeups`) — the stored run's minimal sync/proving wake-up schedule
     as of the scanned tip, jitter re-drawn on every call; `_block_rate_samples` returns
     `FfiBlockRateSamples` (freed by `zcashlc_free_migration_block_rate_samples`) — up to `window`
     most-recently-scanned `(height, header time)` rows, ascending, the raw input a wall-clock
-    chain-tip estimator projects from; and `_reconcile_invalidations` (returns `bool`, `-1` on
-    error) reconciles the stored run against local on-chain truth (own-broadcast/mined promotion, a
-    submit-crash probe, then the foreign-spend nullifier check) and reports whether it recorded a
-    new invalidation. All three are read-only/local-database-only.
+    chain-tip estimator projects from (a missing wallet-database file, like a missing `blocks`
+    table, is the benign empty answer, and a coerced read failure is logged rather than silent);
+    and `_reconcile_invalidations` (returns `bool`, `-1` on error) reconciles the stored run
+    against local on-chain truth (own-broadcast/mined promotion, a submit-crash probe, then the
+    foreign-spend nullifier check — which requires POSITIVE wallet-database evidence that every
+    funding preparation is currently mined, so a rewind/rescan window reads as ambiguous rather
+    than as a foreign spend) and reports whether it recorded a new invalidation, as the engine's
+    own `Invalid { funding_spent }` state. All three are read-only/local-database-only.
   - Batching: `zcashlc_migration_batch_pczts_by_actions` (pure, no wallet database) splits an
     ORDERED array of transaction action-weights (16 per preparation, 3 per transfer) into signer
     sessions bounded by a caller-supplied action budget, returning `FfiMigrationBatchSizes` (freed by
@@ -45,7 +56,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     scanned or retained. Call it from the sync path.
   - Delivery: `zcashlc_migration_next_due_transfer` never proves, and its
     `FfiPreparedTransfer.status` separates `MigrationNothingDue` from `MigrationAwaitingProof` and
-    `MigrationReady`; then `_extract_broadcast_tx`, `_record_transfer_result`, and
+    `MigrationReady`; then `_extract_broadcast_tx`, `_record_transfer_result` (whose terminal
+    tags — 2 invalid, 3 expired — record the engine's own `MigrationTxState::Invalid` with the
+    matching `rejected_invalid`/`rejected_expired` reason, under `mark_invalid`'s rules: an
+    already-mined transaction is left alone, chain inclusion outranking a stale verdict), and
     `_record_immediate_run`, which records a send-max sweep built outside the engine.
   - Recovery: `zcashlc_migration_restart_step`, and `_refresh_stale_transfers`, which rebuilds every
     expired transfer of the stored run and returns the full stored schedule, persisting
@@ -64,8 +78,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Status: `zcashlc_migration_transaction_statuses` returns one row per committed migration
     transaction — stable id, kind, lifecycle state, scheduled/expiry/mined heights, the broadcast
     txid while in mempool, readiness, next action, blocking reason, the `depends_on` heap array of
-    ids that must mine first, and `anchor_boundary` (the bucketed boundary a TRANSFER's anchor was
-    drawn against; `-1` always for a preparation) — freed by
+    ids that must mine first, `anchor_boundary` (the bucketed boundary a TRANSFER's anchor was
+    drawn against; `-1` always for a preparation), and a trailing `invalid_reason` (`-1` unless the
+    lifecycle state is Invalid — state `5`, blocker `6`) — freed by
     `zcashlc_free_migration_transaction_statuses`. No stored run yields an empty container.
   - `FfiMigrationSchedule` gains a trailing `preparations`/`preparations_len` heap array of
     `FfiMigrationPreparationStep` (id, layer, index, broadcast height, and the whole preceding
@@ -122,22 +137,40 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The migration store connection uses the same 15 s `busy_timeout` as the wallet handle, so a
   `zcashlc_migration_*` call racing an engine write waits for the lock instead of surfacing
   `database is locked` early.
+- Terminal rejection classifications live in the engine state
+  (`MigrationTxState::Invalid { reason }` via the upstream `MigrationState::mark_invalid`), not in
+  an SDK side table: the drive loop (`Attend`), the wake-up schedule and every delivery query now
+  account for a dead transaction automatically, and cancelling the run is what clears the
+  attention (a terminal run surfaces neither `Attend` nor `_has_invalid_transfers`). The
+  `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table is retired: its schema
+  migration is no longer registered, any surviving rows are folded into the engine state once, on
+  the first migration call (legacy reasons map `invalid_note` → rejected_invalid, `expired` →
+  rejected_expired, `foreign_spent` → funding_spent), and the table is dropped.
+- The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`,
+  `next_provable_at` / `next_broadcastable_at`) instead of hand-rolled SDK twins of the upstream
+  predicates; behaviour additionally gains upstream's doomed-broadcast withhold (above).
 
 ### Fixed
 - The migration prover's transient-vs-hard error classification (`ProveErrorClass::is_transient`,
   behind `zcashlc_migration_prove_pending` / `_next_due_transfer`): `UnknownSpentNote` (a
-  late-mining dependency's note the wallet has not seen yet) and `Tree` (shard-tree query races
-  during sync — this exact variant crash-looped a prove batch on Android on 2026-07-28) now
-  correctly resolve as the transient "retry on a later sweep" outcome instead of a hard
-  `MIGRATION_PROVING_UNAVAILABLE:` error. `IronwoodTreeUnavailable` moves the other way, out of the
-  transient set: the backend tracks no Ironwood commitment tree at all, which no amount of syncing
-  ever produces, so treating it as transient could retry forever instead of surfacing the real
-  condition.
+  late-mining dependency's note the wallet has not seen yet) and `Tree(ShardTreeError::Query(_))`
+  (shard-tree query races during sync — this exact case crash-looped a prove batch on Android on
+  2026-07-28) now correctly resolve as the transient "retry on a later sweep" outcome instead of a
+  hard `MIGRATION_PROVING_UNAVAILABLE:` error; the non-query `Tree` variants (`Storage`/`Insert`)
+  stay hard, since no amount of syncing repairs a failing persistence layer or a corrupt tree
+  write, and every transient deferral is now logged with the row id (a stalled sweep was
+  previously silent). `IronwoodTreeUnavailable` moves the other way, out of the transient set: the
+  backend tracks no Ironwood commitment tree at all, which no amount of syncing ever produces, so
+  treating it as transient could retry forever instead of surfacing the real condition.
 - `zcashlc_get_memo` accepts the Ironwood output pool code (4); an Ironwood note id was rejected as
   an unrecognized shielded protocol.
 - Due-ness and expiry are evaluated on the engine's target-height contract (`chain tip + 1`) in every
   read path, with the "never expires" case honoured. Transfers now become due and expire one block
-  earlier, consistently, and a doomed transfer is no longer served for broadcast.
+  earlier, consistently, and a doomed transfer is no longer served for broadcast. This now includes
+  the `zcashlc_migration_prove_pending` sweep — the one remaining raw-tip caller — so a preparation
+  scheduled exactly at the target is proved on the sweep that sees it rather than one block late.
+- An `estimated_tip` at or beyond `u32::MAX` saturates below the height ceiling instead of
+  overflowing the `+ 1` target conversion.
 - `FfiMigrationProgress.next_transfer_ready_at_height` reports the next transfer still awaiting
   broadcast rather than one already in the mempool.
 - Transfer amounts are read from the engine's `crossing_values()` instead of being re-derived at

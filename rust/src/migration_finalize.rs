@@ -86,20 +86,23 @@ impl<TE, NE, RE> ProveErrorClass for WalletProveError<TE, NE, RE> {
     /// syncs": no spendable note yet matches the spend's revealed nullifier (`UnknownSpentNote` —
     /// a late-mining dependency's note the wallet has not seen yet), no root at the anchor
     /// checkpoint yet (`AnchorNotFound`), the spent note not witnessable there yet
-    /// (`WitnessNotFound`), a commitment-tree query failure (`Tree` — shard-tree query races
-    /// during sync; this exact variant crash-looped a prove batch on Android on 2026-07-28), or no
-    /// chain data at all (`ChainTipUnknown`).
+    /// (`WitnessNotFound`), a commitment-tree QUERY failure (`Tree(ShardTreeError::Query(_))` —
+    /// shard-tree query races during sync; this exact case crash-looped a prove batch on Android
+    /// on 2026-07-28), or no chain data at all (`ChainTipUnknown`).
     ///
     /// Hard = genuinely unrecoverable, must not be swallowed: everything else, including
     /// `IronwoodTreeUnavailable` explicitly — the backend tracks no Ironwood commitment tree at
-    /// all, which no amount of syncing produces.
+    /// all, which no amount of syncing produces — and the NON-query `Tree` variants (A6): a
+    /// `Storage(_)` failure is the persistence layer erroring and an `Insert(_)` a corrupt tree
+    /// write, neither of which more syncing repairs, so deferring them would stall the sweep
+    /// silently forever.
     fn is_transient(&self) -> bool {
         matches!(
             self,
             WalletProveError::UnknownSpentNote(_)
                 | WalletProveError::AnchorNotFound(_)
                 | WalletProveError::WitnessNotFound(_)
-                | WalletProveError::Tree(_)
+                | WalletProveError::Tree(shardtree::error::ShardTreeError::Query(_))
                 | WalletProveError::ChainTipUnknown
         )
     }
@@ -161,7 +164,16 @@ where
     };
     match result {
         Ok(()) => Ok(Some(())),
-        Err(engine::ProveError::Prover(e)) if e.is_transient() => Ok(None),
+        Err(engine::ProveError::Prover(e)) if e.is_transient() => {
+            // The deferral is ordinary (the sweep retries later), but never silent (A6): a row
+            // that defers on every sweep would otherwise present as a wallet that simply never
+            // proves, with nothing in the logs naming the stall.
+            tracing::warn!(
+                "proving migration transaction {} deferred (transient): {e}",
+                u32::from(id)
+            );
+            Ok(None)
+        }
         Err(e) => Err(proving_unavailable(e)),
     }
 }

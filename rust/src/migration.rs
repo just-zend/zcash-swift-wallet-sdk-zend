@@ -15,16 +15,19 @@
 //!
 //! Semantics that moved into this layer (the v1 crate did them internally):
 //! - There is NO derived state machine anymore: [`zcashlc_migration_advance_step`] is a VERBATIM
-//!   conduit for the engine's own `MigrationState::next_step` decision (with a documented,
-//!   temporary ordering shim — see that function), and the platform drives the run from that
-//!   answer alone. `Complete` is PER-RUN — "the stored run is fully mined (or terminal)", never
-//!   "nothing left to migrate". After completion the platform asks
-//!   `zcashlc_migration_propose_transfers` whether anything remains (an empty schedule means no).
+//!   conduit for the engine's own `MigrationState::next_step` decision — no carve-outs, no
+//!   ordering shims — and the platform drives the run from that answer alone. `Complete` is
+//!   PER-RUN — "the stored run is fully mined (or terminal)", never "nothing left to migrate".
+//!   After completion the platform asks `zcashlc_migration_propose_transfers` whether anything
+//!   remains (an empty schedule means no).
 //! - Mined-transaction reconciliation ([`reconcile_mined`]) runs at the head of every read.
-//! - Rejection classification is recorded in the SDK-owned
-//!   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table (the engine has no
-//!   failure states), created by the wallet schema migrations via [`crate::ext_schema`] and
-//!   written through the wallet's extension-transaction API.
+//! - Rejection classification is recorded as the ENGINE's own failure state
+//!   (`MigrationTxState::Invalid` via `MigrationState::mark_invalid`), persisted through the
+//!   ordinary store round-trip, so the drive loop, the wake-up schedule, and every delivery
+//!   query account for a dead transaction automatically. (Earlier versions kept an SDK-owned
+//!   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` side table the engine could not
+//!   consult; [`migrate_legacy_invalid_marks`] folds any surviving rows into the engine state
+//!   once, on open, and drops the table.)
 //! - The immediate lane (an ordinary send-max sweep, entirely outside the engine) is tracked in
 //!   its own SDK-owned `sdk_immediate_runs` side table and surfaces ONLY through
 //!   [`zcashlc_migration_progress`]: while unmined it reports a 0-of-1 progress snapshot (flagged
@@ -72,6 +75,9 @@ use zcash_client_backend::data_api::wallet::{
 use zcash_client_backend::data_api::{InputSource, NullifierQuery, OutputLockStore, WalletRead};
 use zcash_client_backend::wallet::{LockOwner, OutputRef};
 use zcash_client_sqlite::AccountUuid;
+use zcash_client_sqlite::pool_migration::orchard_ironwood::{
+    Error as PoolMigrationStoreError, PoolMigrations,
+};
 use zcash_protocol::consensus::{
     BLOCKS_PER_HOUR, BlockHeight, Network, NetworkConstants, NetworkUpgrade, Parameters,
 };
@@ -79,7 +85,7 @@ use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
 
 use zcash_pool_migration::engine::{
-    self, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction,
+    self, InvalidReason, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction,
     MigrationTransferId, MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
 use zcash_pool_migration::scheduling::{WakeupParams, WakeupScheduleError};
@@ -87,7 +93,9 @@ use zcash_pool_migration::signing_rounds::{
     NextFit, PREPARATION_ACTIONS, PlannedTx, SigningRoundBudget, SigningRoundStrategy,
     TRANSFER_ACTIONS, action_weight,
 };
-use zcash_pool_migration::state::{AdvanceStep, Blocker, NextAction, TransactionStatus};
+use zcash_pool_migration::state::{
+    AdvanceStep, Blocker, DuenessTargets, NextAction, TransactionStatus,
+};
 use zcash_pool_migration::wallet::WalletMigrationProver;
 
 use crate::migration_engine::{Backend, MigrationWallet};
@@ -219,9 +227,12 @@ unsafe fn open(
         slice::from_raw_parts(db_data, db_data_len)
     }));
     let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network.clone())? };
-    let store_conn = open_store_conn(&db_path)?;
+    let mut store_conn = open_store_conn(&db_path)?;
     init_immediate_runs(&store_conn)
         .map_err(|e| anyhow!("Error initializing immediate-run table: {e}"))?;
+    // One-time: fold any legacy invalid-marks rows into the engine state and drop their table
+    // (a no-op existence probe once done — see the function's doc).
+    migrate_legacy_invalid_marks(&mut store_conn)?;
     let account = account_uuid_from_bytes(account_uuid_bytes)
         .map_err(|e| anyhow!("account uuid must be 16 bytes: {e}"))?;
     let account_bytes = *account.expose_uuid().as_bytes();
@@ -257,72 +268,136 @@ impl CallCtx {
     }
 }
 
-// ----- SDK-owned invalid-transfer marks -----
+// ----- one-time legacy invalid-marks migration -----
 //
-// The engine has no failure states: a rejected broadcast leaves the transaction `Signed`/`Proved`
-// and re-offered. The platform's rejection classifier distinguishes terminal rejections
-// (invalid-note, expired) from retryable ones; the terminal ones are recorded in the
-// `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table so
-// `zcashlc_migration_has_invalid_transfers` / the `RequiresAttention` derivation can surface
-// them. Cleared when the run is cancelled (`zcashlc_migration_restart_step`).
-//
-// The table is created by the wallet schema migrations (see [`crate::ext_schema`]); access goes
-// through `WalletDb::transactionally_with_extension`, whose authorizer restricts writes to the
-// `ext_` namespace.
+// Terminal rejection classifications used to live in an SDK-owned
+// `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table, because the engine had
+// no failure states. The engine now records the same evidence itself
+// (`MigrationTxState::Invalid` via `MigrationState::mark_invalid`), where every state-driven
+// decision — `next_step`'s `Attend`, the delivery queries' exclusions, the wake-up schedule —
+// accounts for it automatically. The helpers below fold any surviving legacy rows into the
+// engine state once, on [`open`], and drop the table; fresh wallets never create it (its
+// `schemerz` migration is no longer registered — see [`crate::ext_schema`]).
 
-fn insert_invalid_mark(
-    wallet: &mut MigrationWallet,
-    account: &[u8; 16],
-    id: MigrationTransferId,
-    reason: &str,
-) -> anyhow::Result<()> {
-    wallet.transactionally_with_extension(|_wdb, ext| {
-        ext.execute(
-            "INSERT INTO ext_zcashlc_orchard_ironwood_migration_invalid_marks
-                (account_uuid, tx_id, reason)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(account_uuid, tx_id) DO UPDATE SET reason = excluded.reason",
-            rusqlite::params![&account[..], u32::from(id), reason],
-        )?;
-        Ok(())
+/// The legacy marks table's name. Only the one-time migration below refers to it now.
+const LEGACY_INVALID_MARKS_TABLE: &str = "ext_zcashlc_orchard_ironwood_migration_invalid_marks";
+
+/// Maps a legacy marks-table reason string onto the engine's [`InvalidReason`].
+///
+/// The engine's own wire names (`funding_spent`, `rejected_invalid`, `rejected_expired`) parse
+/// as themselves; the names this SDK actually wrote map onto the states they described:
+/// - `"invalid_note"` (`zcashlc_migration_record_transfer_result` tag 2, a node rejecting the
+///   submission as invalid) → [`InvalidReason::RejectedInvalid`];
+/// - `"expired"` (tag 3, a node rejecting the submission as expired) →
+///   [`InvalidReason::RejectedExpired`];
+/// - `"foreign_spent"` (the reconcile pass-3 verdict: a funding note spent outside the
+///   migration) → [`InvalidReason::FundingSpent`];
+/// - anything unrecognized → [`InvalidReason::RejectedInvalid`], the conservative "the artifact
+///   is dead, resubmitting cannot help" bucket (a mark existed, so SOME terminal verdict was
+///   recorded; only its finer classification is lost).
+fn legacy_invalid_reason(reason: &str) -> InvalidReason {
+    InvalidReason::try_from(reason).unwrap_or(match reason {
+        "expired" => InvalidReason::RejectedExpired,
+        "foreign_spent" => InvalidReason::FundingSpent,
+        _ => InvalidReason::RejectedInvalid,
     })
 }
 
-/// The account's marked transaction ids, sorted ascending. The extension-transaction API exposes
-/// single-row queries only, so the ids arrive as one aggregated row and are split here.
-fn invalid_marks(wallet: &mut MigrationWallet, account: &[u8; 16]) -> anyhow::Result<Vec<u32>> {
-    let joined: Option<String> = wallet.transactionally_with_extension(|_wdb, ext| {
-        ext.query_row(
-            "SELECT group_concat(tx_id)
-             FROM ext_zcashlc_orchard_ironwood_migration_invalid_marks
-             WHERE account_uuid = ?1",
-            rusqlite::params![&account[..]],
+/// Folds any surviving legacy invalid-marks rows into the engine state and drops the table.
+/// Runs at the head of [`open`] (the path that previously consulted the table), so it happens
+/// before the calling entry point reads the migration state. Idempotent: the first successful
+/// pass drops the table, so the cheap existence probe is all a second open pays.
+///
+/// The table is keyed by account, and one pass migrates EVERY account's rows (an `open` for
+/// account A must not strand — or worse, drop — account B's evidence). Per account:
+/// - no `accounts` row (the account was deleted): its run was cascade-deleted with it, so there
+///   is nothing to carry the evidence onto — the rows drop with the table;
+/// - no stored run, or a TERMINAL one: skipped. A terminal run surfaces no attention anyway
+///   (`next_step` answers `Complete` and `zcashlc_migration_has_invalid_transfers` answers
+///   `false` for it), so carrying stale verdicts onto its rows would change nothing observable;
+/// - otherwise each mark becomes `mark_invalid(id, reason)` with the row persisted through the
+///   narrow single-row store round-trip — under `mark_invalid`'s own rules, so a mark against a
+///   `Mined` row (chain inclusion outranks the verdict) or an unknown id is dropped rather than
+///   resurrected.
+///
+/// Runs on the SDK's own store connection: the extension-transaction API's authorizer denies
+/// DDL, so the final `DROP TABLE` could never go through it — and the table being dropped is the
+/// SDK's own, in the namespace the wallet promises never to touch.
+fn migrate_legacy_invalid_marks(conn: &mut Connection) -> anyhow::Result<()> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            rusqlite::params![LEGACY_INVALID_MARKS_TABLE],
             |row| row.get(0),
         )
-        .map_err(anyhow::Error::from)
-    })?;
-    let mut ids = joined
-        .as_deref()
-        .unwrap_or("")
-        .split_terminator(',')
-        .map(|id| {
-            id.parse::<u32>()
-                .map_err(|e| anyhow!("invalid mark id {id}: {e}"))
-        })
-        .collect::<anyhow::Result<Vec<u32>>>()?;
-    ids.sort_unstable();
-    Ok(ids)
-}
+        .map_err(|e| anyhow!("legacy marks probe failed: {e}"))?;
+    if !exists {
+        return Ok(());
+    }
 
-fn clear_invalid_marks(wallet: &mut MigrationWallet, account: &[u8; 16]) -> anyhow::Result<()> {
-    wallet.transactionally_with_extension(|_wdb, ext| {
-        ext.execute(
-            "DELETE FROM ext_zcashlc_orchard_ironwood_migration_invalid_marks
-             WHERE account_uuid = ?1",
-            rusqlite::params![&account[..]],
-        )?;
-        Ok(())
-    })
+    // All rows, grouped per account (BTreeMap for a deterministic account order). A row whose
+    // account_uuid blob is not 16 bytes cannot name an account and is dropped with the table.
+    let rows: Vec<(Vec<u8>, u32, String)> = {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT account_uuid, tx_id, reason FROM {LEGACY_INVALID_MARKS_TABLE}"
+            ))
+            .map_err(|e| anyhow!("legacy marks read failed: {e}"))?;
+        let mapped = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| anyhow!("legacy marks read failed: {e}"))?;
+        mapped
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow!("legacy marks read failed: {e}"))?
+    };
+    let mut per_account: std::collections::BTreeMap<[u8; 16], Vec<(u32, String)>> =
+        std::collections::BTreeMap::new();
+    for (account_bytes, tx_id, reason) in rows {
+        let Ok(account) = <[u8; 16]>::try_from(account_bytes) else {
+            continue;
+        };
+        per_account
+            .entry(account)
+            .or_default()
+            .push((tx_id, reason));
+    }
+
+    for (account_bytes, marks) in per_account {
+        let account = AccountUuid::from_uuid(uuid::Uuid::from_bytes(account_bytes));
+        let mut store = match PoolMigrations::for_account(&mut *conn, account) {
+            Ok(store) => store,
+            Err(PoolMigrationStoreError::AccountUnknown) => continue,
+            Err(e) => return Err(anyhow!("legacy marks: store open failed: {e}")),
+        };
+        let Some(mut state) = store
+            .get_migration()
+            .map_err(|e| anyhow!("legacy marks: migration read failed: {e}"))?
+        else {
+            continue;
+        };
+        if state.is_terminal() {
+            continue;
+        }
+        for (tx_id, reason) in marks {
+            let id = MigrationTransferId::new(tx_id);
+            state.mark_invalid(id, legacy_invalid_reason(&reason));
+            let invalidated = state
+                .transactions()
+                .iter()
+                .find(|t| t.id() == id)
+                .map(|t| t.state())
+                .filter(|s| matches!(s, MigrationTxState::Invalid { .. }));
+            if let Some(new_state) = invalidated {
+                store
+                    .update_transaction(id, new_state)
+                    .map_err(|e| anyhow!("legacy marks: row persist failed: {e}"))?;
+            }
+        }
+    }
+
+    conn.execute(&format!("DROP TABLE {LEGACY_INVALID_MARKS_TABLE}"), [])
+        .map_err(|e| anyhow!("legacy marks drop failed: {e}"))?;
+    Ok(())
 }
 
 // ----- SDK-owned immediate-migration-run record -----
@@ -469,54 +544,80 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
 
 // ----- invalidation reconciliation (3-pass; Android's `reconcile_invalidated`, F1 fixed) -----
 
-/// Extracts the transaction id from one migration transaction's stored PCZT, mirroring the
-/// Android SDK's `pczt_txid`: `TransactionExtractor::new(Pczt::parse(bytes)).extract()`. Returns
-/// `None` when the PCZT cannot be parsed or extracted yet (an `AwaitingSignature`/`Signed`
-/// transfer whose anchor/witness is not installed) rather than erroring, so an un-extractable
-/// transaction is simply omitted from whatever set is being built.
-fn pczt_txid(bytes: &[u8]) -> Option<[u8; 32]> {
-    let parsed = pczt::Pczt::parse(bytes).ok()?;
-    migration_finalize::extract_tx(parsed)
-        .ok()
-        .map(|(_, txid)| txid)
+/// What one parse of a stored migration PCZT yields for the reconcile passes: the PCZT-derived
+/// transaction id and the nullifiers of EVERY Orchard action. Computed once per transaction per
+/// [`reconcile_invalidations`] call (U1) — pass 2, the own-txid probes, and the pass-3 candidate
+/// set all read from the same [`pczt_digest`] map instead of re-parsing the same bytes up to
+/// three times.
+///
+/// - `txid` is `None` while the transaction is not extractable yet (an
+///   `AwaitingSignature`/`Signed` row whose anchor/witness is not installed) rather than an
+///   error, so an un-extractable transaction is simply omitted from whatever set is being built
+///   — mirroring the Android SDK's `pczt_txid`.
+/// - `nullifiers` collects every action's nullifier, present regardless of proving state
+///   (ZIP 374 defers the anchor/witness, not the nullifier, which is a Constructor-set field of
+///   `pczt::orchard::Spend`); `None` when the bytes do not parse as a PCZT or carry no Orchard
+///   actions at all (ambiguous — the caller skips, never invalidates).
+///
+///   F1 FIX (vs the Android SDK's `transfer_funding_nullifier`): Android requires EXACTLY one
+///   Orchard action and returns `None` otherwise — but production migration transfers carry a
+///   PADDED 2-action Orchard bundle (one real funding spend plus one dummy/padding action), so
+///   Android's extractor is inert on every real transfer. Collecting every action's nullifier is
+///   safe because a dummy spend's nullifier is derived from a random dummy note and cannot match
+///   a wallet note — [`decide_foreign_spend`] only treats a nullifier as evidence when the
+///   wallet KNOWS the note it belongs to.
+struct PcztDigest {
+    txid: Option<[u8; 32]>,
+    nullifiers: Option<Vec<[u8; 32]>>,
 }
 
-/// The nullifiers of EVERY Orchard action of a stored transfer PCZT — present regardless of
-/// proving state (ZIP 374 defers the anchor/witness, not the nullifier, which is a
-/// Constructor-set field of `pczt::orchard::Spend`). Returns `None` when the bytes do not parse
-/// as a PCZT or carry no Orchard actions at all (ambiguous — the caller skips, never invalidates).
-///
-/// F1 FIX (vs the Android SDK's `transfer_funding_nullifier`): Android requires EXACTLY one
-/// Orchard action and returns `None` otherwise — but production migration transfers carry a
-/// PADDED 2-action Orchard bundle (one real funding spend plus one dummy/padding action), so
-/// Android's extractor is inert on every real transfer. This collects every action's nullifier
-/// instead: a dummy spend's nullifier is derived from a random dummy note and cannot match a
-/// wallet note, so including it is harmless — [`decide_foreign_spend`] only treats a nullifier
-/// as evidence when the wallet KNOWS the note it belongs to.
-fn transfer_funding_nullifiers(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
-    let parsed = pczt::Pczt::parse(bytes).ok()?;
+/// Extracts a [`PcztDigest`] from one stored PCZT's bytes — the single parse everything in
+/// [`reconcile_invalidations`] shares.
+fn pczt_digest(bytes: &[u8]) -> PcztDigest {
+    let Ok(parsed) = pczt::Pczt::parse(bytes) else {
+        return PcztDigest {
+            txid: None,
+            nullifiers: None,
+        };
+    };
     let nullifiers: Vec<[u8; 32]> = parsed
         .orchard()
         .actions()
         .iter()
         .map(|action| *action.spend().nullifier())
         .collect();
-    if nullifiers.is_empty() {
+    let nullifiers = if nullifiers.is_empty() {
         None
     } else {
         Some(nullifiers)
-    }
+    };
+    // `extract_tx` consumes the parsed PCZT, so it goes last; it fails (leaving `txid` `None`)
+    // on a transaction whose proof/finalization is not installed yet.
+    let txid = migration_finalize::extract_tx(parsed)
+        .ok()
+        .map(|(_, txid)| txid);
+    PcztDigest { txid, nullifiers }
+}
+
+/// One pass-3 candidate: a `Signed`/`Proved`, store-side dependency-satisfied transfer, with
+/// everything the decision needs pre-extracted from the shared digest map.
+struct ForeignSpendCandidate {
+    id: MigrationTransferId,
+    /// The nullifiers of ALL the transfer's Orchard actions (`None` if its PCZT is unreadable).
+    funding_nullifiers: Option<Vec<[u8; 32]>>,
+    /// The transfer's own PCZT-derived txid (`None` if not yet extractable).
+    own_txid: Option<[u8; 32]>,
+    /// The PCZT-derived txids of the transfer's `depends_on` preparations, in `depends_on`
+    /// order (`None` per dependency whose txid is not extractable) — the A3 evidence inputs.
+    dep_txids: Vec<Option<[u8; 32]>>,
 }
 
 /// Pure decision core of the pass-3 spent-check, factored out (like the Android SDK's
-/// `decide_foreign_spend`) so it unit-tests without a wallet DB. Given, for each candidate
-/// `Signed`/`Proved` transfer:
-///   - the nullifiers of ALL its Orchard actions (`None` if its PCZT is unreadable),
-///   - its own PCZT-derived txid (`None` if not yet extractable),
-///
-/// plus the set of ALL wallet-note nullifiers, the subset the wallet still considers UNSPENT, and
-/// the set of own-plan txids that ARE on-chain right now — decide which transfer (if any) to
-/// invalidate.
+/// `decide_foreign_spend`) so it unit-tests without a wallet DB. Decides which candidate (if
+/// any) to invalidate, given the set of ALL wallet-note nullifiers, the subset the wallet still
+/// considers UNSPENT, and `txid_on_chain` — the caller's (memoized) "is this txid currently
+/// mined per the LOCAL wallet DB?" probe, a closure so the wallet-DB lookups run LAZILY, only
+/// for candidates whose funding already reads as spent (U1; tests supply a set-backed stand-in).
 ///
 /// **Correctness bar: NEVER a false positive.** A candidate is invalidated ONLY when ALL of:
 ///   (a) Some funding nullifier is SPENT: the wallet KNOWS the note (`wallet_nullifiers`, the
@@ -526,46 +627,67 @@ fn transfer_funding_nullifiers(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
 ///       nullifier collected (including the padding dummy's), a dummy nullifier is absent from
 ///       BOTH sets and therefore never reads as spent — under Android's bare "absent from
 ///       unspent" rule it would false-positive on every padded transfer.
-///   (b) The transfer's own PCZT-derived txid IS readable. If not, we cannot confirm the spender
-///       is foreign; ambiguous → skip.
-///   (c) That own txid is NOT in `own_txids_on_chain`. If it IS on-chain, the spender is our own
-///       (possibly crashed) broadcast and pass 2 promotes it → skip.
+///   (b) POSITIVE evidence the funding preparations are currently mined per the LOCAL wallet DB
+///       (A3): every `depends_on` txid is readable AND `txid_on_chain`. The store's own `Mined`
+///       rows (already required by the caller's candidate filter) are a RECORD, not current
+///       truth: in a rewind/rescan window the wallet DB may have demoted the very transaction
+///       that created the funding note, and the All∖Unspent signal then reflects a chain view
+///       mid-rebuild — ambiguous → skip, no mark. (A transfer with no dependencies spends
+///       ordinary wallet notes whose spent-ness the wallet tracks directly, so the vacuous pass
+///       is correct.)
+///   (c) The transfer's own PCZT-derived txid IS readable, and is NOT on-chain. Unreadable → we
+///       cannot confirm the spender is foreign; ambiguous → skip. On-chain → the spender is our
+///       own (possibly crashed) broadcast and pass 2 promotes it → skip.
 ///
 /// False negatives are acceptable: submit-time rejection remains the last line of defence.
-fn decide_foreign_spend(
-    candidates: &[(MigrationTransferId, Option<Vec<[u8; 32]>>, Option<[u8; 32]>)],
+fn decide_foreign_spend<E>(
+    candidates: &[ForeignSpendCandidate],
     wallet_nullifiers: &HashSet<[u8; 32]>,
     unspent_nullifiers: &HashSet<[u8; 32]>,
-    own_txids_on_chain: &HashSet<[u8; 32]>,
-) -> Option<MigrationTransferId> {
-    for (id, funding_nfs, own_txid) in candidates {
+    mut txid_on_chain: impl FnMut(&[u8; 32]) -> Result<bool, E>,
+) -> Result<Option<MigrationTransferId>, E> {
+    'candidates: for candidate in candidates {
         // (a) Unreadable PCZT → ambiguous → skip.
-        let Some(nfs) = funding_nfs else { continue };
-        // (a) Spent = a WALLET note (All) that is no longer unspent. A dummy/padding nullifier is
-        // in neither set, so it can neither trigger nor mask.
+        let Some(nfs) = &candidate.funding_nullifiers else {
+            continue;
+        };
+        // (a) Spent = a WALLET note (All) that is no longer unspent. A dummy/padding nullifier
+        // is in neither set, so it can neither trigger nor mask.
         let spent = nfs
             .iter()
             .any(|nf| wallet_nullifiers.contains(nf) && !unspent_nullifiers.contains(nf));
         if !spent {
             continue;
         }
-        // (b) Own txid unreadable → ambiguous; cannot confirm the spender is foreign → skip.
-        let Some(own_txid_bytes) = own_txid else {
+        // (b) The A3 evidence gate: every funding preparation must be POSITIVELY mined right
+        // now. An unreadable dependency txid, or one the wallet DB does not currently show
+        // mined, is the rewind/rescan ambiguity → skip.
+        for dep_txid in &candidate.dep_txids {
+            let Some(dep_txid) = dep_txid else {
+                continue 'candidates;
+            };
+            if !txid_on_chain(dep_txid)? {
+                continue 'candidates;
+            }
+        }
+        // (c) Own txid unreadable → ambiguous; cannot confirm the spender is foreign → skip.
+        let Some(own_txid) = &candidate.own_txid else {
             continue;
         };
         // (c) Own txid on-chain → our own (possibly crashed) broadcast; pass 2 handles it → skip.
-        if own_txids_on_chain.contains(own_txid_bytes) {
+        if txid_on_chain(own_txid)? {
             continue;
         }
-        return Some(*id);
+        return Ok(Some(candidate.id));
     }
-    None
+    Ok(None)
 }
 
 /// Reconciles the committed run against LOCAL on-chain truth in three mandatory-ordered passes
 /// (the Android SDK's `reconcile_invalidated` structure; R10: the LOCAL wallet DB only, never the
-/// network), recording an invalid mark when a pending transfer's funding note was spent by a
-/// FOREIGN transaction. Returns whether this call recorded an invalidation.
+/// network), recording a pending transfer whose funding note was spent by a FOREIGN transaction
+/// as `MigrationTxState::Invalid` (reason [`InvalidReason::FundingSpent`]) in the engine state.
+/// Returns whether this call recorded an invalidation.
 ///
 /// ORDER IS LOAD-BEARING: the own-broadcast/mined reconciliation MUST run before the spent-check,
 /// so a transfer OUR process broadcast right before crashing (whose funding note is therefore
@@ -573,19 +695,22 @@ fn decide_foreign_spend(
 /// spent-check would misread our own crashed broadcast as a foreign spend.
 ///   1. [`reconcile_mined`] — the existing pass: any `Broadcast` transaction the wallet now knows
 ///      a height for is promoted to `Mined` (its txid was recorded at broadcast time).
-///   2. Submit-crash probe: for each `Proved` transaction, derive its txid from the STORED PROVEN
-///      PCZT ([`pczt_txid`]) and ask the wallet's own `get_tx_height`; a known height means our
-///      broadcast landed but was never recorded (a crash between broadcast and record) —
-///      `mark_broadcast` + `mark_mined`, persisted. (`Broadcast` rows need no probe here: pass 1
-///      already resolves them from their recorded txid — mirroring Android, whose pass 2 probes
-///      `Proved` rows only.)
-///   3. Spent-check (F1 FIXED): for each remaining pending transfer (`Signed`/`Proved`, deps
-///      mined), read the nullifiers of ALL its Orchard actions ([`transfer_funding_nullifiers`])
-///      and decide via [`decide_foreign_spend`] against the wallet's All/Unspent Orchard
-///      nullifier views. A detected foreign spend writes an invalid mark (reason
-///      `"foreign_spent"`) through the same machinery `zcashlc_migration_record_transfer_result`
-///      uses, so the run surfaces through `zcashlc_migration_has_invalid_transfers` exactly like
-///      a broadcast-time terminal rejection.
+///   2. Submit-crash probe: for each `Proved` transaction, take its PCZT-derived txid (from the
+///      shared [`pczt_digest`] map — one parse per transaction per call, U1) and ask the
+///      wallet's own `get_tx_height`; a known height means our broadcast landed but was never
+///      recorded (a crash between broadcast and record) — `mark_broadcast` + `mark_mined`,
+///      persisted. (`Broadcast` rows need no probe here: pass 1 already resolves them from their
+///      recorded txid — mirroring Android, whose pass 2 probes `Proved` rows only.)
+///   3. Spent-check (F1 FIXED, A3 HARDENED): for each remaining pending transfer
+///      (`Signed`/`Proved`, deps mined per the store), decide via [`decide_foreign_spend`]
+///      against the wallet's All/Unspent Orchard nullifier views — with the A3 gate requiring
+///      positive wallet-DB evidence that every funding preparation is CURRENTLY mined, and the
+///      own/dependency txid-on-chain probes evaluated lazily (memoized per call) only once a
+///      candidate's funding reads as spent. A detected foreign spend becomes
+///      `mark_invalid(id, FundingSpent)`, persisted through the narrow single-row store
+///      round-trip — the same state `zcashlc_migration_record_transfer_result` records terminal
+///      rejections into, so the run surfaces through `zcashlc_migration_has_invalid_transfers`
+///      and `AdvanceStep::Attend` exactly like a broadcast-time terminal rejection.
 fn reconcile_invalidations(ctx: &mut CallCtx) -> anyhow::Result<bool> {
     // --- Pass 1 + load current state (reconcile_mined persists any Broadcast→Mined promotions).
     let Some(mut state) = reconcile_mined(ctx)? else {
@@ -596,6 +721,14 @@ fn reconcile_invalidations(ctx: &mut CallCtx) -> anyhow::Result<bool> {
         return Ok(false);
     }
 
+    // The U1 pre-pass: one PCZT parse per transaction, shared by pass 2, the candidate set, and
+    // the on-chain probes below.
+    let digests: std::collections::HashMap<MigrationTransferId, PcztDigest> = state
+        .transactions()
+        .iter()
+        .map(|t| (t.id(), pczt_digest(t.pczt())))
+        .collect();
+
     // --- Pass 2: submit-crash probe. Promote any Proved transaction whose txid is already
     // on-chain per the LOCAL wallet DB.
     let mut promotions: Vec<(MigrationTransferId, TxId, BlockHeight)> = Vec::new();
@@ -603,7 +736,7 @@ fn reconcile_invalidations(ctx: &mut CallCtx) -> anyhow::Result<bool> {
         if !matches!(tx.state(), MigrationTxState::Proved) {
             continue;
         }
-        let Some(txid_bytes) = pczt_txid(tx.pczt()) else {
+        let Some(txid_bytes) = digests.get(&tx.id()).and_then(|d| d.txid) else {
             continue;
         };
         let txid = TxId::from_bytes(txid_bytes);
@@ -624,8 +757,10 @@ fn reconcile_invalidations(ctx: &mut CallCtx) -> anyhow::Result<bool> {
         backend.replace_migration(&state)?;
     }
 
-    // --- Pass 3: spent-check. Candidates are Signed|Proved transfers whose deps are mined.
-    let candidates: Vec<(MigrationTransferId, Option<Vec<[u8; 32]>>, Option<[u8; 32]>)> = state
+    // --- Pass 3: spent-check. Candidates are Signed|Proved transfers whose deps are mined per
+    // the STORE; the wallet-DB's CURRENT view of those dependencies is the A3 evidence gate
+    // inside `decide_foreign_spend`.
+    let candidates: Vec<ForeignSpendCandidate> = state
         .transactions()
         .iter()
         .filter(|t| {
@@ -637,14 +772,20 @@ fn reconcile_invalidations(ctx: &mut CallCtx) -> anyhow::Result<bool> {
                 && state.deps_mined(t.depends_on())
         })
         .map(|t| {
-            (
-                t.id(),
-                transfer_funding_nullifiers(t.pczt()),
-                pczt_txid(t.pczt()),
-            )
+            let digest = &digests[&t.id()];
+            ForeignSpendCandidate {
+                id: t.id(),
+                funding_nullifiers: digest.nullifiers.clone(),
+                own_txid: digest.txid,
+                dep_txids: t
+                    .depends_on()
+                    .iter()
+                    .map(|dep| digests.get(dep).and_then(|d| d.txid))
+                    .collect(),
+            }
         })
         .collect();
-    if candidates.iter().all(|(_, nfs, _)| nfs.is_none()) {
+    if candidates.iter().all(|c| c.funding_nullifiers.is_none()) {
         // Nothing readable to check — no invalidation. (Unlike Android — whose exactly-one-action
         // extractor makes this the UNCONDITIONAL exit on padded production transfers — this arm
         // now only fires when there genuinely are no candidates or their PCZTs do not parse.)
@@ -666,45 +807,51 @@ fn reconcile_invalidations(ctx: &mut CallCtx) -> anyhow::Result<bool> {
         .map(|(_account, nf)| nf.to_bytes())
         .collect();
 
-    // The own-plan txids confirmed on-chain right now — condition (c)'s data: a candidate whose
-    // own txid IS on-chain is our own (possibly crashed) broadcast, not a foreign spend.
-    let own_txids_on_chain: HashSet<[u8; 32]> = {
-        let mut set = HashSet::new();
-        for tx in state.transactions() {
-            if let Some(txid_bytes) = pczt_txid(tx.pczt()) {
-                if ctx
-                    .wallet
-                    .get_tx_height(TxId::from_bytes(txid_bytes))
-                    .map_err(|e| anyhow!("own-txid height lookup failed: {e}"))?
-                    .is_some()
-                {
-                    set.insert(txid_bytes);
-                }
-            }
-            // Also include any txid already recorded in broadcast state.
-            if let Some(recorded_txid) = tx.state().broadcast_txid() {
-                set.insert(recorded_txid);
-            }
+    // The lazy, memoized "is this txid currently mined per the LOCAL wallet DB?" probe (U1: the
+    // eager predecessor probed every transaction's txid up front, even with no spent candidate).
+    // The cache is pre-seeded with every txid already recorded in Broadcast state — those were
+    // treated as on-chain by the predecessor's set unconditionally, and a candidate's own txid
+    // can never legitimately collide with another row's, so the seed only preserves the old
+    // belt-and-braces behaviour without a DB probe.
+    let mut on_chain_cache: std::collections::HashMap<[u8; 32], bool> = state
+        .transactions()
+        .iter()
+        .filter_map(|t| t.state().broadcast_txid().map(|txid| (txid, true)))
+        .collect();
+    let wallet = &ctx.wallet;
+    let mut txid_on_chain = |txid: &[u8; 32]| -> anyhow::Result<bool> {
+        if let Some(known) = on_chain_cache.get(txid) {
+            return Ok(*known);
         }
-        set
+        let mined = wallet
+            .get_tx_height(TxId::from_bytes(*txid))
+            .map_err(|e| anyhow!("own-txid height lookup failed: {e}"))?
+            .is_some();
+        on_chain_cache.insert(*txid, mined);
+        Ok(mined)
     };
 
     let Some(invalid_id) = decide_foreign_spend(
         &candidates,
         &wallet_nullifiers,
         &unspent_nullifiers,
-        &own_txids_on_chain,
-    ) else {
+        &mut txid_on_chain,
+    )?
+    else {
         return Ok(false);
     };
 
-    insert_invalid_mark(
-        &mut ctx.wallet,
-        &ctx.account_bytes,
+    // Record the verdict as engine state and persist the one row that changed. The candidate is
+    // `Signed`/`Proved`, so `mark_invalid` always takes effect (its `Mined` refusal cannot
+    // apply), and the persisted row state below is exactly what the in-memory state now holds.
+    state.mark_invalid(invalid_id, InvalidReason::FundingSpent);
+    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+    backend.update_transaction(
         invalid_id,
-        "foreign_spent",
-    )
-    .map_err(|e| anyhow!("marks write failed: {e}"))?;
+        MigrationTxState::Invalid {
+            reason: InvalidReason::FundingSpent,
+        },
+    )?;
     Ok(true)
 }
 
@@ -934,8 +1081,12 @@ fn encode_schedule_from_plan(
         plan.schedule().iter().map(|e| e.broadcast_height()),
         now_reference,
     );
+    // Every fallible step happens BEFORE any Vec is leaked into a raw pointer (A15): once
+    // `ptr_from_vec` runs, an early `?` return would leak the leaked-on-purpose heap array, so
+    // the preparation rows are computed first and the `?`-free marshaling goes last.
+    let preparation_steps = preparation_steps_from_plan(plan)?;
     let (transfers, transfers_len) = ptr_from_vec(transfers);
-    let (preparations, preparations_len) = ptr_from_vec(preparation_steps_from_plan(plan)?);
+    let (preparations, preparations_len) = ptr_from_vec(preparation_steps);
     Ok(Box::into_raw(Box::new(FfiMigrationSchedule {
         transfers,
         transfers_len,
@@ -1294,7 +1445,7 @@ fn prove_pending_rows(
     Ok(proved)
 }
 
-/// What the delivery lane has for the platform at `tip`.
+/// What the delivery lane has for the platform at the evaluated [`DuenessTargets`].
 #[derive(Debug, PartialEq, Eq)]
 enum DueOutcome {
     /// Nothing is due.
@@ -1305,112 +1456,45 @@ enum DueOutcome {
     AwaitingProof { id: MigrationTransferId },
 }
 
-// ----- estimated-tip due-ness split (M2) -----
+// ----- estimated-tip due-ness (M2, upstream `DuenessTargets`) -----
 //
-// `zcashlc_migration_has_overdue_transfers` / `zcashlc_migration_next_due_transfer` accept an
-// OPTIONAL estimated chain tip (a wall-clock projection past the scanned tip, computed by the
-// platform from `zcashlc_migration_block_rate_samples`). THE HARD RULE, mirrored from the Android
-// SDK's `hasOverdueTransfersNative` / `nextDueTransferNative`: the estimate may only ACCELERATE
-// scheduled-height due-ness — `effective = max(scanned, estimated)` is used ONLY where a row's
-// `scheduled_height` is compared for due-ness. EXPIRY evaluation, the anchor-boundary settle
-// check, and everything else stay on the SCANNED tip: an estimate can never expire a transaction
-// (a reorg-safe, node-visible property of the scanned chain only), and it cannot make an unsynced
-// boundary checkpoint exist.
-//
-// Upstream's `next_provable` / `next_broadcastable` take a single `target_height` and use it for
-// BOTH the schedule comparison and the expiry predicate, so feeding them an effective target
-// would accelerate expiry too. These split twins replicate upstream's predicates field-for-field
-// (see `MigrationState::next_provable` / `next_broadcastable` / `is_expired` in
-// `zcash_pool_migration::state`) with the two heights separated; with
-// `effective_target == scanned_target` they are exactly the upstream functions.
+// `zcashlc_migration_has_overdue_transfers` / `zcashlc_migration_next_due_transfer` /
+// `zcashlc_migration_has_ready_broadcast` accept an OPTIONAL estimated chain tip (a wall-clock
+// projection past the scanned tip, computed by the platform from
+// `zcashlc_migration_block_rate_samples`). The estimate/scanned split is OWNED UPSTREAM now:
+// `zcash_pool_migration::state::DuenessTargets` encodes the rule (the estimate may only
+// ACCELERATE schedule due-ness; expiry, boundary settledness, and every destructive decision
+// evaluate on the scanned target — plus the doomed-broadcast withhold, where an expiry the
+// EFFECTIVE target has passed keeps a broadcast from being served without ever counting as
+// expired), and `MigrationState::next_provable_at` / `next_broadcastable_at` evaluate it. This
+// module only converts the FFI's `estimated_tip: i64` into the estimated-target side of
+// [`DuenessTargets::new`] — see [`dueness_targets`].
 
-/// Whether `t` is expired at `scanned_target` (`scanned tip + 1`) — upstream
-/// `MigrationState::is_expired` verbatim: a `Mined` row is never expired, `expiry_height == 0`
-/// never expires, otherwise expired once `expiry_height < scanned_target`. ALWAYS fed the scanned
-/// target, never an estimated one (see the module section comment above).
-fn is_expired_at(t: &MigrationTransaction, scanned_target: BlockHeight) -> bool {
-    if matches!(t.state(), MigrationTxState::Mined { .. }) {
-        return false;
-    }
-    let expiry = u32::from(t.expiry_height());
-    expiry != 0 && expiry < u32::from(scanned_target)
+/// The estimated TARGET height (`estimated tip + 1`) for an FFI-supplied `estimated_tip`
+/// (`-1`, or any negative, = no estimate) — the `estimated_target` input of
+/// [`DuenessTargets::new`].
+///
+/// The tip value SATURATES at `u32::MAX - 1` before the `+ 1` target conversion (A14): the
+/// predecessor clamped to `u32::MAX` and then computed `tip + 1` in `u32`, which wraps a
+/// nonsensically large estimate to target 0 in release builds (and panics in debug) instead of
+/// keeping it "maximally far ahead". Clamping below the ceiling keeps the conversion total; the
+/// `>= scanned` floor (the old `max(scanned, estimated)` rule) is [`DuenessTargets::new`]'s own
+/// clamp, not re-implemented here.
+fn estimated_target_from_tip(estimated_tip: i64) -> Option<BlockHeight> {
+    (estimated_tip >= 0).then(|| {
+        let tip = estimated_tip.min(i64::from(u32::MAX - 1)) as u32;
+        target_from_tip(BlockHeight::from(tip))
+    })
 }
 
-/// Upstream `MigrationState::prove_ready` with the due-ness/expiry split: expiry and a transfer's
-/// anchor-boundary settledness are judged at `scanned_target` (both are properties of the scanned
-/// chain), while a preparation's `scheduled_height` due-ness comparison uses `effective_target`
-/// (the one comparison the estimate may accelerate).
-fn prove_ready_split(
-    state: &MigrationState,
-    t: &MigrationTransaction,
-    scanned_target: BlockHeight,
-    effective_target: BlockHeight,
-) -> bool {
-    if is_expired_at(t, scanned_target) {
-        return false;
-    }
-    if !state.deps_mined(t.depends_on()) {
-        return false;
-    }
-    match t.anchor_boundary() {
-        // A transfer: the boundary must be strictly below the SCANNED tip — an estimate cannot
-        // make its checkpoint exist. `scanned_target` is `tip + 1`, so `boundary < tip` is
-        // `boundary + 1 < scanned_target` (upstream's own encoding).
-        Some(boundary) => u32::from(boundary) + 1 < u32::from(scanned_target),
-        // A preparation: prove-ready once its schedule is due (accelerable).
-        None => t.scheduled_height() <= effective_target,
-    }
-}
-
-/// Upstream `MigrationState::next_provable` with the due-ness/expiry split (see
-/// [`prove_ready_split`]).
-fn next_provable_split(
-    state: &MigrationState,
-    scanned_target: BlockHeight,
-    effective_target: BlockHeight,
-) -> Option<MigrationTransferId> {
-    state
-        .transactions()
-        .iter()
-        .find(|t| {
-            matches!(t.state(), MigrationTxState::Signed)
-                && prove_ready_split(state, t, scanned_target, effective_target)
-        })
-        .map(|t| t.id())
-}
-
-/// Upstream `MigrationState::next_broadcastable` with the due-ness/expiry split: the
-/// `scheduled_height` comparison uses `effective_target`, the expiry exclusion stays on
-/// `scanned_target`.
-fn next_broadcastable_split(
-    state: &MigrationState,
-    scanned_target: BlockHeight,
-    effective_target: BlockHeight,
-) -> Option<MigrationTransferId> {
-    state
-        .transactions()
-        .iter()
-        .find(|t| {
-            matches!(t.state(), MigrationTxState::Proved)
-                && t.scheduled_height() <= effective_target
-                && state.deps_mined(t.depends_on())
-                && !is_expired_at(t, scanned_target)
-        })
-        .map(|t| t.id())
-}
-
-/// The effective due-ness target for an FFI-supplied `estimated_tip` (`-1` = no estimate):
-/// `max(scanned, estimated) + 1`, mirroring the Android SDK's
-/// `effective_tip = max(scanned_tip, estimated_tip)` — an estimate BELOW the scanned tip is
-/// ignored (the max rule), and `-1` disables the estimate entirely, so the result is never below
-/// `scanned_target`.
-fn effective_target_from(scanned_tip: BlockHeight, estimated_tip: i64) -> BlockHeight {
-    if estimated_tip >= 0 {
-        let estimated = BlockHeight::from(u32::try_from(estimated_tip).unwrap_or(u32::MAX));
-        target_from_tip(std::cmp::max(scanned_tip, estimated))
-    } else {
-        target_from_tip(scanned_tip)
-    }
+/// The [`DuenessTargets`] for a scanned tip plus the FFI's optional estimated tip — the ONE
+/// construction site (U4: `DuenessTargets::new`'s two same-typed parameters invite transposition;
+/// funneling every caller through here means the scanned/estimated order is written once).
+fn dueness_targets(scanned_tip: BlockHeight, estimated_tip: i64) -> DuenessTargets {
+    DuenessTargets::new(
+        target_from_tip(scanned_tip),
+        estimated_target_from_tip(estimated_tip),
+    )
 }
 
 /// The delivery lane's decision, as a pure function of stored state: which row (if any) the
@@ -1423,17 +1507,13 @@ fn effective_target_from(scanned_tip: BlockHeight, estimated_tip: i64) -> BlockH
 /// proving latency, and a platform that is not sweeping learns that it must, instead of seeing an
 /// indefinite "nothing due". The chosen row's artifact is read by [`serve_proved`].
 ///
-/// `scanned_target`/`effective_target` are the two due-ness heights of the estimated-tip split
-/// (equal when no estimate is in play) — see the section comment above [`is_expired_at`].
-fn next_due(
-    state: &MigrationState,
-    scanned_target: BlockHeight,
-    effective_target: BlockHeight,
-) -> DueOutcome {
-    if let Some(id) = next_broadcastable_split(state, scanned_target, effective_target) {
+/// `targets` carries the scanned/estimated due-ness pair (coincident when no estimate is in
+/// play) — see the section comment above [`estimated_target_from_tip`].
+fn next_due(state: &MigrationState, targets: DuenessTargets) -> DueOutcome {
+    if let Some(id) = state.next_broadcastable_at(targets) {
         return DueOutcome::Ready { id };
     }
-    match due_assuming_proving(state, scanned_target, effective_target) {
+    match due_assuming_proving(state, targets) {
         Some(id) => DueOutcome::AwaitingProof { id },
         None => DueOutcome::Nothing,
     }
@@ -1453,19 +1533,18 @@ fn next_due(
 /// report due work whether or not its proof exists: the work exists either way, and proving is
 /// [`prove_pending_rows`]' job, not the reporting path's.
 ///
-/// `scanned_target`/`effective_target` are the two due-ness heights of the estimated-tip split
-/// (equal when no estimate is in play) — see the section comment above [`is_expired_at`].
+/// `targets` carries the scanned/estimated due-ness pair (coincident when no estimate is in
+/// play) — see the section comment above [`estimated_target_from_tip`].
 fn due_assuming_proving(
     state: &MigrationState,
-    scanned_target: BlockHeight,
-    effective_target: BlockHeight,
+    targets: DuenessTargets,
 ) -> Option<MigrationTransferId> {
-    if let Some(id) = next_broadcastable_split(state, scanned_target, effective_target) {
+    if let Some(id) = state.next_broadcastable_at(targets) {
         return Some(id);
     }
-    next_provable_split(state, scanned_target, effective_target)?;
+    state.next_provable_at(targets)?;
     let mut scratch = state.clone();
-    while let Some(id) = next_provable_split(&scratch, scanned_target, effective_target) {
+    while let Some(id) = scratch.next_provable_at(targets) {
         let bytes = scratch
             .transactions()
             .iter()
@@ -1474,7 +1553,7 @@ fn due_assuming_proving(
             .unwrap_or_default();
         scratch.set_transaction_proved(id, bytes);
     }
-    next_broadcastable_split(&scratch, scanned_target, effective_target)
+    scratch.next_broadcastable_at(targets)
 }
 
 // ----- progress derivation (pure; unit-tested) -----
@@ -1609,15 +1688,28 @@ impl FfiMigrationProgress {
     }
 }
 
+/// The step discriminants of [`FfiMigrationAdvanceStep::step`], exported into the generated
+/// header so the Swift layer and the marshal share one set of names instead of re-hardcoding the
+/// numbers on each side (U3).
+pub const ZCASHLC_ADVANCE_STEP_PROVE: u32 = 0;
+pub const ZCASHLC_ADVANCE_STEP_BROADCAST: u32 = 1;
+pub const ZCASHLC_ADVANCE_STEP_REBUILD: u32 = 2;
+pub const ZCASHLC_ADVANCE_STEP_WAITING: u32 = 3;
+pub const ZCASHLC_ADVANCE_STEP_COMPLETE: u32 = 4;
+pub const ZCASHLC_ADVANCE_STEP_ATTEND: u32 = 5;
+
 /// The engine's next-step decision for the stored run (returned by
 /// [`zcashlc_migration_advance_step`]) — a verbatim marshal of upstream
-/// `MigrationState::next_step`'s `AdvanceStep` (with the documented pre-#2867 ordering shim).
+/// `MigrationState::next_step`'s `AdvanceStep`.
 #[repr(C)]
 pub struct FfiMigrationAdvanceStep {
-    /// The step discriminant: `0` = Prove, `1` = Broadcast, `2` = Rebuild, `3` = Waiting,
-    /// `4` = Complete.
+    /// The step discriminant (see the `ZCASHLC_ADVANCE_STEP_*` constants): `0` = Prove,
+    /// `1` = Broadcast, `2` = Rebuild, `3` = Waiting, `4` = Complete, `5` = Attend (a
+    /// transaction is marked invalid and no automatic step can advance the run — resolve
+    /// out-of-band, typically by cancelling and re-planning).
     pub step: u32,
-    /// The engine's raw transaction id for Prove/Broadcast/Rebuild; `0` for Waiting/Complete.
+    /// The engine's raw transaction id for Prove/Broadcast/Rebuild/Attend; `0` for
+    /// Waiting/Complete.
     pub id: u32,
     /// Whether the Prove step's transaction is a preparation (`true`) or a transfer (`false`).
     /// Meaningful only for `step == 0`; `false` otherwise.
@@ -1632,7 +1724,7 @@ pub struct FfiMigrationAdvanceStep {
 }
 
 impl FfiMigrationAdvanceStep {
-    /// A step that names a transaction but carries no kind payload (Broadcast/Rebuild).
+    /// A step that names a transaction but carries no kind payload (Broadcast/Rebuild/Attend).
     fn with_id(step: u32, id: MigrationTransferId) -> *mut Self {
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step,
@@ -1664,7 +1756,7 @@ impl FfiMigrationAdvanceStep {
             MigrationTxKind::Transfer { crossing } => (false, 0, 0, crossing as u32),
         };
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
-            step: 0,
+            step: ZCASHLC_ADVANCE_STEP_PROVE,
             id: u32::from(id),
             kind_is_preparation,
             kind_layer,
@@ -2015,7 +2107,8 @@ pub struct FfiMigrationTransactionStatus {
     /// For a transfer: the funding-note crossing index. `-1` when `is_transfer` is `false`.
     pub crossing: i64,
     /// Lifecycle discriminant: `0` = AwaitingSignature, `1` = Signed, `2` = Proved,
-    /// `3` = Broadcast, `4` = Mined.
+    /// `3` = Broadcast, `4` = Mined, `5` = Invalid (dead by observed event — see
+    /// `invalid_reason` for which one; resolved out-of-band via the Attend step).
     pub state: u8,
     /// The height at or after which this transaction is due to broadcast.
     pub scheduled_height: i64,
@@ -2037,7 +2130,8 @@ pub struct FfiMigrationTransactionStatus {
     pub action: u8,
     /// Why it is not yet actionable, when waiting (and not already broadcast or mined): `0` =
     /// none, `1` = dependencies, `2` = schedule, `3` = anchor_boundary, `4` = signature,
-    /// `5` = expired.
+    /// `5` = expired, `6` = invalid (marked dead by observed event; no chain condition makes it
+    /// actionable again).
     pub blocked_on: u8,
     /// Heap array of `depends_on_len` ids of the transactions that must mine before this one can
     /// be built or broadcast (`TransactionStatus::depends_on`).
@@ -2049,6 +2143,12 @@ pub struct FfiMigrationTransactionStatus {
     /// time instead; see `crate::migration_finalize`'s module doc), so this is always `-1` when
     /// `is_transfer` is `false`.
     pub anchor_boundary: i64,
+    /// Why the transaction was marked invalid, once `state == 5`: `0` = funding_spent (a funding
+    /// note was spent outside the migration), `1` = rejected_invalid (a node rejected the
+    /// submission as invalid), `2` = rejected_expired (a node rejected it as expired). `-1`
+    /// otherwise — the Invalid state's payload, mirroring how `mined_height`/`txid` carry the
+    /// Mined/Broadcast payloads.
+    pub invalid_reason: i32,
 }
 
 /// A snapshot of every committed migration transaction's LIVE status (element type
@@ -2366,30 +2466,19 @@ fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
 
 /// The engine's next step to advance the stored run — a VERBATIM conduit for upstream
 /// `MigrationState::next_step` at `target = scanned tip + 1` (see [`CallCtx::target`]; the
-/// ESTIMATED tip never enters this function). Reconciles mined transactions first, like every
-/// other read.
+/// ESTIMATED tip never enters this function). No carve-outs, no ordering shims: the engine's
+/// answer — Attend ahead of everything, then Broadcast, then Prove (carrying its kind), then
+/// Rebuild — is marshaled field-for-field onto the DTO. Reconciles mined transactions first,
+/// like every other read.
 ///
 /// Returns NULL **with no error recorded** when `get_migration()` returns `None` — no run is
 /// stored, so there is nothing to advance and no step to report. Distinguish that benign NULL
 /// from an error NULL via `zcashlc_last_error_length`. A stored TERMINAL run (Complete, or
 /// Failed/cancelled) reports the `Complete` step VERBATIM, exactly as upstream's `next_step`
 /// does — a cancelled run is never driven further, and is NEVER remapped to any other step.
-///
-/// # Upstream PR #2867 pre-adoption shim (delete at the next `zcash_pool_migration` bump)
-///
-/// While we are pinned to `0.1.0-rc.5`, whose `next_step` checks `next_provable` BEFORE
-/// `next_broadcastable`, this function replicates the ordering upstream PR #2867 flips to
-/// broadcast-first: a proven, due transaction broadcasts ahead of any new proving work (its
-/// broadcast window is the scarcer resource; proving can happen on any later wake-up). The shim:
-///
-/// 1. terminal → `Complete` (checked FIRST, so a cancelled run is never driven);
-/// 2. `next_broadcastable(target)` → `Broadcast`;
-/// 3. otherwise delegate to rc.5's `next_step(target)` verbatim (whose own broadcast arm is
-///    unreachable after step 2).
-///
-/// A second rc.5 shim rides along: rc.5's `AdvanceStep::Prove` carries no transaction kind, so
-/// the Prove row's kind (preparation layer/index vs transfer crossing) is looked up from the
-/// stored transactions and marshaled onto the DTO.
+/// (The terminal check here is upstream's own first check, hoisted only so the answer needs no
+/// chain-tip lookup — the same answer `next_step` would give, available on a wallet that never
+/// saw a chain tip.)
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_advance_step`].
@@ -2407,40 +2496,26 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
             // chain-tip lookup, so it holds even before the wallet ever saw a chain tip.
             return Ok(ptr::null_mut());
         };
-        // Shim step 1: terminal first, BEFORE the broadcast check — a cancelled (Failed) run may
-        // still hold Proved, schedule-due rows, and they must never be offered.
+        // Upstream `next_step`'s own first check, hoisted ahead of the target lookup (not a
+        // carve-out — identical answers): a cancelled (Failed) run reports Complete even on a
+        // wallet with no chain tip, and is never driven further.
         if state.is_terminal() {
-            return Ok(FfiMigrationAdvanceStep::bare(4));
+            return Ok(FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE));
         }
         let target = ctx.target()?;
-        // Shim step 2: the #2867 ordering pin — broadcast-first.
-        if let Some(id) = state.next_broadcastable(target) {
-            return Ok(FfiMigrationAdvanceStep::with_id(1, id));
-        }
-        // Shim step 3: rc.5's own next_step, verbatim.
         Ok(match state.next_step(target) {
-            AdvanceStep::Prove { id } => {
-                // Second shim: rc.5's Prove carries no kind — join it in from the stored row.
-                let kind = state
-                    .transactions()
-                    .iter()
-                    .find(|t| t.id() == id)
-                    .map(|t| t.kind())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "next_step named unknown migration transaction {}",
-                            u32::from(id)
-                        )
-                    })?;
-                FfiMigrationAdvanceStep::prove(id, kind)
+            AdvanceStep::Attend { id } => {
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_ATTEND, id)
             }
-            // Unreachable while shim step 2 precedes (rc.5 checks provable first, so with no
-            // provable row its broadcast answer is the same one step 2 already took); kept as a
-            // defensive verbatim marshal rather than a panic across the FFI.
-            AdvanceStep::Broadcast { id } => FfiMigrationAdvanceStep::with_id(1, id),
-            AdvanceStep::Rebuild { id } => FfiMigrationAdvanceStep::with_id(2, id),
-            AdvanceStep::Waiting => FfiMigrationAdvanceStep::bare(3),
-            AdvanceStep::Complete => FfiMigrationAdvanceStep::bare(4),
+            AdvanceStep::Prove { id, kind } => FfiMigrationAdvanceStep::prove(id, kind),
+            AdvanceStep::Broadcast { id } => {
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_BROADCAST, id)
+            }
+            AdvanceStep::Rebuild { id } => {
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_REBUILD, id)
+            }
+            AdvanceStep::Waiting => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_WAITING),
+            AdvanceStep::Complete => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE),
         })
     });
     unwrap_exc_or_null(res)
@@ -2585,8 +2660,11 @@ pub unsafe extern "C" fn zcashlc_migration_sync_wakeups(
 /// platform's measured-block-rate estimator projects an ESTIMATED chain tip from (fed back into
 /// [`zcashlc_migration_has_overdue_transfers`] / [`zcashlc_migration_next_due_transfer`] as
 /// `estimated_tip`). A read-only, best-effort read of scanned-block metadata, mirroring the
-/// Android SDK's `blockRateSamplesNative`: a wallet with no scanned blocks yet (or no readable
-/// `blocks` table) returns the EMPTY list (`len == 0`, valid pointer), never an error.
+/// Android SDK's `blockRateSamplesNative`: a wallet with no scanned blocks yet — no readable
+/// `blocks` table, or no wallet-database file at all (the read-only open cannot create one) —
+/// returns the EMPTY list (`len == 0`, valid pointer), never an error. A read that fails for any
+/// other reason is coerced to the same empty answer but logged (`tracing::warn!`), so it cannot
+/// silently starve the platform's estimator forever.
 ///
 /// # Safety
 /// - `db_data` must be valid for reads of `db_data_len` bytes and encode a filesystem path.
@@ -2604,15 +2682,32 @@ pub unsafe extern "C" fn zcashlc_migration_block_rate_samples(
         let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
             slice::from_raw_parts(db_data, db_data_len)
         }));
-        let conn = Connection::open_with_flags(
+        let empty = || {
+            let (rows, len) = ptr_from_vec(Vec::new());
+            Box::into_raw(Box::new(FfiBlockRateSamples { rows, len }))
+        };
+        let conn = match Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| anyhow!("block-rate read-only open failed: {e}"))?;
+        ) {
+            Ok(conn) => conn,
+            // A missing wallet-DB file is the same benign "no scanned blocks yet" answer as a
+            // missing `blocks` table (A12): a read-only open cannot create the file, so a wallet
+            // that was never initialized here answers EMPTY, not error. Every other open failure
+            // is real and still errors.
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::CannotOpen =>
+            {
+                return Ok(empty());
+            }
+            Err(e) => return Err(anyhow!("block-rate read-only open failed: {e}")),
+        };
         conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
             .map_err(|e| anyhow!("block-rate busy_timeout failed: {e}"))?;
         // Best-effort projection input, never load-bearing (matching Android): a failing read (no
-        // `blocks` table on a fresh wallet, a transient lock) maps to "no samples", not an error.
+        // `blocks` table on a fresh wallet, a transient lock) maps to "no samples", not an error
+        // — but logged (A12), so a persistently failing read shows up in diagnostics instead of
+        // presenting as a wallet that simply never scanned.
         let samples: Vec<FfiBlockRateSample> = conn
             .prepare(
                 "SELECT height, time FROM (
@@ -2628,7 +2723,10 @@ pub unsafe extern "C" fn zcashlc_migration_block_rate_samples(
                 })
                 .and_then(Iterator::collect)
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::warn!("block-rate sample read failed; answering no samples: {e}");
+                Vec::new()
+            });
         let (rows, len) = ptr_from_vec(samples);
         Ok(Box::into_raw(Box::new(FfiBlockRateSamples { rows, len })))
     });
@@ -2644,13 +2742,25 @@ fn encode_empty_transaction_statuses() -> *mut FfiMigrationTransactionStatuses {
     }))
 }
 
+/// The wire encoding of an [`InvalidReason`] for [`FfiMigrationTransactionStatus::invalid_reason`]:
+/// `0` = funding_spent, `1` = rejected_invalid, `2` = rejected_expired (`-1` = not invalid, set
+/// by the caller for every other state).
+fn invalid_reason_to_i32(reason: InvalidReason) -> i32 {
+    match reason {
+        InvalidReason::FundingSpent => 0,
+        InvalidReason::RejectedInvalid => 1,
+        InvalidReason::RejectedExpired => 2,
+    }
+}
+
 /// Marshal one engine [`TransactionStatus`] row verbatim into the FFI DTO, joining in
-/// `anchor_boundary` from `stored`'s matching [`MigrationTransaction`] row (`TransactionStatus`
-/// itself carries no boundary — only the stored row does) — see
-/// [`zcashlc_migration_transaction_statuses`] for the field-by-field contract.
+/// `anchor_boundary` from `stored_rows` — the caller's id-keyed map over the stored
+/// [`MigrationTransaction`] rows, built ONCE per call (U2; `TransactionStatus` itself carries no
+/// boundary — only the stored row does) — see [`zcashlc_migration_transaction_statuses`] for the
+/// field-by-field contract.
 fn encode_transaction_status(
     ts: &TransactionStatus,
-    stored: &MigrationState,
+    stored_rows: &std::collections::HashMap<MigrationTransferId, &MigrationTransaction>,
 ) -> FfiMigrationTransactionStatus {
     let (is_transfer, prep_layer, prep_index, crossing) = match ts.kind() {
         MigrationTxKind::Preparation { layer, index } => (false, layer as i64, index as i64, -1i64),
@@ -2662,7 +2772,14 @@ fn encode_transaction_status(
         MigrationTxState::Proved => 2,
         MigrationTxState::Broadcast { .. } => 3,
         MigrationTxState::Mined { .. } => 4,
+        MigrationTxState::Invalid { .. } => 5,
     };
+    // The Invalid state's payload, marshaled like the other per-state payloads (`mined_height`
+    // for Mined, `txid` for Broadcast).
+    let invalid_reason = ts
+        .state()
+        .invalid_reason()
+        .map_or(-1, invalid_reason_to_i32);
     let action = match ts.action() {
         None => 0,
         Some(NextAction::Prove) => 1,
@@ -2675,6 +2792,7 @@ fn encode_transaction_status(
         Some(Blocker::AnchorBoundary) => 3,
         Some(Blocker::Signature) => 4,
         Some(Blocker::Expired) => 5,
+        Some(Blocker::Invalid) => 6,
     };
     let (txid, has_txid) = match ts.txid() {
         Some(txid) => (<[u8; 32]>::from(txid), true),
@@ -2682,12 +2800,8 @@ fn encode_transaction_status(
     };
     let depends_on: Vec<u32> = ts.depends_on().iter().map(|id| u32::from(*id)).collect();
     let (depends_on, depends_on_len) = ptr_from_vec(depends_on);
-    let anchor_boundary = stored
-        .transactions()
-        .iter()
-        .find(|t| t.id() == ts.id())
-        .and_then(|t| t.anchor_boundary())
-        .map_or(-1, |h| i64::from(u32::from(h)));
+    let anchor_boundary =
+        height_opt_to_i64(stored_rows.get(&ts.id()).and_then(|t| t.anchor_boundary()));
     FfiMigrationTransactionStatus {
         id: u32::from(ts.id()),
         is_transfer,
@@ -2706,6 +2820,7 @@ fn encode_transaction_status(
         depends_on,
         depends_on_len,
         anchor_boundary,
+        invalid_reason,
     }
 }
 
@@ -2740,10 +2855,14 @@ pub unsafe extern "C" fn zcashlc_migration_transaction_statuses(
             return Ok(encode_empty_transaction_statuses());
         }
         let target = ctx.target()?;
+        // The id-keyed row map the per-status encoding joins `anchor_boundary` from — built once
+        // (U2), not re-searched linearly per row.
+        let stored_rows: std::collections::HashMap<MigrationTransferId, &MigrationTransaction> =
+            state.transactions().iter().map(|t| (t.id(), t)).collect();
         let rows: Vec<FfiMigrationTransactionStatus> = state
             .transaction_statuses(target)
-            .into_iter()
-            .map(|ts| encode_transaction_status(&ts, &state))
+            .iter()
+            .map(|ts| encode_transaction_status(ts, &stored_rows))
             .collect();
         let (ptr, len) = ptr_from_vec(rows);
         Ok(Box::into_raw(Box::new(FfiMigrationTransactionStatuses {
@@ -2789,12 +2908,15 @@ pub unsafe extern "C" fn zcashlc_migration_is_note_split_needed(
 /// work (the signing ceremony advances it). Returns `false` on error (see
 /// `zcashlc_last_error_message`).
 ///
+/// NOT the sync-gate's work-pending predicate: a `Signed` row it counts (due, but its proof not
+/// produced yet) must never hold sync hostage — that predicate is
+/// [`zcashlc_migration_has_ready_broadcast`], which answers for PROVED, servable work only.
+///
 /// `estimated_tip` (`-1` = disabled) is the platform's wall-clock chain-tip projection (from
-/// [`zcashlc_migration_block_rate_samples`]). It may only ACCELERATE scheduled-height due-ness
-/// (`effective = max(scanned, estimated)`, so an estimate below the scanned tip is ignored);
-/// EXPIRY is always evaluated against the SCANNED tip, never the estimate — see the split
-/// helpers' section comment ([`is_expired_at`]) for the full rule, mirrored from the Android
-/// SDK's `hasOverdueTransfersNative`.
+/// [`zcashlc_migration_block_rate_samples`]). Its handling is upstream's
+/// [`DuenessTargets`] rule — the estimate may only ACCELERATE scheduled-height due-ness, never
+/// decide expiry or boundary settledness (both stay on the SCANNED tip) — see the section
+/// comment above [`estimated_target_from_tip`].
 ///
 /// # Safety
 /// See [`open`].
@@ -2814,17 +2936,19 @@ pub unsafe extern "C" fn zcashlc_migration_has_overdue_transfers(
         if state.is_terminal() {
             return Ok(false);
         }
-        let scanned_tip = ctx.tip()?;
-        let scanned_target = target_from_tip(scanned_tip);
-        let effective_target = effective_target_from(scanned_tip, estimated_tip);
-        Ok(due_assuming_proving(&state, scanned_target, effective_target).is_some())
+        let targets = dueness_targets(ctx.tip()?, estimated_tip);
+        Ok(due_assuming_proving(&state, targets).is_some())
     });
     unwrap_exc_or(res, false)
 }
 
-/// Whether the stored run has a transfer that cannot proceed: a terminally-rejected transfer (per
-/// the platform's recorded classification) or an expired, unmined transaction. Returns `false` on
-/// error (see `zcashlc_last_error_message`).
+/// Whether the stored, NON-TERMINAL run has a transaction that cannot proceed: one marked
+/// `Invalid` in the engine state (a terminal broadcast rejection recorded by
+/// [`zcashlc_migration_record_transfer_result`], or a foreign spend detected by
+/// [`zcashlc_migration_reconcile_invalidations`]), or an expired, unmined one. A terminal run
+/// (Complete, or Failed/cancelled) answers `false`: its attention lifecycle is over — cancelling
+/// IS the out-of-band resolution the invalid state asks for. Returns `false` on error (see
+/// `zcashlc_last_error_message`).
 ///
 /// # Safety
 /// See [`open`].
@@ -2840,21 +2964,66 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
         let Some(state) = reconcile_mined(&mut ctx)? else {
             return Ok(false);
         };
-        if matches!(state.status(), MigrationStatus::Complete) {
+        if state.is_terminal() {
             return Ok(false);
         }
-        let marks = invalid_marks(&mut ctx.wallet, &ctx.account_bytes)
-            .map_err(|e| anyhow!("marks read failed: {e}"))?;
-        if !marks.is_empty() {
+        // Derived from the engine state itself — the same rows `AdvanceStep::Attend` is
+        // surfaced from, so this answer and the drive loop's cannot disagree.
+        if state
+            .transactions()
+            .iter()
+            .any(|t| matches!(t.state(), MigrationTxState::Invalid { .. }))
+        {
             return Ok(true);
         }
         // The engine's expiry predicate is defined over `target = tip + 1`, not the raw tip (see
-        // `CallCtx::target`); membership in `expired_transactions` already excludes `Mined` rows
-        // and treats `expiry_height == 0` as "never expires".
+        // `CallCtx::target`); membership in `expired_transactions` already excludes `Mined` (and
+        // `Invalid`) rows and treats `expiry_height == 0` as "never expires".
         let target = ctx.target()?;
         Ok(!state.expired_transactions(target).is_empty())
     });
     unwrap_exc_or(res, false)
+}
+
+/// Whether the stored, NON-TERMINAL run has a broadcast the platform could serve RIGHT NOW: a
+/// `Proved`, schedule-due, dependency-mined, unexpired transaction per upstream
+/// `MigrationState::next_broadcastable_at` at the [`dueness_targets`] of the scanned tip and
+/// `estimated_tip` (`-1` = disabled). Reconciles mined transactions first, like every other
+/// read. Returns `1` for yes, `0` for no (including no stored run and a terminal run), `-1` on
+/// error (see `zcashlc_last_error_message`).
+///
+/// This is the sync-gate's work-pending predicate: `1` means exactly "a PROVED, due, unexpired,
+/// valid transfer is waiting", the one situation where the platform should broadcast instead of
+/// starting a sync (ZIP 318's broadcast-or-sync session split). `Signed` rows — even due ones —
+/// and rows awaiting a proof or an external signature must NEVER block sync (they need MORE
+/// syncing/other work, not a broadcast session), which is why the gate cannot be derived from
+/// [`zcashlc_migration_has_overdue_transfers`] (that query deliberately counts due-but-unproved
+/// work). Rows marked `Invalid` are excluded upstream (a dead transfer gates nothing), and so is
+/// a doomed broadcast whose expiry only the ESTIMATED target has passed (upstream's protective
+/// withhold — served again once the scanned tip proves it either way).
+///
+/// # Safety
+/// See [`open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_has_ready_broadcast(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    estimated_tip: i64,
+) -> i32 {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let Some(state) = reconcile_mined(&mut ctx)? else {
+            return Ok(0);
+        };
+        if state.is_terminal() {
+            return Ok(0);
+        }
+        let targets = dueness_targets(ctx.tip()?, estimated_tip);
+        Ok(i32::from(state.next_broadcastable_at(targets).is_some()))
+    });
+    unwrap_exc_or(res, -1)
 }
 
 /// The note-split preview for the account's live balance: the preparation output values and the
@@ -3254,9 +3423,13 @@ pub unsafe extern "C" fn zcashlc_migration_prove_pending(
         if state.is_terminal() {
             return Ok(0);
         }
-        let tip = ctx.tip()?;
-        let proved =
-            prove_pending_rows(&mut state, tip, |state, id| prove_one(&mut ctx, state, id))?;
+        // `target = tip + 1`, the height every `MigrationState` query is defined over (see
+        // `CallCtx::target`; A1 — this sweep briefly fed the raw tip, which left a preparation
+        // scheduled exactly at the target un-proved for one extra block).
+        let target = ctx.target()?;
+        let proved = prove_pending_rows(&mut state, target, |state, id| {
+            prove_one(&mut ctx, state, id)
+        })?;
         Ok(i64::from(proved))
     });
     unwrap_exc_or(res, -1)
@@ -3271,9 +3444,10 @@ pub unsafe extern "C" fn zcashlc_migration_prove_pending(
 /// scans, so broadcasting stays a pure delivery step. A platform that has not swept sees
 /// `AwaitingProof` and can sweep then retry, rather than paying proving latency here.
 ///
-/// `estimated_tip` (`-1` = disabled) may only ACCELERATE scheduled-height due-ness; expiry is
-/// always evaluated against the SCANNED tip — the same rule (and Android mirror) as
-/// [`zcashlc_migration_has_overdue_transfers`].
+/// `estimated_tip` (`-1` = disabled) follows upstream's [`DuenessTargets`] rule: it may only
+/// ACCELERATE scheduled-height due-ness; expiry is always evaluated against the SCANNED tip
+/// (with the doomed-broadcast withhold when only the estimate has passed an expiry) — the same
+/// rule as [`zcashlc_migration_has_overdue_transfers`].
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_prepared_transfer`].
@@ -3293,10 +3467,8 @@ pub unsafe extern "C" fn zcashlc_migration_next_due_transfer(
         if state.is_terminal() {
             return Ok(FfiPreparedTransfer::none());
         }
-        let scanned_tip = ctx.tip()?;
-        let scanned_target = target_from_tip(scanned_tip);
-        let effective_target = effective_target_from(scanned_tip, estimated_tip);
-        match next_due(&state, scanned_target, effective_target) {
+        let targets = dueness_targets(ctx.tip()?, estimated_tip);
+        match next_due(&state, targets) {
             DueOutcome::Ready { id } => {
                 let (pczt, txid) = serve_proved(&state, id)?;
                 FfiPreparedTransfer::from_parts(id, txid, pczt)
@@ -3339,10 +3511,10 @@ pub unsafe extern "C" fn zcashlc_migration_pending_transfer_proposal(
         // `tip` is the display-only "now" reference the DTO carries (see
         // `FfiTransferProposal::anchor_height`'s doc); `target` (`tip + 1`) is what the engine
         // query below is actually defined over — see `CallCtx::target`. This query takes no
-        // estimated tip, so both due-ness heights are the scanned target.
+        // estimated tip, so both due-ness targets coincide (`DuenessTargets::at`).
         let tip = ctx.tip()?;
         let target = target_from_tip(tip);
-        let next_transfer = due_assuming_proving(&state, target, target)
+        let next_transfer = due_assuming_proving(&state, DuenessTargets::at(target))
             .and_then(|id| state.transactions().iter().find(|t| t.id() == id))
             .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }));
         match next_transfer {
@@ -3391,8 +3563,15 @@ pub unsafe extern "C" fn zcashlc_migration_extract_broadcast_tx(
 /// Records a broadcast outcome for the identified transaction. `result_tag`: 0 = success (with
 /// `txid_bytes`, 32 raw bytes) — the transaction is marked broadcast, to be reconciled to mined
 /// as the wallet scans; 1 = network error (retryable — nothing is recorded, the transaction stays
-/// offered); 2 = invalid note, 3 = expired — recorded in the SDK's invalid marks so the run
-/// surfaces `RequiresAttention`.
+/// offered); 2 = invalid note, 3 = expired — recorded as the engine's own
+/// `MigrationTxState::Invalid` (reasons [`InvalidReason::RejectedInvalid`] /
+/// [`InvalidReason::RejectedExpired`]) via `MigrationState::mark_invalid`, so the run surfaces
+/// attention through `zcashlc_migration_has_invalid_transfers` and `AdvanceStep::Attend`, and
+/// every delivery query stops offering the dead transaction.
+///
+/// The terminal tags follow `mark_invalid`'s own no-op rules: an unknown id records nothing, and
+/// an already-`Mined` transaction is left untouched (chain inclusion outranks a stale rejection
+/// verdict) — both still answer `true`, since the reported outcome was consumed.
 ///
 /// # Safety
 /// See [`open`]; for tag 0, `txid_bytes` must be valid for reads of 32 bytes.
@@ -3429,12 +3608,31 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
             1 => Ok(true),
             2 | 3 => {
                 let reason = if result_tag == 2 {
-                    "invalid_note"
+                    InvalidReason::RejectedInvalid
                 } else {
-                    "expired"
+                    InvalidReason::RejectedExpired
                 };
-                insert_invalid_mark(&mut ctx.wallet, &ctx.account_bytes, id, reason)
-                    .map_err(|e| anyhow!("marks write failed: {e}"))?;
+                let mut backend =
+                    Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+                let mut state = backend
+                    .get_migration()?
+                    .ok_or_else(|| anyhow!("no migration is stored"))?;
+                state.mark_invalid(id, reason);
+                // Persist through the narrow single-row store round-trip (`update_transaction`
+                // rewrites every payload column of the one row; the run-level status cannot
+                // change on `mark_invalid` — its recompute only promotes on broadcast/mined
+                // evidence, which marking a row invalid never adds). Nothing to persist when
+                // `mark_invalid` no-opped (unknown id, or a `Mined` row the chain already
+                // settled).
+                let invalidated = state
+                    .transactions()
+                    .iter()
+                    .find(|t| t.id() == id)
+                    .map(|t| t.state())
+                    .filter(|s| matches!(s, MigrationTxState::Invalid { .. }));
+                if let Some(new_state) = invalidated {
+                    backend.update_transaction(id, new_state)?;
+                }
                 Ok(true)
             }
             other => Err(anyhow!("unknown TransferResult tag: {other}")),
@@ -3506,8 +3704,14 @@ pub unsafe extern "C" fn zcashlc_migration_record_immediate_run(
 }
 
 /// Cancels the stored run (persisting it as `Failed` — its pre-signed transactions are abandoned;
-/// already-broadcast ones are unaffected on-chain), clears the invalid marks, and previews a
-/// fresh plan against the live balance for the platform's re-confirm lane.
+/// already-broadcast ones are unaffected on-chain) and previews a fresh plan against the live
+/// balance for the platform's re-confirm lane.
+///
+/// Cancelling is also what clears the attention state: a terminal run surfaces neither
+/// `AdvanceStep::Attend` (upstream `next_step` answers `Complete` for it) nor
+/// `zcashlc_migration_has_invalid_transfers` (which answers `false` for a terminal run), so any
+/// `Invalid` rows the run carried simply retire with it — no separate clearing step exists or is
+/// needed.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
@@ -3535,8 +3739,6 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
                 }
             }
         }
-        clear_invalid_marks(&mut ctx.wallet, &ctx.account_bytes)
-            .map_err(|e| anyhow!("marks clear failed: {e}"))?;
         match plan_and_cache(&mut ctx, false)? {
             Some((plan, reference_height, handle)) => {
                 encode_schedule_from_plan(&plan, reference_height, handle)
@@ -6047,46 +6249,202 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Round-trips the invalid-transfer marks through the extension table that
-    /// `zcashlc_init_data_database`'s external migrations create (exercising the whole chain:
-    /// the `ext_zcashlc_*` schema migration, then the mediated extension-transaction access).
+    /// [`legacy_invalid_reason`]'s mapping table: the engine's own wire names parse as
+    /// themselves, each name this SDK historically wrote maps onto the state it described, and
+    /// an unrecognized name lands in the conservative rejected-invalid bucket.
     #[test]
-    fn invalid_marks_round_trip() {
-        use zcash_client_sqlite::WalletDb;
-        use zcash_client_sqlite::util::SystemClock;
+    fn legacy_invalid_reason_maps_known_names_and_defaults_conservatively() {
+        assert_eq!(
+            legacy_invalid_reason("invalid_note"),
+            InvalidReason::RejectedInvalid
+        );
+        assert_eq!(
+            legacy_invalid_reason("expired"),
+            InvalidReason::RejectedExpired
+        );
+        assert_eq!(
+            legacy_invalid_reason("foreign_spent"),
+            InvalidReason::FundingSpent
+        );
+        assert_eq!(
+            legacy_invalid_reason("funding_spent"),
+            InvalidReason::FundingSpent
+        );
+        assert_eq!(
+            legacy_invalid_reason("rejected_invalid"),
+            InvalidReason::RejectedInvalid
+        );
+        assert_eq!(
+            legacy_invalid_reason("rejected_expired"),
+            InvalidReason::RejectedExpired
+        );
+        assert_eq!(
+            legacy_invalid_reason("something else entirely"),
+            InvalidReason::RejectedInvalid
+        );
+    }
 
-        let path = init_fixture_db("zcashlc_migration_invalid_marks_round_trip");
-        let network = parse_network(NETWORK_ID_MAINNET).expect("mainnet parses");
-        let mut wallet = WalletDb::for_path(&path, network, SystemClock, OsRng)
-            .expect("the fixture wallet opens");
-        let account = [9u8; 16];
-        let other = [8u8; 16];
-        assert!(invalid_marks(&mut wallet, &account).unwrap().is_empty());
-        insert_invalid_mark(
-            &mut wallet,
-            &account,
-            MigrationTransferId::new(4),
-            "invalid_note",
+    /// Creates the RETIRED legacy marks table (its `schemerz` migration no longer exists, so a
+    /// legacy wallet is simulated by hand — the exact DDL that migration used to run) and
+    /// inserts the given `(account, tx_id, reason)` rows.
+    fn create_legacy_marks_table(path: &std::path::Path, rows: &[(&[u8; 16], u32, &str)]) {
+        let conn = Connection::open(path).expect("the fixture connection opens");
+        conn.execute_batch(
+            "CREATE TABLE ext_zcashlc_orchard_ironwood_migration_invalid_marks (
+                account_uuid BLOB NOT NULL,
+                tx_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                PRIMARY KEY (account_uuid, tx_id)
+            )",
         )
-        .unwrap();
-        insert_invalid_mark(
-            &mut wallet,
-            &account,
-            MigrationTransferId::new(2),
-            "expired",
+        .expect("the legacy marks table creates");
+        for (account, tx_id, reason) in rows {
+            conn.execute(
+                "INSERT INTO ext_zcashlc_orchard_ironwood_migration_invalid_marks
+                    (account_uuid, tx_id, reason) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&account[..], tx_id, reason],
+            )
+            .expect("the legacy mark inserts");
+        }
+    }
+
+    /// Whether the legacy marks table still exists in the wallet database.
+    fn legacy_marks_table_exists(path: &std::path::Path) -> bool {
+        let conn = Connection::open(path).expect("the probe connection opens");
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            rusqlite::params![LEGACY_INVALID_MARKS_TABLE],
+            |row| row.get(0),
         )
-        .unwrap();
-        insert_invalid_mark(
-            &mut wallet,
-            &other,
-            MigrationTransferId::new(7),
-            "invalid_note",
-        )
-        .unwrap();
-        assert_eq!(invalid_marks(&mut wallet, &account).unwrap(), vec![2, 4]);
-        clear_invalid_marks(&mut wallet, &account).unwrap();
-        assert!(invalid_marks(&mut wallet, &account).unwrap().is_empty());
-        assert_eq!(invalid_marks(&mut wallet, &other).unwrap(), vec![7]);
+        .expect("the probe reads")
+    }
+
+    /// The one-time legacy invalid-marks migration, end to end over a real [`open`] (via the
+    /// `has_invalid_transfers` entry point): surviving rows fold into the engine state under
+    /// `mark_invalid`'s own rules — a live row becomes `Invalid` with its mapped reason, a
+    /// `Mined` row is left alone (chain inclusion outranks the stale verdict), an unknown id and
+    /// an unknown account are dropped — and the table is DROPPED, so a second open only pays the
+    /// existence probe (idempotence).
+    #[test]
+    fn legacy_invalid_marks_fold_into_engine_state_and_the_table_drops() {
+        let path = init_fixture_db("zcashlc_legacy_marks_fold");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        // Transfers 0/1/2: Signed, Proved, and Mined.
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed, MigrationTxState::Proved, MINED],
+            3_499_000,
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &state);
+        let stranger = [7u8; 16];
+        create_legacy_marks_table(
+            &path,
+            &[
+                (&account, 0, "invalid_note"),
+                (&account, 1, "foreign_spent"),
+                (&account, 2, "expired"), // Mined: the mark must NOT resurrect it.
+                (&account, 9, "expired"), // unknown id: dropped.
+                (&stranger, 0, "invalid_note"), // unknown account: dropped.
+            ],
+        );
+
+        // Any entry point's `open` runs the migration; this one then reads the folded state
+        // (before any chain-tip lookup, which this fixture deliberately never provides).
+        assert!(
+            unsafe {
+                zcashlc_migration_has_invalid_transfers(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    account.as_ptr(),
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "the folded marks must surface as invalid transfers"
+        );
+        assert!(
+            !legacy_marks_table_exists(&path),
+            "the legacy table must be dropped by the first open"
+        );
+
+        let stored = read_fixture_state(&path, &account);
+        let row_state = |id: u32| {
+            stored
+                .transactions()
+                .iter()
+                .find(|t| t.id() == MigrationTransferId::new(id))
+                .expect("the row remains stored")
+                .state()
+        };
+        assert_eq!(
+            row_state(0).invalid_reason(),
+            Some(InvalidReason::RejectedInvalid),
+            "the invalid_note mark must fold onto row 0"
+        );
+        assert_eq!(
+            row_state(1).invalid_reason(),
+            Some(InvalidReason::FundingSpent),
+            "the foreign_spent mark must fold onto row 1"
+        );
+        assert!(
+            matches!(row_state(2), MigrationTxState::Mined { .. }),
+            "a mark against a Mined row must not resurrect it"
+        );
+
+        // Idempotence: a second open finds no table and changes nothing.
+        assert!(unsafe {
+            zcashlc_migration_has_invalid_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        });
+        assert!(!legacy_marks_table_exists(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Legacy marks against a TERMINAL (cancelled) run are dropped without touching its rows: a
+    /// terminal run surfaces no attention, so carrying stale verdicts onto it would change
+    /// nothing observable — and the table still drops.
+    #[test]
+    fn legacy_invalid_marks_skip_a_terminal_run() {
+        let path = init_fixture_db("zcashlc_legacy_marks_terminal");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        let state = test_state(
+            MigrationStatus::Failed,
+            &[],
+            &[MigrationTxState::Proved],
+            3_499_000,
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &state);
+        create_legacy_marks_table(&path, &[(&account, 0, "invalid_note")]);
+
+        assert!(
+            !unsafe {
+                zcashlc_migration_has_invalid_transfers(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    account.as_ptr(),
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "a terminal run reports no invalid transfers"
+        );
+        assert!(
+            !legacy_marks_table_exists(&path),
+            "the table drops even when every mark is skipped"
+        );
+        let stored = read_fixture_state(&path, &account);
+        assert!(
+            matches!(stored.transactions()[0].state(), MigrationTxState::Proved),
+            "a terminal run's rows must be left untouched"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Regression pin: the migration store connection (a second, independent connection into the
@@ -7240,7 +7598,8 @@ mod tests {
     /// Every other prover failure is HARD and carries the stable proving-unavailable prefix the
     /// Swift layer maps to `migrationProvingUnavailable` — including `IronwoodTreeUnavailable`,
     /// which is hard (not transient): the backend tracks no Ironwood commitment tree at all, so no
-    /// amount of syncing produces one.
+    /// amount of syncing produces one — and the non-query `Tree` variants (A6): a storage or
+    /// insertion failure is not something more scanning repairs.
     #[test]
     fn prove_dispatch_routes_hard_prover_errors_through_the_proving_unavailable_prefix() {
         let hards: Vec<TestProveError> = vec![
@@ -7249,6 +7608,10 @@ mod tests {
             WalletProveError::Notes(()),
             WalletProveError::IronwoodTreeUnavailable,
             WalletProveError::Prove("proof backend failure".into()),
+            WalletProveError::Tree(shardtree::error::ShardTreeError::Storage(())),
+            WalletProveError::Tree(shardtree::error::ShardTreeError::Insert(
+                shardtree::error::InsertionError::CheckpointOutOfOrder,
+            )),
         ];
         for error in hards {
             let label = format!("{error}");
@@ -7272,9 +7635,12 @@ mod tests {
     /// tests above exercise the same classification through the full prove-dispatch machinery,
     /// this one asserts it variant-by-variant with no fixture/prover indirection, so a
     /// classification regression fails here first. The exact transient set: `UnknownSpentNote`,
-    /// `AnchorNotFound`, `WitnessNotFound`, `Tree`, `ChainTipUnknown`. `IronwoodTreeUnavailable`
-    /// is pinned hard here too — it moved out of the transient set (was transient before this
-    /// classification was aligned to Android's unit-tested, incident-litigated one).
+    /// `AnchorNotFound`, `WitnessNotFound`, `Tree(ShardTreeError::Query(_))`, `ChainTipUnknown`.
+    /// `IronwoodTreeUnavailable` is pinned hard here too — it moved out of the transient set
+    /// (was transient before this classification was aligned to Android's unit-tested,
+    /// incident-litigated one) — and so are the NON-query `Tree` variants (A6): a `Storage`
+    /// failure is the persistence layer erroring and an `Insert` a corrupt tree write, neither
+    /// of which syncing repairs, so deferring them would stall the sweep silently forever.
     #[test]
     fn prove_error_class_transient_vs_hard_table() {
         let nullifier = Option::from(orchard::note::Nullifier::from_bytes(&[0u8; 32]))
@@ -7297,6 +7663,10 @@ mod tests {
             WalletProveError::NoRealSpend,
             WalletProveError::MalformedNullifier([0u8; 32]),
             WalletProveError::Prove("proof backend failure".into()),
+            WalletProveError::Tree(shardtree::error::ShardTreeError::Storage(())),
+            WalletProveError::Tree(shardtree::error::ShardTreeError::Insert(
+                shardtree::error::InsertionError::CheckpointOutOfOrder,
+            )),
         ];
         for error in hard {
             assert!(!error.is_transient(), "{error} must be hard");
@@ -7471,7 +7841,7 @@ mod tests {
         // Delivery picks up the swept row, with the prover untouched.
         let calls_before = prover.calls.len();
         assert_eq!(
-            next_due(&stored, h(5_000), h(5_000)),
+            next_due(&stored, DuenessTargets::at(h(5_000))),
             DueOutcome::Ready {
                 id: MigrationTransferId::new(1)
             },
@@ -7493,7 +7863,7 @@ mod tests {
         let state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
 
         assert_eq!(
-            next_due(&state, h(5_000), h(5_000)),
+            next_due(&state, DuenessTargets::at(h(5_000))),
             DueOutcome::AwaitingProof {
                 id: MigrationTransferId::new(1)
             },
@@ -7600,11 +7970,74 @@ mod tests {
         );
         // Still nothing to broadcast: proving does not make a row due.
         assert_eq!(
-            next_due(&stored, h(100), h(100)),
+            next_due(&stored, DuenessTargets::at(h(100))),
             DueOutcome::Nothing,
             "a proved but unscheduled row must not be served"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE A1 BOUNDARY PIN: the sweep is driven at `target = tip + 1` (the height every
+    /// `MigrationState` query is defined over — `zcashlc_migration_prove_pending` reads
+    /// `ctx.target()`, not the raw tip), so a PREPARATION scheduled EXACTLY at the target is
+    /// proved now rather than one block late. A preparation is the kind whose prove-readiness
+    /// IS schedule due-ness, which is why the raw-tip regression only ever bit preparations; the
+    /// raw-tip counterfactual is pinned alongside.
+    #[test]
+    fn sweep_proves_a_preparation_scheduled_exactly_at_target() {
+        let tip = h(100);
+        let build_state = || {
+            custom_state(
+                MigrationStatus::InProgress,
+                vec![MigrationTransaction::from_parts(
+                    MigrationTransferId::new(0),
+                    MigrationTxKind::Preparation { layer: 0, index: 0 },
+                    minimal_pczt_bytes(),
+                    Vec::new(),
+                    h(101), // scheduled exactly at target = tip + 1
+                    h(10_000),
+                    None,
+                    MigrationTxState::Signed,
+                    None,
+                )],
+            )
+        };
+
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let mut state = build_state();
+        let proved = prove_pending_rows(&mut state, target_from_tip(tip), |state, id| {
+            Ok(
+                migration_finalize::prove_due_transaction(&mut prover, state, id, Some(tip))?
+                    .is_some(),
+            )
+        })
+        .expect("the boundary sweep must not fail");
+        assert_eq!(
+            proved, 1,
+            "a preparation scheduled exactly at tip + 1 is due the sweep NOW"
+        );
+        assert_eq!(
+            prover.calls,
+            vec![ProveCall::Preparation(tip)],
+            "the preparation proves against the caller-resolved anchor"
+        );
+
+        // The raw-tip counterfactual (the exact off-by-one A1 fixed): fed the tip instead of the
+        // target, the same state sweeps nothing.
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let mut state = build_state();
+        let proved = prove_pending_rows(&mut state, tip, |state, id| {
+            Ok(
+                migration_finalize::prove_due_transaction(&mut prover, state, id, Some(tip))?
+                    .is_some(),
+            )
+        })
+        .expect("the counterfactual sweep must not fail");
+        assert_eq!(
+            proved, 0,
+            "at the raw tip the target-scheduled preparation is (wrongly) not yet due — the \
+             convention the FFI must therefore never feed the sweep"
+        );
     }
 
     /// A HARD prover failure aborts the sweep and propagates: an unprovable-for-real row is not
@@ -7645,7 +8078,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            due_assuming_proving(&state, h(100), h(100)),
+            due_assuming_proving(&state, DuenessTargets::at(h(100))),
             Some(MigrationTransferId::new(2)),
             "a due-but-unproved transfer is due delivery work"
         );
@@ -7659,19 +8092,25 @@ mod tests {
 
         // Provable but nothing schedule-due: not reported (proving alone is not overdue work).
         let undue = scheduled_state(&[MINED], &[(MigrationTxState::Signed, 9_000, Some(h(40)))]);
-        assert_eq!(due_assuming_proving(&undue, h(100), h(100)), None);
+        assert_eq!(
+            due_assuming_proving(&undue, DuenessTargets::at(h(100))),
+            None
+        );
 
         // Awaiting an external signature, schedule-due: not delivery work.
         let awaiting = scheduled_state(
             &[MINED],
             &[(MigrationTxState::AwaitingSignature, 90, Some(h(40)))],
         );
-        assert_eq!(due_assuming_proving(&awaiting, h(100), h(100)), None);
+        assert_eq!(
+            due_assuming_proving(&awaiting, DuenessTargets::at(h(100))),
+            None
+        );
 
         // Already Proved and due: reported exactly as before the drive existed.
         let proved = scheduled_state(&[MINED], &[(MigrationTxState::Proved, 90, Some(h(40)))]);
         assert_eq!(
-            due_assuming_proving(&proved, h(100), h(100)),
+            due_assuming_proving(&proved, DuenessTargets::at(h(100))),
             Some(MigrationTransferId::new(1))
         );
     }
@@ -8062,6 +8501,17 @@ mod tests {
                 Some(3_600_000), // not settled: boundary + 1 == target
                 MigrationTxState::Signed,
             ),
+            tx_row(
+                4,
+                MigrationTxKind::Transfer { crossing: 3 },
+                &[],
+                3_100_000,
+                4_000_000,
+                Some(3_000_000),
+                MigrationTxState::Invalid {
+                    reason: InvalidReason::RejectedExpired,
+                },
+            ),
         ];
         let state = custom_state(MigrationStatus::InProgress, rows);
         store_fixture_state(&path, &account, &state);
@@ -8069,7 +8519,7 @@ mod tests {
         // The expectation: computed directly from the engine, on the very same state.
         let target = h(3_600_001);
         let expected = state.transaction_statuses(target);
-        assert_eq!(expected.len(), 4, "sanity: every row got a status");
+        assert_eq!(expected.len(), 5, "sanity: every row got a status");
 
         let statuses_ptr = unsafe {
             zcashlc_migration_transaction_statuses(
@@ -8084,7 +8534,7 @@ mod tests {
             "a mixed stored run is not an error"
         );
         let statuses = unsafe { &*statuses_ptr };
-        assert_eq!(statuses.len, 4, "every stored row must get a status");
+        assert_eq!(statuses.len, 5, "every stored row must get a status");
         let ffi_rows = unsafe { std::slice::from_raw_parts(statuses.ptr, statuses.len) };
 
         for exp in &expected {
@@ -8114,8 +8564,16 @@ mod tests {
                 MigrationTxState::Proved => 2,
                 MigrationTxState::Broadcast { .. } => 3,
                 MigrationTxState::Mined { .. } => 4,
+                MigrationTxState::Invalid { .. } => 5,
             };
             assert_eq!(actual.state, exp_state, "row {id}: state");
+            assert_eq!(
+                actual.invalid_reason,
+                exp.state()
+                    .invalid_reason()
+                    .map_or(-1, invalid_reason_to_i32),
+                "row {id}: invalid_reason"
+            );
             assert_eq!(
                 actual.scheduled_height,
                 i64::from(u32::from(exp.scheduled_height())),
@@ -8145,6 +8603,7 @@ mod tests {
                 Some(Blocker::AnchorBoundary) => 3,
                 Some(Blocker::Signature) => 4,
                 Some(Blocker::Expired) => 5,
+                Some(Blocker::Invalid) => 6,
             };
             assert_eq!(actual.blocked_on, exp_blocked_on, "row {id}: blocked_on");
 
@@ -8162,12 +8621,13 @@ mod tests {
                     .to_vec();
             assert_eq!(actual_depends_on, exp_depends_on, "row {id}: depends_on");
 
-            let exp_anchor_boundary = state
-                .transactions()
-                .iter()
-                .find(|t| t.id() == exp.id())
-                .and_then(|t| t.anchor_boundary())
-                .map_or(-1, |h| i64::from(u32::from(h)));
+            let exp_anchor_boundary = height_opt_to_i64(
+                state
+                    .transactions()
+                    .iter()
+                    .find(|t| t.id() == exp.id())
+                    .and_then(|t| t.anchor_boundary()),
+            );
             assert_eq!(
                 actual.anchor_boundary, exp_anchor_boundary,
                 "row {id}: anchor_boundary"
@@ -8215,6 +8675,27 @@ mod tests {
         assert_eq!(
             blocked_transfer.blocked_on, 3,
             "row 3 must be blocked on its anchor boundary"
+        );
+
+        let invalid_transfer = ffi_rows.iter().find(|r| r.id == 4).unwrap();
+        assert_eq!(invalid_transfer.state, 5, "row 4 must report Invalid");
+        assert!(!invalid_transfer.ready, "an invalid row is never ready");
+        assert_eq!(
+            invalid_transfer.action, 0,
+            "an invalid row offers no action"
+        );
+        assert_eq!(
+            invalid_transfer.blocked_on, 6,
+            "row 4 must report the Invalid blocker"
+        );
+        assert_eq!(
+            invalid_transfer.invalid_reason, 2,
+            "row 4 must carry its rejected_expired reason"
+        );
+        let live_row = ffi_rows.iter().find(|r| r.id == 2).unwrap();
+        assert_eq!(
+            live_row.invalid_reason, -1,
+            "a non-invalid row carries the -1 reason sentinel"
         );
 
         unsafe { zcashlc_free_migration_transaction_statuses(statuses_ptr) };
@@ -8553,8 +9034,9 @@ mod tests {
 
     /// A stored CANCELLED (`Failed`) run reports the `Complete` step VERBATIM — never remapped,
     /// and never driven: the fixture deliberately holds a `Proved`, schedule-due row that the
-    /// broadcast check would otherwise offer. The answer also precedes any chain-tip lookup (no
-    /// tip is set here), pinning the shim's terminal-first ordering.
+    /// broadcast arm would otherwise offer. The answer also precedes any chain-tip lookup (no
+    /// tip is set here), pinning the conduit's hoisted terminal check (upstream `next_step`'s own
+    /// first check, made answerable without a target).
     #[test]
     fn advance_step_cancelled_run_reports_complete_verbatim() {
         let path = init_fixture_db("zcashlc_advance_step_cancelled");
@@ -8584,10 +9066,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The #2867 ordering pin: with BOTH a proven, schedule-due row and another provable `Signed`
-    /// row present, Broadcast wins. rc.5's own `next_step` is prove-first and would answer
-    /// `Prove {{ 1 }}` here; the shim replicates the flipped (broadcast-first) ordering of
-    /// upstream PR #2867.
+    /// The broadcast-first ordering pin: with BOTH a proven, schedule-due row and another
+    /// provable `Signed` row present, Broadcast wins. This is upstream `next_step`'s own native
+    /// ordering since PR #2867 (a proven transaction's broadcast window is the scarcer resource;
+    /// proving can happen on any later wake-up) — kept as a regression pin against the pinned
+    /// upstream, no longer implemented by any local shim.
     #[test]
     fn advance_step_broadcast_wins_over_prove() {
         let path = init_fixture_db("zcashlc_advance_step_broadcast_first");
@@ -8623,15 +9106,133 @@ mod tests {
 
         let (step, id, ..) = read_advance_step(path_bytes, &account);
         assert_eq!(
-            step, 1,
+            step, ZCASHLC_ADVANCE_STEP_BROADCAST,
             "the proven, due row must be offered for BROADCAST ahead of any proving work"
         );
         assert_eq!(id, 0, "the broadcast candidate is the proven row");
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A provable PREPARATION reports `Prove` with `kind_is_preparation` and its layer/index
-    /// joined in from the stored row (rc.5's `AdvanceStep::Prove` itself carries no kind).
+    /// The attend-precedence marshal pin: with an `Invalid` row present, `Attend` (naming that
+    /// row) is surfaced ahead of a broadcast that is due right now — upstream's own ordering
+    /// (only a terminal run outranks attention), marshaled verbatim onto the new step
+    /// discriminant.
+    #[test]
+    fn advance_step_attend_precedes_broadcast() {
+        let path = init_fixture_db("zcashlc_advance_step_attend");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                // Proved and due: the broadcast the precedence must hold back.
+                tx_row(
+                    0,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    &[],
+                    3_499_000,
+                    4_000_000,
+                    Some(3_499_000),
+                    MigrationTxState::Proved,
+                ),
+                // Dead by observed event: the run needs attention before it is driven further.
+                tx_row(
+                    1,
+                    MigrationTxKind::Transfer { crossing: 1 },
+                    &[],
+                    3_499_000,
+                    4_000_000,
+                    Some(3_499_000),
+                    MigrationTxState::Invalid {
+                        reason: InvalidReason::FundingSpent,
+                    },
+                ),
+            ],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, id, is_prep, layer, index, crossing) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_ATTEND,
+            "an invalid row must surface Attend ahead of the due broadcast"
+        );
+        assert_eq!(id, 1, "the Attend step names the invalid row");
+        assert!(
+            !is_prep && layer == 0 && index == 0 && crossing == 0,
+            "the Attend step carries no kind payload"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Cancelling IS how attention clears: the same run as
+    /// [`advance_step_attend_precedes_broadcast`] stops surfacing `Attend` (and
+    /// `has_invalid_transfers`) once `zcashlc_migration_restart_step` cancels it — the cancelled
+    /// run is terminal, so the conduit answers `Complete` and the attention queries answer
+    /// `false`, with no separate clearing machinery involved.
+    #[test]
+    fn restart_step_clears_attention_by_cancelling_the_run() {
+        let path = init_fixture_db("zcashlc_restart_clears_attention");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![tx_row(
+                0,
+                MigrationTxKind::Transfer { crossing: 0 },
+                &[],
+                3_499_000,
+                4_000_000,
+                Some(3_499_000),
+                MigrationTxState::Invalid {
+                    reason: InvalidReason::RejectedInvalid,
+                },
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let has_invalid = || unsafe {
+            zcashlc_migration_has_invalid_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        let (step, id, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(step, ZCASHLC_ADVANCE_STEP_ATTEND, "sanity: attention is up");
+        assert_eq!(id, 0);
+        assert!(has_invalid(), "sanity: the invalid row surfaces");
+
+        // Cancel + re-plan. The fixture wallet holds no balance, so the fresh preview is the
+        // benign empty schedule.
+        let schedule_ptr = unsafe {
+            zcashlc_migration_restart_step(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(!schedule_ptr.is_null(), "the restart must succeed");
+        unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
+
+        let (step, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_COMPLETE,
+            "the cancelled run is terminal: Attend is no longer surfaced"
+        );
+        assert!(
+            !has_invalid(),
+            "a terminal run reports no invalid transfers: attention has cleared"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A provable PREPARATION reports `Prove` with `kind_is_preparation` and its layer/index —
+    /// carried natively by upstream's `AdvanceStep::Prove { id, kind }`, no stored-row lookup
+    /// involved.
     #[test]
     fn advance_step_prove_carries_preparation_kind() {
         let path = init_fixture_db("zcashlc_advance_step_prove_prep");
@@ -9116,6 +9717,42 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A12: a wallet-database file that does not exist at all is the same benign "no scanned
+    /// blocks yet" answer as a missing `blocks` table — EMPTY, with NO error recorded — because
+    /// the read-only open cannot create the file (`SQLITE_CANTOPEN` is a state of the world, not
+    /// a failure of this read).
+    #[test]
+    fn block_rate_samples_nonexistent_db_file_is_empty_not_an_error() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_block_rate_missing_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let ptr = unsafe {
+            zcashlc_migration_block_rate_samples(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                NETWORK_ID_MAINNET,
+                10,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "a missing wallet-database file must answer EMPTY, not error"
+        );
+        assert_eq!(unsafe { &*ptr }.len, 0);
+        assert!(
+            ffi_helpers::error_handling::take_last_error().is_none(),
+            "the empty answer must record NO error"
+        );
+        unsafe { zcashlc_free_block_rate_samples(ptr) };
+        assert!(
+            !path.exists(),
+            "the read-only probe must not have created the file"
+        );
+    }
+
     /// With scanned blocks present, the most recent `window` rows come back ASCENDING by height,
     /// carrying the stored header times.
     #[test]
@@ -9169,6 +9806,101 @@ mod tests {
         }
     }
 
+    fn has_ready_broadcast(path_bytes: &[u8], account: &[u8; 16], estimated_tip: i64) -> i32 {
+        unsafe {
+            zcashlc_migration_has_ready_broadcast(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                estimated_tip,
+            )
+        }
+    }
+
+    // ----- the sync-gate predicate (`zcashlc_migration_has_ready_broadcast`) -----
+
+    /// THE A2 WEDGE PIN: a `Signed`, schedule-due, prove-ready transfer is overdue DELIVERY work
+    /// (`has_overdue_transfers` answers `true` — a sweep plus a broadcast will discharge it) but
+    /// must NOT gate sync (`has_ready_broadcast` answers `0`): it needs MORE syncing/proving
+    /// before a broadcast session can do anything with it, so a gate keyed on it would wedge —
+    /// sync withheld for a broadcast that cannot be served until sync proceeds.
+    #[test]
+    fn has_ready_broadcast_signed_due_row_answers_no_while_overdue_answers_yes() {
+        let path = init_fixture_db("zcashlc_ready_broadcast_signed");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        // Signed, due, boundary settled — `has_overdue_transfers_reports_a_due_signed_transfer`'s
+        // exact fixture.
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            3_499_000,
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &state);
+
+        assert!(
+            has_overdue(path_bytes, &account, -1),
+            "sanity: the due Signed row IS overdue delivery work"
+        );
+        assert_eq!(
+            has_ready_broadcast(path_bytes, &account, -1),
+            0,
+            "a Signed row — even a due one — must never block sync (the A2 wedge)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The gate's yes-case and its exclusions: a `Proved`, due row answers `1`; the same row
+    /// marked `Invalid` answers `0` (a dead transfer gates nothing); no stored run answers `0`.
+    #[test]
+    fn has_ready_broadcast_serves_proved_due_rows_and_excludes_invalid_ones() {
+        let path = init_fixture_db("zcashlc_ready_broadcast_proved");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+
+        assert_eq!(
+            has_ready_broadcast(path_bytes, &account, -1),
+            0,
+            "no stored run: nothing gates (and no chain tip is needed to say so)"
+        );
+
+        set_fixture_tip(path_bytes);
+        let proved = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Proved],
+            3_499_000,
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &proved);
+        assert_eq!(
+            has_ready_broadcast(path_bytes, &account, -1),
+            1,
+            "a Proved, due, unexpired transfer is exactly the gate's yes-case"
+        );
+
+        let invalid = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Invalid {
+                reason: InvalidReason::RejectedInvalid,
+            }],
+            3_499_000,
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &invalid);
+        assert_eq!(
+            has_ready_broadcast(path_bytes, &account, -1),
+            0,
+            "an Invalid row — even a due, proved-then-killed one — gates nothing"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A transfer scheduled past the scanned target but at/below the estimated tip is overdue
     /// WITH the estimate and not without it (`-1` disables).
     #[test]
@@ -9198,32 +9930,126 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// THE M2 HARD RULE: the estimate must never accelerate EXPIRY. A row that is past expiry
-    /// only under the estimated tip (expiry 3_600_020 < estimated target) but valid under the
-    /// scanned tip must still be served as due — an implementation that fed the effective target
-    /// into the expiry predicate would drop it and answer `false`.
+    /// THE M2 HARD RULE, as upstream `DuenessTargets` encodes it: the estimate never DECIDES an
+    /// expiry — but it does WITHHOLD a doomed broadcast (upstream's protective refusal, A4). A
+    /// proved row due at the SCANNED tip whose expiry only the ESTIMATED target has passed:
+    /// - is served without the estimate (the scanned view proves nothing wrong with it);
+    /// - is NOT served with the estimate (if the estimate is right, a node would reject the
+    ///   submission — withholding wastes nothing and is reversible);
+    /// - is treated as EXPIRED nowhere (no attention verdict, nothing marked or persisted): the
+    ///   expiry decision needs the scanned tip, and once withheld the row simply waits for the
+    ///   scanned tip to prove the expiry either way.
     #[test]
-    fn has_overdue_estimated_tip_never_accelerates_expiry() {
+    fn has_overdue_estimated_tip_withholds_a_doomed_broadcast_but_never_decides_expiry() {
         let path = init_fixture_db("zcashlc_overdue_estimate_expiry");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
         set_fixture_tip(path_bytes);
-        // Proved; due only under the estimate; expiry ABOVE the scanned target but far BELOW the
-        // estimated one.
+        // Proved; due at the SCANNED target already; expiry ABOVE the scanned target but far
+        // BELOW the estimated one.
         let state = test_state(
             MigrationStatus::InProgress,
             &[],
             &[MigrationTxState::Proved],
-            3_600_010,
+            3_499_000,
             3_600_020,
         );
         store_fixture_state(&path, &account, &state);
 
         assert!(
-            has_overdue(path_bytes, &account, 3_700_000),
-            "expiry must be judged at the SCANNED tip: the row is valid there and due under the \
-             estimate, so it IS overdue — treating it as expired means the estimate leaked into \
-             the expiry check"
+            has_overdue(path_bytes, &account, -1),
+            "without the estimate the scanned view serves the due, unexpired row"
+        );
+        assert!(
+            !has_overdue(path_bytes, &account, 3_700_000),
+            "the doomed broadcast is withheld: under the estimate the node would reject it"
+        );
+        assert!(
+            !unsafe {
+                zcashlc_migration_has_invalid_transfers(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    account.as_ptr(),
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "the withhold is not an expiry verdict: nothing reports the row as expired/invalid"
+        );
+        assert!(
+            has_overdue(path_bytes, &account, -1),
+            "nothing was marked or persisted by the withheld query: the scanned view still serves"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The delivery lane and the sync-gate predicate honour the same doomed-broadcast withhold: a
+    /// proved, scanned-due row whose expiry only the ESTIMATED target has passed is NOT served by
+    /// the delivery decision ([`next_due`], and over the FFI
+    /// [`zcashlc_migration_next_due_transfer`] answers `NothingDue`) and does NOT gate sync via
+    /// [`zcashlc_migration_has_ready_broadcast`] — while without the estimate both serve it.
+    #[test]
+    fn next_due_transfer_and_ready_broadcast_withhold_a_doomed_broadcast() {
+        let path = init_fixture_db("zcashlc_next_due_doomed");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        let scanned_tip = h(3_600_000);
+        // Proved; due at the SCANNED target; expiry between the scanned and estimated targets.
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Proved],
+            3_499_000,
+            3_600_020,
+        );
+        store_fixture_state(&path, &account, &state);
+
+        // The pure delivery decision: served on the scanned view, withheld under the estimate.
+        assert_eq!(
+            next_due(&state, dueness_targets(scanned_tip, -1)),
+            DueOutcome::Ready {
+                id: MigrationTransferId::new(0)
+            },
+            "without the estimate the proved, due, unexpired row is served"
+        );
+        assert_eq!(
+            next_due(&state, dueness_targets(scanned_tip, 3_700_000)),
+            DueOutcome::Nothing,
+            "under the estimate the doomed broadcast is withheld from the delivery lane"
+        );
+
+        // The same withhold over the FFI: the delivery call answers the benign NothingDue (it
+        // never reaches the artifact read), and the sync gate stops gating.
+        let ptr = unsafe {
+            zcashlc_migration_next_due_transfer(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                3_700_000,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "the withheld delivery answer is not an error"
+        );
+        assert!(
+            matches!(
+                unsafe { &*ptr }.status,
+                FfiPreparedTransferStatus::MigrationNothingDue
+            ),
+            "the doomed row must read as NothingDue under the estimate"
+        );
+        unsafe { zcashlc_free_migration_prepared_transfer(ptr) };
+        assert_eq!(
+            has_ready_broadcast(path_bytes, &account, -1),
+            1,
+            "without the estimate the row gates sync (a broadcast is servable right now)"
+        );
+        assert_eq!(
+            has_ready_broadcast(path_bytes, &account, 3_700_000),
+            0,
+            "the doomed row must not gate sync: serving it would only earn a rejection"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -9341,11 +10167,11 @@ mod tests {
     }
 
     /// The F1 pin: a REAL production-shaped transfer PCZT carries a PADDED 2-action Orchard
-    /// bundle, and [`transfer_funding_nullifiers`] reads a nullifier out of EVERY action. The
-    /// Android SDK's extractor requires exactly ONE action and returns `None` on this exact
-    /// artifact, which is what left its pass-3 foreign-spend check inert in production.
+    /// bundle, and [`pczt_digest`] reads a nullifier out of EVERY action. The Android SDK's
+    /// extractor requires exactly ONE action and returns `None` on this exact artifact, which is
+    /// what left its pass-3 foreign-spend check inert in production.
     #[test]
-    fn transfer_funding_nullifiers_extracts_every_action_of_a_padded_transfer() {
+    fn pczt_digest_extracts_every_action_of_a_padded_transfer() {
         let bytes = fixture_transfer_pczt_bytes(3_500_000, 3_500_040);
         let parsed = pczt::Pczt::parse(&bytes).expect("the fixture transfer parses");
         let action_count = parsed.orchard().actions().len();
@@ -9355,36 +10181,99 @@ mod tests {
              shape Android's exactly-one-action extractor refuses"
         );
 
-        let nullifiers = transfer_funding_nullifiers(&bytes)
+        let digest = pczt_digest(&bytes);
+        let nullifiers = digest
+            .nullifiers
             .expect("the padded transfer must yield its nullifiers");
         assert_eq!(
             nullifiers.len(),
             2,
             "every action's nullifier must be collected (the real funding spend plus the dummy)"
         );
+        assert_eq!(
+            digest.txid, None,
+            "an unproved transfer is not extractable yet — nullifiers present, txid absent"
+        );
     }
 
-    /// Garbage and empty bytes are unreadable — `None`, never a panic (the ambiguous-skip lane).
+    /// Garbage and empty bytes are unreadable — `None` on both digest halves, never a panic (the
+    /// ambiguous-skip lane).
     #[test]
-    fn transfer_funding_nullifiers_and_pczt_txid_reject_garbage() {
-        assert_eq!(transfer_funding_nullifiers(&[0u8; 32]), None);
-        assert_eq!(transfer_funding_nullifiers(&[]), None);
-        assert_eq!(pczt_txid(&[0u8; 32]), None);
-        assert_eq!(pczt_txid(&[]), None);
+    fn pczt_digest_rejects_garbage() {
+        for bytes in [&[0u8; 32][..], &[]] {
+            let digest = pczt_digest(bytes);
+            assert_eq!(digest.nullifiers, None);
+            assert_eq!(digest.txid, None);
+        }
+    }
+
+    /// U14: the pinned upstream signing-round budgets are what this SDK's estimate math and the
+    /// platform's Keystone batching were designed around — a silent upstream change to either
+    /// capacity must fail here, not in a hardware-wallet session.
+    #[test]
+    fn pinned_signing_round_budgets_match_the_planning_assumptions() {
+        assert_eq!(
+            SigningRoundBudget::KEYSTONE.max_actions(),
+            96,
+            "the Keystone per-round action budget the estimates assume"
+        );
+        assert_eq!(
+            SigningRoundBudget::DEFAULT.max_actions(),
+            512,
+            "the default per-round action budget the estimates assume"
+        );
     }
 
     // `decide_foreign_spend` decision-logic tests (mirroring the Android SDK's suite, extended
-    // with the F1-fix dummy-nullifier guard).
+    // with the F1-fix dummy-nullifier guard and the A3 dependency-evidence gate).
+
+    /// A dependency-free candidate row (its funding notes are ordinary wallet notes, so the A3
+    /// gate passes vacuously).
+    fn candidate(
+        id: u32,
+        funding_nullifiers: Option<Vec<[u8; 32]>>,
+        own: Option<[u8; 32]>,
+    ) -> ForeignSpendCandidate {
+        candidate_with_deps(id, funding_nullifiers, own, &[])
+    }
+
+    /// A candidate row with explicit per-dependency PCZT-derived txids (the A3 evidence inputs).
+    fn candidate_with_deps(
+        id: u32,
+        funding_nullifiers: Option<Vec<[u8; 32]>>,
+        own: Option<[u8; 32]>,
+        dep_txids: &[Option<[u8; 32]>],
+    ) -> ForeignSpendCandidate {
+        ForeignSpendCandidate {
+            id: MigrationTransferId::new(id),
+            funding_nullifiers,
+            own_txid: own,
+            dep_txids: dep_txids.to_vec(),
+        }
+    }
+
+    /// Drives [`decide_foreign_spend`] with a set-backed, infallible stand-in for the wallet-DB
+    /// on-chain probe (production memoizes `get_tx_height` behind the same closure shape).
+    fn decide(
+        candidates: &[ForeignSpendCandidate],
+        wallet: &HashSet<[u8; 32]>,
+        unspent: &HashSet<[u8; 32]>,
+        on_chain: &HashSet<[u8; 32]>,
+    ) -> Option<MigrationTransferId> {
+        decide_foreign_spend(candidates, wallet, unspent, |txid: &[u8; 32]| {
+            Ok::<bool, std::convert::Infallible>(on_chain.contains(txid))
+        })
+        .unwrap()
+    }
 
     /// An unspent funding note never invalidates, regardless of the own-txid fields.
     #[test]
     fn decide_foreign_spend_unspent_funding_note_never_invalidated() {
-        let id = MigrationTransferId::new(3);
-        let candidates = vec![(id, Some(vec![nf(0x42)]), Some(own_txid(0x10)))];
+        let candidates = vec![candidate(3, Some(vec![nf(0x42)]), Some(own_txid(0x10)))];
         let wallet: HashSet<[u8; 32]> = [nf(0x42)].into_iter().collect();
         let unspent: HashSet<[u8; 32]> = [nf(0x42)].into_iter().collect();
         assert_eq!(
-            decide_foreign_spend(&candidates, &wallet, &unspent, &HashSet::new()),
+            decide(&candidates, &wallet, &unspent, &HashSet::new()),
             None,
             "an unspent funding note must never be invalidated"
         );
@@ -9396,14 +10285,17 @@ mod tests {
     /// transfer; wallet-note membership is what makes collecting every action's nullifier safe.
     #[test]
     fn decide_foreign_spend_dummy_nullifiers_never_invalidate() {
-        let id = MigrationTransferId::new(4);
         // Both nullifiers are dummies (unknown to the wallet); own txid readable, not on-chain —
         // every OTHER condition for invalidation holds.
-        let candidates = vec![(id, Some(vec![nf(0xD0), nf(0xD1)]), Some(own_txid(0x20)))];
+        let candidates = vec![candidate(
+            4,
+            Some(vec![nf(0xD0), nf(0xD1)]),
+            Some(own_txid(0x20)),
+        )];
         let wallet: HashSet<[u8; 32]> = [nf(0x01)].into_iter().collect();
         let unspent: HashSet<[u8; 32]> = HashSet::new();
         assert_eq!(
-            decide_foreign_spend(&candidates, &wallet, &unspent, &HashSet::new()),
+            decide(&candidates, &wallet, &unspent, &HashSet::new()),
             None,
             "a nullifier the wallet does not know must never count as a foreign spend"
         );
@@ -9413,14 +10305,13 @@ mod tests {
     /// (possibly crashed) broadcast — never invalidated (pass 2 promotes it instead).
     #[test]
     fn decide_foreign_spend_own_txid_on_chain_never_invalidated() {
-        let id = MigrationTransferId::new(5);
         let own = own_txid(0xAB);
-        let candidates = vec![(id, Some(vec![nf(0x55)]), Some(own))];
+        let candidates = vec![candidate(5, Some(vec![nf(0x55)]), Some(own))];
         let wallet: HashSet<[u8; 32]> = [nf(0x55)].into_iter().collect();
         let unspent: HashSet<[u8; 32]> = HashSet::new(); // 0x55 known and not unspent -> spent
         let on_chain: HashSet<[u8; 32]> = [own].into_iter().collect();
         assert_eq!(
-            decide_foreign_spend(&candidates, &wallet, &unspent, &on_chain),
+            decide(&candidates, &wallet, &unspent, &on_chain),
             None,
             "a spent nullifier whose own txid is on-chain must NOT be invalidated (the spender \
              is our own broadcast)"
@@ -9434,18 +10325,69 @@ mod tests {
         let wallet: HashSet<[u8; 32]> = [nf(0x77)].into_iter().collect();
         let unspent: HashSet<[u8; 32]> = HashSet::new();
         // Spent nullifier but own txid unreadable.
-        let unreadable_txid = vec![(MigrationTransferId::new(9), Some(vec![nf(0x77)]), None)];
+        let unreadable_txid = vec![candidate(9, Some(vec![nf(0x77)]), None)];
         assert_eq!(
-            decide_foreign_spend(&unreadable_txid, &wallet, &unspent, &HashSet::new()),
+            decide(&unreadable_txid, &wallet, &unspent, &HashSet::new()),
             None,
             "an unreadable own txid is ambiguous — must not invalidate"
         );
         // Unreadable PCZT (no nullifiers at all).
-        let unreadable_pczt = vec![(MigrationTransferId::new(1), None, Some(own_txid(0x01)))];
+        let unreadable_pczt = vec![candidate(1, None, Some(own_txid(0x01)))];
         assert_eq!(
-            decide_foreign_spend(&unreadable_pczt, &wallet, &unspent, &HashSet::new()),
+            decide(&unreadable_pczt, &wallet, &unspent, &HashSet::new()),
             None,
             "an unreadable funding-nullifier set is ambiguous — must not invalidate"
+        );
+    }
+
+    /// THE A3 GATE: a spent-reading candidate whose funding preparation the wallet DB does NOT
+    /// currently show mined — the store says `Mined`, but the creating transaction was demoted
+    /// by a rewind/rescan — is AMBIGUOUS and skipped, exactly like an unreadable dependency
+    /// txid. Positive on-chain evidence for every dependency is what admits the verdict.
+    #[test]
+    fn decide_foreign_spend_requires_positive_dependency_evidence() {
+        let wallet: HashSet<[u8; 32]> = [nf(0x66)].into_iter().collect();
+        let unspent: HashSet<[u8; 32]> = HashSet::new(); // 0x66 known and not unspent -> spent
+        let dep = own_txid(0xC1);
+
+        // Demoted creating tx: the dep txid is readable but NOT on-chain per the wallet DB.
+        let demoted = vec![candidate_with_deps(
+            6,
+            Some(vec![nf(0x66)]),
+            Some(own_txid(0x30)),
+            &[Some(dep)],
+        )];
+        assert_eq!(
+            decide(&demoted, &wallet, &unspent, &HashSet::new()),
+            None,
+            "a demoted funding preparation (rewind/rescan window) must skip, not invalidate"
+        );
+
+        // Unreadable dep txid: no positive evidence is derivable — skip.
+        let unreadable_dep = vec![candidate_with_deps(
+            7,
+            Some(vec![nf(0x66)]),
+            Some(own_txid(0x31)),
+            &[None],
+        )];
+        assert_eq!(
+            decide(&unreadable_dep, &wallet, &unspent, &HashSet::new()),
+            None,
+            "an unreadable dependency txid is ambiguous — must not invalidate"
+        );
+
+        // The dep IS currently mined (and the candidate's own txid is not): the verdict stands.
+        let on_chain: HashSet<[u8; 32]> = [dep].into_iter().collect();
+        let confirmed = vec![candidate_with_deps(
+            8,
+            Some(vec![nf(0x66)]),
+            Some(own_txid(0x32)),
+            &[Some(dep)],
+        )];
+        assert_eq!(
+            decide(&confirmed, &wallet, &unspent, &on_chain),
+            Some(MigrationTransferId::new(8)),
+            "with every dependency positively mined, the foreign spend is confirmed"
         );
     }
 
@@ -9458,26 +10400,14 @@ mod tests {
         let unspent: HashSet<[u8; 32]> = [nf(0x01)].into_iter().collect(); // only 0x01 unspent
         let candidates = vec![
             // Unspent -> skip.
-            (
-                MigrationTransferId::new(1),
-                Some(vec![nf(0x01), nf(0xD0)]),
-                Some(own_txid(0x01)),
-            ),
+            candidate(1, Some(vec![nf(0x01), nf(0xD0)]), Some(own_txid(0x01))),
             // Real spend (0x02) beside a dummy (0xD1) -> invalidate; first match wins.
-            (
-                MigrationTransferId::new(2),
-                Some(vec![nf(0x02), nf(0xD1)]),
-                Some(own_txid(0x02)),
-            ),
+            candidate(2, Some(vec![nf(0x02), nf(0xD1)]), Some(own_txid(0x02))),
             // Also spent, but id 2 already won.
-            (
-                MigrationTransferId::new(3),
-                Some(vec![nf(0x03)]),
-                Some(own_txid(0x03)),
-            ),
+            candidate(3, Some(vec![nf(0x03)]), Some(own_txid(0x03))),
         ];
         assert_eq!(
-            decide_foreign_spend(&candidates, &wallet, &unspent, &HashSet::new()),
+            decide(&candidates, &wallet, &unspent, &HashSet::new()),
             Some(MigrationTransferId::new(2)),
             "the first foreign-spent candidate must be the one invalidated"
         );
@@ -9580,6 +10510,129 @@ mod tests {
                 )
             },
             "no invalid mark may have been recorded"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- terminal broadcast rejections (`zcashlc_migration_record_transfer_result` tags 2/3) -----
+
+    fn record_result(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+        transfer_id: u32,
+        result_tag: i32,
+    ) -> bool {
+        unsafe {
+            zcashlc_migration_record_transfer_result(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                transfer_id,
+                result_tag,
+                std::ptr::null(),
+            )
+        }
+    }
+
+    /// Tags 2 (invalid note) and 3 (expired) record the ENGINE's own `Invalid` state with the
+    /// matching reason, persisted — the run then surfaces attention (`has_invalid_transfers`,
+    /// `Attend`) and the delivery lane stops offering the dead rows.
+    #[test]
+    fn record_transfer_result_terminal_tags_mark_the_engine_rows_invalid() {
+        let path = init_fixture_db("zcashlc_record_result_terminal");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Proved, MigrationTxState::Proved],
+            3_499_000,
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &state);
+        assert_eq!(
+            has_ready_broadcast(path_bytes, &account, -1),
+            1,
+            "sanity: the due proved rows are servable before the rejections land"
+        );
+
+        assert!(record_result(path_bytes, &account, 0, 2), "tag 2 records");
+        assert!(record_result(path_bytes, &account, 1, 3), "tag 3 records");
+
+        let stored = read_fixture_state(&path, &account);
+        assert_eq!(
+            stored.transactions()[0].state().invalid_reason(),
+            Some(InvalidReason::RejectedInvalid),
+            "tag 2 must persist rejected_invalid"
+        );
+        assert_eq!(
+            stored.transactions()[1].state().invalid_reason(),
+            Some(InvalidReason::RejectedExpired),
+            "tag 3 must persist rejected_expired"
+        );
+        assert!(
+            unsafe {
+                zcashlc_migration_has_invalid_transfers(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    account.as_ptr(),
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "the recorded rejections must surface as invalid transfers"
+        );
+        let (step, id, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_ATTEND,
+            "the run must ask for attention"
+        );
+        assert_eq!(id, 0, "the first invalid row is the one named");
+        assert_eq!(
+            has_ready_broadcast(path_bytes, &account, -1),
+            0,
+            "dead rows must no longer be servable"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `mark_invalid`'s no-op rules hold over the FFI: a terminal tag against a MINED row leaves
+    /// it mined (chain inclusion outranks a stale rejection verdict), against an unknown id it
+    /// records nothing — both still answer `true` (the outcome was consumed).
+    #[test]
+    fn record_transfer_result_terminal_tag_is_a_no_op_on_mined_and_unknown_rows() {
+        let path = init_fixture_db("zcashlc_record_result_noop");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MINED, MigrationTxState::Signed],
+            3_499_000,
+            4_000_000,
+        );
+        store_fixture_state(&path, &account, &state);
+
+        assert!(
+            record_result(path_bytes, &account, 0, 2),
+            "a stale rejection against a mined row is consumed"
+        );
+        assert!(
+            record_result(path_bytes, &account, 9, 3),
+            "a rejection naming an unknown id is consumed"
+        );
+        let stored = read_fixture_state(&path, &account);
+        assert!(
+            matches!(
+                stored.transactions()[0].state(),
+                MigrationTxState::Mined { .. }
+            ),
+            "the mined row must stay mined"
+        );
+        assert!(
+            matches!(stored.transactions()[1].state(), MigrationTxState::Signed),
+            "the unrelated row must be untouched"
         );
         let _ = std::fs::remove_file(&path);
     }

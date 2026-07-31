@@ -16,71 +16,30 @@
 //!
 //! [`WalletDb::transactionally_with_extension`]: zcash_client_sqlite::WalletDb::transactionally_with_extension
 
-use std::collections::HashSet;
-
 use schemerz_rusqlite::RusqliteMigration;
-use uuid::Uuid;
-use zcash_client_sqlite::wallet::init::{
-    WalletMigrationError, migrations::CURRENT_LEAF_MIGRATIONS,
-};
+use zcash_client_sqlite::wallet::init::WalletMigrationError;
 
 /// The SDK's external migrations, in the form [`WalletMigrator::with_external_migrations`]
-/// accepts.
+/// accepts. Currently EMPTY — the SDK keeps no extension tables — but the registration
+/// point stays wired so a future table only has to add its migration here.
+///
+/// # Retired migrations
+///
+/// `AddInvalidTransferMarksTable` (id `0e1fd980-5cad-41c5-a6db-183dab527dcc` — reserved
+/// forever, never reuse it) created `ext_zcashlc_orchard_ironwood_migration_invalid_marks`,
+/// the side table that recorded terminal pool-migration rejection classifications back when
+/// the engine had no failure states. The engine now records that evidence itself
+/// (`MigrationTxState::Invalid` via `MigrationState::mark_invalid`), so the migration is no
+/// longer registered: fresh wallets never create the table, and
+/// `crate::migration::migrate_legacy_invalid_marks` folds any surviving rows into the
+/// engine state on open and drops it. Removing (rather than keeping) the registration is
+/// safe because `schemerz`'s `Migrator::up` walks REGISTERED migrations only and checks
+/// each against the applied set — a recorded id it no longer knows is simply never
+/// consulted, so wallets that already ran the migration keep its inert row in the
+/// migrations table and are otherwise unaffected.
 ///
 /// [`WalletMigrator::with_external_migrations`]: zcash_client_sqlite::wallet::init::WalletMigrator::with_external_migrations
 pub(crate) fn external_migrations() -> Vec<Box<dyn RusqliteMigration<Error = WalletMigrationError>>>
 {
-    vec![Box::new(AddInvalidTransferMarksTable)]
-}
-
-const ADD_INVALID_TRANSFER_MARKS_TABLE_ID: Uuid =
-    Uuid::from_u128(0x0e1fd980_5cad_41c5_a6db_183dab527dcc);
-
-/// Adds `ext_zcashlc_orchard_ironwood_migration_invalid_marks`, the table recording
-/// terminal rejection classifications for Orchard -> Ironwood pool-migration transfers.
-///
-/// The engine has no failure states (a rejected broadcast leaves the transaction re-offered),
-/// so the platform's rejection classifier records terminal rejections here, keyed by account
-/// and the engine's per-run transaction id; see the accessors in [`crate::migration`]. The
-/// account is stored as raw uuid bytes rather than a foreign key into `accounts`, per the
-/// extension contract's warning against depending on wallet-internal ids.
-struct AddInvalidTransferMarksTable;
-
-impl schemerz::Migration<Uuid> for AddInvalidTransferMarksTable {
-    fn id(&self) -> Uuid {
-        ADD_INVALID_TRANSFER_MARKS_TABLE_ID
-    }
-
-    fn dependencies(&self) -> HashSet<Uuid> {
-        // The marks annotate the engine's pool-migration transactions, whose tables are
-        // registered in the wallet's own migration graph; anchoring on the wallet's leaf
-        // frontier guarantees they exist first.
-        CURRENT_LEAF_MIGRATIONS.iter().copied().collect()
-    }
-
-    fn description(&self) -> &'static str {
-        "Adds the SDK's invalid-transfer marks table for Orchard -> Ironwood pool migrations."
-    }
-}
-
-impl RusqliteMigration for AddInvalidTransferMarksTable {
-    type Error = WalletMigrationError;
-
-    fn up(&self, transaction: &rusqlite::Transaction) -> Result<(), Self::Error> {
-        transaction.execute_batch(
-            "CREATE TABLE ext_zcashlc_orchard_ironwood_migration_invalid_marks (
-                account_uuid BLOB NOT NULL,
-                tx_id INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                PRIMARY KEY (account_uuid, tx_id)
-            )",
-        )?;
-        Ok(())
-    }
-
-    fn down(&self, _transaction: &rusqlite::Transaction) -> Result<(), Self::Error> {
-        Err(WalletMigrationError::CannotRevert(
-            ADD_INVALID_TRANSFER_MARKS_TABLE_ID,
-        ))
-    }
+    Vec::new()
 }
