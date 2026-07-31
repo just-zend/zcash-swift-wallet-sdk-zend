@@ -1,175 +1,220 @@
-#!/bin/bash
-# Full SDK release workflow
-# Usage: ./Scripts/release.sh <remote> <version>
+#!/usr/bin/env bash
 #
-# This script performs the COMPLETE release process:
-#   1. Pre-flight checks (clean dir, branch, GPG)
-#   2. Builds xcframework and uploads draft release (via prepare-release.sh)
-#   3. Updates Package.swift with URL and checksum
-#   4. Commits the Package.swift change
-#   5. Pauses for manual verification of the draft release
-#   6. Creates a signed tag
-#   7. Pushes to the specified remote
-#   8. Publishes the GitHub release
+# release.sh: tag and publish a release whose pull request has merged.
 #
-# Arguments:
-#   <remote>   The git remote pointing to zcash/zcash-swift-wallet-sdk
-#              (e.g., 'origin' or 'upstream')
-#   <version>  The version to release (e.g., '2.5.0')
+# This is the last step. Scripts/prepare-release.sh has already cut the
+# branches, opened and readied the pull request, built the XCFramework, and
+# pointed Package.swift at it; someone has merged that pull request into
+# release/X.Y.Z. What is left is to sign the tag, push it, and take the GitHub
+# release out of draft.
+#
+# Usage:
+#   ./Scripts/release.sh [--dry-run] <remote> <version>
+#
+#   <remote>   git remote for the repository being released, e.g. upstream
+#   <version>  the version to release, e.g. 2.7.1
 #
 # Prerequisites:
-#   - gh CLI installed and authenticated
-#   - Rust toolchain with all Apple targets
-#   - GPG key configured for signing tags
-#   - Clean working directory (no uncommitted changes)
+#   - run from release/X.Y.Z, with the pull request merged
+#   - gh installed and authenticated
+#   - a tag signing key configured
 #
-# For security releases where you need more control over timing,
-# use prepare-release.sh instead and perform steps manually.
+# Afterwards, merge release/X.Y.Z back into its maint/ branch and forward along
+# the chain, as described in CONTRIBUTING.md.
 
-set -e
+set -euo pipefail
 
-# Ensure Rust toolchain is on PATH (needed when invoked from Xcode build phases)
-if [[ -f "$HOME/.cargo/env" ]]; then
-    source "$HOME/.cargo/env"
-fi
+cd "$(git rev-parse --show-toplevel)"
+# shellcheck source=lib/release-lib.sh
+. "Scripts/lib/release-lib.sh"
 
-cd "$(dirname "$0")/.."
+usage() {
+    cat <<'EOF'
+Usage: ./Scripts/release.sh [--dry-run] <remote> <version>
 
-if [[ -z "$1" ]] || [[ -z "$2" ]]; then
-    echo "Usage: $0 <remote> <version>"
-    echo "Example: $0 upstream 2.5.0"
-    echo ""
-    echo "Available remotes:"
-    git remote -v
-    exit 1
-fi
+Tag and publish a release whose pull request has already merged into
+release/X.Y.Z. Run it from that branch.
 
-UPSTREAM_REMOTE="$1"
-VERSION="$2"
+Options:
+  --dry-run  print what would happen and change nothing
+EOF
+}
 
-# Verify the remote exists
-if ! git remote get-url "$UPSTREAM_REMOTE" &>/dev/null; then
-    echo "Error: Remote '$UPSTREAM_REMOTE' does not exist."
-    echo ""
-    echo "Available remotes:"
-    git remote -v
-    exit 1
-fi
-REPO="zcash/zcash-swift-wallet-sdk"
-PRODUCTS_DIR="BuildSupport/products"
+main() {
+    local remote version release_branch declared_version declared_checksum
+    local asset_checksum dir is_draft
 
-echo "=== SDK Release ${VERSION} ==="
-echo ""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) DRY_RUN=true; shift ;;
+            -h|--help) usage; return 0 ;;
+            --*)       usage >&2; die "unknown option '$1'" ;;
+            *)         break ;;
+        esac
+    done
 
-# Verify clean working directory
-if [[ -n $(git status --porcelain) ]]; then
-    echo "Error: Working directory is not clean."
-    echo "Please commit or stash your changes before releasing."
-    git status --short
-    exit 1
-fi
+    if [ $# -lt 2 ]; then
+        usage >&2
+        die "release.sh needs a remote and a version."
+    fi
+    remote="$1"
+    version="${2#v}"
+    release_branch="release/${version}"
 
-# Verify we're on main branch
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [[ "$CURRENT_BRANCH" != "main" ]]; then
-    echo "Warning: You are on branch '$CURRENT_BRANCH', not 'main'."
-    read -p "Continue anyway? [y/N] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    step "Checking preconditions"
+    require_clean_tree
+    require_remote "$remote"
+    require_gh_auth
+
+    GH_REPO="$(repo_for_remote "$remote")"
+    export GH_REPO
+    echo "  repository: ${GH_REPO}"
+
+    # The old script checked for `main`, which contradicts the branch model in
+    # CONTRIBUTING.md: release/X.Y.Z is what gets tagged.
+    if [ "$(git rev-parse --abbrev-ref HEAD)" != "$release_branch" ]; then
+        die "release.sh must run from ${release_branch}." \
+            "You are on $(git rev-parse --abbrev-ref HEAD)." \
+            "Merge the release pull request, then check out ${release_branch}."
+    fi
+
+    echo "  fetching ${remote} ..."
+    if ! git fetch --tags "$remote" >/dev/null 2>&1; then
+        die "git fetch ${remote} failed." \
+            "The already-tagged check below would otherwise run on stale tags."
+    fi
+
+    # A local tag with no remote counterpart is the signature of a previous run
+    # that died between tagging and pushing, so say which case this is rather
+    # than reporting the bare fact and leaving the operator to investigate.
+    if git rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
+        if git ls-remote --tags --exit-code "$remote" "refs/tags/${version}" >/dev/null 2>&1; then
+            die "${version} is already tagged on ${remote}; this release is out." \
+                "If it still shows as a draft, publish it with:" \
+                "  gh release edit ${version} --repo ${GH_REPO} --draft=false"
+        fi
+        die "${version} is tagged locally but not on ${remote}." \
+            "A previous run probably stopped between tagging and pushing." \
+            "Resume with:" \
+            "  git push ${remote} ${release_branch} ${version}" \
+            "  gh release edit ${version} --repo ${GH_REPO} --draft=false" \
+            "Or discard the local tag and start over: git tag -d ${version}"
+    fi
+
+    if ! git config --get user.signingkey >/dev/null 2>&1; then
+        die "no tag signing key is configured." \
+            "Run: git config --global user.signingkey <your-key-id>"
+    fi
+
+    step "Verifying Package.swift against the uploaded artifact"
+
+    declared_version="$(package_swift_url_version Package.swift)"
+    if [ "$declared_version" != "$version" ]; then
+        die "Package.swift points at ${declared_version}, not ${version}." \
+            "The release pull request may not have merged into this branch."
+    fi
+
+    if ! gh release view "$version" --repo "$GH_REPO" >/dev/null 2>&1; then
+        die "there is no ${version} release on ${GH_REPO}." \
+            "Run 'prepare-release.sh build' first."
+    fi
+
+    is_draft="$(gh release view "$version" --repo "$GH_REPO" --json isDraft --jq .isDraft)"
+    if [ "$is_draft" != "true" ]; then
+        die "release ${version} on ${GH_REPO} is already published."
+    fi
+
+    # SwiftPM validates this checksum when it fetches the binary target, so a
+    # mismatch does not fail here -- it fails in every consumer's build, after
+    # the release is public. Verify against the asset itself, not release.env.
+    declared_checksum="$(package_swift_checksum Package.swift)"
+    dir="$(mktemp -d)"
+    if ! gh release download "$version" --repo "$GH_REPO" \
+            --pattern "$ZIP_FILE" --dir "$dir" >/dev/null; then
+        rm -rf "$dir"
+        die "could not download ${ZIP_FILE} from the ${version} release." \
+            "The release exists but may carry no asset. Check" \
+            "https://github.com/${GH_REPO}/releases/tag/${version}, or re-run" \
+            "'prepare-release.sh build --rebuild' to rebuild and re-upload it."
+    fi
+    asset_checksum="$(shasum -a 256 "${dir}/${ZIP_FILE}" | awk '{print $1}')"
+    rm -rf "$dir"
+
+    if [ "$declared_checksum" != "$asset_checksum" ]; then
+        die "checksum mismatch between Package.swift and the uploaded asset." \
+            "Package.swift declares: ${declared_checksum}" \
+            "${ZIP_FILE} hashes to:  ${asset_checksum}" \
+            "Re-run 'prepare-release.sh build --rebuild' to reconcile them."
+    fi
+    echo "  checksum matches: ${asset_checksum}"
+
+    # From here on the actions are effectively permanent: a pushed tag and a
+    # published release are not things to retract quietly. Each step therefore
+    # reports what has already happened if the next one fails, rather than
+    # letting `set -e` abort with only the underlying tool's message.
+    step "Creating the signed tag ${version}"
+    run git tag -s "$version" -m "Release ${version}"
+
+    step "Pushing ${release_branch} and ${version} to ${remote}"
+    if ! run git push "$remote" "$release_branch" "$version"; then
+        cat >&2 <<EOF
+
+error: the push failed. The signed tag ${version} EXISTS LOCALLY but may not
+have reached ${remote}, and the release is still a draft.
+
+Check with:
+  git ls-remote --tags ${remote} refs/tags/${version}
+
+Then either retry:
+  git push ${remote} ${release_branch} ${version}
+  gh release edit ${version} --repo ${GH_REPO} --draft=false
+
+or discard the local tag and start over:
+  git tag -d ${version}
+EOF
         exit 1
     fi
-fi
 
-# Check if tag already exists
-if git rev-parse "$VERSION" >/dev/null 2>&1; then
-    echo "Error: Tag $VERSION already exists."
-    exit 1
-fi
+    step "Publishing the release"
+    if ! run gh release edit "$version" --repo "$GH_REPO" --draft=false; then
+        cat >&2 <<EOF
 
-# Verify GPG signing is configured
-if ! git config --get user.signingkey >/dev/null 2>&1; then
-    echo "Error: No GPG signing key configured."
-    echo "Run: git config --global user.signingkey <your-key-id>"
-    exit 1
-fi
+error: the release could not be published.
 
-# === Step 1: Build and upload draft release ===
-echo "=== Step 1/6: Build and upload draft release ==="
-./Scripts/prepare-release.sh "$VERSION"
+${release_branch} and the signed tag ${version} ARE already on ${remote}, and
+the tag is public -- do not delete it. Only the draft release remains. Publish
+it by hand with:
 
-# Read release info written by prepare-release.sh
-source "$PRODUCTS_DIR/release.env"
+  gh release edit ${version} --repo ${GH_REPO} --draft=false
 
-echo ""
-echo "=== Step 2/6: Updating Package.swift ==="
+or from https://github.com/${GH_REPO}/releases/tag/${version}
+EOF
+        exit 1
+    fi
 
-# Update the binaryTarget URL and checksum in Package.swift
-sed -i.bak -E \
-    -e "s|(url: \"https://github.com/${REPO}/releases/download/)[^\"]+(/libzcashlc.xcframework.zip\")|\1${VERSION}\2|" \
-    -e "s|(checksum: \")[^\"]+(\")|\1${CHECKSUM}\2|" \
-    Package.swift
-rm -f Package.swift.bak
+    # Under --dry-run none of the three steps above ran, so the summary must
+    # not claim the release is out.
+    if [ "$DRY_RUN" = "true" ]; then
+        cat <<EOF
 
-# Verify the update worked
-if ! grep -q "download/${VERSION}/libzcashlc.xcframework.zip" Package.swift; then
-    echo "Error: Failed to update Package.swift URL"
-    git checkout Package.swift
-    exit 1
-fi
+Dry run: nothing was tagged, pushed or published. ${version} is not released.
 
-if ! grep -q "checksum: \"${CHECKSUM}\"" Package.swift; then
-    echo "Error: Failed to update Package.swift checksum"
-    git checkout Package.swift
-    exit 1
-fi
+A real run would sign and push the tag ${version}, publish
+https://github.com/${GH_REPO}/releases/tag/${version}, and then need
+${release_branch} merged back into its maint/ branch.
+EOF
+    else
+        cat <<EOF
 
-echo "Package.swift updated with:"
-echo "  URL: ${DOWNLOAD_URL}"
-echo "  Checksum: ${CHECKSUM}"
+Release ${version} is out.
 
-echo ""
-echo "=== Step 3/6: Committing Package.swift ==="
-git add Package.swift
-git commit -m "Prepare release ${VERSION}"
+  https://github.com/${GH_REPO}/releases/tag/${version}
 
-# === Confirmation step ===
-echo ""
-echo "=========================================="
-echo "  Draft release uploaded and Package.swift committed."
-echo "  Please verify the draft release before continuing:"
-echo ""
-echo "  https://github.com/${REPO}/releases/tag/${VERSION}"
-echo "=========================================="
-echo ""
-read -p "Proceed with tagging, pushing, and publishing? [y/N] " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo ""
-    echo "Release paused. To resume manually:"
-    echo "  git tag -s ${VERSION} -m \"Release ${VERSION}\""
-    echo "  git push ${UPSTREAM_REMOTE} ${CURRENT_BRANCH} ${VERSION}"
-    echo "  gh release edit ${VERSION} --repo ${REPO} --draft=false"
-    exit 0
-fi
+Now merge ${release_branch} back into its maint/ branch, then forward along the
+chain to newer maint/ branches and finally to main, as described in
+CONTRIBUTING.md. Skipping a forward merge is how a fix silently regresses.
+EOF
+    fi
+}
 
-echo ""
-echo "=== Step 4/6: Creating signed tag ==="
-git tag -s "$VERSION" -m "Release ${VERSION}"
-
-echo ""
-echo "=== Step 5/6: Pushing to $UPSTREAM_REMOTE ==="
-git push "$UPSTREAM_REMOTE" "$CURRENT_BRANCH" "$VERSION"
-
-echo ""
-echo "=== Step 6/6: Publishing release ==="
-gh release edit "$VERSION" --repo "$REPO" --draft=false
-
-echo ""
-echo "=========================================="
-echo "  Release ${VERSION} complete!"
-echo "=========================================="
-echo ""
-echo "  GitHub Release: https://github.com/${REPO}/releases/tag/${VERSION}"
-echo "  Package.swift updated and pushed"
-echo "  Signed tag ${VERSION} created and pushed"
-echo ""
+main "$@"
