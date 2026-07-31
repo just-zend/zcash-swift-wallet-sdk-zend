@@ -94,6 +94,17 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertFalse(hasOverdue)
     }
 
+    /// The sync-gate's work-pending predicate over the real FFI: a fresh wallet with no stored run
+    /// answers `false` (the benign `0`, not the `-1` error sentinel) — at the scanned tip and
+    /// under an estimate alike.
+    func testFreshWalletHasNoReadyBroadcast() async throws {
+        let atScannedTip = try await rustBackend.migrationHasReadyBroadcast(for: account, estimatedTip: nil)
+        XCTAssertFalse(atScannedTip)
+
+        let underEstimate = try await rustBackend.migrationHasReadyBroadcast(for: account, estimatedTip: 3_000_000)
+        XCTAssertFalse(underEstimate)
+    }
+
     func testFreshWalletHasNoInvalidTransfers() async throws {
         let hasInvalid = try await rustBackend.migrationHasInvalidTransfers(for: account)
         XCTAssertFalse(hasInvalid)
@@ -627,6 +638,31 @@ final class MigrationFFITests: XCTestCase {
 
         let expired = try XCTUnwrap(makeStatus(blockedOn: 5).unsafeToMigrationTransactionStatus())
         XCTAssertEqual(expired.blockedOn, .expired)
+
+        let invalid = try XCTUnwrap(makeStatus(blockedOn: 6).unsafeToMigrationTransactionStatus())
+        XCTAssertEqual(invalid.blockedOn, .invalid)
+    }
+
+    /// The Invalid lifecycle state (discriminant 5) folds `invalid_reason` into
+    /// `.invalid(reason:)` the way Mined folds its height: `0` = fundingSpent,
+    /// `1` = rejectedInvalid, `2` = rejectedExpired.
+    func testDecodeMapsInvalidStateWithEachReason() throws {
+        let fundingSpent = try XCTUnwrap(makeStatus(state: 5, invalidReason: 0).unsafeToMigrationTransactionStatus())
+        XCTAssertEqual(fundingSpent.state, .invalid(reason: .fundingSpent))
+
+        let rejectedInvalid = try XCTUnwrap(makeStatus(state: 5, invalidReason: 1).unsafeToMigrationTransactionStatus())
+        XCTAssertEqual(rejectedInvalid.state, .invalid(reason: .rejectedInvalid))
+
+        let rejectedExpired = try XCTUnwrap(makeStatus(state: 5, invalidReason: 2).unsafeToMigrationTransactionStatus())
+        XCTAssertEqual(rejectedExpired.state, .invalid(reason: .rejectedExpired))
+    }
+
+    /// An Invalid row without its reason payload (`-1` — the "not invalid" sentinel) or with an
+    /// out-of-range one violates the FFI contract: decode treats it as malformed rather than
+    /// inventing a reason, mirroring the broadcast-without-txid rule below.
+    func testDecodeReturnsNilForAnInvalidStateWithoutAValidReason() {
+        XCTAssertNil(makeStatus(state: 5, invalidReason: -1).unsafeToMigrationTransactionStatus())
+        XCTAssertNil(makeStatus(state: 5, invalidReason: 99).unsafeToMigrationTransactionStatus())
     }
 
     func testDecodeReturnsNilForAnOutOfRangeState() {
@@ -724,6 +760,130 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertNil(decoded.anchorBoundaryHeight, "a preparation never carries a drawn boundary")
     }
 
+    // MARK: - Advance step decode mapping
+    //
+    // `FfiMigrationAdvanceStep`'s marshal into `MigrationAdvanceStep`, constructed directly like
+    // the status rows above. The discriminants are asserted through the header's exported
+    // `ZCASHLC_ADVANCE_STEP_*` constants (U3) — the same names the decode itself matches on — so
+    // a renumbering on either side surfaces here.
+
+    /// Every step discriminant decodes to its case; `requiresAttention` (ATTEND) carries the id
+    /// like the other id-bearing steps.
+    func testAdvanceStepDecodeMapsEveryStepIncludingAttend() throws {
+        let prove = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE), id: 4, kindIsPreparation: false, kindCrossing: 2)
+        XCTAssertEqual(prove.unsafeToMigrationAdvanceStep(), .prove(id: 4, kind: .transfer(crossing: 2)))
+
+        let provePreparation = makeAdvanceStep(
+            step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE),
+            id: 5,
+            kindIsPreparation: true,
+            kindLayer: 1,
+            kindIndex: 3
+        )
+        XCTAssertEqual(provePreparation.unsafeToMigrationAdvanceStep(), .prove(id: 5, kind: .preparation(layer: 1, index: 3)))
+
+        let broadcast = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_BROADCAST), id: 6)
+        XCTAssertEqual(broadcast.unsafeToMigrationAdvanceStep(), .broadcast(id: 6))
+
+        let rebuild = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_REBUILD), id: 7)
+        XCTAssertEqual(rebuild.unsafeToMigrationAdvanceStep(), .rebuild(id: 7))
+
+        let waiting = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_WAITING), id: 0)
+        XCTAssertEqual(waiting.unsafeToMigrationAdvanceStep(), .waiting)
+
+        let complete = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_COMPLETE), id: 0)
+        XCTAssertEqual(complete.unsafeToMigrationAdvanceStep(), .complete)
+
+        let attend = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_ATTEND), id: 9)
+        XCTAssertEqual(
+            attend.unsafeToMigrationAdvanceStep(),
+            .requiresAttention(id: 9),
+            "the engine's Attend step must pass through verbatim, carrying the invalid transaction's id"
+        )
+    }
+
+    func testAdvanceStepDecodeReturnsNilForAnOutOfRangeStep() {
+        XCTAssertNil(makeAdvanceStep(step: 99, id: 1).unsafeToMigrationAdvanceStep())
+    }
+
+    // MARK: - Routed migration error parsing (U13)
+    //
+    // `migrationRoutedError` parses the rust layer's stable message prefixes; the branches are
+    // pinned directly (internal member) because no offline path can drive each prefix through a
+    // real FFI failure.
+
+    /// `MIGRATION_WAKEUP_INFEASIBLE:<id>` parses the id into `.migrationWakeupInfeasible(id)`.
+    func testMigrationRoutedErrorParsesWakeupInfeasibleWithItsTransferId() throws {
+        let backend = try XCTUnwrap(rustBackend as? ZcashRustBackend)
+
+        let routed = backend.migrationRoutedError(
+            "MIGRATION_WAKEUP_INFEASIBLE:17",
+            fallback: ZcashError.rustMigrationSyncWakeups
+        )
+
+        guard case .migrationWakeupInfeasible(let transferId) = routed else {
+            XCTFail("expected migrationWakeupInfeasible, got \(routed)")
+            return
+        }
+        XCTAssertEqual(transferId, 17)
+    }
+
+    /// A malformed id (contract drift) degrades to the member's own fallback case rather than
+    /// fabricating a transfer id.
+    func testMigrationRoutedErrorDegradesAMalformedWakeupInfeasibleIdToTheFallback() throws {
+        let backend = try XCTUnwrap(rustBackend as? ZcashRustBackend)
+
+        for malformed in ["MIGRATION_WAKEUP_INFEASIBLE:", "MIGRATION_WAKEUP_INFEASIBLE:abc", "MIGRATION_WAKEUP_INFEASIBLE:-3"] {
+            let routed = backend.migrationRoutedError(malformed, fallback: ZcashError.rustMigrationSyncWakeups)
+
+            guard case .rustMigrationSyncWakeups(let message) = routed else {
+                XCTFail("expected the rustMigrationSyncWakeups fallback for \(malformed), got \(routed)")
+                return
+            }
+            XCTAssertEqual(message, malformed, "the fallback must carry the raw message untouched")
+        }
+    }
+
+    /// The two payload-less prefixes route to their dedicated cases.
+    func testMigrationRoutedErrorRoutesPlanStaleAndProvingUnavailable() throws {
+        let backend = try XCTUnwrap(rustBackend as? ZcashRustBackend)
+
+        let planStale = backend.migrationRoutedError(
+            "MIGRATION_PLAN_STALE: the previewed plan was superseded",
+            fallback: ZcashError.rustMigrationSignAndStoreSchedule
+        )
+        guard case .migrationPlanStale = planStale else {
+            XCTFail("expected migrationPlanStale, got \(planStale)")
+            return
+        }
+
+        let provingUnavailable = backend.migrationRoutedError(
+            "MIGRATION_PROVING_UNAVAILABLE: prover parameters missing",
+            fallback: ZcashError.rustMigrationProvePending
+        )
+        guard case .migrationProvingUnavailable(let message) = provingUnavailable else {
+            XCTFail("expected migrationProvingUnavailable, got \(provingUnavailable)")
+            return
+        }
+        XCTAssertTrue(message.hasPrefix("MIGRATION_PROVING_UNAVAILABLE"))
+    }
+
+    /// An unrelated message — including one merely CONTAINING a known prefix mid-string — falls
+    /// through to the member's own case untouched.
+    func testMigrationRoutedErrorLeavesUnrelatedMessagesToTheFallback() throws {
+        let backend = try XCTUnwrap(rustBackend as? ZcashRustBackend)
+
+        for unrelated in ["sqlite disk I/O error", "saw MIGRATION_PLAN_STALE downstream"] {
+            let routed = backend.migrationRoutedError(unrelated, fallback: ZcashError.rustMigrationRestartStep)
+
+            guard case .rustMigrationRestartStep(let message) = routed else {
+                XCTFail("expected the rustMigrationRestartStep fallback for \(unrelated), got \(routed)")
+                return
+            }
+            XCTAssertEqual(message, unrelated)
+        }
+    }
+
     // MARK: - Actor integration over real FFI (nil paths)
 
     /// Constructs a real `OrchardMigration` via the injecting initializer, wired to the SAME
@@ -748,7 +908,7 @@ final class MigrationFFITests: XCTestCase {
                 accountUUID: account,
                 bufferDuration: 600,
                 tickInterval: 3600,
-                overdueProvider: { false },
+                readyBroadcastProvider: { false },
                 logger: logger
             ),
             logger: logger
@@ -776,7 +936,7 @@ final class MigrationFFITests: XCTestCase {
     /// every migration FFI call on a `.regtest`/custom network id (2) throws "custom network (id 2)
     /// used before it was configured" (see `rust/src/lib.rs`'s `parse_network`), which
     /// `migrationAdvanceStep()` surfaces as `rustMigrationAdvanceStep`, and which
-    /// `isSyncBlocked()`/the gate's `overdueProvider` silently swallow via `try?` instead (finding
+    /// `isSyncBlocked()`/the gate's `readyBroadcastProvider` silently swallow via `try?` instead (finding
     /// 5's "migration dead on .custom/.regtest").
     ///
     /// `NetworkActivationHeights` here intentionally matches
@@ -904,6 +1064,27 @@ final class MigrationFFITests: XCTestCase {
     ///   see `testDecodeMapsDependsOnIds` below, which scopes one via
     ///   `withUnsafeMutableBufferPointer`, mirroring `testDecodeContainerMapsMultipleRowsInEngineOrder`'s
     ///   existing pattern for the outer container.
+    /// Builds an `FfiMigrationAdvanceStep` with the per-kind payload fields defaulted to their
+    /// "not a Prove step" zeroes, mirroring the FFI contract (`kind_*` meaningful only for
+    /// `ZCASHLC_ADVANCE_STEP_PROVE`).
+    private func makeAdvanceStep(
+        step: UInt32,
+        id: UInt32,
+        kindIsPreparation: Bool = false,
+        kindLayer: UInt32 = 0,
+        kindIndex: UInt32 = 0,
+        kindCrossing: UInt32 = 0
+    ) -> FfiMigrationAdvanceStep {
+        FfiMigrationAdvanceStep(
+            step: step,
+            id: id,
+            kind_is_preparation: kindIsPreparation,
+            kind_layer: kindLayer,
+            kind_index: kindIndex,
+            kind_crossing: kindCrossing
+        )
+    }
+
     private func makeStatus(
         id: UInt32 = 7,
         isTransfer: Bool = true,
@@ -921,7 +1102,8 @@ final class MigrationFFITests: XCTestCase {
         blockedOn: UInt8 = 0,
         dependsOnPtr: UnsafeMutablePointer<UInt32>? = nil,
         dependsOnLen: UInt = 0,
-        anchorBoundary: Int64 = -1
+        anchorBoundary: Int64 = -1,
+        invalidReason: Int32 = -1
     ) -> FfiMigrationTransactionStatus {
         FfiMigrationTransactionStatus(
             id: id,
@@ -940,7 +1122,8 @@ final class MigrationFFITests: XCTestCase {
             blocked_on: blockedOn,
             depends_on: dependsOnPtr,
             depends_on_len: dependsOnLen,
-            anchor_boundary: anchorBoundary
+            anchor_boundary: anchorBoundary,
+            invalid_reason: invalidReason
         )
     }
 }

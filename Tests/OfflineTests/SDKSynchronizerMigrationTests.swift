@@ -56,7 +56,8 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
             .broadcast(id: 5),
             .rebuild(id: 6),
             .waiting,
-            .complete
+            .complete,
+            .requiresAttention(id: 7)
         ]
 
         for expectedStep in cases {
@@ -507,7 +508,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     func testIsMigrationSyncBlockedForwardsToHostPredicate() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountUUID)]
-        welding.migrationHasOverdueTransfersForEstimatedTipReturnValue = true
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
 
         let blocked = await synchronizer.isMigrationSyncBlocked()
@@ -520,7 +521,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     func testMigrationSyncBlockedStreamForwardsToHostStream() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountUUID)]
-        welding.migrationHasOverdueTransfersForEstimatedTipReturnValue = true
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, tickInterval: 0.02))
 
         var received: [Bool] = []
@@ -552,7 +553,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     func testStartThrowsMigrationSyncBlockedWhenHostReportsBlocked() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountUUID)]
-        welding.migrationHasOverdueTransfersForEstimatedTipReturnValue = true
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
         await synchronizer.updateStatus(.stopped)
 
@@ -854,7 +855,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
                         bufferDuration: 600,
                         tickInterval: tickInterval,
                         now: { Date() },
-                        overdueProvider: { (try? await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: nil)) ?? false },
+                        readyBroadcastProvider: { (try? await welding.migrationHasReadyBroadcast(for: accountUUID, estimatedTip: nil)) ?? false },
                         logger: logger
                     ),
                     logger: logger

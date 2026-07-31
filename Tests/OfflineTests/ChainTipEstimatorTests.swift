@@ -3,8 +3,8 @@
 //  OfflineTests
 //
 //  Pure-math tests for `ChainTipEstimator`: the measured-block-rate wall-clock chain-tip
-//  projection behind `Synchronizer.estimatedMigrationChainTip(accountUUID:)` /
-//  `.estimatedMigrationSecondsPerBlock(accountUUID:)` and every `useEstimatedTip: true` call site.
+//  projection behind `Synchronizer.estimatedMigrationChainTip()` /
+//  `.estimatedMigrationSecondsPerBlock()` and every `useEstimatedTip: true` call site.
 //  No network, no FFI, no wallet database -- `ChainTipEstimator` is constructed directly from
 //  hand-built `MigrationBlockRateSample` fixtures.
 //

@@ -2823,49 +2823,45 @@ class SynchronizerMock: Synchronizer {
 
     // MARK: - estimatedMigrationChainTip
 
-    var estimatedMigrationChainTipAccountUUIDThrowableError: Error?
-    var estimatedMigrationChainTipAccountUUIDCallsCount = 0
-    var estimatedMigrationChainTipAccountUUIDCalled: Bool {
-        return estimatedMigrationChainTipAccountUUIDCallsCount > 0
+    var estimatedMigrationChainTipThrowableError: Error?
+    var estimatedMigrationChainTipCallsCount = 0
+    var estimatedMigrationChainTipCalled: Bool {
+        return estimatedMigrationChainTipCallsCount > 0
     }
-    var estimatedMigrationChainTipAccountUUIDReceivedAccountUUID: AccountUUID?
-    var estimatedMigrationChainTipAccountUUIDReturnValue: BlockHeight!
-    var estimatedMigrationChainTipAccountUUIDClosure: ((AccountUUID) async throws -> BlockHeight)?
+    var estimatedMigrationChainTipReturnValue: BlockHeight!
+    var estimatedMigrationChainTipClosure: (() async throws -> BlockHeight)?
 
-    func estimatedMigrationChainTip(accountUUID: AccountUUID) async throws -> BlockHeight {
-        if let error = estimatedMigrationChainTipAccountUUIDThrowableError {
+    func estimatedMigrationChainTip() async throws -> BlockHeight {
+        if let error = estimatedMigrationChainTipThrowableError {
             throw error
         }
-        estimatedMigrationChainTipAccountUUIDCallsCount += 1
-        estimatedMigrationChainTipAccountUUIDReceivedAccountUUID = accountUUID
-        if let closure = estimatedMigrationChainTipAccountUUIDClosure {
-            return try await closure(accountUUID)
+        estimatedMigrationChainTipCallsCount += 1
+        if let closure = estimatedMigrationChainTipClosure {
+            return try await closure()
         } else {
-            return estimatedMigrationChainTipAccountUUIDReturnValue
+            return estimatedMigrationChainTipReturnValue
         }
     }
 
     // MARK: - estimatedMigrationSecondsPerBlock
 
-    var estimatedMigrationSecondsPerBlockAccountUUIDThrowableError: Error?
-    var estimatedMigrationSecondsPerBlockAccountUUIDCallsCount = 0
-    var estimatedMigrationSecondsPerBlockAccountUUIDCalled: Bool {
-        return estimatedMigrationSecondsPerBlockAccountUUIDCallsCount > 0
+    var estimatedMigrationSecondsPerBlockThrowableError: Error?
+    var estimatedMigrationSecondsPerBlockCallsCount = 0
+    var estimatedMigrationSecondsPerBlockCalled: Bool {
+        return estimatedMigrationSecondsPerBlockCallsCount > 0
     }
-    var estimatedMigrationSecondsPerBlockAccountUUIDReceivedAccountUUID: AccountUUID?
-    var estimatedMigrationSecondsPerBlockAccountUUIDReturnValue: Double!
-    var estimatedMigrationSecondsPerBlockAccountUUIDClosure: ((AccountUUID) async throws -> Double)?
+    var estimatedMigrationSecondsPerBlockReturnValue: Double!
+    var estimatedMigrationSecondsPerBlockClosure: (() async throws -> Double)?
 
-    func estimatedMigrationSecondsPerBlock(accountUUID: AccountUUID) async throws -> Double {
-        if let error = estimatedMigrationSecondsPerBlockAccountUUIDThrowableError {
+    func estimatedMigrationSecondsPerBlock() async throws -> Double {
+        if let error = estimatedMigrationSecondsPerBlockThrowableError {
             throw error
         }
-        estimatedMigrationSecondsPerBlockAccountUUIDCallsCount += 1
-        estimatedMigrationSecondsPerBlockAccountUUIDReceivedAccountUUID = accountUUID
-        if let closure = estimatedMigrationSecondsPerBlockAccountUUIDClosure {
-            return try await closure(accountUUID)
+        estimatedMigrationSecondsPerBlockCallsCount += 1
+        if let closure = estimatedMigrationSecondsPerBlockClosure {
+            return try await closure()
         } else {
-            return estimatedMigrationSecondsPerBlockAccountUUIDReturnValue
+            return estimatedMigrationSecondsPerBlockReturnValue
         }
     }
 
@@ -5264,6 +5260,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(account, estimatedTip)
         } else {
             return migrationHasOverdueTransfersForEstimatedTipReturnValue
+        }
+    }
+
+    // MARK: - migrationHasReadyBroadcast
+
+    var migrationHasReadyBroadcastForEstimatedTipThrowableError: Error?
+    var migrationHasReadyBroadcastForEstimatedTipCallsCount = 0
+    var migrationHasReadyBroadcastForEstimatedTipCalled: Bool {
+        return migrationHasReadyBroadcastForEstimatedTipCallsCount > 0
+    }
+    var migrationHasReadyBroadcastForEstimatedTipReceivedArguments: (account: AccountUUID, estimatedTip: BlockHeight?)?
+    var migrationHasReadyBroadcastForEstimatedTipReturnValue: Bool!
+    var migrationHasReadyBroadcastForEstimatedTipClosure: ((AccountUUID, BlockHeight?) async throws -> Bool)?
+
+    func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
+        if let error = migrationHasReadyBroadcastForEstimatedTipThrowableError {
+            throw error
+        }
+        migrationHasReadyBroadcastForEstimatedTipCallsCount += 1
+        migrationHasReadyBroadcastForEstimatedTipReceivedArguments = (account: account, estimatedTip: estimatedTip)
+        if let closure = migrationHasReadyBroadcastForEstimatedTipClosure {
+            return try await closure(account, estimatedTip)
+        } else {
+            return migrationHasReadyBroadcastForEstimatedTipReturnValue
         }
     }
 

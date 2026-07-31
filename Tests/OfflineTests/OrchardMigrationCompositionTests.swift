@@ -431,6 +431,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// A record failure on a non-success outcome (here a transport error — nothing verifiably
     /// landed) propagates the raw error unwrapped and the gate stays untouched: the
     /// record-failed-after-broadcast contract is reserved for outcomes that map to success.
+    /// A11: the in-flight marker is RETAINED — a transport failure cannot prove the submit did
+    /// not land, exactly the submit-to-record ambiguity the marker exists for (it self-expires).
     func testExecuteNextPendingTransferRecordThrowOnTransportErrorPropagatesRawAndLeavesGateUntouched() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
@@ -452,6 +454,133 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         }
 
         XCTAssertNil(gate.currentResumeAt())
+        XCTAssertNotNil(
+            gate.currentInFlightUntil(),
+            "A11: a record throw on a network error must retain the protective in-flight marker"
+        )
+    }
+
+    /// A11, the definitive-rejection half: when the server's answer PROVES nothing landed (an
+    /// expired / invalid-note rejection), a record throw clears the in-flight marker first — the
+    /// submit-to-record ambiguity is over, so sync must not stay blocked for the marker's full
+    /// self-expiry window — and then rethrows the raw record error.
+    func testExecuteNextPendingTransferRecordThrowOnDefinitiveRejectionClearsInFlightMarkerAndRethrows() async throws {
+        let rejections: [(script: MigrationBroadcastOutcome, expected: MigrationTransferResult)] = [
+            (MigrationBroadcastOutcome.rejected(errorCode: -25, message: "tx-expiring-soon"), MigrationTransferResult.expired),
+            (MigrationBroadcastOutcome.rejected(errorCode: -25, message: "bad-txns-inputs-spent"), MigrationTransferResult.invalidNote)
+        ]
+
+        for (script, expected) in rejections {
+            let prepared = makePreparedTransfer(id: 1)
+            welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+            welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
+            welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
+            let broadcaster = ScriptedBroadcaster(script: .outcome(script))
+            let migration = makeMigration(broadcaster: broadcaster)
+
+            do {
+                _ = try await migration.executeNextPendingTransfer(
+                    options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint),
+                    useEstimatedTip: false
+                )
+                XCTFail("Expected the raw record error to be rethrown for \(expected)")
+            } catch is StubEngineError {
+                // expected
+            } catch {
+                XCTFail("Expected StubEngineError but got \(error) for \(expected)")
+            }
+
+            // The mock throws before capturing arguments, so the mapped-result routing is pinned
+            // by the non-throwing rejection tests above; here only the gate effects matter.
+            XCTAssertNil(gate.currentResumeAt(), "a rejection must not start the privacy buffer")
+            XCTAssertNil(
+                gate.currentInFlightUntil(),
+                "A11: a definitive rejection proves nothing landed — the marker must be cleared before the rethrow (\(expected))"
+            )
+        }
+    }
+
+    /// A11 control: with the record SUCCEEDING, a non-success outcome still ends with the marker
+    /// cleared (the outcome is durably recorded, so the submit-to-record window is closed).
+    func testExecuteNextPendingTransferRecordSuccessOnNetworkErrorClearsInFlightMarker() async throws {
+        let prepared = makePreparedTransfer(id: 1)
+        welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .outcome(.transportError)))
+
+        _ = try await migration.executeNextPendingTransfer(
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint),
+            useEstimatedTip: false
+        )
+
+        XCTAssertNil(gate.currentInFlightUntil(), "a recorded outcome closes the submit-to-record window")
+    }
+
+    // MARK: - In-flight marker arming at submit time (A9)
+
+    /// A9: the in-flight marker is (re-)armed via the broadcaster's `onWillSubmit` hook at the
+    /// LAST pre-submit instant — after connection setup — so its 120 s window covers the actual
+    /// submit-to-record span rather than being burned by a slow Tor bootstrap. Pinned by
+    /// capturing, at the exact moment the fake fires the hook, that the marker was already armed
+    /// once (the early belt) and that the hook re-arms it: the re-armed expiry read AFTER the
+    /// hook equals the hook-time clock + guard, not the (earlier) flow-start arm.
+    func testExecuteNextPendingTransferReArmsTheInFlightMarkerAtSubmitTimeViaTheHook() async throws {
+        let prepared = makePreparedTransfer(id: 1)
+        welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
+        welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
+        let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
+
+        // Stand in for a slow Tor bootstrap: by the time the fake reaches its pre-submit hook,
+        // 90 s of the early (belt) marker's 120 s window have already elapsed.
+        var armedAtHookTime: Date?
+        broadcaster.onWillSubmitObserver = { [clock, gate] in
+            armedAtHookTime = gate?.currentInFlightUntil()
+            clock?.now = self.referenceDate.addingTimeInterval(90)
+        }
+        let migration = makeMigration(broadcaster: broadcaster)
+
+        do {
+            _ = try await migration.executeNextPendingTransfer(
+                options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint),
+                useEstimatedTip: false
+            )
+            XCTFail("Expected the record error to be rethrown (retaining the marker)")
+        } catch is StubEngineError {
+            // expected — a network-error record throw retains the marker (A11), letting this test
+            // read the post-hook marker without the success path's clear.
+        }
+
+        XCTAssertEqual(broadcaster.onWillSubmitCallCount, 1)
+        XCTAssertEqual(
+            armedAtHookTime,
+            referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration),
+            "the early belt arm must already be in place when the hook fires"
+        )
+        XCTAssertEqual(
+            gate.currentInFlightUntil(),
+            referenceDate.addingTimeInterval(90 + MigrationSyncGate.broadcastInFlightGuardDuration),
+            "the hook must RE-arm the marker at submit time, extending the window past the bootstrap"
+        )
+    }
+
+    /// A9's no-submit half, via the composition: a fail-closed broadcaster throw means the hook
+    /// never fired and the flow's early belt marker is cleared — nothing is in flight.
+    func testExecuteNextPendingTransferFailClosedThrowNeverFiresTheHook() async throws {
+        let prepared = makePreparedTransfer(id: 1)
+        welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
+        let broadcaster = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable))
+        let migration = makeMigration(broadcaster: broadcaster)
+
+        _ = try? await migration.executeNextPendingTransfer(
+            options: MigrationNetworkPrivacyOptions(useTor: true, submissionEndpoint: defaultEndpoint),
+            useEstimatedTip: false
+        )
+
+        XCTAssertEqual(broadcaster.onWillSubmitCallCount, 0, "a pre-submit throw must never fire the hook")
+        XCTAssertNil(gate.currentInFlightUntil(), "the early belt marker is cleared when nothing reached the network")
     }
 
     // MARK: - Broadcast single-flight
@@ -600,8 +729,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// gate-file (privacy-buffer) state rather than crash or propagate -- checked both with no gate
     /// file (unblocked) and with an active buffer (blocked), so the fallback is proven to actually
     /// read the file, not just swallow the error into a hardcoded answer.
-    func testIsSyncBlockedDegradesToGateFileStateWhenWeldingHasOverdueThrows() async throws {
-        welding.migrationHasOverdueTransfersForEstimatedTipThrowableError = StubEngineError()
+    func testIsSyncBlockedDegradesToGateFileStateWhenWeldingHasReadyBroadcastThrows() async throws {
+        welding.migrationHasReadyBroadcastForEstimatedTipThrowableError = StubEngineError()
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         let blockedWithNoGateFile = await migration.isSyncBlocked()
@@ -611,6 +740,112 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
         let blockedWithGateFile = await migration.isSyncBlocked()
         XCTAssertTrue(blockedWithGateFile)
+    }
+
+    // MARK: - isSyncBlocked ready-broadcast policy (D1)
+
+    /// The gate's work-pending clause is the READY-broadcast predicate: a proved, due transfer
+    /// blocks sync. The very wedge D1 exists to prevent is pinned separately below.
+    func testIsSyncBlockedBlocksWhenAReadyBroadcastIsWaiting() async throws {
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        let blocked = await migration.isSyncBlocked()
+
+        XCTAssertTrue(blocked, "a proved, due, valid transfer must hold sync for a broadcast session")
+    }
+
+    /// THE WEDGE (D1): a due-but-unproved row — `migrationHasOverdueTransfers` would answer `true`
+    /// for it, `migrationHasReadyBroadcast` answers `false` — must NOT block sync: its proof is
+    /// produced AT sync wake-ups, so gating sync on it would starve the very work that clears it.
+    /// The overdue query throwing loudly (rather than answering) additionally proves the gate no
+    /// longer consults it at all.
+    func testIsSyncBlockedDoesNotBlockForADueButUnprovedSignedRow() async throws {
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
+        welding.migrationHasOverdueTransfersForEstimatedTipThrowableError = StubEngineError()
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        let blocked = await migration.isSyncBlocked()
+
+        XCTAssertFalse(blocked, "a Signed-due row needs MORE syncing; it must never hold sync hostage")
+        XCTAssertFalse(
+            welding.migrationHasOverdueTransfersForEstimatedTipCalled,
+            "no gate path may consult the overdue query anymore"
+        )
+    }
+
+    /// U8 ordering: the gate asks the ready-broadcast question at the SCANNED tip FIRST (nil
+    /// estimate). When that answer is already `true`, the block-rate samples are never read — the
+    /// estimate could not change the answer.
+    func testIsSyncBlockedAsksScannedTipFirstAndSkipsTheEstimateWhenAlreadyBlocked() async throws {
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        let blocked = await migration.isSyncBlocked()
+
+        XCTAssertTrue(blocked)
+        XCTAssertEqual(welding.migrationHasReadyBroadcastForEstimatedTipCallsCount, 1)
+        XCTAssertNil(
+            welding.migrationHasReadyBroadcastForEstimatedTipReceivedArguments?.estimatedTip,
+            "the first (and only) ask must be at the scanned tip"
+        )
+        XCTAssertFalse(
+            welding.migrationBlockRateSamplesWindowCalled,
+            "a true scanned answer must not pay for the sample read"
+        )
+    }
+
+    /// U8 ordering, second half: only a `false` scanned answer pays for the estimate projection
+    /// and re-asks with it — the estimate can only ACCELERATE due-ness, so it is consulted second.
+    func testIsSyncBlockedReAsksWithTheEstimateOnlyAfterAFalseScannedAnswer() async throws {
+        let sampleTime = referenceDate.addingTimeInterval(-100)
+        welding.migrationBlockRateSamplesWindowReturnValue = [
+            MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
+        ]
+        var receivedTips: [BlockHeight?] = []
+        welding.migrationHasReadyBroadcastForEstimatedTipClosure = { _, estimatedTip in
+            receivedTips.append(estimatedTip)
+            // Scanned tip says no; the estimate-accelerated re-ask says yes.
+            return estimatedTip != nil
+        }
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        let blocked = await migration.isSyncBlocked()
+
+        XCTAssertTrue(blocked, "an estimate-accelerated ready broadcast must block sync")
+        XCTAssertEqual(receivedTips.count, 2)
+        let firstTip = try XCTUnwrap(receivedTips.first)
+        XCTAssertNil(firstTip, "the scanned tip must be asked first")
+        let secondTip = try XCTUnwrap(receivedTips.last)
+        XCTAssertNotNil(secondTip, "the second ask must carry the projected estimate")
+    }
+
+    /// U7/U9: the estimate the gate feeds into the second ask is projected at the ACTOR'S injected
+    /// clock, not the wall clock — the deterministic fake-clock arithmetic only holds if the shared
+    /// tip-estimation helper received `clock.now`.
+    func testIsSyncBlockedProjectsTheEstimateAtTheInjectedClock() async throws {
+        // One sample 150 s (two 75 s target-spacing blocks) before the frozen test clock: the
+        // deterministic projection is height + 2 — any wall-clock leak (years past
+        // `referenceDate`) would project far beyond it.
+        let sampleTime = referenceDate.addingTimeInterval(-150)
+        welding.migrationBlockRateSamplesWindowReturnValue = [
+            MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
+        ]
+        var receivedTips: [BlockHeight?] = []
+        welding.migrationHasReadyBroadcastForEstimatedTipClosure = { _, estimatedTip in
+            receivedTips.append(estimatedTip)
+            return false
+        }
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        _ = await migration.isSyncBlocked()
+
+        let projectedTip = try XCTUnwrap(receivedTips.last)
+        XCTAssertEqual(
+            projectedTip,
+            3_000_002,
+            "the projection must be evaluated at the actor's injected clock (height + floor(150/75))"
+        )
     }
 
     // MARK: - Helpers
@@ -624,12 +859,16 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         if welding.migrationBlockRateSamplesWindowReturnValue == nil {
             welding.migrationBlockRateSamplesWindowReturnValue = []
         }
+        let clockValue = clock!
         return OrchardMigration(
             welding: welding,
             accountUUID: accountA,
             broadcaster: broadcaster,
             syncGate: gate,
-            logger: logger
+            logger: logger,
+            // The actor's estimate-consulting paths read the injected clock (U7), so the
+            // fake-clock projection tests are deterministic.
+            now: { clockValue.now }
         )
     }
 
@@ -641,7 +880,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             // A long tick keeps the background re-evaluation out of these deterministic assertions.
             tickInterval: 3600,
             now: { clock.now },
-            overdueProvider: { false },
+            readyBroadcastProvider: { false },
             logger: logger
         )
     }
@@ -682,7 +921,8 @@ private actor GatedBroadcaster: MigrationBroadcasting {
     func broadcast(
         rawTransaction: Data,
         to endpoint: LightWalletEndpoint,
-        useTor: Bool
+        useTor: Bool,
+        onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome {
         startedCount += 1
         notifyStartObservers()
@@ -691,6 +931,9 @@ private actor GatedBroadcaster: MigrationBroadcasting {
                 pendingBroadcasts.append(continuation)
             }
         }
+        // Per the production contract the hook fires at the last pre-submit instant; a returned
+        // outcome means a submit happened.
+        onWillSubmit()
         return outcome
     }
 

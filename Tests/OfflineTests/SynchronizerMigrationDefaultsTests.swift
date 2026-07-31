@@ -55,11 +55,11 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
     }
 
     func testEstimatedMigrationChainTipDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.estimatedMigrationChainTip(accountUUID: self.accountUUID) }
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.estimatedMigrationChainTip() }
     }
 
     func testEstimatedMigrationSecondsPerBlockDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.estimatedMigrationSecondsPerBlock(accountUUID: self.accountUUID) }
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.estimatedMigrationSecondsPerBlock() }
     }
 
     func testMigrationTransactionStatusesDefaultThrowsUnimplemented() async {
