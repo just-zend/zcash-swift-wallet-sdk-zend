@@ -38,10 +38,7 @@ public struct AccountId: Equatable, Codable, Hashable {
 public struct AccountUUID: Equatable, Codable, Hashable, Identifiable {
     public let id: [UInt8]
 
-    /// Reconstructs an account UUID from its canonical 16-byte representation.
-    ///
-    /// - Parameter id: The exact 16 bytes persisted by the wallet database.
-    public init(id: [UInt8]) {
+    init(id: [UInt8]) {
         guard id.count == 16 else {
             fatalError("Account UUID must be 16 bytes long. Input value is \(id).")
         }

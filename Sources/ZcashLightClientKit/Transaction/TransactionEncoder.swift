@@ -35,6 +35,9 @@ protocol TransactionEncoder {
         memoBytes: MemoBytes?
     ) async throws -> Proposal
 
+    /// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal
+
     /// Creates a proposal for shielding any transparent funds received by the given account.
     ///
     /// - Parameter accountUUID:the account from which to shield funds.

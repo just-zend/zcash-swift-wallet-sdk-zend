@@ -106,83 +106,16 @@ final class UpdateChainTipActionTests: ZcashTestCase {
         }
     }
 
-    func testUpdateChainTipSamplesLoadBalancerAndCommitsOnlyHighestTipAtOrAboveLocalFloor() async throws {
-        let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.maxScannedHeightReturnValue = 105
-        rustBackend.updateChainTipHeightClosure = { _ in }
-        let service = LightWalletServiceMock()
-        var sampledHeights = [104, 110, 106]
-        service.latestBlockHeightModeClosure = { _ in sampledHeights.removeFirst() }
-        let provider = LatestBlocksDataProviderMock()
-        provider.underlyingLatestBlockHeight = 107
-        provider.updateClosure = { _ in }
-        let logger = LoggerMock()
-        logger.debugFileFunctionLineClosure = { _, _, _, _ in }
-        let context = ActionContextMock.default()
-        context.updateLastChainTipUpdateTimeClosure = { _ in }
-        let action = await setupAction(
-            logger,
-            BlockDownloaderMock(),
-            provider,
-            rustBackend,
-            service
-        )
-
-        try await action.updateChainTip(context, time: 123)
-
-        XCTAssertEqual(service.latestBlockHeightModeCallsCount, 3)
-        XCTAssertEqual(rustBackend.updateChainTipHeightReceivedHeight, 110)
-        XCTAssertEqual(provider.updateReceivedLatestBlockHeight, 110)
-        XCTAssertEqual(context.updateLastChainTipUpdateTimeReceivedLastChainTipUpdateTime, 123)
-    }
-
-    func testUpdateChainTipRejectsAllStaleReplicasWithoutAnyLowerTipMutation() async throws {
-        let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.maxScannedHeightReturnValue = 105
-        rustBackend.updateChainTipHeightClosure = { _ in }
-        let service = LightWalletServiceMock()
-        var sampledHeights = [102, 104, 103]
-        service.latestBlockHeightModeClosure = { _ in sampledHeights.removeFirst() }
-        let provider = LatestBlocksDataProviderMock()
-        provider.underlyingLatestBlockHeight = 101
-        provider.updateClosure = { _ in }
-        let logger = LoggerMock()
-        logger.debugFileFunctionLineClosure = { _, _, _, _ in }
-        let context = ActionContextMock.default()
-        context.updateLastChainTipUpdateTimeClosure = { _ in }
-        let action = await setupAction(
-            logger,
-            BlockDownloaderMock(),
-            provider,
-            rustBackend,
-            service
-        )
-
-        do {
-            try await action.updateChainTip(context, time: 123)
-            XCTFail("Expected every sampled replica below durable state to fail closed")
-        } catch let ZcashError.compactBlockProcessorServerTipBehind(floor, observed, attempts) {
-            XCTAssertEqual(floor, 105)
-            XCTAssertEqual(observed, 104)
-            XCTAssertEqual(attempts, 3)
-        }
-
-        XCTAssertEqual(service.latestBlockHeightModeCallsCount, 3)
-        XCTAssertFalse(rustBackend.updateChainTipHeightCalled)
-        XCTAssertFalse(provider.updateCalled)
-        XCTAssertFalse(context.updateLastChainTipUpdateTimeCalled)
-    }
-
     private func setupAction(
         _ loggerMock: LoggerMock = LoggerMock(),
         _ blockDownloaderMock: BlockDownloaderMock = BlockDownloaderMock(),
-        _ latestBlocksDataProvider: LatestBlocksDataProvider = LatestBlocksDataProviderMock(),
-        _ rustBackendMock: ZcashRustBackendWeldingMock = ZcashRustBackendWeldingMock(),
-        _ serviceMock: LightWalletServiceMock = LightWalletServiceMock()
+        _ latestBlocksDataProvider: LatestBlocksDataProvider = LatestBlocksDataProviderMock()
     ) async -> UpdateChainTipAction {
         let config: CompactBlockProcessor.Configuration = .standard(
             for: ZcashNetworkBuilder.network(for: underlyingNetworkType), walletBirthday: 0
         )
+
+        let rustBackendMock = ZcashRustBackendWeldingMock()
 
         rustBackendMock.consensusBranchIdForHeightClosure = { height in
             XCTAssertEqual(height, 2, "")
@@ -197,17 +130,9 @@ final class UpdateChainTipActionTests: ZcashTestCase {
         lightWalletdInfoMock.underlyingBlockHeight = 2
         lightWalletdInfoMock.underlyingChainName = underlyingChainName
 
+        let serviceMock = LightWalletServiceMock()
         serviceMock.getInfoModeReturnValue = lightWalletdInfoMock
-        if serviceMock.latestBlockHeightModeClosure == nil {
-            serviceMock.latestBlockHeightModeReturnValue = 1
-        }
-
-        if let provider = latestBlocksDataProvider as? LatestBlocksDataProviderMock {
-            provider.underlyingLatestBlockHeight = provider.underlyingLatestBlockHeight ?? .zero
-            provider.underlyingMaxScannedHeight = provider.underlyingMaxScannedHeight ?? .zero
-            provider.underlyingFullyScannedHeight = provider.underlyingFullyScannedHeight ?? .zero
-            provider.underlyingWalletBirthday = provider.underlyingWalletBirthday ?? .zero
-        }
+        serviceMock.latestBlockHeightModeReturnValue = 1
 
         mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in rustBackendMock }
         mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in serviceMock }

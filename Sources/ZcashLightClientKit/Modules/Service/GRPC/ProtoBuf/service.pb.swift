@@ -25,6 +25,53 @@ fileprivate struct _GeneratedWithProtocGenSwiftVersion: SwiftProtobuf.ProtobufAP
   typealias Version = _2
 }
 
+/// An identifier for a Zcash value pool.
+enum PoolType: SwiftProtobuf.Enum, Swift.CaseIterable {
+  typealias RawValue = Int
+  case invalid // = 0
+  case transparent // = 1
+  case sapling // = 2
+  case orchard // = 3
+  case ironwood // = 4
+  case UNRECOGNIZED(Int)
+
+  init() {
+    self = .invalid
+  }
+
+  init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .invalid
+    case 1: self = .transparent
+    case 2: self = .sapling
+    case 3: self = .orchard
+    case 4: self = .ironwood
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  var rawValue: Int {
+    switch self {
+    case .invalid: return 0
+    case .transparent: return 1
+    case .sapling: return 2
+    case .orchard: return 3
+    case .ironwood: return 4
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  static let allCases: [PoolType] = [
+    .invalid,
+    .transparent,
+    .sapling,
+    .orchard,
+    .ironwood,
+  ]
+
+}
+
 enum ShieldedProtocol: SwiftProtobuf.Enum, Swift.CaseIterable {
   typealias RawValue = Int
   case sapling // = 0
@@ -64,7 +111,9 @@ enum ShieldedProtocol: SwiftProtobuf.Enum, Swift.CaseIterable {
 }
 
 /// A BlockID message contains identifiers to select a block: a height or a
-/// hash. Specification by hash is not implemented, but may be in the future.
+/// hash. Support for specification by hash is not mandatory. (If `hash` is
+/// non-empty, the rpc may return an error.) This field is present to support
+/// a possible future upgrade.
 struct BlockID: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -81,6 +130,14 @@ struct BlockID: Sendable {
 
 /// BlockRange specifies a series of blocks from start to end inclusive.
 /// Both BlockIDs must be heights; specification by hash is not yet supported.
+///
+/// If no pool types are specified, the server should default to the legacy
+/// behavior of returning only data relevant to the shielded (Sapling, Orchard,
+/// and Ironwood) pools; otherwise, the server should prune `CompactBlock`s
+/// returned to include only data relevant to the requested pool types. Clients MUST
+/// verify that the version of the server they are connected to are capable
+/// of returning pruned and/or transparent data before setting `poolTypes`
+/// to a non-empty value.
 struct BlockRange: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -103,6 +160,8 @@ struct BlockRange: Sendable {
   var hasEnd: Bool {self._end != nil}
   /// Clears the value of `end`. Subsequent reads from it will return its default value.
   mutating func clearEnd() {self._end = nil}
+
+  var poolTypes: [PoolType] = []
 
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -143,18 +202,38 @@ struct TxFilter: Sendable {
   fileprivate var _block: BlockID? = nil
 }
 
-/// RawTransaction contains the complete transaction data. It also optionally includes 
+/// RawTransaction contains the complete transaction data. It also optionally includes
 /// the block height in which the transaction was included, or, when returned
 /// by GetMempoolStream(), the latest block height.
+///
+/// FIXME: the documentation here about mempool status contradicts the documentation
+/// for the `height` field. See https://github.com/zcash/librustzcash/issues/1484
 struct RawTransaction: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  /// exact data returned by Zcash 'getrawtransaction'
+  /// The serialized representation of the Zcash transaction.
   var data: Data = Data()
 
-  /// height that the transaction was mined (or -1)
+  /// The height at which the transaction is mined, or a sentinel value.
+  ///
+  /// Due to an error in the original protobuf definition, it is necessary to
+  /// reinterpret the result of the `getrawtransaction` RPC call. Zcashd will
+  /// return the int64 value `-1` for the height of transactions that appear
+  /// in the block index, but which are not mined in the main chain. Here, the
+  /// height field of `RawTransaction` was erroneously created as a `uint64`,
+  /// and as such we must map the response from the zcashd RPC API to be
+  /// representable within this space. Additionally, the `height` field will
+  /// be absent for transactions in the mempool, resulting in the default
+  /// value of `0` being set. Therefore, the meanings of the `height` field of
+  /// the `RawTransaction` type are as follows:
+  ///
+  /// * height 0: the transaction is in the mempool
+  /// * height 0xffffffffffffffff: the transaction has been mined on a fork that
+  ///   is not currently the main chain
+  /// * any other height: the transaction has been mined in the main chain at the
+  ///   given height
   var height: UInt64 = 0
 
   var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -203,54 +282,127 @@ struct Empty: Sendable {
 
 /// LightdInfo returns various information about this lightwalletd instance
 /// and the state of the blockchain.
-struct LightdInfo: Sendable {
+struct LightdInfo: @unchecked Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  var version: String = String()
+  var version: String {
+    get {_storage._version}
+    set {_uniqueStorage()._version = newValue}
+  }
 
-  var vendor: String = String()
+  var vendor: String {
+    get {_storage._vendor}
+    set {_uniqueStorage()._vendor = newValue}
+  }
 
   /// true
-  var taddrSupport: Bool = false
+  var taddrSupport: Bool {
+    get {_storage._taddrSupport}
+    set {_uniqueStorage()._taddrSupport = newValue}
+  }
 
   /// either "main" or "test"
-  var chainName: String = String()
+  var chainName: String {
+    get {_storage._chainName}
+    set {_uniqueStorage()._chainName = newValue}
+  }
 
   /// depends on mainnet or testnet
-  var saplingActivationHeight: UInt64 = 0
+  var saplingActivationHeight: UInt64 {
+    get {_storage._saplingActivationHeight}
+    set {_uniqueStorage()._saplingActivationHeight = newValue}
+  }
 
   /// protocol identifier, see consensus/upgrades.cpp
-  var consensusBranchID: String = String()
+  var consensusBranchID: String {
+    get {_storage._consensusBranchID}
+    set {_uniqueStorage()._consensusBranchID = newValue}
+  }
 
   /// latest block on the best chain
-  var blockHeight: UInt64 = 0
+  var blockHeight: UInt64 {
+    get {_storage._blockHeight}
+    set {_uniqueStorage()._blockHeight = newValue}
+  }
 
-  var gitCommit: String = String()
+  var gitCommit: String {
+    get {_storage._gitCommit}
+    set {_uniqueStorage()._gitCommit = newValue}
+  }
 
-  var branch: String = String()
+  var branch: String {
+    get {_storage._branch}
+    set {_uniqueStorage()._branch = newValue}
+  }
 
-  var buildDate: String = String()
+  var buildDate: String {
+    get {_storage._buildDate}
+    set {_uniqueStorage()._buildDate = newValue}
+  }
 
-  var buildUser: String = String()
+  var buildUser: String {
+    get {_storage._buildUser}
+    set {_uniqueStorage()._buildUser = newValue}
+  }
 
   /// less than tip height if zcashd is syncing
-  var estimatedHeight: UInt64 = 0
+  var estimatedHeight: UInt64 {
+    get {_storage._estimatedHeight}
+    set {_uniqueStorage()._estimatedHeight = newValue}
+  }
 
   /// example: "v4.1.1-877212414"
-  var zcashdBuild: String = String()
+  var zcashdBuild: String {
+    get {_storage._zcashdBuild}
+    set {_uniqueStorage()._zcashdBuild = newValue}
+  }
 
   /// example: "/MagicBean:4.1.1/"
-  var zcashdSubversion: String = String()
+  var zcashdSubversion: String {
+    get {_storage._zcashdSubversion}
+    set {_uniqueStorage()._zcashdSubversion = newValue}
+  }
+
+  /// Zcash donation UA address
+  var donationAddress: String {
+    get {_storage._donationAddress}
+    set {_uniqueStorage()._donationAddress = newValue}
+  }
+
+  /// name of next pending network upgrade, empty if none scheduled
+  var upgradeName: String {
+    get {_storage._upgradeName}
+    set {_uniqueStorage()._upgradeName = newValue}
+  }
+
+  /// height of next pending upgrade, zero if none is scheduled
+  var upgradeHeight: UInt64 {
+    get {_storage._upgradeHeight}
+    set {_uniqueStorage()._upgradeHeight = newValue}
+  }
+
+  /// version of https://github.com/zcash/lightwallet-protocol served by this server
+  var lightwalletProtocolVersion: String {
+    get {_storage._lightwalletProtocolVersion}
+    set {_uniqueStorage()._lightwalletProtocolVersion = newValue}
+  }
 
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
   init() {}
+
+  fileprivate var _storage = _StorageClass.defaultInstance
 }
 
-/// TransparentAddressBlockFilter restricts the results to the given address
-/// or block range.
+/// TransparentAddressBlockFilter restricts the results of the GRPC methods that
+/// use it to the transactions that involve the given address and were mined in
+/// the specified block range. Non-default values for both the address and the
+/// block range must be specified. Mempool transactions are not included.
+///
+/// The `poolTypes` field of the `range` argument should be ignored.
+/// Implementations MAY consider it an error if any pool types are specified.
 struct TransparentAddressBlockFilter: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -259,7 +411,7 @@ struct TransparentAddressBlockFilter: Sendable {
   /// t-address
   var address: String = String()
 
-  /// start, end heights
+  /// start, end heights only
   var range: BlockRange {
     get {_range ?? BlockRange()}
     set {_range = newValue}
@@ -344,12 +496,25 @@ struct Balance: Sendable {
   init() {}
 }
 
-struct Exclude: Sendable {
+/// Request parameters for the `GetMempoolTx` RPC.
+struct GetMempoolTxRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  var txid: [Data] = []
+  /// A list of transaction ID byte string suffixes that should be excluded
+  /// from the response. These suffixes may be produced either directly from
+  /// the underlying txid bytes, or, if the source values are encoded txid
+  /// strings, by truncating the hexadecimal representation of each
+  /// transaction ID to an even number of characters, and then hex-decoding
+  /// and then byte-reversing this value to obtain the byte representation.
+  var excludeTxidSuffixes: [Data] = []
+
+  /// The server must prune `CompactTx`s returned to include only data
+  /// relevant to the requested pool types. If no pool types are specified,
+  /// the server should default to the legacy behavior of returning only data
+  /// relevant to the shielded (Sapling, Orchard, and Ironwood) pools.
+  var poolTypes: [PoolType] = []
 
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -483,6 +648,10 @@ struct GetAddressUtxosReplyList: Sendable {
 
 fileprivate let _protobuf_package = "cash.z.wallet.sdk.rpc"
 
+extension PoolType: SwiftProtobuf._ProtoNameProviding {
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0POOL_TYPE_INVALID\0\u{1}TRANSPARENT\0\u{1}SAPLING\0\u{1}ORCHARD\0\u{1}IRONWOOD\0")
+}
+
 extension ShieldedProtocol: SwiftProtobuf._ProtoNameProviding {
   static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0sapling\0\u{1}orchard\0\u{1}ironwood\0")
 }
@@ -524,7 +693,7 @@ extension BlockID: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
 
 extension BlockRange: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   static let protoMessageName: String = _protobuf_package + ".BlockRange"
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}start\0\u{1}end\0")
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}start\0\u{1}end\0\u{1}poolTypes\0")
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -534,6 +703,7 @@ extension BlockRange: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementatio
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularMessageField(value: &self._start) }()
       case 2: try { try decoder.decodeSingularMessageField(value: &self._end) }()
+      case 3: try { try decoder.decodeRepeatedEnumField(value: &self.poolTypes) }()
       default: break
       }
     }
@@ -550,12 +720,16 @@ extension BlockRange: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementatio
     try { if let v = self._end {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
     } }()
+    if !self.poolTypes.isEmpty {
+      try visitor.visitPackedEnumField(value: self.poolTypes, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   static func ==(lhs: BlockRange, rhs: BlockRange) -> Bool {
     if lhs._start != rhs._start {return false}
     if lhs._end != rhs._end {return false}
+    if lhs.poolTypes != rhs.poolTypes {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -715,94 +889,184 @@ extension Empty: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase
 
 extension LightdInfo: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   static let protoMessageName: String = _protobuf_package + ".LightdInfo"
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}version\0\u{1}vendor\0\u{1}taddrSupport\0\u{1}chainName\0\u{1}saplingActivationHeight\0\u{1}consensusBranchId\0\u{1}blockHeight\0\u{1}gitCommit\0\u{1}branch\0\u{1}buildDate\0\u{1}buildUser\0\u{1}estimatedHeight\0\u{1}zcashdBuild\0\u{1}zcashdSubversion\0")
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}version\0\u{1}vendor\0\u{1}taddrSupport\0\u{1}chainName\0\u{1}saplingActivationHeight\0\u{1}consensusBranchId\0\u{1}blockHeight\0\u{1}gitCommit\0\u{1}branch\0\u{1}buildDate\0\u{1}buildUser\0\u{1}estimatedHeight\0\u{1}zcashdBuild\0\u{1}zcashdSubversion\0\u{1}donationAddress\0\u{1}upgradeName\0\u{1}upgradeHeight\0\u{1}lightwalletProtocolVersion\0")
+
+  fileprivate class _StorageClass {
+    var _version: String = String()
+    var _vendor: String = String()
+    var _taddrSupport: Bool = false
+    var _chainName: String = String()
+    var _saplingActivationHeight: UInt64 = 0
+    var _consensusBranchID: String = String()
+    var _blockHeight: UInt64 = 0
+    var _gitCommit: String = String()
+    var _branch: String = String()
+    var _buildDate: String = String()
+    var _buildUser: String = String()
+    var _estimatedHeight: UInt64 = 0
+    var _zcashdBuild: String = String()
+    var _zcashdSubversion: String = String()
+    var _donationAddress: String = String()
+    var _upgradeName: String = String()
+    var _upgradeHeight: UInt64 = 0
+    var _lightwalletProtocolVersion: String = String()
+
+      // This property is used as the initial default value for new instances of the type.
+      // The type itself is protecting the reference to its storage via CoW semantics.
+      // This will force a copy to be made of this reference when the first mutation occurs;
+      // hence, it is safe to mark this as `nonisolated(unsafe)`.
+      static nonisolated(unsafe) let defaultInstance = _StorageClass()
+
+    private init() {}
+
+    init(copying source: _StorageClass) {
+      _version = source._version
+      _vendor = source._vendor
+      _taddrSupport = source._taddrSupport
+      _chainName = source._chainName
+      _saplingActivationHeight = source._saplingActivationHeight
+      _consensusBranchID = source._consensusBranchID
+      _blockHeight = source._blockHeight
+      _gitCommit = source._gitCommit
+      _branch = source._branch
+      _buildDate = source._buildDate
+      _buildUser = source._buildUser
+      _estimatedHeight = source._estimatedHeight
+      _zcashdBuild = source._zcashdBuild
+      _zcashdSubversion = source._zcashdSubversion
+      _donationAddress = source._donationAddress
+      _upgradeName = source._upgradeName
+      _upgradeHeight = source._upgradeHeight
+      _lightwalletProtocolVersion = source._lightwalletProtocolVersion
+    }
+  }
+
+  fileprivate mutating func _uniqueStorage() -> _StorageClass {
+    if !isKnownUniquelyReferenced(&_storage) {
+      _storage = _StorageClass(copying: _storage)
+    }
+    return _storage
+  }
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularStringField(value: &self.version) }()
-      case 2: try { try decoder.decodeSingularStringField(value: &self.vendor) }()
-      case 3: try { try decoder.decodeSingularBoolField(value: &self.taddrSupport) }()
-      case 4: try { try decoder.decodeSingularStringField(value: &self.chainName) }()
-      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.saplingActivationHeight) }()
-      case 6: try { try decoder.decodeSingularStringField(value: &self.consensusBranchID) }()
-      case 7: try { try decoder.decodeSingularUInt64Field(value: &self.blockHeight) }()
-      case 8: try { try decoder.decodeSingularStringField(value: &self.gitCommit) }()
-      case 9: try { try decoder.decodeSingularStringField(value: &self.branch) }()
-      case 10: try { try decoder.decodeSingularStringField(value: &self.buildDate) }()
-      case 11: try { try decoder.decodeSingularStringField(value: &self.buildUser) }()
-      case 12: try { try decoder.decodeSingularUInt64Field(value: &self.estimatedHeight) }()
-      case 13: try { try decoder.decodeSingularStringField(value: &self.zcashdBuild) }()
-      case 14: try { try decoder.decodeSingularStringField(value: &self.zcashdSubversion) }()
-      default: break
+    _ = _uniqueStorage()
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      while let fieldNumber = try decoder.nextFieldNumber() {
+        // The use of inline closures is to circumvent an issue where the compiler
+        // allocates stack space for every case branch when no optimizations are
+        // enabled. https://github.com/apple/swift-protobuf/issues/1034
+        switch fieldNumber {
+        case 1: try { try decoder.decodeSingularStringField(value: &_storage._version) }()
+        case 2: try { try decoder.decodeSingularStringField(value: &_storage._vendor) }()
+        case 3: try { try decoder.decodeSingularBoolField(value: &_storage._taddrSupport) }()
+        case 4: try { try decoder.decodeSingularStringField(value: &_storage._chainName) }()
+        case 5: try { try decoder.decodeSingularUInt64Field(value: &_storage._saplingActivationHeight) }()
+        case 6: try { try decoder.decodeSingularStringField(value: &_storage._consensusBranchID) }()
+        case 7: try { try decoder.decodeSingularUInt64Field(value: &_storage._blockHeight) }()
+        case 8: try { try decoder.decodeSingularStringField(value: &_storage._gitCommit) }()
+        case 9: try { try decoder.decodeSingularStringField(value: &_storage._branch) }()
+        case 10: try { try decoder.decodeSingularStringField(value: &_storage._buildDate) }()
+        case 11: try { try decoder.decodeSingularStringField(value: &_storage._buildUser) }()
+        case 12: try { try decoder.decodeSingularUInt64Field(value: &_storage._estimatedHeight) }()
+        case 13: try { try decoder.decodeSingularStringField(value: &_storage._zcashdBuild) }()
+        case 14: try { try decoder.decodeSingularStringField(value: &_storage._zcashdSubversion) }()
+        case 15: try { try decoder.decodeSingularStringField(value: &_storage._donationAddress) }()
+        case 16: try { try decoder.decodeSingularStringField(value: &_storage._upgradeName) }()
+        case 17: try { try decoder.decodeSingularUInt64Field(value: &_storage._upgradeHeight) }()
+        case 18: try { try decoder.decodeSingularStringField(value: &_storage._lightwalletProtocolVersion) }()
+        default: break
+        }
       }
     }
   }
 
   func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if !self.version.isEmpty {
-      try visitor.visitSingularStringField(value: self.version, fieldNumber: 1)
-    }
-    if !self.vendor.isEmpty {
-      try visitor.visitSingularStringField(value: self.vendor, fieldNumber: 2)
-    }
-    if self.taddrSupport != false {
-      try visitor.visitSingularBoolField(value: self.taddrSupport, fieldNumber: 3)
-    }
-    if !self.chainName.isEmpty {
-      try visitor.visitSingularStringField(value: self.chainName, fieldNumber: 4)
-    }
-    if self.saplingActivationHeight != 0 {
-      try visitor.visitSingularUInt64Field(value: self.saplingActivationHeight, fieldNumber: 5)
-    }
-    if !self.consensusBranchID.isEmpty {
-      try visitor.visitSingularStringField(value: self.consensusBranchID, fieldNumber: 6)
-    }
-    if self.blockHeight != 0 {
-      try visitor.visitSingularUInt64Field(value: self.blockHeight, fieldNumber: 7)
-    }
-    if !self.gitCommit.isEmpty {
-      try visitor.visitSingularStringField(value: self.gitCommit, fieldNumber: 8)
-    }
-    if !self.branch.isEmpty {
-      try visitor.visitSingularStringField(value: self.branch, fieldNumber: 9)
-    }
-    if !self.buildDate.isEmpty {
-      try visitor.visitSingularStringField(value: self.buildDate, fieldNumber: 10)
-    }
-    if !self.buildUser.isEmpty {
-      try visitor.visitSingularStringField(value: self.buildUser, fieldNumber: 11)
-    }
-    if self.estimatedHeight != 0 {
-      try visitor.visitSingularUInt64Field(value: self.estimatedHeight, fieldNumber: 12)
-    }
-    if !self.zcashdBuild.isEmpty {
-      try visitor.visitSingularStringField(value: self.zcashdBuild, fieldNumber: 13)
-    }
-    if !self.zcashdSubversion.isEmpty {
-      try visitor.visitSingularStringField(value: self.zcashdSubversion, fieldNumber: 14)
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      if !_storage._version.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._version, fieldNumber: 1)
+      }
+      if !_storage._vendor.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._vendor, fieldNumber: 2)
+      }
+      if _storage._taddrSupport != false {
+        try visitor.visitSingularBoolField(value: _storage._taddrSupport, fieldNumber: 3)
+      }
+      if !_storage._chainName.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._chainName, fieldNumber: 4)
+      }
+      if _storage._saplingActivationHeight != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._saplingActivationHeight, fieldNumber: 5)
+      }
+      if !_storage._consensusBranchID.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._consensusBranchID, fieldNumber: 6)
+      }
+      if _storage._blockHeight != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._blockHeight, fieldNumber: 7)
+      }
+      if !_storage._gitCommit.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._gitCommit, fieldNumber: 8)
+      }
+      if !_storage._branch.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._branch, fieldNumber: 9)
+      }
+      if !_storage._buildDate.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._buildDate, fieldNumber: 10)
+      }
+      if !_storage._buildUser.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._buildUser, fieldNumber: 11)
+      }
+      if _storage._estimatedHeight != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._estimatedHeight, fieldNumber: 12)
+      }
+      if !_storage._zcashdBuild.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._zcashdBuild, fieldNumber: 13)
+      }
+      if !_storage._zcashdSubversion.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._zcashdSubversion, fieldNumber: 14)
+      }
+      if !_storage._donationAddress.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._donationAddress, fieldNumber: 15)
+      }
+      if !_storage._upgradeName.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._upgradeName, fieldNumber: 16)
+      }
+      if _storage._upgradeHeight != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._upgradeHeight, fieldNumber: 17)
+      }
+      if !_storage._lightwalletProtocolVersion.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._lightwalletProtocolVersion, fieldNumber: 18)
+      }
     }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   static func ==(lhs: LightdInfo, rhs: LightdInfo) -> Bool {
-    if lhs.version != rhs.version {return false}
-    if lhs.vendor != rhs.vendor {return false}
-    if lhs.taddrSupport != rhs.taddrSupport {return false}
-    if lhs.chainName != rhs.chainName {return false}
-    if lhs.saplingActivationHeight != rhs.saplingActivationHeight {return false}
-    if lhs.consensusBranchID != rhs.consensusBranchID {return false}
-    if lhs.blockHeight != rhs.blockHeight {return false}
-    if lhs.gitCommit != rhs.gitCommit {return false}
-    if lhs.branch != rhs.branch {return false}
-    if lhs.buildDate != rhs.buildDate {return false}
-    if lhs.buildUser != rhs.buildUser {return false}
-    if lhs.estimatedHeight != rhs.estimatedHeight {return false}
-    if lhs.zcashdBuild != rhs.zcashdBuild {return false}
-    if lhs.zcashdSubversion != rhs.zcashdSubversion {return false}
+    if lhs._storage !== rhs._storage {
+      let storagesAreEqual: Bool = withExtendedLifetime((lhs._storage, rhs._storage)) { (_args: (_StorageClass, _StorageClass)) in
+        let _storage = _args.0
+        let rhs_storage = _args.1
+        if _storage._version != rhs_storage._version {return false}
+        if _storage._vendor != rhs_storage._vendor {return false}
+        if _storage._taddrSupport != rhs_storage._taddrSupport {return false}
+        if _storage._chainName != rhs_storage._chainName {return false}
+        if _storage._saplingActivationHeight != rhs_storage._saplingActivationHeight {return false}
+        if _storage._consensusBranchID != rhs_storage._consensusBranchID {return false}
+        if _storage._blockHeight != rhs_storage._blockHeight {return false}
+        if _storage._gitCommit != rhs_storage._gitCommit {return false}
+        if _storage._branch != rhs_storage._branch {return false}
+        if _storage._buildDate != rhs_storage._buildDate {return false}
+        if _storage._buildUser != rhs_storage._buildUser {return false}
+        if _storage._estimatedHeight != rhs_storage._estimatedHeight {return false}
+        if _storage._zcashdBuild != rhs_storage._zcashdBuild {return false}
+        if _storage._zcashdSubversion != rhs_storage._zcashdSubversion {return false}
+        if _storage._donationAddress != rhs_storage._donationAddress {return false}
+        if _storage._upgradeName != rhs_storage._upgradeName {return false}
+        if _storage._upgradeHeight != rhs_storage._upgradeHeight {return false}
+        if _storage._lightwalletProtocolVersion != rhs_storage._lightwalletProtocolVersion {return false}
+        return true
+      }
+      if !storagesAreEqual {return false}
+    }
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -1002,9 +1266,9 @@ extension Balance: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
   }
 }
 
-extension Exclude: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  static let protoMessageName: String = _protobuf_package + ".Exclude"
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}txid\0")
+extension GetMempoolTxRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  static let protoMessageName: String = _protobuf_package + ".GetMempoolTxRequest"
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}exclude_txid_suffixes\0\u{2}\u{2}poolTypes\0\u{c}\u{2}\u{1}")
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1012,21 +1276,26 @@ extension Exclude: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
       // allocates stack space for every case branch when no optimizations are
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
-      case 1: try { try decoder.decodeRepeatedBytesField(value: &self.txid) }()
+      case 1: try { try decoder.decodeRepeatedBytesField(value: &self.excludeTxidSuffixes) }()
+      case 3: try { try decoder.decodeRepeatedEnumField(value: &self.poolTypes) }()
       default: break
       }
     }
   }
 
   func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if !self.txid.isEmpty {
-      try visitor.visitRepeatedBytesField(value: self.txid, fieldNumber: 1)
+    if !self.excludeTxidSuffixes.isEmpty {
+      try visitor.visitRepeatedBytesField(value: self.excludeTxidSuffixes, fieldNumber: 1)
+    }
+    if !self.poolTypes.isEmpty {
+      try visitor.visitPackedEnumField(value: self.poolTypes, fieldNumber: 3)
     }
     try unknownFields.traverse(visitor: &visitor)
   }
 
-  static func ==(lhs: Exclude, rhs: Exclude) -> Bool {
-    if lhs.txid != rhs.txid {return false}
+  static func ==(lhs: GetMempoolTxRequest, rhs: GetMempoolTxRequest) -> Bool {
+    if lhs.excludeTxidSuffixes != rhs.excludeTxidSuffixes {return false}
+    if lhs.poolTypes != rhs.poolTypes {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

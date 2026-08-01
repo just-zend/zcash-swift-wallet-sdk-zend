@@ -136,7 +136,7 @@ actor CompactBlockProcessor {
             self.outputParamsURL = outputParamsURL
             self.saplingParamsSourceURL = saplingParamsSourceURL
             self.walletBirthdayProvider = walletBirthdayProvider
-            self.saplingActivation = network.saplingActivationHeight
+            self.saplingActivation = network.constants.saplingActivationHeight
             self.network = network
             self.cacheDbURL = nil
             self.enhanceBatchSize = enhanceBatchSize
@@ -657,8 +657,7 @@ extension CompactBlockProcessor {
                     ZcashError.serviceSubtreeRootsStreamFailed,
                     ZcashError.rustTorConnectToLightwalletd, ZcashError.rustTorLwdGetInfo,
                     ZcashError.rustTorLwdSubmit, ZcashError.rustTorLwdFetchTransaction,
-                    ZcashError.rustTorLwdLatestBlockHeight, ZcashError.rustTorLwdGetTreeState,
-                    ZcashError.compactBlockProcessorServerTipBehind: serviceError = true
+                    ZcashError.rustTorLwdLatestBlockHeight, ZcashError.rustTorLwdGetTreeState: serviceError = true
                 default:
                     // Non-ZcashError exceptions are raw gRPC/transport failures that escaped without
                     // proper wrapping — treat them as service errors so the retry logic kicks in

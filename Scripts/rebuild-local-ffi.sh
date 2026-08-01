@@ -20,14 +20,6 @@ if [[ -f "$HOME/.cargo/env" ]]; then
     source "$HOME/.cargo/env"
 fi
 
-# shellcheck source=rust-build-env.sh
-source Scripts/rust-build-env.sh
-RUST_TOOLCHAIN=$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)
-if [[ -z "$RUST_TOOLCHAIN" ]]; then
-    echo "Error: rust-toolchain.toml must pin an exact toolchain" >&2
-    exit 1
-fi
-
 TARGET="${1:-ios-sim}"
 XCFRAMEWORK_DIR="LocalPackages/libzcashlc.xcframework"
 
@@ -45,10 +37,7 @@ else
     IS_APPLE_SILICON=false
 fi
 
-# Map target to Rust triple and xcframework slice. Slice identifiers name
-# exactly the single architecture that was built (never the full build's fat
-# ios-arm64_x86_64-simulator / macos-arm64_x86_64 names) — see the invariant
-# note in init-local-ffi.sh; the two tools must stay interchangeable.
+# Map target to Rust triple and xcframework slice
 case "$TARGET" in
     ios-sim)
         if [[ "$IS_APPLE_SILICON" == "true" ]]; then
@@ -58,7 +47,7 @@ case "$TARGET" in
             RUST_TARGET="x86_64-apple-ios"
             ARCH="x86_64"
         fi
-        XCFRAMEWORK_SLICE="ios-${ARCH}-simulator"
+        XCFRAMEWORK_SLICE="ios-arm64_x86_64-simulator"
         PLATFORM="ios"
         PLATFORM_VARIANT="simulator"
         ;;
@@ -77,7 +66,7 @@ case "$TARGET" in
             RUST_TARGET="x86_64-apple-darwin"
             ARCH="x86_64"
         fi
-        XCFRAMEWORK_SLICE="macos-${ARCH}"
+        XCFRAMEWORK_SLICE="macos-arm64_x86_64"
         PLATFORM="macos"
         PLATFORM_VARIANT=""
         ;;
@@ -92,7 +81,7 @@ echo "Building for $TARGET ($RUST_TARGET)..."
 echo ""
 
 # Check if Rust target is installed
-if ! rustup target list --installed --toolchain "$RUST_TOOLCHAIN" | grep -q "^${RUST_TARGET}$"; then
+if ! rustup target list --installed | grep -q "^${RUST_TARGET}$"; then
     echo "Rust target '$RUST_TARGET' is not installed."
     read -p "Install it now? [Y/n] " -n 1 -r
     echo
@@ -100,12 +89,12 @@ if ! rustup target list --installed --toolchain "$RUST_TOOLCHAIN" | grep -q "^${
         echo "Cannot build without the target. Exiting."
         exit 1
     fi
-    rustup target add --toolchain "$RUST_TOOLCHAIN" "$RUST_TARGET"
+    rustup target add "$RUST_TARGET"
 fi
 
 # Incremental cargo build (fast for small changes!)
 # Cargo.toml is at the repo root, so we run cargo from there
-cargo "+$RUST_TOOLCHAIN" build --locked --target "$RUST_TARGET" --release
+cargo build --target "$RUST_TARGET" --release
 
 # Path to built static library (target/ is at repo root)
 BUILT_LIB="target/$RUST_TARGET/release/libzcashlc.a"

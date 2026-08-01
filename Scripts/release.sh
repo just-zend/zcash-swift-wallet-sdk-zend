@@ -13,8 +13,8 @@
 #   8. Publishes the GitHub release
 #
 # Arguments:
-#   <remote>   The git remote pointing to just-zend/zcash-swift-wallet-sdk-zend
-#              (usually 'origin')
+#   <remote>   The git remote pointing to zcash/zcash-swift-wallet-sdk
+#              (e.g., 'origin' or 'upstream')
 #   <version>  The version to release (e.g., '2.5.0')
 #
 # Versions with a SemVer pre-release suffix (e.g. 2.6.0-alpha.1, 2.7.0-rc.2)
@@ -58,7 +58,7 @@ if ! git remote get-url "$UPSTREAM_REMOTE" &>/dev/null; then
     git remote -v
     exit 1
 fi
-REPO="just-zend/zcash-swift-wallet-sdk-zend"
+REPO="zcash/zcash-swift-wallet-sdk"
 PRODUCTS_DIR="BuildSupport/products"
 
 # SemVer: a hyphen in the version (e.g. 2.6.0-alpha.1) marks a pre-release

@@ -10,7 +10,7 @@ use zcash_voting as voting;
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
-use super::constants::{CANONICAL_FIELD_LEN, SHARE_NULLIFIER_HEX_LEN, SHARE_NULLIFIER_LEN};
+use super::constants::CANONICAL_FIELD_LEN;
 use super::db::VotingDatabaseHandle;
 use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
 
@@ -54,31 +54,6 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     hex
 }
 
-fn hex_nibble(byte: u8) -> anyhow::Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(anyhow!("nullifier contains non-hex character")),
-    }
-}
-
-fn decode_share_nullifier_hex(hex: &str) -> anyhow::Result<[u8; SHARE_NULLIFIER_LEN]> {
-    if hex.len() != SHARE_NULLIFIER_HEX_LEN {
-        return Err(anyhow!(
-            "nullifier must be {} hex chars, got {}",
-            SHARE_NULLIFIER_HEX_LEN,
-            hex.len()
-        ));
-    }
-
-    let mut out = [0u8; SHARE_NULLIFIER_LEN];
-    for (i, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
-        out[i] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
-    }
-    Ok(out)
-}
-
 /// Compute the share reveal nullifier from client-known inputs.
 ///
 /// Returns the 32-byte nullifier as a hex string (64 chars), or null on error.
@@ -107,7 +82,7 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
                     anyhow!("primary_blind must be exactly {CANONICAL_FIELD_LEN} bytes")
                 })?;
 
-        let nullifier = voting::share_tracking::compute_share_nullifier(&vc, share_index, &blind)
+        let nullifier = voting::share::compute_nullifier(&vc, share_index, &blind)
             .map_err(|e| anyhow!("compute_share_nullifier failed: {}", e))?;
 
         let hex_str = bytes_to_hex(&nullifier);
@@ -119,13 +94,16 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
 
 /// Record a share delegation after sending to helper servers.
 ///
+/// The share's nullifier is derived internally from the round's recovery state
+/// rather than supplied by the caller, so a caller cannot record a nullifier
+/// that disagrees with the share it belongs to.
+///
 /// Returns 0 on success, -1 on error.
 ///
 /// # Safety
 ///
 /// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
 /// - String params must be valid UTF-8 pointers with correct lengths.
-/// - `nullifier_hex` must point to exactly 64 hex chars.
 /// - `sent_to_urls_json` must be a JSON array of strings.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_record_share_delegation(
@@ -137,8 +115,6 @@ pub unsafe extern "C" fn zcashlc_voting_record_share_delegation(
     share_index: u32,
     sent_to_urls_json: *const u8,
     sent_to_urls_json_len: usize,
-    nullifier_hex: *const u8,
-    nullifier_hex_len: usize,
     submit_at: u64,
 ) -> i32 {
     let db = AssertUnwindSafe(db);
@@ -146,23 +122,19 @@ pub unsafe extern "C" fn zcashlc_voting_record_share_delegation(
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let nullifier_hex_str = unsafe { str_from_ptr(nullifier_hex, nullifier_hex_len) }?;
-        let nullifier = decode_share_nullifier_hex(&nullifier_hex_str)?;
         let urls_bytes = unsafe { bytes_from_ptr(sent_to_urls_json, sent_to_urls_json_len) }?;
         let sent_to_urls: Vec<String> = serde_json::from_slice(urls_bytes)?;
 
-        handle
-            .db
-            .record_share_delegation(
-                &round_id_str,
-                bundle_index,
-                proposal_id,
-                share_index,
-                &sent_to_urls,
-                &nullifier,
-                submit_at,
-            )
-            .map_err(|e| anyhow!("record_share_delegation failed: {}", e))?;
+        voting::share::record(
+            &handle.db,
+            &round_id_str,
+            bundle_index,
+            proposal_id,
+            share_index,
+            &sent_to_urls,
+            submit_at,
+        )
+        .map_err(|e| anyhow!("share::record failed: {}", e))?;
         Ok(0)
     });
     unwrap_exc_or(res, -1)
@@ -310,14 +282,28 @@ mod tests {
     use crate::voting::db::zcashlc_voting_db_free;
     use crate::voting::test_helpers::{insert_round_and_bundle, open_memory_db};
 
+    // A test asserting that an invalid caller-supplied nullifier is rejected
+    // used to live here. `share::record` now derives the nullifier from the
+    // round's recovery state, so callers cannot supply one at all and there is
+    // no longer a malformed-input case to exercise.
+
+    // The former round-trip test asserted that a caller-supplied hex nullifier
+    // came back unchanged. `share::record` now derives the nullifier from the
+    // vote's persisted recovery bundle, which only a real `vote::commit` writes
+    // — `zcash_voting` exposes a public reader for that bundle but no writer.
+    // A successful record therefore cannot be staged from a unit test, so the
+    // boundary that remains testable is the failure below.
+
     #[test]
-    fn record_share_delegation_rejects_invalid_nullifier_length() {
+    fn record_share_delegation_rejects_a_vote_that_was_never_committed() {
         let db = open_memory_db();
         let round_id = b"round";
         insert_round_and_bundle(db, "round");
         let urls_json = br#"["https://helper.example"]"#;
-        let nullifier_hex = [b'a'; SHARE_NULLIFIER_LEN * 2 - 1];
 
+        // The round and bundle exist, but no vote has been committed for them,
+        // so there is no recovery bundle to derive a share nullifier from.
+        // Recording must fail rather than persist a share with no provenance.
         let code = unsafe {
             zcashlc_voting_record_share_delegation(
                 db,
@@ -328,41 +314,10 @@ mod tests {
                 0,
                 urls_json.as_ptr(),
                 urls_json.len(),
-                nullifier_hex.as_ptr(),
-                nullifier_hex.len(),
                 0,
             )
         };
-
         assert_eq!(code, -1);
-        unsafe { zcashlc_voting_db_free(db) };
-    }
-
-    #[test]
-    fn record_share_delegation_round_trips_hex_nullifier() {
-        let db = open_memory_db();
-        let round_id = b"round";
-        insert_round_and_bundle(db, "round");
-        let urls_json = br#"["https://helper.example"]"#;
-        let nullifier = (0u8..SHARE_NULLIFIER_LEN as u8).collect::<Vec<_>>();
-        let nullifier_hex = bytes_to_hex(&nullifier);
-
-        let code = unsafe {
-            zcashlc_voting_record_share_delegation(
-                db,
-                round_id.as_ptr(),
-                round_id.len(),
-                0,
-                0,
-                0,
-                urls_json.as_ptr(),
-                urls_json.len(),
-                nullifier_hex.as_ptr(),
-                nullifier_hex.len(),
-                0,
-            )
-        };
-        assert_eq!(code, 0);
 
         let result =
             unsafe { zcashlc_voting_get_share_delegations(db, round_id.as_ptr(), round_id.len()) };
@@ -370,8 +325,10 @@ mod tests {
         let json = unsafe { (*result).as_slice() }.to_vec();
         let records: Vec<JsonShareDelegationRecord> =
             serde_json::from_slice(&json).expect("share delegation records");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].nullifier, nullifier_hex);
+        assert!(
+            records.is_empty(),
+            "a rejected record must not leave a partial row behind"
+        );
 
         unsafe { zcashlc_free_boxed_slice(result) };
         unsafe { zcashlc_voting_db_free(db) };

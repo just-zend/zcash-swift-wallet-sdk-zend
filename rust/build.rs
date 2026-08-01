@@ -4,7 +4,6 @@ use std::{env, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=rust/src/lib.rs");
-    println!("cargo:rerun-if-changed=rust/src/migration.rs");
     println!("cargo:rerun-if-changed=rust/src/voting.rs");
     println!("cargo:rerun-if-changed=rust/src/voting");
     println!("cargo:rerun-if-changed=rust/wrapper.c");

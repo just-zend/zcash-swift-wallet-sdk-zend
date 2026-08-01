@@ -77,6 +77,12 @@ class WalletTransactionEncoder: TransactionEncoder {
         return Proposal(inner: proposal)
     }
 
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
+        let proposal = try await rustBackend.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
+
+        return Proposal(inner: proposal)
+    }
+
     func proposeShielding(
         accountUUID: AccountUUID,
         shieldingThreshold: Zatoshi,

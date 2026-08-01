@@ -54,6 +54,10 @@ public protocol CombineSynchronizer {
         memo: Memo?
     ) -> SinglePublisher<Proposal, Error>
 
+    /// Creates a proposal that migrates the account's entire Orchard balance into the Ironwood pool.
+    /// Fails unless NU6.3 is active at the chain tip.
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) -> SinglePublisher<Proposal, Error>
+
     /// Creates a proposal for shielding any transparent funds received by the given account.
     ///
     /// - Parameter accountUUID: the account from which to shield funds.

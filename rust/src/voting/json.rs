@@ -240,69 +240,6 @@ impl From<JsonWireEncryptedShare> for voting::WireEncryptedShare {
     }
 }
 
-/// JSON-serializable VoteCommitmentBundle.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JsonVoteCommitmentBundle {
-    pub van_nullifier: Vec<u8>,
-    pub vote_authority_note_new: Vec<u8>,
-    pub vote_commitment: Vec<u8>,
-    pub proposal_id: u32,
-    pub proof: Vec<u8>,
-    pub enc_shares: Vec<JsonWireEncryptedShare>,
-    pub anchor_height: u32,
-    pub vote_round_id: String,
-    pub shares_hash: Vec<u8>,
-    pub share_blinds: Vec<Vec<u8>>,
-    pub share_comms: Vec<Vec<u8>>,
-    pub r_vpk_bytes: Vec<u8>,
-    pub alpha_v: Vec<u8>,
-}
-
-impl From<voting::VoteCommitmentBundle> for JsonVoteCommitmentBundle {
-    fn from(b: voting::VoteCommitmentBundle) -> Self {
-        Self {
-            van_nullifier: b.van_nullifier,
-            vote_authority_note_new: b.vote_authority_note_new,
-            vote_commitment: b.vote_commitment,
-            proposal_id: b.proposal_id,
-            proof: b.proof,
-            enc_shares: b.enc_shares.into_iter().map(Into::into).collect(),
-            anchor_height: b.anchor_height,
-            vote_round_id: b.vote_round_id,
-            shares_hash: b.shares_hash,
-            share_blinds: b.share_blinds,
-            share_comms: b.share_comms,
-            r_vpk_bytes: b.r_vpk_bytes,
-            alpha_v: b.alpha_v,
-        }
-    }
-}
-
-impl JsonVoteCommitmentBundle {
-    /// Rebuild the core commitment fields that are safe to carry in JSON.
-    ///
-    /// `enc_shares` is intentionally left empty because the JSON form only
-    /// carries wire-safe encrypted share fields, not the secret client-side
-    /// fields present in `voting::EncryptedShare`.
-    pub(super) fn into_core_without_encrypted_shares(self) -> voting::VoteCommitmentBundle {
-        voting::VoteCommitmentBundle {
-            van_nullifier: self.van_nullifier,
-            vote_authority_note_new: self.vote_authority_note_new,
-            vote_commitment: self.vote_commitment,
-            proposal_id: self.proposal_id,
-            proof: self.proof,
-            enc_shares: Vec::new(),
-            anchor_height: self.anchor_height,
-            vote_round_id: self.vote_round_id,
-            shares_hash: self.shares_hash,
-            share_blinds: self.share_blinds,
-            share_comms: self.share_comms,
-            r_vpk_bytes: self.r_vpk_bytes,
-            alpha_v: self.alpha_v,
-        }
-    }
-}
-
 /// JSON-serializable SharePayload.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonSharePayload {
@@ -343,16 +280,49 @@ impl From<voting::SharePayload> for JsonSharePayload {
     }
 }
 
-/// JSON-serializable CastVoteSignature.
+/// JSON-serializable `voting::vote::VoteCommit`.
+///
+/// This is the whole result of committing one cast-vote: the signed commitment
+/// fields destined for the vote chain, the encrypted shares that the vote proof
+/// binds, and the helper-server payloads derived from them. Previously the
+/// Swift layer assembled the equivalent by calling three separate FFI entry
+/// points and re-serializing intermediate state between them; `zcash_voting`
+/// now owns that orchestration, so a single response carries everything.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JsonCastVoteSignature {
+pub struct JsonVoteCommit {
+    pub proposal_id: u32,
+    pub van_nullifier: Vec<u8>,
+    pub vote_authority_note_new: Vec<u8>,
+    pub vote_commitment: Vec<u8>,
+    pub proof: Vec<u8>,
+    pub anchor_height: u32,
+    pub r_vpk: Vec<u8>,
     pub vote_auth_sig: Vec<u8>,
+    pub enc_shares: Vec<JsonWireEncryptedShare>,
+    pub share_payloads: Vec<JsonSharePayload>,
 }
 
-impl From<voting::CastVoteSignature> for JsonCastVoteSignature {
-    fn from(s: voting::CastVoteSignature) -> Self {
+impl From<voting::vote::VoteCommit> for JsonVoteCommit {
+    fn from(c: voting::vote::VoteCommit) -> Self {
         Self {
-            vote_auth_sig: s.vote_auth_sig,
+            proposal_id: c.proposal_id,
+            van_nullifier: c.van_nullifier.to_vec(),
+            vote_authority_note_new: c.vote_authority_note_new.to_vec(),
+            vote_commitment: c.vote_commitment.to_vec(),
+            proof: c.proof,
+            anchor_height: c.anchor_height,
+            r_vpk: c.r_vpk.to_vec(),
+            vote_auth_sig: c.vote_auth_sig.to_vec(),
+            enc_shares: c
+                .encrypted_shares
+                .into_iter()
+                .map(|s| JsonWireEncryptedShare {
+                    c1: s.c1,
+                    c2: s.c2,
+                    share_index: s.share_index,
+                })
+                .collect(),
+            share_payloads: c.share_payloads.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -364,8 +334,6 @@ pub struct JsonDelegationInputs {
     pub g_d_new_x: Vec<u8>,
     pub pk_d_new_x: Vec<u8>,
     pub hotkey_raw_address: Vec<u8>,
-    pub hotkey_public_key: Vec<u8>,
-    pub hotkey_address: String,
     pub seed_fingerprint: Vec<u8>,
 }
 
@@ -380,8 +348,8 @@ pub struct JsonVanWitness {
     pub anchor_height: u32,
 }
 
-impl From<voting::tree_sync::VanWitness> for JsonVanWitness {
-    fn from(w: voting::tree_sync::VanWitness) -> Self {
+impl From<voting::vote::VanWitness> for JsonVanWitness {
+    fn from(w: voting::vote::VanWitness) -> Self {
         Self {
             auth_path: w.auth_path.iter().map(|h| h.to_vec()).collect(),
             position: w.position,

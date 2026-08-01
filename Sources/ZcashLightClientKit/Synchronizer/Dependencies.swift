@@ -17,8 +17,7 @@ enum Dependencies {
         endpoint: LightWalletEndpoint,
         loggingPolicy: Initializer.LoggingPolicy = .default(.debug),
         isTorEnabled: Bool,
-        isExchangeRateEnabled: Bool,
-        regtestActivationHeights: NetworkActivationHeights? = nil
+        isExchangeRateEnabled: Bool
     ) {
         container.register(type: SDKFlags.self, isSingleton: true) { _ in
             SDKFlags(
@@ -28,7 +27,7 @@ enum Dependencies {
         }
 
         container.register(type: CheckpointSource.self, isSingleton: true) { _ in
-            CheckpointSourceFactory.fromBundle(for: networkType, regtestActivationHeights: regtestActivationHeights)
+            CheckpointSourceFactory.fromBundle(for: networkType)
         }
 
         container.register(type: Logger.self, isSingleton: true) { _ in

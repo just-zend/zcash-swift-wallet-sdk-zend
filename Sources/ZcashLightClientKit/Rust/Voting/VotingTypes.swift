@@ -36,11 +36,24 @@ public struct VotingRoundSummary: Sendable {
 
 // MARK: - Hotkey
 
-/// Voting hotkey (secret key, public key, address).
-public struct VotingHotkey: Sendable {
-    public let secretKey: [UInt8]
-    public let publicKey: [UInt8]
-    public let address: String
+/// A voting hotkey: the secret the wallet delegates voting power to, together
+/// with the Orchard address derived from it.
+///
+/// A voting hotkey is an app-owned random value, not a wallet-seed derivation.
+/// The application **must persist `storedSecret`**: it cannot be recovered from
+/// the wallet seed, so restoring a wallet from its seed phrase does not restore
+/// the ability to vote with a hotkey whose secret was lost. Everything else here
+/// is derived from `storedSecret` and does not need to be stored.
+///
+/// Conforms to `Undescribable` so the secret cannot escape through
+/// `print`, string interpolation, or reflection.
+public struct VotingHotkey: Sendable, Undescribable {
+    /// The material to persist. Treat it as key material, not as an identifier.
+    public let storedSecret: [UInt8]
+    /// Raw Orchard address bytes for the hotkey, derived from `storedSecret`.
+    public let rawOrchardAddress: [UInt8]
+    /// Address index the hotkey's Orchard address was derived at.
+    public let addressIndex: UInt32
 }
 
 // MARK: - Bundle Setup
@@ -49,6 +62,10 @@ public struct VotingHotkey: Sendable {
 public struct VotingBundleSetupResult: Sendable {
     public let bundleCount: UInt32
     public let eligibleWeight: UInt64
+    /// Notes the canonical bundling policy discarded, and which are therefore
+    /// not represented in `eligibleWeight`. A non-zero value here means the
+    /// wallet holds voting notes that will not be voted with.
+    public let droppedCount: UInt32
 }
 
 // MARK: - Vote Record
@@ -64,7 +81,11 @@ public struct VotingVoteRecord: Sendable {
 // MARK: - Note Info (JSON)
 
 /// Note information for voting eligibility.
-public struct VotingNoteInfo: Codable, Sendable {
+///
+/// Conforms to `Undescribable` because `rho` and `rseed` are Orchard note
+/// secrets: printing a note recovers the material needed to re-derive the note,
+/// so reflection-based description must not expose them.
+public struct VotingNoteInfo: Codable, Sendable, Undescribable {
     public let commitment: [UInt8]
     public let nullifier: [UInt8]
     public let value: UInt64
@@ -106,7 +127,11 @@ public struct VotingNoteInfo: Codable, Sendable {
 // MARK: - Voting PCZT (JSON)
 
 /// Result of building a voting PCZT.
-public struct VotingPczt: Codable, Sendable {
+///
+/// Conforms to `Undescribable` because it carries the spend-authorization
+/// randomizer `alpha` alongside the `rseed` values and padded note secrets of
+/// the actions it authorizes; those are signing and note secrets, not wire data.
+public struct VotingPczt: Codable, Sendable, Undescribable {
     public let pcztBytes: [UInt8]
     /// Randomized verification key (`rk` on the wire).
     public let randomizedKey: [UInt8]
@@ -268,68 +293,39 @@ public struct VotingDelegationSubmission: Codable, Sendable {
     }
 }
 
-// MARK: - Vote Commitment Bundle (JSON)
+// MARK: - Vote Commit (JSON)
 
-/// A vote commitment bundle produced by Voting ZKP.
-public struct VotingVoteCommitmentBundle: Codable, Sendable {
+/// Everything produced by committing one cast vote: the signed commitment
+/// fields destined for the vote chain, the encrypted shares the vote proof
+/// binds, and the helper-server payloads derived from them.
+///
+/// Every field here is wire data — it is published on chain or sent to helper
+/// servers — so the commit result carries no secret the wallet must retain. The
+/// signing secrets used to produce it stay inside `zcash_voting`.
+public struct VotingVoteCommit: Codable, Sendable {
+    public let proposalId: UInt32
     public let vanNullifier: [UInt8]
     public let voteAuthorityNoteNew: [UInt8]
     public let voteCommitment: [UInt8]
-    public let proposalId: UInt32
     public let proof: [UInt8]
-    public let encShares: [VotingWireEncryptedShare]
     public let anchorHeight: UInt32
-    public let voteRoundId: String
-    public let sharesHash: [UInt8]
-    public let shareBlinds: [[UInt8]]
-    public let shareComms: [[UInt8]]
-    public let rVpkBytes: [UInt8]
-    public let alphaV: [UInt8]
+    /// Randomizer for the vote public key (`r_vpk` on the wire).
+    public let voteKeyRandomizer: [UInt8]
+    public let voteAuthSig: [UInt8]
+    public let encShares: [VotingWireEncryptedShare]
+    public let sharePayloads: [VotingSharePayload]
 
     enum CodingKeys: String, CodingKey {
+        case proposalId = "proposal_id"
         case vanNullifier = "van_nullifier"
         case voteAuthorityNoteNew = "vote_authority_note_new"
         case voteCommitment = "vote_commitment"
-        case proposalId = "proposal_id"
         case proof
-        case encShares = "enc_shares"
         case anchorHeight = "anchor_height"
-        case voteRoundId = "vote_round_id"
-        case sharesHash = "shares_hash"
-        case shareBlinds = "share_blinds"
-        case shareComms = "share_comms"
-        case rVpkBytes = "r_vpk_bytes"
-        case alphaV = "alpha_v"
-    }
-
-    public init(
-        vanNullifier: [UInt8],
-        voteAuthorityNoteNew: [UInt8],
-        voteCommitment: [UInt8],
-        proposalId: UInt32,
-        proof: [UInt8],
-        encShares: [VotingWireEncryptedShare],
-        anchorHeight: UInt32,
-        voteRoundId: String,
-        sharesHash: [UInt8],
-        shareBlinds: [[UInt8]],
-        shareComms: [[UInt8]],
-        rVpkBytes: [UInt8],
-        alphaV: [UInt8]
-    ) {
-        self.vanNullifier = vanNullifier
-        self.voteAuthorityNoteNew = voteAuthorityNoteNew
-        self.voteCommitment = voteCommitment
-        self.proposalId = proposalId
-        self.proof = proof
-        self.encShares = encShares
-        self.anchorHeight = anchorHeight
-        self.voteRoundId = voteRoundId
-        self.sharesHash = sharesHash
-        self.shareBlinds = shareBlinds
-        self.shareComms = shareComms
-        self.rVpkBytes = rVpkBytes
-        self.alphaV = alphaV
+        case voteKeyRandomizer = "r_vpk"
+        case voteAuthSig = "vote_auth_sig"
+        case encShares = "enc_shares"
+        case sharePayloads = "share_payloads"
     }
 }
 
@@ -382,17 +378,6 @@ public struct VotingSharePayload: Codable, Sendable {
     }
 }
 
-// MARK: - Cast Vote Signature (JSON)
-
-/// Signature for a cast vote transaction.
-public struct VotingCastVoteSignature: Codable, Sendable {
-    public let voteAuthSig: [UInt8]
-
-    enum CodingKeys: String, CodingKey {
-        case voteAuthSig = "vote_auth_sig"
-    }
-}
-
 // MARK: - Delegation Inputs (JSON)
 
 /// Inputs needed for delegation construction.
@@ -401,8 +386,6 @@ public struct VotingDelegationInputs: Codable, Sendable {
     public let gDNewX: [UInt8]
     public let pkDNewX: [UInt8]
     public let hotkeyRawAddress: [UInt8]
-    public let hotkeyPublicKey: [UInt8]
-    public let hotkeyAddress: String
     public let seedFingerprint: [UInt8]
 
     enum CodingKeys: String, CodingKey {
@@ -410,8 +393,6 @@ public struct VotingDelegationInputs: Codable, Sendable {
         case gDNewX = "g_d_new_x"
         case pkDNewX = "pk_d_new_x"
         case hotkeyRawAddress = "hotkey_raw_address"
-        case hotkeyPublicKey = "hotkey_public_key"
-        case hotkeyAddress = "hotkey_address"
         case seedFingerprint = "seed_fingerprint"
     }
 }
@@ -461,6 +442,42 @@ public struct VotingKeystoneSignatureRecord: Codable, Sendable, Equatable {
     }
 }
 
+// MARK: - Delegation key inputs
+
+/// The wallet-side material `zcash_voting` needs to reconstruct the delegation
+/// keys for one bundle.
+///
+/// `hotkeyStoredSecret` is the ``VotingHotkey/storedSecret`` the application
+/// persisted. The hotkey's Orchard address, address index and network are all
+/// derived from it, so no separate hotkey address is supplied.
+///
+/// Conforms to `Undescribable` because `hotkeyStoredSecret` is the voting
+/// hotkey's key material.
+public struct VotingDelegationKeyInputs: Sendable, Undescribable {
+    public let networkId: UInt32
+    public let fvk: [UInt8]
+    public let hotkeyStoredSecret: [UInt8]
+    public let seedFingerprint: [UInt8]
+    public let accountIndex: UInt32
+    public let roundName: String
+
+    public init(
+        networkId: UInt32,
+        fvk: [UInt8],
+        hotkeyStoredSecret: [UInt8],
+        seedFingerprint: [UInt8],
+        accountIndex: UInt32,
+        roundName: String
+    ) {
+        self.networkId = networkId
+        self.fvk = fvk
+        self.hotkeyStoredSecret = hotkeyStoredSecret
+        self.seedFingerprint = seedFingerprint
+        self.accountIndex = accountIndex
+        self.roundName = roundName
+    }
+}
+
 // MARK: - Build PCZT parameters
 
 /// Parameters required to build a voting PCZT for a delegation bundle.
@@ -468,39 +485,43 @@ public struct VotingBuildPcztParams: Sendable {
     public let roundId: String
     public let bundleIndex: UInt32
     public let notes: [VotingNoteInfo]
-    public let fvk: [UInt8]
-    public let hotkeyRawAddress: [UInt8]
+    public let keys: VotingDelegationKeyInputs
     public let consensusBranchId: UInt32
-    public let coinType: UInt32
-    public let seedFingerprint: [UInt8]
-    public let accountIndex: UInt32
-    public let roundName: String
-    public let addressIndex: UInt32
 
     public init(
         roundId: String,
         bundleIndex: UInt32,
         notes: [VotingNoteInfo],
-        fvk: [UInt8],
-        hotkeyRawAddress: [UInt8],
-        consensusBranchId: UInt32,
-        coinType: UInt32,
-        seedFingerprint: [UInt8],
-        accountIndex: UInt32,
-        roundName: String,
-        addressIndex: UInt32
+        keys: VotingDelegationKeyInputs,
+        consensusBranchId: UInt32
     ) {
         self.roundId = roundId
         self.bundleIndex = bundleIndex
         self.notes = notes
-        self.fvk = fvk
-        self.hotkeyRawAddress = hotkeyRawAddress
+        self.keys = keys
         self.consensusBranchId = consensusBranchId
-        self.coinType = coinType
-        self.seedFingerprint = seedFingerprint
-        self.accountIndex = accountIndex
-        self.roundName = roundName
-        self.addressIndex = addressIndex
+    }
+}
+
+// MARK: - Delegation proving parameters
+
+/// Parameters required to build and prove the delegation ZKP for a bundle.
+public struct VotingDelegationProofParams: Sendable {
+    public let roundId: String
+    public let bundleIndex: UInt32
+    public let notes: [VotingNoteInfo]
+    public let keys: VotingDelegationKeyInputs
+
+    public init(
+        roundId: String,
+        bundleIndex: UInt32,
+        notes: [VotingNoteInfo],
+        keys: VotingDelegationKeyInputs
+    ) {
+        self.roundId = roundId
+        self.bundleIndex = bundleIndex
+        self.notes = notes
+        self.keys = keys
     }
 }
 
@@ -539,7 +560,9 @@ public struct VotingPirProof: Sendable, Equatable {
 ///
 /// Returned by `VotingRustBackend.getCommitmentBundle(...)`.
 public struct VotingStoredCommitmentBundle: Sendable, Equatable {
-    /// JSON-encoded `VotingVoteCommitmentBundle` as it was stored.
+    /// The recovery bundle JSON `zcash_voting` wrote when the vote was
+    /// committed. It is opaque to the SDK: only `zcash_voting` produces and
+    /// consumes it.
     public let bundleJson: String
     /// Position of the vote commitment within the vote commitment tree.
     public let voteCommitmentTreePosition: UInt64

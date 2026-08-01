@@ -21,6 +21,8 @@ public enum ZcashErrorCode: String {
     case initializerGeneralStorageCantCreate = "ZINIT0004"
     /// Can't set `isExcludedFromBackup` flag to `generalStorageURL`.
     case initializerCantSetNoBackupFlagToGeneralStorageURL = "ZINIT0005"
+    /// The seed passed to `prepare` does not match the seed-derived account(s) already stored in `data.db`; restoring a different wallet requires wiping first.
+    case initializerSeedMismatch = "ZINIT0006"
     /// Unknown GRPC Service error
     case serviceUnknownError = "ZSRVC0001"
     /// LightWalletService.getInfo failed.
@@ -41,7 +43,7 @@ public enum ZcashErrorCode: String {
     case serviceBlockStreamFailed = "ZSRVC0000"
     /// LightWalletService.getSubtreeRoots failed.
     case serviceSubtreeRootsStreamFailed = "ZSRVC0009"
-    /// LightWalletService.getTaddressTxids failed.
+    /// LightWalletService.getTaddressTransactions failed.
     case serviceGetTaddressTxidsFailed = "ZSRVC0010"
     /// LightWalletService.getMempoolStream failed.
     case serviceGetMempoolStreamFailed = "ZSRVC0011"
@@ -263,70 +265,6 @@ public enum ZcashErrorCode: String {
     case rustTruncateToChainState = "ZRUST0091"
     /// Error from rust layer when calling ZcashEip681Backend.parseTransactionRequest
     case rustEip681Parse = "ZRUST0092"
-    /// Error from rust layer when calling ZcashRustBackend.migrationState
-    case rustMigrationState = "ZRUST0093"
-    /// Error from rust layer when calling ZcashRustBackend.migrationProgress
-    case rustMigrationProgress = "ZRUST0094"
-    /// Error from rust layer when calling ZcashRustBackend.migrationIsNoteSplitNeeded
-    case rustMigrationIsNoteSplitNeeded = "ZRUST0095"
-    /// Error from rust layer when calling ZcashRustBackend.migrationPrepareNoteSplit
-    case rustMigrationPrepareNoteSplit = "ZRUST0096"
-    /// Error from rust layer when calling ZcashRustBackend.migrationSignNoteSplit
-    case rustMigrationSignNoteSplit = "ZRUST0097"
-    /// Error from rust layer when calling ZcashRustBackend.migrationProposeTransfers
-    case rustMigrationProposeTransfers = "ZRUST0098"
-    /// Error from rust layer when calling ZcashRustBackend.migrationSignAndStore
-    case rustMigrationSignAndStore = "ZRUST0099"
-    /// Error from rust layer when calling ZcashRustBackend.migrationIsSyncRequired
-    case rustMigrationIsSyncRequired = "ZRUST0100"
-    /// Error from rust layer when calling ZcashRustBackend.migrationNextDueTransfer
-    case rustMigrationNextDueTransfer = "ZRUST0101"
-    /// Error from rust layer when calling ZcashRustBackend.migrationRecordTransferResult
-    case rustMigrationRecordTransferResult = "ZRUST0102"
-    /// Error from rust layer when calling ZcashRustBackend.migrationHasOverdueTransfers
-    case rustMigrationHasOverdueTransfers = "ZRUST0103"
-    /// Error from rust layer when calling ZcashRustBackend.migrationHasInvalidTransfers
-    case rustMigrationHasInvalidTransfers = "ZRUST0104"
-    /// Error from rust layer when calling ZcashRustBackend.migrationRestartStep
-    case rustMigrationRestartStep = "ZRUST0105"
-    /// Error from rust layer when calling ZcashRustBackend.migrationInitializePostUpgrade
-    case rustMigrationInitializePostUpgrade = "ZRUST0106"
-    /// Error from rust layer when calling ZcashRustBackend.migrationExtractBroadcastTx
-    case rustMigrationExtractBroadcastTx = "ZRUST0107"
-    /// Error from rust layer when calling ZcashRustBackend.migrationRefreshStaleTransfers
-    case rustMigrationRefreshStaleTransfers = "ZRUST0108"
-    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedNoteSplitPCZT
-    case rustMigrationCreateUnsignedNoteSplitPCZT = "ZRUST0111"
-    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedTransferPCZTs
-    case rustMigrationCreateUnsignedTransferPCZTs = "ZRUST0112"
-    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedNoteSplitPCZT
-    case rustMigrationStoreSignedNoteSplitPCZT = "ZRUST0113"
-    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePCZTs
-    case rustMigrationStoreSignedSchedulePCZTs = "ZRUST0114"
-    /// Ordinary wallet spending is blocked by the active Ironwood migration.
-    case migrationOrdinarySpendsBlocked = "ZRUST0115"
-    /// Error from rust layer when reading the authoritative migration snapshot.
-    case rustMigrationSnapshot = "ZRUST0116"
-    /// Error from rust layer when proposing a private anchorless intent schedule.
-    case rustMigrationProposePrivateIntents = "ZRUST0117"
-    /// Error from rust layer when proposing an immediate anchorless intent.
-    case rustMigrationProposeImmediateIntent = "ZRUST0118"
-    /// Error from rust layer when committing an approved intent schedule.
-    case rustMigrationCommitIntents = "ZRUST0119"
-    /// Error from rust layer when claiming a persisted due migration transaction.
-    case rustMigrationClaimNextDueTransfer = "ZRUST0120"
-    /// Error from rust layer when materializing and claiming a software-signed intent.
-    case rustMigrationMaterializeAndClaimNextDue = "ZRUST0121"
-    /// Error from rust layer when staging a due intent for an external signer.
-    case rustMigrationStageNextDueExternalPCZT = "ZRUST0122"
-    /// Error from rust layer when resuming an engine-owned signed submission.
-    case rustMigrationResumeStagedSubmission = "ZRUST0123"
-    /// Error from rust layer when storing a device-signed due intent.
-    case rustMigrationStoreSignedDueIntent = "ZRUST0124"
-    /// Error from rust layer when recording a tokenized migration submission result.
-    case rustMigrationRecordClaimedTransferResult = "ZRUST0125"
-    /// Error from rust layer when ingesting and claiming a persisted denomination-split transaction.
-    case rustMigrationClaimNoteSplitSubmission = "ZRUST0126"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.
@@ -489,8 +427,6 @@ public enum ZcashErrorCode: String {
     case compactBlockProcessorPutOrchardSubtreeRoots = "ZCBPEO0022"
     /// Put Ironwood subtree roots to the DB failed.
     case compactBlockProcessorPutIronwoodSubtreeRoots = "ZCBPEO0023"
-    /// Every sampled server tip was below durable local wallet state. Retrying may select a healthy load-balanced replica.
-    case compactBlockProcessorServerTipBehind = "ZCBPEO0024"
     /// The synchronizer is unprepared.
     case synchronizerNotPrepared = "ZSYNCO0001"
     /// Memos can't be sent to transparent addresses.

@@ -31,29 +31,26 @@ extension ValidateServerAction: Action {
         let localNetwork = config.network
         let saplingActivation = config.saplingActivation
 
-        guard let remoteChainName = ConsensusChainName.canonicalize(info.chainName) else {
+        // check network types
+        guard let remoteNetworkType = NetworkType.forChainName(info.chainName) else {
             throw ZcashError.compactBlockProcessorChainName(info.chainName)
         }
-        guard remoteChainName == localNetwork.chainName else {
-            if localNetwork.customActivationHeights == nil,
-               let remoteNetworkType = NetworkType.forChainName(remoteChainName) {
-                throw ZcashError.compactBlockProcessorNetworkMismatch(localNetwork.networkType, remoteNetworkType)
-            }
-            throw ZcashError.compactBlockProcessorChainName(info.chainName)
+
+        guard remoteNetworkType == localNetwork.networkType else {
+            throw ZcashError.compactBlockProcessorNetworkMismatch(localNetwork.networkType, remoteNetworkType)
         }
 
         guard saplingActivation == info.saplingActivationHeight else {
             throw ZcashError.compactBlockProcessorSaplingActivationMismatch(saplingActivation, BlockHeight(info.saplingActivationHeight))
         }
 
-        guard info.blockHeight < UInt64(Int32.max),
-              let nextBlockHeight = Int32(exactly: info.blockHeight + 1) else {
-            throw ZcashError.compactBlockProcessorConsensusBranchID
-        }
-        let localBranch = try rustBackend.consensusBranchIdFor(height: nextBlockHeight)
+        // check branch id
+        let localBranch = try rustBackend.consensusBranchIdFor(height: Int32(info.blockHeight))
+
         guard let remoteBranchID = ConsensusBranchID.fromString(info.consensusBranchID) else {
             throw ZcashError.compactBlockProcessorConsensusBranchID
         }
+
         guard remoteBranchID == localBranch else {
             throw ZcashError.compactBlockProcessorWrongConsensusBranchId(localBranch, remoteBranchID)
         }

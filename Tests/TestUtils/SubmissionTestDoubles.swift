@@ -83,6 +83,10 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
         unimplementedStreaming(on: context.eventLoop)
     }
 
+    func getTaddressTransactions(request: TransparentAddressBlockFilter, context: StreamingResponseCallContext<RawTransaction>) -> EventLoopFuture<GRPCStatus> {
+        unimplementedStreaming(on: context.eventLoop)
+    }
+
     func getTaddressBalance(request: AddressList, context: StatusOnlyCallContext) -> EventLoopFuture<Balance> {
         unimplementedUnary(on: context.eventLoop)
     }
@@ -91,7 +95,7 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
         unimplementedUnary(on: context.eventLoop)
     }
 
-    func getMempoolTx(request: Exclude, context: StreamingResponseCallContext<CompactTx>) -> EventLoopFuture<GRPCStatus> {
+    func getMempoolTx(request: GetMempoolTxRequest, context: StreamingResponseCallContext<CompactTx>) -> EventLoopFuture<GRPCStatus> {
         unimplementedStreaming(on: context.eventLoop)
     }
 
@@ -226,11 +230,6 @@ final class StubTransactionEncoder: TransactionEncoder {
     private(set) var receivedFetchTxIds: [Data]?
     private(set) var submittedTransactions: [EncodedTransaction] = []
 
-    /// When set, `submit(transaction:)` records the transaction and then throws this error.
-    var submitError: Error?
-    /// `isTransactionKnownToServer(txId:)` returns `true` for txids in this set.
-    var knownToServerTxIds: Set<Data> = []
-
     init(createdTransactions: [ZcashTransaction.Overview]) {
         self.createdTransactions = createdTransactions
     }
@@ -241,6 +240,10 @@ final class StubTransactionEncoder: TransactionEncoder {
         amount: Zatoshi,
         memoBytes: MemoBytes?
     ) async throws -> Proposal {
+        fatalError("Unused in test")
+    }
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
         fatalError("Unused in test")
     }
 
@@ -270,13 +273,10 @@ final class StubTransactionEncoder: TransactionEncoder {
 
     func submit(transaction: EncodedTransaction) async throws {
         submittedTransactions.append(transaction)
-        if let submitError {
-            throw submitError
-        }
     }
 
     func isTransactionKnownToServer(txId: Data) async -> Bool {
-        knownToServerTxIds.contains(txId)
+        false
     }
 
     func fetchTransactionsForTxIds(_ txIds: [Data]) async throws -> [ZcashTransaction.Overview] {
@@ -287,102 +287,6 @@ final class StubTransactionEncoder: TransactionEncoder {
     }
 
     func closeDBConnection() { }
-}
-
-final class MigrationTransactionSubmitterMock: MigrationTransactionSubmitting {
-    struct ReceivedArguments {
-        let transaction: EncodedTransaction
-        let displayTransactionID: String
-        let expiryHeight: BlockHeight
-        let options: NetworkPrivacyOptions
-        let defaultEndpoint: LightWalletEndpoint
-        let networkType: NetworkType
-        let expectedChainName: String
-        let boundPolicy: BoundSubmissionPolicy
-        let transactionConsensusBranchId: UInt32
-    }
-
-    private let transactionEncoder: TransactionEncoder?
-    private(set) var receivedArguments: ReceivedArguments?
-    private(set) var validationCallsCount = 0
-    var result: TransferResult?
-    var throwableError: Error?
-    var validationPolicy: SubmissionPolicy?
-    var validationThrowableError: Error?
-    var closure: ((EncodedTransaction, String, BlockHeight, NetworkPrivacyOptions, LightWalletEndpoint, NetworkType) async throws -> TransferResult)?
-
-    init(transactionEncoder: TransactionEncoder? = nil) {
-        self.transactionEncoder = transactionEncoder
-    }
-
-    func validateSubmissionPolicy(
-        options: NetworkPrivacyOptions,
-        defaultEndpoint: LightWalletEndpoint,
-        networkType: NetworkType,
-        expectedChainName: String,
-        consensusFingerprint: String,
-        branchIdForHeight: @escaping (Int32) throws -> Int32
-    ) async throws -> SubmissionPolicy {
-        validationCallsCount += 1
-        if let validationThrowableError { throw validationThrowableError }
-        if let validationPolicy { return validationPolicy }
-        return SubmissionPolicy(
-            transport: options.useTor ? .tor : .direct,
-            endpointIdentity: "\(defaultEndpoint.secure ? "https" : "http")://\(defaultEndpoint.host.lowercased()):\(defaultEndpoint.port)",
-            consensusFingerprint: consensusFingerprint
-        )
-    }
-
-    func submit(
-        transaction: EncodedTransaction,
-        displayTransactionID: String,
-        expiryHeight: BlockHeight,
-        options: NetworkPrivacyOptions,
-        defaultEndpoint: LightWalletEndpoint,
-        networkType: NetworkType,
-        expectedChainName: String,
-        boundPolicy: BoundSubmissionPolicy,
-        transactionConsensusBranchId: UInt32,
-        branchIdForHeight: @escaping (Int32) throws -> Int32,
-        renewLease: @escaping () async throws -> Void
-    ) async throws -> TransferResult {
-        receivedArguments = ReceivedArguments(
-            transaction: transaction,
-            displayTransactionID: displayTransactionID,
-            expiryHeight: expiryHeight,
-            options: options,
-            defaultEndpoint: defaultEndpoint,
-            networkType: networkType,
-            expectedChainName: expectedChainName,
-            boundPolicy: boundPolicy,
-            transactionConsensusBranchId: transactionConsensusBranchId
-        )
-
-        if let throwableError {
-            throw throwableError
-        }
-        if let closure {
-            return try await closure(transaction, displayTransactionID, expiryHeight, options, defaultEndpoint, networkType)
-        }
-        if let result {
-            return result
-        }
-        guard let transactionEncoder else {
-            fatalError("Configure a result, throwableError, or transactionEncoder")
-        }
-
-        do {
-            try await transactionEncoder.submit(transaction: transaction)
-            return .success(txid: displayTransactionID)
-        } catch TransactionEncoderError.submitError {
-            if await transactionEncoder.isTransactionKnownToServer(txId: transaction.transactionId) {
-                return .success(txid: displayTransactionID)
-            }
-            return .networkError(retryable: false)
-        } catch {
-            return .outcomeUnknown
-        }
-    }
 }
 
 final class SubmitPlanStoringMock: SubmitPlanStoring {

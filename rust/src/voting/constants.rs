@@ -14,6 +14,10 @@ pub(super) const SEED_FINGERPRINT_LEN: usize = 32;
 pub(super) const ORCHARD_FVK_LEN: usize = 96;
 
 /// Raw Orchard address byte length consumed by `zcash_voting`.
+///
+/// `zcash_voting` now performs this length check itself when reconstructing a
+/// hotkey, so the constant survives only as the expected value in tests.
+#[cfg(test)]
 pub(super) const HOTKEY_RAW_ADDRESS_LEN: usize = 43;
 
 /// Byte length of Keystone / RedPallas signatures at the voting FFI boundary.
@@ -24,15 +28,6 @@ pub(super) const PCZT_SIGHASH_LEN: usize = 32;
 
 /// Byte length of randomized verification keys at the voting FFI boundary.
 pub(super) const RANDOMIZED_KEY_LEN: usize = 32;
-
-/// Byte length of share reveal nullifiers.
-pub(super) const SHARE_NULLIFIER_LEN: usize = 32;
-
-/// Hex string length for share reveal nullifiers.
-pub(super) const SHARE_NULLIFIER_HEX_LEN: usize = SHARE_NULLIFIER_LEN * 2;
-
-/// Hex string length for canonical voting round identifiers.
-pub(super) const VOTE_ROUND_ID_HEX_LEN: usize = 64;
 
 /// Byte length of root elements in PIR-fetched IMT non-membership proofs.
 pub(super) const PIR_ROOT_LEN: usize = 32;

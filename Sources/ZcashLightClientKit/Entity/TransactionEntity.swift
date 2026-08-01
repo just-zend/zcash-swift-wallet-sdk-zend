@@ -141,7 +141,8 @@ extension ZcashTransaction.Output {
 
             if
                 let outputRecipient = try row.get(Column.toAddress),
-                let metadata = DerivationTool.getAddressMetadata(outputRecipient) {
+                let metadata = DerivationTool.getAddressMetadata(outputRecipient)
+            {
                 recipient = TransactionRecipient.address(try Recipient(outputRecipient, network: metadata.networkType))
             } else if let toAccount = try row.get(Column.toAccount) {
                 recipient = .internalAccount(AccountUUID(id: [UInt8](Data(blob: toAccount))))
@@ -233,12 +234,12 @@ extension ZcashTransaction.Overview {
     func anchor(network: ZcashNetwork) -> BlockHeight? {
         guard let minedHeight = self.minedHeight else { return nil }
         if minedHeight != -1 {
-            return max(minedHeight - ZcashSDK.defaultStaleTolerance, network.saplingActivationHeight)
+            return max(minedHeight - ZcashSDK.defaultStaleTolerance, network.constants.saplingActivationHeight)
         }
 
         guard let expiryHeight = self.expiryHeight else { return nil }
         if expiryHeight != -1 {
-            return max(expiryHeight - ZcashSDK.expiryOffset - ZcashSDK.defaultStaleTolerance, network.saplingActivationHeight)
+            return max(expiryHeight - ZcashSDK.expiryOffset - ZcashSDK.defaultStaleTolerance, network.constants.saplingActivationHeight)
         }
 
         return nil

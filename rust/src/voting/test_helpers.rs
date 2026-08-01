@@ -21,7 +21,10 @@ pub(crate) fn insert_round_and_bundle(db: *mut VotingDatabaseHandle, round_id: &
         nc_root: vec![8u8; 32],
         nullifier_imt_root: vec![9u8; 32],
     };
-    handle.db.init_round(&params, None).expect("insert round");
+    handle
+        .db
+        .init_round(zcash_voting::Network::Mainnet, &params, None)
+        .expect("insert round");
 
     let notes: Vec<zcash_voting::NoteInfo> = (0..5)
         .map(|position| zcash_voting::NoteInfo {
@@ -36,9 +39,9 @@ pub(crate) fn insert_round_and_bundle(db: *mut VotingDatabaseHandle, round_id: &
             ufvk_str: String::new(),
         })
         .collect();
-    let (count, _) = handle
+    let layout = handle
         .db
-        .setup_bundles(round_id, &notes)
+        .ensure_bundles(round_id, &notes)
         .expect("setup bundle");
-    assert_eq!(count, 1);
+    assert_eq!(layout.bundle_count, 1);
 }

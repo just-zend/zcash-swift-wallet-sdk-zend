@@ -127,6 +127,15 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         }
     }
 
+    public func proposeOrchardToIronwoodMigration(
+        accountUUID: AccountUUID,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    ) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
+        }
+    }
+
     public func proposeShielding(
         accountUUID: AccountUUID,
         shieldingThreshold: Zatoshi,

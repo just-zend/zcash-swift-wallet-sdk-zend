@@ -16,9 +16,6 @@ extension Checkpoint {
             return birthday(with: height, checkpointDirectory: checkpointDirectoryURL) ?? .mainnetMin
         case .testnet:
             return birthday(with: height, checkpointDirectory: checkpointDirectoryURL) ?? .testnetMin
-        case .regtest:
-            return birthday(with: height, checkpointDirectory: checkpointDirectoryURL)
-                ?? .regtestMin(saplingHeight: network.saplingActivationHeight)
         }
     }
 }

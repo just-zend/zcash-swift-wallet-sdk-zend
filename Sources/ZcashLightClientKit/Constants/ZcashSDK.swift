@@ -9,44 +9,16 @@ import Foundation
 public protocol ZcashNetwork {
     var networkType: NetworkType { get }
     var constants: NetworkConstants.Type { get }
-
-    /// The Sapling activation height for this network. Defaults to ``constants``'s
-    /// `saplingActivationHeight`; a regtest network returns its configured height.
-    var saplingActivationHeight: BlockHeight { get }
-
-    /// The full set of custom NU activation heights when this is a custom (regtest-slot) network,
-    /// otherwise `nil`. Consumed by the Rust backend to switch the core onto a custom-parameter network.
-    var customActivationHeights: NetworkActivationHeights? { get }
-
-    /// For a custom network (``customActivationHeights`` non-nil), the base identity registered with the
-    /// Rust core: address encoding follows this while activation heights are custom (e.g. a
-    /// modified-mainnet Ironwood backend uses base `.mainnet`). `nil` for standard networks.
-    var customNetworkBase: NetworkType? { get }
-
-    /// The exact canonical chain name expected from lightwalletd `getInfo`. This is included in the
-    /// Rust consensus-configuration fingerprint and must not be selected dynamically per request.
-    var chainName: String { get }
-}
-
-public extension ZcashNetwork {
-    var saplingActivationHeight: BlockHeight { constants.saplingActivationHeight }
-    var customActivationHeights: NetworkActivationHeights? { nil }
-    var customNetworkBase: NetworkType? { nil }
-    var chainName: String { networkType.chainName }
 }
 
 public enum NetworkType: Equatable, Codable, Hashable {
     case mainnet
     case testnet
-    /// A custom-parameter (regtest) network with configurable NU activation heights. Select it via
-    /// ``ZcashNetworkBuilder/regtest(activationHeights:)`` rather than constructing it directly.
-    case regtest
 
     var networkId: UInt32 {
         switch self {
         case .mainnet:  return 1
         case .testnet:  return 0
-        case .regtest:  return 2
         }
     }
 }
@@ -56,7 +28,6 @@ extension NetworkType {
         switch chainame {
         case "test":    return .testnet
         case "main":    return .mainnet
-        case "regtest": return .regtest
         default:        return nil
         }
     }
@@ -65,7 +36,6 @@ extension NetworkType {
         switch id {
         case 1: return .mainnet
         case 0: return .testnet
-        case 2: return .regtest
         default: return nil
         }
     }
@@ -78,8 +48,6 @@ extension NetworkType {
             return "main"
         case .testnet:
             return "test"
-        case .regtest:
-            return "regtest"
         }
     }
 }
@@ -89,34 +57,7 @@ public enum ZcashNetworkBuilder {
         switch networkType {
         case .mainnet:  return ZcashMainnet()
         case .testnet:  return ZcashTestnet()
-        case .regtest:
-            return ZcashRegtest(
-                base: .regtest,
-                chainName: NetworkType.regtest.chainName,
-                activationHeights: NetworkActivationHeights.allActiveFromGenesis
-            )
         }
-    }
-
-    /// Builds a custom **regtest** network with the given NU activation heights, for connecting the SDK
-    /// to a custom-parameter `lightwalletd`. Addresses and chain identity are regtest-encoded, and the
-    /// on-disk databases use a `regtest`-specific name prefix. See `MIGRATING.md`.
-    public static func regtest(activationHeights: NetworkActivationHeights) -> ZcashNetwork {
-        ZcashRegtest(base: .regtest, chainName: NetworkType.regtest.chainName, activationHeights: activationHeights)
-    }
-
-    /// Builds a **custom network**: a chosen `base` identity (which determines address encoding and the
-    /// expected `chainName`) combined with custom per-NU activation heights. For example a
-    /// modified-mainnet Ironwood testing backend uses `base: .mainnet` with NU6.3 at a custom height —
-    /// the Rust core then derives **mainnet-encoded** addresses and runs mainnet consensus at the custom
-    /// heights. On-disk the network still uses the `regtest`-slot name prefix, so it never collides with
-    /// a real mainnet wallet. See `MIGRATING.md`.
-    public static func custom(
-        base: NetworkType,
-        chainName: String? = nil,
-        activationHeights: NetworkActivationHeights
-    ) -> ZcashNetwork {
-        ZcashRegtest(base: base, chainName: chainName ?? base.chainName, activationHeights: activationHeights)
     }
 }
 
@@ -128,26 +69,6 @@ class ZcashTestnet: ZcashNetwork {
 class ZcashMainnet: ZcashNetwork {
     let networkType: NetworkType = .mainnet
     let constants: NetworkConstants.Type = ZcashSDKMainnetConstants.self
-}
-
-class ZcashRegtest: ZcashNetwork {
-    let networkType: NetworkType = .regtest
-    let constants: NetworkConstants.Type = ZcashSDKRegtestConstants.self
-    /// The base identity registered with the Rust core (address encoding / `chainName`). `.regtest` for
-    /// a plain regtest network; `.mainnet` for a modified-mainnet custom network (e.g. Ironwood).
-    let base: NetworkType
-    let chainName: String
-    let activationHeights: NetworkActivationHeights
-
-    init(base: NetworkType, chainName: String, activationHeights: NetworkActivationHeights) {
-        self.base = base
-        self.chainName = ConsensusChainName.canonicalize(chainName) ?? chainName
-        self.activationHeights = activationHeights
-    }
-
-    var saplingActivationHeight: BlockHeight { activationHeights.sapling ?? 1 }
-    var customActivationHeights: NetworkActivationHeights? { activationHeights }
-    var customNetworkBase: NetworkType? { base }
 }
 
 /**
@@ -297,27 +218,6 @@ public enum ZcashSDKTestnetConstants: NetworkConstants {
     public static let defaultFsBlockDbRootName = "fs_cache"
 
     public static let defaultDbNamePrefix = "ZcashSdk_testnet_"
-}
-
-public enum ZcashSDKRegtestConstants: NetworkConstants {
-    /// Fallback only. The Sapling activation height of a regtest network is supplied per-instance via
-    /// ``ZcashNetworkBuilder/regtest(activationHeights:)`` and read from the ``ZcashNetwork`` instance,
-    /// not from this static value.
-    public static let saplingActivationHeight: BlockHeight = 1
-
-    /// Default Name for LibRustZcash data.db
-    public static let defaultDataDbName = "data.db"
-
-    /// Default Name for Tor data directory
-    public static let defaultTorDirName = "tor"
-
-    /// Default Name for Compact Block caches db
-    public static let defaultCacheDbName = "caches.db"
-
-    public static let defaultFsBlockDbRootName = "fs_cache"
-
-    /// A regtest-specific prefix keeps regtest wallet databases from colliding with mainnet/testnet data.
-    public static let defaultDbNamePrefix = "ZcashSdk_regtest_"
 }
 
 /// Used when importing an account `importAccount(..., purpose: AccountPurpose)`
