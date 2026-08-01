@@ -24,7 +24,7 @@ together instead of one:
 | `.notStarted` | `migrationAdvanceStep(accountUUID:) == nil && migrationProgress(accountUUID:) == nil` |
 | `.splitPendingConfirmation` | `!migrationTransactionStatuses(accountUUID:).isPreparationPhaseComplete` |
 | `.inProgress(progress)` | `migrationAdvanceStep` is `.prove`/`.broadcast`/`.waiting` + `migrationProgress(accountUUID:)` for the progress payload |
-| `.requiresAttention(.invalidTransfer)` | `migrationAdvanceStep` is `.requiresAttention(id:)` (the engine surfaces it FIRST, ahead of any actionable step); the per-row detail is the new `.invalid(reason:)` case of `MigrationTransactionStatus.State` (`fundingSpent` / `rejectedInvalid` / `rejectedExpired`, with `blockedOn == .invalid`), and `hasInvalidMigrationTransfers(accountUUID:)` / a `true` from `reconcileMigrationInvalidations(accountUUID:)` remain the boolean checks |
+| `.requiresAttention(.invalidTransfer)` | `migrationAdvanceStep` is `.requiresAttention(id:)` (the engine surfaces it FIRST, ahead of any actionable step); the per-row detail is the new `.invalid(reason:)` case of `MigrationTransactionStatus.State` (`fundingSpent` / `rejectedInvalid` / `rejectedExpired`, with `blockedOn == .invalid`), and `hasInvalidMigrationTransfers(accountUUID:)` remains the boolean check |
 | `.requiresAttention(.transferExpired)` | `migrationAdvanceStep` is `.rebuild(id:)` (an already-expired PREPARATION instead reports the new `.expired` case of `MigrationTransactionStatus.Blocker` in `migrationTransactionStatuses(accountUUID:)` — its remedy is `restartCurrentMigrationStep(accountUUID:)`, not a rebuild) |
 | `.complete` | `migrationAdvanceStep == .complete` (per-run, including a cancelled run — see below) |
 
@@ -37,10 +37,13 @@ of the removed `MigrationState.complete` and carries over unchanged to `migratio
 Discharging each step:
 
 - `.requiresAttention(id:)` → a transaction of the run is `.invalid(reason:)` (its funding note was
-  spent outside the migration, or the network terminally rejected its broadcast) and no automatic
-  step can advance the run: run `reconcileMigrationInvalidations(accountUUID:)`, surface the
-  attention UX over the invalid `migrationTransactionStatuses(accountUUID:)` row(s), then
-  `restartCurrentMigrationStep(accountUUID:)` (cancel and re-plan). Invalid rows are excluded from
+  spent outside the migration, or the network rejected its broadcast) and no automatic step can
+  advance the run right now: SYNC and call `migrationAdvanceStep(accountUUID:)` again, which
+  adjudicates against the newly scanned data and re-offers the work where the obstruction was
+  transient. Only if attention persists, surface the attention UX over the invalid
+  `migrationTransactionStatuses(accountUUID:)` row(s) and then `restartCurrentMigrationStep(accountUUID:)`
+  (cancel and re-plan). `reconcileMigrationInvalidations(accountUUID:)` is NOT part of this
+  discharge — it records no marks; see its own entry below. Invalid rows are excluded from
   delivery and from the sync gate — a dead transfer is never served and gates nothing.
 - `.broadcast(id:)` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)` —
   submit and end the session (a broadcast session must not sync).
@@ -141,6 +144,15 @@ every account (an earlier unreleased iteration carried an unused `accountUUID:`;
 See each member's doc comment for its full contract; the estimated-tip and privacy-buffer notes
 below cover the cross-cutting parts.
 
+`reconcileMigrationInvalidations(accountUUID:)` needs one note of its own, because its name no
+longer describes it. It repairs exactly one thing: a transaction this process submitted to a node,
+which mined, but whose broadcast was never recorded (a crash, or a failed persist, between
+submitting and recording). It returns whether it repaired a row, records no invalid marks, and is
+not part of the `.requiresAttention(id:)` discharge. Everything else it used to do belongs to the
+engine now — a funding note spent outside the migration is discovered by the satisfiability oracle
+from scanned wallet data, and a recorded broadcast is promoted to mined on every
+`migrationAdvanceStep`. Expect the name to change before release.
+
 ### `useEstimatedTip` parameters
 
 `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)` and
@@ -167,8 +179,8 @@ reasons:
    mainnet constant.
 2. **In-flight broadcast marker** — a 120 s self-expiring marker blocks sync from just before a
    migration submit hits the network until its outcome is recorded, so the
-   invalidation-reconciliation probe (`reconcileMigrationInvalidations`) never treats a
-   just-broadcast transfer as a submit crash. The marker is (re-)armed at the last pre-submit
+   unrecorded-broadcast repair (`reconcileMigrationInvalidations`) never treats a just-broadcast
+   transfer as a submit crash. The marker is (re-)armed at the last pre-submit
    instant — after the Tor bootstrap — so a slow bootstrap does not burn its window, and a marker
    observed implausibly far in the future (a backwards clock step) is clamped/ignored rather than
    wedging sync.

@@ -670,15 +670,26 @@ public protocol Synchronizer: AnyObject {
     ///   non-transient reason.
     func finalizeReadyMigrationTransfers(accountUUID: AccountUUID) async throws -> Int
 
-    /// Reconciles `accountUUID`'s committed run against LOCAL on-chain truth and records an
-    /// invalid mark when a pending transfer's funding note was spent by a foreign transaction;
-    /// returns whether this call recorded an invalidation (`false` also covers "no stored run" /
-    /// "terminal run"). Touches only the local wallet database, never the network — run it after
-    /// a sync catches the wallet up, before deciding what to do next. The 120-second
-    /// in-flight-broadcast guard (a just-broadcast transfer must not be probed) is enforced by
-    /// the migration sync gate the broadcast path arms, so honoring
-    /// ``isMigrationSyncBlocked()`` before syncing keeps this probe safe.
-    /// - Parameter accountUUID: the account to reconcile.
+    /// Repairs `accountUUID`'s committed run in the one case the engine cannot see for itself: a
+    /// transaction THIS process submitted to a node, which mined, but whose broadcast was never
+    /// recorded — a crash, or a failed persist, between submitting and recording. Returns whether
+    /// this call repaired a row (`false` also covers "no stored run" / "terminal run"). Touches
+    /// only the local wallet database, never the network — run it after a sync catches the wallet
+    /// up, before deciding what to do next. The 120-second in-flight-broadcast guard (a
+    /// just-broadcast transfer must not be probed) is enforced by the migration sync gate the
+    /// broadcast path arms, so honoring ``isMigrationSyncBlocked()`` before syncing keeps this
+    /// probe safe.
+    ///
+    /// It no longer looks for spent funding notes, and no longer records invalid marks. The
+    /// engine's satisfiability oracle discovers a funding note spent outside the migration from
+    /// scanned wallet data, stamped with the evidence height a reorg can withdraw — which an
+    /// SDK-side verdict never carried — and surfaces it through
+    /// ``migrationAdvanceStep(accountUUID:)``. Promoting a RECORDED broadcast to mined is
+    /// likewise the engine's, on every advance.
+    ///
+    /// - Note: The name predates that split and is due to change; this is not part of a released
+    ///   API. See ``MigrationAdvanceStep/requiresAttention(id:)`` for the current discharge.
+    /// - Parameter accountUUID: the account to repair.
     func reconcileMigrationInvalidations(accountUUID: AccountUUID) async throws -> Bool
 
     /// The stored run's minimal sync/proving wake-up schedule for `accountUUID`, as of the

@@ -305,15 +305,16 @@ actor OrchardMigration {
         try await welding.migrationSyncWakeups(for: accountUUID)
     }
 
-    /// Reconciles the committed run against local on-chain truth and records an invalid mark when
-    /// a pending transfer's funding note was spent by a foreign transaction; returns whether this
-    /// call recorded an invalidation. Local-database only — never touches the network — so it is
-    /// safe in a sync session; the 120-second in-flight-broadcast guard (during which a
-    /// just-broadcast transfer must not be probed) is primarily enforced by the sync gate the
-    /// broadcast path arms, and — as optional hardening — honored here directly too: while the
-    /// persisted in-flight marker is live this call no-ops (returns `false` without touching the
-    /// engine), so a caller that bypasses the gate cannot drive the probe into the
-    /// submit-to-record window either.
+    /// Repairs the committed run where this process submitted a transaction that mined but never
+    /// recorded the broadcast; returns whether this call repaired a row. Local-database only —
+    /// never touches the network — so it is safe in a sync session; the 120-second
+    /// in-flight-broadcast guard (during which a just-broadcast transfer must not be probed) is
+    /// primarily enforced by the sync gate the broadcast path arms, and — as optional hardening —
+    /// honored here directly too: while the persisted in-flight marker is live this call no-ops
+    /// (returns `false` without touching the engine), so a caller that bypasses the gate cannot
+    /// drive the probe into the submit-to-record window either. That guard is exactly why the
+    /// repair cannot simply run on every read: inside the submit-to-record window, the row it
+    /// would "repair" is one whose broadcast is still being recorded.
     func reconcileInvalidations() async throws -> Bool {
         // Optional hardening (belt to the sync gate's suspenders): the probe's own crash
         // heuristics are the primary defense, but there is no reason to let it observe a

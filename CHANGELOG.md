@@ -83,9 +83,15 @@ Changes are relative to `2.8.0-rc.3`.
   (one/two-argument convenience overloads default it to `false`) that lets the estimated tip only
   ACCELERATE scheduled-height due-ness; expiry always evaluates against the scanned tip, and an
   estimator failure silently degrades to the scanned-tip behavior. New:
-  `reconcileMigrationInvalidations(accountUUID:)` retains its compatibility role, while the
-  engine's sqlite satisfiability oracle now discovers funding spends and other unsatisfiable steps
-  during `migrationAdvanceStep` from scanned wallet data.
+  `reconcileMigrationInvalidations(accountUUID:)` now repairs only a broadcast this process
+  submitted but failed to record (returning whether it repaired a row) — it records no invalid
+  marks, and is NOT part of the `.requiresAttention(id:)` discharge. Everything else it used to do
+  is the engine's: a funding note spent outside the migration is discovered by the sqlite
+  satisfiability oracle from scanned wallet data during `migrationAdvanceStep`, and a recorded
+  broadcast is promoted to mined on every advance. Mined-ness is now derived, never reported —
+  the SDK never marks a transaction mined — and is judged at the wallet's FULLY-SCANNED height
+  rather than its chain tip, so a status read and the drive path can no longer disagree about
+  whether a transaction has mined. The method's name predates this split and is due to change.
 - Recovery: `restartCurrentMigrationStep` cancels and re-plans;
   `refreshStaleMigrationTransfers(accountUUID:usk:)` rebuilds every expired transfer of the stored
   run, all-or-nothing, with `usk` selecting in-process signing or the external-signer lane. A funding

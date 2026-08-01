@@ -20,13 +20,20 @@
 //!   PER-RUN — "the stored run is fully mined (or terminal)", never "nothing left to migrate".
 //!   After completion the platform asks `zcashlc_migration_propose_transfers` whether anything
 //!   remains (an empty schedule means no).
-//! - Mined-transaction reconciliation ([`reconcile_mined`]) runs at the head of every read.
+//! - Mined-ness is DERIVED, never reported: this layer never marks a transaction mined. The
+//!   engine promotes every in-flight transaction its scan has seen mine, inside
+//!   `advance_migration`; the read-only entry points ask the same question through
+//!   [`reconcile_mined`] so a standalone read is not answered from a state the scan has moved
+//!   past. The one gap the engine cannot see — a broadcast THIS process made but failed to
+//!   record — is [`reconcile_unrecorded_broadcasts`], and closing it upstream is
+//!   zcash/librustzcash#2884.
 //! - Node rejection is recorded as testimony via `report_broadcast_failure`; the sqlite-backed
 //!   satisfiability oracle adjudicates it after sufficient scanning and independently discovers
-//!   scan-visible spends. (Earlier versions kept an SDK-owned
-//!   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` side table the engine could not
-//!   consult; [`migrate_legacy_invalid_marks`] folds any surviving rows into the engine state
-//!   once, on open, and drops the table.)
+//!   scan-visible spends. The SDK makes no invalidity determination of its own: it has no way to
+//!   date a verdict against the scanned region, so a reorg could never withdraw one. (Earlier
+//!   versions kept an SDK-owned `ext_zcashlc_orchard_ironwood_migration_invalid_marks` side table
+//!   the engine could not consult; [`migrate_legacy_invalid_marks`] folds any surviving rows into
+//!   the engine state once, on open, and drops the table.)
 //! - The immediate lane (an ordinary send-max sweep, entirely outside the engine) is tracked in
 //!   its own SDK-owned `sdk_immediate_runs` side table and surfaces ONLY through
 //!   [`zcashlc_migration_progress`]: while unmined it reports a 0-of-1 progress snapshot (flagged
@@ -71,7 +78,7 @@ use zcash_client_backend::data_api::wallet::{
     TargetHeight,
     input_selection::{LockFilter, LockedInputPolicy},
 };
-use zcash_client_backend::data_api::{InputSource, NullifierQuery, OutputLockStore, WalletRead};
+use zcash_client_backend::data_api::{InputSource, OutputLockStore, WalletRead};
 use zcash_client_backend::wallet::{LockOwner, OutputRef};
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::pool_migration::orchard_ironwood::{
@@ -485,11 +492,16 @@ fn resolve_immediate_run(
 
 // ----- reconciliation, planning, committing -----
 
-/// Marks as mined every `Broadcast` transaction whose txid the wallet has since observed on-chain,
-/// persisting once if anything changed, and returns the freshest state (or `None` when no
-/// migration is stored). This is the v1 crate's internal reconciliation, now SDK-owned: it is the
-/// only way transactions advance `Broadcast -> Mined` (and therefore the only way a run reaches
-/// `Complete`).
+/// Loads the stored run with its `Broadcast` transactions promoted to `Mined` wherever the
+/// wallet's scan has since seen them, persisting once if anything changed. `None` means no
+/// migration is stored.
+///
+/// The promotion itself is the ENGINE's — [`PoolMigrationRead::mined_height`], the same query
+/// `advance_migration` sweeps with, bounded by the wallet's fully-scanned height rather than by
+/// the chain tip `WalletRead::get_tx_height` uses. What remains SDK-side is only WHEN to ask: the
+/// drive path gets the promotion inside `advance_migration` and does not call this, while the
+/// read-only entry points (progress, statuses, the delivery queries) run it so a standalone read
+/// is not answered from a state the wallet's own scan has already moved past.
 fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> {
     let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
     let Some(mut state) = backend.get_migration()? else {
@@ -498,24 +510,18 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
     if state.is_terminal() {
         return Ok(Some(state));
     }
-    let broadcast: Vec<(MigrationTransferId, [u8; 32])> = state
+    let broadcast: Vec<(MigrationTransferId, TxId)> = state
         .transactions()
         .iter()
         .filter_map(|t| match t.state() {
-            MigrationTxState::Broadcast { .. } => {
-                t.state().broadcast_txid().map(|txid| (t.id(), txid))
-            }
+            MigrationTxState::Broadcast { txid } => Some((t.id(), txid)),
             _ => None,
         })
         .collect();
     let mut changed = false;
     for (id, txid) in broadcast {
-        if let Some(height) = ctx
-            .wallet
-            .get_tx_height(TxId::from_bytes(txid))
-            .map_err(|e| anyhow!("mined-height lookup failed: {e}"))?
-        {
-            state.mark_mined(id, TxId::from_bytes(txid), height);
+        if let Some(height) = backend.mined_height(txid)? {
+            state.mark_mined(id, txid, height);
             changed = true;
         }
     }
@@ -525,306 +531,82 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
     Ok(Some(state))
 }
 
-// ----- invalidation reconciliation (3-pass; Android's `reconcile_invalidated`, F1 fixed) -----
+// ----- unrecorded-broadcast repair -----
 
-/// What one parse of a stored migration PCZT yields for the reconcile passes: the PCZT-derived
-/// transaction id and the nullifiers of EVERY Orchard action. Computed once per transaction per
-/// [`reconcile_invalidations`] call (U1) — pass 2, the own-txid probes, and the pass-3 candidate
-/// set all read from the same [`pczt_digest`] map instead of re-parsing the same bytes up to
-/// three times.
+/// The PCZT-derived transaction id of one stored migration transaction, or `None` when the bytes
+/// do not parse or the transaction is not extractable yet.
 ///
-/// - `txid` is `None` while the transaction is not extractable yet (an
-///   `AwaitingSignature`/`Signed` row whose anchor/witness is not installed) rather than an
-///   error, so an un-extractable transaction is simply omitted from whatever set is being built
-///   — mirroring the Android SDK's `pczt_txid`.
-/// - `nullifiers` collects every action's nullifier, present regardless of proving state
-///   (ZIP 374 defers the anchor/witness, not the nullifier, which is a Constructor-set field of
-///   `pczt::orchard::Spend`); `None` when the bytes do not parse as a PCZT or carry no Orchard
-///   actions at all (ambiguous — the caller skips, never invalidates).
-///
-///   F1 FIX (vs the Android SDK's `transfer_funding_nullifier`): Android requires EXACTLY one
-///   Orchard action and returns `None` otherwise — but production migration transfers carry a
-///   PADDED 2-action Orchard bundle (one real funding spend plus one dummy/padding action), so
-///   Android's extractor is inert on every real transfer. Collecting every action's nullifier is
-///   safe because a dummy spend's nullifier is derived from a random dummy note and cannot match
-///   a wallet note — [`decide_foreign_spend`] only treats a nullifier as evidence when the
-///   wallet KNOWS the note it belongs to.
-struct PcztDigest {
-    txid: Option<[u8; 32]>,
-    nullifiers: Option<Vec<[u8; 32]>>,
-}
-
-/// Extracts a [`PcztDigest`] from one stored PCZT's bytes — the single parse everything in
-/// [`reconcile_invalidations`] shares.
-fn pczt_digest(bytes: &[u8]) -> PcztDigest {
-    let Ok(parsed) = pczt::Pczt::parse(bytes) else {
-        return PcztDigest {
-            txid: None,
-            nullifiers: None,
-        };
-    };
-    let nullifiers: Vec<[u8; 32]> = parsed
-        .orchard()
-        .actions()
-        .iter()
-        .map(|action| *action.spend().nullifier())
-        .collect();
-    let nullifiers = if nullifiers.is_empty() {
-        None
-    } else {
-        Some(nullifiers)
-    };
-    // `extract_tx` consumes the parsed PCZT, so it goes last; it fails (leaving `txid` `None`)
-    // on a transaction whose proof/finalization is not installed yet.
-    let txid = migration_finalize::extract_tx(parsed)
+/// A signature commits to the txid, so it is fixed from signing time and the deferred anchor and
+/// witnesses (ZIP 374) do not disturb it — but `extract_tx` needs a COMPLETE transaction, so this
+/// answers only once proving has installed them. That is exactly the set the one caller cares
+/// about ([`reconcile_unrecorded_broadcasts`], over `Proved` rows): a transaction that was never
+/// proved cannot have been broadcast, so it cannot be the one on chain.
+fn pczt_txid(bytes: &[u8]) -> Option<TxId> {
+    let parsed = pczt::Pczt::parse(bytes).ok()?;
+    migration_finalize::extract_tx(parsed)
         .ok()
-        .map(|(_, txid)| txid);
-    PcztDigest { txid, nullifiers }
+        .map(|(_, txid)| TxId::from_bytes(txid))
 }
 
-/// One pass-3 candidate: a `Signed`/`Proved`, store-side dependency-satisfied transfer, with
-/// everything the decision needs pre-extracted from the shared digest map.
-struct ForeignSpendCandidate {
-    id: MigrationTransferId,
-    /// The nullifiers of ALL the transfer's Orchard actions (`None` if its PCZT is unreadable).
-    funding_nullifiers: Option<Vec<[u8; 32]>>,
-    /// The transfer's own PCZT-derived txid (`None` if not yet extractable).
-    own_txid: Option<[u8; 32]>,
-    /// The PCZT-derived txids of the transfer's `depends_on` preparations, in `depends_on`
-    /// order (`None` per dependency whose txid is not extractable) — the A3 evidence inputs.
-    dep_txids: Vec<Option<[u8; 32]>>,
-}
-
-/// Pure decision core of the pass-3 spent-check, factored out (like the Android SDK's
-/// `decide_foreign_spend`) so it unit-tests without a wallet DB. Decides which candidate (if
-/// any) to invalidate, given the set of ALL wallet-note nullifiers, the subset the wallet still
-/// considers UNSPENT, and `txid_on_chain` — the caller's (memoized) "is this txid currently
-/// mined per the LOCAL wallet DB?" probe, a closure so the wallet-DB lookups run LAZILY, only
-/// for candidates whose funding already reads as spent (U1; tests supply a set-backed stand-in).
+/// Repairs the stored run against LOCAL on-chain truth (R10: the wallet database only, never the
+/// network) in the one case the engine cannot see for itself: a transaction THIS process submitted
+/// to a node and that mined, but whose `mark_broadcast` never reached the store — a crash, or a
+/// failed persist, between the submission and the record. The engine's own promotion sweep keys on
+/// the recorded txid, so such a row sits at `Proved` with its transaction already on chain, and
+/// nothing else would ever promote it.
 ///
-/// **Correctness bar: NEVER a false positive.** A candidate is invalidated ONLY when ALL of:
-///   (a) Some funding nullifier is SPENT: the wallet KNOWS the note (`wallet_nullifiers`, the
-///       `NullifierQuery::All` view) and no longer lists it unspent (`unspent_nullifiers`, the
-///       `NullifierQuery::Unspent` view). Requiring wallet-note membership is the F1-fix
-///       counterpart of Android's plain complement-of-unspent test: with every action's
-///       nullifier collected (including the padding dummy's), a dummy nullifier is absent from
-///       BOTH sets and therefore never reads as spent — under Android's bare "absent from
-///       unspent" rule it would false-positive on every padded transfer.
-///   (b) POSITIVE evidence the funding preparations are currently mined per the LOCAL wallet DB
-///       (A3): every `depends_on` txid is readable AND `txid_on_chain`. The store's own `Mined`
-///       rows (already required by the caller's candidate filter) are a RECORD, not current
-///       truth: in a rewind/rescan window the wallet DB may have demoted the very transaction
-///       that created the funding note, and the All∖Unspent signal then reflects a chain view
-///       mid-rebuild — ambiguous → skip, no mark. (A transfer with no dependencies spends
-///       ordinary wallet notes whose spent-ness the wallet tracks directly, so the vacuous pass
-///       is correct.)
-///   (c) The transfer's own PCZT-derived txid IS readable, and is NOT on-chain. Unreadable → we
-///       cannot confirm the spender is foreign; ambiguous → skip. On-chain → the spender is our
-///       own (possibly crashed) broadcast and pass 2 promotes it → skip.
+/// Returns whether this call repaired anything.
 ///
-/// False negatives are acceptable: submit-time rejection remains the last line of defence.
-fn decide_foreign_spend<E>(
-    candidates: &[ForeignSpendCandidate],
-    wallet_nullifiers: &HashSet<[u8; 32]>,
-    unspent_nullifiers: &HashSet<[u8; 32]>,
-    mut txid_on_chain: impl FnMut(&[u8; 32]) -> Result<bool, E>,
-) -> Result<Option<MigrationTransferId>, E> {
-    'candidates: for candidate in candidates {
-        // (a) Unreadable PCZT → ambiguous → skip.
-        let Some(nfs) = &candidate.funding_nullifiers else {
-            continue;
-        };
-        // (a) Spent = a WALLET note (All) that is no longer unspent. A dummy/padding nullifier
-        // is in neither set, so it can neither trigger nor mask.
-        let spent = nfs
-            .iter()
-            .any(|nf| wallet_nullifiers.contains(nf) && !unspent_nullifiers.contains(nf));
-        if !spent {
-            continue;
-        }
-        // (b) The A3 evidence gate: every funding preparation must be POSITIVELY mined right
-        // now. An unreadable dependency txid, or one the wallet DB does not currently show
-        // mined, is the rewind/rescan ambiguity → skip.
-        for dep_txid in &candidate.dep_txids {
-            let Some(dep_txid) = dep_txid else {
-                continue 'candidates;
-            };
-            if !txid_on_chain(dep_txid)? {
-                continue 'candidates;
-            }
-        }
-        // (c) Own txid unreadable → ambiguous; cannot confirm the spender is foreign → skip.
-        let Some(own_txid) = &candidate.own_txid else {
-            continue;
-        };
-        // (c) Own txid on-chain → our own (possibly crashed) broadcast; pass 2 handles it → skip.
-        if txid_on_chain(own_txid)? {
-            continue;
-        }
-        return Ok(Some(candidate.id));
-    }
-    Ok(None)
-}
-
-/// Reconciles the committed run against LOCAL on-chain truth in three mandatory-ordered passes
-/// (the Android SDK's `reconcile_invalidated` structure; R10: the LOCAL wallet DB only, never the
-/// network), recording a pending transfer whose funding note was spent by a FOREIGN transaction
-/// as unsatisfiable through the upstream satisfiability oracle. Returns whether this call found
-/// a candidate; the next advance performs the oracle evaluation.
+/// Everything else this used to do now belongs to the engine. Mined promotion of a RECORDED
+/// broadcast is [`reconcile_mined`] (and, on the drive path, `advance_migration`'s own sweep);
+/// a funding note spent outside the migration is discovered by the store's satisfiability oracle
+/// from scanned wallet data, with correct evidence stamping, which the SDK could not do — it had
+/// no way to date its verdict against the scanned region, so a reorg could not withdraw it.
 ///
-/// ORDER IS LOAD-BEARING: the own-broadcast/mined reconciliation MUST run before the spent-check,
-/// so a transfer OUR process broadcast right before crashing (whose funding note is therefore
-/// spent on-chain by us) is promoted and removed from the candidate set FIRST — otherwise the
-/// spent-check would misread our own crashed broadcast as a foreign spend.
-///   1. [`reconcile_mined`] — the existing pass: any `Broadcast` transaction the wallet now knows
-///      a height for is promoted to `Mined` (its txid was recorded at broadcast time).
-///   2. Submit-crash probe: for each `Proved` transaction, take its PCZT-derived txid (from the
-///      shared [`pczt_digest`] map — one parse per transaction per call, U1) and ask the
-///      wallet's own `get_tx_height`; a known height means our broadcast landed but was never
-///      recorded (a crash between broadcast and record) — `mark_broadcast` + `mark_mined`,
-///      persisted. (`Broadcast` rows need no probe here: pass 1 already resolves them from their
-///      recorded txid — mirroring Android, whose pass 2 probes `Proved` rows only.)
-///   3. Spent-check (F1 FIXED, A3 HARDENED): for each remaining pending transfer
-///      (`Signed`/`Proved`, deps mined per the store), decide via [`decide_foreign_spend`]
-///      against the wallet's All/Unspent Orchard nullifier views — with the A3 gate requiring
-///      positive wallet-DB evidence that every funding preparation is CURRENTLY mined, and the
-///      own/dependency txid-on-chain probes evaluated lazily (memoized per call) only once a
-///      candidate's funding reads as spent. The oracle discovers the unavailable input on the
-///      next advance and surfaces reevaluation or replanning through the compatibility DTO.
-fn reconcile_invalidations(ctx: &mut CallCtx) -> anyhow::Result<bool> {
-    // --- Pass 1 + load current state (reconcile_mined persists any Broadcast→Mined promotions).
+/// The probe is deliberately NOT folded into [`reconcile_mined`]: it costs one PCZT parse per
+/// `Proved` row, which is affordable at an explicit repair point and not on every status read.
+/// Closing this window upstream — by deriving the txid from the stored PCZT inside the engine's
+/// own sweep — is zcash/librustzcash#2884; this function goes when that lands.
+fn reconcile_unrecorded_broadcasts(ctx: &mut CallCtx) -> anyhow::Result<bool> {
+    // Load with recorded broadcasts already promoted, so a row this probe would otherwise
+    // re-examine is out of `Proved` before it starts.
     let Some(mut state) = reconcile_mined(ctx)? else {
         return Ok(false);
     };
-    // Terminal (Complete, or Failed/cancelled): nothing left to reconcile or invalidate.
+    // Terminal (Complete, or Failed/cancelled): never driven again, so nothing to repair.
     if state.is_terminal() {
         return Ok(false);
     }
 
-    // The U1 pre-pass: one PCZT parse per transaction, shared by pass 2, the candidate set, and
-    // the on-chain probes below.
-    let digests: std::collections::HashMap<MigrationTransferId, PcztDigest> = state
-        .transactions()
-        .iter()
-        .map(|t| (t.id(), pczt_digest(t.pczt())))
-        .collect();
-
-    // --- Pass 2: submit-crash probe. Promote any Proved transaction whose txid is already
-    // on-chain per the LOCAL wallet DB.
     let mut promotions: Vec<(MigrationTransferId, TxId, BlockHeight)> = Vec::new();
-    for tx in state.transactions() {
-        if !matches!(tx.state(), MigrationTxState::Proved) {
-            continue;
-        }
-        let Some(txid_bytes) = digests.get(&tx.id()).and_then(|d| d.txid) else {
-            continue;
-        };
-        let txid = TxId::from_bytes(txid_bytes);
-        if let Some(height) = ctx
-            .wallet
-            .get_tx_height(txid)
-            .map_err(|e| anyhow!("mined-height lookup failed: {e}"))?
-        {
-            promotions.push((tx.id(), txid, height));
-        }
-    }
-    if !promotions.is_empty() {
-        for (id, txid, height) in &promotions {
-            state.mark_broadcast(*id, *txid);
-            state.mark_mined(*id, *txid, *height);
-        }
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        backend.replace_migration(&state)?;
-    }
-
-    // --- Pass 3: spent-check. Candidates are Signed|Proved transfers whose deps are mined per
-    // the STORE; the wallet-DB's CURRENT view of those dependencies is the A3 evidence gate
-    // inside `decide_foreign_spend`.
-    let candidates: Vec<ForeignSpendCandidate> = state
-        .transactions()
-        .iter()
-        .filter(|t| {
-            matches!(t.kind(), MigrationTxKind::Transfer { .. })
-                && matches!(
-                    t.state(),
-                    MigrationTxState::Signed | MigrationTxState::Proved
-                )
-                && state.deps_mined(t.depends_on())
-        })
-        .map(|t| {
-            let digest = &digests[&t.id()];
-            ForeignSpendCandidate {
-                id: t.id(),
-                funding_nullifiers: digest.nullifiers.clone(),
-                own_txid: digest.txid,
-                dep_txids: t
-                    .depends_on()
-                    .iter()
-                    .map(|dep| digests.get(dep).and_then(|d| d.txid))
-                    .collect(),
+    {
+        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+        for tx in state.transactions() {
+            if !matches!(tx.state(), MigrationTxState::Proved) {
+                continue;
             }
-        })
-        .collect();
-    if candidates.iter().all(|c| c.funding_nullifiers.is_none()) {
-        // Nothing readable to check — no invalidation. (Unlike Android — whose exactly-one-action
-        // extractor makes this the UNCONDITIONAL exit on padded production transfers — this arm
-        // now only fires when there genuinely are no candidates or their PCZTs do not parse.)
+            // A `Proved` row is extractable by construction, so a `None` here is a corrupt or
+            // unreadable PCZT: skipped, never treated as evidence either way.
+            let Some(txid) = pczt_txid(tx.pczt()) else {
+                continue;
+            };
+            if let Some(height) = backend.mined_height(txid)? {
+                promotions.push((tx.id(), txid, height));
+            }
+        }
+    }
+    if promotions.is_empty() {
         return Ok(false);
     }
-
-    let wallet_nullifiers: HashSet<[u8; 32]> = ctx
-        .wallet
-        .get_orchard_nullifiers(NullifierQuery::All)
-        .map_err(|e| anyhow!("wallet Orchard nullifier read failed: {e}"))?
-        .into_iter()
-        .map(|(_account, nf)| nf.to_bytes())
-        .collect();
-    let unspent_nullifiers: HashSet<[u8; 32]> = ctx
-        .wallet
-        .get_orchard_nullifiers(NullifierQuery::Unspent)
-        .map_err(|e| anyhow!("unspent Orchard nullifier read failed: {e}"))?
-        .into_iter()
-        .map(|(_account, nf)| nf.to_bytes())
-        .collect();
-
-    // The lazy, memoized "is this txid currently mined per the LOCAL wallet DB?" probe (U1: the
-    // eager predecessor probed every transaction's txid up front, even with no spent candidate).
-    // The cache is pre-seeded with every txid already recorded in Broadcast state — those were
-    // treated as on-chain by the predecessor's set unconditionally, and a candidate's own txid
-    // can never legitimately collide with another row's, so the seed only preserves the old
-    // belt-and-braces behaviour without a DB probe.
-    let mut on_chain_cache: std::collections::HashMap<[u8; 32], bool> = state
-        .transactions()
-        .iter()
-        .filter_map(|t| t.state().broadcast_txid().map(|txid| (txid, true)))
-        .collect();
-    let wallet = &ctx.wallet;
-    let mut txid_on_chain = |txid: &[u8; 32]| -> anyhow::Result<bool> {
-        if let Some(known) = on_chain_cache.get(txid) {
-            return Ok(*known);
-        }
-        let mined = wallet
-            .get_tx_height(TxId::from_bytes(*txid))
-            .map_err(|e| anyhow!("own-txid height lookup failed: {e}"))?
-            .is_some();
-        on_chain_cache.insert(*txid, mined);
-        Ok(mined)
-    };
-
-    let Some(invalid_id) = decide_foreign_spend(
-        &candidates,
-        &wallet_nullifiers,
-        &unspent_nullifiers,
-        &mut txid_on_chain,
-    )?
-    else {
-        return Ok(false);
-    };
-
-    // The upstream satisfiability oracle now owns scan-discovered spends. The next
-    // `advance_migration` call will discover and evidence-stamp this row from wallet scan data.
-    let _ = invalid_id;
-    Ok(false)
+    for (id, txid, height) in &promotions {
+        // Through `Broadcast` first: that is the state the lost record would have written, and
+        // `mark_mined` reads the txid from its own argument rather than from the row.
+        state.mark_broadcast(*id, *txid);
+        state.mark_mined(*id, *txid, *height);
+    }
+    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+    backend.replace_migration(&state)?;
+    Ok(true)
 }
 
 /// Computes a fresh preview plan against the account's live balance and caches it under a fresh
@@ -2476,7 +2258,13 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
 ) -> *mut FfiMigrationAdvanceStep {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(mut state) = reconcile_mined(&mut ctx)? else {
+        // A plain load, NOT `reconcile_mined`: `advance_migration` sweeps every in-flight
+        // transaction and promotes the ones the wallet's scan has seen mine, so reconciling first
+        // would only ask the same question twice.
+        let Some(mut state) = ({
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend.get_migration()?
+        }) else {
             // No stored run: NULL with NO error (see the function doc). Returned before any
             // chain-tip lookup, so it holds even before the wallet ever saw a chain tip.
             return Ok(ptr::null_mut());
@@ -2963,10 +2751,10 @@ pub unsafe extern "C" fn zcashlc_migration_has_overdue_transfers(
     unwrap_exc_or(res, false)
 }
 
-/// Whether the stored, NON-TERMINAL run has a transaction that cannot proceed: one marked
-/// `Invalid` in the engine state (a terminal broadcast rejection recorded by
-/// [`zcashlc_migration_record_transfer_result`], or a foreign spend detected by
-/// [`zcashlc_migration_reconcile_invalidations`]), or an expired, unmined one. A terminal run
+/// Whether the stored, NON-TERMINAL run has a transaction that cannot proceed: one the engine
+/// reports unsatisfiable or awaiting reevaluation (a spend of its inputs discovered by the store's
+/// satisfiability oracle from scanned wallet data, or a broadcast rejection reported by
+/// [`zcashlc_migration_record_transfer_result`]), or an expired, unmined one. A terminal run
 /// (Complete, or Failed/cancelled) answers `false`: its attention lifecycle is over — cancelling
 /// IS the out-of-band resolution the invalid state asks for. Returns `false` on error (see
 /// `zcashlc_last_error_message`).
@@ -3656,22 +3444,25 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
     unwrap_exc_or(res, false)
 }
 
-/// Reconciles the committed run against LOCAL on-chain truth (own-broadcast/mined promotion, a
-/// submit-crash probe on `Proved` rows, then the F1-fixed foreign-spend nullifier check) and
-/// records an invalid mark when a pending transfer's funding note was spent by a foreign
-/// transaction — see [`reconcile_invalidations`] for the load-bearing 3-pass ordering. Touches
-/// only the local wallet database, never the network (R10); any in-flight-broadcast guard (the
-/// 120 s window during which a just-broadcast transfer must not be probed) is the platform's
-/// job, not this function's.
+/// Repairs the stored run where THIS process broadcast a transaction that mined but never
+/// recorded the broadcast (a crash, or a failed persist, between submitting and recording) — see
+/// [`reconcile_unrecorded_broadcasts`]. Touches only the local wallet database, never the network
+/// (R10); any in-flight-broadcast guard (the 120 s window during which a just-broadcast transfer
+/// must not be probed) is the platform's job, not this function's.
 ///
-/// Returns `1` when this call recorded an invalidation, `0` when nothing was invalidated (no
-/// stored run, a terminal run, or every pending transfer's funding notes check out), `-1` on
-/// error (see `zcashlc_last_error_message`).
+/// This no longer looks for spent funding notes: the engine's satisfiability oracle discovers
+/// those from scanned wallet data, with the evidence height a reorg can withdraw — which an SDK
+/// verdict never carried. Nor does it promote a RECORDED broadcast, which the engine's own sweep
+/// does on every advance.
+///
+/// Returns `1` when this call repaired a row, `0` when it found nothing to repair (no stored run,
+/// a terminal run, or no `Proved` row whose transaction is already on chain), `-1` on error (see
+/// `zcashlc_last_error_message`).
 ///
 /// # Safety
 /// See [`open`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_reconcile_invalidations(
+pub unsafe extern "C" fn zcashlc_migration_reconcile_unrecorded_broadcasts(
     db_data: *const u8,
     db_data_len: usize,
     account_uuid_bytes: *const u8,
@@ -3679,7 +3470,7 @@ pub unsafe extern "C" fn zcashlc_migration_reconcile_invalidations(
 ) -> i32 {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        Ok(i32::from(reconcile_invalidations(&mut ctx)?))
+        Ok(i32::from(reconcile_unrecorded_broadcasts(&mut ctx)?))
     });
     unwrap_exc_or(res, -1)
 }
@@ -4731,6 +4522,38 @@ mod tests {
     /// [`create_fixture_account_with_usk`] for the fixtures that never sign.
     fn create_fixture_account(path: &std::path::Path) -> [u8; 16] {
         create_fixture_account_with_usk(path).0
+    }
+
+    /// Marks the fixture wallet fully scanned through `height`, by writing the `Scanned`
+    /// (priority 10) scan-queue range from the account birthday that
+    /// `zcash_client_sqlite`'s `fully_scanned_height` derives its answer from.
+    ///
+    /// Needed by any fixture that hand-inserts a `transactions` row and expects the migration
+    /// layer to act on its mined height: promotion is bounded by the FULLY-SCANNED height, not
+    /// the chain tip, so an unscanned wallet reports nothing mined however many rows its
+    /// `transactions` table holds. That bound is not an artifact — a real wallet learns a
+    /// migration transaction's height BY scanning, so the two always move together outside a
+    /// fixture — and it is the same bound `advance_migration`'s own sweep promotes under, which
+    /// is what keeps a status read from reporting `Mined` for a row the drive path would refuse.
+    fn mark_fixture_scanned_through(path: &std::path::Path, height: u32) {
+        let conn = Connection::open(path).expect("the wallet connection opens");
+        let birthday: u32 = conn
+            .query_row("SELECT MIN(birthday_height) FROM accounts", [], |row| {
+                row.get(0)
+            })
+            .expect("the fixture account has a birthday");
+        // `zcashlc_update_chain_tip` has already queued the birthday-to-tip range as UNSCANNED,
+        // and the table's start/end uniqueness constraints leave no room to add beside it. The
+        // whole queue is replaced rather than amended: this fixture asserts about scan RESULTS,
+        // never about what remains to scan.
+        conn.execute("DELETE FROM scan_queue", [])
+            .expect("the existing scan queue clears");
+        conn.execute(
+            "INSERT INTO scan_queue (block_range_start, block_range_end, priority) \
+             VALUES (?1, ?2, 10)",
+            rusqlite::params![birthday, height + 1],
+        )
+        .expect("the scanned range inserts");
     }
 
     /// A view-only account imported by UFVK (no seed) — the negative-path counterpart to
@@ -8470,7 +8293,9 @@ mod tests {
         let txid = [3u8; 32];
         let mined_at = 3_500_000u32;
         // The wallet's own view: this txid mined at `mined_at`, independent of the migration
-        // store (`reconcile_mined` cross-references the two).
+        // store (`reconcile_mined` cross-references the two). The wallet must also be SCANNED
+        // through that height — promotion rests on evidence inside the scanned region, so a
+        // hand-inserted row alone is not something the engine will act on.
         {
             let conn = Connection::open(&path).expect("the wallet connection opens");
             conn.execute(
@@ -8480,6 +8305,7 @@ mod tests {
             )
             .expect("the fixture mined-transaction row inserts");
         }
+        mark_fixture_scanned_through(&path, mined_at);
 
         let rows = vec![tx_row(
             0,
@@ -9538,266 +9364,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ----- invalidation reconciliation (`zcashlc_migration_reconcile_invalidations`) -----
+    // ----- unrecorded-broadcast repair (`zcashlc_migration_reconcile_unrecorded_broadcasts`) -----
 
-    fn nf(byte: u8) -> [u8; 32] {
-        [byte; 32]
-    }
-
-    fn own_txid(byte: u8) -> [u8; 32] {
-        [byte; 32]
-    }
-
-    /// The F1 pin: a REAL production-shaped transfer PCZT carries a PADDED 2-action Orchard
-    /// bundle, and [`pczt_digest`] reads a nullifier out of EVERY action. The Android SDK's
-    /// extractor requires exactly ONE action and returns `None` on this exact artifact, which is
-    /// what left its pass-3 foreign-spend check inert in production.
-    #[test]
-    fn pczt_digest_extracts_every_action_of_a_padded_transfer() {
-        let bytes = fixture_transfer_pczt_bytes(3_500_000, 3_500_040);
-        let parsed = pczt::Pczt::parse(&bytes).expect("the fixture transfer parses");
-        let action_count = parsed.orchard().actions().len();
-        assert_eq!(
-            action_count, 2,
-            "the production transfer shape is a PADDED 2-action Orchard bundle — exactly the \
-             shape Android's exactly-one-action extractor refuses"
-        );
-
-        let digest = pczt_digest(&bytes);
-        let nullifiers = digest
-            .nullifiers
-            .expect("the padded transfer must yield its nullifiers");
-        assert_eq!(
-            nullifiers.len(),
-            2,
-            "every action's nullifier must be collected (the real funding spend plus the dummy)"
-        );
-        assert_eq!(
-            digest.txid, None,
-            "an unproved transfer is not extractable yet — nullifiers present, txid absent"
-        );
-    }
-
-    /// Garbage and empty bytes are unreadable — `None` on both digest halves, never a panic (the
-    /// ambiguous-skip lane).
-    #[test]
-    fn pczt_digest_rejects_garbage() {
-        for bytes in [&[0u8; 32][..], &[]] {
-            let digest = pczt_digest(bytes);
-            assert_eq!(digest.nullifiers, None);
-            assert_eq!(digest.txid, None);
-        }
-    }
-
-    /// U14: the pinned upstream signing-round budgets are what this SDK's estimate math and the
-    /// platform's Keystone batching were designed around — a silent upstream change to either
-    /// capacity must fail here, not in a hardware-wallet session.
-    #[test]
-    fn pinned_signing_round_budgets_match_the_planning_assumptions() {
-        assert_eq!(
-            SigningRoundBudget::KEYSTONE.max_actions(),
-            96,
-            "the Keystone per-round action budget the estimates assume"
-        );
-        assert_eq!(
-            SigningRoundBudget::DEFAULT.max_actions(),
-            512,
-            "the default per-round action budget the estimates assume"
-        );
-    }
-
-    // `decide_foreign_spend` decision-logic tests (mirroring the Android SDK's suite, extended
-    // with the F1-fix dummy-nullifier guard and the A3 dependency-evidence gate).
-
-    /// A dependency-free candidate row (its funding notes are ordinary wallet notes, so the A3
-    /// gate passes vacuously).
-    fn candidate(
-        id: u32,
-        funding_nullifiers: Option<Vec<[u8; 32]>>,
-        own: Option<[u8; 32]>,
-    ) -> ForeignSpendCandidate {
-        candidate_with_deps(id, funding_nullifiers, own, &[])
-    }
-
-    /// A candidate row with explicit per-dependency PCZT-derived txids (the A3 evidence inputs).
-    fn candidate_with_deps(
-        id: u32,
-        funding_nullifiers: Option<Vec<[u8; 32]>>,
-        own: Option<[u8; 32]>,
-        dep_txids: &[Option<[u8; 32]>],
-    ) -> ForeignSpendCandidate {
-        ForeignSpendCandidate {
-            id: MigrationTransferId::new(id),
-            funding_nullifiers,
-            own_txid: own,
-            dep_txids: dep_txids.to_vec(),
-        }
-    }
-
-    /// Drives [`decide_foreign_spend`] with a set-backed, infallible stand-in for the wallet-DB
-    /// on-chain probe (production memoizes `get_tx_height` behind the same closure shape).
-    fn decide(
-        candidates: &[ForeignSpendCandidate],
-        wallet: &HashSet<[u8; 32]>,
-        unspent: &HashSet<[u8; 32]>,
-        on_chain: &HashSet<[u8; 32]>,
-    ) -> Option<MigrationTransferId> {
-        decide_foreign_spend(candidates, wallet, unspent, |txid: &[u8; 32]| {
-            Ok::<bool, std::convert::Infallible>(on_chain.contains(txid))
-        })
-        .unwrap()
-    }
-
-    /// An unspent funding note never invalidates, regardless of the own-txid fields.
-    #[test]
-    fn decide_foreign_spend_unspent_funding_note_never_invalidated() {
-        let candidates = vec![candidate(3, Some(vec![nf(0x42)]), Some(own_txid(0x10)))];
-        let wallet: HashSet<[u8; 32]> = [nf(0x42)].into_iter().collect();
-        let unspent: HashSet<[u8; 32]> = [nf(0x42)].into_iter().collect();
-        assert_eq!(
-            decide(&candidates, &wallet, &unspent, &HashSet::new()),
-            None,
-            "an unspent funding note must never be invalidated"
-        );
-    }
-
-    /// THE F1-FIX GUARD: a padded transfer's dummy nullifiers match NO wallet note — they are
-    /// absent from both the All and the Unspent view — and must never read as "spent". Under
-    /// Android's bare complement-of-unspent rule these would false-positive on every padded
-    /// transfer; wallet-note membership is what makes collecting every action's nullifier safe.
-    #[test]
-    fn decide_foreign_spend_dummy_nullifiers_never_invalidate() {
-        // Both nullifiers are dummies (unknown to the wallet); own txid readable, not on-chain —
-        // every OTHER condition for invalidation holds.
-        let candidates = vec![candidate(
-            4,
-            Some(vec![nf(0xD0), nf(0xD1)]),
-            Some(own_txid(0x20)),
-        )];
-        let wallet: HashSet<[u8; 32]> = [nf(0x01)].into_iter().collect();
-        let unspent: HashSet<[u8; 32]> = HashSet::new();
-        assert_eq!(
-            decide(&candidates, &wallet, &unspent, &HashSet::new()),
-            None,
-            "a nullifier the wallet does not know must never count as a foreign spend"
-        );
-    }
-
-    /// The no-false-positive guard: a spent funding note whose own txid IS on-chain is our own
-    /// (possibly crashed) broadcast — never invalidated (pass 2 promotes it instead).
-    #[test]
-    fn decide_foreign_spend_own_txid_on_chain_never_invalidated() {
-        let own = own_txid(0xAB);
-        let candidates = vec![candidate(5, Some(vec![nf(0x55)]), Some(own))];
-        let wallet: HashSet<[u8; 32]> = [nf(0x55)].into_iter().collect();
-        let unspent: HashSet<[u8; 32]> = HashSet::new(); // 0x55 known and not unspent -> spent
-        let on_chain: HashSet<[u8; 32]> = [own].into_iter().collect();
-        assert_eq!(
-            decide(&candidates, &wallet, &unspent, &on_chain),
-            None,
-            "a spent nullifier whose own txid is on-chain must NOT be invalidated (the spender \
-             is our own broadcast)"
-        );
-    }
-
-    /// Ambiguity guards: an unreadable own txid, or an unreadable nullifier set, skips — never
-    /// invalidates.
-    #[test]
-    fn decide_foreign_spend_ambiguity_skips() {
-        let wallet: HashSet<[u8; 32]> = [nf(0x77)].into_iter().collect();
-        let unspent: HashSet<[u8; 32]> = HashSet::new();
-        // Spent nullifier but own txid unreadable.
-        let unreadable_txid = vec![candidate(9, Some(vec![nf(0x77)]), None)];
-        assert_eq!(
-            decide(&unreadable_txid, &wallet, &unspent, &HashSet::new()),
-            None,
-            "an unreadable own txid is ambiguous — must not invalidate"
-        );
-        // Unreadable PCZT (no nullifiers at all).
-        let unreadable_pczt = vec![candidate(1, None, Some(own_txid(0x01)))];
-        assert_eq!(
-            decide(&unreadable_pczt, &wallet, &unspent, &HashSet::new()),
-            None,
-            "an unreadable funding-nullifier set is ambiguous — must not invalidate"
-        );
-    }
-
-    /// THE A3 GATE: a spent-reading candidate whose funding preparation the wallet DB does NOT
-    /// currently show mined — the store says `Mined`, but the creating transaction was demoted
-    /// by a rewind/rescan — is AMBIGUOUS and skipped, exactly like an unreadable dependency
-    /// txid. Positive on-chain evidence for every dependency is what admits the verdict.
-    #[test]
-    fn decide_foreign_spend_requires_positive_dependency_evidence() {
-        let wallet: HashSet<[u8; 32]> = [nf(0x66)].into_iter().collect();
-        let unspent: HashSet<[u8; 32]> = HashSet::new(); // 0x66 known and not unspent -> spent
-        let dep = own_txid(0xC1);
-
-        // Demoted creating tx: the dep txid is readable but NOT on-chain per the wallet DB.
-        let demoted = vec![candidate_with_deps(
-            6,
-            Some(vec![nf(0x66)]),
-            Some(own_txid(0x30)),
-            &[Some(dep)],
-        )];
-        assert_eq!(
-            decide(&demoted, &wallet, &unspent, &HashSet::new()),
-            None,
-            "a demoted funding preparation (rewind/rescan window) must skip, not invalidate"
-        );
-
-        // Unreadable dep txid: no positive evidence is derivable — skip.
-        let unreadable_dep = vec![candidate_with_deps(
-            7,
-            Some(vec![nf(0x66)]),
-            Some(own_txid(0x31)),
-            &[None],
-        )];
-        assert_eq!(
-            decide(&unreadable_dep, &wallet, &unspent, &HashSet::new()),
-            None,
-            "an unreadable dependency txid is ambiguous — must not invalidate"
-        );
-
-        // The dep IS currently mined (and the candidate's own txid is not): the verdict stands.
-        let on_chain: HashSet<[u8; 32]> = [dep].into_iter().collect();
-        let confirmed = vec![candidate_with_deps(
-            8,
-            Some(vec![nf(0x66)]),
-            Some(own_txid(0x32)),
-            &[Some(dep)],
-        )];
-        assert_eq!(
-            decide(&confirmed, &wallet, &unspent, &on_chain),
-            Some(MigrationTransferId::new(8)),
-            "with every dependency positively mined, the foreign spend is confirmed"
-        );
-    }
-
-    /// A genuine foreign spend — a WALLET-known nullifier no longer unspent, own txid readable
-    /// and NOT on-chain — invalidates, and with several candidates the FIRST foreign-spent one
-    /// is reported. A padded candidate detects through its real spend even with a dummy alongside.
-    #[test]
-    fn decide_foreign_spend_reports_first_foreign_spent_candidate() {
-        let wallet: HashSet<[u8; 32]> = [nf(0x01), nf(0x02), nf(0x03)].into_iter().collect();
-        let unspent: HashSet<[u8; 32]> = [nf(0x01)].into_iter().collect(); // only 0x01 unspent
-        let candidates = vec![
-            // Unspent -> skip.
-            candidate(1, Some(vec![nf(0x01), nf(0xD0)]), Some(own_txid(0x01))),
-            // Real spend (0x02) beside a dummy (0xD1) -> invalidate; first match wins.
-            candidate(2, Some(vec![nf(0x02), nf(0xD1)]), Some(own_txid(0x02))),
-            // Also spent, but id 2 already won.
-            candidate(3, Some(vec![nf(0x03)]), Some(own_txid(0x03))),
-        ];
-        assert_eq!(
-            decide(&candidates, &wallet, &unspent, &HashSet::new()),
-            Some(MigrationTransferId::new(2)),
-            "the first foreign-spent candidate must be the one invalidated"
-        );
-    }
-
-    fn reconcile_invalidations_ffi(path_bytes: &[u8], account: &[u8; 16]) -> i32 {
+    fn reconcile_unrecorded_broadcasts_ffi(path_bytes: &[u8], account: &[u8; 16]) -> i32 {
         unsafe {
-            zcashlc_migration_reconcile_invalidations(
+            zcashlc_migration_reconcile_unrecorded_broadcasts(
                 path_bytes.as_ptr(),
                 path_bytes.len(),
                 account.as_ptr(),
@@ -9806,52 +9377,61 @@ mod tests {
         }
     }
 
-    /// Nothing pending (no stored run at all): `0`, before any chain-tip lookup.
+    /// Nothing stored at all: `0`, before any chain-tip lookup.
     #[test]
-    fn reconcile_invalidations_fresh_db_is_zero() {
-        let path = init_fixture_db("zcashlc_reconcile_inval_fresh");
+    fn reconcile_unrecorded_broadcasts_fresh_db_is_zero() {
+        let path = init_fixture_db("zcashlc_reconcile_unrecorded_fresh");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
-        assert_eq!(reconcile_invalidations_ffi(path_bytes, &account), 0);
+        assert_eq!(reconcile_unrecorded_broadcasts_ffi(path_bytes, &account), 0);
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A terminal (cancelled) run reconciles nothing: `0`.
+    /// A terminal (cancelled) run is never driven again, so there is nothing to repair: `0`.
     #[test]
-    fn reconcile_invalidations_terminal_run_is_zero() {
-        let path = init_fixture_db("zcashlc_reconcile_inval_terminal");
+    fn reconcile_unrecorded_broadcasts_terminal_run_is_zero() {
+        let path = init_fixture_db("zcashlc_reconcile_unrecorded_terminal");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
         let state = test_state(
             MigrationStatus::Failed,
             &[],
-            &[MigrationTxState::Signed],
+            &[MigrationTxState::Proved],
             3_499_000,
             4_000_000,
         );
         store_fixture_state(&path, &account, &state);
-        assert_eq!(reconcile_invalidations_ffi(path_bytes, &account), 0);
+        assert_eq!(reconcile_unrecorded_broadcasts_ffi(path_bytes, &account), 0);
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A pending run whose transfers carry REAL (parseable, padded 2-action) PCZTs on a wallet
-    /// holding none of those notes: pass 3 runs past the all-unreadable early exit (pinning that
-    /// the F1 fix actually reads the nullifiers), finds no wallet-known spent nullifier, and
-    /// invalidates nothing — `0`, and no invalid mark is recorded.
+    /// A `Proved` row whose stored PCZT is not extractable is SKIPPED, not an error: the probe
+    /// has no txid to ask about, and a row it cannot identify is never evidence either way.
+    ///
+    /// The fixture transfer PCZT is signed but not proven, so `extract_tx` — which needs a
+    /// complete transaction — declines it. That mismatch (a row recorded `Proved` whose bytes are
+    /// not) is exactly the corrupt-store shape the skip exists for, so the test asserts the
+    /// premise rather than resting on it.
     #[test]
-    fn reconcile_invalidations_pending_run_with_no_foreign_spend_is_zero() {
-        let path = init_fixture_db("zcashlc_reconcile_inval_clean");
+    fn reconcile_unrecorded_broadcasts_skips_an_unextractable_proved_row() {
+        let path = init_fixture_db("zcashlc_reconcile_unrecorded_pending");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
-        let pczt_bytes = fixture_transfer_pczt_bytes(3_500_000, 4_000_000);
+        set_fixture_tip(path_bytes);
         let base = test_state(
             MigrationStatus::InProgress,
             &[],
-            &[MigrationTxState::Signed],
+            &[MigrationTxState::Proved, MigrationTxState::Proved],
             3_499_000,
             4_000_000,
         );
-        let transactions = base
+        let pczt_bytes = fixture_transfer_pczt_bytes(3_500_000, 3_500_040);
+        assert!(
+            pczt_txid(&pczt_bytes).is_none(),
+            "premise: the fixture transfer is signed but not proven, so it yields no txid",
+        );
+        let transactions: Vec<MigrationTransaction> = base
             .transactions()
             .iter()
             .map(|t| {
@@ -9878,20 +9458,17 @@ mod tests {
         store_fixture_state(&path, &account, &state);
 
         assert_eq!(
-            reconcile_invalidations_ffi(path_bytes, &account),
+            reconcile_unrecorded_broadcasts_ffi(path_bytes, &account),
             0,
-            "no wallet-known nullifier is spent, so nothing may be invalidated"
+            "a row the probe cannot identify is skipped, not repaired and not an error"
         );
+        let stored = read_fixture_state(&path, &account);
         assert!(
-            !unsafe {
-                zcashlc_migration_has_invalid_transfers(
-                    path_bytes.as_ptr(),
-                    path_bytes.len(),
-                    account.as_ptr(),
-                    NETWORK_ID_MAINNET,
-                )
-            },
-            "no invalid mark may have been recorded"
+            stored
+                .transactions()
+                .iter()
+                .all(|t| matches!(t.state(), MigrationTxState::Proved)),
+            "every row must be left exactly as stored"
         );
         let _ = std::fs::remove_file(&path);
     }

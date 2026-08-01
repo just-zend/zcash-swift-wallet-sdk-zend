@@ -39,6 +39,7 @@ use zcash_pool_migration::engine::{
 };
 use zcash_pool_migration::scheduling::SchedulingParams;
 use zcash_protocol::ShieldedPool;
+use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 
@@ -229,6 +230,16 @@ impl PoolMigrationRead for Backend<'_> {
         self.store
             .check_step_satisfiability(tx, settle)
             .map_err(|e| anyhow!("migration satisfiability check failed: {e}"))
+    }
+
+    /// Delegated to the store, which reads the wallet's own `transactions` table bounded by the
+    /// FULLY-SCANNED height — a stricter bound than `WalletRead::get_tx_height`'s chain tip, and
+    /// the reason the SDK no longer runs its own mined-height lookup: a promotion may not rest on
+    /// a block outside the region a reorg truncation would roll back.
+    fn mined_height(&self, txid: TxId) -> Result<Option<BlockHeight>, Self::Error> {
+        self.store
+            .mined_height(txid)
+            .map_err(|e| anyhow!("mined-height lookup failed: {e}"))
     }
 }
 

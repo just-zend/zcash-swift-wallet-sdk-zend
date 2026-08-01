@@ -459,12 +459,19 @@ protocol ZcashRustBackendWelding {
     /// - Throws: `rustMigrationBlockRateSamples` if the rust layer returns an error.
     func migrationBlockRateSamples(window: UInt32) async throws -> [MigrationBlockRateSample]
 
-    /// Reconciles `account`'s committed run against LOCAL on-chain truth (own-broadcast/mined
-    /// promotion, a submit-crash probe on proved rows, then the foreign-spend nullifier check)
-    /// and records an invalid mark when a pending transfer's funding note was spent by a foreign
-    /// transaction. Touches only the local wallet database, never the network. Returns `true`
-    /// when this call recorded an invalidation, `false` when nothing was invalidated (no stored
-    /// run, a terminal run, or every pending transfer's funding notes check out).
+    /// Repairs `account`'s committed run where THIS process submitted a transaction that mined but
+    /// never recorded the broadcast (a crash, or a failed persist, between submitting and
+    /// recording): the engine's own promotion sweep keys on the recorded txid, so such a row sits
+    /// at proved with its transaction already on chain and nothing else would promote it. Touches
+    /// only the local wallet database, never the network. Returns `true` when this call repaired a
+    /// row, `false` when it found nothing to repair (no stored run, a terminal run, or no proved
+    /// row whose transaction is already on chain).
+    ///
+    /// It records no invalid marks and no longer inspects funding notes: the engine's
+    /// satisfiability oracle discovers a spend outside the migration from scanned wallet data,
+    /// with an evidence height a reorg can withdraw. Promoting a RECORDED broadcast is the
+    /// engine's too, on every advance. The Swift name predates that split (the rust entry point is
+    /// `zcashlc_migration_reconcile_unrecorded_broadcasts`) and is due to follow it.
     ///
     /// The 120-second in-flight-broadcast guard (during which a just-broadcast transfer must not
     /// be probed) is the caller's job — see ``MigrationSyncGate``'s in-flight marker — not this

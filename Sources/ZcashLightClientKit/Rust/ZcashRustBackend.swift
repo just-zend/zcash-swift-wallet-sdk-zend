@@ -1549,15 +1549,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationReconcileInvalidations(for account: AccountUUID) async throws -> Bool {
-        let outcome = zcashlc_migration_reconcile_invalidations(
+        let outcome = zcashlc_migration_reconcile_unrecorded_broadcasts(
             dbData.0,
             dbData.1,
             account.id,
             networkType.networkId
         )
 
-        // `-1` means only "error" (`0` = nothing invalidated / `1` = invalidation recorded are
-        // the two legitimate outcomes).
+        // `-1` means only "error" (`0` = nothing repaired / `1` = a row repaired are the two
+        // legitimate outcomes).
         guard outcome >= 0 else {
             throw ZcashError.rustMigrationReconcileInvalidations(
                 lastErrorMessage(fallback: "`migrationReconcileInvalidations` failed with unknown error")

@@ -37,12 +37,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     most-recently-scanned `(height, header time)` rows, ascending, the raw input a wall-clock
     chain-tip estimator projects from (a missing wallet-database file, like a missing `blocks`
     table, is the benign empty answer, and a coerced read failure is logged rather than silent);
-    and `_reconcile_invalidations` (returns `bool`, `-1` on error) reconciles the stored run
-    against local on-chain truth (own-broadcast/mined promotion, a submit-crash probe, then the
-    foreign-spend nullifier check — which requires POSITIVE wallet-database evidence that every
-    funding preparation is currently mined, so a rewind/rescan window reads as ambiguous rather
-    than as a foreign spend) and reports whether it recorded a new invalidation, as the engine's
-    own `Invalid { funding_spent }` state. All three are read-only/local-database-only.
+    and `_reconcile_unrecorded_broadcasts` (returns `bool`, `-1` on error) repairs the one case
+    the engine cannot see for itself — a transaction this process submitted that mined, but whose
+    broadcast was never recorded (a crash, or a failed persist, between submitting and recording),
+    leaving a proved row whose transaction is already on chain — and reports whether it repaired
+    anything. It records no invalid marks: a funding note spent outside the migration is
+    discovered by the engine's satisfiability oracle from scanned wallet data, and promoting a
+    RECORDED broadcast is the engine's own sweep. All three are read-only/local-database-only.
   - Batching: `zcashlc_migration_batch_pczts_by_actions` (pure, no wallet database) splits an
     ORDERED array of transaction action-weights (16 per preparation, 3 per transfer) into signer
     sessions bounded by a caller-supplied action budget, returning `FfiMigrationBatchSizes` (freed by
@@ -147,6 +148,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
   hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
   doomed-broadcast withhold (above).
+- Mined-transaction promotion is the upstream engine's: `advance_migration` sweeps every in-flight
+  transaction and promotes the ones the wallet's scan has seen mine, so the drive path no longer
+  reconciles first, and the read-only entry points reconcile through the engine's own
+  `PoolMigrationRead::mined_height` rather than `WalletRead::get_tx_height`. That tightens the
+  bound from the chain tip to the FULLY-SCANNED height — a promotion may not rest on a block
+  outside the region a reorg truncation would roll back — and is the same bound the drive path
+  promotes under, so a status read can no longer report `Mined` for a row `advance_migration`
+  would refuse to promote.
 
 ### Fixed
 - The migration prover's transient-vs-hard error classification (`ProveErrorClass::is_transient`,
