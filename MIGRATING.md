@@ -42,7 +42,7 @@ Discharging each step:
   adjudicates against the newly scanned data and re-offers the work where the obstruction was
   transient. Only if attention persists, surface the attention UX over the invalid
   `migrationTransactionStatuses(accountUUID:)` row(s) and then `restartCurrentMigrationStep(accountUUID:)`
-  (cancel and re-plan). `reconcileMigrationInvalidations(accountUUID:)` is NOT part of this
+  (cancel and re-plan). `reconcileUnrecordedMigrationBroadcasts(accountUUID:)` is NOT part of this
   discharge — it records no marks; see its own entry below. Invalid rows are excluded from
   delivery and from the sync gate — a dead transfer is never served and gates nothing.
 - `.broadcast(id:)` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)` —
@@ -133,7 +133,7 @@ instead.
 
 ### New members
 
-`finalizeReadyMigrationTransfers(accountUUID:)`, `reconcileMigrationInvalidations(accountUUID:)`,
+`finalizeReadyMigrationTransfers(accountUUID:)`, `reconcileUnrecordedMigrationBroadcasts(accountUUID:)`,
 `migrationSyncWakeups(accountUUID:)`, `estimatedMigrationChainTip()`,
 `estimatedMigrationSecondsPerBlock()`,
 `batchMigrationPcztsForSigning(_:maxActionsPerSession:)`, and `hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)`
@@ -144,14 +144,14 @@ every account (an earlier unreleased iteration carried an unused `accountUUID:`;
 See each member's doc comment for its full contract; the estimated-tip and privacy-buffer notes
 below cover the cross-cutting parts.
 
-`reconcileMigrationInvalidations(accountUUID:)` needs one note of its own, because its name no
-longer describes it. It repairs exactly one thing: a transaction this process submitted to a node,
-which mined, but whose broadcast was never recorded (a crash, or a failed persist, between
-submitting and recording). It returns whether it repaired a row, records no invalid marks, and is
-not part of the `.requiresAttention(id:)` discharge. Everything else it used to do belongs to the
-engine now — a funding note spent outside the migration is discovered by the satisfiability oracle
-from scanned wallet data, and a recorded broadcast is promoted to mined on every
-`migrationAdvanceStep`. Expect the name to change before release.
+`reconcileUnrecordedMigrationBroadcasts(accountUUID:)` needs one note of its own, because it is
+narrower than a repair entry point sounds. It repairs exactly one thing: a transaction this process
+submitted to a node, which mined, but whose broadcast was never recorded (a crash, or a failed
+persist, between submitting and recording). It returns whether it repaired a row, records no
+invalid marks, and is not part of the `.requiresAttention(id:)` discharge. Every other repair is
+the engine's — a funding note spent outside the migration is discovered by the satisfiability
+oracle from scanned wallet data, and a recorded broadcast is promoted to mined on every
+`migrationAdvanceStep`.
 
 ### `useEstimatedTip` parameters
 
@@ -179,8 +179,8 @@ reasons:
    mainnet constant.
 2. **In-flight broadcast marker** — a 120 s self-expiring marker blocks sync from just before a
    migration submit hits the network until its outcome is recorded, so the
-   unrecorded-broadcast repair (`reconcileMigrationInvalidations`) never treats a just-broadcast
-   transfer as a submit crash. The marker is (re-)armed at the last pre-submit
+   unrecorded-broadcast repair (`reconcileUnrecordedMigrationBroadcasts`) never treats a
+   just-broadcast transfer as a submit crash. The marker is (re-)armed at the last pre-submit
    instant — after the Tor bootstrap — so a slow bootstrap does not burn its window, and a marker
    observed implausibly far in the future (a backwards clock step) is clamped/ignored rather than
    wedging sync.

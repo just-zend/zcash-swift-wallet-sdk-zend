@@ -20,9 +20,9 @@ import Foundation
 ///    broadcast is not correlated with a fresh sync. This is the `resumeAt` timestamp persisted here.
 /// 3. **Broadcast in flight** — from just before a migration submit hits the network until its
 ///    outcome is recorded, sync must not run: the reconciliation probe
-///    (`migrationReconcileInvalidations`) would otherwise treat the not-yet-visible broadcast as a
-///    submit crash. This is the `inFlightUntil` timestamp persisted here; a crash between submit
-///    and record leaves the marker behind, and it self-expires
+///    (`migrationReconcileUnrecordedBroadcasts`) would otherwise treat the not-yet-visible
+///    broadcast as a submit crash. This is the `inFlightUntil` timestamp persisted here; a crash
+///    between submit and record leaves the marker behind, and it self-expires
 ///    ``broadcastInFlightGuardDuration`` (120 s) after it was set.
 ///
 /// The gate owns the privacy-buffer and in-flight halves; the ready-broadcast half is supplied by
@@ -373,7 +373,7 @@ final class MigrationSyncGate: @unchecked Sendable {
     /// Whether the in-flight broadcast marker is currently live: armed
     /// (``markBroadcastInFlight()``) and neither cleared nor self-expired. The submit-to-record
     /// window signal callers use to defer work that must not observe a just-broadcast transfer
-    /// (see `OrchardMigration.reconcileInvalidations()`).
+    /// (see `OrchardMigration.reconcileUnrecordedBroadcasts()`).
     func isBroadcastInFlight() -> Bool {
         guard let inFlightUntil = currentInFlightUntil() else {
             return false

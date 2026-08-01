@@ -1154,8 +1154,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).finalizeReadyTransfers()
     }
 
-    public func reconcileMigrationInvalidations(accountUUID: AccountUUID) async throws -> Bool {
-        try await migrationHost.migration(for: accountUUID).reconcileInvalidations()
+    public func reconcileUnrecordedMigrationBroadcasts(accountUUID: AccountUUID) async throws -> Bool {
+        try await migrationHost.migration(for: accountUUID).reconcileUnrecordedBroadcasts()
     }
 
     public func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {

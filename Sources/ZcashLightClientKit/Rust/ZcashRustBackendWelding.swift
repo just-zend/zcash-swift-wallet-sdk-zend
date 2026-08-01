@@ -470,14 +470,13 @@ protocol ZcashRustBackendWelding {
     /// It records no invalid marks and no longer inspects funding notes: the engine's
     /// satisfiability oracle discovers a spend outside the migration from scanned wallet data,
     /// with an evidence height a reorg can withdraw. Promoting a RECORDED broadcast is the
-    /// engine's too, on every advance. The Swift name predates that split (the rust entry point is
-    /// `zcashlc_migration_reconcile_unrecorded_broadcasts`) and is due to follow it.
+    /// engine's too, on every advance.
     ///
     /// The 120-second in-flight-broadcast guard (during which a just-broadcast transfer must not
     /// be probed) is the caller's job — see ``MigrationSyncGate``'s in-flight marker — not this
     /// function's.
-    /// - Throws: `rustMigrationReconcileInvalidations` if the rust layer returns an error.
-    func migrationReconcileInvalidations(for account: AccountUUID) async throws -> Bool
+    /// - Throws: `rustMigrationReconcileUnrecordedBroadcasts` if the rust layer returns an error.
+    func migrationReconcileUnrecordedBroadcasts(for account: AccountUUID) async throws -> Bool
 
     /// Splits an ORDERED list of transaction action-weights (`MigrationUnsignedTransferPczt.actions`)
     /// into signer sessions bounded by `maxActionsPerSession`, preserving order, and returns the
@@ -549,10 +548,10 @@ protocol ZcashRustBackendWelding {
     /// Whether `account`'s stored, NON-TERMINAL run has a transaction that cannot proceed: one
     /// marked ``MigrationTransactionStatus/State/invalid(reason:)`` in the engine state (a
     /// terminal broadcast rejection recorded by
-    /// `migrationRecordTransferResult(transferId:result:for:)`, or a foreign spend detected by
-    /// `migrationReconcileInvalidations(for:)`), or an expired, unmined one. A terminal run —
-    /// complete, or failed/cancelled — answers `false`: its attention lifecycle is over
-    /// (cancelling IS the out-of-band resolution the invalid state asks for).
+    /// `migrationRecordTransferResult(transferId:result:for:)`, or a spend of its inputs the
+    /// engine's satisfiability oracle discovered from scanned wallet data), or an expired, unmined
+    /// one. A terminal run — complete, or failed/cancelled — answers `false`: its attention
+    /// lifecycle is over (cancelling IS the out-of-band resolution the invalid state asks for).
     /// - Throws: `rustMigrationHasInvalidTransfers` if the rust layer returns an error.
     func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool
 

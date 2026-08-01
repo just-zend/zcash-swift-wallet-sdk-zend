@@ -315,14 +315,14 @@ actor OrchardMigration {
     /// drive the probe into the submit-to-record window either. That guard is exactly why the
     /// repair cannot simply run on every read: inside the submit-to-record window, the row it
     /// would "repair" is one whose broadcast is still being recorded.
-    func reconcileInvalidations() async throws -> Bool {
+    func reconcileUnrecordedBroadcasts() async throws -> Bool {
         // Optional hardening (belt to the sync gate's suspenders): the probe's own crash
         // heuristics are the primary defense, but there is no reason to let it observe a
         // just-broadcast transfer at all while the submit-to-record window is provably open.
         if syncGate.isBroadcastInFlight() {
             return false
         }
-        return try await welding.migrationReconcileInvalidations(for: accountUUID)
+        return try await welding.migrationReconcileUnrecordedBroadcasts(for: accountUUID)
     }
 
     /// Proves every migration transaction whose anchor the wallet can resolve right now and

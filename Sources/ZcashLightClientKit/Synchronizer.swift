@@ -618,9 +618,10 @@ public protocol Synchronizer: AnyObject {
     /// Discharging each step (see ``MigrationAdvanceStep`` for the full contract):
     /// - `.requiresAttention` — surfaced FIRST, before any actionable step, when a transaction of
     ///   the run is ``MigrationTransactionStatus/State/invalid(reason:)`` (funding note spent
-    ///   outside the migration, or a network-rejected broadcast) →
-    ///   ``reconcileMigrationInvalidations(accountUUID:)``, surface the attention UX over the
-    ///   invalid status row(s), then ``restartCurrentMigrationStep(accountUUID:)``. Invalid rows
+    ///   outside the migration, or a network-rejected broadcast) → SYNC and call this again, so
+    ///   the engine can adjudicate against the newly scanned data and re-offer the work where the
+    ///   obstruction was transient; only if attention persists, surface the attention UX over the
+    ///   invalid status row(s) and then ``restartCurrentMigrationStep(accountUUID:)``. Invalid rows
     ///   are excluded from delivery (never served by
     ///   ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``) and from
     ///   the sync gate (a dead transfer gates nothing).
@@ -687,10 +688,10 @@ public protocol Synchronizer: AnyObject {
     /// ``migrationAdvanceStep(accountUUID:)``. Promoting a RECORDED broadcast to mined is
     /// likewise the engine's, on every advance.
     ///
-    /// - Note: The name predates that split and is due to change; this is not part of a released
-    ///   API. See ``MigrationAdvanceStep/requiresAttention(id:)`` for the current discharge.
+    /// - Note: See ``MigrationAdvanceStep/requiresAttention(id:)`` for the attention discharge,
+    ///   which this method is no longer part of.
     /// - Parameter accountUUID: the account to repair.
-    func reconcileMigrationInvalidations(accountUUID: AccountUUID) async throws -> Bool
+    func reconcileUnrecordedMigrationBroadcasts(accountUUID: AccountUUID) async throws -> Bool
 
     /// The stored run's minimal sync/proving wake-up schedule for `accountUUID`, as of the
     /// SCANNED chain tip: each row is a height at which to wake, sync, and run
@@ -1326,7 +1327,7 @@ public extension Synchronizer {
         throw MigrationUnimplemented(member: #function)
     }
 
-    func reconcileMigrationInvalidations(accountUUID: AccountUUID) async throws -> Bool {
+    func reconcileUnrecordedMigrationBroadcasts(accountUUID: AccountUUID) async throws -> Bool {
         throw MigrationUnimplemented(member: #function)
     }
 

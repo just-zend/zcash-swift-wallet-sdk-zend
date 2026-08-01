@@ -2773,27 +2773,27 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
-    // MARK: - reconcileMigrationInvalidations
+    // MARK: - reconcileUnrecordedMigrationBroadcasts
 
-    var reconcileMigrationInvalidationsAccountUUIDThrowableError: Error?
-    var reconcileMigrationInvalidationsAccountUUIDCallsCount = 0
-    var reconcileMigrationInvalidationsAccountUUIDCalled: Bool {
-        return reconcileMigrationInvalidationsAccountUUIDCallsCount > 0
+    var reconcileUnrecordedMigrationBroadcastsAccountUUIDThrowableError: Error?
+    var reconcileUnrecordedMigrationBroadcastsAccountUUIDCallsCount = 0
+    var reconcileUnrecordedMigrationBroadcastsAccountUUIDCalled: Bool {
+        return reconcileUnrecordedMigrationBroadcastsAccountUUIDCallsCount > 0
     }
-    var reconcileMigrationInvalidationsAccountUUIDReceivedAccountUUID: AccountUUID?
-    var reconcileMigrationInvalidationsAccountUUIDReturnValue: Bool!
-    var reconcileMigrationInvalidationsAccountUUIDClosure: ((AccountUUID) async throws -> Bool)?
+    var reconcileUnrecordedMigrationBroadcastsAccountUUIDReceivedAccountUUID: AccountUUID?
+    var reconcileUnrecordedMigrationBroadcastsAccountUUIDReturnValue: Bool!
+    var reconcileUnrecordedMigrationBroadcastsAccountUUIDClosure: ((AccountUUID) async throws -> Bool)?
 
-    func reconcileMigrationInvalidations(accountUUID: AccountUUID) async throws -> Bool {
-        if let error = reconcileMigrationInvalidationsAccountUUIDThrowableError {
+    func reconcileUnrecordedMigrationBroadcasts(accountUUID: AccountUUID) async throws -> Bool {
+        if let error = reconcileUnrecordedMigrationBroadcastsAccountUUIDThrowableError {
             throw error
         }
-        reconcileMigrationInvalidationsAccountUUIDCallsCount += 1
-        reconcileMigrationInvalidationsAccountUUIDReceivedAccountUUID = accountUUID
-        if let closure = reconcileMigrationInvalidationsAccountUUIDClosure {
+        reconcileUnrecordedMigrationBroadcastsAccountUUIDCallsCount += 1
+        reconcileUnrecordedMigrationBroadcastsAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = reconcileUnrecordedMigrationBroadcastsAccountUUIDClosure {
             return try await closure(accountUUID)
         } else {
-            return reconcileMigrationInvalidationsAccountUUIDReturnValue
+            return reconcileUnrecordedMigrationBroadcastsAccountUUIDReturnValue
         }
     }
 
@@ -5071,6 +5071,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
+    // MARK: - migrationAdvanceStep
+
+    var migrationAdvanceStepForEstimatedTipThrowableError: Error?
+    var migrationAdvanceStepForEstimatedTipCallsCount = 0
+    var migrationAdvanceStepForEstimatedTipCalled: Bool {
+        return migrationAdvanceStepForEstimatedTipCallsCount > 0
+    }
+    var migrationAdvanceStepForEstimatedTipReceivedArguments: (account: AccountUUID, estimatedTip: BlockHeight?)?
+    var migrationAdvanceStepForEstimatedTipReturnValue: MigrationAdvanceStep?
+    var migrationAdvanceStepForEstimatedTipClosure: ((AccountUUID, BlockHeight?) async throws -> MigrationAdvanceStep?)?
+
+    func migrationAdvanceStep(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> MigrationAdvanceStep? {
+        if let error = migrationAdvanceStepForEstimatedTipThrowableError {
+            throw error
+        }
+        migrationAdvanceStepForEstimatedTipCallsCount += 1
+        migrationAdvanceStepForEstimatedTipReceivedArguments = (account: account, estimatedTip: estimatedTip)
+        if let closure = migrationAdvanceStepForEstimatedTipClosure {
+            return try await closure(account, estimatedTip)
+        } else {
+            return migrationAdvanceStepForEstimatedTipReturnValue
+        }
+    }
+
     // MARK: - migrationProgress
 
     var migrationProgressForThrowableError: Error?
@@ -5143,27 +5167,27 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
-    // MARK: - migrationReconcileInvalidations
+    // MARK: - migrationReconcileUnrecordedBroadcasts
 
-    var migrationReconcileInvalidationsForThrowableError: Error?
-    var migrationReconcileInvalidationsForCallsCount = 0
-    var migrationReconcileInvalidationsForCalled: Bool {
-        return migrationReconcileInvalidationsForCallsCount > 0
+    var migrationReconcileUnrecordedBroadcastsForThrowableError: Error?
+    var migrationReconcileUnrecordedBroadcastsForCallsCount = 0
+    var migrationReconcileUnrecordedBroadcastsForCalled: Bool {
+        return migrationReconcileUnrecordedBroadcastsForCallsCount > 0
     }
-    var migrationReconcileInvalidationsForReceivedAccount: AccountUUID?
-    var migrationReconcileInvalidationsForReturnValue: Bool!
-    var migrationReconcileInvalidationsForClosure: ((AccountUUID) async throws -> Bool)?
+    var migrationReconcileUnrecordedBroadcastsForReceivedAccount: AccountUUID?
+    var migrationReconcileUnrecordedBroadcastsForReturnValue: Bool!
+    var migrationReconcileUnrecordedBroadcastsForClosure: ((AccountUUID) async throws -> Bool)?
 
-    func migrationReconcileInvalidations(for account: AccountUUID) async throws -> Bool {
-        if let error = migrationReconcileInvalidationsForThrowableError {
+    func migrationReconcileUnrecordedBroadcasts(for account: AccountUUID) async throws -> Bool {
+        if let error = migrationReconcileUnrecordedBroadcastsForThrowableError {
             throw error
         }
-        migrationReconcileInvalidationsForCallsCount += 1
-        migrationReconcileInvalidationsForReceivedAccount = account
-        if let closure = migrationReconcileInvalidationsForClosure {
+        migrationReconcileUnrecordedBroadcastsForCallsCount += 1
+        migrationReconcileUnrecordedBroadcastsForReceivedAccount = account
+        if let closure = migrationReconcileUnrecordedBroadcastsForClosure {
             return try await closure(account)
         } else {
-            return migrationReconcileInvalidationsForReturnValue
+            return migrationReconcileUnrecordedBroadcastsForReturnValue
         }
     }
 

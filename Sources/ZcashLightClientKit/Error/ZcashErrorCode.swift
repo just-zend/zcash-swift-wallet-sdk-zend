@@ -359,8 +359,8 @@ public enum ZcashErrorCode: String {
     case rustMigrationSyncWakeups = "ZRUST0143"
     /// Error from rust layer when calling ZcashRustBackend.migrationBlockRateSamples
     case rustMigrationBlockRateSamples = "ZRUST0144"
-    /// Error from rust layer when calling ZcashRustBackend.migrationReconcileInvalidations
-    case rustMigrationReconcileInvalidations = "ZRUST0145"
+    /// Error from rust layer when calling ZcashRustBackend.migrationReconcileUnrecordedBroadcasts
+    case rustMigrationReconcileUnrecordedBroadcasts = "ZRUST0145"
     /// Error from rust layer when calling ZcashRustBackend.migrationBatchPcztsByActions
     case rustMigrationBatchPcztsByActions = "ZRUST0146"
     /// No chain tip is available to estimate from: the wallet has never scanned a block.

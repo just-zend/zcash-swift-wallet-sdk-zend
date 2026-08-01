@@ -1548,7 +1548,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationReconcileInvalidations(for account: AccountUUID) async throws -> Bool {
+    func migrationReconcileUnrecordedBroadcasts(for account: AccountUUID) async throws -> Bool {
         let outcome = zcashlc_migration_reconcile_unrecorded_broadcasts(
             dbData.0,
             dbData.1,
@@ -1559,8 +1559,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         // `-1` means only "error" (`0` = nothing repaired / `1` = a row repaired are the two
         // legitimate outcomes).
         guard outcome >= 0 else {
-            throw ZcashError.rustMigrationReconcileInvalidations(
-                lastErrorMessage(fallback: "`migrationReconcileInvalidations` failed with unknown error")
+            throw ZcashError.rustMigrationReconcileUnrecordedBroadcasts(
+                lastErrorMessage(fallback: "`migrationReconcileUnrecordedBroadcasts` failed with unknown error")
             )
         }
 
