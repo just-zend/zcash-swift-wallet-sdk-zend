@@ -9,10 +9,10 @@ import Foundation
 /// by `Synchronizer.migrationAdvanceStep(accountUUID:)` /
 /// `ZcashRustBackendWelding.migrationAdvanceStep(for:)`.
 ///
-/// A VERBATIM conduit of the upstream engine's own `MigrationState::next_step`: the SDK adds no
-/// state machine, no ordering shims, and no carve-outs of its own on top — upstream `next_step`
-/// natively carries the attention step, the broadcast-first ordering, and the prove step's kind
-/// (upstream PR #2873), so every case below is the engine's answer marshaled field-for-field.
+/// A conduit of the upstream engine's public `advance_migration` API. The SDK preserves this
+/// enum's source-compatible shape by projecting upstream `Reevaluate` and `Replan` decisions onto
+/// ``requiresAttention(id:)``; the broadcast/prove/rebuild/waiting/complete cases marshal directly
+/// (upstream PR #2871).
 /// `nil` at the API level (the call returns an optional) means no migration run is stored at all —
 /// none was ever committed for the account — so there is nothing to advance and nothing to poll.
 /// The engine's priority order is attend > broadcast > prove > rebuild:
@@ -21,9 +21,10 @@ import Foundation
 /// ahead of any new proving work (its broadcast window is the scarcer resource; proving can
 /// happen on any later wake-up).
 ///
-/// Evaluated against the SCANNED chain tip only — the wall-clock tip ESTIMATE
-/// (`estimatedMigrationChainTip`) never enters this decision. It is also memoryless about
-/// sessions: it reports what the run needs next, not whether doing it now would pair a broadcast
+/// Evaluated with both the wallet's fully-scanned target and its wall-clock tip estimate. Upstream
+/// uses the estimate only for reversible scheduling/withholding; persisted or destructive
+/// judgments remain anchored to scanned data. It is also memoryless about sessions: it reports
+/// what the run needs next, not whether doing it now would pair a broadcast
 /// with a sync — session policy (one broadcast per session, no sync in a broadcast session, the
 /// post-broadcast privacy buffer) belongs to the caller and the sync gate, not to this value.
 ///
@@ -69,11 +70,11 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     case waiting
     /// The stored run is terminal (fully mined, or cancelled): stop polling it.
     case complete
-    /// The transaction identified by `id` is marked
-    /// ``MigrationTransactionStatus/State/invalid(reason:)`` — its funding note was spent outside
-    /// the migration, or the network terminally rejected its broadcast — and no automatic step
-    /// can advance the run. Surfaced FIRST, before any actionable step, exactly as upstream
-    /// `next_step` orders it. Discharge: `reconcileMigrationInvalidations(accountUUID:)` →
+    /// The transaction identified by `id` either has an open node-rejection report that requires
+    /// more sync (`Reevaluate`) or was determined unsatisfiable and requires a new plan (`Replan`).
+    /// Discharge: sync and call `migrationAdvanceStep` again for reevaluation; if attention
+    /// remains, show the status and use `restartCurrentMigrationStep`. The compatibility flow is
+    /// `reconcileMigrationInvalidations(accountUUID:)` →
     /// attention UX → `restartCurrentMigrationStep(accountUUID:)` (see the type doc's mapping).
     case requiresAttention(id: UInt32)
 }
@@ -217,20 +218,15 @@ public struct MigrationProgress: Equatable, Sendable {
     }
 }
 
-/// Why a migration transaction was marked ``MigrationTransactionStatus/State/invalid(reason:)``
-/// — the engine's own `Invalid` payload, recorded by upstream `mark_invalid` when the death was
-/// OBSERVED as an event (never inferred from a chain condition alone). Chain inclusion outranks
-/// every one of these: a row the wallet's scan has observed mined reports `.mined`, never
-/// `.invalid`.
+/// Compatibility reasons for ``MigrationTransactionStatus/State/invalid(reason:)``. Upstream now
+/// stores unsatisfiability orthogonally to lifecycle state and records node rejection as testimony;
+/// the wrapper projects those details into this existing public enum.
 public enum MigrationInvalidReason: Equatable, Sendable {
-    /// A funding note this transaction spends was spent outside the migration (detected by
-    /// `reconcileMigrationInvalidations`), so the transaction can never mine.
+    /// An input was spent, or the transaction inherited unsatisfiability from a dependency.
     case fundingSpent
-    /// A node terminally rejected the broadcast as invalid (recorded from a
-    /// ``MigrationTransferResult/invalidNote`` outcome).
+    /// Another unsatisfiable cause, or a node rejection awaiting reevaluation against scanned data.
     case rejectedInvalid
-    /// A node rejected the broadcast as expired (recorded from a
-    /// ``MigrationTransferResult/expired`` outcome).
+    /// Retained for source compatibility. New expiry determinations surface as ``Blocker/expired``.
     case rejectedExpired
 }
 
@@ -257,10 +253,9 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
     /// combinations (a mined row still carrying a broadcast txid, a broadcast row with none, or
     /// an invalid row without its reason) are unrepresentable.
     ///
-    /// - Note: A MINED row's txid is NOT carried by this state model: the engine's own `Mined`
-    ///   state carries only the height, so the txid is available only while a transaction is
-    ///   in flight (`.broadcast`), not once it is mined. A caller that needs a mined
-    ///   transaction's id should look it up through transaction history instead.
+    /// - Note: This public model continues to expose only the mined height for `.mined`, even
+    ///   though the upstream lifecycle now retains the txid too. Use transaction history when the
+    ///   mined txid is needed.
     public enum State: Equatable, Sendable {
         /// Built but not yet signed.
         case awaitingSignature
@@ -273,11 +268,9 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         case broadcast(txid: Data)
         /// Mined at `height`.
         case mined(height: BlockHeight)
-        /// Dead by OBSERVED EVENT — the engine's own `Invalid` state, recorded via upstream
-        /// `mark_invalid` when a funding note was spent outside the migration
-        /// (`reconcileMigrationInvalidations`) or the network terminally rejected the broadcast
-        /// (`migrationRecordTransferResult`'s `.invalidNote`/`.expired` outcomes); `reason` says
-        /// which. Never derived from a chain condition alone, and chain inclusion OUTRANKS it: a
+        /// Dead according to the engine's satisfiability oracle after a funding input became
+        /// unavailable or the network rejected the broadcast. `reason` is the compatibility
+        /// projection of that upstream condition. Chain inclusion OUTRANKS it: a
         /// row the wallet's scan has observed mined reports `.mined`, never `.invalid` — a stale
         /// verdict cannot shadow a landed transaction. Resolved out-of-band via the
         /// ``MigrationAdvanceStep/requiresAttention(id:)`` discharge mapping (typically

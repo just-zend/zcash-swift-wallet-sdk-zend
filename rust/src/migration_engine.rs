@@ -34,8 +34,8 @@ use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_pool_migration::build::{AccountDerivation, sign_pczt};
 use zcash_pool_migration::engine::{
-    MigrationBackend, MigrationCrypto, MigrationState, MigrationTransferId, MigrationTxState,
-    PoolMigrationRead, PoolMigrationWrite,
+    MigrationBackend, MigrationCrypto, MigrationState, MigrationTransaction, MigrationTransferId,
+    MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
 use zcash_pool_migration::scheduling::SchedulingParams;
 use zcash_protocol::ShieldedPool;
@@ -219,6 +219,16 @@ impl PoolMigrationRead for Backend<'_> {
         self.store
             .get_migration()
             .map_err(|e| anyhow!("migration store read failed: {e}"))
+    }
+
+    fn check_step_satisfiability(
+        &self,
+        tx: &MigrationTransaction,
+        settle: zcash_pool_migration::satisfiability::ReorgSettleDepth,
+    ) -> Result<zcash_pool_migration::satisfiability::StepSatisfiability, Self::Error> {
+        self.store
+            .check_step_satisfiability(tx, settle)
+            .map_err(|e| anyhow!("migration satisfiability check failed: {e}"))
     }
 }
 

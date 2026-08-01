@@ -54,16 +54,15 @@ Changes are relative to `2.8.0-rc.3`.
   `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`,
   `MigrationTransactionStatus`, `DueMigrationTransfer`, `KeystoneBatchDecodeResult`, and
   `KeystoneFirmwareVersion`. Migration transaction ids are `UInt32`.
-- State: `migrationAdvanceStep(accountUUID:)` is a VERBATIM conduit of the migration engine's own
-  next-step decision, evaluated at the scanned chain tip — `nil` when no run is stored, otherwise
-  `.requiresAttention(id:)` (a transaction of the run is invalid — surfaced FIRST, ahead of any
-  actionable step; discharge via `reconcileMigrationInvalidations`, attention UX, then
-  `restartCurrentMigrationStep`), `.prove(id:kind:)`, `.broadcast(id:)`, `.rebuild(id:)`,
+- State: `migrationAdvanceStep(accountUUID:)` drives the migration engine's public
+  `advance_migration` decision at the scanned chain tip — `nil` when no run is stored, otherwise
+  `.requiresAttention(id:)` (the engine returned `Reevaluate` after a node rejection or `Replan`
+  after determining a transaction unsatisfiable), `.prove(id:kind:)`, `.broadcast(id:)`, `.rebuild(id:)`,
   `.waiting`, or the terminal `.complete` (per-run, including a cancelled run — never "nothing
   left to migrate"; ask `proposeMigrationTransfers` for that). The SDK adds no state machine, no
   ordering shims, and no carve-outs of its own on top of the engine's answer — the attention step
   and the broadcast-first ordering are native to the pinned librustzcash revision (upstream PR
-  #2873).
+  #2871).
 - Planning and delivery: a randomized-cadence schedule proposal committed by
   `signAndStoreMigrationSchedule`, proved opportunistically during sync by the new
   `finalizeReadyMigrationTransfers(accountUUID:)`, then delivered by
@@ -84,10 +83,9 @@ Changes are relative to `2.8.0-rc.3`.
   (one/two-argument convenience overloads default it to `false`) that lets the estimated tip only
   ACCELERATE scheduled-height due-ness; expiry always evaluates against the scanned tip, and an
   estimator failure silently degrades to the scanned-tip behavior. New:
-  `reconcileMigrationInvalidations(accountUUID:)` reconciles the stored run against local on-chain
-  truth (own-broadcast/mined promotion, a submit-crash probe, then the foreign-spend nullifier
-  check) and records an invalid mark when a pending transfer's funding note was spent outside the
-  migration — local-database only, safe to run in a sync session.
+  `reconcileMigrationInvalidations(accountUUID:)` retains its compatibility role, while the
+  engine's sqlite satisfiability oracle now discovers funding spends and other unsatisfiable steps
+  during `migrationAdvanceStep` from scanned wallet data.
 - Recovery: `restartCurrentMigrationStep` cancels and re-plans;
   `refreshStaleMigrationTransfers(accountUUID:usk:)` rebuilds every expired transfer of the stored
   run, all-or-nothing, with `usk` selecting in-process signing or the external-signer lane. A funding
@@ -122,11 +120,12 @@ Changes are relative to `2.8.0-rc.3`.
   `migrationProgress`'s summary — kind, lifecycle state, scheduled and expiry heights, readiness,
   next action/blocker, `dependsOn` (the ids of the same run's transactions that must mine first), and
   `anchorBoundaryHeight` (the bucketed boundary a TRANSFER's anchor was drawn against; always `nil`
-  for a preparation), keyed by a stable id. The lifecycle state includes
-  `.invalid(reason: MigrationInvalidReason)` (`fundingSpent` / `rejectedInvalid` /
-  `rejectedExpired`) with the matching `Blocker.invalid` — the engine's event-recorded death
-  states, which chain inclusion outranks (a mined row never reports invalid). A txid is available
-  only while a transaction is `broadcast`, not once mined. An empty array means no stored run, not
+  for a preparation), keyed by a stable id. For source compatibility, the wrapper projects the
+  engine's orthogonal unsatisfiability mark and open broadcast-failure report onto
+  `.invalid(reason:)` with `Blocker.invalid`: input-spend/inherited marks become `.fundingSpent`,
+  other unsatisfiable causes and an awaiting reevaluation become `.rejectedInvalid`.
+  `.rejectedExpired` remains source-compatible but new expiry decisions use `Blocker.expired`.
+  Chain inclusion outranks both reports and marks. An empty array means no stored run, not
   an error. New:
   `Array<MigrationTransactionStatus>.isPreparationPhaseComplete` — `true` iff every preparation-kind
   row is mined (vacuously `true` when the run needs no preparations).

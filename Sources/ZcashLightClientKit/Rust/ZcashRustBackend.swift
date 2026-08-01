@@ -1439,6 +1439,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep? {
+        try await migrationAdvanceStep(for: account, estimatedTip: nil)
+    }
+
+    @DBActor
+    func migrationAdvanceStep(
+        for account: AccountUUID,
+        estimatedTip: BlockHeight?
+    ) async throws -> MigrationAdvanceStep? {
         // Clear any stale, unconsumed last-error before this sentinel read (see
         // `migrationIsNoteSplitNeeded` below): a NULL return overloads "no stored run" and
         // "error", and only a recorded last-error distinguishes the two.
@@ -1448,7 +1456,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             dbData.0,
             dbData.1,
             account.id,
-            networkType.networkId
+            networkType.networkId,
+            estimatedTip.map(Int64.init) ?? -1
         )
 
         // NULL with no recorded error is the benign "no migration run is stored" answer (the

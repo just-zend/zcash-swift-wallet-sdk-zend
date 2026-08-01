@@ -163,7 +163,9 @@ where
         }
     };
     match result {
-        Ok(()) => Ok(Some(())),
+        Ok(engine::ProveOutcome::Proved) => Ok(Some(())),
+        Ok(engine::ProveOutcome::NotYetProvable) => Ok(None),
+        Ok(engine::ProveOutcome::MarkedUnsatisfiable { .. }) => Ok(None),
         Err(engine::ProveError::Prover(e)) if e.is_transient() => {
             // The deferral is ordinary (the sweep retries later), but never silent (A6): a row
             // that defers on every sweep would otherwise present as a wallet that simply never

@@ -5,10 +5,10 @@
 The public 5-state `MigrationState` enum, `MigrationAttentionReason`, and
 `migrationState(accountUUID:)` are removed (this was never in a released SDK, so there is no
 deprecation period). The SDK no longer derives a state machine of its own on top of the engine at
-all: `migrationAdvanceStep(accountUUID:) async throws -> MigrationAdvanceStep?` is a VERBATIM
-conduit of the upstream engine's own `next_step` decision — no ordering shims and no carve-outs;
-the attention step, the broadcast-first ordering, and the prove step's kind are all native to the
-pinned librustzcash revision (upstream PR #2873) — evaluated at the SCANNED chain tip only.
+all: `migrationAdvanceStep(accountUUID:) async throws -> MigrationAdvanceStep?` drives the
+upstream engine's public `advance_migration` API. The broadcast-first ordering and prove step's
+kind are native to the pinned librustzcash revision (upstream PR #2871); its `Reevaluate` and
+`Replan` results project onto the existing `.requiresAttention(id:)` case.
 `nil` means no run is stored at all (nothing was ever committed for the account); a stored run
 answers `.requiresAttention(id:)`, `.prove(id:kind:)`, `.broadcast(id:)`, `.rebuild(id:)`,
 `.waiting`, or the terminal `.complete` — priority order attend > broadcast > prove > rebuild, and

@@ -415,17 +415,23 @@ protocol ZcashRustBackendWelding {
 
     // MARK: - Ironwood migration
 
-    /// The engine's next step to advance `account`'s stored migration run — a VERBATIM conduit of
-    /// the upstream engine's `MigrationState::next_step` (no ordering shims, no carve-outs: the
-    /// engine's own answer — ``MigrationAdvanceStep/requiresAttention(id:)`` ahead of everything,
-    /// then broadcast, then prove carrying its kind, then rebuild — marshaled field-for-field),
-    /// evaluated at the SCANNED tip (the estimated tip never enters this decision), with mined
+    /// The engine's next step to advance `account`'s stored migration run. This compatibility
+    /// overload drives at the scanned target; migration hosts use the estimate-aware overload.
+    /// Upstream `Reevaluate` and `Replan` project to ``MigrationAdvanceStep/requiresAttention(id:)``.
+    /// Mined
     /// transactions reconciled first like every other read. `nil` means NO run is stored at all
     /// (nothing to advance); a stored TERMINAL run — complete or cancelled — reports
     /// ``MigrationAdvanceStep/complete`` verbatim and is never driven further. See
     /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping.
     /// - Throws: `rustMigrationAdvanceStep` if the rust layer returns an error.
     func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep?
+
+    /// Estimate-aware drive entry point. `estimatedTip` is the wall-clock chain-tip estimate;
+    /// destructive judgments remain anchored to the wallet's fully-scanned height upstream.
+    func migrationAdvanceStep(
+        for account: AccountUUID,
+        estimatedTip: BlockHeight?
+    ) async throws -> MigrationAdvanceStep?
 
     /// Live migration progress, or `nil` when no snapshot is reportable: present only while an
     /// engine run is ACTIVE (not terminal) or a recorded immediate sweep is pending (unmined and
@@ -517,7 +523,7 @@ protocol ZcashRustBackendWelding {
 
     /// Whether `account`'s stored, NON-TERMINAL run has a broadcast the platform could serve
     /// RIGHT NOW: a PROVED, schedule-due, dependency-mined, unexpired, valid transaction per the
-    /// upstream engine's own `next_broadcastable_at` — the sync-gate's work-pending predicate
+    /// upstream engine's transaction-status evaluation — the sync-gate's work-pending predicate
     /// (`true` means exactly "broadcast instead of syncing", ZIP 318's broadcast-or-sync session
     /// split). `Signed` rows — even due ones — and rows awaiting a proof or an external
     /// signature never count (they need MORE syncing or other work, not a broadcast session),
@@ -854,4 +860,13 @@ protocol ZcashRustBackendWelding {
         pczts: [MigrationUnsignedTransferPczt],
         batchSignResponse: Data
     ) async throws -> [MigrationSignedTransferPczt]
+}
+
+extension ZcashRustBackendWelding {
+    func migrationAdvanceStep(
+        for account: AccountUUID,
+        estimatedTip: BlockHeight?
+    ) async throws -> MigrationAdvanceStep? {
+        try await migrationAdvanceStep(for: account)
+    }
 }

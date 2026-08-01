@@ -28,11 +28,10 @@ use zcash_client_sqlite::wallet::init::WalletMigrationError;
 /// `AddInvalidTransferMarksTable` (id `0e1fd980-5cad-41c5-a6db-183dab527dcc` — reserved
 /// forever, never reuse it) created `ext_zcashlc_orchard_ironwood_migration_invalid_marks`,
 /// the side table that recorded terminal pool-migration rejection classifications back when
-/// the engine had no failure states. The engine now records that evidence itself
-/// (`MigrationTxState::Invalid` via `MigrationState::mark_invalid`), so the migration is no
-/// longer registered: fresh wallets never create the table, and
-/// `crate::migration::migrate_legacy_invalid_marks` folds any surviving rows into the
-/// engine state on open and drops it. Removing (rather than keeping) the registration is
+/// the engine had no failure states. The engine now records rejection testimony and adjudicates
+/// it through the sqlite satisfiability oracle, so the migration is no longer registered: fresh
+/// wallets never create the table, and `crate::migration::migrate_legacy_invalid_marks` replays
+/// surviving rejection rows as reports before dropping it. Removing the registration is
 /// safe because `schemerz`'s `Migrator::up` walks REGISTERED migrations only and checks
 /// each against the applied set — a recorded id it no longer knows is simply never
 /// consulted, so wallets that already ran the migration keep its inert row in the

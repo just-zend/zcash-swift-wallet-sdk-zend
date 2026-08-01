@@ -15,11 +15,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure through the thread-local last-error channel with `NULL` / `false` / `-1` sentinels. Two
   stable message prefixes name the actionable conditions: `MIGRATION_PLAN_STALE` and
   `MIGRATION_PROVING_UNAVAILABLE`.
-  - State: `zcashlc_migration_advance_step` (a verbatim marshal of the upstream engine's own
-    `MigrationState::next_step` — `FfiMigrationAdvanceStep`, freed by
+  - State: `zcashlc_migration_advance_step` (drives upstream `advance_migration` and marshals its
+    decision into `FfiMigrationAdvanceStep`, freed by
     `zcashlc_free_migration_advance_step`; `NULL` with no last error means no run is stored; the
-    step discriminants are exported as `ZCASHLC_ADVANCE_STEP_*` constants, including `_ATTEND` for
-    a run holding an invalid transaction, surfaced ahead of all actionable work), `_progress`,
+    step discriminants are exported as `ZCASHLC_ADVANCE_STEP_*` constants; upstream `Reevaluate`
+    and `Replan` map to the compatibility `_ATTEND` case), `_progress`,
     `_is_note_split_needed`, `_has_overdue_transfers`, `_has_invalid_transfers` (true iff the
     NON-terminal stored run holds an engine-`Invalid` or expired-unmined transaction; a cancelled
     run answers `false`), `_has_ready_broadcast` (the sync-gate's work-pending predicate:
@@ -57,9 +57,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Delivery: `zcashlc_migration_next_due_transfer` never proves, and its
     `FfiPreparedTransfer.status` separates `MigrationNothingDue` from `MigrationAwaitingProof` and
     `MigrationReady`; then `_extract_broadcast_tx`, `_record_transfer_result` (whose terminal
-    tags — 2 invalid, 3 expired — record the engine's own `MigrationTxState::Invalid` with the
-    matching `rejected_invalid`/`rejected_expired` reason, under `mark_invalid`'s rules: an
-    already-mined transaction is left alone, chain inclusion outranking a stale verdict), and
+    tags — 2 invalid, 3 expired — record `report_broadcast_failure` testimony stamped at the
+    observed wallet tip; the next drive call adjudicates it through sqlite's satisfiability
+    oracle, while unknown and already-mined rows remain no-ops), and
     `_record_immediate_run`, which records a send-max sweep built outside the engine.
   - Recovery: `zcashlc_migration_restart_step`, and `_refresh_stale_transfers`, which rebuilds every
     expired transfer of the stored run and returns the full stored schedule, persisting
@@ -79,8 +79,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     transaction — stable id, kind, lifecycle state, scheduled/expiry/mined heights, the broadcast
     txid while in mempool, readiness, next action, blocking reason, the `depends_on` heap array of
     ids that must mine first, `anchor_boundary` (the bucketed boundary a TRANSFER's anchor was
-    drawn against; `-1` always for a preparation), and a trailing `invalid_reason` (`-1` unless the
-    lifecycle state is Invalid — state `5`, blocker `6`) — freed by
+    drawn against; `-1` always for a preparation), and a trailing compatibility `invalid_reason`.
+    Upstream unsatisfiability marks and open broadcast-failure reports project to state `5` /
+    blocker `6` without changing the Swift ABI — freed by
     `zcashlc_free_migration_transaction_statuses`. No stored run yields an empty container.
   - `FfiMigrationSchedule` gains a trailing `preparations`/`preparations_len` heap array of
     `FfiMigrationPreparationStep` (id, layer, index, broadcast height, and the whole preceding
@@ -137,18 +138,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The migration store connection uses the same 15 s `busy_timeout` as the wallet handle, so a
   `zcashlc_migration_*` call racing an engine write waits for the lock instead of surfacing
   `database is locked` early.
-- Terminal rejection classifications live in the engine state
-  (`MigrationTxState::Invalid { reason }` via the upstream `MigrationState::mark_invalid`), not in
-  an SDK side table: the drive loop (`Attend`), the wake-up schedule and every delivery query now
-  account for a dead transaction automatically, and cancelling the run is what clears the
-  attention (a terminal run surfaces neither `Attend` nor `_has_invalid_transfers`). The
+- Terminal rejection evidence is reported to the upstream engine, whose satisfiability oracle
+  returns `Reevaluate` or `Replan`; the FFI projects those onto its existing `Attend` case. The
   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table is retired: its schema
-  migration is no longer registered, any surviving rows are folded into the engine state once, on
-  the first migration call (legacy reasons map `invalid_note` → rejected_invalid, `expired` →
-  rejected_expired, `foreign_spent` → funding_spent), and the table is dropped.
-- The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`,
-  `next_provable_at` / `next_broadcastable_at`) instead of hand-rolled SDK twins of the upstream
-  predicates; behaviour additionally gains upstream's doomed-broadcast withhold (above).
+  migration is no longer registered. On the first migration call, surviving rejection rows are
+  replayed at the current scanned height, funding-spent rows are left for the oracle to rediscover,
+  and the table is dropped.
+- The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
+  hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
+  doomed-broadcast withhold (above).
 
 ### Fixed
 - The migration prover's transient-vs-hard error classification (`ProveErrorClass::is_transient`,
