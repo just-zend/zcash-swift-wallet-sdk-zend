@@ -1222,9 +1222,6 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).finalizeReadyTransfers()
     }
 
-    public func reconcileUnrecordedMigrationBroadcasts(accountUUID: AccountUUID) async throws -> Bool {
-        try await migrationHost.migration(for: accountUUID).reconcileUnrecordedBroadcasts()
-    }
 
     public func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
         try await migrationHost.migration(for: accountUUID).syncWakeups()

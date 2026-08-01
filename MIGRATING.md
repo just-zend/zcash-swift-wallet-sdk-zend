@@ -42,9 +42,8 @@ Discharging each step:
   adjudicates against the newly scanned data and re-offers the work where the obstruction was
   transient. Only if attention persists, surface the attention UX over the invalid
   `migrationTransactionStatuses(accountUUID:)` row(s) and then `restartCurrentMigrationStep(accountUUID:)`
-  (cancel and re-plan). `reconcileUnrecordedMigrationBroadcasts(accountUUID:)` is NOT part of this
-  discharge — it records no marks; see its own entry below. Invalid rows are excluded from
-  delivery and from the sync gate — a dead transfer is never served and gates nothing.
+  (cancel and re-plan). Invalid rows are excluded from delivery and from the sync gate — a dead
+  transfer is never served and gates nothing.
 - `.broadcast(id:)` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)` —
   submit and end the session (a broadcast session must not sync).
 - `.prove(id:kind:)` with a `.transfer(crossing:)` kind → `finalizeReadyMigrationTransfers(accountUUID:)`
@@ -133,7 +132,7 @@ instead.
 
 ### New members
 
-`finalizeReadyMigrationTransfers(accountUUID:)`, `reconcileUnrecordedMigrationBroadcasts(accountUUID:)`,
+`finalizeReadyMigrationTransfers(accountUUID:)`,
 `migrationSyncWakeups(accountUUID:)`, `estimatedMigrationChainTip()`,
 `estimatedMigrationSecondsPerBlock()`,
 `batchMigrationPcztsForSigning(_:maxActionsPerSession:)`, and `hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)`
@@ -144,14 +143,14 @@ every account (an earlier unreleased iteration carried an unused `accountUUID:`;
 See each member's doc comment for its full contract; the estimated-tip and privacy-buffer notes
 below cover the cross-cutting parts.
 
-`reconcileUnrecordedMigrationBroadcasts(accountUUID:)` needs one note of its own, because it is
-narrower than a repair entry point sounds. It repairs exactly one thing: a transaction this process
-submitted to a node, which mined, but whose broadcast was never recorded (a crash, or a failed
-persist, between submitting and recording). It returns whether it repaired a row, records no
-invalid marks, and is not part of the `.requiresAttention(id:)` discharge. Every other repair is
-the engine's — a funding note spent outside the migration is discovered by the satisfiability
-oracle from scanned wallet data, and a recorded broadcast is promoted to mined on every
-`migrationAdvanceStep`.
+There is no repair entry point at all, and nothing to call to get one. Every repair the SDK once
+exposed is now the engine's, performed on every `migrationAdvanceStep(accountUUID:)`: a funding
+note spent outside the migration is discovered by the satisfiability oracle from scanned wallet
+data; a recorded broadcast is promoted to mined; and a transaction this process submitted whose
+broadcast was never recorded — a crash, or a failed persist, between submitting and recording — is
+recognized by the id the engine derived when it BUILT it, and promoted just the same. An earlier
+unreleased iteration exposed that last one as `reconcileUnrecordedMigrationBroadcasts(accountUUID:)`
+(and before that, `reconcileMigrationInvalidations(accountUUID:)`); delete the call.
 
 ### `useEstimatedTip` parameters
 
@@ -178,9 +177,8 @@ reasons:
    resolves for its own network; the network-less protocol-extension default keeps forwarding the
    mainnet constant.
 2. **In-flight broadcast marker** — a 120 s self-expiring marker blocks sync from just before a
-   migration submit hits the network until its outcome is recorded, so the
-   unrecorded-broadcast repair (`reconcileUnrecordedMigrationBroadcasts`) never treats a
-   just-broadcast transfer as a submit crash. The marker is (re-)armed at the last pre-submit
+   migration submit hits the network until its outcome is recorded, so the engine's in-flight
+   sweep never meets a transfer that is neither recorded broadcast nor yet visible on chain. The marker is (re-)armed at the last pre-submit
    instant — after the Tor bootstrap — so a slow bootstrap does not burn its window, and a marker
    observed implausibly far in the future (a backwards clock step) is clamped/ignored rather than
    wedging sync.

@@ -22,11 +22,10 @@
 //!   remains (an empty schedule means no).
 //! - Mined-ness is DERIVED, never reported: this layer never marks a transaction mined. The
 //!   engine promotes every in-flight transaction its scan has seen mine, inside
-//!   `advance_migration`; the read-only entry points ask the same question through
-//!   [`reconcile_mined`] so a standalone read is not answered from a state the scan has moved
-//!   past. The one gap the engine cannot see — a broadcast THIS process made but failed to
-//!   record — is [`reconcile_unrecorded_broadcasts`], and closing it upstream is
-//!   zcash/librustzcash#2884.
+//!   `advance_migration` — including one whose broadcast THIS process failed to record, which it
+//!   identifies by the id stored on the row. The read-only entry points ask the same question
+//!   through [`reconcile_mined`], so a standalone read is not answered from a state the scan has
+//!   already moved past.
 //! - Node rejection is recorded as testimony via `report_broadcast_failure`; the sqlite-backed
 //!   satisfiability oracle adjudicates it after sufficient scanning and independently discovers
 //!   scan-visible spends. The SDK makes no invalidity determination of its own: it has no way to
@@ -521,7 +520,7 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
     let mut changed = false;
     for (id, txid) in broadcast {
         if let Some(height) = backend.mined_height(txid)? {
-            state.mark_mined(id, txid, height);
+            state.mark_mined(id, height);
             changed = true;
         }
     }
@@ -529,84 +528,6 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
         backend.replace_migration(&state)?;
     }
     Ok(Some(state))
-}
-
-// ----- unrecorded-broadcast repair -----
-
-/// The PCZT-derived transaction id of one stored migration transaction, or `None` when the bytes
-/// do not parse or the transaction is not extractable yet.
-///
-/// A signature commits to the txid, so it is fixed from signing time and the deferred anchor and
-/// witnesses (ZIP 374) do not disturb it — but `extract_tx` needs a COMPLETE transaction, so this
-/// answers only once proving has installed them. That is exactly the set the one caller cares
-/// about ([`reconcile_unrecorded_broadcasts`], over `Proved` rows): a transaction that was never
-/// proved cannot have been broadcast, so it cannot be the one on chain.
-fn pczt_txid(bytes: &[u8]) -> Option<TxId> {
-    let parsed = pczt::Pczt::parse(bytes).ok()?;
-    migration_finalize::extract_tx(parsed)
-        .ok()
-        .map(|(_, txid)| TxId::from_bytes(txid))
-}
-
-/// Repairs the stored run against LOCAL on-chain truth (R10: the wallet database only, never the
-/// network) in the one case the engine cannot see for itself: a transaction THIS process submitted
-/// to a node and that mined, but whose `mark_broadcast` never reached the store — a crash, or a
-/// failed persist, between the submission and the record. The engine's own promotion sweep keys on
-/// the recorded txid, so such a row sits at `Proved` with its transaction already on chain, and
-/// nothing else would ever promote it.
-///
-/// Returns whether this call repaired anything.
-///
-/// Everything else this used to do now belongs to the engine. Mined promotion of a RECORDED
-/// broadcast is [`reconcile_mined`] (and, on the drive path, `advance_migration`'s own sweep);
-/// a funding note spent outside the migration is discovered by the store's satisfiability oracle
-/// from scanned wallet data, with correct evidence stamping, which the SDK could not do — it had
-/// no way to date its verdict against the scanned region, so a reorg could not withdraw it.
-///
-/// The probe is deliberately NOT folded into [`reconcile_mined`]: it costs one PCZT parse per
-/// `Proved` row, which is affordable at an explicit repair point and not on every status read.
-/// Closing this window upstream — by deriving the txid from the stored PCZT inside the engine's
-/// own sweep — is zcash/librustzcash#2884; this function goes when that lands.
-fn reconcile_unrecorded_broadcasts(ctx: &mut CallCtx) -> anyhow::Result<bool> {
-    // Load with recorded broadcasts already promoted, so a row this probe would otherwise
-    // re-examine is out of `Proved` before it starts.
-    let Some(mut state) = reconcile_mined(ctx)? else {
-        return Ok(false);
-    };
-    // Terminal (Complete, or Failed/cancelled): never driven again, so nothing to repair.
-    if state.is_terminal() {
-        return Ok(false);
-    }
-
-    let mut promotions: Vec<(MigrationTransferId, TxId, BlockHeight)> = Vec::new();
-    {
-        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        for tx in state.transactions() {
-            if !matches!(tx.state(), MigrationTxState::Proved) {
-                continue;
-            }
-            // A `Proved` row is extractable by construction, so a `None` here is a corrupt or
-            // unreadable PCZT: skipped, never treated as evidence either way.
-            let Some(txid) = pczt_txid(tx.pczt()) else {
-                continue;
-            };
-            if let Some(height) = backend.mined_height(txid)? {
-                promotions.push((tx.id(), txid, height));
-            }
-        }
-    }
-    if promotions.is_empty() {
-        return Ok(false);
-    }
-    for (id, txid, height) in &promotions {
-        // Through `Broadcast` first: that is the state the lost record would have written, and
-        // `mark_mined` reads the txid from its own argument rather than from the row.
-        state.mark_broadcast(*id, *txid);
-        state.mark_mined(*id, *txid, *height);
-    }
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-    backend.replace_migration(&state)?;
-    Ok(true)
 }
 
 /// Computes a fresh preview plan against the account's live balance and caches it under a fresh
@@ -3416,7 +3337,20 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
                 let mut state = backend
                     .get_migration()?
                     .ok_or_else(|| anyhow!("no migration is stored"))?;
-                state.mark_broadcast(id, TxId::from_bytes(txid));
+                // The engine records the broadcast under the id it derived when it BUILT the
+                // transaction, so the reported one is no longer an input. It is still checked:
+                // the two can only differ if the platform submitted something other than the
+                // artifact the engine handed it, which is worth naming rather than silently
+                // recording a broadcast of a transaction that was never sent.
+                if let Some(stored) = state.transactions().iter().find(|t| t.id() == id)
+                    && <[u8; 32]>::from(stored.txid()) != txid
+                {
+                    return Err(anyhow!(
+                        "the reported broadcast txid does not match transfer {}'s own transaction",
+                        u32::from(id)
+                    ));
+                }
+                state.mark_broadcast(id);
                 backend.replace_migration(&state)?;
                 Ok(true)
             }
@@ -3442,37 +3376,6 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
         }
     });
     unwrap_exc_or(res, false)
-}
-
-/// Repairs the stored run where THIS process broadcast a transaction that mined but never
-/// recorded the broadcast (a crash, or a failed persist, between submitting and recording) — see
-/// [`reconcile_unrecorded_broadcasts`]. Touches only the local wallet database, never the network
-/// (R10); any in-flight-broadcast guard (the 120 s window during which a just-broadcast transfer
-/// must not be probed) is the platform's job, not this function's.
-///
-/// This no longer looks for spent funding notes: the engine's satisfiability oracle discovers
-/// those from scanned wallet data, with the evidence height a reorg can withdraw — which an SDK
-/// verdict never carried. Nor does it promote a RECORDED broadcast, which the engine's own sweep
-/// does on every advance.
-///
-/// Returns `1` when this call repaired a row, `0` when it found nothing to repair (no stored run,
-/// a terminal run, or no `Proved` row whose transaction is already on chain), `-1` on error (see
-/// `zcashlc_last_error_message`).
-///
-/// # Safety
-/// See [`open`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_reconcile_unrecorded_broadcasts(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-) -> i32 {
-    let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        Ok(i32::from(reconcile_unrecorded_broadcasts(&mut ctx)?))
-    });
-    unwrap_exc_or(res, -1)
 }
 
 /// Records a broadcast immediate-migration sweep (an ordinary send-max transaction proposed via
@@ -4320,6 +4223,13 @@ mod tests {
             scheduled_height,
             expiry_height,
             anchor_boundary,
+            // The row's own id. Where the lifecycle state carries a copy, that IS this value: the
+            // engine writes one id per transaction, so a fixture stating two different ones would
+            // describe a row no store can represent.
+            match state {
+                MigrationTxState::Broadcast { txid } | MigrationTxState::Mined { txid, .. } => txid,
+                _ => TxId::from_bytes([u32::from(id) as u8; 32]),
+            },
             state,
             lock_owner,
             None,
@@ -9361,115 +9271,6 @@ mod tests {
             "under the estimate the due-but-unproved row must report AwaitingProof"
         );
         assert_eq!(id, 0, "the awaiting row must be named");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // ----- unrecorded-broadcast repair (`zcashlc_migration_reconcile_unrecorded_broadcasts`) -----
-
-    fn reconcile_unrecorded_broadcasts_ffi(path_bytes: &[u8], account: &[u8; 16]) -> i32 {
-        unsafe {
-            zcashlc_migration_reconcile_unrecorded_broadcasts(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
-            )
-        }
-    }
-
-    /// Nothing stored at all: `0`, before any chain-tip lookup.
-    #[test]
-    fn reconcile_unrecorded_broadcasts_fresh_db_is_zero() {
-        let path = init_fixture_db("zcashlc_reconcile_unrecorded_fresh");
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let account = create_fixture_account(&path);
-        assert_eq!(reconcile_unrecorded_broadcasts_ffi(path_bytes, &account), 0);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A terminal (cancelled) run is never driven again, so there is nothing to repair: `0`.
-    #[test]
-    fn reconcile_unrecorded_broadcasts_terminal_run_is_zero() {
-        let path = init_fixture_db("zcashlc_reconcile_unrecorded_terminal");
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let account = create_fixture_account(&path);
-        set_fixture_tip(path_bytes);
-        let state = test_state(
-            MigrationStatus::Failed,
-            &[],
-            &[MigrationTxState::Proved],
-            3_499_000,
-            4_000_000,
-        );
-        store_fixture_state(&path, &account, &state);
-        assert_eq!(reconcile_unrecorded_broadcasts_ffi(path_bytes, &account), 0);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A `Proved` row whose stored PCZT is not extractable is SKIPPED, not an error: the probe
-    /// has no txid to ask about, and a row it cannot identify is never evidence either way.
-    ///
-    /// The fixture transfer PCZT is signed but not proven, so `extract_tx` — which needs a
-    /// complete transaction — declines it. That mismatch (a row recorded `Proved` whose bytes are
-    /// not) is exactly the corrupt-store shape the skip exists for, so the test asserts the
-    /// premise rather than resting on it.
-    #[test]
-    fn reconcile_unrecorded_broadcasts_skips_an_unextractable_proved_row() {
-        let path = init_fixture_db("zcashlc_reconcile_unrecorded_pending");
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let account = create_fixture_account(&path);
-        set_fixture_tip(path_bytes);
-        let base = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Proved, MigrationTxState::Proved],
-            3_499_000,
-            4_000_000,
-        );
-        let pczt_bytes = fixture_transfer_pczt_bytes(3_500_000, 3_500_040);
-        assert!(
-            pczt_txid(&pczt_bytes).is_none(),
-            "premise: the fixture transfer is signed but not proven, so it yields no txid",
-        );
-        let transactions: Vec<MigrationTransaction> = base
-            .transactions()
-            .iter()
-            .map(|t| {
-                test_transaction_from_parts(
-                    t.id(),
-                    t.kind(),
-                    pczt_bytes.clone(),
-                    t.depends_on().clone(),
-                    t.scheduled_height(),
-                    t.expiry_height(),
-                    t.anchor_boundary(),
-                    t.state(),
-                    t.lock_owner(),
-                )
-            })
-            .collect();
-        let state = test_state_from_parts(
-            base.status(),
-            base.denominations().clone(),
-            base.preparation().clone(),
-            transactions,
-            base.anchor_bucket_interval(),
-        );
-        store_fixture_state(&path, &account, &state);
-
-        assert_eq!(
-            reconcile_unrecorded_broadcasts_ffi(path_bytes, &account),
-            0,
-            "a row the probe cannot identify is skipped, not repaired and not an error"
-        );
-        let stored = read_fixture_state(&path, &account);
-        assert!(
-            stored
-                .transactions()
-                .iter()
-                .all(|t| matches!(t.state(), MigrationTxState::Proved)),
-            "every row must be left exactly as stored"
-        );
         let _ = std::fs::remove_file(&path);
     }
 

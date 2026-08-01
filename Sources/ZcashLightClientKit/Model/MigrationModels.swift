@@ -35,9 +35,6 @@ import Foundation
 ///   out-of-band resolution — surface the attention UX over the
 ///   ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
 ///   `restartCurrentMigrationStep(accountUUID:)` to cancel and re-plan.
-///   `reconcileUnrecordedMigrationBroadcasts(accountUUID:)` is NOT part of this discharge: it no
-///   longer records marks (the engine's oracle does, from scanned data) and only repairs a
-///   broadcast this process failed to record.
 /// - ``broadcast(id:)`` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`:
 ///   submit the served transaction and end the session — a broadcast session must not sync.
 /// - ``prove(id:kind:)`` with a ``MigrationTransactionStatus/Kind/transfer(crossing:)`` kind →
@@ -78,7 +75,7 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     /// more sync (`Reevaluate`) or was determined unsatisfiable and requires a new plan (`Replan`).
     /// Discharge: sync and call `migrationAdvanceStep` again for reevaluation; if attention
     /// remains, show the status and use `restartCurrentMigrationStep` (see the type doc's
-    /// mapping). `reconcileUnrecordedMigrationBroadcasts(accountUUID:)` is not part of it.
+    /// mapping).
     case requiresAttention(id: UInt32)
 }
 

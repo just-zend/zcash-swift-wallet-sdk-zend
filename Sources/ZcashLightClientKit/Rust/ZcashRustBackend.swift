@@ -1547,25 +1547,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return samples
     }
 
-    @DBActor
-    func migrationReconcileUnrecordedBroadcasts(for account: AccountUUID) async throws -> Bool {
-        let outcome = zcashlc_migration_reconcile_unrecorded_broadcasts(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId
-        )
-
-        // `-1` means only "error" (`0` = nothing repaired / `1` = a row repaired are the two
-        // legitimate outcomes).
-        guard outcome >= 0 else {
-            throw ZcashError.rustMigrationReconcileUnrecordedBroadcasts(
-                lastErrorMessage(fallback: "`migrationReconcileUnrecordedBroadcasts` failed with unknown error")
-            )
-        }
-
-        return outcome == 1
-    }
 
     // DB-free: a pure split over the caller's action weights (mirrors the Keystone UR bridge
     // below), so unlike the wallet-db migration methods this is not `@DBActor`.

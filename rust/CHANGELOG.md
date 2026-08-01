@@ -37,13 +37,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     most-recently-scanned `(height, header time)` rows, ascending, the raw input a wall-clock
     chain-tip estimator projects from (a missing wallet-database file, like a missing `blocks`
     table, is the benign empty answer, and a coerced read failure is logged rather than silent);
-    and `_reconcile_unrecorded_broadcasts` (returns `bool`, `-1` on error) repairs the one case
-    the engine cannot see for itself — a transaction this process submitted that mined, but whose
-    broadcast was never recorded (a crash, or a failed persist, between submitting and recording),
-    leaving a proved row whose transaction is already on chain — and reports whether it repaired
-    anything. It records no invalid marks: a funding note spent outside the migration is
-    discovered by the engine's satisfiability oracle from scanned wallet data, and promoting a
-    RECORDED broadcast is the engine's own sweep. All three are read-only/local-database-only.
+    both read-only/local-database-only. There is no repair entry point: every repair is the
+    engine's, performed inside `advance_migration` — a funding note spent outside the migration is
+    discovered by the satisfiability oracle from scanned wallet data, a recorded broadcast is
+    promoted to mined, and a transaction this process submitted whose broadcast was never recorded
+    (a crash, or a failed persist, between submitting and recording) is recognized by the id the
+    engine derived when it BUILT it and promoted just the same.
   - Batching: `zcashlc_migration_batch_pczts_by_actions` (pure, no wallet database) splits an
     ORDERED array of transaction action-weights (16 per preparation, 3 per transfer) into signer
     sessions bounded by a caller-supplied action budget, returning `FfiMigrationBatchSizes` (freed by
@@ -136,6 +135,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Note locks are owner-keyed: the residual lock is keyed to a deterministic per-account owner, which
   makes re-locking idempotent, and `zcashlc_migration_unlock_residual` still clears the account's
   locks wholesale.
+- `zcashlc_migration_record_transfer_result`'s success tag no longer records the reported txid: the
+  engine marks the broadcast under the id it derived when it built the transaction. The reported
+  value is now CHECKED against that id, and a mismatch is an error — the two can differ only if the
+  platform submitted something other than the artifact the engine handed it, which is worth naming
+  rather than silently recording a broadcast of a transaction that was never sent.
 - The migration store connection uses the same 15 s `busy_timeout` as the wallet handle, so a
   `zcashlc_migration_*` call racing an engine write waits for the lock instead of surfacing
   `database is locked` early.

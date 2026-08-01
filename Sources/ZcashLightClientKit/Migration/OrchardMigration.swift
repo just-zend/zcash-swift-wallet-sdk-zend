@@ -305,25 +305,6 @@ actor OrchardMigration {
         try await welding.migrationSyncWakeups(for: accountUUID)
     }
 
-    /// Repairs the committed run where this process submitted a transaction that mined but never
-    /// recorded the broadcast; returns whether this call repaired a row. Local-database only —
-    /// never touches the network — so it is safe in a sync session; the 120-second
-    /// in-flight-broadcast guard (during which a just-broadcast transfer must not be probed) is
-    /// primarily enforced by the sync gate the broadcast path arms, and — as optional hardening —
-    /// honored here directly too: while the persisted in-flight marker is live this call no-ops
-    /// (returns `false` without touching the engine), so a caller that bypasses the gate cannot
-    /// drive the probe into the submit-to-record window either. That guard is exactly why the
-    /// repair cannot simply run on every read: inside the submit-to-record window, the row it
-    /// would "repair" is one whose broadcast is still being recorded.
-    func reconcileUnrecordedBroadcasts() async throws -> Bool {
-        // Optional hardening (belt to the sync gate's suspenders): the probe's own crash
-        // heuristics are the primary defense, but there is no reason to let it observe a
-        // just-broadcast transfer at all while the submit-to-record window is provably open.
-        if syncGate.isBroadcastInFlight() {
-            return false
-        }
-        return try await welding.migrationReconcileUnrecordedBroadcasts(for: accountUUID)
-    }
 
     /// Proves every migration transaction whose anchor the wallet can resolve right now and
     /// returns how many were proved (`0` is the ordinary "nothing left to prove" answer). Run it

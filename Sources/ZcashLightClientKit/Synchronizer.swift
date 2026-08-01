@@ -671,27 +671,6 @@ public protocol Synchronizer: AnyObject {
     ///   non-transient reason.
     func finalizeReadyMigrationTransfers(accountUUID: AccountUUID) async throws -> Int
 
-    /// Repairs `accountUUID`'s committed run in the one case the engine cannot see for itself: a
-    /// transaction THIS process submitted to a node, which mined, but whose broadcast was never
-    /// recorded — a crash, or a failed persist, between submitting and recording. Returns whether
-    /// this call repaired a row (`false` also covers "no stored run" / "terminal run"). Touches
-    /// only the local wallet database, never the network — run it after a sync catches the wallet
-    /// up, before deciding what to do next. The 120-second in-flight-broadcast guard (a
-    /// just-broadcast transfer must not be probed) is enforced by the migration sync gate the
-    /// broadcast path arms, so honoring ``isMigrationSyncBlocked()`` before syncing keeps this
-    /// probe safe.
-    ///
-    /// It no longer looks for spent funding notes, and no longer records invalid marks. The
-    /// engine's satisfiability oracle discovers a funding note spent outside the migration from
-    /// scanned wallet data, stamped with the evidence height a reorg can withdraw — which an
-    /// SDK-side verdict never carried — and surfaces it through
-    /// ``migrationAdvanceStep(accountUUID:)``. Promoting a RECORDED broadcast to mined is
-    /// likewise the engine's, on every advance.
-    ///
-    /// - Note: See ``MigrationAdvanceStep/requiresAttention(id:)`` for the attention discharge,
-    ///   which this method is no longer part of.
-    /// - Parameter accountUUID: the account to repair.
-    func reconcileUnrecordedMigrationBroadcasts(accountUUID: AccountUUID) async throws -> Bool
 
     /// The stored run's minimal sync/proving wake-up schedule for `accountUUID`, as of the
     /// SCANNED chain tip: each row is a height at which to wake, sync, and run
@@ -1327,9 +1306,6 @@ public extension Synchronizer {
         throw MigrationUnimplemented(member: #function)
     }
 
-    func reconcileUnrecordedMigrationBroadcasts(accountUUID: AccountUUID) async throws -> Bool {
-        throw MigrationUnimplemented(member: #function)
-    }
 
     func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
         throw MigrationUnimplemented(member: #function)

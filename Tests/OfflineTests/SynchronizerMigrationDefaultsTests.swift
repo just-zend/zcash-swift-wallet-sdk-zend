@@ -46,12 +46,6 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.finalizeReadyMigrationTransfers(accountUUID: self.accountUUID) }
     }
 
-    func testReconcileUnrecordedMigrationBroadcastsDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.reconcileUnrecordedMigrationBroadcasts(accountUUID: self.accountUUID)
-        }
-    }
-
     func testMigrationSyncWakeupsDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationSyncWakeups(accountUUID: self.accountUUID) }
     }
