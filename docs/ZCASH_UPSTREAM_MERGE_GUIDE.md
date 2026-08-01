@@ -2,13 +2,37 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-30
+Last reviewed: 2026-07-31
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Bleeding-edge refresh (2026-07-31)
+
+- Fresh fetches leave `origin/main=4497fe9e` and `upstream/main=f51ed74a`; the
+  merge base remains `769809a2` and the parity relationship remains `174 87`.
+  Draft Zend PR `#33` at `7a7936d2` is still the sole clean reconciliation tracker;
+  it deliberately contains only the decision record, not the upstream source range.
+- No newly active upstream PR or branch clears the ready, useful, and low-risk
+  early-carry gate. PR `#1923` is changes-requested with a failed build and rewrites
+  the migration state machine across the RC.5/Ironwood/FFI family. Its branch is
+  162 commits and 120 files ahead of its merge base with `upstream/main`; wait for
+  upstream stabilization and a Zend source/artifact reconciliation.
+- PR `#1926` (`Proposal.spendsLegacyOrchardFunds`) is blocked and review-required.
+  Although its endpoint is only ten files, it is stacked on the 2.7/2.8 RC dependency,
+  FFI, and `Proposal` schema line. Draft PR `#1927` likewise carries a temporary
+  librustzcash pin and generated proposal-proto changes. Neither can be isolated from
+  Zend's provenance-locked engine and XCFramework contract.
+- PR `#1925` is dirty and review-required while unifying release scripts across 36
+  files. Merged maintenance-line work `#1905` and `#1922` remains unmerged into
+  upstream `main`, so it is not a safe substitute for the release/FFI reconciliation.
+  Draft PR `#1898` remains dirty despite approval and green checks; its Tor-off
+  submission semantics should wait for its upstream release-line decision.
+- This is a documentation-only monitor record. No SDK source or FFI artifact changed,
+  so `swift build` and `swift test --filter OfflineTests` were intentionally not run.
 
 ## Bleeding-edge refresh (2026-07-30)
 
