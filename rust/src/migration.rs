@@ -1094,11 +1094,19 @@ fn next_provable_excluding(
 fn prove_pending_rows(
     state: &mut MigrationState,
     target: BlockHeight,
+    max_proofs: Option<u32>,
     mut prove: impl FnMut(&mut MigrationState, MigrationTransferId) -> anyhow::Result<bool>,
 ) -> anyhow::Result<u32> {
     let mut deferred: Vec<MigrationTransferId> = Vec::new();
     let mut proved = 0;
     while let Some(id) = next_provable_excluding(state, target, &deferred) {
+        // `max_proofs` caps SUCCESSFUL proofs per call so an FFI caller can chunk a sweep:
+        // each proof is seconds of CPU, and a platform serializing DB access behind one
+        // actor needs a seam between proofs for interactive reads to interleave. Deferred
+        // (transient) rows don't count against the cap — they cost no proving time.
+        if max_proofs.is_some_and(|max| proved >= max) {
+            break;
+        }
         if prove(state, id)? {
             // `next_provable` only offers `Signed` rows, so a successful prove must have advanced
             // this one; were that ever untrue the loop would re-select it forever, which as an FFI
@@ -3153,6 +3161,7 @@ pub unsafe extern "C" fn zcashlc_migration_prove_pending(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
+    max_proofs: i64,
 ) -> i64 {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
@@ -3166,7 +3175,11 @@ pub unsafe extern "C" fn zcashlc_migration_prove_pending(
         // `CallCtx::target`; A1 — this sweep briefly fed the raw tip, which left a preparation
         // scheduled exactly at the target un-proved for one extra block).
         let target = ctx.target()?;
-        let proved = prove_pending_rows(&mut state, target, |state, id| {
+        // `max_proofs <= 0` means unlimited. A platform whose DB access serializes behind one
+        // actor should pass 1 and loop with a yield between calls, so interactive reads
+        // interleave between proofs instead of waiting out the whole sweep.
+        let cap = u32::try_from(max_proofs).ok().filter(|&n| n > 0);
+        let proved = prove_pending_rows(&mut state, target, cap, |state, id| {
             prove_one(&mut ctx, state, id)
         })?;
         Ok(i64::from(proved))
@@ -7433,6 +7446,49 @@ mod tests {
             .expect("a migration is stored")
     }
 
+    /// `max_proofs` chunks a sweep: the first call proves exactly the cap and leaves the rest
+    /// `Signed`; the next (uncapped) call finishes the remainder. This is the seam platforms use
+    /// to interleave interactive DB reads between seconds-long proofs.
+    #[test]
+    fn sweep_cap_proves_at_most_max_and_the_next_call_finishes() {
+        let path = init_fixture_db("zcashlc_sweep_cap_chunks");
+        let account = create_fixture_account(&path);
+        let mut state = provable_state(
+            &[MINED],
+            &[MigrationTxState::Signed, MigrationTxState::Signed],
+            Some(h(1440)),
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let first = prove_pending_rows(&mut state, h(5_000), Some(1), |state, id| {
+            prove_with_test_prover(&path, &account, &mut prover, state, id)
+        })
+        .expect("a capped sweep must not fail");
+        assert_eq!(first, 1, "the cap must stop the sweep after one proof");
+        assert_eq!(
+            prover.calls.len(),
+            1,
+            "the prover must run exactly once under a cap of 1"
+        );
+        assert_eq!(
+            state
+                .transactions()
+                .iter()
+                .filter(|t| matches!(t.state(), MigrationTxState::Signed))
+                .count(),
+            1,
+            "one transfer must remain Signed for the next chunk"
+        );
+
+        let second = prove_pending_rows(&mut state, h(5_000), None, |state, id| {
+            prove_with_test_prover(&path, &account, &mut prover, state, id)
+        })
+        .expect("the follow-up sweep must not fail");
+        assert_eq!(second, 1, "the uncapped follow-up must prove the remainder");
+        assert_eq!(prover.calls.len(), 2, "two proofs total across the chunks");
+    }
+
     /// The sweep proves a provable `Signed` transfer — `Signed -> Proved`, PERSISTED — against the
     /// boundary drawn on its row, and the delivery lane then serves that stored artifact WITHOUT
     /// consulting a prover: proving and broadcasting are separate steps.
@@ -7444,7 +7500,7 @@ mod tests {
         store_fixture_state(&path, &account, &state);
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let proved = prove_pending_rows(&mut state, h(5_000), |state, id| {
+        let proved = prove_pending_rows(&mut state, h(5_000), None, |state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("sweeping a provable transfer must not fail");
@@ -7529,7 +7585,7 @@ mod tests {
             error: Some(WalletProveError::AnchorNotFound(h(40))),
             calls: Vec::new(),
         };
-        let proved = prove_pending_rows(&mut state, h(100), |state, id| {
+        let proved = prove_pending_rows(&mut state, h(100), None, |state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("a transient prove outcome must not be an error");
@@ -7580,7 +7636,7 @@ mod tests {
         store_fixture_state(&path, &account, &state);
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let proved = prove_pending_rows(&mut state, h(100), |state, id| {
+        let proved = prove_pending_rows(&mut state, h(100), None, |state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("the sweep must not fail");
@@ -7633,7 +7689,7 @@ mod tests {
 
         let mut prover = RecordingProver { calls: Vec::new() };
         let mut state = build_state();
-        let proved = prove_pending_rows(&mut state, target_from_tip(tip), |state, id| {
+        let proved = prove_pending_rows(&mut state, target_from_tip(tip), None, |state, id| {
             Ok(
                 migration_finalize::prove_due_transaction(&mut prover, state, id, Some(tip))?
                     .is_some(),
@@ -7654,7 +7710,7 @@ mod tests {
         // target, the same state sweeps nothing.
         let mut prover = RecordingProver { calls: Vec::new() };
         let mut state = build_state();
-        let proved = prove_pending_rows(&mut state, tip, |state, id| {
+        let proved = prove_pending_rows(&mut state, tip, None, |state, id| {
             Ok(
                 migration_finalize::prove_due_transaction(&mut prover, state, id, Some(tip))?
                     .is_some(),
@@ -7680,7 +7736,7 @@ mod tests {
         let mut prover = FailingProver {
             error: Some(WalletProveError::Prove("proof backend failure".into())),
         };
-        let err = prove_pending_rows(&mut state, h(5_000), |state, id| {
+        let err = prove_pending_rows(&mut state, h(5_000), None, |state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect_err("a hard prover failure must not be swallowed");

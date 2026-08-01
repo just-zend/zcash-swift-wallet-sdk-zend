@@ -1978,27 +1978,44 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationProvePending(for account: AccountUUID) async throws -> Int {
-        // Unlike the ambiguous sentinels above, `-1` is never a legitimate count, so the return
-        // value alone decides success. The last-error is still cleared first so the message this
-        // reads on failure cannot be a leftover from an earlier call.
-        zcashlc_clear_last_error()
+        // The sweep is CHUNKED: one proof per FFI call, with a suspension between calls. Each
+        // proof is seconds of CPU, and this method runs on the global `DBActor` — an uncapped
+        // call held that actor for the whole sweep, so every DB-bound read (the transactions
+        // list at app open, the migration flow's re-entry hydration) queued behind the full
+        // sweep. Yielding between single-proof calls bounds any queued read's wait to at most
+        // one proof. Sweep total time is unchanged; each chunk re-opens its context and
+        // re-reconciles, which is milliseconds against a multi-second proof.
+        var totalProved = 0
+        while true {
+            // Unlike the ambiguous sentinels above, `-1` is never a legitimate count, so the
+            // return value alone decides success. The last-error is still cleared first so the
+            // message this reads on failure cannot be a leftover from an earlier call.
+            zcashlc_clear_last_error()
 
-        let proved = zcashlc_migration_prove_pending(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId
-        )
-
-        // `-1` is the error sentinel; every non-negative value is a legitimate count.
-        guard proved >= 0 else {
-            throw migrationRoutedError(
-                lastErrorMessage(fallback: "`migrationProvePending` failed with unknown error"),
-                fallback: ZcashError.rustMigrationProvePending
+            let proved = zcashlc_migration_prove_pending(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                1
             )
-        }
 
-        return Int(proved)
+            // `-1` is the error sentinel; every non-negative value is a legitimate count.
+            guard proved >= 0 else {
+                throw migrationRoutedError(
+                    lastErrorMessage(fallback: "`migrationProvePending` failed with unknown error"),
+                    fallback: ZcashError.rustMigrationProvePending
+                )
+            }
+            guard proved > 0 else {
+                return totalProved
+            }
+            totalProved += Int(proved)
+
+            // The seam this whole chunking exists for: let queued `DBActor` work run before the
+            // next proof.
+            await Task.yield()
+        }
     }
 
     @DBActor

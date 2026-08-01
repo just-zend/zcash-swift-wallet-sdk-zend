@@ -8,6 +8,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Changes are relative to `2.8.0-rc.3`.
 
+## Fixed
+
+- The migration prove sweep no longer freezes interactive reads for its whole duration: proofs
+  are produced one per database-actor turn with a yield between them, so screens that read the
+  wallet database (the transactions list, the migration flow's re-entry) wait at most one proof
+  instead of the entire sweep. Proving worker threads additionally run at utility QoS on Apple
+  platforms, so seconds-long halo2 proving no longer starves the UI of CPU.
+
 ## Added
 
 ### Custom (regtest-style) networks
