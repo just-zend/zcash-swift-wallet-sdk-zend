@@ -319,6 +319,48 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         )
     }
 
+    /// `advanceStep()` takes no `useEstimatedTip` switch — it ALWAYS drives the engine with both
+    /// targets — so the only way the estimate can be lost is silently, by reaching the welding as
+    /// `nil`. Pins the exact projected value rather than just non-nil: one sample 150 s (two 75 s
+    /// target-spacing blocks) before the frozen clock projects to height + 2, which neither a
+    /// dropped estimate nor a wall-clock leak can produce.
+    func testAdvanceStepPassesTheProjectedTipEstimateToTheWelding() async throws {
+        let sampleTime = referenceDate.addingTimeInterval(-150)
+        welding.migrationBlockRateSamplesWindowReturnValue = [
+            MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
+        ]
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        let step = try await migration.advanceStep()
+
+        XCTAssertEqual(step, .waiting)
+        let received = try XCTUnwrap(welding.migrationAdvanceStepForEstimatedTipReceivedArguments)
+        XCTAssertEqual(received.account, accountA)
+        XCTAssertEqual(
+            received.estimatedTip,
+            3_000_002,
+            "the advance step must carry the tip projected at the actor's injected clock (height + floor(150/75))"
+        )
+    }
+
+    /// The other half of the gating contract: an estimator failure degrades `advanceStep()` to the
+    /// scanned-tip behavior (`nil`) instead of propagating — the estimate may accelerate the
+    /// engine's scheduled-height due-ness, never block the call that consults it.
+    func testAdvanceStepDegradesToNilTipWhenBlockRateSamplesThrows() async throws {
+        welding.migrationBlockRateSamplesWindowThrowableError = StubEngineError()
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        let step = try await migration.advanceStep()
+
+        XCTAssertEqual(step, .waiting, "an estimator failure must not fail the advance step")
+        XCTAssertNil(
+            welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.estimatedTip,
+            "an estimator failure must degrade to the scanned-tip behavior"
+        )
+    }
+
     /// `hasOverdueTransfers(useEstimatedTip:)` mirrors the same wiring as
     /// `executeNextPendingTransfer` above: `true` feeds a projected tip into the welding's overdue
     /// check, `false` always passes `nil`.
