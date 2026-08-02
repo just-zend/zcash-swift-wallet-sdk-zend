@@ -110,6 +110,14 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // `isSyncStalled` (+PureHelpers.swift). State is `internal` (not private) so
     // the extension file can reach it.
     var watchdogStallLogged = false
+    /// When the CURRENT engine handle came up (stamped by `resetStallWatchdog()` at start /
+    /// switchTo / wipe). The engine-owned stall span (`snap.stalledSeconds`) can survive a
+    /// stop→start — a restarted handle's first snapshots surfaced a span accumulated before
+    /// (and across) a deliberate stop, which fired the watchdog at the exact moment recovery
+    /// was WORKING (field-caught 2026-08-02: a 497 s "stall" of which ~4.5 min was a
+    /// gate-stopped engine). `checkStallWatchdog` clamps the reported span to this handle's
+    /// own lifetime, so only stall time the CURRENT handle actually accrued can fire the log.
+    var watchdogHandleStartedAt = Date()
     /// Logger accessor for same-type extensions in other files (`initializer` is
     /// private; the StallWatchdog extension needs the injected logger).
     var watchdogLogger: Logger { initializer.logger }
