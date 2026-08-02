@@ -10,6 +10,14 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- Anchor-retention marks are now persisted into the wallet database at wallet open. The sync
+  engine retained ZIP 318 boundary anchors only in memory while building each batch; the
+  database's retained-checkpoint tables stayed empty, so its own open-time deep-history heal —
+  which spares exactly the checkpoints those tables name — would eventually prune migration
+  boundary anchors once they aged past its 10,000-block margin, permanently stalling any
+  migration whose privacy schedule runs longer than that (~3.5 days on testnet, ~8.7 on
+  mainnet). Every policy-retained height from NU6.3 activation to the chain tip is now marked
+  durable in all three pools before the engine's first session of the app-open.
 - A migration transfer whose funding preparation mined LATER than the anchor boundary drawn for
   it at commit time no longer stalls the migration forever. The funding note does not exist in
   that boundary's tree state, so its witness could never be computed there; the prove sweep
