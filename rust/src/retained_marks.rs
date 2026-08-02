@@ -126,12 +126,10 @@ mod tests {
                 "SELECT checkpoint_id FROM {table} ORDER BY checkpoint_id"
             ))
             .expect("prepares");
-        let rows = stmt
-            .query_map([], |r| r.get::<_, u32>(0))
+        stmt.query_map([], |r| r.get::<_, u32>(0))
             .expect("queries")
             .collect::<Result<Vec<_>, _>>()
-            .expect("collects");
-        rows
+            .expect("collects")
     }
 
     /// The reconcile marks every policy-retained grid height in [floor ..= tip], in all
