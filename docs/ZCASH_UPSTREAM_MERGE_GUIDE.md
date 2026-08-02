@@ -2,13 +2,34 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-31
+Last reviewed: 2026-08-01
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Bleeding-edge refresh (2026-08-01)
+
+- Fresh fetches leave `origin/main=4497fe9e` and `upstream/main=f51ed74a`; the
+  merge base remains `769809a2` and the parity relationship remains `174 87`.
+  Draft Zend PR `#33` at `13121500` is still the sole clean reconciliation tracker;
+  it deliberately contains only the decision record, not the upstream source range.
+- PR `#1923` advanced and its build, SwiftLint, zizmor, and proto checks are now
+  green, but it remains changes-requested. Its 17-commit, 39-file review branch is
+  still the broad RC/Ironwood migration-state-machine and FFI reconciliation line,
+  so green CI does not make an isolated Zend carry safe.
+- PR `#1914` is approved, clean, and green, but it would bring the 23-commit v2.8
+  maintenance/release line to upstream `main`, including `Cargo`, `Package.swift`,
+  and FFI release changes. Wait for upstream to land that release line and fold it
+  into the same provenance-verified reconciliation rather than carrying it early.
+- PRs `#1926` and `#1927` remain blocked/draft on the RC `Proposal` schema and
+  generated-proto line; `#1925` remains conflicting release-script work; and
+  draft PR `#1898` remains conflicting despite green checks. None clears the ready,
+  useful, and low-risk early-carry gate.
+- This is a documentation-only monitor record. No SDK source or FFI artifact changed,
+  so `swift build` and `swift test --filter OfflineTests` were intentionally not run.
 
 ## Bleeding-edge refresh (2026-07-31)
 
