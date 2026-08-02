@@ -10,6 +10,26 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- The migration prove sweep no longer holds the wallet-database serializer while proofs are
+  computed: each single-proof chunk's blocking FFI call now runs detached at utility priority and
+  is awaited, releasing `DBActor` for the whole multi-second computation instead of only between
+  chunks. Database-bound reads (the transactions list, the migration flow's screen hydration)
+  interleave DURING a proof, so opening those screens mid-sweep no longer shows a
+  tens-of-seconds loader. Safe by construction: the Rust side opens its own connection per call
+  (WAL, busy_timeout), and the FFI's thread-local last-error is cleared and read inside the
+  detached closure on one thread.
+- The Slipstream stall watchdog no longer fires on a restarted engine's inherited history: the
+  engine-owned stall span can survive a stop→start, so a restart's first snapshots reported
+  stall time accumulated before — and across — a deliberate stop (a 497 s "stall" of which ~4.5
+  minutes the engine was stopped behind the migration gate), tripping the loud hung-engine log
+  at the exact moment recovery was working. The evaluated span is now clamped to the current
+  handle's own lifetime.
+- The migration sync gate's blocked stream now wakes AT its own known boundaries: `resumeAt` and
+  `inFlightUntil` are wall-clock deadlines the gate itself persists, yet the stream only
+  re-evaluated on a flat 15-second ticker, leaving a cleared gate unnoticed for up to a whole
+  interval — on a foregrounded device that read as a dead half-minute between "privacy buffer
+  expired" and "sync resumed". Each ticker iteration now sleeps only until the soonest future
+  boundary (capped at the interval); ready-broadcast flips keep the interval cadence.
 - Proved migration transactions are recorded in the wallet's own transaction tables at proving
   time (librustzcash re-pin to `feat/migration_unsatisfiability` @ `1988cfe1`): their inputs are
   marked spent from the moment the proof exists, so the wallet's own sends can no longer

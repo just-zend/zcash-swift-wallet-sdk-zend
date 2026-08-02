@@ -392,7 +392,9 @@ final class MigrationSyncGate: @unchecked Sendable {
     }
 
     /// A stream of the blocked flag: emits the current value on subscribe, re-evaluates every
-    /// `tickInterval` and after every ``markBroadcast()``, and collapses consecutive duplicates.
+    /// `tickInterval` — waking EARLY at each known gate boundary (`resumeAt`/`inFlightUntil`
+    /// expiry, see `nextRecomputeDelay`) — and after every ``markBroadcast()``, and collapses
+    /// consecutive duplicates.
     /// Internally synchronized: the ticker loop and every `markBroadcast()`-triggered recompute can
     /// be in flight concurrently (both suspend awaiting the injected `readyBroadcastProvider`), but every
     /// send is serialized and generation-ordered -- latest-wins, so a recompute that started earlier
@@ -447,6 +449,14 @@ final class MigrationSyncGate: @unchecked Sendable {
     /// transition (`subscriberAttached()`) -- creating the `Task` here is a cheap, non-suspending
     /// call, so doing it under the lock is safe. No risk of deadlock either way: the task's own body
     /// (`recompute()`) only ever acquires `emissionLock`, never `subscriptionLock`.
+    ///
+    /// BOUNDARY-AWARE (field-caught 2026-08-02): the gate KNOWS when its persisted inputs flip --
+    /// `resumeAt` and `inFlightUntil` are wall-clock deadlines -- yet the flat `tickInterval` sleep
+    /// could leave a cleared gate unnoticed for a whole interval. On a foregrounded device that
+    /// read as a dead half-minute between "gate expired" and "sync resumed", with the app doing
+    /// nothing wrong. Each iteration now sleeps only until the SOONEST future boundary (plus a
+    /// small epsilon so the recompute lands strictly after the flip), capped at `tickInterval`;
+    /// ready-broadcast flips carry no deadline and keep the interval cadence as before.
     private func startTicking() {
         tickerTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -454,9 +464,32 @@ final class MigrationSyncGate: @unchecked Sendable {
                     return
                 }
                 await self.recompute()
-                try? await Task.sleep(nanoseconds: UInt64(self.tickInterval * 1_000_000_000))
+                let delay = Self.nextRecomputeDelay(
+                    now: self.now(),
+                    resumeAt: self.currentResumeAt(),
+                    inFlightUntil: self.currentInFlightUntil(),
+                    tickInterval: self.tickInterval
+                )
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
         }
+    }
+
+    /// The ticker's next sleep: the soonest FUTURE gate boundary (`resumeAt`/`inFlightUntil`,
+    /// plus a 0.25 s epsilon so the wake lands strictly after the input flips), capped at
+    /// `tickInterval`. Past or absent boundaries fall back to the plain interval. Pure and
+    /// static for offline testing.
+    static func nextRecomputeDelay(
+        now: Date,
+        resumeAt: Date?,
+        inFlightUntil: Date?,
+        tickInterval: TimeInterval
+    ) -> TimeInterval {
+        let futureBoundaries = [resumeAt, inFlightUntil]
+            .compactMap { $0?.timeIntervalSince(now) }
+            .filter { $0 > 0 }
+        guard let soonest = futureBoundaries.min() else { return tickInterval }
+        return min(tickInterval, soonest + 0.25)
     }
 
     /// Stops the ticker task. Only called with `subscriptionLock` held, on the 1 -> 0 subscriber

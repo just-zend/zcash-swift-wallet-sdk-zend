@@ -928,6 +928,55 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertNil(pending)
     }
 
+    // MARK: - Gate ticker boundary wake (field-caught 2026-08-02)
+    //
+    // The gate KNOWS when its persisted inputs flip (`resumeAt`/`inFlightUntil` are wall-clock
+    // deadlines), yet the flat tickInterval sleep left a cleared gate unnoticed for up to a whole
+    // interval — a dead half-minute of foreground between "gate expired" and "sync resumed".
+    // `nextRecomputeDelay` sleeps only until the soonest FUTURE boundary (+0.25 s epsilon), capped
+    // at the interval; ready-broadcast flips carry no deadline and keep the interval cadence.
+
+    func testNextRecomputeDelayWakesAtTheSoonestFutureBoundary() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let delay = MigrationSyncGate.nextRecomputeDelay(
+            now: now,
+            resumeAt: now.addingTimeInterval(6),
+            inFlightUntil: now.addingTimeInterval(40),
+            tickInterval: 15
+        )
+        XCTAssertEqual(delay, 6.25, accuracy: 0.001, "the sooner boundary (+epsilon) must win over the interval")
+    }
+
+    func testNextRecomputeDelayIgnoresPastBoundaries() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let delay = MigrationSyncGate.nextRecomputeDelay(
+            now: now,
+            resumeAt: now.addingTimeInterval(-30),
+            inFlightUntil: now.addingTimeInterval(-5),
+            tickInterval: 15
+        )
+        XCTAssertEqual(delay, 15, "expired boundaries must fall back to the plain interval")
+    }
+
+    func testNextRecomputeDelayWithNoBoundariesKeepsTheInterval() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        XCTAssertEqual(
+            MigrationSyncGate.nextRecomputeDelay(now: now, resumeAt: nil, inFlightUntil: nil, tickInterval: 15),
+            15
+        )
+    }
+
+    func testNextRecomputeDelayCapsDistantBoundariesAtTheInterval() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let delay = MigrationSyncGate.nextRecomputeDelay(
+            now: now,
+            resumeAt: now.addingTimeInterval(600),
+            inFlightUntil: nil,
+            tickInterval: 15
+        )
+        XCTAssertEqual(delay, 15, "a boundary beyond the interval must not stretch the cadence")
+    }
+
     // MARK: - Custom network registration
 
     /// `OrchardMigration.init(config:)` builds its own `ZcashRustBackend` rather than sharing the
