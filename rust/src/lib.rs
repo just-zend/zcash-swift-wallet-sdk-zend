@@ -102,6 +102,7 @@ mod migration_finalize;
 mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
+mod retained_marks;
 mod tor;
 // Voting is gated off on this line: the `zcash_voting` dependency is commented out in
 // Cargo.toml (see there), so the module and its `zcashlc_voting_*` symbols are not compiled.

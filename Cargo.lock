@@ -2932,6 +2932,7 @@ dependencies = [
  "sharded-slab",
  "shardtree",
  "slipstream-core",
+ "tempfile",
  "tokio",
  "tonic",
  "tor-rtcompat",
