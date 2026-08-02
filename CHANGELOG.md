@@ -10,6 +10,17 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- A migration transfer whose funding preparation mined LATER than the anchor boundary drawn for
+  it at commit time no longer stalls the migration forever. The funding note does not exist in
+  that boundary's tree state, so its witness could never be computed there; the prove sweep
+  deferred it as "not scanned yet" on every pass — reported ready to prove, blocked on nothing,
+  proving nothing, permanently (the shape behind the app-side "PROVE STALLED" detector firing on
+  otherwise-complete testnet runs). The engine now re-validates the boundary against the funding
+  preparations' real mined heights at proving time and re-draws it from the note's actual
+  creation height when it postdates the drawn one (librustzcash pin `d5b665cf`); the sweep
+  supplies the wallet's fully-scanned height and network parameters for that re-draw. A wedged
+  run needs no restore: the next sweep re-draws, proves, and the run completes on the existing
+  rails.
 - The migration prove sweep no longer freezes interactive reads for its whole duration: proofs
   are produced one per database-actor turn with a yield between them, so screens that read the
   wallet database (the transactions list, the migration flow's re-entry) wait at most one proof

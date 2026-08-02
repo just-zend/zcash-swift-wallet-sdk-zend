@@ -20,9 +20,14 @@
 //! - TRANSFERS prove against the boundary anchor their schedule DREW and persisted on the row
 //!   (`MigrationTransaction::anchor_boundary()`): `engine::prove_transfer` reads the persisted
 //!   boundary and hands it to the prover, so transfers cluster into ZIP 318 anchor cohorts
-//!   instead of timestamping the wallet's recent activity with a fresh anchor. A transfer with no
-//!   stored boundary is a corrupt store and a HARD error — never a fallback to the preparation
-//!   anchor. Boundary checkpoints stay durably witnessable because upstream anchor-checkpoint
+//!   instead of timestamping the wallet's recent activity with a fresh anchor. The persisted
+//!   boundary is PROVISIONAL, though: it was drawn from an estimate of when the funding
+//!   preparations would mine, and `engine::prove_transfer` re-validates it against their REAL
+//!   mined heights at proving time, re-drawing (and re-persisting) it when the funding note
+//!   postdates it — the note is absent from that tree state and could never be witnessed there.
+//!   That re-draw is why this caller supplies the network parameters, the wallet's scanned tip,
+//!   and an rng. A transfer with no stored boundary is a corrupt store and a HARD error — never a
+//!   fallback to the preparation anchor. Boundary checkpoints stay durably witnessable because upstream anchor-checkpoint
 //!   retention (active from NU6.3 activation) keeps every boundary of the wallet's anchor
 //!   retention interval — necessarily the same grid the engine draws boundaries on, since the
 //!   engine reads that interval back off the wallet. [`crate::anchor_retention_interval`] is where
@@ -129,15 +134,20 @@ impl<TE, NE, RE> ProveErrorClass for WalletProveError<TE, NE, RE> {
 ///
 /// Generic over the prover so tests substitute a recording/failing `impl MigrationProver` for the
 /// production `wallet::WalletMigrationProver`.
-pub(crate) fn prove_due_transaction<P>(
+pub(crate) fn prove_due_transaction<C, P, R>(
+    params: &C,
     prover: &mut P,
     state: &mut MigrationState,
     id: MigrationTransferId,
     preparation_anchor: Option<BlockHeight>,
+    scanned_tip: BlockHeight,
+    rng: &mut R,
 ) -> anyhow::Result<Option<()>>
 where
+    C: zcash_protocol::consensus::Parameters,
     P: MigrationProver,
     P::Error: ProveErrorClass + std::fmt::Display,
+    R: rand::RngCore + rand::CryptoRng,
 {
     let kind = state
         .transactions()
@@ -151,7 +161,14 @@ where
             ))
         })?;
     let result = match kind {
-        MigrationTxKind::Transfer { .. } => engine::prove_transfer(prover, state, id),
+        // `params`, `scanned_tip`, and `rng` feed the engine's proving-time boundary re-draw: a
+        // transfer whose funding preparation mined PAST its commit-time boundary gets a fresh
+        // boundary drawn from the note's real creation height (ZIP 318 anchor selection is a
+        // proving-time rule; the pre-signed PCZT pins nothing — ZIP 374 defers its anchor to
+        // proving), instead of deferring forever against a tree state its input is absent from.
+        MigrationTxKind::Transfer { .. } => {
+            engine::prove_transfer(params, prover, state, id, scanned_tip, rng)
+        }
         MigrationTxKind::Preparation { .. } => {
             let anchor = preparation_anchor.ok_or_else(|| {
                 proving_unavailable(format!(

@@ -1029,14 +1029,29 @@ fn prove_one(
                 }
                 MigrationTxKind::Transfer { .. } => None,
             };
+            // The scanned tip bounds the engine's proving-time boundary re-draw: a re-drawn
+            // boundary must be one the wallet can actually witness at. A wallet with nothing
+            // fully scanned yet (a restore mid-sync) falls back to its chain tip — the draw may
+            // then land past the scan, but the only consumer is the re-draw, and the prover's own
+            // not-scanned-yet answer defers the row exactly as it would any unscanned anchor.
+            let scanned_tip = ctx
+                .wallet
+                .block_fully_scanned()
+                .map_err(|e| anyhow!("fully-scanned height lookup failed: {e}"))?
+                .map(|meta| meta.block_height())
+                .map_or_else(|| ctx.tip(), Ok)?;
+            let network = ctx.network;
             let fvk = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?
                 .stored_orchard_fvk()?;
             let mut prover = WalletMigrationProver::new(&mut ctx.wallet, ctx.account, fvk);
             if migration_finalize::prove_due_transaction(
+                &network,
                 &mut prover,
                 state,
                 id,
                 preparation_anchor,
+                scanned_tip,
+                &mut OsRng,
             )?
             .is_none()
             {
@@ -6971,6 +6986,32 @@ mod tests {
         }
     }
 
+    /// [`migration_finalize::prove_due_transaction`] with the re-draw inputs every dispatch test
+    /// shares: testnet parameters, a scanned tip far past every fixture height, and `OsRng`. No
+    /// fixture here triggers the proving-time boundary re-draw (every mined dependency mines at
+    /// height 100, below each drawn boundary), so these remain pure dispatch tests — the re-draw
+    /// itself is covered by the engine's own suite.
+    fn prove_due_for_test<P>(
+        prover: &mut P,
+        state: &mut MigrationState,
+        id: MigrationTransferId,
+        preparation_anchor: Option<BlockHeight>,
+    ) -> anyhow::Result<Option<()>>
+    where
+        P: MigrationProver,
+        P::Error: migration_finalize::ProveErrorClass + std::fmt::Display,
+    {
+        migration_finalize::prove_due_transaction(
+            &NetworkParams::Standard(Network::TestNetwork),
+            prover,
+            state,
+            id,
+            preparation_anchor,
+            h(5_000),
+            &mut OsRng,
+        )
+    }
+
     /// A test prover whose FIRST call fails with the configured error and whose later calls
     /// succeed: the shape a sweep meets when one row's anchor is not scanned yet but the rest are.
     struct FirstFailsProver {
@@ -7081,13 +7122,8 @@ mod tests {
     fn prove_dispatch_routes_a_transfer_to_its_stored_boundary() {
         let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
         let mut prover = RecordingProver { calls: Vec::new() };
-        let res = migration_finalize::prove_due_transaction(
-            &mut prover,
-            &mut state,
-            MigrationTransferId::new(1),
-            None,
-        )
-        .expect("a boundary-carrying transfer proves");
+        let res = prove_due_for_test(&mut prover, &mut state, MigrationTransferId::new(1), None)
+            .expect("a boundary-carrying transfer proves");
         assert_eq!(res, Some(()), "the transfer must prove, not defer");
         assert_eq!(
             prover.calls,
@@ -7124,7 +7160,7 @@ mod tests {
             Some(h(1440)),
         );
         let mut prover = RecordingProver { calls: Vec::new() };
-        let res = migration_finalize::prove_due_transaction(
+        let res = prove_due_for_test(
             &mut prover,
             &mut state,
             MigrationTransferId::new(0),
@@ -7155,13 +7191,8 @@ mod tests {
     fn prove_dispatch_transfer_without_boundary_is_a_hard_error() {
         let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], None);
         let mut prover = RecordingProver { calls: Vec::new() };
-        let err = migration_finalize::prove_due_transaction(
-            &mut prover,
-            &mut state,
-            MigrationTransferId::new(1),
-            None,
-        )
-        .expect_err("a boundary-less transfer must not prove");
+        let err = prove_due_for_test(&mut prover, &mut state, MigrationTransferId::new(1), None)
+            .expect_err("a boundary-less transfer must not prove");
         assert!(
             err.to_string().starts_with(PROVING_UNAVAILABLE_PREFIX),
             "the corrupt store must surface on the proving-unavailable route, got: {err}"
@@ -7202,13 +7233,9 @@ mod tests {
             let label = format!("{error}");
             let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
             let mut prover = FailingProver { error: Some(error) };
-            let res = migration_finalize::prove_due_transaction(
-                &mut prover,
-                &mut state,
-                MigrationTransferId::new(1),
-                None,
-            )
-            .unwrap_or_else(|e| panic!("{label} must be transient, got hard error: {e}"));
+            let res =
+                prove_due_for_test(&mut prover, &mut state, MigrationTransferId::new(1), None)
+                    .unwrap_or_else(|e| panic!("{label} must be transient, got hard error: {e}"));
             assert_eq!(res, None, "{label} must map to the nothing-due lane");
             let tx = state
                 .transactions()
@@ -7251,13 +7278,9 @@ mod tests {
             let label = format!("{error}");
             let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
             let mut prover = FailingProver { error: Some(error) };
-            let err = migration_finalize::prove_due_transaction(
-                &mut prover,
-                &mut state,
-                MigrationTransferId::new(1),
-                None,
-            )
-            .expect_err(&format!("{label} must be a hard error"));
+            let err =
+                prove_due_for_test(&mut prover, &mut state, MigrationTransferId::new(1), None)
+                    .expect_err(&format!("{label} must be a hard error"));
             assert!(
                 err.to_string().starts_with(PROVING_UNAVAILABLE_PREFIX),
                 "{label} must carry the proving-unavailable prefix, got: {err}"
@@ -7326,13 +7349,8 @@ mod tests {
             Some(h(1440)),
         );
         let mut prover = RecordingProver { calls: Vec::new() };
-        let err = migration_finalize::prove_due_transaction(
-            &mut prover,
-            &mut state,
-            MigrationTransferId::new(0),
-            None,
-        )
-        .expect_err("a preparation without a preparation anchor must not prove");
+        let err = prove_due_for_test(&mut prover, &mut state, MigrationTransferId::new(0), None)
+            .expect_err("a preparation without a preparation anchor must not prove");
         assert!(
             err.to_string().starts_with(PROVING_UNAVAILABLE_PREFIX),
             "the missing anchor must surface on the proving-unavailable route, got: {err}"
@@ -7424,7 +7442,7 @@ mod tests {
         match tx_state {
             MigrationTxState::Proved => Ok(true),
             MigrationTxState::Signed => {
-                if migration_finalize::prove_due_transaction(prover, state, id, None)?.is_none() {
+                if prove_due_for_test(prover, state, id, None)?.is_none() {
                     return Ok(false);
                 }
                 store_fixture_state(path, account, state);
@@ -7690,10 +7708,7 @@ mod tests {
         let mut prover = RecordingProver { calls: Vec::new() };
         let mut state = build_state();
         let proved = prove_pending_rows(&mut state, target_from_tip(tip), None, |state, id| {
-            Ok(
-                migration_finalize::prove_due_transaction(&mut prover, state, id, Some(tip))?
-                    .is_some(),
-            )
+            Ok(prove_due_for_test(&mut prover, state, id, Some(tip))?.is_some())
         })
         .expect("the boundary sweep must not fail");
         assert_eq!(
@@ -7711,10 +7726,7 @@ mod tests {
         let mut prover = RecordingProver { calls: Vec::new() };
         let mut state = build_state();
         let proved = prove_pending_rows(&mut state, tip, None, |state, id| {
-            Ok(
-                migration_finalize::prove_due_transaction(&mut prover, state, id, Some(tip))?
-                    .is_some(),
-            )
+            Ok(prove_due_for_test(&mut prover, state, id, Some(tip))?.is_some())
         })
         .expect("the counterfactual sweep must not fail");
         assert_eq!(
