@@ -302,7 +302,7 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-08-02.v0.9-prove-time-boundary-redraw",
+        zcashlc_build = "2026-08-02.v0.10-retained-anchor-marks",
         "tracing initialized (zcash_client_backend capped at WARN)"
     );
 
@@ -4968,6 +4968,29 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
         } else {
             TestNetwork
         };
+
+        // [B6, second half] Persist the anchor-retention marks the engine's in-memory trees
+        // draw but its flush never writes: the open-time deep-history heal spares only ids
+        // present in the SQLITE store's retained set, so reconcile the marks BEFORE any
+        // engine session (and with it the heal) exists — including the E-3 snapshot seed's
+        // own `WalletSession::open` a few lines below, which already runs that heal on
+        // every open. Non-fatal by design — a wallet that cannot be marked must still open
+        // and sync.
+        let network_params = NetworkParams::Standard(network);
+        match unsafe { wallet_db(db_data, db_data_len, network_params) }.and_then(|mut wallet| {
+            retained_marks::reconcile_retained_anchor_marks(&mut wallet, &network_params)
+        }) {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(
+                    marks = n,
+                    "retained anchor marks reconciled into the wallet store"
+                )
+            }
+            Err(e) => {
+                tracing::warn!(%e, "retained anchor-mark reconcile failed (non-fatal) — continuing")
+            }
+        }
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
