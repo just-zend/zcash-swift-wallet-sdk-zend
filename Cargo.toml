@@ -160,7 +160,7 @@ lto = true
 # build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep it in step with
 # the librustzcash generation the versions above declare: a rev built against an older generation
 # cannot resolve against them.
-slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "8d3bd18d95d3a7eae463d0907ff76c1f55ec296f" }
+slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "5ca9e556bb4f7b1cc7e42365926e2ff7097d1554" }
 
 # The librustzcash family rides a pinned rev — the `feat/migration_unsatisfiability` tip
 # (pool-migration unsatisfiable-step detection, estimate-aware scheduling, engine-derived
