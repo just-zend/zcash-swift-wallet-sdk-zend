@@ -160,28 +160,31 @@ lto = true
 # build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep it in step with
 # the librustzcash generation the versions above declare: a rev built against an older generation
 # cannot resolve against them.
-slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "b57678befaeaeb87ec5b17f466eb3335c764a8b7" }
+slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "29428b2bff3841343ef571fb80abb2962613bb04" }
 
 # The librustzcash family rides a pinned rev — the `feat/migration_unsatisfiability` merge
 # head (pool-migration unsatisfiable-step detection, estimate-aware scheduling, engine-derived
 # mined-ness with the `pczt_txid` promotion and foreign-spend recording that finish it), now
-# carrying BOTH mobile PRs merged upstream: #2887, the public `batch_ensure_heights`
+# carrying BOTH mobile PRs merged upstream — #2887, the public `batch_ensure_heights`
 # checkpoint-ensure seam the slipstream anchor fix above requires, and #2888, the proving-time
-# anchor-boundary re-draw. Every family crate is patched to the SAME rev so
+# anchor-boundary re-draw — plus the proved-transaction wallet-persistence work (proofs are
+# finalized into the wallet's own transaction tables at proving time, marking their inputs
+# spent, so the wallet cannot double-spend a migration input during the prove-to-broadcast
+# window). Every family crate is patched to the SAME rev so
 # the graph stays a single family
 # instance (mixing a git and a crates.io generation of these crates does not resolve). Re-pin to
 # crates.io at the first librustzcash release that carries all of it.
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "bbfac67bf4559e0e46072e08d1bd7dfb70c618fb" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
 
 # Reinstate together with the voting dependencies above:
 # zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "e53e74487d31ad0f5713580fb2f0222b53ae9db8" }

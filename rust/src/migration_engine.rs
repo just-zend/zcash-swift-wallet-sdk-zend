@@ -35,7 +35,7 @@ use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_pool_migration::build::{AccountDerivation, sign_pczt};
 use zcash_pool_migration::engine::{
     MigrationBackend, MigrationCrypto, MigrationState, MigrationTransaction, MigrationTransferId,
-    MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
+    MigrationTxState, PoolMigrationRead, PoolMigrationWrite, ProvedTransaction,
 };
 use zcash_pool_migration::scheduling::SchedulingParams;
 use zcash_protocol::ShieldedPool;
@@ -59,7 +59,7 @@ pub(crate) struct Backend<'a> {
     wallet: &'a MigrationWallet,
     account: AccountUuid,
     usk: Option<UnifiedSpendingKey>,
-    store: PoolMigrations<&'a mut rusqlite::Connection>,
+    store: PoolMigrations<&'a mut rusqlite::Connection, NetworkParams, SystemClock>,
 }
 
 impl<'a> Backend<'a> {
@@ -75,8 +75,17 @@ impl<'a> Backend<'a> {
             wallet,
             account,
             usk,
-            store: PoolMigrations::for_account(store_conn, account)
-                .map_err(|e| anyhow!("opening the account-scoped migration store failed: {e}"))?,
+            // `params` and `clock` serve the store's `store_proved_transaction` (it finalizes the
+            // proven transaction into the wallet's own tables, which needs the network's branch
+            // ids and a creation timestamp); both come from the same sources the wallet itself
+            // was built with.
+            store: PoolMigrations::for_account(
+                wallet.params().clone(),
+                SystemClock,
+                store_conn,
+                account,
+            )
+            .map_err(|e| anyhow!("opening the account-scoped migration store failed: {e}"))?,
         })
     }
 
@@ -258,5 +267,15 @@ impl PoolMigrationWrite for Backend<'_> {
         self.store
             .update_transaction(id, state)
             .map_err(|e| anyhow!("migration store update failed: {e}"))
+    }
+
+    fn store_proved_transaction(
+        &mut self,
+        state: &mut MigrationState,
+        proven: ProvedTransaction,
+    ) -> Result<(), Self::Error> {
+        self.store
+            .store_proved_transaction(state, proven)
+            .map_err(|e| anyhow!("migration store proved-transaction write failed: {e}"))
     }
 }

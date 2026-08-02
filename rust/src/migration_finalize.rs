@@ -142,7 +142,7 @@ pub(crate) fn prove_due_transaction<C, P, R>(
     preparation_anchor: Option<BlockHeight>,
     scanned_tip: BlockHeight,
     rng: &mut R,
-) -> anyhow::Result<Option<()>>
+) -> anyhow::Result<Option<engine::ProvedTransaction>>
 where
     C: zcash_protocol::consensus::Parameters,
     P: MigrationProver,
@@ -180,7 +180,12 @@ where
         }
     };
     match result {
-        Ok(engine::ProveOutcome::Proved) => Ok(Some(())),
+        // The proof comes OUT as a `#[must_use]` value rather than being written into the state:
+        // nothing says `Proved` — in memory or on disk — until the caller hands it to
+        // `PoolMigrationWrite::store_proved_transaction`, which persists the state atomically
+        // with the wallet's own record of the finalized transaction (marking its inputs spent,
+        // so the wallet cannot double-spend them during the prove-to-broadcast window).
+        Ok(engine::ProveOutcome::Proved(proved)) => Ok(Some(proved)),
         Ok(engine::ProveOutcome::NotYetProvable) => Ok(None),
         Ok(engine::ProveOutcome::MarkedUnsatisfiable { .. }) => Ok(None),
         Err(engine::ProveError::Prover(e)) if e.is_transient() => {

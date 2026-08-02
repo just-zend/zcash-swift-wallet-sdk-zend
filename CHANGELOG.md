@@ -10,6 +10,12 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- Proved migration transactions are recorded in the wallet's own transaction tables at proving
+  time (librustzcash re-pin to `feat/migration_unsatisfiability` @ `1988cfe1`): their inputs are
+  marked spent from the moment the proof exists, so the wallet's own sends can no longer
+  double-spend a scheduled migration transfer's inputs during the deliberately long window
+  between proving and broadcast — the exact self-inflicted unsatisfiability the engine otherwise
+  had to detect after the fact.
 - Anchor-retention marks are now persisted into the wallet database at wallet open. The sync
   engine retained ZIP 318 boundary anchors only in memory while building each batch; the
   database's retained-checkpoint tables stayed empty, so its own open-time deep-history heal —

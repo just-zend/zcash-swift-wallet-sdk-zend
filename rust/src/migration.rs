@@ -83,6 +83,7 @@ use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::pool_migration::orchard_ironwood::{
     Error as PoolMigrationStoreError, PoolMigrations,
 };
+use zcash_client_sqlite::util::SystemClock;
 use zcash_protocol::consensus::{
     BLOCKS_PER_HOUR, BlockHeight, Network, NetworkConstants, NetworkUpgrade, Parameters,
 };
@@ -244,7 +245,7 @@ unsafe fn open(
         .map_err(|e| anyhow!("Error reading fully-scanned height: {e}"))?
         .map(|metadata| metadata.block_height())
         .unwrap_or(BlockHeight::from(0));
-    migrate_legacy_invalid_marks(&mut store_conn, fully_scanned_height)?;
+    migrate_legacy_invalid_marks(&mut store_conn, network, fully_scanned_height)?;
     let account = account_uuid_from_bytes(account_uuid_bytes)
         .map_err(|e| anyhow!("account uuid must be 16 bytes: {e}"))?;
     let account_bytes = *account.expose_uuid().as_bytes();
@@ -314,6 +315,7 @@ const LEGACY_INVALID_MARKS_TABLE: &str = "ext_zcashlc_orchard_ironwood_migration
 /// SDK's own, in the namespace the wallet promises never to touch.
 fn migrate_legacy_invalid_marks(
     conn: &mut Connection,
+    network: NetworkParams,
     fully_scanned_height: BlockHeight,
 ) -> anyhow::Result<()> {
     let exists: bool = conn
@@ -356,7 +358,8 @@ fn migrate_legacy_invalid_marks(
 
     for (account_bytes, marks) in per_account {
         let account = AccountUuid::from_uuid(uuid::Uuid::from_bytes(account_bytes));
-        let mut store = match PoolMigrations::for_account(&mut *conn, account) {
+        let mut store = match PoolMigrations::for_account(network, SystemClock, &mut *conn, account)
+        {
             Ok(store) => store,
             Err(PoolMigrationStoreError::AccountUnknown) => continue,
             Err(e) => return Err(anyhow!("legacy marks: store open failed: {e}")),
@@ -1044,7 +1047,7 @@ fn prove_one(
             let fvk = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?
                 .stored_orchard_fvk()?;
             let mut prover = WalletMigrationProver::new(&mut ctx.wallet, ctx.account, fvk);
-            if migration_finalize::prove_due_transaction(
+            let Some(proved) = migration_finalize::prove_due_transaction(
                 &network,
                 &mut prover,
                 state,
@@ -1053,13 +1056,18 @@ fn prove_one(
                 scanned_tip,
                 &mut OsRng,
             )?
-            .is_none()
-            {
+            else {
                 // Not scanned/retained yet — transient, retry on a later sweep.
                 return Ok(false);
-            }
+            };
+            // The store method is the ONLY consumer of the proof: it flips the row `Proved` and
+            // persists the state atomically with the wallet's own record of the finalized
+            // transaction (inputs marked spent), closing the prove-to-broadcast window in which
+            // the wallet's own spends could double-spend a migration input. It persists the
+            // whole state, so the proving-time boundary re-draw's mutation rides along — the
+            // separate `replace_migration` this replaces is no longer needed here.
             let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.replace_migration(state)?;
+            backend.store_proved_transaction(state, proved)?;
             Ok(true)
         }
         other => Err(anyhow!(
@@ -6576,8 +6584,13 @@ mod tests {
     fn store_fixture_state(path: &std::path::Path, account: &[u8; 16], state: &MigrationState) {
         let mut conn = Connection::open(path).expect("the fixture store connection opens");
         let account = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
-        let mut store = PoolMigrations::for_account(&mut conn, account)
-            .expect("the account-keyed store resolves the fixture account");
+        let mut store = PoolMigrations::for_account(
+            NetworkParams::Standard(Network::TestNetwork),
+            SystemClock,
+            &mut conn,
+            account,
+        )
+        .expect("the account-keyed store resolves the fixture account");
         store
             .replace_migration(state)
             .expect("the fixture state stores");
@@ -6882,8 +6895,13 @@ mod tests {
         // Nothing was persisted: the expired transfer still holds the old bytes, still Signed.
         let mut conn = Connection::open(&path).expect("the verification connection opens");
         let account_id = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
-        let store = PoolMigrations::for_account(&mut conn, account_id)
-            .expect("the account-keyed store resolves the fixture account");
+        let store = PoolMigrations::for_account(
+            NetworkParams::Standard(Network::TestNetwork),
+            SystemClock,
+            &mut conn,
+            account_id,
+        )
+        .expect("the account-keyed store resolves the fixture account");
         let stored = store
             .get_migration()
             .expect("the store reads")
@@ -7001,6 +7019,11 @@ mod tests {
         P: MigrationProver,
         P::Error: migration_finalize::ProveErrorClass + std::fmt::Display,
     {
+        // The proof comes out as a value now (nothing says `Proved` until it is consumed); these
+        // in-memory tests discharge it through `ProvedTransaction::apply` — the same call a
+        // store's `store_proved_transaction` makes on the state it persists — so the observable
+        // the assertions pin (`Signed -> Proved` on the state) is unchanged. Durable persistence
+        // is the store-backed tests' concern, not this wrapper's.
         migration_finalize::prove_due_transaction(
             &NetworkParams::Standard(Network::TestNetwork),
             prover,
@@ -7010,6 +7033,7 @@ mod tests {
             h(5_000),
             &mut OsRng,
         )
+        .map(|outcome| outcome.map(|proved| proved.apply(state)))
     }
 
     /// A test prover whose FIRST call fails with the configured error and whose later calls
@@ -7456,8 +7480,13 @@ mod tests {
     fn read_fixture_state(path: &std::path::Path, account: &[u8; 16]) -> MigrationState {
         let mut conn = Connection::open(path).expect("the verification connection opens");
         let account_id = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
-        let store = PoolMigrations::for_account(&mut conn, account_id)
-            .expect("the account-keyed store resolves the fixture account");
+        let store = PoolMigrations::for_account(
+            NetworkParams::Standard(Network::TestNetwork),
+            SystemClock,
+            &mut conn,
+            account_id,
+        )
+        .expect("the account-keyed store resolves the fixture account");
         store
             .get_migration()
             .expect("the store reads")
