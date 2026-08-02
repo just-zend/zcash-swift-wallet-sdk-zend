@@ -1978,43 +1978,65 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationProvePending(for account: AccountUUID) async throws -> Int {
-        // The sweep is CHUNKED: one proof per FFI call, with a suspension between calls. Each
-        // proof is seconds of CPU, and this method runs on the global `DBActor` — an uncapped
-        // call held that actor for the whole sweep, so every DB-bound read (the transactions
-        // list at app open, the migration flow's re-entry hydration) queued behind the full
-        // sweep. Yielding between single-proof calls bounds any queued read's wait to at most
-        // one proof. Sweep total time is unchanged; each chunk re-opens its context and
-        // re-reconciles, which is milliseconds against a multi-second proof.
+        // The sweep is CHUNKED (one proof per FFI call) and each chunk's blocking call runs OFF
+        // this actor: proof generation is seconds of pure CPU that never needed `DBActor` — the
+        // Rust side opens its own connection per call (WAL on the file, busy_timeout set, and
+        // the slipstream engine is already a concurrent writer by design), so holding a
+        // DB-access serializer through the compute starved every DB-bound read for the whole
+        // proof (field-caught 2026-08-03: the Migration Progress hydration's sequential reads
+        // each waited out a chunk — a multi-tens-of-seconds loader). Detaching the call and
+        // awaiting it suspends this method AT the actor, so queued reads interleave DURING a
+        // proof, not merely between proofs. The method keeps `@DBActor` so two sweeps can never
+        // interleave their bookkeeping should a second caller ever appear.
+        //
+        // THREAD-LOCALITY: the FFI last-error slot is thread-local, so the clear, the prove
+        // call, and the error-message read must all run inside the detached closure — on one
+        // thread. Only the already-materialized message crosses back.
+        let dbDataPath = dbData
+        let accountId = account.id
+        let networkId = networkType.networkId
+
+        // Local chunk outcome (`Result<Int32, String>` can't — `String` is no `Error`); routing
+        // the message into a `ZcashError` stays OUT of the detached closure, which must not
+        // capture `self`.
+        enum ProveChunk: Sendable {
+            case proved(Int64)
+            case failed(String)
+        }
+
         var totalProved = 0
         while true {
-            // Unlike the ambiguous sentinels above, `-1` is never a legitimate count, so the
-            // return value alone decides success. The last-error is still cleared first so the
-            // message this reads on failure cannot be a leftover from an earlier call.
-            zcashlc_clear_last_error()
+            let chunk = await Task.detached(priority: TaskPriority.utility) {
+                // `-1` is never a legitimate count, so the return value alone decides success.
+                // The last-error is cleared first so the message read on failure cannot be a
+                // leftover from an earlier call on this thread.
+                zcashlc_clear_last_error()
 
-            let proved = zcashlc_migration_prove_pending(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                1
-            )
-
-            // `-1` is the error sentinel; every non-negative value is a legitimate count.
-            guard proved >= 0 else {
-                throw migrationRoutedError(
-                    lastErrorMessage(fallback: "`migrationProvePending` failed with unknown error"),
-                    fallback: ZcashError.rustMigrationProvePending
+                let proved = zcashlc_migration_prove_pending(
+                    dbDataPath.0,
+                    dbDataPath.1,
+                    accountId,
+                    networkId,
+                    1
                 )
-            }
-            guard proved > 0 else {
-                return totalProved
-            }
-            totalProved += Int(proved)
 
-            // The seam this whole chunking exists for: let queued `DBActor` work run before the
-            // next proof.
-            await Task.yield()
+                guard proved >= 0 else {
+                    return ProveChunk.failed(
+                        lastErrorMessage(fallback: "`migrationProvePending` failed with unknown error")
+                    )
+                }
+                return ProveChunk.proved(proved)
+            }.value
+
+            switch chunk {
+            case let .failed(message):
+                throw migrationRoutedError(message, fallback: ZcashError.rustMigrationProvePending)
+            case let .proved(proved):
+                guard proved > 0 else {
+                    return totalProved
+                }
+                totalProved += Int(proved)
+            }
         }
     }
 
