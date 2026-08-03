@@ -5,6 +5,11 @@
 //  Created by Jack Grigg on 5/8/19.
 //  Copyright © 2019 Electric Coin Company. All rights reserved.
 //
+//  ACTOR DISCIPLINE: methods here are split READ (no `@DBActor`, carries a `DB-READ` audit
+//  marker) vs WRITE (`@DBActor`). The contract, the rule for new methods, and the re-pin
+//  re-audit rule live on the `DBActor` declaration in Utils/DBActor.swift — read it before
+//  adding or reclassifying a method.
+//
 // swiftlint:disable type_body_length
 import Foundation
 import libzcashlc
