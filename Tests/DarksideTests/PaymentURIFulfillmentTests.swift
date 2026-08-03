@@ -126,12 +126,12 @@ class PaymentURIFulfillmentTests: ZcashTestCase {
                 case .grpcFailure(_, let error):
                     XCTFail("transaction failed to submit with error:\(error.localizedDescription)")
                     return
-                case .success(txId: let txId):
+                case .success:
                     continue
-                case let .submitFailure(txId: txId, code: code, description: description):
+                case let .submitFailure(txId: _, code: code, description: description):
                     XCTFail("transaction failed to submit with code: \(code) - description: \(description)")
                     return
-                case .notAttempted(txId: let txId):
+                case .notAttempted:
                     XCTFail("transaction not attempted")
                     return
                 }

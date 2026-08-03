@@ -220,23 +220,10 @@ class ShieldFundsTests: ZcashTestCase {
 
         shouldContinue = false
 
-        var shieldingPendingTx: ZcashTransaction.Overview?
+        let shieldingPendingTx: ZcashTransaction.Overview? = nil
 
         // shield the funds
-        do {
-//            let pendingTx = try await coordinator.synchronizer.shieldFunds(
-//                spendingKey: coordinator.spendingKey,
-//                memo: try Memo(string: "shield funds"),
-//                shieldingThreshold: Zatoshi(10000)
-//            )
-//            shouldContinue = true
-//            XCTAssertEqual(pendingTx.value, Zatoshi(10000) - pendingTx.fee!)
-//            shieldingPendingTx = pendingTx
-            shieldFundsExpectation.fulfill()
-        } catch {
-            shieldFundsExpectation.fulfill()
-            XCTFail("Failed With error: \(error)")
-        }
+        shieldFundsExpectation.fulfill()
 
         await fulfillment(of: [shieldFundsExpectation], timeout: 30)
 
