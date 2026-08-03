@@ -117,6 +117,57 @@ Every public API parameter that carries a domain value — key material, seeds, 
 - When logging errors, log `error.message` or `localizedDescription` (generic, code-prefixed, safe). NEVER log errors via `String(describing:)`, `"\(error)"`, or `dump(...)` — default reflection prints the associated values, and that output ends up in logs users mail to support.
 - New error cases added to `Error/ZcashErrorCodeDefinition.swift` must keep raw input out of their `message` text; carry context via the error code, not the offending value.
 
+## Database access: views only, everything else through the FFI
+
+`dataDb` is owned by Rust. `zcash_client_sqlite` defines both its tables and a
+set of `v_*` views, and only the views are a supported interface. The tables
+are an implementation detail that upstream reshapes freely, and a schema
+migration that leaves a view's columns intact can still rename, split or drop
+the tables underneath it.
+
+**Swift may read `v_transactions` and `v_tx_outputs` directly. Every other
+query goes through the FFI.** Never read a table from Swift, and never write
+anything at all: writes belong to Rust, which owns invariants across tables
+that no single statement can preserve.
+
+Those two views are the client-facing read surface. `zcash_client_sqlite`
+defines other `v_*` views, but they serve the scanning and note-commitment
+machinery inside Rust and are not an interface for this SDK; treat them like
+tables. The definitions live in `zcash_client_sqlite/src/wallet/db.rs` in
+[librustzcash][lrz].
+
+[lrz]: https://github.com/zcash/librustzcash
+
+### Why those two, and when to ask for another
+
+Everything the FFI returns is serialized and copied across the boundary, so a
+query yielding many rows can cost more that way than reading it directly.
+That is why `v_transactions` and `v_tx_outputs`, which back the transaction
+history, are exempt at all.
+
+Another query with the same bulk property may deserve the same treatment, but
+that is not a call to make on your own. Do not add a direct read silently:
+flag it to the user, say what the query returns and roughly how much data it
+moves, and let them decide. If they agree, record it in the table below so the
+next reader sees a sanctioned exception rather than a violation.
+
+### Where direct access lives
+
+All of it is under `Sources/ZcashLightClientKit/DAO/`. Adding a query anywhere
+else is a mistake; adding one that names a table is a mistake wherever it is.
+
+| File | Reads | Status |
+|---|---|---|
+| `TransactionDao.swift` | `v_transactions`, `v_tx_outputs` | views, fine |
+| `BlockDao.swift` | `blocks` | **table, pre-existing exception** |
+
+`PagedTransactionDao.swift` and `UnspentTransactionOutputDao.swift` name no
+entities of their own.
+
+The exception predates this rule and is being migrated to the FFI. Do not copy
+it, and do not add to it: if you need something it exposes, add an FFI call
+rather than a second table reader.
+
 ## Pre-push validation
 
 Before opening a PR or pushing to an existing PR branch, run the checks CI runs.
