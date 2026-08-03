@@ -10,6 +10,10 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- `SimpleConnectionProvider`'s lazy connection init is now lock-guarded: two concurrent
+  first-touch reads (possible since read-only calls left the database actor) could race the
+  unsynchronized check-then-assign and construct two SQLite connections, silently dropping
+  one and its serial queue with it.
 - The Slipstream stall watchdog no longer fires on a restarted engine's inherited history: the
   engine-owned stall span can survive a stop→start, so a restart's first snapshots reported
   stall time accumulated before — and across — a deliberate stop (a 497 s "stall" of which ~4.5
