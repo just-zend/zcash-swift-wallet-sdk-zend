@@ -10,14 +10,6 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
-- The migration prove sweep no longer holds the wallet-database serializer while proofs are
-  computed: each single-proof chunk's blocking FFI call now runs detached at utility priority and
-  is awaited, releasing `DBActor` for the whole multi-second computation instead of only between
-  chunks. Database-bound reads (the transactions list, the migration flow's screen hydration)
-  interleave DURING a proof, so opening those screens mid-sweep no longer shows a
-  tens-of-seconds loader. Safe by construction: the Rust side opens its own connection per call
-  (WAL, busy_timeout), and the FFI's thread-local last-error is cleared and read inside the
-  detached closure on one thread.
 - The Slipstream stall watchdog no longer fires on a restarted engine's inherited history: the
   engine-owned stall span can survive a stop→start, so a restart's first snapshots reported
   stall time accumulated before — and across — a deliberate stop (a 497 s "stall" of which ~4.5
