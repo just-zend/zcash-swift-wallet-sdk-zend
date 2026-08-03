@@ -15,8 +15,39 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure through the thread-local last-error channel with `NULL` / `false` / `-1` sentinels. Two
   stable message prefixes name the actionable conditions: `MIGRATION_PLAN_STALE` and
   `MIGRATION_PROVING_UNAVAILABLE`.
-  - State: `zcashlc_migration_state`, `_progress`, `_is_note_split_needed`,
-    `_has_overdue_transfers`, `_has_invalid_transfers`, `_pending_transfer_proposal`.
+  - State: `zcashlc_migration_advance_step` (drives upstream `advance_migration` and marshals its
+    decision into `FfiMigrationAdvanceStep`, freed by
+    `zcashlc_free_migration_advance_step`; `NULL` with no last error means no run is stored; the
+    step discriminants are exported as `ZCASHLC_ADVANCE_STEP_*` constants; upstream `Reevaluate`
+    and `Replan` map to the compatibility `_ATTEND` case), `_progress`,
+    `_is_note_split_needed`, `_has_overdue_transfers`, `_has_invalid_transfers` (true iff the
+    NON-terminal stored run holds an engine-`Invalid` or expired-unmined transaction; a cancelled
+    run answers `false`), `_has_ready_broadcast` (the sync-gate's work-pending predicate:
+    `1`/`0`/`-1`, true iff a PROVED, due, unexpired, valid transaction is servable right now —
+    `Signed` or awaiting-proof rows never gate sync), and `_pending_transfer_proposal`.
+    `_has_overdue_transfers`, `_has_ready_broadcast` and `_next_due_transfer` (below) take an
+    `estimated_tip: i64` parameter (`-1` = disabled) evaluated under the upstream engine's
+    `DuenessTargets` rule: the estimate may only ACCELERATE scheduled-height due-ness, expiry and
+    boundary settledness stay on the SCANNED tip, and a broadcast whose expiry only the ESTIMATED
+    target has passed is withheld (protective, reversible) without ever being treated as expired.
+  - Sync scheduling: `zcashlc_migration_sync_wakeups` returns `FfiMigrationSyncWakeups` (freed by
+    `zcashlc_free_migration_sync_wakeups`) — the stored run's minimal sync/proving wake-up schedule
+    as of the scanned tip, jitter re-drawn on every call; `_block_rate_samples` returns
+    `FfiBlockRateSamples` (freed by `zcashlc_free_migration_block_rate_samples`) — up to `window`
+    most-recently-scanned `(height, header time)` rows, ascending, the raw input a wall-clock
+    chain-tip estimator projects from (a missing wallet-database file, like a missing `blocks`
+    table, is the benign empty answer, and a coerced read failure is logged rather than silent);
+    both read-only/local-database-only. There is no repair entry point: every repair is the
+    engine's, performed inside `advance_migration` — a funding note spent outside the migration is
+    discovered by the satisfiability oracle from scanned wallet data, a recorded broadcast is
+    promoted to mined, and a transaction this process submitted whose broadcast was never recorded
+    (a crash, or a failed persist, between submitting and recording) is recognized by the id the
+    engine derived when it BUILT it and promoted just the same.
+  - Batching: `zcashlc_migration_batch_pczts_by_actions` (pure, no wallet database) splits an
+    ORDERED array of transaction action-weights (16 per preparation, 3 per transfer) into signer
+    sessions bounded by a caller-supplied action budget, returning `FfiMigrationBatchSizes` (freed by
+    `zcashlc_free_migration_batch_sizes`) — the per-session transaction COUNTS, summing to the input
+    length, for the caller to re-slice its own ordered PCZT array by.
   - Note split: `zcashlc_migration_prepare_note_split`, `_sign_note_split`.
   - Proposal and commit: `zcashlc_migration_residual_after_migration`, `_propose_transfers`,
     `_sign_and_store_schedule`.
@@ -25,7 +56,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     scanned or retained. Call it from the sync path.
   - Delivery: `zcashlc_migration_next_due_transfer` never proves, and its
     `FfiPreparedTransfer.status` separates `MigrationNothingDue` from `MigrationAwaitingProof` and
-    `MigrationReady`; then `_extract_broadcast_tx`, `_record_transfer_result`, and
+    `MigrationReady`; then `_extract_broadcast_tx`, `_record_transfer_result` (whose terminal
+    tags — 2 invalid, 3 expired — record `report_broadcast_failure` testimony stamped at the
+    observed wallet tip; the next drive call adjudicates it through sqlite's satisfiability
+    oracle, while unknown and already-mined rows remain no-ops), and
     `_record_immediate_run`, which records a send-max sweep built outside the engine.
   - Recovery: `zcashlc_migration_restart_step`, and `_refresh_stale_transfers`, which rebuilds every
     expired transfer of the stored run and returns the full stored schedule, persisting
@@ -37,11 +71,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     valid "nothing was spendable"); `_unlock_residual` returns the cleared-output count.
   - Estimation: `zcashlc_migration_estimate_runs` returns `FfiMigrationRunEstimate` (a per-run
     `FfiRunEstimate` plus the final residual), freed by `zcashlc_free_migration_run_estimate`. A
-    zero balance is the zero-run estimate, not an error.
+    zero balance is the zero-run estimate, not an error. `FfiRunEstimate` gains trailing `actions`
+    (the signing workload in Orchard-family actions: 16 per preparation transaction, 3 per transfer)
+    and `keystone_rounds` (the Keystone-class signing-round count the optimal `MinRounds` packing
+    computes for the run) fields.
   - Status: `zcashlc_migration_transaction_statuses` returns one row per committed migration
     transaction — stable id, kind, lifecycle state, scheduled/expiry/mined heights, the broadcast
-    txid while in mempool, readiness, next action, blocking reason — freed by
+    txid while in mempool, readiness, next action, blocking reason, the `depends_on` heap array of
+    ids that must mine first, `anchor_boundary` (the bucketed boundary a TRANSFER's anchor was
+    drawn against; `-1` always for a preparation), and a trailing compatibility `invalid_reason`.
+    Upstream unsatisfiability marks and open broadcast-failure reports project to state `5` /
+    blocker `6` without changing the Swift ABI — freed by
     `zcashlc_free_migration_transaction_statuses`. No stored run yields an empty container.
+  - `FfiMigrationSchedule` gains a trailing `preparations`/`preparations_len` heap array of
+    `FfiMigrationPreparationStep` (id, layer, index, broadcast height, and the whole preceding
+    layer's ids as its `depends_on`) — the note-preparation transactions of the same plan, which the
+    transfer rows alone do not surface.
 - The echo parameters on the commit calls (`ids`, `amounts`, heights and duration on the schedule
   commits; `output_values` and `fee` on the note-split commit) are verified consent echoes, checked
   against the previewed plan or, once committed, the stored state. A mismatch surfaces
@@ -66,12 +111,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Keystone rejects the batch with "None of inputs belongs to the provided account".
 - `Balance` (inside `FfiAccountBalance` / `FfiWalletSummary`) gains a trailing `locked_value` field,
   keeping "the sum of the fields is the account's total" true.
+- `zcashlc_migration_propose_immediate_transfers` — briefly part of this unreleased cycle, never
+  exposed through the Swift welding and removed again before release — is gone. The immediate
+  (single-transaction) lane is built entirely on the general-purpose
+  `zcashlc_propose_send_max_transfer` (called with `orchard_only: true`) instead, which the engine
+  itself never touches.
 
 ### Changed
-- `zcashlc_migration_state` / `_progress`: a mined immediate (send-max) run is consumed. It derives
-  no migration state and masks a stale engine `Complete`, so a host goes quiet once the sweep mines
-  instead of reporting a per-run completion. An unmined, unexpired immediate run still derives
-  `InProgress`. `FfiMigrationProgress` gains a trailing `is_immediate` boolean.
+- `zcashlc_migration_state` is removed before any release exposed it, along with the state machine
+  it served (`MigrationState`/`Complete`/`InProgress`/etc. never crossed the FFI as a stable shape).
+  `zcashlc_migration_advance_step` replaces it: a verbatim, un-opinionated marshal of the upstream
+  engine's own `next_step`, with no SDK-side derivation on top. `_progress` is otherwise unchanged
+  in shape and keeps its own `is_immediate`-aware behavior: a mined immediate (send-max) run is
+  consumed — it reports `is_present: false` and masks a stale engine `Complete`, so a host goes
+  quiet once the sweep mines instead of reporting a per-run completion — while an unmined, unexpired
+  immediate run still reports present with `is_immediate: true`. `FfiMigrationProgress` gains a
+  trailing `is_immediate` boolean.
 - The anchor bucket interval is selected per network: mainnet keeps the ZIP 318 144-block grid, while
   testnet and custom-parameter networks retain anchors every 12 blocks and compress the transfer and
   preparation delays by the same factor, so a migration crosses enough boundaries to be exercised in
@@ -80,16 +135,53 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Note locks are owner-keyed: the residual lock is keyed to a deterministic per-account owner, which
   makes re-locking idempotent, and `zcashlc_migration_unlock_residual` still clears the account's
   locks wholesale.
+- `zcashlc_migration_record_transfer_result`'s success tag no longer records the reported txid: the
+  engine marks the broadcast under the id it derived when it built the transaction. The reported
+  value is now CHECKED against that id, and a mismatch is an error — the two can differ only if the
+  platform submitted something other than the artifact the engine handed it, which is worth naming
+  rather than silently recording a broadcast of a transaction that was never sent.
 - The migration store connection uses the same 15 s `busy_timeout` as the wallet handle, so a
   `zcashlc_migration_*` call racing an engine write waits for the lock instead of surfacing
   `database is locked` early.
+- Terminal rejection evidence is reported to the upstream engine, whose satisfiability oracle
+  returns `Reevaluate` or `Replan`; the FFI projects those onto its existing `Attend` case. The
+  `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table is retired: its schema
+  migration is no longer registered. On the first migration call, surviving rejection rows are
+  replayed at the current scanned height, funding-spent rows are left for the oracle to rediscover,
+  and the table is dropped.
+- The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
+  hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
+  doomed-broadcast withhold (above).
+- Mined-transaction promotion is the upstream engine's: `advance_migration` sweeps every in-flight
+  transaction and promotes the ones the wallet's scan has seen mine, so the drive path no longer
+  reconciles first, and the read-only entry points reconcile through the engine's own
+  `PoolMigrationRead::mined_height` rather than `WalletRead::get_tx_height`. That tightens the
+  bound from the chain tip to the FULLY-SCANNED height — a promotion may not rest on a block
+  outside the region a reorg truncation would roll back — and is the same bound the drive path
+  promotes under, so a status read can no longer report `Mined` for a row `advance_migration`
+  would refuse to promote.
 
 ### Fixed
+- The migration prover's transient-vs-hard error classification (`ProveErrorClass::is_transient`,
+  behind `zcashlc_migration_prove_pending` / `_next_due_transfer`): `UnknownSpentNote` (a
+  late-mining dependency's note the wallet has not seen yet) and `Tree(ShardTreeError::Query(_))`
+  (shard-tree query races during sync — this exact case crash-looped a prove batch on Android on
+  2026-07-28) now correctly resolve as the transient "retry on a later sweep" outcome instead of a
+  hard `MIGRATION_PROVING_UNAVAILABLE:` error; the non-query `Tree` variants (`Storage`/`Insert`)
+  stay hard, since no amount of syncing repairs a failing persistence layer or a corrupt tree
+  write, and every transient deferral is now logged with the row id (a stalled sweep was
+  previously silent). `IronwoodTreeUnavailable` moves the other way, out of the transient set: the
+  backend tracks no Ironwood commitment tree at all, which no amount of syncing ever produces, so
+  treating it as transient could retry forever instead of surfacing the real condition.
 - `zcashlc_get_memo` accepts the Ironwood output pool code (4); an Ironwood note id was rejected as
   an unrecognized shielded protocol.
 - Due-ness and expiry are evaluated on the engine's target-height contract (`chain tip + 1`) in every
   read path, with the "never expires" case honoured. Transfers now become due and expire one block
-  earlier, consistently, and a doomed transfer is no longer served for broadcast.
+  earlier, consistently, and a doomed transfer is no longer served for broadcast. This now includes
+  the `zcashlc_migration_prove_pending` sweep — the one remaining raw-tip caller — so a preparation
+  scheduled exactly at the target is proved on the sweep that sees it rather than one block late.
+- An `estimated_tip` at or beyond `u32::MAX` saturates below the height ceiling instead of
+  overflowing the `+ 1` target conversion.
 - `FfiMigrationProgress.next_transfer_ready_at_height` reports the next transfer still awaiting
   broadcast rather than one already in the mempool.
 - Transfer amounts are read from the engine's `crossing_values()` instead of being re-derived at

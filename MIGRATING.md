@@ -1,5 +1,198 @@
 # Migrating from previous versions to _Unreleased_
 
+## The SDK-side migration state machine is removed — `migrationAdvanceStep` replaces it
+
+The public 5-state `MigrationState` enum, `MigrationAttentionReason`, and
+`migrationState(accountUUID:)` are removed (this was never in a released SDK, so there is no
+deprecation period). The SDK no longer derives a state machine of its own on top of the engine at
+all: `migrationAdvanceStep(accountUUID:) async throws -> MigrationAdvanceStep?` drives the
+upstream engine's public `advance_migration` API. The broadcast-first ordering and prove step's
+kind are native to the pinned librustzcash revision (upstream PR #2871); its `Reevaluate` and
+`Replan` results project onto the existing `.requiresAttention(id:)` case.
+`nil` means no run is stored at all (nothing was ever committed for the account); a stored run
+answers `.requiresAttention(id:)`, `.prove(id:kind:)`, `.broadcast(id:)`, `.rebuild(id:)`,
+`.waiting`, or the terminal `.complete` — priority order attend > broadcast > prove > rebuild, and
+a cancelled run also reports `.complete` rather than ever being driven further.
+
+Every `MigrationState` case a host rendered UI off has a direct replacement — table below — but note
+the shape is different: `migrationAdvanceStep` answers "what does the run need next", not "what is
+the run's overall status", so a host that switched over the old 5 cases now reads several signals
+together instead of one:
+
+| Old `MigrationState` case | Replacement |
+| --- | --- |
+| `.notStarted` | `migrationAdvanceStep(accountUUID:) == nil && migrationProgress(accountUUID:) == nil` |
+| `.splitPendingConfirmation` | `!migrationTransactionStatuses(accountUUID:).isPreparationPhaseComplete` |
+| `.inProgress(progress)` | `migrationAdvanceStep` is `.prove`/`.broadcast`/`.waiting` + `migrationProgress(accountUUID:)` for the progress payload |
+| `.requiresAttention(.invalidTransfer)` | `migrationAdvanceStep` is `.requiresAttention(id:)` (the engine surfaces it FIRST, ahead of any actionable step); the per-row detail is the new `.invalid(reason:)` case of `MigrationTransactionStatus.State` (`fundingSpent` / `rejectedInvalid` / `rejectedExpired`, with `blockedOn == .invalid`), and `hasInvalidMigrationTransfers(accountUUID:)` remains the boolean check |
+| `.requiresAttention(.transferExpired)` | `migrationAdvanceStep` is `.rebuild(id:)` (an already-expired PREPARATION instead reports the new `.expired` case of `MigrationTransactionStatus.Blocker` in `migrationTransactionStatuses(accountUUID:)` — its remedy is `restartCurrentMigrationStep(accountUUID:)`, not a rebuild) |
+| `.complete` | `migrationAdvanceStep == .complete` (per-run, including a cancelled run — see below) |
+
+`.complete` is **per-run, never "nothing left to migrate"**: whether a migratable balance remains
+(several successive runs, or funds received later) is answered by
+`proposeMigrationTransfers(accountUUID:)` alone — an empty schedule means no. This was already true
+of the removed `MigrationState.complete` and carries over unchanged to `migrationAdvanceStep ==
+.complete`.
+
+Discharging each step:
+
+- `.requiresAttention(id:)` → a transaction of the run is `.invalid(reason:)` (its funding note was
+  spent outside the migration, or the network rejected its broadcast) and no automatic step can
+  advance the run right now: SYNC and call `migrationAdvanceStep(accountUUID:)` again, which
+  adjudicates against the newly scanned data and re-offers the work where the obstruction was
+  transient. Only if attention persists, surface the attention UX over the invalid
+  `migrationTransactionStatuses(accountUUID:)` row(s) and then `restartCurrentMigrationStep(accountUUID:)`
+  (cancel and re-plan). Invalid rows are excluded from delivery and from the sync gate — a dead
+  transfer is never served and gates nothing.
+- `.broadcast(id:)` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)` —
+  submit and end the session (a broadcast session must not sync).
+- `.prove(id:kind:)` with a `.transfer(crossing:)` kind → `finalizeReadyMigrationTransfers(accountUUID:)`
+  at a sync wake-up (see `migrationSyncWakeups(accountUUID:)`); the broadcast then follows in its own
+  LATER session. Proving has no deadline of its own — a missed wake-up defers the proof, never
+  invalidates it.
+- `.prove(id:kind:)` with a `.preparation(layer:index:)` kind → the preparation is due by
+  construction and may be proved (`finalizeReadyMigrationTransfers`) and broadcast at the SAME
+  wake-up.
+- `.rebuild(id:)` → `refreshStaleMigrationTransfers(accountUUID:usk:)` (needs spend authority — a
+  spending key in-process, or the external-signer re-serve ceremony for `usk: nil`).
+- `.waiting` → nothing is actionable now: register OS wake-ups at the heights
+  `migrationSyncWakeups(accountUUID:)` returns, plus each `migrationTransactionStatuses(accountUUID:)`
+  row's `scheduledHeight` for the broadcast windows.
+
+### `executeNextPendingMigrationTransfer` is broadcast-only and returns `MigrationTransferAttempt`
+
+`executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)` now returns
+`MigrationTransferAttempt` instead of an optional `MigrationTransferResult`:
+
+- `.nothingDue` — nothing scheduled yet, dependencies unmined, rows awaiting an external signature,
+  or everything already broadcast.
+- `.awaitingProof(id:)` — the next-due transaction has not been proved yet; run
+  `finalizeReadyMigrationTransfers(accountUUID:)` at a sync wake-up, then retry in a later broadcast
+  session.
+- `.executed(MigrationTransferResult)` — a broadcast was attempted and its outcome recorded.
+
+The call is now strictly BROADCAST-ONLY: it never proves. Proving moved to the new
+`finalizeReadyMigrationTransfers(accountUUID:) async throws -> Int` sweep member, which proves every
+migration transaction whose anchor the wallet can resolve right now and returns how many were
+proved (`0` is the ordinary "nothing left to prove" answer). Run it at sync wake-ups
+(`migrationSyncWakeups(accountUUID:)`) — never in a broadcast session, since proving needs the
+wallet's commitment tree and takes real time, while a broadcast session must stay a pure delivery
+step.
+
+### Renamed: `rescheduleOverdueMigrationTransfer` → `pendingMigrationTransferProposal`
+
+Purely a rename (same signature, same behavior — a straight delegation to the engine-backed
+pending-proposal accessor). Update call sites mechanically.
+
+### Signing-session counts are precomputed by the engine, not derived in Swift
+
+`MigrationRunEstimate.Run.signingSessions(maxTransactionsPerSession:)` and
+`MigrationRunEstimate.totalSigningSessions(maxTransactionsPerSession:)` are removed. They computed
+`ceil(transactions / maxTransactionsPerSession)`, which UNDERCOUNTS the real signing workload:
+external-signer effort is actions, not a transaction count (a preparation transaction weighs 16
+Orchard-family actions, a transfer 3), so — for example — 6 preparations plus 1 transfer is 99
+actions, one Keystone round over the 96-action budget, needing 2 rounds, while any count-based
+ceiling admitting ≥ 7 transactions per session claimed 1.
+
+Replacement: `MigrationRunEstimate.Run` gains `actions: Int` (the signing workload) and
+`keystoneSigningSessions: Int` (the number of Keystone signing ROUNDS the upstream engine's own
+optimal `MinRounds` packing computes for the run, under the new `MigrationSigningBudget.keystone`
+== 96 budget), and `MigrationRunEstimate` gains the cross-run sums `totalActions`/
+`totalKeystoneSigningSessions`. Both are read-only, verbatim engine passthrough — there is no
+Swift-side computation to call with a different budget; for an actual PCZT batch (any budget, order
+preserved) use the new `Synchronizer.batchMigrationPcztsForSigning(_:maxActionsPerSession:)`
+instead.
+
+### Model initializer changes
+
+- `MigrationTransactionStatus.init(...)` gains two required parameters: `dependsOn: [UInt32]` (the
+  ids of the same run's transactions that must mine before this one can be built or broadcast; empty
+  when it depends on nothing) and `anchorBoundaryHeight: BlockHeight?` (the bucketed boundary a
+  TRANSFER's anchor was drawn against; always `nil` for a preparation, which anchors near-tip at
+  proving time instead of a drawn boundary). A new `Array<MigrationTransactionStatus>.isPreparationPhaseComplete`
+  computed property answers `.splitPendingConfirmation`'s replacement above.
+- `MigrationUnsignedTransferPczt.init(...)` gains a required `actions: Int` (the signer action
+  weight for budget batching — 16 for a preparation, 3 for a transfer; `0` on the signed
+  counterparts `applyKeystoneBatchSignatures(pczts:batchSignResponse:)` reconstructs, which carry no
+  stored kind to weigh).
+- `MigrationSchedule.init(...)` gains a required `preparations: [MigrationPreparationStep]` (the
+  note-preparation transactions of the same plan — the transfer rows alone do not surface the
+  preparations that mint their funding notes). `Codable` decode is back-compatible: a copy persisted
+  before this field existed decodes it as an empty array.
+- `MigrationSchedule`'s `encode(to:)` deliberately OMITS `proposalHandle`: the handle identifies a
+  process-lifetime native plan cache entry, so no persisted copy could ever identify a live plan —
+  every decoded copy (round-tripped or legacy) therefore carries handle `0`, the documented
+  "re-propose instead of committing a persisted schedule" contract, by construction.
+- `MigrationTransactionStatus.State` gains `.invalid(reason: MigrationInvalidReason)` (with
+  `MigrationInvalidReason.fundingSpent` / `.rejectedInvalid` / `.rejectedExpired`) and
+  `MigrationTransactionStatus.Blocker` gains `.invalid`: the engine's event-recorded death states
+  (a foreign spend of a funding note, or a terminal network rejection). Chain inclusion outranks
+  the mark — a row the wallet's scan has observed mined reports `.mined`, never `.invalid`. An
+  exhaustive `switch` over either enum stops compiling until the new case is handled.
+
+### New members
+
+`finalizeReadyMigrationTransfers(accountUUID:)`,
+`migrationSyncWakeups(accountUUID:)`, `estimatedMigrationChainTip()`,
+`estimatedMigrationSecondsPerBlock()`,
+`batchMigrationPcztsForSigning(_:maxActionsPerSession:)`, and `hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)`
+(the pre-existing `hasOverdueMigrationTransfers(accountUUID:)` becomes a convenience overload
+defaulting `useEstimatedTip` to `false`). The two `estimated*` members take NO account: the
+projection reads the wallet-shared blocks table, so — like the batching group — one answer serves
+every account (an earlier unreleased iteration carried an unused `accountUUID:`; drop the argument).
+See each member's doc comment for its full contract; the estimated-tip and privacy-buffer notes
+below cover the cross-cutting parts.
+
+There is no repair entry point at all, and nothing to call to get one. Every repair the SDK once
+exposed is now the engine's, performed on every `migrationAdvanceStep(accountUUID:)`: a funding
+note spent outside the migration is discovered by the satisfiability oracle from scanned wallet
+data; a recorded broadcast is promoted to mined; and a transaction this process submitted whose
+broadcast was never recorded — a crash, or a failed persist, between submitting and recording — is
+recognized by the id the engine derived when it BUILT it, and promoted just the same. An earlier
+unreleased iteration exposed that last one as `reconcileUnrecordedMigrationBroadcasts(accountUUID:)`
+(and before that, `reconcileMigrationInvalidations(accountUUID:)`); delete the call.
+
+### `useEstimatedTip` parameters
+
+`executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)` and
+`hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)` gain a `useEstimatedTip: Bool`
+parameter (protocol-extension overloads without it default to `false`, so existing two/one-argument
+call sites keep compiling unchanged). `true` opts the due-ness check into the wall-clock chain-tip
+estimate `estimatedMigrationChainTip()` projects from the most recently scanned blocks'
+header times: the estimate may only ACCELERATE scheduled-height due-ness (the effective tip is
+`max(scanned, estimated)`) and expiry is always evaluated against the SCANNED tip, never the
+estimate — so a wallet that wakes between syncs can deliver an already-due transfer without first
+paying for a sync, and an estimator failure silently degrades to the scanned-tip behavior rather
+than blocking or crashing the call.
+
+### The sync gate's predicate: privacy buffer, in-flight marker, READY broadcast
+
+`isMigrationSyncBlocked()`/`migrationSyncBlockedStream` block sync, per account, for exactly three
+reasons:
+
+1. **Privacy buffer** — network-scaled after every migration broadcast: 600 s on mainnet
+   (unchanged from the previous fixed value), 180 s on testnet/regtest — the full 10 minutes only
+   slowed QA cycles down there, where traffic-correlation privacy is moot.
+   `Synchronizer.migrationPrivacySyncBufferDuration` still reports the value a real synchronizer
+   resolves for its own network; the network-less protocol-extension default keeps forwarding the
+   mainnet constant.
+2. **In-flight broadcast marker** — a 120 s self-expiring marker blocks sync from just before a
+   migration submit hits the network until its outcome is recorded, so the engine's in-flight
+   sweep never meets a transfer that is neither recorded broadcast nor yet visible on chain. The marker is (re-)armed at the last pre-submit
+   instant — after the Tor bootstrap — so a slow bootstrap does not burn its window, and a marker
+   observed implausibly far in the future (a backwards clock step) is clamped/ignored rather than
+   wedging sync.
+3. **A READY broadcast is waiting** — a PROVED, schedule-due, unexpired, valid transfer the wallet
+   should serve (`executeNextPendingMigrationTransfer`) instead of syncing (ZIP 318's
+   broadcast-or-sync session split). This clause is estimate-ACCELERATED: the wall-clock chain-tip
+   estimate may only bring due-ness forward (the scanned tip is asked first), never decide expiry.
+   It deliberately does NOT gate on `hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)`:
+   that broader query also counts due-but-unproved `Signed` rows, whose proofs are produced AT
+   sync wake-ups — gating sync on them would starve the very work that clears them, so a `Signed`
+   or awaiting-proof row never blocks sync. `hasOverdueMigrationTransfers` remains available as an
+   informational query (re-arm background execution, launch reconciliation); it is no longer
+   consulted by any gate path.
+
 ## The pool-migration surface rides the final engine
 
 The Orchard→Ironwood migration group (never in a released SDK) is rewired onto the final engine

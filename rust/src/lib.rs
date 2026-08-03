@@ -102,6 +102,7 @@ mod migration_finalize;
 mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
+mod retained_marks;
 mod tor;
 // Voting is gated off on this line: the `zcash_voting` dependency is commented out in
 // Cargo.toml (see there), so the module and its `zcashlc_voting_*` symbols are not compiled.
@@ -301,18 +302,35 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-07-08.v0.7-p1b-alternates",
+        zcashlc_build = "2026-08-02.v0.13-proved-tx-wallet-persistence",
         "tracing initialized (zcash_client_backend capped at WARN)"
     );
 
     // Log panics instead of writing them to stderr.
     log_panics::init();
 
-    // Manually build the Rayon thread pool, so we can name the threads.
-    rayon::ThreadPoolBuilder::new()
-        .thread_name(|i| format!("zc-rayon-{}", i))
-        .build_global()
-        .expect("Only initialized once");
+    // Manually build the Rayon thread pool, so we can name the threads — and, on Apple
+    // platforms, drop every worker to UTILITY QoS. Halo2 proving saturates all cores through
+    // this pool for seconds per proof; at default priority that starves the UI (an app-open
+    // prove sweep froze interactive screens for the sweep's whole duration). UTILITY keeps
+    // full-width proving when the device is idle (the overnight BGTask path) while letting
+    // user-interactive work preempt it. Thread count is deliberately unchanged.
+    #[cfg(target_vendor = "apple")]
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(
+            qos_class: core::ffi::c_uint,
+            relative_priority: core::ffi::c_int,
+        ) -> core::ffi::c_int;
+    }
+    #[cfg(target_vendor = "apple")]
+    const QOS_CLASS_UTILITY: core::ffi::c_uint = 0x11;
+
+    let pool_builder = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("zc-rayon-{}", i));
+    #[cfg(target_vendor = "apple")]
+    let pool_builder = pool_builder.start_handler(|_| unsafe {
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    });
+    pool_builder.build_global().expect("Only initialized once");
 
     debug!("Rust backend has been initialized successfully");
     cfg_if::cfg_if! {
@@ -4950,6 +4968,29 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
         } else {
             TestNetwork
         };
+
+        // [B6, second half] Persist the anchor-retention marks the engine's in-memory trees
+        // draw but its flush never writes: the open-time deep-history heal spares only ids
+        // present in the SQLITE store's retained set, so reconcile the marks BEFORE any
+        // engine session (and with it the heal) exists — including the E-3 snapshot seed's
+        // own `WalletSession::open` a few lines below, which already runs that heal on
+        // every open. Non-fatal by design — a wallet that cannot be marked must still open
+        // and sync.
+        let network_params = NetworkParams::Standard(network);
+        match unsafe { wallet_db(db_data, db_data_len, network_params) }.and_then(|mut wallet| {
+            retained_marks::reconcile_retained_anchor_marks(&mut wallet, &network_params)
+        }) {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(
+                    marks = n,
+                    "retained anchor marks reconciled into the wallet store"
+                )
+            }
+            Err(e) => {
+                tracing::warn!(%e, "retained anchor-mark reconcile failed (non-fatal) — continuing")
+            }
+        }
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)

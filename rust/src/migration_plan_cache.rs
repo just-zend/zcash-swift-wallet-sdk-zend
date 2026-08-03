@@ -23,10 +23,9 @@
 //! the app re-proposes, rather than silently recomputing a fresh, differently-randomized plan the
 //! user never saw or approved.
 //!
-//! Each entry also records whether the plan was previewed through the IMMEDIATE lane
-//! (`zcashlc_migration_propose_immediate_transfers`), so the commit path knows to rewrite the
-//! committed transfers' scheduled heights to the commit height (everything due at once) instead
-//! of keeping the drawn ZIP 318 spread.
+//! Each entry also records whether the plan was previewed through the IMMEDIATE lane, so the
+//! commit path knows to rewrite the committed transfers' scheduled heights to the commit height
+//! (everything due at once) instead of keeping the drawn ZIP 318 spread.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

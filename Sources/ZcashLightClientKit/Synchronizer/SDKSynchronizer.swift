@@ -1206,12 +1206,31 @@ public class SDKSynchronizer: Synchronizer {
     // mutual-exclusion lock: sync and migration broadcasts must never share a session, and hosts
     // still sequence sessions themselves.
 
-    public func migrationState(accountUUID: AccountUUID) async throws -> MigrationState {
-        try await migrationHost.migration(for: accountUUID).migrationState()
+    public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep? {
+        try await migrationHost.migration(for: accountUUID).advanceStep()
     }
 
     public func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress? {
         try await migrationHost.migration(for: accountUUID).migrationProgress()
+    }
+
+    public func finalizeReadyMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
+        try await migrationHost.migration(for: accountUUID).finalizeReadyTransfers()
+    }
+
+
+    public func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
+        try await migrationHost.migration(for: accountUUID).syncWakeups()
+    }
+
+    public func estimatedMigrationChainTip() async throws -> BlockHeight {
+        // Wallet-scoped (the samples come from the shared blocks table), so this lives on the
+        // host, not on a per-account actor.
+        try await migrationHost.estimatedChainTip()
+    }
+
+    public func estimatedMigrationSecondsPerBlock() async throws -> Double {
+        try await migrationHost.estimatedSecondsPerBlock()
     }
 
     public func migrationTransactionStatuses(accountUUID: AccountUUID) async throws -> [MigrationTransactionStatus] {
@@ -1270,10 +1289,12 @@ public class SDKSynchronizer: Synchronizer {
 
     public func executeNextPendingMigrationTransfer(
         accountUUID: AccountUUID,
-        options: MigrationNetworkPrivacyOptions
-    ) async throws -> MigrationTransferResult? {
+        options: MigrationNetworkPrivacyOptions,
+        useEstimatedTip: Bool
+    ) async throws -> MigrationTransferAttempt {
         try await throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).executeNextPendingTransfer(options: options)
+        return try await migrationHost.migration(for: accountUUID)
+            .executeNextPendingTransfer(options: options, useEstimatedTip: useEstimatedTip)
     }
 
     public func isMigrationSyncBlocked() async -> Bool {
@@ -1288,16 +1309,16 @@ public class SDKSynchronizer: Synchronizer {
         migrationHost.privacySyncBufferDuration
     }
 
-    public func hasOverdueMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
-        try await migrationHost.migration(for: accountUUID).hasOverdueTransfers()
+    public func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool {
+        try await migrationHost.migration(for: accountUUID).hasOverdueTransfers(useEstimatedTip: useEstimatedTip)
     }
 
     public func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
         try await migrationHost.migration(for: accountUUID).hasInvalidTransfers()
     }
 
-    public func rescheduleOverdueMigrationTransfer(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
-        try await migrationHost.migration(for: accountUUID).rescheduleOverdueTransfer()
+    public func pendingMigrationTransferProposal(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
+        try await migrationHost.migration(for: accountUUID).pendingTransferProposal()
     }
 
     public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
@@ -1336,9 +1357,20 @@ public class SDKSynchronizer: Synchronizer {
 
     // MARK: Migration Keystone batch-signing (external signer ceremony)
     //
-    // DB-free, account-free: unlike the migration group above, these four forward straight to
+    // DB-free, account-free: unlike the migration group above, these forward straight to
     // `initializer.rustBackend` (no `migrationHost.migration(for:)` per-account actor), the same
     // way the ordinary PCZT operations do (`createPCZTFromProposal`, `redactPCZTForSigner`, ...).
+
+    public func batchMigrationPcztsForSigning(
+        _ pczts: [MigrationUnsignedTransferPczt],
+        maxActionsPerSession: Int
+    ) async throws -> [[MigrationUnsignedTransferPczt]] {
+        try await OrchardMigration.batchPcztsForSigning(
+            welding: initializer.rustBackend,
+            pczts: pczts,
+            maxActionsPerSession: maxActionsPerSession
+        )
+    }
 
     public func buildKeystoneSignBatchQRParts(
         requestId: Data,
@@ -1370,7 +1402,7 @@ public class SDKSynchronizer: Synchronizer {
     /// Throws ``ZcashError/migrationBroadcastDuringSync`` when the synchronizer is actively syncing.
     ///
     /// Guards the two migration entry points that broadcast (``submitNoteSplit(accountUUID:proposal:usk:options:)``
-    /// and ``executeNextPendingMigrationTransfer(accountUUID:options:)``): sync and migration
+    /// and ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``): sync and migration
     /// broadcasts must never share a session. Reads `status` -- the same source `start(retry:)`
     /// switches on -- so the guard triggers on the syncing case only; stopped/synced/disconnected/
     /// error/unprepared all proceed.
