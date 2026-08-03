@@ -5036,7 +5036,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slipstream-core"
 version = "0.6.4"
-source = "git+https://github.com/zodl-inc/slipstream.git?rev=6d9633416e37b07900f4fa2822fb37cd07853f54#6d9633416e37b07900f4fa2822fb37cd07853f54"
+source = "git+https://github.com/zodl-inc/slipstream.git?rev=5af0a550bc7ef97c2871094a80598426e47dcc0d#5af0a550bc7ef97c2871094a80598426e47dcc0d"
 dependencies = [
  "ff",
  "futures-util",
@@ -5076,7 +5076,7 @@ dependencies = [
 [[package]]
 name = "slipstream-gpuhash"
 version = "0.0.1"
-source = "git+https://github.com/zodl-inc/slipstream.git?rev=6d9633416e37b07900f4fa2822fb37cd07853f54#6d9633416e37b07900f4fa2822fb37cd07853f54"
+source = "git+https://github.com/zodl-inc/slipstream.git?rev=5af0a550bc7ef97c2871094a80598426e47dcc0d#5af0a550bc7ef97c2871094a80598426e47dcc0d"
 dependencies = [
  "bytemuck",
  "ff",
