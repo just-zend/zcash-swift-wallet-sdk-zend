@@ -231,6 +231,15 @@ Changes are relative to `2.8.0-rc.3`.
   `Proposal.testOnlyFakeProposal(totalFee:spendsLegacyOrchardFunds:)` gained a
   defaulted parameter for building test fixtures.
 
+## Changed
+
+- `DBActor` now serializes only Swift-initiated writes, audited per call: verified read-only
+  calls (wallet getters, balances, memos, the propose* family, DAO reads, migration
+  block-rate samples) run off the actor and never queue behind proof generation or other
+  writes, while every write-bearing call — including each proof chunk, and the migration
+  status/progress reads, which persist mined-ness promotions under the hood — holds the
+  actor so no two Swift-initiated writes can interleave.
+
 # 2.8.0-rc.3 - 2026-07-29
 
 ## Changed
