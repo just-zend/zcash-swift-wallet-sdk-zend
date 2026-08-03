@@ -174,17 +174,17 @@ slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "2
 # the graph stays a single family
 # instance (mixing a git and a crates.io generation of these crates does not resolve). Re-pin to
 # crates.io at the first librustzcash release that carries all of it.
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "1988cfe102b5e36bd1884c318c55c19ae307d83d" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
 
 # Reinstate together with the voting dependencies above:
 # zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "e53e74487d31ad0f5713580fb2f0222b53ae9db8" }
