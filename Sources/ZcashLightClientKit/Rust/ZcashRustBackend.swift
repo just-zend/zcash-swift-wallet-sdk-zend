@@ -173,6 +173,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
     }
 
+    // DB-AUDIT (2026-08-03): SELECT-only, but stays serialized — listAccounts' per-id
+    // getAccount loop relies on the actor's no-suspension property for enumeration
+    // atomicity against deleteAccount. Un-actor only by resolving accounts in one FFI call.
     @DBActor
     func listAccounts() async throws -> [Account] {
         let accountsPtr = zcashlc_list_accounts(
@@ -201,6 +204,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return accounts
     }
 
+    // DB-AUDIT (2026-08-03): SELECT-only, but stays serialized — listAccounts' per-id
+    // getAccount loop relies on the actor's no-suspension property for enumeration
+    // atomicity against deleteAccount. Un-actor only by resolving accounts in one FFI call.
     @DBActor
     func getAccount(
         for accountUUID: AccountUUID
@@ -320,7 +326,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return ffiBinaryKeyPtr.pointee.unsafeToUnifiedSpendingKey(network: networkType)
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): seed_relevance_to_derived_accounts — SELECT loops over
+    // accounts plus in-memory key derivation.
     func isSeedRelevantToAnyDerivedAccount(seed: [UInt8]) async throws -> Bool {
         let result = zcashlc_is_seed_relevant_to_any_derived_account(
             dbData.0,
@@ -341,7 +348,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return result != 0
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): propose_transfer with lock_inputs = None — the only write
+    // branch statically skipped; input selection SELECT-only; the proposal is returned
+    // serialized, never stored.
     func proposeTransfer(
         accountUUID: AccountUUID,
         to address: String,
@@ -401,7 +410,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         ))
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): propose_transfer with lock_inputs = None — identical to
+    // proposeTransfer; the URI is parsed in memory.
     func proposeTransferFromURI(
         _ uri: String,
         accountUUID: AccountUUID
@@ -596,7 +606,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return Data(contiguousTxidBytes)
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): get_last_generated_address_matching — SELECT on
+    // addresses; generates nothing.
     func getCurrentAddress(accountUUID: AccountUUID) async throws -> UnifiedAddress {
         let addressCStr = zcashlc_get_current_address(
             dbData.0,
@@ -641,7 +652,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return UnifiedAddress(validatedEncoding: address, networkType: networkType)
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): get_sent_memo / get_received_memo — two query_row
+    // SELECTs.
     func getMemo(txId: Data, outputPool: UInt32, outputIndex: UInt16) async throws -> Memo? {
         guard txId.count == 32 else {
             throw ZcashError.rustGetMemoInvalidTxIdLength
@@ -659,7 +671,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return (try? MemoBytes(contiguousBytes: contiguousMemoBytes)).flatMap { try? $0.intoMemo() }
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): get_transparent_balances — SELECT-only; the only inserts
+    // in the body are into a Rust HashMap.
     func getTransparentBalance(accountUUID: AccountUUID) async throws -> Int64 {
         let balance = zcashlc_get_total_transparent_balance_for_account(
             dbData.0,
@@ -678,7 +691,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return balance
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): get_spendable_transparent_outputs — SELECT-only; the
+    // lock policy only filters rows, acquires nothing.
     func getVerifiedTransparentBalance(accountUUID: AccountUUID) async throws -> Int64 {
         let balance = zcashlc_get_verified_transparent_balance_for_account(
             dbData.0,
@@ -781,7 +795,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): FsBlockDb get_max_cached_height — SELECT MAX(height)
+    // on the cache-metadata DB.
     func latestCachedBlockHeight() async throws -> BlockHeight {
         let height = zcashlc_latest_cached_block_height(fsBlockDbRoot.0, fsBlockDbRoot.1)
 
@@ -794,7 +809,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): get_transparent_receivers — no SQL writes anywhere in
+    // its body.
     func listTransparentReceivers(accountUUID: AccountUUID) async throws -> [TransparentAddress] {
         let encodedKeysPtr = zcashlc_list_transparent_receivers(
             dbData.0,
@@ -1102,7 +1118,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): block_fully_scanned — SELECTs via fully-scanned height
+    // and block metadata.
     func fullyScannedHeight() async throws -> BlockHeight? {
         let height = zcashlc_fully_scanned_height(dbData.0, dbData.1, networkType.networkId)
 
@@ -1115,7 +1132,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): block_max_scanned — single query_row SELECT.
     func maxScannedHeight() async throws -> BlockHeight? {
         let height = zcashlc_max_scanned_height(dbData.0, dbData.1, networkType.networkId)
 
@@ -1128,7 +1145,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL
+    // across its whole body; the sdkFlags await sits after the FFI window.
     func getWalletSummary() async throws -> WalletSummary? {
         let summaryPtr = zcashlc_get_wallet_summary(dbData.0, dbData.1, networkType.networkId, confirmationsPolicy.toBackend())
 
@@ -1149,7 +1167,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return summary
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): suggest_scan_ranges — single SELECT on scan_queue; no
+    // request state is consumed.
     func suggestScanRanges() async throws -> [ScanRange] {
         let scanRangesPtr = zcashlc_suggest_scan_ranges(dbData.0, dbData.1, networkType.networkId)
 
@@ -1210,7 +1229,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): propose_shielding with lock_inputs = None — write branch
+    // statically gated off; pre-reads SELECT-only; returns without writing when nothing is
+    // shieldable.
     func proposeShielding(
         accountUUID: AccountUUID,
         memo: MemoBytes?,
@@ -1296,7 +1317,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     // swiftlint:disable:next cyclomatic_complexity
-    @DBActor func transactionDataRequests() async throws -> [TransactionDataRequest] {
+    // DB-READ (audited 2026-08-03): transaction_data_requests — SELECT-only in both the
+    // wallet and transparent bodies; no request state is consumed or marked.
+    func transactionDataRequests() async throws -> [TransactionDataRequest] {
         let tDataRequestsPtr = zcashlc_transaction_data_requests(
             dbData.0,
             dbData.1,
@@ -1950,7 +1973,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return schedule
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): propose_send_max_transfer with lock_inputs = None — write
+    // branch statically gated off; selection over a shared read-only reference.
     func proposeSendMaxTransfer(
         accountUUID: AccountUUID,
         recipient: String,
