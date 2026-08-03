@@ -9,6 +9,11 @@
 //  test controls. The block being synchronous is the point: an `await` inside the actor is a
 //  suspension point that RELEASES the actor (reentrancy, SE-0306) and would hold nothing.
 //
+//  Three converted reads are pinned — one per conversion area: the migration family
+//  (blockRateSamples), the turnstile proposal (proposeOrchardToIronwoodMigration, which needs
+//  the account fixture), and the wallet getters (maxScannedHeight). The DAO conversions are
+//  exercised transitively by the rest of OfflineTests.
+//
 
 import XCTest
 import libzcashlc
@@ -18,6 +23,7 @@ import libzcashlc
 final class DBActorIsolationTests: XCTestCase {
     var dbData: URL!
     var rustBackend: ZcashRustBackendWelding!
+    var account: AccountUUID!
 
     override func setUp() async throws {
         try await super.setUp()
@@ -34,19 +40,58 @@ final class DBActorIsolationTests: XCTestCase {
             XCTFail("Failed to initDataDb. Expected `.success`, got \(String(describing: dbInit))")
             return
         }
+
+        let checkpointSource = CheckpointSourceFactory.fromBundle(for: .testnet)
+        let treeState = checkpointSource.latestKnownCheckpoint().treeState()
+        _ = try await rustBackend.createAccount(
+            seed: Environment.seedBytes,
+            treeState: treeState,
+            recoverUntil: nil,
+            name: "",
+            keySource: nil
+        )
+        let accounts = try await rustBackend.listAccounts()
+        account = try XCTUnwrap(accounts.first?.id)
     }
 
     override func tearDown() {
         super.tearDown()
         try? FileManager.default.removeItem(at: dbData!)
         rustBackend = nil
+        account = nil
     }
 
     func testBlockRateSamplesReadCompletesWhileDBActorIsHeld() async throws {
-        // Deterministically occupy DBActor: the holder signals `entered` from INSIDE the
-        // actor, then synchronously blocks its thread until the test signals release. From
-        // `entered` until `release.signal()`, the actor is executing this one job and every
-        // other `@DBActor` call queues behind it.
+        let backend = rustBackend!
+        await assertCompletesWhileDBActorIsHeld("migrationBlockRateSamples completed while actor held") {
+            _ = try? await backend.migrationBlockRateSamples(window: 100)
+        }
+    }
+
+    func testProposeMigrationReadCompletesWhileDBActorIsHeld() async throws {
+        let backend = rustBackend!
+        let accountUUID = account!
+        await assertCompletesWhileDBActorIsHeld("proposeOrchardToIronwoodMigration completed while actor held") {
+            // An empty fixture wallet has nothing to propose — throwing IS completing here;
+            // what the assertion needs is that the call RAN while the actor was parked.
+            _ = try? await backend.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
+        }
+    }
+
+    func testMaxScannedHeightReadCompletesWhileDBActorIsHeld() async throws {
+        let backend = rustBackend!
+        await assertCompletesWhileDBActorIsHeld("maxScannedHeight completed while actor held") {
+            _ = try? await backend.maxScannedHeight()
+        }
+    }
+
+    /// Occupies `DBActor` with a synchronous thread-block (no suspension point — an `await`
+    /// would release the actor via reentrancy), runs `read`, and requires it to complete
+    /// while the actor is still blocked. Releases the holder afterwards regardless.
+    private func assertCompletesWhileDBActorIsHeld(
+        _ description: String,
+        read: @escaping @Sendable () async -> Void
+    ) async {
         let entered = XCTestExpectation(description: "holder entered DBActor")
         let release = DispatchSemaphore(value: 0)
         let holder = Task { @DBActor in
@@ -55,19 +100,14 @@ final class DBActorIsolationTests: XCTestCase {
         }
         await fulfillment(of: [entered], timeout: 5.0)
 
-        // The read under test: must complete (value or throw — either proves it ran) while
-        // the actor is still parked. Before the split lands this times out: the read is
-        // `@DBActor` and queues behind the holder.
-        let readCompleted = XCTestExpectation(description: "read completed while actor held")
-        let backend = rustBackend!
+        let readCompleted = XCTestExpectation(description: description)
         let reader = Task {
-            _ = try? await backend.migrationBlockRateSamples(window: 100)
+            await read()
             readCompleted.fulfill()
         }
 
         await fulfillment(of: [readCompleted], timeout: 5.0)
 
-        // Cleanup: release the actor, then settle both tasks so nothing outlives the test.
         release.signal()
         _ = await holder.value
         _ = await reader.value

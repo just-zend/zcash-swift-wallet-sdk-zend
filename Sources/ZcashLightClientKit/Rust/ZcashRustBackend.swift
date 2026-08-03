@@ -1316,7 +1316,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return branchId
     }
 
-    // swiftlint:disable:next cyclomatic_complexity
     // DB-READ (audited 2026-08-03): transaction_data_requests — SELECT-only in both the
     // wallet and transparent bodies; no request state is consumed or marked.
     func transactionDataRequests() async throws -> [TransactionDataRequest] {
