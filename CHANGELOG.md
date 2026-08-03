@@ -6,6 +6,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- `ZcashTransaction.Overview.zip318Kind` reports how a transaction classifies
+  against ZIP 318, the Orchard to Ironwood pool migration: `nonconforming`,
+  `preparation`, `transfer`, `canonicalCrossingPayment`, or `notClassified`.
+  This is a conformance class and not a provenance, so it cannot establish that
+  a transaction came from this wallet's own migration run; only `preparation`
+  and `transfer` are a migration this account made. `notClassified` is the
+  absence of a decision rather than the decision that a transaction is not a ZIP
+  318 one: the transaction either predates the underlying column or has not been
+  decrypted yet, and it must be rescanned before anything can be said about it.
+  An encoding a future librustzcash adds also reads as `notClassified`, since an
+  SDK that does not know the code has learned nothing about the transaction.
+
 ## Changed
 - Updated the librustzcash crates to `zcash_client_backend 0.24.0-rc.6` and
   `zcash_client_sqlite 0.22.0-rc.6`, adopting the revised ZIP 318 migration timing

@@ -92,14 +92,14 @@ cbindgen = "0.29"
 cc = "1.0"
 
 [patch.crates-io]
-# pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
-# zcash_client_backend = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
-# zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
-# zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
-# zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
-# zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
-# zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
-# zcash_transparent = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
+pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "2a99c4a2265b2195b8d7cbbe7af91ece1af4c0bf" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash.git", rev = "2a99c4a2265b2195b8d7cbbe7af91ece1af4c0bf" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash.git", rev = "2a99c4a2265b2195b8d7cbbe7af91ece1af4c0bf" }
+zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "2a99c4a2265b2195b8d7cbbe7af91ece1af4c0bf" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "2a99c4a2265b2195b8d7cbbe7af91ece1af4c0bf" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "2a99c4a2265b2195b8d7cbbe7af91ece1af4c0bf" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "2a99c4a2265b2195b8d7cbbe7af91ece1af4c0bf" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash.git", rev = "2a99c4a2265b2195b8d7cbbe7af91ece1af4c0bf" }
 
 [features]
 default = []

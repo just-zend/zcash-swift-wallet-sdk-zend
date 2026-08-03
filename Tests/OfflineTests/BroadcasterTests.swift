@@ -327,7 +327,8 @@ final class BroadcasterTests: ZcashTestCase {
             totalReceived: nil,
             spentNoteCount: 0,
             poolCrossingValue: nil,
-            isTrusted: false
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
     }
 

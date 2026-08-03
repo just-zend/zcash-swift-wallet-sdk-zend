@@ -158,7 +158,8 @@ extension MockTransactionRepository: TransactionRepository {
             totalReceived: nil,
             spentNoteCount: 0,
             poolCrossingValue: nil,
-            isTrusted: false
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
     }
 
@@ -183,7 +184,8 @@ extension MockTransactionRepository: TransactionRepository {
             totalReceived: nil,
             spentNoteCount: 0,
             poolCrossingValue: nil,
-            isTrusted: false
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
     }
 
