@@ -47,7 +47,11 @@ final class BlockEnhancerImplTests: XCTestCase {
             value: value,
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 1,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
     }
 
