@@ -24,6 +24,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zcashlc_init_data_database` applies new `zcash_client_sqlite` migrations
   that repair the Ironwood change classification and address-use data
   described under Fixed below. No rescan is required.
+- `zcashlc_set_transaction_status` now returns `bool` (`true` on success) instead of `void`, so
+  callers can detect a failed status write (previously any error — including an unknown chain
+  height — was silently discarded). No `repr(C)` struct layout changes.
 
 ### Fixed
 - Ironwood notes received on an account's internal address are now classified

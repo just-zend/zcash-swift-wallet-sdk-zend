@@ -62,38 +62,22 @@ jobs:
     - name: Build FFI for macOS
       if: steps.cache-ffi.outputs.cache-hit != 'true'
       timeout-minutes: 30
-      working-directory: ./BuildSupport
-      run: |
-        echo "Building FFI for macOS..."
-        make macos
-        mkdir -p products/libzcashlc.xcframework
-        cp -R products/macos/frameworks products/libzcashlc.xcframework/macos-arm64_x86_64
-        cp Info.plist products/libzcashlc.xcframework
+      run: make ffi-macos
 
     # Verify xcframework exists (whether from cache or fresh build)
     - name: Verify XCFramework
-      run: |
-        if [ ! -d "BuildSupport/products/libzcashlc.xcframework" ]; then
-          echo "Error: BuildSupport/products/libzcashlc.xcframework not found"
-          exit 1
-        fi
-        echo "XCFramework contents:"
-        ls -la BuildSupport/products/libzcashlc.xcframework/
+      run: make verify-ffi
 
     # Set up LocalPackages so Package.swift auto-detects the local build
     - name: Configure local FFI for CI
-      run: |
-        mkdir -p LocalPackages
-        cp -R BuildSupport/products/libzcashlc.xcframework LocalPackages/
-        cp BuildSupport/LocalPackages-Package.swift LocalPackages/Package.swift
-        echo "LocalPackages created — Package.swift will use local FFI"
+      run: make configure-local-ffi
 
     # Build the Swift package
     - name: Build ZcashLightClientKit Swift Package
       timeout-minutes: 15
-      run: swift build -v
+      run: make build SWIFT_BUILD_FLAGS=-v
 
     # Run tests
     - name: Run OfflineTests suite
       timeout-minutes: 10
-      run: swift test --filter OfflineTests
+      run: make test-offline

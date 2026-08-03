@@ -334,8 +334,6 @@ final class SynchronizerTests: ZcashTestCase {
 
         // assert that after the new height is
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let lastScannedHeight = try await coordinator.synchronizer.initializer.transactionRepository.lastScannedHeight()
-//        XCTAssertEqual(lastScannedHeight, self.birthday)
 
         // check that the balance is cleared
         let expectedVerifiedBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]?.saplingBalance.spendableValue ?? .zero

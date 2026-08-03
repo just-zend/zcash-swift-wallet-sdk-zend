@@ -6,6 +6,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- `ZcashTransaction.Overview.zip318Kind` reports how a transaction classifies
+  against ZIP 318, the Orchard to Ironwood pool migration: `nonconforming`,
+  `preparation`, `transfer`, `canonicalCrossingPayment`, or `notClassified`.
+  This is a conformance class and not a provenance, so it cannot establish that
+  a transaction came from this wallet's own migration run; only `preparation`
+  and `transfer` are a migration this account made. `notClassified` is the
+  absence of a decision rather than the decision that a transaction is not a ZIP
+  318 one: the transaction either predates the underlying column or has not been
+  decrypted yet, and it must be rescanned before anything can be said about it.
+  An encoding a future librustzcash adds also reads as `notClassified`, since an
+  SDK that does not know the code has learned nothing about the transaction.
+
 ## Changed
 - Updated the librustzcash crates to `zcash_client_backend 0.24.0-rc.6` and
   `zcash_client_sqlite 0.22.0-rc.6`, adopting the revised ZIP 318 migration timing
@@ -124,13 +137,6 @@ All of the following were picked up from the librustzcash update:
   scheme is neither `http` nor `https` (for example `ftp` or `ws`). Such a URL
   was previously treated as plaintext HTTP; a URL with no scheme at all was,
   and remains, rejected.
-
-# 2.7.0-rc.3 - 2026-07-28
-
-The 2.7 maintenance line's release of the changes listed under 2.8.0-rc.2
-above. It carries those and nothing else, so wallets on either line receive
-the same `zcash_client_backend 0.24.0-rc.5` / `zcash_client_sqlite 0.22.0-rc.5`
-behavior changes and fixes.
 
 # v2.8.0-rc.1 - 2026-07-26
 
@@ -251,6 +257,32 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4010000.json
 ...
 Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4090000.json
 ````
+
+# 2.7.0-rc.3 - 2026-07-28
+
+The 2.7 maintenance line's release of the changes listed under 2.8.0-rc.2
+above. It carries those and nothing else, so wallets on either line receive
+the same `zcash_client_backend 0.24.0-rc.5` / `zcash_client_sqlite 0.22.0-rc.5`
+behavior changes and fixes.
+
+## Fixed
+- `SynchronizerEvent.minedTransaction` fires again. `BlockEnhancerImpl` had stopped invoking its
+  `didEnhance` callback when transaction data requests were adopted, silently killing the event in
+  production — client apps never received the signal that a pending sent transaction was mined.
+  The event is now emitted exactly once per unmined→mined transition of a sent transaction, from
+  the enhancement path (scanning-originated — the path shielded transactions take) and from a
+  mined `GetStatus` answer (fully-transparent transactions).
+- `ZcashRustBackend.setTransactionStatus` failures are no longer silently ignored: the FFI now
+  reports success, and the Swift side throws the new `ZcashError.rustSetTransactionStatus`
+  (`ZRUST0111`), feeding the block enhancer's existing retry and logging instead of vanishing.
+
+## Added
+- Server validation now fails loudly with the new
+  `ZcashError.compactBlockProcessorServerMissingIronwoodSupport` (`ZCBPEO0024`) when the chain is
+  on the NU6.3 ("Ironwood") consensus branch but the connected lightwalletd serves no Ironwood
+  tree state. Compact-block scanning is what detects the wallet's shielded transactions, and a
+  server missing Ironwood data would previously let scanning pass silently while never detecting
+  anything in that pool.
 
 # 2.7.0-rc.2 - 2026-07-26
 
@@ -573,7 +605,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4030000.json
 
 ## Fixed
 - `Transport became inactive` connectivity issue.
-- `NIOHTTP2` connectivity issues. 
+- `NIOHTTP2` connectivity issues.
 
 ## Checkpoints
 
@@ -616,7 +648,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/3930000.json
 # 2.4.8 - 2026-03-25
 
 ## Fixed
-- Networking connections are closed properly, resetting the state and letting the next re-run to properly initialize. This fixes the issues with restore after reset and also server switch issues. 
+- Networking connections are closed properly, resetting the state and letting the next re-run to properly initialize. This fixes the issues with restore after reset and also server switch issues.
 
 ## Checkpoints
 
@@ -657,7 +689,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/3900000.json
 # 2.4.6 - 2026-03-12
 
 ## Fixed
-- `switchTo` server updates `TransactionEncoder`. It was missing and submission of the transactions went through the previous server instead of a current one. 
+- `switchTo` server updates `TransactionEncoder`. It was missing and submission of the transactions went through the previous server instead of a current one.
 
 # 2.4.5 - 2026-03-06
 
@@ -787,7 +819,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/3710000.json
 
 ## Added
 - `SDKSynchronizer.getSingleUseTransparentAddress` Get an ephemeral single use transparent address.
-- `SDKSynchronizer.checkSingleUseTransparentAddresses` Checks to find any single-use ephemeral addresses exposed in the past day that have not yet received funds, excluding any whose next check time is in the future. This will then choose the address that is most overdue for checking, retrieve any UTXOs for that address over Tor, and add them to the wallet database. 
+- `SDKSynchronizer.checkSingleUseTransparentAddresses` Checks to find any single-use ephemeral addresses exposed in the past day that have not yet received funds, excluding any whose next check time is in the future. This will then choose the address that is most overdue for checking, retrieve any UTXOs for that address over Tor, and add them to the wallet database.
 - `SDKSynchronizer.updateTransparentAddressTransactions` Finds all transactions associated with the given transparent address.
 - `SDKSynchronizer.fetchUTXOsBy(address)` Checks to find any UTXOs associated with the given transparent address. This check will cover the block range starting at the exposure height for that address, if known, or otherwise at the birthday height of the specified account.
 
@@ -842,7 +874,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/3630000.json
 # 2.3.6 - 2025-10-10
 
 ## Changed
-- Transparent funds are now reported after `UpdateChainTipAction` is processed. Attempt to shield before this action has been failing otherwise. 
+- Transparent funds are now reported after `UpdateChainTipAction` is processed. Attempt to shield before this action has been failing otherwise.
 
 ## Fixed
 - FFI bumped to 0.18.3 with sqp fixes for balances.
@@ -1144,7 +1176,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/3310000.json
 - `SDKSynchronizer.PCZTRequiresSaplingProofs`: Check whether the Sapling parameters are required for a given PCZT.
 
 ## Updated
-- Methods returning an array of `ZcashTransaction.Overview` try to evaluate transaction's missing blockTime. This typically applies to an expired transaction.  
+- Methods returning an array of `ZcashTransaction.Overview` try to evaluate transaction's missing blockTime. This typically applies to an expired transaction.
 
 ## Checkpoints
 
@@ -1267,9 +1299,9 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2647500.json
 ## Added
 
 ### [#1466] Choose the best server by testing responses from multiple hosts
-- Synchronizer's `evaluateBestOf(endpoints: [], ...) async -> [LightWalletEndpoint]` method takes a list of endpoints and evaluates top k best performant servers. 
+- Synchronizer's `evaluateBestOf(endpoints: [], ...) async -> [LightWalletEndpoint]` method takes a list of endpoints and evaluates top k best performant servers.
 
-- `TransactionEntity` extended to access `is_shielding` from the DB and provides the value to the clients. 
+- `TransactionEntity` extended to access `is_shielding` from the DB and provides the value to the clients.
 
 ## Checkpoints
 
@@ -1339,7 +1371,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2560000.json
 # 2.1.10 - 2024-06-14
 
 ## Fixed
-- Further changes for compatibility with Xcode 15.3 and above. 
+- Further changes for compatibility with Xcode 15.3 and above.
 
 ## Checkpoints
 
@@ -1354,7 +1386,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2540000.json
 # 2.1.9 - 2024-06-05
 
 ## Fixed
-- Synchronizer's' `prepare()` method passes even if server is down and not providing chan tip. 
+- Synchronizer's' `prepare()` method passes even if server is down and not providing chan tip.
 
 ## Checkpoints
 
@@ -1369,7 +1401,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/2530000.json
 # 2.1.8 - 2024-05-30
 
 ## Added
-- New API `getMemos(for rawID: Data) -> [Memos]` to load memos for a certain transaction (ZcashTransaction.Overview) defined by its rawID. 
+- New API `getMemos(for rawID: Data) -> [Memos]` to load memos for a certain transaction (ZcashTransaction.Overview) defined by its rawID.
 
 ## Fixed
 - Swiftlint issues have been addressed.
