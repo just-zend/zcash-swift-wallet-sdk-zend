@@ -96,25 +96,11 @@ class BalanceTests: ZcashTestCase {
         XCTAssertTrue(verifiedBalance > network.constants.defaultFee())
         XCTAssertEqual(verifiedBalance, totalBalance)
         
-        let maxBalance = verifiedBalance - Zatoshi(10000)
-        
         // 3 create a transaction for the max amount possible
         // 4 send the transaction
-        let spendingKey = coordinator.spendingKey
 
-        var pendingTx: ZcashTransaction.Overview?
-        do {
-//            let transaction = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: spendingKey,
-//                zatoshi: maxBalance,
-//                toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//                memo: try Memo(string: "this is a test")
-//            )
-//            pendingTx = transaction
-            self.sentTransactionExpectation.fulfill()
-        } catch {
-            XCTFail("sendToAddress failed: \(error)")
-        }
+        let pendingTx: ZcashTransaction.Overview? = nil
+        self.sentTransactionExpectation.fulfill()
 
         await fulfillment(of: [sentTransactionExpectation], timeout: 20)
         guard let pendingTx else {
@@ -153,25 +139,7 @@ class BalanceTests: ZcashTestCase {
         sleep(2) // add enhance breakpoint here
         
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let mineExpectation = XCTestExpectation(description: "mineTxExpectation")
   
-//        do {
-//            try await coordinator.sync(
-//                completion: { synchronizer in
-//                    let pendingEntity = try await synchronizer.allPendingTransactions().first(where: { $0.rawID == pendingTx.rawID })
-//                    XCTAssertNotNil(pendingEntity, "pending transaction should have been mined by now")
-//                    XCTAssertNotNil(pendingEntity?.minedHeight)
-//                    XCTAssertEqual(pendingEntity?.minedHeight, sentTxHeight)
-//                    mineExpectation.fulfill()
-//                },
-//                error: self.handleError
-//            )
-//        } catch {
-//            handleError(error)
-//        }
-//
-//        await fulfillment(of: [mineExpectation, transactionMinedExpectation, foundTransactionsExpectation], timeout: 5)
-//
         // 7 advance to confirmation
         
         try coordinator.applyStaged(blockheight: sentTxHeight + 10)
@@ -200,10 +168,6 @@ class BalanceTests: ZcashTestCase {
         await fulfillment(of: [confirmExpectation], timeout: 5)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let confirmedPending = try await coordinator.synchronizer.allPendingTransactions()
-//            .first(where: { $0.rawID == pendingTx.rawID })
-//
-//        XCTAssertNil(confirmedPending, "pending, now confirmed transaction found")
 
         accountBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]
         let expectedVerifiedBalance = accountBalance?.saplingBalance.spendableValue ?? .zero
@@ -252,24 +216,10 @@ class BalanceTests: ZcashTestCase {
         XCTAssertTrue(verifiedBalance > network.constants.defaultFee())
         XCTAssertEqual(verifiedBalance, totalBalance)
 
-        let maxBalanceMinusOne = verifiedBalance - Zatoshi(10000)
-
         // 3 create a transaction for the max amount possible
         // 4 send the transaction
-        let spendingKey = coordinator.spendingKey
-        var pendingTx: ZcashTransaction.Overview?
-        do {
-//            let transaction = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: spendingKey,
-//                zatoshi: maxBalanceMinusOne,
-//                toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//                memo: try Memo(string: "\(self.description) \(Date().description)")
-//            )
-//            pendingTx = transaction
-            self.sentTransactionExpectation.fulfill()
-        } catch {
-            XCTFail("sendToAddress failed: \(error)")
-        }
+        let pendingTx: ZcashTransaction.Overview? = nil
+        self.sentTransactionExpectation.fulfill()
 
         await fulfillment(of: [sentTransactionExpectation], timeout: 20)
         guard let pendingTx else {
@@ -308,24 +258,6 @@ class BalanceTests: ZcashTestCase {
         sleep(2) // add enhance breakpoint here
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let mineExpectation = XCTestExpectation(description: "mineTxExpectation")
-
-//        do {
-//            try await coordinator.sync(
-//                completion: { synchronizer in
-//                    let pendingEntity = try await synchronizer.allPendingTransactions().first(where: { $0.rawID == pendingTx.rawID })
-//                    XCTAssertNotNil(pendingEntity, "pending transaction should have been mined by now")
-//                    XCTAssertNotNil(pendingEntity?.minedHeight)
-//                    XCTAssertEqual(pendingEntity?.minedHeight, sentTxHeight)
-//                    mineExpectation.fulfill()
-//                },
-//                error: self.handleError
-//            )
-//        } catch {
-//            handleError(error)
-//        }
-//
-//        await fulfillment(of: [mineExpectation, transactionMinedExpectation, foundTransactionsExpectation], timeout: 5)
 
         // 7 advance to confirmation
 
@@ -356,11 +288,6 @@ class BalanceTests: ZcashTestCase {
         await fulfillment(of: [confirmExpectation], timeout: 5)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let confirmedPending = try await coordinator.synchronizer
-//            .allPendingTransactions()
-//            .first(where: { $0.rawID == pendingTx.rawID })
-//
-//        XCTAssertNil(confirmedPending, "pending, now confirmed transaction found")
 
         accountBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]
         let expectedVerifiedBalance = accountBalance?.saplingBalance.spendableValue ?? .zero
@@ -403,31 +330,9 @@ class BalanceTests: ZcashTestCase {
         XCTAssertTrue(verifiedBalance > network.constants.defaultFee())
         XCTAssertEqual(verifiedBalance, totalBalance)
         
-        let maxBalanceMinusOne = verifiedBalance - Zatoshi(10000) - Zatoshi(1)
-        
         // 3 create a transaction for the max amount possible
         // 4 send the transaction
-        let spendingKey = coordinator.spendingKey
 
-        do {
-//            _ = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: spendingKey,
-//                zatoshi: maxBalanceMinusOne,
-//                toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//                memo: try Memo(string: "\(self.description) \(Date().description)")
-//            )
-        } catch {
-            guard
-                let zcashError = error as? ZcashError,
-                case let ZcashError.rustCreateToAddress(message) = zcashError
-            else {
-                XCTFail("Expected ZcashError and found \(error)")
-                return
-            }
-
-            XCTAssertEqual(message, "Error while sending funds: Insufficient balance (have 200000, need 200999 including fee)")
-            return
-        }
         XCTFail("This should have failed with Insufficient funds error")
     }
     
@@ -471,24 +376,10 @@ class BalanceTests: ZcashTestCase {
         XCTAssertTrue(verifiedBalance > network.constants.defaultFee())
         XCTAssertEqual(verifiedBalance, totalBalance)
         
-        let maxBalanceMinusFee = Zatoshi(100000) - Zatoshi(10000)
-        
         // 3 create a transaction for the max amount possible
         // 4 send the transaction
-        let spendingKey = coordinator.spendingKey
-        var pendingTx: ZcashTransaction.Overview?
-        do {
-//            let transaction = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: spendingKey,
-//                zatoshi: maxBalanceMinusFee,
-//                toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//                memo: try Memo(string: "test send \(self.description) \(Date().description)")
-//            )
-//            pendingTx = transaction
-            self.sentTransactionExpectation.fulfill()
-        } catch {
-            XCTFail("sendToAddress failed: \(error)")
-        }
+        let pendingTx: ZcashTransaction.Overview? = nil
+        self.sentTransactionExpectation.fulfill()
 
         await fulfillment(of: [sentTransactionExpectation], timeout: 20)
         guard let pendingTx else {
@@ -527,25 +418,7 @@ class BalanceTests: ZcashTestCase {
         sleep(2) // add enhance breakpoint here
         
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let mineExpectation = XCTestExpectation(description: "mineTxExpectation")
 
-//        do {
-//            try await coordinator.sync(
-//                completion: { synchronizer in
-//                    let pendingEntity = try await synchronizer.allPendingTransactions().first(where: { $0.rawID == pendingTx.rawID })
-//                    XCTAssertNotNil(pendingEntity, "pending transaction should have been mined by now")
-//                    XCTAssertTrue(pendingEntity?.minedHeight != nil)
-//                    XCTAssertEqual(pendingEntity?.minedHeight, sentTxHeight)
-//                    mineExpectation.fulfill()
-//                },
-//                error: self.handleError
-//            )
-//        } catch {
-//            handleError(error)
-//        }
-//
-//        await fulfillment(of: [mineExpectation, transactionMinedExpectation, foundTransactionsExpectation], timeout: 5)
-        
         // 7 advance to confirmation
         let advanceToConfirmation = sentTxHeight + 10
 
@@ -575,11 +448,6 @@ class BalanceTests: ZcashTestCase {
         await fulfillment(of: [confirmExpectation], timeout: 5)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let confirmedPending = try await coordinator.synchronizer
-//            .allPendingTransactions()
-//            .first(where: { $0.rawID == pendingTx.rawID })
-//
-//        XCTAssertNil(confirmedPending, "pending, now confirmed transaction found")
 
         accountBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]
         let expectedVerifiedBalance = accountBalance?.saplingBalance.spendableValue ?? .zero
@@ -625,26 +493,17 @@ class BalanceTests: ZcashTestCase {
 
         await fulfillment(of: [syncedExpectation], timeout: 60)
         
-        let spendingKey = coordinator.spendingKey
-        
         let accountUUID = TestsData.mockedAccountUUID
         let spendableValue = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]?.saplingBalance.spendableValue
         let presendVerifiedBalance: Zatoshi = spendableValue ?? .zero
-        
+
         /*
         there's more zatoshi to send than network fee
         */
         XCTAssertTrue(presendVerifiedBalance >= network.constants.defaultFee() + sendAmount)
-        
-        var pendingTx: ZcashTransaction.Overview?
 
-//        let transaction = try await coordinator.synchronizer.sendToAddress(
-//            spendingKey: spendingKey,
-//            zatoshi: sendAmount,
-//            toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//            memo: try Memo(string: "this is a test")
-//        )
-//        pendingTx = transaction
+        let pendingTx: ZcashTransaction.Overview? = nil
+
         self.sentTransactionExpectation.fulfill()
 
         var expectedVerifiedBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]?.saplingBalance.spendableValue ?? .zero
@@ -771,30 +630,15 @@ class BalanceTests: ZcashTestCase {
         
         await fulfillment(of: [syncedExpectation], timeout: 5)
         
-        let spendingKey = coordinator.spendingKey
-
         let accountUUID = TestsData.mockedAccountUUID
         let presendBalance: Zatoshi = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]?.saplingBalance.total() ?? .zero
 
         // there's more zatoshi to send than network fee
         XCTAssertTrue(presendBalance >= network.constants.defaultFee() + sendAmount)
-        var pendingTx: ZcashTransaction.Overview?
-        
-        var testError: Error?
-        do {
-//            let transaction = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: spendingKey,
-//                zatoshi: sendAmount,
-//                toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//                memo: try Memo(string: "test send \(self.description) \(Date().description)")
-//            )
-//            pendingTx = transaction
-            self.sentTransactionExpectation.fulfill()
-        } catch {
-            // balance should be the same as before sending if transaction failed
-            testError = error
-            XCTFail("sendToAddress failed: \(error)")
-        }
+        let pendingTx: ZcashTransaction.Overview? = nil
+
+        let testError: Error? = nil
+        self.sentTransactionExpectation.fulfill()
 
         let accountBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]
         var expectedVerifiedBalance = accountBalance?.saplingBalance.spendableValue ?? .zero
@@ -941,23 +785,13 @@ class BalanceTests: ZcashTestCase {
         let accountUUID = TestsData.mockedAccountUUID
         let accountBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]
         let previousVerifiedBalance: Zatoshi = accountBalance?.saplingBalance.spendableValue ?? .zero
-        let previousTotalBalance: Zatoshi = accountBalance?.saplingBalance.total() ?? .zero
-        
-        let spendingKey = coordinator.spendingKey
-        
+
         /*
         Send
         */
         let memo = try Memo(string: "shielding is fun!")
-        var pendingTx: ZcashTransaction.Overview?
+        let pendingTx: ZcashTransaction.Overview? = nil
 
-//        let transaction = try await coordinator.synchronizer.sendToAddress(
-//            spendingKey: spendingKey,
-//            zatoshi: sendAmount,
-//            toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//            memo: memo
-//        )
-//        pendingTx = transaction
         sendExpectation.fulfill()
 
         await fulfillment(of: [sendExpectation], timeout: 30)
@@ -1023,7 +857,7 @@ class BalanceTests: ZcashTestCase {
                         return
                     }
 
-                    guard let sentOutput = outputs.first(where: { !$0.isChange }) else {
+                    guard outputs.contains(where: { !$0.isChange }) else {
                         XCTFail("sent transaction does not have a 'sent' output")
                         return
                     }
@@ -1035,27 +869,6 @@ class BalanceTests: ZcashTestCase {
                         previousVerifiedBalance - self.sendAmount - Zatoshi(10000),
                         changeOutput.value
                     )
-
-//                    guard let fee = transaction.fee else {
-//                        XCTFail("sent transaction has no fee")
-//                        return
-//                    }
-//                    /*
-//                    Balance meets verified Balance and total balance criteria
-//                    */
-//                    self.verifiedBalanceValidation(
-//                        previousBalance: previousVerifiedBalance,
-//                        spentValue: sentOutput.value,
-//                        fee: fee,
-//                        sentAmount: self.sendAmount,
-//                        currentVerifiedBalance: try await synchronizer.getAccountsBalances()[accountUUID]?.saplingBalance.spendableValue ?? .zero
-//                    )
-//
-//                    self.totalBalanceValidation(
-//                        totalBalance: try await synchronizer.getAccountsBalances()[accountUUID]?.saplingBalance.total() ?? .zero,
-//                        previousTotalbalance: previousTotalBalance,
-//                        sentAmount: self.sendAmount
-//                    )
 
                     syncToMinedheightExpectation.fulfill()
                 },
@@ -1110,32 +923,13 @@ class BalanceTests: ZcashTestCase {
 
         await fulfillment(of: [syncedExpectation], timeout: 5)
         
-        let spendingKey = coordinator.spendingKey
-        
         let accountUUID = TestsData.mockedAccountUUID
         var accountBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]
         let previousVerifiedBalance: Zatoshi = accountBalance?.saplingBalance.spendableValue ?? .zero
         let previousTotalBalance: Zatoshi = accountBalance?.saplingBalance.total() ?? .zero
         let sendExpectation = XCTestExpectation(description: "send expectation")
-        var pendingTx: ZcashTransaction.Overview?
-        do {
-//            let pending = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: spendingKey,
-//                zatoshi: sendAmount,
-//                toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//                memo: try Memo(string: "test send \(self.description)")
-//            )
-//            pendingTx = pending
-            sendExpectation.fulfill()
-        } catch {
-            // balance should be the same as before sending if transaction failed
-            let accountBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]
-            let expectedVerifiedBalance = accountBalance?.saplingBalance.spendableValue ?? .zero
-            let expectedBalance = accountBalance?.saplingBalance.total() ?? .zero
-            XCTAssertEqual(expectedVerifiedBalance, previousVerifiedBalance)
-            XCTAssertEqual(expectedBalance, previousTotalBalance)
-            XCTFail("sendToAddress failed: \(error)")
-        }
+        let pendingTx: ZcashTransaction.Overview? = nil
+        sendExpectation.fulfill()
 
         await fulfillment(of: [sendExpectation], timeout: 12)
         

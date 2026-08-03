@@ -122,8 +122,6 @@ class RewindRescanTests: ZcashTestCase {
 
         // assert that after the new height is
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let lastScannedHeight = try await coordinator.synchronizer.initializer.transactionRepository.lastScannedHeight()
-//        XCTAssertEqual(lastScannedHeight, self.birthday)
         
         // check that the balance is cleared
         accountBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]
@@ -246,18 +244,7 @@ class RewindRescanTests: ZcashTestCase {
         
         // try to spend the funds
         let sendExpectation = XCTestExpectation(description: "after rewind expectation")
-        do {
-//            let pendingTx = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: coordinator.spendingKey,
-//                zatoshi: Zatoshi(1000),
-//                toAddress: try! Recipient(Environment.testRecipientAddress, network: .mainnet),
-//                memo: .empty
-//            )
-//            XCTAssertEqual(Zatoshi(1000), pendingTx.value)
-            sendExpectation.fulfill()
-        } catch {
-            XCTFail("sending fail: \(error)")
-        }
+        sendExpectation.fulfill()
         await fulfillment(of: [sendExpectation], timeout: 15)
     }
     
@@ -318,8 +305,6 @@ class RewindRescanTests: ZcashTestCase {
         // assert that after the new height is lower or same as transaction, rewind doesn't have to be make exactly to transaction height, it can
         // be done to nearest height provided by rust
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let lastScannedHeight = try await coordinator.synchronizer.initializer.transactionRepository.lastScannedHeight()
-//        XCTAssertLessThanOrEqual(lastScannedHeight, transaction.anchor(network: network) ?? -1)
         
         let secondScanExpectation = XCTestExpectation(description: "rescan")
         
@@ -378,24 +363,10 @@ class RewindRescanTests: ZcashTestCase {
         XCTAssertTrue(verifiedBalance > network.constants.defaultFee())
         XCTAssertEqual(verifiedBalance, totalBalance)
         
-        let maxBalance = verifiedBalance - Zatoshi(10000)
-        
         // 3 create a transaction for the max amount possible
         // 4 send the transaction
-        let spendingKey = coordinator.spendingKey
-        var pendingTx: ZcashTransaction.Overview?
-        do {
-//            let transaction = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: spendingKey,
-//                zatoshi: maxBalance,
-//                toAddress: try! Recipient(Environment.testRecipientAddress, network: .mainnet),
-//                memo: try Memo(string: "test send \(self.description) \(Date().description)")
-//            )
-//            pendingTx = transaction
-            self.sentTransactionExpectation.fulfill()
-        } catch {
-            XCTFail("sendToAddress failed: \(error)")
-        }
+        let pendingTx: ZcashTransaction.Overview? = nil
+        self.sentTransactionExpectation.fulfill()
         await fulfillment(of: [sentTransactionExpectation], timeout: 20)
         guard let pendingTx else {
             XCTFail("transaction creation failed")
@@ -433,25 +404,7 @@ class RewindRescanTests: ZcashTestCase {
         sleep(2)
         
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let mineExpectation = XCTestExpectation(description: "mineTxExpectation")
 
-//        do {
-//            try await coordinator.sync(
-//                completion: { synchronizer in
-//                    let pendingTransaction = try await synchronizer.allPendingTransactions()
-//                        .first(where: { $0.rawID == pendingTx.rawID })
-//                    XCTAssertNotNil(pendingTransaction, "pending transaction should have been mined by now")
-//                    XCTAssertNotNil(pendingTransaction?.minedHeight)
-//                    XCTAssertEqual(pendingTransaction?.minedHeight, sentTxHeight)
-//                    mineExpectation.fulfill()
-//                }, error: self.handleError
-//            )
-//        } catch {
-//            handleError(error)
-//        }
-//
-//        await fulfillment(of: [mineExpectation, transactionMinedExpectation, foundTransactionsExpectation], timeout: 5)
-        
         // 7 advance to confirmation
         let advanceToConfirmationHeight = sentTxHeight + 10
 
@@ -485,15 +438,6 @@ class RewindRescanTests: ZcashTestCase {
         await fulfillment(of: [rewindExpectation], timeout: 2)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        guard
-//            let pendingEntity = try await coordinator.synchronizer.allPendingTransactions()
-//                .first(where: { $0.rawID == pendingTx.rawID })
-//        else {
-//            XCTFail("sent pending transaction not found after rewind")
-//            return
-//        }
-//
-//        XCTAssertNil(pendingEntity.minedHeight)
 
         let confirmExpectation = XCTestExpectation(description: "confirm expectation")
         notificationHandler.transactionsFound = { txs in
@@ -523,10 +467,6 @@ class RewindRescanTests: ZcashTestCase {
         await fulfillment(of: [confirmExpectation], timeout: 10)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let confirmedPending = try await coordinator.synchronizer.allPendingTransactions()
-//            .first(where: { $0.rawID == pendingTx.rawID })
-//
-//        XCTAssertNil(confirmedPending, "pending, now confirmed transaction found")
 
         accountBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]
         let expectedVerifiedbalance = accountBalance?.saplingBalance.spendableValue ?? .zero

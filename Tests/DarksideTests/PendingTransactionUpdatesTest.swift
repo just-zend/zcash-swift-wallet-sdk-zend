@@ -87,24 +87,13 @@ class PendingTransactionUpdatesTest: ZcashTestCase {
         sleep(1)
         
         let sendExpectation = XCTestExpectation(description: "send expectation")
-        var pendingEntity: ZcashTransaction.Overview?
-        
+        let pendingEntity: ZcashTransaction.Overview? = nil
+
         /*
         2. send transaction to recipient address
         */
         LoggerProxy.info("2. send transaction to recipient address")
-        do {
-//            let pendingTx = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: self.coordinator.spendingKey,
-//                zatoshi: Zatoshi(20000),
-//                toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//                memo: try Memo(string: "this is a test")
-//            )
-//            pendingEntity = pendingTx
-            sendExpectation.fulfill()
-        } catch {
-            await self.handleError(error)
-        }
+        sendExpectation.fulfill()
         
         await fulfillment(of: [sendExpectation], timeout: 11)
         
@@ -176,19 +165,6 @@ class PendingTransactionUpdatesTest: ZcashTestCase {
         await fulfillment(of: [secondSyncExpectation], timeout: 5)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let pendingTransactionsCount = await coordinator.synchronizer.pendingTransactions.count
-//        XCTAssertEqual(pendingTransactionsCount, 1)
-//        guard let afterStagePendingTx = await coordinator.synchronizer.pendingTransactions.first else {
-//            return
-//        }
-//
-//        /*
-//        6a. verify that there's a pending transaction with a mined height of sentTxHeight
-//        */
-//        LoggerProxy.info("6a. verify that there's a pending transaction with a mined height of \(sentTxHeight)")
-//        XCTAssertEqual(afterStagePendingTx.minedHeight, sentTxHeight)
-//        XCTAssertNotNil(afterStagePendingTx.minedHeight, "pending transaction shown as unmined when it has been mined")
-//        XCTAssertTrue(afterStagePendingTx.isPending(currentHeight: sentTxHeight))
         
         /*
         7. stage 15  blocks from sentTxHeight
@@ -220,16 +196,6 @@ class PendingTransactionUpdatesTest: ZcashTestCase {
         }
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        await fulfillment(of: [syncToConfirmExpectation], timeout: 6)
-//        let supposedlyPendingUnexistingTransaction = try await coordinator.synchronizer.allPendingTransactions().first
-//
-//        let clearedTransactions = await coordinator.synchronizer
-//            .transactions
-//
-//        let clearedTransaction = clearedTransactions.first(where: { $0.rawID == afterStagePendingTx.rawID })
-//
-//        XCTAssertEqual(clearedTransaction!.value.amount, afterStagePendingTx.value.amount)
-//        XCTAssertNil(supposedlyPendingUnexistingTransaction)
     }
     
     func handleError(_ error: Error?) async {
