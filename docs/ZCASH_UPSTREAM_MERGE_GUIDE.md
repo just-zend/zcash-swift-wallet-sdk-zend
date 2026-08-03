@@ -2,13 +2,38 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-01
+Last reviewed: 2026-08-02
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Bleeding-edge refresh (2026-08-02)
+
+- Fresh fetches leave `origin/main=4497fe9e` and `upstream/main=f51ed74a`, with
+  merge base `769809a2` and the same `174 87` divergence. Zend draft PR
+  [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34) now
+  contains a conflict-resolved merge through `f51ed74a`; its build, SwiftLint,
+  and workflow zizmor checks succeeded. It remains a draft pending review of the
+  19 conflict resolutions, exact FFI/provenance reconciliation, and funded-device
+  migration evidence. Do not create a competing default-branch parity vehicle.
+- Upstream PR [#1923](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1923)
+  advanced to `ffda00dd`; it is clean and its build, SwiftLint, and zizmor checks
+  are green. It is nevertheless not an early Zend carry: 40 files (+8,587/-2,197)
+  replace migration-state logic and modify Rust/Swift FFI, private-engine and
+  librustzcash pins, persistence, scheduling, generated mocks, and tests atop the
+  unmerged `feature/ironwood-slipstream` line. Treat it as part of the full
+  artifact-provenance and funded-device reconciliation.
+- No other active upstream PR or branch clears the ready, useful, and low-risk
+  gate: #1914 is an approved release-line merge awaiting upstream integration;
+  #1925-#1927 are dirty, blocked, or draft; #1893 and #1900 remain draft and
+  dependency-coupled; and #1895-#1898 are not clean against their maintenance or
+  Ironwood bases. Wait for upstream integration or a scoped Zend-specific need.
+- This is a documentation-only monitor record. No SDK source or FFI artifact
+  changed, so local `swift build` and `swift test --filter OfflineTests` were not
+  rerun.
 
 ## Bleeding-edge refresh (2026-08-01)
 
