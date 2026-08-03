@@ -1978,65 +1978,42 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationProvePending(for account: AccountUUID) async throws -> Int {
-        // The sweep is CHUNKED (one proof per FFI call) and each chunk's blocking call runs OFF
-        // this actor: proof generation is seconds of pure CPU that never needed `DBActor` — the
-        // Rust side opens its own connection per call (WAL on the file, busy_timeout set, and
-        // the slipstream engine is already a concurrent writer by design), so holding a
-        // DB-access serializer through the compute starved every DB-bound read for the whole
-        // proof (field-caught 2026-08-03: the Migration Progress hydration's sequential reads
-        // each waited out a chunk — a multi-tens-of-seconds loader). Detaching the call and
-        // awaiting it suspends this method AT the actor, so queued reads interleave DURING a
-        // proof, not merely between proofs. The method keeps `@DBActor` so two sweeps can never
-        // interleave their bookkeeping should a second caller ever appear.
-        //
-        // THREAD-LOCALITY: the FFI last-error slot is thread-local, so the clear, the prove
-        // call, and the error-message read must all run inside the detached closure — on one
-        // thread. Only the already-materialized message crosses back.
-        let dbDataPath = dbData
-        let accountId = account.id
-        let networkId = networkType.networkId
-
-        // Local chunk outcome (`Result<Int32, String>` can't — `String` is no `Error`); routing
-        // the message into a `ZcashError` stays OUT of the detached closure, which must not
-        // capture `self`.
-        enum ProveChunk: Sendable {
-            case proved(Int64)
-            case failed(String)
-        }
-
+        // The sweep is CHUNKED: one proof per FFI call, with a suspension between calls. Each
+        // proof is seconds of CPU. Since the read/write split, every read-only call runs OFF
+        // `DBActor`, so readers never queue here at all — the actor now serializes only
+        // Swift-initiated WRITES, and holding it through each chunk is the point: no other
+        // Swift write can interleave with a proof's bookkeeping. The `Task.yield()` between
+        // chunks releases the actor briefly so queued WRITERS (broadcast bookkeeping, a user
+        // send) wait at most one proof, not the whole sweep. See `DBActor.swift` for the
+        // contract this method now relies on.
         var totalProved = 0
         while true {
-            let chunk = await Task.detached(priority: TaskPriority.utility) {
-                // `-1` is never a legitimate count, so the return value alone decides success.
-                // The last-error is cleared first so the message read on failure cannot be a
-                // leftover from an earlier call on this thread.
-                zcashlc_clear_last_error()
+            // `-1` is never a legitimate count, so the return value alone decides success.
+            // The last-error is cleared first so the message read on failure cannot be a
+            // leftover from an earlier call on this thread.
+            zcashlc_clear_last_error()
 
-                let proved = zcashlc_migration_prove_pending(
-                    dbDataPath.0,
-                    dbDataPath.1,
-                    accountId,
-                    networkId,
-                    1
+            let proved = zcashlc_migration_prove_pending(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                1
+            )
+
+            guard proved >= 0 else {
+                throw migrationRoutedError(
+                    lastErrorMessage(fallback: "`migrationProvePending` failed with unknown error"),
+                    fallback: ZcashError.rustMigrationProvePending
                 )
-
-                guard proved >= 0 else {
-                    return ProveChunk.failed(
-                        lastErrorMessage(fallback: "`migrationProvePending` failed with unknown error")
-                    )
-                }
-                return ProveChunk.proved(proved)
-            }.value
-
-            switch chunk {
-            case let .failed(message):
-                throw migrationRoutedError(message, fallback: ZcashError.rustMigrationProvePending)
-            case let .proved(proved):
-                guard proved > 0 else {
-                    return totalProved
-                }
-                totalProved += Int(proved)
             }
+            guard proved > 0 else {
+                return totalProved
+            }
+            totalProved += Int(proved)
+
+            // Let queued `DBActor` writers run before the next proof.
+            await Task.yield()
         }
     }
 
