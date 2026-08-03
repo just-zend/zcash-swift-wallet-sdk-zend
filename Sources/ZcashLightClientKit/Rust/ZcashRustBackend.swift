@@ -371,7 +371,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         ))
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): propose_send_max_transfer with lock_inputs = None — the
+    // only write arm statically skipped; input selection SELECT-only; proposal returned,
+    // never stored. Bypasses the migration open() preamble entirely.
     func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> FfiProposal {
         let dbDataPtr = dbData.0
         let dbDataLen = dbData.1
@@ -1488,6 +1490,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return step
     }
 
+    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
+    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
     @DBActor
     func migrationSyncWakeups(for account: AccountUUID) async throws -> [MigrationSyncWakeup] {
         let wakeupsPtr = zcashlc_migration_sync_wakeups(
@@ -1524,7 +1528,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return wakeups
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): wrapper-local SQL on its own SQLITE_OPEN_READ_ONLY
+    // connection — single SELECT over `blocks`; writes impossible at connection level.
     func migrationBlockRateSamples(window: UInt32) async throws -> [MigrationBlockRateSample] {
         let samplesPtr = zcashlc_migration_block_rate_samples(
             dbData.0,
@@ -1592,6 +1597,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return sizes
     }
 
+    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
+    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
     @DBActor
     func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress? {
         let progressPtr = zcashlc_migration_progress(
@@ -1610,6 +1617,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return progressPtr.pointee.unsafeToMigrationProgress()
     }
 
+    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
+    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
     @DBActor
     func migrationTransactionStatuses(for account: AccountUUID) async throws -> [MigrationTransactionStatus] {
         let statusesPtr = zcashlc_migration_transaction_statuses(
@@ -1636,6 +1645,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return statuses
     }
 
+    // DB-AUDIT (2026-08-03): SELECT-only in steady state, but routes through the shared
+    // open() preamble (CREATE TABLE IF NOT EXISTS + first-call legacy-marks migration can
+    // write). Stays serialized.
     @DBActor
     func migrationIsNoteSplitNeeded(for account: AccountUUID) async throws -> Bool {
         // Clear any stale, unconsumed last-error left by an earlier producer before reading this
@@ -1662,6 +1674,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return needed
     }
 
+    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
+    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
     @DBActor
     func migrationHasOverdueTransfers(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
         // Clear any stale, unconsumed last-error before this sentinel read (see
@@ -1687,6 +1701,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return hasOverdue
     }
 
+    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
+    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
     @DBActor
     func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
         let outcome = zcashlc_migration_has_ready_broadcast(
@@ -1709,6 +1725,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return outcome == 1
     }
 
+    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
+    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
     @DBActor
     func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool {
         // Clear any stale, unconsumed last-error before this sentinel read (see
@@ -1814,6 +1832,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return prepared
     }
 
+    // DB-AUDIT (2026-08-03): SELECT-only in steady state, but routes through the shared
+    // open() preamble (CREATE TABLE IF NOT EXISTS + first-call legacy-marks migration can
+    // write). Stays serialized.
     @DBActor
     func migrationResidualAfterMigration(for account: AccountUUID) async throws -> Zatoshi? {
         // Clear any stale, unconsumed last-error before this sentinel read (see
@@ -1880,6 +1901,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return Int(unlocked)
     }
 
+    // DB-AUDIT (2026-08-03): SELECT-only in steady state, but routes through the shared
+    // open() preamble (CREATE TABLE IF NOT EXISTS + first-call legacy-marks migration can
+    // write). Stays serialized.
     @DBActor
     func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate {
         let estimatePtr = zcashlc_migration_estimate_runs(
@@ -2022,6 +2046,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
+    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
+    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
     @DBActor
     func migrationNextDueTransfer(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> DueMigrationTransfer {
         let preparedPtr = zcashlc_migration_next_due_transfer(
@@ -2051,6 +2077,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return due
     }
 
+    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
+    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
     @DBActor
     func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal? {
         // Clear any stale, unconsumed last-error before this sentinel read (see
@@ -2082,6 +2110,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return proposalPtr.pointee.unsafeToMigrationTransferProposal()
     }
 
+    // DB-AUDIT (2026-08-03): SELECT-only in steady state, but routes through the shared
+    // open() preamble (CREATE TABLE IF NOT EXISTS + first-call legacy-marks migration can
+    // write). Stays serialized.
     @DBActor
     func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data {
         let txPtr: UnsafeMutablePointer<FfiBoxedSlice>? = pczt.withUnsafeBytes { buffer in
