@@ -12,10 +12,6 @@ import Combine
 /// Synchronizer implementation for UIKit and iOS 13+
 // swiftlint:disable type_body_length file_length
 public class SDKSynchronizer: Synchronizer {
-    private enum Constants {
-        static let fixWitnessesLastVersionCall = "ud_fixWitnessesLastVersionCall"
-    }
-
     public var alias: ZcashSynchronizerAlias { initializer.alias }
 
     private lazy var streamsUpdateQueue = { DispatchQueue(label: "streamsUpdateQueue_\(initializer.alias.description)") }()
@@ -294,22 +290,22 @@ public class SDKSynchronizer: Synchronizer {
     // MARK: Witnesses Fix
 
     private func resolveWitnessesFix() async {
-        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        let gate = WitnessesFixGate(
+            currentVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+            userDefaults: UserDefaults.standard,
+            alias: initializer.alias
+        )
 
-        guard let lastVersionCall = UserDefaults.standard.string(forKey: Constants.fixWitnessesLastVersionCall) else {
-            // No recorded version — run the fix.
-            await runWitnessesFix(appVersion: appVersion)
-            return
+        let decision = gate.decide()
+        logger.info("Witnesses fix: \(decision)")
+
+        if decision.shouldRunFix {
+            await initializer.rustBackend.fixWitnesses()
         }
 
-        guard lastVersionCall < appVersion else { return }
-
-        await runWitnessesFix(appVersion: appVersion)
-    }
-
-    private func runWitnessesFix(appVersion: String) async {
-        UserDefaults.standard.set(appVersion, forKey: Constants.fixWitnessesLastVersionCall)
-        await initializer.rustBackend.fixWitnesses()
+        // Recorded only once the repair has been attempted, so that a launch interrupted part-way
+        // through retries instead of recording a repair that never completed.
+        gate.recordCurrentVersion()
     }
 
     // MARK: Connectivity State

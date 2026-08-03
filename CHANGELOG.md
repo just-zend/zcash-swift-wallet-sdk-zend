@@ -144,6 +144,29 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- The witnesses-fix gate compared the recorded and current app versions with a plain String
+  comparison, which orders versions lexicographically: whenever the shorter number's leading digit
+  was the larger one (for example 2.9.0 → 2.10.0, 2.4.9 → 2.4.10, or 2.99.0 → 2.100.0) the upgrade
+  read as a downgrade and silently skipped the note-commitment-witness repair check — and kept
+  skipping it until some later version sorted above the stale recorded string. Versions are now
+  compared numerically component-wise (missing components count as zero), and versions that cannot
+  be ordered numerically run the check rather than risk missing a repair.
+- The witnesses-fix gate recorded its "already repaired" marker under a single app-wide key.
+  Because every synchronizer alias owns a separate data DB, only the first alias to call `prepare()`
+  was ever repaired for a given app version; the other wallets' databases were never checked. The
+  marker is now scoped per alias. Existing installs have no marker under the new key, so the repair
+  check runs once more on the next launch.
+- The witnesses-fix gate wrote its marker before running the repair, so a launch interrupted
+  part-way through recorded a repair that never completed. The marker is now written afterwards.
+- The witnesses-fix gate treated a host that reports no `CFBundleShortVersionString` as if it were
+  running version `""`. After the first launch that gate could never re-open, and an unreadable
+  version would overwrite a previously recorded real one. A missing version is now treated as
+  unknown: the repair runs and no marker is recorded.
+- The witnesses-fix marker was only ever moved forward, so a single higher version — a beta the
+  user later rolled back from — suppressed the repair for every release below it. The marker now
+  tracks the version that is actually running.
+- The witnesses-fix gate now logs which version it decided for and why, so a skipped repair leaves
+  a trace.
 - Memos on Ironwood outputs are retrievable; a note id in the Ironwood pool was rejected as an
   unrecognized shielded protocol.
 - `getAccountsBalances()` no longer reports empty balances for up to ~30 s after a restore completes,
