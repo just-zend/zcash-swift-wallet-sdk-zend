@@ -118,6 +118,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself never touches.
 
 ### Changed
+- Migrated to `zcash_protocol 0.10.4`, `zcash_client_backend 0.24.0-rc.7`,
+  `zcash_client_sqlite 0.22.0-rc.7`, `pczt 0.9.2`.
+- `zcashlc_set_transaction_status` now returns `bool` (`true` on success) instead of `void`, so
+  callers can detect a failed status write (previously any error — including an unknown chain
+  height — was silently discarded). No `repr(C)` struct layout changes.
 - `zcashlc_migration_state` is removed before any release exposed it, along with the state machine
   it served (`MigrationState`/`Complete`/`InProgress`/etc. never crossed the FFI as a stable shape).
   `zcashlc_migration_advance_step` replaces it: a verbatim, un-opinionated marshal of the upstream
@@ -162,6 +167,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would refuse to promote.
 
 ### Fixed
+- `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood
+  outputs in the stored sent transaction. Every Ironwood output was previously
+  omitted, so for a post-NU6.3 PCZT delivering its payment through the Ironwood
+  pool the external recipient's address and the decrypted memo were never
+  persisted (and are not otherwise recoverable), and wallet-internal Ironwood
+  outputs were invisible to the wallet until the transaction was mined and
+  scanned. Shielded sent outputs stored by this call are also now tagged with
+  their note commitment tree, as the transaction-builder spend path already did.
 - The migration prover's transient-vs-hard error classification (`ProveErrorClass::is_transient`,
   behind `zcashlc_migration_prove_pending` / `_next_due_transfer`): `UnknownSpentNote` (a
   late-mining dependency's note the wallet has not seen yet) and `Tree(ShardTreeError::Query(_))`

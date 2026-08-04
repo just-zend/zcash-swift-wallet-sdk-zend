@@ -17,7 +17,7 @@ class TorClientTests: ZcashTestCase {
 
     func testApis() async throws {
         // Spin up a new Tor client.
-        let client = try TorClient(torDir: testTempDirectory)
+        let client = TorClient(torDir: testTempDirectory)
 
         // Connect to a testnet lightwalletd server.
         let lwdConn = try await client.connectToLightwalletd(endpoint: LightWalletEndpointBuilder.publicTestnet.urlString)

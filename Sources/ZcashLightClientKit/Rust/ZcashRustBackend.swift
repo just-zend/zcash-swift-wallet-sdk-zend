@@ -1409,7 +1409,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             transactionStatus.mined = UInt32(height)
         }
 
-        zcashlc_set_transaction_status(
+        let success = zcashlc_set_transaction_status(
             dbData.0,
             dbData.1,
             networkType.networkId,
@@ -1417,6 +1417,12 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             UInt(txId.bytes.count),
             transactionStatus
         )
+
+        guard success else {
+            throw ZcashError.rustSetTransactionStatus(
+                lastErrorMessage(fallback: "`setTransactionStatus` failed with unknown error")
+            )
+        }
     }
 
     @DBActor
