@@ -3352,7 +3352,7 @@ pub unsafe extern "C" fn zcashlc_set_transaction_status(
     txid_bytes: *const u8,
     txid_bytes_len: usize,
     status: ffi::TransactionStatus,
-) {
+) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
@@ -3368,10 +3368,12 @@ pub unsafe extern "C" fn zcashlc_set_transaction_status(
 
         db_data
             .set_transaction_status(txid, status)
-            .map_err(|e| anyhow!("Error setting transaction status for txid {}: {}", txid, e))
+            .map_err(|e| anyhow!("Error setting transaction status for txid {}: {}", txid, e))?;
+
+        Ok(true)
     });
 
-    unwrap_exc_or(res, ())
+    unwrap_exc_or(res, false)
 }
 
 /// Returns a list of transaction data requests that the network client should satisfy.

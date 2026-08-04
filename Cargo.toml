@@ -2,10 +2,10 @@
 name = "libzcashlc"
 version = "2.8.0-rc.2"
 authors = [
-    "Jack Grigg <thestr4d@gmail.com>",
-    "Lukas Korba <lukas@zodl.com>",
-    "Kris Nuttycombe<kris@nutty.land>",
-    "Francisco Gindre",
+  "Jack Grigg <thestr4d@gmail.com>",
+  "Lukas Korba <lukas@zodl.com>",
+  "Kris Nuttycombe<kris@nutty.land>",
+  "Francisco Gindre",
 ]
 license = "MIT"
 edition = "2024"
@@ -21,15 +21,15 @@ ff = "0.13"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
 transparent = { package = "zcash_transparent", version = "0.10", default-features = false }
 zcash_address = { version = "0.13" }
-zcash_client_backend = { version = "0.24.0-rc.6", features = [
-    "lightwalletd-tonic-tls-webpki-roots",
-    "orchard",
-    "pczt",
-    "tor",
-    "transparent-inputs",
-    "unstable",
+zcash_client_backend = { version = "0.24.0-rc.7", features = [
+  "lightwalletd-tonic-tls-webpki-roots",
+  "orchard",
+  "pczt",
+  "tor",
+  "transparent-inputs",
+  "unstable",
 ] }
-zcash_client_sqlite = { version = "0.22.0-rc.6", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "0.22.0-rc.7", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.30"
 zcash_proofs = "0.30"
@@ -160,31 +160,20 @@ lto = true
 # build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep it in step with
 # the librustzcash generation the versions above declare: a rev built against an older generation
 # cannot resolve against them.
-slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "5af0a550bc7ef97c2871094a80598426e47dcc0d" }
+slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "ab89ada45f2ef893a05fcefa0ead99f87d848a4e" }
 
-# The librustzcash family rides a pinned rev — the `feat/migration_unsatisfiability` merge
-# head (pool-migration unsatisfiable-step detection, estimate-aware scheduling, engine-derived
-# mined-ness with the `pczt_txid` promotion and foreign-spend recording that finish it), now
-# carrying BOTH mobile PRs merged upstream — #2887, the public `batch_ensure_heights`
-# checkpoint-ensure seam the slipstream anchor fix above requires, and #2888, the proving-time
-# anchor-boundary re-draw — plus the proved-transaction wallet-persistence work (proofs are
-# finalized into the wallet's own transaction tables at proving time, marking their inputs
-# spent, so the wallet cannot double-spend a migration input during the prove-to-broadcast
-# window). Every family crate is patched to the SAME rev so
-# the graph stays a single family
-# instance (mixing a git and a crates.io generation of these crates does not resolve). Re-pin to
-# crates.io at the first librustzcash release that carries all of it.
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "96a34008e5b290c8eefd0f80583144c17165edcb" }
+## Update the `rev` value in the following lines to use a hash-pinned version of the librustzcash crates.
+# pczt = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zip321 = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
 
 # Reinstate together with the voting dependencies above:
 # zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "e53e74487d31ad0f5713580fb2f0222b53ae9db8" }

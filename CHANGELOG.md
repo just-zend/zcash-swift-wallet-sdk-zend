@@ -27,8 +27,8 @@ Changes are relative to `2.8.0-rc.3`.
   expired" and "sync resumed". Each ticker iteration now sleeps only until the soonest future
   boundary (capped at the interval); ready-broadcast flips keep the interval cadence.
 - Proved migration transactions are recorded in the wallet's own transaction tables at proving
-  time (librustzcash re-pin to `feat/migration_unsatisfiability` @ `1988cfe1`): their inputs are
-  marked spent from the moment the proof exists, so the wallet's own sends can no longer
+  time: their inputs are marked spent from the moment the proof exists, so the wallet's own sends
+  can no longer
   double-spend a scheduled migration transfer's inputs during the deliberately long window
   between proving and broadcast — the exact self-inflicted unsatisfiability the engine otherwise
   had to detect after the fact.
@@ -47,7 +47,7 @@ Changes are relative to `2.8.0-rc.3`.
   proving nothing, permanently (the shape behind the app-side "PROVE STALLED" detector firing on
   otherwise-complete testnet runs). The engine now re-validates the boundary against the funding
   preparations' real mined heights at proving time and re-draws it from the note's actual
-  creation height when it postdates the drawn one (librustzcash pin `d5b665cf`); the sweep
+  creation height when it postdates the drawn one; the sweep
   supplies the wallet's fully-scanned height and network parameters for that re-draw. A wedged
   run needs no restore: the next sweep re-draws, proves, and the run completes on the existing
   rails.
@@ -56,6 +56,15 @@ Changes are relative to `2.8.0-rc.3`.
   wallet database (the transactions list, the migration flow's re-entry) wait at most one proof
   instead of the entire sweep. Proving worker threads additionally run at utility QoS on Apple
   platforms, so seconds-long halo2 proving no longer starves the UI of CPU.
+- `createTransactionFromPCZT(pcztWithProofs:pcztWithSigs:)` now records the
+  transaction's Ironwood outputs. Every Ironwood output was previously omitted
+  from the stored transaction, so for a post-NU6.3 PCZT that delivers its payment
+  through the Ironwood pool the recipient address and the memo the wallet sent
+  were never persisted — and are not recoverable afterwards — while the
+  transaction's wallet-internal Ironwood outputs stayed invisible to the wallet,
+  and so absent from `getTransactionOutputs(for:)`, until the transaction was
+  mined and scanned. Shielded outputs stored by this path are also now tagged with
+  their note commitment tree, as the ordinary send path already did.
 
 ## Added
 
@@ -88,6 +97,17 @@ Changes are relative to `2.8.0-rc.3`.
 - `ZcashTransaction.Output.Pool.ironwood`: Ironwood outputs decode to their own case instead of
   `.other(4)`. A `switch` over `Pool` with no `default` stops compiling until the case is handled.
 - `ZcashNetwork.ironwoodActivationHeight`.
+- `ZcashTransaction.Overview.zip318Kind` reports how a transaction classifies
+  against ZIP 318, the Orchard to Ironwood pool migration: `nonconforming`,
+  `preparation`, `transfer`, `canonicalCrossingPayment`, or `notClassified`.
+  This is a conformance class and not a provenance, so it cannot establish that
+  a transaction came from this wallet's own migration run; only `preparation`
+  and `transfer` are a migration this account made. `notClassified` is the
+  absence of a decision rather than the decision that a transaction is not a ZIP
+  318 one: the transaction either predates the underlying column or has not been
+  decrypted yet, and it must be rescanned before anything can be said about it.
+  An encoding a future librustzcash adds also reads as `notClassified`, since an
+  SDK that does not know the code has learned nothing about the transaction.
 
 ### Orchard → Ironwood migration
 
@@ -235,6 +255,10 @@ Changes are relative to `2.8.0-rc.3`.
   writes, while every write-bearing call — including each proof chunk, and the migration
   status/progress reads, which persist mined-ness promotions under the hood — holds the
   actor so no two Swift-initiated writes can interleave.
+- Updated the librustzcash crates to `zcash_client_backend 0.24.0-rc.7`,
+  `zcash_client_sqlite 0.22.0-rc.7`, `zcash_protocol 0.10.4` and `pczt 0.9.2`, which are the
+  source of `ZcashTransaction.Overview.zip318Kind` and of the
+  `createTransactionFromPCZT` Ironwood-output fix.
 
 # 2.8.0-rc.3 - 2026-07-29
 
