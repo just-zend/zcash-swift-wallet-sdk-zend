@@ -163,17 +163,20 @@ lto = true
 slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "ab89ada45f2ef893a05fcefa0ead99f87d848a4e" }
 
 ## Update the `rev` value in the following lines to use a hash-pinned version of the librustzcash crates.
-# pczt = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
-# zip321 = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# INTERIM PIN (MOB-1466 M3): librustzcash PR #2909 — migration transactions classified against
+# ZIP 318 at store time, which is what activates the app's unmined-migration Activity filter.
+# Remove this pin (recomment the block) at the first published rc that contains the PR.
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "ebee7a8ad8803121180d494351a9fc76ba270a60" }
 
 # Reinstate together with the voting dependencies above:
 # zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "e53e74487d31ad0f5713580fb2f0222b53ae9db8" }

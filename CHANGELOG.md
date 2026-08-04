@@ -8,6 +8,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Changes are relative to `2.8.0-rc.3`.
 
+## Changed
+
+- The librustzcash family rides an interim git pin (librustzcash PR #2909) so a wallet's own
+  scheduled migration transactions carry their ZIP 318 classification (`Overview.zip318Kind`)
+  from the moment they are STORED at proving time, instead of only after they mine and are
+  scanned. This is what lets a wallet hold stored-but-unmined migration transactions out of its
+  activity list. The pin reverts to published crates at the first rc containing that PR.
+
 ## Fixed
 
 - `SimpleConnectionProvider`'s lazy connection init is now lock-guarded: two concurrent
