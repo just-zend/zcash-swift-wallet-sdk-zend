@@ -241,7 +241,12 @@ extension ZcashTransaction.Overview {
         static let totalReceived = SQLite.Expression<Int64?>("total_received")
         static let spentNoteCount = SQLite.Expression<Int>("spent_note_count")
         static let poolCrossingValue = SQLite.Expression<Int64?>("pool_crossing_value")
-        static let trustStatus = SQLite.Expression<Bool>("trust_status")
+        // Optional by contract: `trust_status` is an opt-in marker (`set_tx_trust`) with no
+        // default, no backfill, and — today — no caller anywhere, so it is NULL on every row of
+        // every real wallet. librustzcash's own readers consume it as IFNULL(trust_status, 0);
+        // decoding it strictly threw on the first row and emptied the entire transaction list
+        // (field, 2026-08-04). NULL decodes as "never evaluated" → untrusted.
+        static let trustStatus = SQLite.Expression<Bool?>("trust_status")
         static let zip318Kind = SQLite.Expression<Int>("zip318_kind")
     }
 
@@ -260,7 +265,7 @@ extension ZcashTransaction.Overview {
             self.value = Zatoshi(try row.get(Column.value))
             self.isExpiredUmined = try row.get(Column.expiredUnmined)
             self.spentNoteCount = try row.get(Column.spentNoteCount)
-            self.isTrusted = try row.get(Column.trustStatus)
+            self.isTrusted = (try row.get(Column.trustStatus)) ?? false
             self.zip318Kind = .init(rawValue: try row.get(Column.zip318Kind))
 
             if let poolCrossingValue = try row.get(Column.poolCrossingValue) {

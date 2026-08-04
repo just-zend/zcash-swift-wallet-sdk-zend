@@ -22,6 +22,13 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- Fetching transactions no longer fails on wallets whose `trust_status` column is NULL — which is
+  every wallet today, since transaction trust (`set_tx_trust`) is an opt-in marker with no default,
+  no backfill, and no caller yet. The strict `Overview` decode threw on the first row and the whole
+  `getAllTransactions` failed, rendering an empty transaction list over a fully-populated wallet. A
+  NULL now decodes as untrusted, matching librustzcash's own `IFNULL(trust_status, 0)` readers, and
+  a regression test decodes real migrated rows through `v_transactions` so no future nullable view
+  column can silently kill the fetch again.
 - `SimpleConnectionProvider`'s lazy connection init is now lock-guarded: two concurrent
   first-touch reads (possible since read-only calls left the database actor) could race the
   unsynchronized check-then-assign and construct two SQLite connections, silently dropping
