@@ -8,8 +8,27 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Changes are relative to `2.8.0-rc.3`.
 
+## Changed
+
+- The librustzcash family rides an interim git pin (librustzcash main at the #2909 merge) so a
+  wallet's own scheduled migration transactions carry their ZIP 318 classification
+  (`Overview.zip318Kind`) from the moment they are STORED at proving time, instead of only after
+  they mine and are scanned. This is what lets a wallet hold stored-but-unmined migration
+  transactions out of its activity list. The rev also carries librustzcash #2907: the engine's
+  advance-path selection (prove/broadcast steps) now picks transfers by scheduled height instead
+  of internal id. (The SDK's own next-due delivery query still selects by id — tracked
+  separately as the MOB-1466 M2 residual.) The pin reverts to published crates at the first rc
+  containing both.
+
 ## Fixed
 
+- Fetching transactions no longer fails on wallets whose `trust_status` column is NULL — which is
+  every wallet today, since transaction trust (`set_tx_trust`) is an opt-in marker with no default,
+  no backfill, and no caller yet. The strict `Overview` decode threw on the first row and the whole
+  `getAllTransactions` failed, rendering an empty transaction list over a fully-populated wallet. A
+  NULL now decodes as untrusted, matching librustzcash's own `IFNULL(trust_status, 0)` readers, and
+  a regression test decodes real migrated rows through `v_transactions` so no future nullable view
+  column can silently kill the fetch again.
 - `SimpleConnectionProvider`'s lazy connection init is now lock-guarded: two concurrent
   first-touch reads (possible since read-only calls left the database actor) could race the
   unsynchronized check-then-assign and construct two SQLite connections, silently dropping
