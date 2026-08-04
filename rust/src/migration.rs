@@ -2234,6 +2234,9 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
             &mut state,
             targets,
             &AdvanceConfig::new(ReorgSettleDepth::new(10)),
+            // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
+            // inter-broadcast gaps, so advancing needs entropy.
+            &mut OsRng,
         )?;
         Ok(match step {
             AdvanceStep::Reevaluate | AdvanceStep::Replan => {
