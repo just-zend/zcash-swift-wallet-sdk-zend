@@ -209,6 +209,8 @@ public enum ZcashErrorCode: String {
     case rustTorClientGet = "ZRUST0063"
     /// Error from rust layer when calling ZcashRustBackend.transactionDataRequests
     case rustTransactionDataRequests = "ZRUST0064"
+    /// Error from rust layer when calling ZcashRustBackend.setTransactionStatus
+    case rustSetTransactionStatus = "ZRUST0111"
     /// Error from rust layer when calling ZcashRustBackend.deriveArbitraryWalletKey
     case rustDeriveArbitraryWalletKey = "ZRUST0065"
     /// Error from rust layer when calling ZcashRustBackend.deriveArbitraryAccountKey
@@ -427,6 +429,8 @@ public enum ZcashErrorCode: String {
     case compactBlockProcessorPutOrchardSubtreeRoots = "ZCBPEO0022"
     /// Put Ironwood subtree roots to the DB failed.
     case compactBlockProcessorPutIronwoodSubtreeRoots = "ZCBPEO0023"
+    /// The chain is past the Ironwood (NU6.3) activation but the connected server does not serve Ironwood data, which the wallet needs in order to detect its shielded transactions by scanning.
+    case compactBlockProcessorServerMissingIronwoodSupport = "ZCBPEO0024"
     /// The synchronizer is unprepared.
     case synchronizerNotPrepared = "ZSYNCO0001"
     /// Memos can't be sent to transparent addresses.

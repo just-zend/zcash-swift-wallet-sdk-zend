@@ -323,26 +323,13 @@ class AdvancedReOrgTests: ZcashTestCase {
         await fulfillment(of: [preTxExpectation], timeout: 5)
 
         let sendExpectation = XCTestExpectation(description: "sendToAddress")
-        var pendingEntity: ZcashTransaction.Overview?
-        var testError: Error?
-        let sendAmount = Zatoshi(10000)
+        let pendingEntity: ZcashTransaction.Overview? = nil
+        let testError: Error? = nil
 
         /*
         4. create transaction
         */
-        do {
-//            let pendingTx = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: coordinator.spendingKey,
-//                zatoshi: sendAmount,
-//                toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-//                memo: try Memo(string: "test transaction")
-//            )
-//            pendingEntity = pendingTx
-            sendExpectation.fulfill()
-        } catch {
-            testError = error
-            XCTFail("error sending to address. Error: \(String(describing: error))")
-        }
+        sendExpectation.fulfill()
 
         await fulfillment(of: [sendExpectation], timeout: 2)
 
@@ -378,23 +365,6 @@ class AdvancedReOrgTests: ZcashTestCase {
         /*
         7. sync to  sentTxHeight + 1
         */
-//        let sentTxSyncExpectation = XCTestExpectation(description: "sent tx sync expectation")
-//
-//        do {
-//            try await coordinator.sync(
-//                completion: { synchronizer in
-//                    let pMinedHeight = await synchronizer.pendingTransactions.first?.minedHeight
-//                    XCTAssertEqual(pMinedHeight, sentTxHeight)
-//                    sentTxSyncExpectation.fulfill()
-//                },
-//                error: self.handleError
-//            )
-//        } catch {
-//            await handleError(error)
-//        }
-//
-//        await fulfillment(of: [sentTxSyncExpectation], timeout: 5)
-
         /*
         8. stage sentTx and otherTx at sentTxheight
         */
@@ -410,29 +380,6 @@ class AdvancedReOrgTests: ZcashTestCase {
         sleep(2)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        print("Starting after reorg sync")
-//        let afterReOrgExpectation = XCTestExpectation(description: "after ReOrg Expectation")
-//        do {
-//            try await coordinator.sync(
-//                completion: { synchronizer in
-//                    /*
-//                    11. verify that the sent tx is mined and balance is correct
-//                    */
-//                    let pMinedHeight = await synchronizer.pendingTransactions.first?.minedHeight
-//                    XCTAssertEqual(pMinedHeight, sentTxHeight)
-//                    // fee change on this branch
-//                    let expectedBalance = try await synchronizer.getShieldedBalance()
-//                    XCTAssertEqual(initialTotalBalance - sendAmount - Zatoshi(10000), expectedBalance)
-//                    afterReOrgExpectation.fulfill()
-//                },
-//                error: self.handleError
-//            )
-//        } catch {
-//            await handleError(error)
-//        }
-//
-//        await fulfillment(of: [afterReOrgExpectation], timeout: 5)
-
         /*
         12. applyStaged(sentTx + 10)
         */
@@ -459,8 +406,6 @@ class AdvancedReOrgTests: ZcashTestCase {
         let expectedVerifiedBalance = initialTotalBalance + pendingTx.value
         let currentVerifiedBalance = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]?.saplingBalance.spendableValue ?? .zero
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let expectedPendingTransactionsCount = await coordinator.synchronizer.pendingTransactions.count
-//        XCTAssertEqual(expectedPendingTransactionsCount, 0)
         XCTAssertEqual(expectedVerifiedBalance, currentVerifiedBalance)
 
         let resultingBalance: Zatoshi = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]?.saplingBalance.total() ?? .zero
@@ -819,24 +764,15 @@ class AdvancedReOrgTests: ZcashTestCase {
         await fulfillment(of: [firstSyncExpectation], timeout: 5)
 
         sleep(1)
-//        let initialTotalBalance: Zatoshi = try await coordinator.synchronizer.getShieldedBalance()
 
         let sendExpectation = XCTestExpectation(description: "send expectation")
-        var pendingEntity: ZcashTransaction.Overview?
+        let pendingEntity: ZcashTransaction.Overview? = nil
 
         /*
         2. send transaction to recipient address
         */
-        let recipient = try Recipient(Environment.testRecipientAddress, network: self.network.networkType)
 
         do {
-//            let pendingTx = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: self.coordinator.spendingKey,
-//                zatoshi: Zatoshi(20000),
-//                toAddress: recipient,
-//                memo: try Memo(string: "this is a test")
-//            )
-//            pendingEntity = pendingTx
             sendExpectation.fulfill()
         } catch {
             await handleError(error)
@@ -894,16 +830,10 @@ class AdvancedReOrgTests: ZcashTestCase {
         await fulfillment(of: [secondSyncExpectation], timeout: 5)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        var pendingTransactionsCount = await coordinator.synchronizer.pendingTransactions.count
-//        XCTAssertEqual(pendingTransactionsCount, 1)
-//        guard let afterStagePendingTx = await coordinator.synchronizer.pendingTransactions.first else {
-//            return
-//        }
 
         /*
         6a. verify that there's a pending transaction with a mined height of sentTxHeight
         */
-//        XCTAssertEqual(afterStagePendingTx.minedHeight, sentTxHeight)
 
         /*
         7. stage 20  blocks from sentTxHeight
@@ -944,14 +874,6 @@ class AdvancedReOrgTests: ZcashTestCase {
         /*
         10. verify that there's a pending transaction with -1 mined height
         */
-//        guard let newPendingTx = await coordinator.synchronizer.pendingTransactions.first else {
-//            XCTFail("No pending transaction")
-//            try await coordinator.stop()
-//            return
-//        }
-//
-//        XCTAssertNil(newPendingTx.minedHeight)
-
         /*
         11. applyHeight(sentTxHeight + 2)
         */
@@ -980,16 +902,6 @@ class AdvancedReOrgTests: ZcashTestCase {
         /*
         12. verify that there's a pending transaction with a mined height of sentTxHeight + 2
         */
-//        pendingTransactionsCount = await coordinator.synchronizer.pendingTransactions.count
-//        XCTAssertEqual(pendingTransactionsCount, 1)
-//        guard let newlyPendingTx = try await coordinator.synchronizer.allPendingTransactions().first(where: { $0.isSentTransaction }) else {
-//            XCTFail("no pending transaction")
-//            try await coordinator.stop()
-//            return
-//        }
-//
-//        XCTAssertEqual(newlyPendingTx.minedHeight, sentTxHeight + 2)
-
         /*
         13. apply height(sentTxHeight + 25)
         */
@@ -1019,38 +931,7 @@ class AdvancedReOrgTests: ZcashTestCase {
         15. verify that there's no pending transaction and that the tx is displayed on the sentTransactions collection
         */
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let pendingTranscationsCount = await coordinator.synchronizer.pendingTransactions.count
-//        XCTAssertEqual(pendingTranscationsCount, 0)
 
-//        let sentTransactions = await coordinator.synchronizer.sentTransactions
-//            .first(
-//                where: { transaction in
-//                    return transaction.rawID == newlyPendingTx.rawID
-//                }
-//            )
-//
-//        XCTAssertNotNil(
-//            sentTransactions,
-//            "Sent Tx is not on sent transactions"
-//        )
-//
-//        let expectedVerifiedBalance = try await coordinator.synchronizer.getShieldedVerifiedBalance()
-//        let expectedBalance = try await coordinator.synchronizer.getShieldedBalance()
-//
-//        XCTAssertEqual(
-//            initialTotalBalance + newlyPendingTx.value, // Note: sent transactions have negative values
-//            expectedBalance
-//        )
-//
-//        XCTAssertEqual(
-//            initialTotalBalance + newlyPendingTx.value, // Note: sent transactions have negative values
-//            expectedVerifiedBalance
-//        )
-//
-//        let txRecipients = await coordinator.synchronizer.getRecipients(for: newPendingTx)
-//        XCTAssertEqual(txRecipients.count, 2)
-//        XCTAssertNotNil(txRecipients.first(where: { $0 == .internalAccount(0) }))
-//        XCTAssertNotNil(txRecipients.first(where: { $0 == .address(recipient) }))
     }
 
     /// Uses the zcash-hackworks data set.
@@ -1272,19 +1153,12 @@ class AdvancedReOrgTests: ZcashTestCase {
         let initialTotalBalance: Zatoshi = try await coordinator.synchronizer.getAccountsBalances()[accountUUID]?.saplingBalance.total() ?? .zero
 
         let sendExpectation = XCTestExpectation(description: "send expectation")
-        var pendingEntity: ZcashTransaction.Overview?
+        let pendingEntity: ZcashTransaction.Overview? = nil
 
         /*
         2. send transaction to recipient address
         */
         do {
-////            let pendingTx = try await coordinator.synchronizer.sendToAddress(
-////                spendingKey: self.coordinator.spendingKey,
-////                zatoshi: Zatoshi(20000),
-////                toAddress: try Recipient(Environment.testRecipientAddress, network: self.network.networkType),
-////                memo: try! Memo(string: "this is a test")
-//        )
-//            pendingEntity = pendingTx
             sendExpectation.fulfill()
         } catch {
             await handleError(error)
@@ -1362,13 +1236,6 @@ class AdvancedReOrgTests: ZcashTestCase {
         await fulfillment(of: [reorgExpectation, reorgSyncExpectation], timeout: 5)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        guard let pendingTx = await coordinator.synchronizer.pendingTransactions.first else {
-//            XCTFail("no pending transaction after reorg sync")
-//            return
-//        }
-//
-//        XCTAssertNil(pendingTx.minedHeight)
-
         LoggerProxy.info("applyStaged(blockheight: \(sentTxHeight + extraBlocks - 1))")
         try coordinator.applyStaged(blockheight: sentTxHeight + extraBlocks - 1)
 
@@ -1426,8 +1293,6 @@ class AdvancedReOrgTests: ZcashTestCase {
         await fulfillment(of: [firstSyncExpectation], timeout: 600)
 
         // TODO: [#1247] needs to review this to properly solve, https://github.com/zcash/ZcashLightClientKit/issues/1247
-//        let latestScannedHeight = await coordinator.synchronizer.latestBlocksDataProvider.latestScannedHeight
-//        XCTAssertEqual(latestScannedHeight, birthday + fullSyncLength)
     }
 
     func handleError(_ error: Error?) async {
