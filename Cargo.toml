@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "2.8.0-rc.1"
+version = "2.8.0-rc.2"
 authors = [
     "Jack Grigg <thestr4d@gmail.com>",
     "Lukas Korba <lukas@tangiblecodes.com>",
@@ -21,7 +21,7 @@ ff = "0.13"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
 transparent = { package = "zcash_transparent", version = "0.10", default-features = false }
 zcash_address = { version = "0.13" }
-zcash_client_backend = { version = "0.24.0-rc.4", features = [
+zcash_client_backend = { version = "0.24.0-rc.6", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "pczt",
@@ -29,11 +29,11 @@ zcash_client_backend = { version = "0.24.0-rc.4", features = [
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "0.22.0-rc.4", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "0.22.0-rc.6", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_note_encryption = "0.4.1"
 zcash_primitives = "0.30"
 zcash_proofs = "0.30"
-zcash_protocol = "0.10"
+zcash_protocol = "0.10.2"
 zcash_script = "0.4"
 zip32 = "0.2"
 pczt = { version = "0.9.0", features = ["prover", "orchard", "sapling"] }
@@ -93,15 +93,18 @@ bindgen = "0.72"
 cbindgen = "0.29"
 cc = "1.0"
 
-# zcash_voting is taken from git rather than crates.io. The published 1.0.0 pins
-# the pre-Ironwood librustzcash family (orchard 0.14, zcash_protocol 0.9) and
-# cannot resolve against this tree; this revision is 2.0.0-rc.1, whose pins match
-# the 2.8.0-rc.1 dependency set exactly, including zcash_client_sqlite
-# 0.22.0-rc.4. The version requirement above must keep matching the revision's
-# own version, or the patch is silently ignored and the crates.io release is
-# resolved instead.
 [patch.crates-io]
-zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting", rev = "bde9ee0283ff3e23995bd6996dff3ba1f8969076" }
+zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting", rev = "3c9900e56081966b74dd57a0c880c782f4f602bb" }
+
+## Uncomment these to test librustzcash against a git commit
+# pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
+# zcash_client_backend = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
+# zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
+# zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
+# zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
+# zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
+# zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
+# zcash_transparent = { git = "https://github.com/zcash/librustzcash.git", rev = "REPLACE_ME" }
 
 [features]
 default = []

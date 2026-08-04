@@ -25,6 +25,132 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VotingNoteInfo`, `VotingPczt`, `VotingDelegationKeyInputs`) now conform to
   `Undescribable` so their contents cannot leak through logging or reflection.
 
+## Changed
+- Updated the librustzcash crates to `zcash_client_backend 0.24.0-rc.6` and
+  `zcash_client_sqlite 0.22.0-rc.6`, adopting the revised ZIP 318 migration timing
+  (shorter transfer and preparation delays, and an anchor-age cap of 4 bucket
+  boundaries rather than 16).
+- A canonical ZIP 318 crossing is now funded from the single oldest Orchard note
+  that covers the payment and its fee, falling back to ordinary multi-note funding
+  when no such note exists. Canonical-denomination payments that previously lost
+  the canonical shape to multi-note funding now take it whenever a single covering
+  note exists.
+
+## Fixed
+All of the following were picked up from the librustzcash update:
+
+- A wallet whose database was upgraded by a build using
+  `zcash_client_sqlite 0.22.0-rc.1` (the 2.6.6 internal build) no longer fails
+  every scan. Such a wallet's `orchard_ironwood_migrations` table never acquired
+  the `anchor_bucket_interval` column, added to the table-creation migration in
+  place afterwards, and the column reference then failed on every scan — no block
+  could be written and no transaction ever acquired a mined height, whether or not
+  a pool migration was in progress. A new database migration adds the missing
+  column. The backfilled value is exact on the production network; on a test
+  network, a pool migration planned under a custom anchor grid is reported as
+  `AnchorIntervalMismatch` and must be re-planned.
+- A ZIP 318 crossing anchored to a bucket boundary whose block contains no note
+  commitments in any pool no longer fails with `ProposalError::AnchorNotFound`:
+  scanning now creates a checkpoint at every anchor-retention grid height, and
+  proposal creation additionally falls back to an ordinary crossing when no anchor
+  is computable at the boundary rather than proposing a build that would fail.
+- Note selection now draws the oldest eligible notes first, in note commitment
+  tree (chain) order. Notes were previously drawn in scan-discovery order, which
+  for a restored wallet prefers its most recently discovered — typically newest —
+  notes.
+- A payment to one of the wallet's own transparent addresses is now reported with
+  the transparent receiver address itself as the output's recipient, rather than
+  the receiving account's unified address; for outputs the wallet created, the
+  recipient address recorded at transaction construction time takes precedence
+  over the receiving address.
+
+# 2.8.0-rc.2 - 2026-07-28
+
+## Changed
+- Once NU6.3 has activated, `proposeTransfer` and `proposefulfillingPaymentURI`
+  propose a single payment whose value is a canonical ZIP 318 denomination (a
+  `{1, 2, 5} * 10^k` amount between 0.01 ZEC and 10,000 ZEC) that crosses the
+  Orchard turnstile as a ZIP 318 canonical crossing: funded from a single
+  Orchard note, anchored on the wallet's ZIP 318 anchor bucket grid, given the
+  ZIP 318 rolling expiry height, and built with one unpadded Ironwood action
+  instead of two. Such a proposal therefore pays one fewer ZIP 317
+  marginal-fee action, and requires up to two bucket intervals of
+  confirmations on its inputs beyond the `ConfirmationsPolicy` the caller
+  supplied. When the wallet cannot fund the payment that way, an ordinary
+  transaction is proposed instead, as before.
+- The FFI xcframework build now compiles every Apple architecture in a single
+  multi-target `cargo build` invocation rather than one invocation per
+  architecture. Concurrent cargo invocations serialize on a lock over the
+  shared host artifact directory, so the single-threaded fat-LTO pass for each
+  architecture previously ran one after another; they now overlap. The
+  per-platform goals (`make macos`, `make ios-device`, `make ios-simulator`)
+  still build only their own architectures.
+- `make clean` in `BuildSupport/` no longer removes the cargo `target`
+  directory; the new `make distclean` goal does. This lets a restored Rust
+  dependency cache survive a release build, which previously deleted it before
+  compiling.
+- The bundled `libzcashlc` XCFramework is built against
+  `zcash_client_backend 0.24.0-rc.5`, `zcash_client_sqlite 0.22.0-rc.5` and
+  `zcash_protocol 0.10.2`, which are the source of the proposal behavior above
+  and of the fixes below.
+
+## Fixed
+- An Ironwood note received on an account's internal address is now classified
+  as change once the wallet learns that the same account funded the
+  transaction. This was previously applied to Sapling and Orchard notes only,
+  so an Ironwood note that was recorded before its transaction's spends could
+  be linked to the wallet kept the wrong classification permanently:
+  `ZcashTransaction.Overview.hasChange` was `false` while the note was instead
+  counted in `receivedNoteCount` and `sentNoteCount`, and the corresponding
+  `ZcashTransaction.Output.isChange` was `false`, presenting the account's own
+  change as a recipient of the user's transaction. Balances were not affected.
+  Notes already recorded with the wrong classification are repaired by a
+  database migration on upgrade; no rescan is required.
+- An address that had received only Ironwood notes was treated as never having
+  been used: the transparent address gap-limit search still considered it
+  unused, so `getCustomUnifiedAddress(accountUUID:receivers:)` could hand it
+  out again, and the account that received the note was not reported as being
+  involved in the transaction that paid it. Since NU6.3 every payment to an
+  Orchard receiver is delivered in the Ironwood bundle, so this affected
+  ordinary received payments. A database migration corrects the affected data
+  on upgrade.
+- The funding account reported for a transparent output now takes value spent
+  from the Ironwood pool into account. Ironwood inputs were not counted, so a
+  transparent output whose creating transaction was funded entirely from
+  Ironwood was attributed to no account and so was absent from the outputs
+  `getTransactionOutputs(for:)` reports for that transaction, and an output
+  funded from several pools could be attributed to an account other than the
+  largest contributor. Post-NU6.3 wallets hold their shielded value in
+  Ironwood, so this affected ordinary spends rather than only unusual ones.
+- Transaction status is now requested during enhancement on the basis of
+  durable observation intent recorded when a transaction is stored, rather
+  than synthesized from the presence of a shielded bundle. A sent transaction
+  is queried by txid when this wallet cannot observe one of its shielded
+  spends or outputs — including a transaction funded entirely by transparent
+  inputs whose shielded outputs all belong to another wallet, whose mined or
+  expired status the wallet could not previously learn. Intent remains dormant
+  while a transaction is mined and becomes active again after a chain rewind;
+  redundant status requests for transactions the wallet can observe by
+  scanning are no longer produced.
+- Requests made over Tor now bound how long each network operation may take.
+  A server that accepted a connection and then never responded previously left
+  the request pending indefinitely, stalling the calling SDK operation: this
+  affects `Synchronizer.refreshExchangeRateUSD()` and
+  `TorClient.getExchangeRateUSD()`, which aggregate several exchange servers,
+  as well as every lightwalletd call the SDK routes over Tor. Requests that
+  exceed a deadline now fail with an error instead of hanging.
+- `TorClient.httpRequest(for:retryLimit:)` now rejects a `URLRequest` whose URL
+  scheme is neither `http` nor `https` (for example `ftp` or `ws`). Such a URL
+  was previously treated as plaintext HTTP; a URL with no scheme at all was,
+  and remains, rejected.
+
+# 2.7.0-rc.3 - 2026-07-28
+
+The 2.7 maintenance line's release of the changes listed under 2.8.0-rc.2
+above. It carries those and nothing else, so wallets on either line receive
+the same `zcash_client_backend 0.24.0-rc.5` / `zcash_client_sqlite 0.22.0-rc.5`
+behavior changes and fixes.
+
 # v2.8.0-rc.1 - 2026-07-26
 
 ## Added
@@ -211,10 +337,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4090000.json
   finalization with a missing-signature error. The Ironwood bundle redaction
   is preserved: the full view clears Ironwood spend witnesses and output
   metadata alongside the other bundles.
-- Send-max proposals now spend from the Ironwood pool in addition to Sapling
-  and Orchard, so a post-NU6.3 wallet's Ironwood funds are no longer silently
-  excluded from a send-max. This affects only the general send-max proposal;
-  the Orchard-to-Ironwood migration is unchanged.
 
 # 2.7.0-rc.1 - 2026-07-25
 
@@ -231,12 +353,24 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4090000.json
 
 ## Changed
 - Bumped the Rust dependency stack to the Ironwood (NU6.3) crates.io releases
-  (`orchard` 0.13→0.15, `zcash_client_backend` 0.23→0.24.0-rc.1,
-  `zcash_client_sqlite` 0.21→0.22.0-rc.1, `zcash_primitives`/`zcash_proofs`
-  0.28→0.29, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
-  `zcash_transparent` 0.8→0.9, `pczt` 0.7→0.8.0-rc.1, `zcash_keys` 0.14→0.15)
+  (`orchard` 0.14→0.15, `zcash_client_backend` 0.23→0.24.0-rc.2,
+  `zcash_client_sqlite` 0.21→0.22.0-rc.2, `zcash_primitives`/`zcash_proofs`
+  0.28→0.30, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
+  `zcash_transparent` 0.8→0.10, `pczt` 0.7→0.8, `zcash_keys` 0.14→0.16)
   and dropped the `[patch.crates-io]` git overrides, matching the Android SDK's
   2.5.x dependency set. `addProofsToPCZT` now also proves Ironwood bundles.
+- Once NU6.3 activates, a payment to an Orchard receiver is delivered through
+  the Ironwood bundle of a version 6 transaction rather than as an Orchard
+  output: a `Proposal` reports such payments and the change from Ironwood
+  spends as Ironwood-pool outputs, and `createProposedTransactions` and
+  `createPCZTFromProposal` build the version 6 transaction that carries them.
+- Fee and change calculation derive the Orchard bundle version from the
+  proposal's target height instead of always applying the pre-NU6.3 policy, so
+  a proposal targeting a height at or beyond NU6.3 activation is charged one
+  ZIP 317 action per Orchard spend or output rather than
+  `max(spends, outputs)`, and Ironwood spends, outputs and change are charged
+  against the separate Ironwood bundle. Proposals below the activation height
+  are unaffected.
 
 ## Removed
 - The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
@@ -245,7 +379,14 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4090000.json
   `orchard` release, so voting is not shipped on the 2.5.x line, matching the
   Android SDK.
 
-# 2.6.0-alpha.6
+## Fixed
+- `deleteAccount(_:)` no longer fails with a rusqlite
+  `InvalidParameterName(":address")` error when the account being deleted is
+  recorded as the recipient of one of its own sent outputs, as happens after
+  an internal transfer to that account. Wallets on the 2.6 line received this
+  fix in 2.6.0-alpha.6.
+
+# 2.6.0-alpha.6 - 2026-06-26
 
 ## Added
 - `BlockEnhancer` now emits structured diagnostic logs at each step of an enhance cycle — cycle start with request count, per-request type and attempt, fetch response shape (status, whether a tx was returned, whether a `minedHeight` was set), the decision taken (`setTransactionStatus` or `decryptAndStoreTransaction`), per-attempt errors with error type, retry exhaustion, and cycle completion. Logs use opaque per-request correlation IDs (no transaction ids, addresses, or other PII) so production logs are debuggable for future stuck-transaction reports without exposing user-identifying data.
@@ -300,10 +441,36 @@ other server-streaming gRPC calls (`[ZUTXO0001]`).
   streams): these server-streaming gRPC calls now use the streaming-call timeout
   instead of the shorter single-call timeout.
 
-# 2.6.0-alpha.4
+# 2.6.0-alpha.4 - 2026-06-04
 
 This release updates from 2.6.0-alpha.3 to integrate support for the NU6.2
 network upgrade.
+
+## Changed
+- Updated the Rust dependency stack to the released crates.io versions carried
+  by 2.5.2 below, including `zcash_protocol` 0.9, which sets the NU6.2
+  activation heights (mainnet 3364600, testnet 4052000). Transactions
+  targeting those heights and above are built against the NU6.2 consensus
+  branch id.
+
+# 2.5.2 - 2026-06-03
+
+## Changed
+- Updated the Rust dependency stack to released crates.io versions
+  (`orchard` 0.13.1→0.14, `zcash_client_backend` 0.22→0.23,
+  `zcash_client_sqlite` 0.20.2→0.21, `zcash_keys` 0.13→0.14,
+  `zcash_primitives`/`zcash_proofs` 0.27→0.28, `zcash_protocol` 0.8→0.9,
+  `zcash_address` 0.11→0.12, `zcash_transparent` 0.7→0.8, `pczt` 0.6→0.7).
+  `zcash_protocol` 0.9 carries the NU6.2 activation heights (mainnet 3364600,
+  testnet 4052000), so transactions targeting those heights and above are now
+  built against the NU6.2 consensus branch id. The public Swift API is
+  unchanged.
+
+# 2.6.0-alpha.3 - 2026-05-27
+
+## Changed
+- Updated `zcash_voting` to 0.10.1, taken from the released crate rather than a
+  git revision.
 
 ## Checkpoints
 
@@ -322,11 +489,33 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4010000.json
 ...
 Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4030000.json
 ````
+
+# 2.6.0-alpha.2 - 2026-05-18
+
+## Added
+- `VotingRustBackend.generateHotkey(seed:)`, deriving a `VotingHotkey` from the
+  wallet seed.
+
+## Changed
+- Updated `zcash_voting` to 0.8.1 (from 0.6.0).
+
 # 2.5.1 - 2026-05-14
 
 ## Fixed
 - Fixed a bug that could cause transactions shielding more than 150 transparent
   P2PKH inputs to fail due to incorrect fee computation.
+
+# 2.6.0-alpha.1 - 2026-05-12
+
+## Added
+- A Swift wrapper over the `zcashlc_voting_*` FFI introduced in 2.5.0:
+  `VotingRustBackend` (voting-database handle, round setup and state, vote
+  commitment and share-payload construction, share encryption, delegation PIR
+  precomputation, vote-tree sync, VAN and note witness generation, and the
+  vote/delegation transaction-hash store), the public `Voting*` value types,
+  and `PirSnapshotResolver` / `PirSnapshotProbing` / `HTTPPirSnapshotProbe` for
+  selecting a PIR snapshot server. This surface was removed again in
+  2.7.0-rc.1.
 
 # 2.5.0 - 2026-05-11
 
