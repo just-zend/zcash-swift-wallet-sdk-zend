@@ -26,12 +26,20 @@ enum MigrationBroadcastOutcome: Equatable {
 /// conformer.
 protocol MigrationBroadcasting {
     /// Submits `rawTransaction` to `endpoint` exactly once. See
-    /// ``MigrationBroadcaster/broadcast(rawTransaction:to:useTor:)`` for the full contract (fail-closed
-    /// Tor, throw-vs-return split).
+    /// ``MigrationBroadcaster/broadcast(rawTransaction:to:useTor:onWillSubmit:)`` for the full
+    /// contract (fail-closed Tor, throw-vs-return split, and when exactly `onWillSubmit` fires).
+    ///
+    /// `onWillSubmit` MUST be invoked at the last pre-submit instant — after every piece of
+    /// connection setup (Tor bootstrap, isolated-circuit/connection establishment) and
+    /// immediately before the submit RPC — and must NOT be invoked on a path that throws before
+    /// submitting anything. `OrchardMigration` uses it to (re-)arm the sync gate's 120 s
+    /// in-flight broadcast marker so the marker's window covers the actual submit-to-record span
+    /// rather than being burned by a slow Tor bootstrap (A9).
     func broadcast(
         rawTransaction: Data,
         to endpoint: LightWalletEndpoint,
-        useTor: Bool
+        useTor: Bool,
+        onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome
 }
 
@@ -151,19 +159,26 @@ actor MigrationBroadcaster: MigrationBroadcasting {
 
     /// Submits `rawTransaction` to `endpoint` exactly once.
     ///
+    /// `onWillSubmit` fires at the last pre-submit instant — after the Tor bootstrap and
+    /// isolated-connection setup on the Tor path (which can take many seconds), or right before
+    /// the direct submit — and never on a path that throws before submitting (the fail-closed Tor
+    /// throws happen strictly before it). See ``MigrationBroadcasting``'s requirement doc for the
+    /// contract this implements.
+    ///
     /// - Throws: ``ZcashError/migrationTorUnavailable`` when `useTor` is `true` and the dedicated Tor
     ///   runtime or connection cannot be established before the submit RPC is attempted. In that case
-    ///   nothing is broadcast and the caller must record no result.
+    ///   nothing is broadcast (and `onWillSubmit` never fired) and the caller must record no result.
     /// - Returns: the raw outcome (submitted / rejected / transport error) for the caller to map.
     func broadcast(
         rawTransaction: Data,
         to endpoint: LightWalletEndpoint,
-        useTor: Bool
+        useTor: Bool,
+        onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome {
         if useTor {
-            return try await broadcastOverTor(rawTransaction: rawTransaction, to: endpoint)
+            return try await broadcastOverTor(rawTransaction: rawTransaction, to: endpoint, onWillSubmit: onWillSubmit)
         } else {
-            return await broadcastDirect(rawTransaction: rawTransaction, to: endpoint)
+            return await broadcastDirect(rawTransaction: rawTransaction, to: endpoint, onWillSubmit: onWillSubmit)
         }
     }
 
@@ -209,7 +224,8 @@ actor MigrationBroadcaster: MigrationBroadcasting {
 
     private func broadcastOverTor(
         rawTransaction: Data,
-        to endpoint: LightWalletEndpoint
+        to endpoint: LightWalletEndpoint,
+        onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome {
         // Fail-closed: any failure to build the runtime or open the isolated connection — i.e. any
         // failure *before* the submit RPC — is reported as Tor-unavailable, and nothing is broadcast.
@@ -231,6 +247,10 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         }
 
         // The connection is established; a thrown error here is a mid-submit transport failure.
+        // The bootstrap/connect above can take many seconds, so only NOW — at the last pre-submit
+        // instant — does the caller's hook fire (A9: it re-arms the in-flight marker so its
+        // window covers the submit, not the bootstrap).
+        onWillSubmit()
         do {
             let response = try connection.submit(spendTransaction: rawTransaction)
             return outcome(from: response)
@@ -242,11 +262,15 @@ actor MigrationBroadcaster: MigrationBroadcasting {
 
     private func broadcastDirect(
         rawTransaction: Data,
-        to endpoint: LightWalletEndpoint
+        to endpoint: LightWalletEndpoint,
+        onWillSubmit: @Sendable () -> Void
     ) async -> MigrationBroadcastOutcome {
         // A fresh, ephemeral gRPC service for exactly this endpoint, closed after the single attempt.
         let service = LightWalletGRPCService(endpoint: endpoint)
 
+        // The last pre-submit instant on the direct path: the ephemeral service connects lazily
+        // inside `submit`, so the hook fires immediately before it (A9).
+        onWillSubmit()
         do {
             let response = try await service.submit(spendTransaction: rawTransaction, mode: ServiceMode.direct)
             await service.closeConnections()

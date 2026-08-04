@@ -98,7 +98,8 @@ class TransactionSQLDAO: TransactionRepository {
         return transactionsCopy
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): SELECT over v_transactions JOIN v_tx_outputs — filter/join
+    // query via connection().prepare only.
     func fetchTxidsWithMemoContaining(searchTerm: String) async throws -> [Data] {
         let query = transactionsView
             .join(txOutputsView, on: transactionsView[UserMetadata.txid] == txOutputsView[UserMetadata.txid])
@@ -115,7 +116,8 @@ class TransactionSQLDAO: TransactionRepository {
         return txids
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): SELECT over the slipstream_v_tx_reconciled VIEW — read-only
+    // by construction.
     func unreconciledTxids() async throws -> Set<Data> {
         // [#1755] Reads the slipstream-owned `slipstream_v_tx_reconciled` view (a VIEW over upstream's
         // nullifier_map / *_received_notes — see slipstream `reconcile.rs`). Returns the txids whose
@@ -136,12 +138,13 @@ class TransactionSQLDAO: TransactionRepository {
         }
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): blocks table via BlockSQLDAO.block(at:) — filter+limit
+    // SELECT.
     func blockForHeight(_ height: BlockHeight) async throws -> Block? {
         try blockDao.block(at: height)
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): scalar COUNT over v_transactions.
     func countAll() async throws -> Int {
         do {
             return try connection().scalar(transactionsView.count)
@@ -150,7 +153,7 @@ class TransactionSQLDAO: TransactionRepository {
         }
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): scalar COUNT over v_transactions filtered unmined.
     func countUnmined() async throws -> Int {
         do {
             return try connection().scalar(transactionsView.filter(ZcashTransaction.Overview.Column.minedHeight == nil).count)
@@ -285,7 +288,8 @@ class TransactionSQLDAO: TransactionRepository {
         return entity
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): connection().prepare(query).map — every caller passes a
+    // view-based SELECT.
     private func execute<Entity>(_ query: View, createEntity: (Row) throws -> Entity) async throws -> [Entity] {
         do {
             let entities = try connection()

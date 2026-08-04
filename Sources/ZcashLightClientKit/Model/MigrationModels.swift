@@ -5,28 +5,188 @@
 
 import Foundation
 
-/// The top-level Orchard -> Ironwood migration state machine surfaced to the app.
+/// The migration engine's next-step decision for the stored Orchard -> Ironwood run, as surfaced
+/// by `Synchronizer.migrationAdvanceStep(accountUUID:)` /
+/// `ZcashRustBackendWelding.migrationAdvanceStep(for:)`.
 ///
-/// The app fetches this via `ZcashRustBackendWelding.migrationState(for:)` on launch and after
-/// every migration-related operation; it is the reconciliation hub for driving the migration UI.
-public enum MigrationState: Equatable, Sendable {
-    /// No migration run is stored: none was started, or a previous run was cancelled.
-    case notStarted
-    /// The run is committed and its preparation (note-split) transactions are not yet all mined.
-    case splitPendingConfirmation
-    /// Preparation is mined and the run's transfers are executing.
-    case inProgress(MigrationProgress)
-    /// A transfer cannot proceed automatically; the app must act.
-    case requiresAttention(MigrationAttentionReason)
-    /// Every transaction of the STORED RUN is mined. This is PER-RUN — it does not mean the
-    /// account has nothing left to migrate: a large balance can need several successive runs, and
-    /// funds received later re-create a migratable balance. After completion, ask
-    /// `proposeMigrationTransfers` whether anything remains (an empty schedule means no).
+/// A conduit of the upstream engine's public `advance_migration` API. The SDK preserves this
+/// enum's source-compatible shape by projecting upstream `Reevaluate` and `Replan` decisions onto
+/// ``requiresAttention(id:)``; the broadcast/prove/rebuild/waiting/complete cases marshal directly
+/// (upstream PR #2871).
+/// `nil` at the API level (the call returns an optional) means no migration run is stored at all —
+/// none was ever committed for the account — so there is nothing to advance and nothing to poll.
+/// The engine's priority order is attend > broadcast > prove > rebuild:
+/// ``requiresAttention(id:)`` outranks every actionable step (a run holding an invalid
+/// transaction is not driven further until resolved), and a proven, due transaction broadcasts
+/// ahead of any new proving work (its broadcast window is the scarcer resource; proving can
+/// happen on any later wake-up).
+///
+/// Evaluated with both the wallet's fully-scanned target and its wall-clock tip estimate. Upstream
+/// uses the estimate only for reversible scheduling/withholding; persisted or destructive
+/// judgments remain anchored to scanned data. It is also memoryless about sessions: it reports
+/// what the run needs next, not whether doing it now would pair a broadcast
+/// with a sync — session policy (one broadcast per session, no sync in a broadcast session, the
+/// post-broadcast privacy buffer) belongs to the caller and the sync gate, not to this value.
+///
+/// Discharging each step:
+/// - ``requiresAttention(id:)`` → SYNC, then call `migrationAdvanceStep(accountUUID:)` again: the
+///   engine adjudicates against the newly scanned data and, where the obstruction was transient,
+///   re-offers the work in that same call. Only if attention persists does the run need the
+///   out-of-band resolution — surface the attention UX over the
+///   ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
+///   `restartCurrentMigrationStep(accountUUID:)` to cancel and re-plan.
+/// - ``broadcast(id:)`` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`:
+///   submit the served transaction and end the session — a broadcast session must not sync.
+/// - ``prove(id:kind:)`` with a ``MigrationTransactionStatus/Kind/transfer(crossing:)`` kind →
+///   `finalizeReadyMigrationTransfers(accountUUID:)` at a sync wake-up (see
+///   `migrationSyncWakeups(accountUUID:)`); the broadcast then follows in its own LATER session.
+///   Proving has no deadline of its own — a transfer's boundary anchor checkpoint is durably
+///   retained, so a missed wake-up defers the proof, never invalidates it.
+/// - ``prove(id:kind:)`` with a ``MigrationTransactionStatus/Kind/preparation(layer:index:)`` kind
+///   → the preparation is due by construction (the engine only reports a preparation prove once
+///   its broadcast height has arrived and its dependencies are mined), and a preparation proves
+///   against a near-tip witnessable anchor rather than a drawn boundary — so it may be proved
+///   (`finalizeReadyMigrationTransfers`) and broadcast at the SAME wake-up.
+/// - ``rebuild(id:)`` → `refreshStaleMigrationTransfers(accountUUID:usk:)` — needs spend
+///   authority (a spending key in-process, or the external-signer re-serve ceremony).
+/// - ``waiting`` → nothing is actionable now: register OS wake-ups at the heights
+///   `migrationSyncWakeups(accountUUID:)` returns, plus each status row's
+///   ``MigrationTransactionStatus/scheduledHeight`` for the broadcast windows.
+///
+/// ``complete`` is terminal for the STORED run — including a CANCELLED one, which the engine also
+/// reports as complete rather than ever driving it further — and means "stop polling this run".
+/// Per-run, not per-account: whether a migratable balance remains (several successive runs, or
+/// funds received later) is answered by `proposeMigrationTransfers(accountUUID:)` — an empty
+/// schedule means no.
+public enum MigrationAdvanceStep: Equatable, Sendable {
+    /// The transaction identified by `id` is ready to be proved; `kind` tells a preparation (may
+    /// prove and broadcast at the same wake-up) from a transfer (prove now, broadcast in its own
+    /// later session) — see the type doc's discharge mapping.
+    case prove(id: UInt32, kind: MigrationTransactionStatus.Kind)
+    /// The transaction identified by `id` is proved and due: broadcast it (and end the session).
+    case broadcast(id: UInt32)
+    /// The transfer identified by `id` expired unmined and must be rebuilt in place.
+    case rebuild(id: UInt32)
+    /// Nothing is actionable right now: wake again at the sync-wakeup/scheduled heights.
+    case waiting
+    /// The stored run is terminal (fully mined, or cancelled): stop polling it.
     case complete
+    /// The transaction identified by `id` either has an open node-rejection report that requires
+    /// more sync (`Reevaluate`) or was determined unsatisfiable and requires a new plan (`Replan`).
+    /// Discharge: sync and call `migrationAdvanceStep` again for reevaluation; if attention
+    /// remains, show the status and use `restartCurrentMigrationStep` (see the type doc's
+    /// mapping).
+    case requiresAttention(id: UInt32)
 }
 
-/// A snapshot of an in-progress migration, as carried by `MigrationState.inProgress` or returned
-/// standalone by `ZcashRustBackendWelding.migrationProgress(for:)`.
+/// The outcome of one broadcast-lane delivery attempt
+/// (`Synchronizer.executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`).
+///
+/// Distinguishes the two empty outcomes from an actual broadcast: ``nothingDue`` ends the session
+/// with nothing to do, ``awaitingProof(id:)`` means the due transaction's proof has not been
+/// produced yet (run `finalizeReadyMigrationTransfers` at a sync wake-up, then retry in a later
+/// broadcast session), and ``executed(_:)`` carries the broadcast's recorded
+/// ``MigrationTransferResult``.
+public enum MigrationTransferAttempt: Equatable, Sendable {
+    /// Nothing is due: nothing scheduled yet, dependencies unmined, rows awaiting an external
+    /// signature, or everything already broadcast.
+    case nothingDue
+    /// The transaction identified by `id` is due but has not been proved yet; nothing was
+    /// broadcast. Proofs are produced by `finalizeReadyMigrationTransfers` as the wallet syncs.
+    case awaitingProof(id: UInt32)
+    /// A broadcast was attempted and its outcome recorded.
+    case executed(MigrationTransferResult)
+}
+
+/// One sync/proving wake-up of the stored run's schedule, as returned by
+/// `Synchronizer.migrationSyncWakeups(accountUUID:)`: the block height at which the wallet should
+/// wake, sync, and prove, plus the ids of the transfers that wake-up is responsible for proving.
+///
+/// A verbatim marshal of the upstream engine's `SyncWakeup`. Wake-up heights are floored at the
+/// scanned tip (a row at exactly the tip means "right now"), and jitter is re-drawn on every call
+/// — two calls may legitimately differ, so recompute (and re-register with the OS) after any
+/// state change rather than caching a schedule.
+public struct MigrationSyncWakeup: Equatable, Sendable {
+    /// The block height at which to wake, sync, and prove.
+    public let height: BlockHeight
+    /// The ids of the transfers this wake-up is responsible for proving.
+    public let coversTransferIds: [UInt32]
+
+    /// Creates a `MigrationSyncWakeup`.
+    public init(height: BlockHeight, coversTransferIds: [UInt32]) {
+        self.height = height
+        self.coversTransferIds = coversTransferIds
+    }
+}
+
+/// One scanned block's `(height, header time)` sample from the wallet database, as returned by
+/// `ZcashRustBackendWelding.migrationBlockRateSamples(window:)` — the raw input of
+/// ``ChainTipEstimator``'s measured-block-rate chain-tip projection. Internal: apps consume the
+/// projection (`Synchronizer.estimatedMigrationChainTip()`), never the samples.
+struct MigrationBlockRateSample: Equatable, Sendable {
+    /// The scanned block's height.
+    let height: BlockHeight
+    /// The block header's time, as Unix epoch seconds.
+    let unixTime: Int64
+}
+
+/// A single note-preparation transaction in a schedule preview — an element of
+/// ``MigrationSchedule/preparations``: the transfer rows alone do not surface the preparations
+/// that mint their funding notes.
+///
+/// Populated either from a fresh plan at propose time (numbered and scheduled exactly as the
+/// engine's commit path will persist them once confirmed) or, once a run is stored, read straight
+/// off its persisted rows.
+public struct MigrationPreparationStep: Identifiable, Equatable, Sendable, Codable {
+    /// This transaction's stable engine-issued id (the same ordinal space as
+    /// ``MigrationTransferProposal/id`` and ``MigrationTransactionStatus/id``).
+    public let id: UInt32
+    /// The dependency-layer index this preparation belongs to.
+    public let layer: Int
+    /// This preparation's index within `layer`.
+    public let index: Int
+    /// The height at or after which this preparation is due to broadcast.
+    public let broadcastHeight: BlockHeight
+    /// The ids of the transactions that must mine before this one may broadcast: the WHOLE
+    /// preceding layer's ids (empty for layer 0) — the engine does not narrow this to the
+    /// specific producer(s) a layer's inputs spend.
+    public let dependsOn: [UInt32]
+
+    /// Creates a `MigrationPreparationStep`.
+    public init(id: UInt32, layer: Int, index: Int, broadcastHeight: BlockHeight, dependsOn: [UInt32]) {
+        self.id = id
+        self.layer = layer
+        self.index = index
+        self.broadcastHeight = broadcastHeight
+        self.dependsOn = dependsOn
+    }
+}
+
+/// The signing-round action budgets of the external signers the SDK knows about, mirroring the
+/// upstream engine's `SigningRoundBudget`: how many Orchard-family actions one signing session
+/// may carry (a preparation transaction weighs 16 actions, a transfer 3).
+///
+/// Feed one of these (or a device-specific value) to
+/// `Synchronizer.batchMigrationPcztsForSigning(_:maxActionsPerSession:)` to split an ordered PCZT
+/// batch into device-sized sessions, and compare with
+/// ``MigrationRunEstimate/totalKeystoneSigningSessions`` — which is precomputed under the
+/// ``keystone`` budget by the upstream optimal packing.
+public enum MigrationSigningBudget {
+    /// A Keystone-class hardware signer's per-round budget: 96 actions
+    /// (`SigningRoundBudget::KEYSTONE` upstream).
+    public static let keystone = 96
+    /// The default budget for signers without a device-specific limit: 512 actions
+    /// (`SigningRoundBudget::DEFAULT` upstream).
+    public static let `default` = 512
+}
+
+/// A snapshot of an in-progress migration, as returned by
+/// `ZcashRustBackendWelding.migrationProgress(for:)`.
+///
+/// Present only while there is something live to report: an engine-tracked run that is ACTIVE
+/// (not terminal), or a recorded immediate sweep that is still unmined and unexpired. A terminal
+/// run — complete or cancelled — reports `nil`, as does an immediate sweep once it mines
+/// (consumed) or expires (the offer re-arms).
 public struct MigrationProgress: Equatable, Sendable {
     /// The number of scheduled transfers confirmed on-chain so far.
     public let completedTransfers: Int
@@ -58,13 +218,25 @@ public struct MigrationProgress: Equatable, Sendable {
     }
 }
 
+/// Compatibility reasons for ``MigrationTransactionStatus/State/invalid(reason:)``. Upstream now
+/// stores unsatisfiability orthogonally to lifecycle state and records node rejection as testimony;
+/// the wrapper projects those details into this existing public enum.
+public enum MigrationInvalidReason: Equatable, Sendable {
+    /// An input was spent, or the transaction inherited unsatisfiability from a dependency.
+    case fundingSpent
+    /// Another unsatisfiable cause, or a node rejection awaiting reevaluation against scanned data.
+    case rejectedInvalid
+    /// Retained for source compatibility. New expiry determinations surface as ``Blocker/expired``.
+    case rejectedExpired
+}
+
 /// One migration transaction's LIVE status, as the engine computes it — an element of the array
 /// returned by `ZcashRustBackendWelding.migrationTransactionStatuses(for:)` /
 /// `Synchronizer.migrationTransactionStatuses(accountUUID:)`. A verbatim marshal of the engine's
 /// own `MigrationState::transaction_statuses`: nothing here is derived independently of the
 /// engine's view, and it is reconciled against mined transactions at every read (the same
-/// read-path convention as `MigrationState`), so a transaction the wallet's own scan has since
-/// observed mined is reported `.mined` here even if the stored run still marks it broadcast.
+/// read-path convention as `migrationAdvanceStep`), so a transaction the wallet's own scan has
+/// since observed mined is reported `.mined` here even if the stored run still marks it broadcast.
 public struct MigrationTransactionStatus: Equatable, Sendable {
     /// This transaction's kind: a note-PREPARATION at a given dependency-layer/index, or a
     /// phase-2 pool-crossing TRANSFER at a given funding-note crossing index.
@@ -76,14 +248,14 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         case transfer(crossing: Int)
     }
 
-    /// This transaction's lifecycle state. `broadcast`/`mined` fold the engine's `txid`/
-    /// `mined_height` payloads into the matching case, so illegal combinations (a mined row still
-    /// carrying a broadcast txid, or a broadcast row with none) are unrepresentable.
+    /// This transaction's lifecycle state. `broadcast`/`mined`/`invalid` fold the engine's
+    /// `txid`/`mined_height`/`invalid_reason` payloads into the matching case, so illegal
+    /// combinations (a mined row still carrying a broadcast txid, a broadcast row with none, or
+    /// an invalid row without its reason) are unrepresentable.
     ///
-    /// - Note: A MINED row's txid is NOT carried by this state model: the engine's own `Mined`
-    ///   state carries only the height, so the txid is available only while a transaction is
-    ///   in flight (`.broadcast`), not once it is mined. A caller that needs a mined
-    ///   transaction's id should look it up through transaction history instead.
+    /// - Note: This public model continues to expose only the mined height for `.mined`, even
+    ///   though the upstream lifecycle now retains the txid too. Use transaction history when the
+    ///   mined txid is needed.
     public enum State: Equatable, Sendable {
         /// Built but not yet signed.
         case awaitingSignature
@@ -96,6 +268,14 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         case broadcast(txid: Data)
         /// Mined at `height`.
         case mined(height: BlockHeight)
+        /// Dead according to the engine's satisfiability oracle after a funding input became
+        /// unavailable or the network rejected the broadcast. `reason` is the compatibility
+        /// projection of that upstream condition. Chain inclusion OUTRANKS it: a
+        /// row the wallet's scan has observed mined reports `.mined`, never `.invalid` — a stale
+        /// verdict cannot shadow a landed transaction. Resolved out-of-band via the
+        /// ``MigrationAdvanceStep/requiresAttention(id:)`` discharge mapping (typically
+        /// `restartCurrentMigrationStep`).
+        case invalid(reason: MigrationInvalidReason)
     }
 
     /// The action available now, when `isReady` is `true`.
@@ -119,6 +299,11 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         case signature
         /// Its expiry height has elapsed.
         case expired
+        /// Marked dead by an observed event (its state is
+        /// ``MigrationTransactionStatus/State/invalid(reason:)``): no chain condition makes it
+        /// actionable again — resolution is out-of-band, via the
+        /// ``MigrationAdvanceStep/requiresAttention(id:)`` discharge mapping.
+        case invalid
     }
 
     /// This transaction's stable id (the engine's own raw ordinal). Stable across reads and
@@ -144,6 +329,16 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
     /// Why this transaction is not yet actionable, when waiting (and not already broadcast or
     /// mined); `nil` otherwise.
     public let blockedOn: Blocker?
+    /// The ids of the transactions of the same run that must mine before this one can be built or
+    /// broadcast (the engine's own `TransactionStatus::depends_on`); empty when it depends on
+    /// nothing.
+    public let dependsOn: [UInt32]
+    /// The bucketed boundary height this transaction's anchor was drawn against, or `nil` when
+    /// none was drawn. Only ever set for a TRANSFER: a preparation is exempt from anchor
+    /// bucketing by design — it proves against a near-tip witnessable anchor at proving time
+    /// instead of a drawn boundary — so this is always `nil` for a
+    /// ``Kind/preparation(layer:index:)`` row.
+    public let anchorBoundaryHeight: BlockHeight?
 
     /// Creates a `MigrationTransactionStatus`.
     public init(
@@ -154,7 +349,9 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         expiryHeight: BlockHeight?,
         isReady: Bool,
         nextAction: NextAction?,
-        blockedOn: Blocker?
+        blockedOn: Blocker?,
+        dependsOn: [UInt32],
+        anchorBoundaryHeight: BlockHeight?
     ) {
         self.id = id
         self.kind = kind
@@ -164,6 +361,29 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         self.isReady = isReady
         self.nextAction = nextAction
         self.blockedOn = blockedOn
+        self.dependsOn = dependsOn
+        self.anchorBoundaryHeight = anchorBoundaryHeight
+    }
+}
+
+extension Array where Element == MigrationTransactionStatus {
+    /// Whether the run's preparation (note-split) phase is fully mined: `true` iff every
+    /// ``MigrationTransactionStatus/Kind/preparation(layer:index:)``-kind row is `.mined` —
+    /// vacuously `true` when the run needs no preparations at all.
+    ///
+    /// The replacement for the removed `MigrationState.splitPendingConfirmation`: a host that
+    /// rendered "preparing your funds" off that state derives the same signal from this
+    /// predicate over `migrationTransactionStatuses(accountUUID:)`.
+    public var isPreparationPhaseComplete: Bool {
+        allSatisfy { status in
+            guard case .preparation = status.kind else {
+                return true
+            }
+            if case .mined = status.state {
+                return true
+            }
+            return false
+        }
     }
 }
 
@@ -246,12 +466,32 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
     /// PERSISTED copy also carries `0`: the native cache is process-lifetime, so a persisted
     /// schedule can never identify a live plan — re-propose instead of committing it.
     public let proposalHandle: UInt64
+    /// The note-preparation transactions of the same plan, in broadcast order — the transfer rows
+    /// alone do not surface the preparations that mint their funding notes. Plan data at propose
+    /// time; the stored run's persisted rows on re-serve.
+    public let preparations: [MigrationPreparationStep]
+
+    /// The persisted-envelope keys. Explicit (the compiler stops synthesizing `CodingKeys` once
+    /// BOTH `init(from:)` and `encode(to:)` are hand-written), with the raw names the synthesized
+    /// conformance used — existing persisted copies keep decoding unchanged.
+    private enum CodingKeys: String, CodingKey {
+        case transfers
+        case estimatedDurationHours
+        case proposalHandle
+        case preparations
+    }
 
     /// Creates a `MigrationSchedule`.
-    public init(transfers: [MigrationTransferProposal], estimatedDurationHours: Int, proposalHandle: UInt64) {
+    public init(
+        transfers: [MigrationTransferProposal],
+        estimatedDurationHours: Int,
+        proposalHandle: UInt64,
+        preparations: [MigrationPreparationStep]
+    ) {
         self.transfers = transfers
         self.estimatedDurationHours = estimatedDurationHours
         self.proposalHandle = proposalHandle
+        self.preparations = preparations
     }
 
     public init(from decoder: any Decoder) throws {
@@ -260,8 +500,24 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
         self.estimatedDurationHours = try container.decode(Int.self, forKey: .estimatedDurationHours)
         // Absent in copies persisted before the handle existed — and a persisted handle could
         // not identify a live plan anyway (the native cache is process-lifetime), so `0` ("no
-        // plan") is the honest decode either way.
+        // plan") is the honest decode either way. `encode(to:)` below never writes the key, so
+        // this branch is also what every round-tripped copy takes.
         self.proposalHandle = try container.decodeIfPresent(UInt64.self, forKey: .proposalHandle) ?? 0
+        // Absent in copies persisted before the preparations rows existed; an empty list is the
+        // honest decode (the persisted copy simply never carried them).
+        self.preparations = try container.decodeIfPresent([MigrationPreparationStep].self, forKey: .preparations) ?? []
+    }
+
+    /// Encodes everything EXCEPT `proposalHandle`: the handle identifies a PROCESS-LIFETIME native
+    /// plan cache entry, so a persisted copy could never identify a live plan — persisting the raw
+    /// number would only invite a later launch to present it as meaningful. Omitting it makes the
+    /// documented decode contract (`init(from:)` above reads an absent handle as `0`, "no plan")
+    /// true of every persisted copy by construction, not just of pre-handle legacy files.
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(transfers, forKey: .transfers)
+        try container.encode(estimatedDurationHours, forKey: .estimatedDurationHours)
+        try container.encode(preparations, forKey: .preparations)
     }
 }
 
@@ -272,10 +528,18 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
 /// A balance beyond one run's capacity (the note cap times the maximum denomination) migrates
 /// over several runs; each run carries BOTH what it migrates (the note-split crossings) and what
 /// preparing it costs (the note-preparation layers and transactions), so the two can be compared
-/// before anything is planned or committed. An external signer's per-session capacity is a query
-/// parameter (`Run.signingSessions(maxTransactionsPerSession:)` /
-/// `totalSigningSessions(maxTransactionsPerSession:)`), not part of the estimate, so any signer
-/// capacity can be evaluated without re-running the planners.
+/// before anything is planned or committed.
+///
+/// External-signer workload is expressed in ACTIONS, not transaction counts: a preparation
+/// transaction weighs 16 Orchard-family actions and a transfer 3, so per-run ``Run/actions`` is
+/// the signing workload and ``Run/keystoneSigningSessions`` the number of signer interactions a
+/// Keystone-class device (the 96-action ``MigrationSigningBudget/keystone`` budget) needs, as
+/// computed by the upstream optimal `MinRounds` packing. A count-based
+/// `ceil(transactions / maxTransactionsPerSession)` UNDERCOUNTS that: 6 preparations plus 1
+/// transfer is 99 actions — one Keystone round over the 96-action budget — so it needs 2 rounds,
+/// while any count-based ceiling admitting ≥ 7 transactions per session claimed 1. For splitting
+/// an actual PCZT batch (any budget, order preserved), use
+/// `Synchronizer.batchMigrationPcztsForSigning(_:maxActionsPerSession:)`.
 public struct MigrationRunEstimate: Equatable, Sendable {
     /// A per-run entry: what one migration run migrates (the note-split side) and what preparing
     /// it costs (the note-preparation side), so the two can be compared.
@@ -291,31 +555,37 @@ public struct MigrationRunEstimate: Equatable, Sendable {
         public let preparationLayers: Int
         /// The number of note-preparation transactions this run builds across all its layers.
         public let preparationTransactions: Int
+        /// The total Orchard-family actions a signer processes for this run: 16 per preparation
+        /// transaction, 3 per transfer. The signing WORKLOAD — a proxy for signing time —
+        /// distinct from ``keystoneSigningSessions``, which counts signer INTERACTIONS.
+        public let actions: Int
+        /// The number of signing rounds this run needs from a Keystone-class external signer
+        /// (``MigrationSigningBudget/keystone``, 96 actions per round), computed by the upstream
+        /// optimal `MinRounds` packing — see the type doc for why a count-based ceiling
+        /// undercounts this.
+        public let keystoneSigningSessions: Int
 
         /// Creates a `Run`.
-        public init(migratable: Zatoshi, crossings: Int, preparationLayers: Int, preparationTransactions: Int) {
+        public init(
+            migratable: Zatoshi,
+            crossings: Int,
+            preparationLayers: Int,
+            preparationTransactions: Int,
+            actions: Int,
+            keystoneSigningSessions: Int
+        ) {
             self.migratable = migratable
             self.crossings = crossings
             self.preparationLayers = preparationLayers
             self.preparationTransactions = preparationTransactions
+            self.actions = actions
+            self.keystoneSigningSessions = keystoneSigningSessions
         }
 
         /// The total number of transactions this run builds and signs: its preparation
         /// transactions plus one pool-crossing transfer per funding note.
         public var transactions: Int {
             preparationTransactions + crossings
-        }
-
-        /// The number of signing sessions this run needs when an external signer (for example a
-        /// Keystone hardware wallet) can sign at most `maxTransactionsPerSession` transactions in
-        /// one interaction: `ceil(transactions / maxTransactionsPerSession)`. All of a run's
-        /// transactions are built and signed together (anchors and witnesses are deferred to
-        /// proving time, ZIP 374), so they pool into sessions bounded only by the signer's
-        /// capacity.
-        /// - Precondition: `maxTransactionsPerSession > 0`.
-        public func signingSessions(maxTransactionsPerSession: Int) -> Int {
-            precondition(maxTransactionsPerSession > 0, "maxTransactionsPerSession must be positive")
-            return (transactions + maxTransactionsPerSession - 1) / maxTransactionsPerSession
         }
     }
 
@@ -364,17 +634,21 @@ public struct MigrationRunEstimate: Equatable, Sendable {
         runs.reduce(0) { $0 + $1.transactions }
     }
 
-    /// The total number of signing sessions the whole migration needs when an external signer can
-    /// sign at most `maxTransactionsPerSession` transactions in one interaction — the number of
-    /// times the user must interact with a capacity-limited hardware signer.
+    /// The total signing workload across all runs, in Orchard-family actions (the sum of each
+    /// run's ``Run/actions``).
+    public var totalActions: Int {
+        runs.reduce(0) { $0 + $1.actions }
+    }
+
+    /// The total number of Keystone signing rounds the whole migration needs (the sum of each
+    /// run's ``Run/keystoneSigningSessions``) — the number of times the user must interact with a
+    /// Keystone-class hardware signer.
     ///
-    /// This is the SUM of each run's `signingSessions(maxTransactionsPerSession:)`, NOT
-    /// `ceil(totalTransactions / maxTransactionsPerSession)`: signing sessions cannot span runs,
-    /// because a later run's transactions spend notes an earlier run must mine first, so each run
-    /// is signed on its own (any spare capacity in a run's last session goes unused).
-    /// - Precondition: `maxTransactionsPerSession > 0`.
-    public func totalSigningSessions(maxTransactionsPerSession: Int) -> Int {
-        runs.reduce(0) { $0 + $1.signingSessions(maxTransactionsPerSession: maxTransactionsPerSession) }
+    /// A SUM, never a re-packing across runs: a later run's transactions spend notes an earlier
+    /// run must mine first, so each run is signed on its own and any spare capacity in a run's
+    /// last round goes unused.
+    public var totalKeystoneSigningSessions: Int {
+        runs.reduce(0) { $0 + $1.keystoneSigningSessions }
     }
 }
 
@@ -459,14 +733,6 @@ public enum MigrationTransferResult: Equatable, Sendable {
     case expired
 }
 
-/// Why a migration requires user attention, as carried by `MigrationState.requiresAttention`.
-public enum MigrationAttentionReason: Equatable, Sendable {
-    /// The input note funding `transferId` was spent externally before its transfer broadcast.
-    case invalidTransfer(transferId: UInt32)
-    /// A transaction's anchor/expiry elapsed before it could be broadcast.
-    case transferExpired
-}
-
 /// An unsigned-but-proven PCZT for one scheduled transfer, awaiting an external signer (see
 /// `ZcashRustBackendWelding.migrationCreateUnsignedTransferPczts(for:for:)`).
 public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
@@ -482,11 +748,22 @@ public struct MigrationUnsignedTransferPczt: Equatable, Sendable {
     public let id: UInt32
     /// The serialized, proven-but-unsigned PCZT.
     public let pczt: Data
+    /// The signer action weight of this transaction for budget batching: 16 for a preparation,
+    /// 3 for a transfer — feed an ordered batch of these rows to
+    /// `Synchronizer.batchMigrationPcztsForSigning(_:maxActionsPerSession:)` to split it into
+    /// device-sized signing sessions before dispatching.
+    ///
+    /// `0` on values reconstructed by `applyKeystoneBatchSignatures(pczts:batchSignResponse:)`'s
+    /// signed counterparts: that path rebuilds PCZTs from caller-held bytes without engine
+    /// context, so it has no stored kind to weigh — batching happens BEFORE signing, over these
+    /// CREATE/RE-SERVE rows, never over its result.
+    public let actions: Int
 
     /// Creates a `MigrationUnsignedTransferPczt`.
-    public init(id: UInt32, pczt: Data) {
+    public init(id: UInt32, pczt: Data, actions: Int) {
         self.id = id
         self.pczt = pczt
+        self.actions = actions
     }
 }
 

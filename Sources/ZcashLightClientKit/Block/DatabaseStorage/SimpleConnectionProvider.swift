@@ -21,7 +21,14 @@ class SimpleConnectionProvider: ConnectionProvider {
 
     let path: String
     let readonly: Bool
-    var db: Connection?
+    /// Guards `db`. Since the DBActor read/write split, read-only DAO members call
+    /// `connection()` from arbitrary threads concurrently, so the lazy init below must be
+    /// single-flight — two racing first-touches used to construct two `Connection`s (one
+    /// silently dropped, its serial queue with it). `NSLock` rather than
+    /// `OSAllocatedUnfairLock` because the package floor (iOS 13 / macOS 12) predates the
+    /// latter's availability.
+    private let dbLock = NSLock()
+    private var db: Connection?
 
     init(path: String, readonly: Bool = false) {
         self.path = path
@@ -30,17 +37,20 @@ class SimpleConnectionProvider: ConnectionProvider {
 
     /// throws ZcashError.simpleConnectionProvider
     func connection() throws -> Connection {
-        guard let conn = db else {
-            do {
-                let conn = try Connection(path, readonly: readonly)
-                conn.busyTimeout = Self.busyTimeoutSeconds
-                self.db = conn
-                return conn
-            } catch {
-                throw ZcashError.simpleConnectionProvider(error)
-            }
+        dbLock.lock()
+        defer { dbLock.unlock() }
+
+        if let conn = db {
+            return conn
         }
-        return conn
+        do {
+            let conn = try Connection(path, readonly: readonly)
+            conn.busyTimeout = Self.busyTimeoutSeconds
+            db = conn
+            return conn
+        } catch {
+            throw ZcashError.simpleConnectionProvider(error)
+        }
     }
 
     /// throws ZcashError.simpleConnectionProvider
@@ -56,7 +66,9 @@ class SimpleConnectionProvider: ConnectionProvider {
     }
 
     func close() {
-        self.db = nil
+        dbLock.lock()
+        defer { dbLock.unlock() }
+        db = nil
     }
 }
 

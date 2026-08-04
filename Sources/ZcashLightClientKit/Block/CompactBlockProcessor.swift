@@ -406,6 +406,8 @@ extension CompactBlockProcessor {
         } catch { }
     }
 
+    // DB-AUDIT (2026-08-03): WRITE — decryptAndStoreTransaction persists the decrypted tx;
+    // the trailing find only reads back the own write. Stays serialized.
     @DBActor
     func resolveMempools(rawTransaction: RawTransaction) async throws -> [ZcashTransaction.Overview] {
         let minedHeight = (rawTransaction.height == 0 || rawTransaction.height > UInt32.max)

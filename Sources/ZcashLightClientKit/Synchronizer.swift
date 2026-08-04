@@ -603,20 +603,104 @@ public protocol Synchronizer: AnyObject {
     // external (PCZT) signing. None of these methods require `prepare()` to have been called — a
     // host may broadcast a migration transfer from a background session without ever starting sync.
 
-    /// The current Orchard -> Ironwood migration state for `accountUUID`. Also the reconciliation hub:
-    /// call it on launch and after every migration operation.
+    /// The migration engine's next step to advance `accountUUID`'s stored run — the replacement
+    /// for the removed SDK-side migration state machine, and a VERBATIM conduit of the upstream
+    /// engine's own `next_step`: no SDK ordering shims, no carve-outs — the attention step, the
+    /// broadcast-first ordering, and the prove step's kind are all the engine's own answer,
+    /// marshaled field-for-field. Call it on launch and after every migration operation.
     ///
-    /// `MigrationState.complete` is PER-RUN — "the stored run is fully mined", never "nothing left
-    /// to migrate". A large balance can need several successive runs and later-received funds
-    /// re-create a migratable balance, so hosts must NOT latch "never migrate again" off this
-    /// state: after completion, ask `proposeMigrationTransfers(accountUUID:)` whether anything
-    /// remains (an empty schedule means no).
-    /// - Parameter accountUUID: the account whose migration state is of interest.
-    func migrationState(accountUUID: AccountUUID) async throws -> MigrationState
+    /// `nil` means NO run is stored (none was ever committed) — nothing to advance, nothing to
+    /// poll. Evaluated on the SCANNED tip only (the estimated tip never enters this decision),
+    /// with the engine's attend > broadcast > prove > rebuild priority, and memoryless about
+    /// sessions: it reports what the run needs next, while session policy (one broadcast per
+    /// session, no sync in a broadcast session) stays with the caller and the sync gate.
+    ///
+    /// Discharging each step (see ``MigrationAdvanceStep`` for the full contract):
+    /// - `.requiresAttention` — surfaced FIRST, before any actionable step, when a transaction of
+    ///   the run is ``MigrationTransactionStatus/State/invalid(reason:)`` (funding note spent
+    ///   outside the migration, or a network-rejected broadcast) → SYNC and call this again, so
+    ///   the engine can adjudicate against the newly scanned data and re-offer the work where the
+    ///   obstruction was transient; only if attention persists, surface the attention UX over the
+    ///   invalid status row(s) and then ``restartCurrentMigrationStep(accountUUID:)``. Invalid rows
+    ///   are excluded from delivery (never served by
+    ///   ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``) and from
+    ///   the sync gate (a dead transfer gates nothing).
+    /// - `.broadcast` → ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``
+    ///   — submit and END the session (no sync).
+    /// - `.prove` with a `.transfer` kind → ``finalizeReadyMigrationTransfers(accountUUID:)`` at a
+    ///   sync wake-up; the broadcast follows in its own LATER session. Proving has no deadline —
+    ///   boundary anchor checkpoints are durably retained, so a missed wake-up only defers it.
+    /// - `.prove` with a `.preparation` kind → the preparation is due by construction and may be
+    ///   proved AND broadcast at the same wake-up (it anchors near-tip, not against a drawn
+    ///   boundary).
+    /// - `.rebuild` → ``refreshStaleMigrationTransfers(accountUUID:usk:)`` (needs spend
+    ///   authority).
+    /// - `.waiting` → register OS wake-ups from ``migrationSyncWakeups(accountUUID:)`` plus each
+    ///   ``migrationTransactionStatuses(accountUUID:)`` row's `scheduledHeight`.
+    ///
+    /// `.complete` is terminal for the STORED run — including a CANCELLED one — and means "stop
+    /// polling". It is PER-RUN, never "nothing left to migrate": whether a migratable balance
+    /// remains is answered by ``proposeMigrationTransfers(accountUUID:)`` (an empty schedule
+    /// means no). For the other signals the removed state machine used to carry: "preparations
+    /// still confirming" is `isPreparationPhaseComplete` over
+    /// ``migrationTransactionStatuses(accountUUID:)``, live progress is
+    /// ``migrationProgress(accountUUID:)``, and invalid/expired transfers surface through
+    /// ``hasInvalidMigrationTransfers(accountUUID:)`` and per-row `state`/`blockedOn` values.
+    /// - Parameter accountUUID: the account whose next step is of interest.
+    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep?
 
-    /// Live migration progress for `accountUUID`, or `nil` when no migration is in progress.
+    /// Live migration progress for `accountUUID`, or `nil` when no snapshot is reportable:
+    /// present only while an engine run is ACTIVE (not terminal) or a recorded immediate sweep is
+    /// pending (unmined and unexpired); a terminal — complete or cancelled — run reports `nil`.
     /// - Parameter accountUUID: the account whose migration progress is of interest.
     func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress?
+
+    /// Proves every migration transaction of `accountUUID`'s stored run whose anchor the wallet
+    /// can resolve right now, persisting each proof, and returns how many were proved (`0` is the
+    /// ordinary "nothing left to prove" answer).
+    ///
+    /// Run this at the sync wake-ups ``migrationSyncWakeups(accountUUID:)`` schedules — after the
+    /// wake-up's sync has caught the wallet up — and NEVER in a broadcast session: proving needs
+    /// the wallet's commitment tree and takes real time, while
+    /// ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`` stays a pure
+    /// delivery step (it never proves, and reports `.awaitingProof` when this sweep has not run
+    /// yet). A transaction that cannot be proved yet (anchor not scanned/retained) is skipped and
+    /// retried by a later call, so this is safe on any schedule, including mid-sync.
+    /// - Parameter accountUUID: the account whose pending proofs should be produced.
+    /// - Throws: ``ZcashError/migrationProvingUnavailable(_:)`` when proving fails for a
+    ///   non-transient reason.
+    func finalizeReadyMigrationTransfers(accountUUID: AccountUUID) async throws -> Int
+
+
+    /// The stored run's minimal sync/proving wake-up schedule for `accountUUID`, as of the
+    /// SCANNED chain tip: each row is a height at which to wake, sync, and run
+    /// ``finalizeReadyMigrationTransfers(accountUUID:)``, plus the transfer ids it covers.
+    /// Register OS wake-ups from these heights (converted to wall clock via
+    /// ``estimatedMigrationSecondsPerBlock()``) plus each status row's
+    /// `scheduledHeight` for the broadcast windows. Jitter is re-drawn on every call — recompute
+    /// (and re-register) after any state change rather than caching. Empty when there is nothing
+    /// left to prove (including no stored or a terminal run).
+    /// - Parameter accountUUID: the account whose wake-ups should be scheduled.
+    /// - Throws: ``ZcashError/migrationWakeupInfeasible(_:)`` when a stored transfer admits no
+    ///   valid wake-up height (an inconsistent stored schedule; rebuild or restart the run).
+    func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup]
+
+    /// The wall-clock ESTIMATED chain tip, projected from the most recently scanned blocks'
+    /// header times (the measured-block-rate estimator behind `useEstimatedTip`). Falls back to
+    /// the wallet's max SCANNED height when no samples exist. WALLET-scoped, like the batching
+    /// group: the projection reads the shared blocks table, so it takes no account — one answer
+    /// serves every account.
+    /// - Throws: ``ZcashError/migrationChainTipUnavailable`` when the wallet has never scanned a
+    ///   block, so no tip exists to estimate from.
+    func estimatedMigrationChainTip() async throws -> BlockHeight
+
+    /// The measured seconds-per-block over the most recently scanned blocks: the mean of the last
+    /// up-to-100 consecutive header-time deltas, clamped to [5, 150] s, falling back to 75 s (the
+    /// target spacing) when fewer than two samples exist. Use it to convert
+    /// ``migrationSyncWakeups(accountUUID:)`` heights into wall-clock OS timers. WALLET-scoped
+    /// like ``estimatedMigrationChainTip()`` — the measurement reads the shared blocks table, so
+    /// it takes no account.
+    func estimatedMigrationSecondsPerBlock() async throws -> Double
 
     /// The LIVE status of every committed migration transaction for `accountUUID`, keyed by its
     /// stable id — the per-transaction detail view behind ``migrationProgress(accountUUID:)``'s
@@ -627,7 +711,7 @@ public protocol Synchronizer: AnyObject {
     /// here is derived independently of the engine's view. Each row's `id` is STABLE across reads
     /// and across a stale-transfer rebuild (a rebuilt transfer keeps its id; only its state and
     /// heights change), so a wallet may use it as a durable row key. Reconciles mined transactions
-    /// first (the same read-path convention as ``migrationState(accountUUID:)``), so a transaction
+    /// first (the same read-path convention as ``migrationAdvanceStep(accountUUID:)``), so a transaction
     /// the wallet's own scan has since observed mined is reported `.mined` here even if the stored
     /// run still marks it broadcast. No stored run, or a stored run with no transactions, returns
     /// an EMPTY array — not an error.
@@ -751,11 +835,13 @@ public protocol Synchronizer: AnyObject {
     /// Estimates how `accountUUID` migrates its whole spendable Orchard balance — the rounds
     /// preview for the multi-round migration UI, answered before anything is planned or
     /// committed: the number of migration RUNS ("rounds") it takes, per run both what it migrates
-    /// (the pool crossings) and what preparing it costs (the note-preparation layers and
-    /// transactions), and the final residual that never migrates. Signing sessions for a
-    /// capacity-limited external signer (for example a Keystone hardware wallet) are a query on
-    /// the result — ``MigrationRunEstimate/totalSigningSessions(maxTransactionsPerSession:)`` —
-    /// not a parameter, so any signer capacity can be evaluated without re-running the planners.
+    /// (the pool crossings) and what preparing it costs (the note-preparation layers,
+    /// transactions, and signer ACTIONS), and the final residual that never migrates. External-
+    /// signer effort is precomputed on the result in actions, not transaction counts:
+    /// ``MigrationRunEstimate/totalActions`` is the signing workload and
+    /// ``MigrationRunEstimate/totalKeystoneSigningSessions`` the signer-interaction count under
+    /// the 96-action Keystone budget (see ``MigrationRunEstimate`` for why count-based session
+    /// math undercounts).
     /// - Parameter accountUUID: the account to estimate for.
     /// - Note: The zero-run estimate (`runCount == 0`, a zero or fully sub-quantum balance) is a
     ///   legitimate answer, not an error.
@@ -786,12 +872,22 @@ public protocol Synchronizer: AnyObject {
     ///   propose/prepare call — re-propose and re-display; rust-layer errors otherwise.
     func signAndStoreMigrationSchedule(accountUUID: AccountUUID, _ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws
 
-    /// Broadcasts the next height-due migration transfer for `accountUUID`, or returns `nil` when
-    /// nothing is currently due.
+    /// Broadcasts the next height-due, ALREADY-PROVEN migration transaction for `accountUUID`, or
+    /// reports why nothing was broadcast — see ``MigrationTransferAttempt`` for the three
+    /// outcomes. BROADCAST-ONLY: this call never proves; `.awaitingProof` is cleared by
+    /// ``finalizeReadyMigrationTransfers(accountUUID:)`` at a sync wake-up, never here, so a
+    /// broadcast session stays a pure delivery step.
     ///
     /// - Parameters:
     ///   - accountUUID: the account whose next transfer should execute.
     ///   - options: network-privacy options (Tor, submission endpoint) for this broadcast.
+    ///   - useEstimatedTip: opts the due-ness check into the wall-clock chain-tip estimate (see
+    ///     ``estimatedMigrationChainTip()``). The estimate may only ACCELERATE
+    ///     scheduled-height due-ness — the engine takes `max(scanned, estimated)` and always
+    ///     evaluates EXPIRY against the scanned tip — so a wallet that wakes between syncs can
+    ///     deliver an already-due transfer without first paying for a sync; an estimator failure
+    ///     silently degrades to the scanned-tip behavior. The protocol-extension overload without
+    ///     this parameter defaults it to `false`.
     /// - Throws: ``ZcashError/migrationBroadcastDuringSync`` if the synchronizer is actively syncing —
     ///   sync and migration broadcasts must never share a session; this is enforced by the SDK on
     ///   this call, so stop sync first. Otherwise, a pre-broadcast failure throws untouched (nothing
@@ -806,11 +902,25 @@ public protocol Synchronizer: AnyObject {
     ///   re-broadcasting). The sync-state check above is advisory, point-in-time enforcement, not a
     ///   hard mutual-exclusion lock: a sync started concurrently with an in-flight broadcast is not
     ///   torn down, so hosts should still sequence sync and migration-broadcast sessions themselves.
-    func executeNextPendingMigrationTransfer(accountUUID: AccountUUID, options: MigrationNetworkPrivacyOptions) async throws -> MigrationTransferResult?
+    func executeNextPendingMigrationTransfer(
+        accountUUID: AccountUUID,
+        options: MigrationNetworkPrivacyOptions,
+        useEstimatedTip: Bool
+    ) async throws -> MigrationTransferAttempt
 
     /// Whether ordinary wallet sync should currently be paused because a migration privacy gate is
     /// active for any account in the wallet — including an account with no live activity this
     /// session (a persisted gate file from a previous launch still counts).
+    ///
+    /// The predicate, per account: the post-broadcast privacy buffer has not elapsed, OR a
+    /// broadcast's 120 s in-flight marker is live, OR a READY broadcast is waiting — a PROVED,
+    /// schedule-due, unexpired, valid transfer the wallet should serve
+    /// (``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``) instead of
+    /// syncing. The ready-broadcast clause is estimate-accelerated (the wall-clock chain-tip
+    /// estimate may only bring due-ness FORWARD; the scanned tip is asked first) and never counts
+    /// a `Signed` or awaiting-proof row — those need MORE syncing, so
+    /// ``hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)``'s broader answer
+    /// deliberately does not gate sync.
     ///
     /// Non-throwing: degrades open (returns `false`, i.e. sync allowed) if the check itself fails
     /// rather than blocking sync on an internal error. ``start(retry:)`` consults this and throws
@@ -818,7 +928,9 @@ public protocol Synchronizer: AnyObject {
     func isMigrationSyncBlocked() async -> Bool
 
     /// A stream of ``isMigrationSyncBlocked()`` at wallet scope: emits the current value on subscribe
-    /// and re-evaluates reactively thereafter.
+    /// and re-evaluates reactively thereafter. The predicate is ``isMigrationSyncBlocked()``'s —
+    /// privacy buffer, in-flight marker, or an estimate-accelerated READY broadcast (proved, due,
+    /// unexpired, valid; never a `Signed`/awaiting-proof row).
     ///
     /// - Important: The value delivered synchronously on subscribe is a conservative `false` seed; it
     ///   is corrected by the first asynchronous re-evaluation. A subscriber that must be correct from
@@ -831,9 +943,20 @@ public protocol Synchronizer: AnyObject {
     var migrationPrivacySyncBufferDuration: TimeInterval { get }
 
     /// Whether `accountUUID` has any scheduled transfer that is past its send height but not yet
-    /// broadcast.
-    /// - Parameter accountUUID: the account to check.
-    func hasOverdueMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool
+    /// broadcast — the delivery lane's "is there actionable work" query, counting an
+    /// already-proved due transaction AND a due, dependency-satisfied `Signed` one the delivery
+    /// call would drive through proving. Informational (re-arm background execution, launch
+    /// reconciliation): it is deliberately NOT the sync-gate predicate —
+    /// ``isMigrationSyncBlocked()`` asks the narrower ready-broadcast question instead, because a
+    /// due-but-unproved row needs MORE syncing and must never block sync.
+    /// - Parameters:
+    ///   - accountUUID: the account to check.
+    ///   - useEstimatedTip: opts the check into the wall-clock chain-tip estimate, which may only
+    ///     ACCELERATE due-ness (expiry stays scanned-tip; estimator failure degrades to the
+    ///     scanned-tip behavior) — the same rule as
+    ///     ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``. The
+    ///     protocol-extension overload without this parameter defaults it to `false`.
+    func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool
 
     /// Whether `accountUUID`'s migration is in an invalid state (spendable Orchard remains but no
     /// scheduled transfer covers it).
@@ -849,7 +972,7 @@ public protocol Synchronizer: AnyObject {
     /// reschedule. `nil` means there is nothing to re-arm (no active run, the plan is complete, or
     /// only the note-split prep is pending).
     /// - Parameter accountUUID: the account to check.
-    func rescheduleOverdueMigrationTransfer(accountUUID: AccountUUID) async throws -> MigrationTransferProposal?
+    func pendingMigrationTransferProposal(accountUUID: AccountUUID) async throws -> MigrationTransferProposal?
 
     /// Re-evaluates `accountUUID`'s remaining spendable Orchard balance and returns a fresh schedule.
     ///
@@ -962,10 +1085,39 @@ public protocol Synchronizer: AnyObject {
     // MARK: - Migration Keystone batch-signing (external signer ceremony)
     //
     // A DB-free, account-free bridge for driving a Keystone hardware signer through the migration
-    // ceremony's PCZTs over an animated multi-part QR UR: none of these four calls take an
+    // ceremony's PCZTs over an animated multi-part QR UR: none of these calls take an
     // `accountUUID`, since they operate purely on caller-held PCZT bytes (from
     // `createUnsignedNoteSplitPCZTs(accountUUID:for:)` / `createUnsignedMigrationTransferPCZTs(accountUUID:for:)`)
     // and a scanned device response, never touching the wallet database or the migration engine.
+
+    /// Splits an ORDERED unsigned-PCZT batch into signer sessions bounded by
+    /// `maxActionsPerSession` actions, preserving order: each returned sub-array is one signing
+    /// session, and their concatenation is exactly `pczts`. Run each session through the QR
+    /// ceremony (``buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)`` ...) on its
+    /// own.
+    ///
+    /// Action-weighted, not count-based: the split packs by each row's
+    /// ``MigrationUnsignedTransferPczt/actions`` weight (16 preparation / 3 transfer) with an
+    /// order-preserving greedy strategy — the CREATE/RE-SERVE order carries the ceremony's
+    /// preparation-then-transfer contract, so reordering is not an option here (unlike the
+    /// estimate's ``MigrationRunEstimate/Run/keystoneSigningSessions``, which packs optimally
+    /// because nothing is dispatched yet). Account-free like the rest of this group: it weighs
+    /// caller-held rows, never the wallet database.
+    /// - Parameters:
+    ///   - pczts: the unsigned PCZTs to split, in ceremony order (preparations first, then
+    ///     transfers) — rows from the CREATE/RE-SERVE calls, whose `actions` weights are
+    ///     populated.
+    ///   - maxActionsPerSession: the signer's per-session action budget — e.g.
+    ///     ``MigrationSigningBudget/keystone`` (96) — at least 16 (a single preparation
+    ///     transaction, the minimum any signer must support).
+    /// - Throws: `ZcashError.rustMigrationBatchPcztsByActions` when any row's weight is not
+    ///   exactly 16 or 3 (e.g. rows returned by
+    ///   ``applyKeystoneBatchSignatures(pczts:batchSignResponse:)``, which carry `0`), or when
+    ///   `maxActionsPerSession` is below 16 — caller bugs, not signer conditions.
+    func batchMigrationPcztsForSigning(
+        _ pczts: [MigrationUnsignedTransferPczt],
+        maxActionsPerSession: Int
+    ) async throws -> [[MigrationUnsignedTransferPczt]]
 
     /// Builds the animated multi-part QR frames for a Keystone batch-signing request covering
     /// every PCZT in `pczts`, in the given order.
@@ -1056,11 +1208,11 @@ private struct BroadcasterUnimplemented: LocalizedError {
 /// Error thrown by the default implementations of the throwing members of the migration group (see
 /// `public extension Synchronizer` below) when a conformer doesn't override them. One shared,
 /// member-parameterized type rather than one hoisted struct per member (as
-/// ``GetTreeStateUnimplemented``/``BroadcasterUnimplemented`` do): the migration group has 28
-/// throwing requirements, and duplicating that two-struct precedent 28 times over would be pure
-/// boilerplate for the same LocalizedError-conforming, "override this in your conformer" pattern.
-/// Hoisted to file scope for the same reason as those two — protocol-extension methods carry an
-/// implicit `Self` and so count as generic, and Swift forbids nesting concrete types with
+/// ``GetTreeStateUnimplemented``/``BroadcasterUnimplemented`` do): the migration group has over
+/// thirty throwing requirements, and duplicating that two-struct precedent once per member would
+/// be pure boilerplate for the same LocalizedError-conforming, "override this in your conformer"
+/// pattern. Hoisted to file scope for the same reason as those two — protocol-extension methods
+/// carry an implicit `Self` and so count as generic, and Swift forbids nesting concrete types with
 /// synthesized members inside a generic function.
 private struct MigrationUnimplemented: LocalizedError {
     /// The unimplemented member's signature, supplied by each default via `#function`.
@@ -1142,11 +1294,28 @@ public extension Synchronizer {
     // members get inert defaults instead, documented below — conformers must override them to offer
     // real migration behavior.
 
-    func migrationState(accountUUID: AccountUUID) async throws -> MigrationState {
+    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep? {
         throw MigrationUnimplemented(member: #function)
     }
 
     func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress? {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func finalizeReadyMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+
+    func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func estimatedMigrationChainTip() async throws -> BlockHeight {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func estimatedMigrationSecondsPerBlock() async throws -> Double {
         throw MigrationUnimplemented(member: #function)
     }
 
@@ -1203,8 +1372,21 @@ public extension Synchronizer {
         throw MigrationUnimplemented(member: #function)
     }
 
-    func executeNextPendingMigrationTransfer(accountUUID: AccountUUID, options: MigrationNetworkPrivacyOptions) async throws -> MigrationTransferResult? {
+    func executeNextPendingMigrationTransfer(
+        accountUUID: AccountUUID,
+        options: MigrationNetworkPrivacyOptions,
+        useEstimatedTip: Bool
+    ) async throws -> MigrationTransferAttempt {
         throw MigrationUnimplemented(member: #function)
+    }
+
+    /// Convenience overload of the protocol requirement, defaulting `useEstimatedTip` to `false`
+    /// (scanned-tip due-ness only) so two-argument call sites keep reading naturally.
+    func executeNextPendingMigrationTransfer(
+        accountUUID: AccountUUID,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferAttempt {
+        try await executeNextPendingMigrationTransfer(accountUUID: accountUUID, options: options, useEstimatedTip: false)
     }
 
     /// Inert default: conformers must override to provide the wallet-scope migration privacy gate.
@@ -1223,15 +1405,21 @@ public extension Synchronizer {
         OrchardMigration.privacySyncBufferDuration
     }
 
-    func hasOverdueMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
+    func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool {
         throw MigrationUnimplemented(member: #function)
+    }
+
+    /// Convenience overload of the protocol requirement, defaulting `useEstimatedTip` to `false`
+    /// (scanned-tip due-ness only) so one-argument call sites keep reading naturally.
+    func hasOverdueMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
+        try await hasOverdueMigrationTransfers(accountUUID: accountUUID, useEstimatedTip: false)
     }
 
     func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
         throw MigrationUnimplemented(member: #function)
     }
 
-    func rescheduleOverdueMigrationTransfer(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
+    func pendingMigrationTransferProposal(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
         throw MigrationUnimplemented(member: #function)
     }
 
@@ -1260,6 +1448,13 @@ public extension Synchronizer {
     }
 
     func storeSignedMigrationSchedulePCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func batchMigrationPcztsForSigning(
+        _ pczts: [MigrationUnsignedTransferPczt],
+        maxActionsPerSession: Int
+    ) async throws -> [[MigrationUnsignedTransferPczt]] {
         throw MigrationUnimplemented(member: #function)
     }
 

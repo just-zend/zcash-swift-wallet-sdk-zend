@@ -275,8 +275,6 @@ public enum ZcashErrorCode: String {
     case rustSlipstreamSyncFailed = "ZRUST0096"
     /// Operation is not supported by `SlipstreamSynchronizer` (wipe / switchTo).
     case rustSlipstreamUnsupported = "ZRUST0097"
-    /// Error from rust layer when calling ZcashRustBackend.migrationState
-    case rustMigrationState = "ZRUST0098"
     /// Error from rust layer when calling ZcashRustBackend.migrationProgress
     case rustMigrationProgress = "ZRUST0099"
     /// Error from rust layer when calling ZcashRustBackend.migrationIsNoteSplitNeeded
@@ -353,6 +351,22 @@ public enum ZcashErrorCode: String {
     case rustMigrationDebugRescheduleTransfers = "ZRUST0139"
     /// Error from rust layer when calling ZcashRustBackend.migrationProvePending
     case rustMigrationProvePending = "ZRUST0140"
+    /// A stored migration transfer admits NO valid sync/proving wake-up height.
+    case migrationWakeupInfeasible = "ZRUST0141"
+    /// Error from rust layer when calling ZcashRustBackend.migrationAdvanceStep
+    case rustMigrationAdvanceStep = "ZRUST0142"
+    /// Error from rust layer when calling ZcashRustBackend.migrationSyncWakeups
+    case rustMigrationSyncWakeups = "ZRUST0143"
+    /// Error from rust layer when calling ZcashRustBackend.migrationBlockRateSamples
+    case rustMigrationBlockRateSamples = "ZRUST0144"
+    /// Error from rust layer when calling ZcashRustBackend.migrationReconcileUnrecordedBroadcasts
+    case rustMigrationReconcileUnrecordedBroadcasts = "ZRUST0145"
+    /// Error from rust layer when calling ZcashRustBackend.migrationBatchPcztsByActions
+    case rustMigrationBatchPcztsByActions = "ZRUST0146"
+    /// No chain tip is available to estimate from: the wallet has never scanned a block.
+    case migrationChainTipUnavailable = "ZRUST0147"
+    /// Error from rust layer when calling ZcashRustBackend.migrationHasReadyBroadcast
+    case rustMigrationHasReadyBroadcast = "ZRUST0148"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.

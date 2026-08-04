@@ -899,4 +899,41 @@ class SlipstreamOfflineTests: ZcashTestCase {
         XCTAssertEqual(SlipstreamSynchronizer.stallWatchdogThresholdSeconds, 120)
     }
 
+    // Field failure 2026-08-02: the engine-owned stall clock survives a stop→start, so a
+    // restarted handle's first snapshots carried a 497 s span accumulated before — and across —
+    // a deliberate stop, and the watchdog fired at the exact moment recovery was working. The
+    // clamp caps the evaluated span at the CURRENT handle's own lifetime.
+
+    /// A stale pre-restart span is clamped to the young handle's lifetime — below threshold,
+    /// so the restart never fires the loud log on inherited history.
+    func testEffectiveStallSecondsClampsInheritedSpanToHandleLifetime() {
+        XCTAssertEqual(
+            SlipstreamSynchronizer.effectiveStallSeconds(engineReported: 497, secondsSinceHandleStart: 31),
+            31
+        )
+    }
+
+    /// A genuine stall of the current handle passes through untouched and can still fire.
+    func testEffectiveStallSecondsPassesGenuineSpanThrough() {
+        XCTAssertEqual(
+            SlipstreamSynchronizer.effectiveStallSeconds(engineReported: 130, secondsSinceHandleStart: 600),
+            130
+        )
+        XCTAssertTrue(SlipstreamSynchronizer.isSyncStalled(
+            state: 1,
+            secondsSinceLastCounterChange: SlipstreamSynchronizer.effectiveStallSeconds(
+                engineReported: 130,
+                secondsSinceHandleStart: 600
+            ),
+            threshold: 120
+        ), "a real 130 s stall on a long-lived handle must still fire")
+    }
+
+    /// A backwards clock adjustment cannot produce a negative span.
+    func testEffectiveStallSecondsNeverGoesNegative() {
+        XCTAssertEqual(
+            SlipstreamSynchronizer.effectiveStallSeconds(engineReported: 497, secondsSinceHandleStart: -5),
+            0
+        )
+    }
 }

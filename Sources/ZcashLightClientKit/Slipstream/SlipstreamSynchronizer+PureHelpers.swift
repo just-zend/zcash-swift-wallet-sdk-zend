@@ -94,6 +94,28 @@ extension SlipstreamSynchronizer {
     ) -> Bool {
         state == 1 && secondsSinceLastCounterChange >= threshold
     }
+
+    /// The handle-lifetime clamp on the engine-reported stall span, feeding `isSyncStalled`'s
+    /// `secondsSinceLastCounterChange` input.
+    ///
+    /// Field failure 2026-08-02: the engine-owned stall clock (`snap.stalledSeconds`) survived a
+    /// stop→start, so the restarted handle's first snapshots carried a span accumulated before —
+    /// and across — a deliberate stop (497 s, of which ~4.5 min the engine was stopped behind the
+    /// migration gate), and the watchdog fired its loud log at the exact moment recovery was
+    /// working. Only stall time the CURRENT handle could actually have accrued may count.
+    ///
+    /// - Parameters:
+    ///   - engineReported: `snap.stalledSeconds` as stamped by the engine.
+    ///   - secondsSinceHandleStart: wall time since `resetStallWatchdog()` last re-armed (start /
+    ///     switchTo / wipe). Clamped below at zero so a clock adjustment can never yield a
+    ///     negative span.
+    /// - Returns: the span `checkStallWatchdog` should evaluate against the threshold.
+    static func effectiveStallSeconds(
+        engineReported: TimeInterval,
+        secondsSinceHandleStart: TimeInterval
+    ) -> TimeInterval {
+        min(engineReported, max(0, secondsSinceHandleStart))
+    }
 }
 
 // MARK: - PendingStopSlot (Phase E / audit SDK-2)

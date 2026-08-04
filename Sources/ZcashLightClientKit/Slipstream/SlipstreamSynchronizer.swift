@@ -110,6 +110,14 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // `isSyncStalled` (+PureHelpers.swift). State is `internal` (not private) so
     // the extension file can reach it.
     var watchdogStallLogged = false
+    /// When the CURRENT engine handle came up (stamped by `resetStallWatchdog()` at start /
+    /// switchTo / wipe). The engine-owned stall span (`snap.stalledSeconds`) can survive a
+    /// stop→start — a restarted handle's first snapshots surfaced a span accumulated before
+    /// (and across) a deliberate stop, which fired the watchdog at the exact moment recovery
+    /// was WORKING (field-caught 2026-08-02: a 497 s "stall" of which ~4.5 min was a
+    /// gate-stopped engine). `checkStallWatchdog` clamps the reported span to this handle's
+    /// own lifetime, so only stall time the CURRENT handle actually accrued can fire the log.
+    var watchdogHandleStartedAt = Date()
     /// Logger accessor for same-type extensions in other files (`initializer` is
     /// private; the StallWatchdog extension needs the injected logger).
     var watchdogLogger: Logger { initializer.logger }
@@ -1142,12 +1150,31 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // -- an advisory point-in-time check, not a hard mutual-exclusion lock: sync and migration
     // broadcasts must never share a session, and hosts still sequence sessions themselves.
 
-    public func migrationState(accountUUID: AccountUUID) async throws -> MigrationState {
-        try await migrationHost.migration(for: accountUUID).migrationState()
+    public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep? {
+        try await migrationHost.migration(for: accountUUID).advanceStep()
     }
 
     public func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress? {
         try await migrationHost.migration(for: accountUUID).migrationProgress()
+    }
+
+    public func finalizeReadyMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
+        try await migrationHost.migration(for: accountUUID).finalizeReadyTransfers()
+    }
+
+
+    public func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
+        try await migrationHost.migration(for: accountUUID).syncWakeups()
+    }
+
+    public func estimatedMigrationChainTip() async throws -> BlockHeight {
+        // Wallet-scoped (the samples come from the shared blocks table), so this lives on the
+        // host, not on a per-account actor.
+        try await migrationHost.estimatedChainTip()
+    }
+
+    public func estimatedMigrationSecondsPerBlock() async throws -> Double {
+        try await migrationHost.estimatedSecondsPerBlock()
     }
 
     public func migrationTransactionStatuses(accountUUID: AccountUUID) async throws -> [MigrationTransactionStatus] {
@@ -1206,10 +1233,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     public func executeNextPendingMigrationTransfer(
         accountUUID: AccountUUID,
-        options: MigrationNetworkPrivacyOptions
-    ) async throws -> MigrationTransferResult? {
+        options: MigrationNetworkPrivacyOptions,
+        useEstimatedTip: Bool
+    ) async throws -> MigrationTransferAttempt {
         try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).executeNextPendingTransfer(options: options)
+        return try await migrationHost.migration(for: accountUUID)
+            .executeNextPendingTransfer(options: options, useEstimatedTip: useEstimatedTip)
     }
 
     public func isMigrationSyncBlocked() async -> Bool {
@@ -1224,16 +1253,16 @@ public actor SlipstreamSynchronizer: Synchronizer {
         migrationHost.privacySyncBufferDuration
     }
 
-    public func hasOverdueMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
-        try await migrationHost.migration(for: accountUUID).hasOverdueTransfers()
+    public func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool {
+        try await migrationHost.migration(for: accountUUID).hasOverdueTransfers(useEstimatedTip: useEstimatedTip)
     }
 
     public func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
         try await migrationHost.migration(for: accountUUID).hasInvalidTransfers()
     }
 
-    public func rescheduleOverdueMigrationTransfer(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
-        try await migrationHost.migration(for: accountUUID).rescheduleOverdueTransfer()
+    public func pendingMigrationTransferProposal(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
+        try await migrationHost.migration(for: accountUUID).pendingTransferProposal()
     }
 
     public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
@@ -1272,10 +1301,22 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     // ── Migration Keystone batch-signing (external signer ceremony) ───────────
     //
-    // DB-free, account-free: unlike the migration group above, these four forward straight to
+    // DB-free, account-free: unlike the migration group above, these forward straight to
     // `initializer.rustBackend` (no `migrationHost.migration(for:)` per-account actor) -- the same
     // way the ordinary PCZT operations above do (`createPCZTFromProposal`, `redactPCZTForSigner`,
     // ...) -- mirrors `SDKSynchronizer`'s "MARK: Migration Keystone batch-signing" section exactly.
+
+    /// See ``Synchronizer/batchMigrationPcztsForSigning(_:maxActionsPerSession:)`` for the contract.
+    public func batchMigrationPcztsForSigning(
+        _ pczts: [MigrationUnsignedTransferPczt],
+        maxActionsPerSession: Int
+    ) async throws -> [[MigrationUnsignedTransferPczt]] {
+        try await OrchardMigration.batchPcztsForSigning(
+            welding: initializer.rustBackend,
+            pczts: pczts,
+            maxActionsPerSession: maxActionsPerSession
+        )
+    }
 
     /// See ``Synchronizer/buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)`` for the contract.
     public func buildKeystoneSignBatchQRParts(
@@ -1311,7 +1352,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// Throws ``ZcashError/migrationBroadcastDuringSync`` when the synchronizer is actively syncing.
     ///
     /// Guards the two migration entry points that broadcast (``submitNoteSplit(accountUUID:proposal:usk:options:)``
-    /// and ``executeNextPendingMigrationTransfer(accountUUID:options:)``): sync and migration
+    /// and ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``): sync and migration
     /// broadcasts must never share a session. Reads `latestState.internalSyncStatus` -- the same
     /// nonisolated status surface `start(retry:)`'s unprepared guard reads -- so the guard triggers on
     /// the syncing case only; unprepared/stopped/synced/disconnected/error all proceed. Advisory,

@@ -34,11 +34,12 @@ use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_pool_migration::build::{AccountDerivation, sign_pczt};
 use zcash_pool_migration::engine::{
-    MigrationBackend, MigrationCrypto, MigrationState, MigrationTransferId, MigrationTxState,
-    PoolMigrationRead, PoolMigrationWrite,
+    MigrationBackend, MigrationCrypto, MigrationState, MigrationTransaction, MigrationTransferId,
+    MigrationTxState, PoolMigrationRead, PoolMigrationWrite, ProvedTransaction,
 };
 use zcash_pool_migration::scheduling::SchedulingParams;
 use zcash_protocol::ShieldedPool;
+use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 
@@ -58,7 +59,7 @@ pub(crate) struct Backend<'a> {
     wallet: &'a MigrationWallet,
     account: AccountUuid,
     usk: Option<UnifiedSpendingKey>,
-    store: PoolMigrations<&'a mut rusqlite::Connection>,
+    store: PoolMigrations<&'a mut rusqlite::Connection, NetworkParams, SystemClock>,
 }
 
 impl<'a> Backend<'a> {
@@ -74,8 +75,17 @@ impl<'a> Backend<'a> {
             wallet,
             account,
             usk,
-            store: PoolMigrations::for_account(store_conn, account)
-                .map_err(|e| anyhow!("opening the account-scoped migration store failed: {e}"))?,
+            // `params` and `clock` serve the store's `store_proved_transaction` (it finalizes the
+            // proven transaction into the wallet's own tables, which needs the network's branch
+            // ids and a creation timestamp); both come from the same sources the wallet itself
+            // was built with.
+            store: PoolMigrations::for_account(
+                wallet.params().clone(),
+                SystemClock,
+                store_conn,
+                account,
+            )
+            .map_err(|e| anyhow!("opening the account-scoped migration store failed: {e}"))?,
         })
     }
 
@@ -158,9 +168,10 @@ impl MigrationBackend for Backend<'_> {
 
     /// The anchor bucket grid is the wallet's own anchor retention interval (selected per network
     /// in [`crate::wallet_db`]), so a transfer can only anchor to a boundary whose checkpoint this
-    /// wallet retains; the delay distributions are derived from that interval by the ZIP 318
-    /// ratios, which reproduces the specified schedule exactly on the standard 144-block grid and
-    /// compresses it by the same factor on a shortened one.
+    /// wallet retains; the delay distributions scale each ZIP 318 delay mean and cap by the ratio
+    /// of the interval to the 144-block ZIP 318 one, which reproduces the specified schedule
+    /// exactly on the standard 144-block grid and compresses it by the same factor on a shortened
+    /// one.
     fn scheduling_params(&self) -> SchedulingParams {
         SchedulingParams::new_with_default_distributions(
             self.wallet.anchor_retention_interval().into(),
@@ -219,6 +230,26 @@ impl PoolMigrationRead for Backend<'_> {
             .get_migration()
             .map_err(|e| anyhow!("migration store read failed: {e}"))
     }
+
+    fn check_step_satisfiability(
+        &self,
+        tx: &MigrationTransaction,
+        settle: zcash_pool_migration::satisfiability::ReorgSettleDepth,
+    ) -> Result<zcash_pool_migration::satisfiability::StepSatisfiability, Self::Error> {
+        self.store
+            .check_step_satisfiability(tx, settle)
+            .map_err(|e| anyhow!("migration satisfiability check failed: {e}"))
+    }
+
+    /// Delegated to the store, which reads the wallet's own `transactions` table bounded by the
+    /// FULLY-SCANNED height — a stricter bound than `WalletRead::get_tx_height`'s chain tip, and
+    /// the reason the SDK no longer runs its own mined-height lookup: a promotion may not rest on
+    /// a block outside the region a reorg truncation would roll back.
+    fn mined_height(&self, txid: TxId) -> Result<Option<BlockHeight>, Self::Error> {
+        self.store
+            .mined_height(txid)
+            .map_err(|e| anyhow!("mined-height lookup failed: {e}"))
+    }
 }
 
 impl PoolMigrationWrite for Backend<'_> {
@@ -236,5 +267,15 @@ impl PoolMigrationWrite for Backend<'_> {
         self.store
             .update_transaction(id, state)
             .map_err(|e| anyhow!("migration store update failed: {e}"))
+    }
+
+    fn store_proved_transaction(
+        &mut self,
+        state: &mut MigrationState,
+        proven: ProvedTransaction,
+    ) -> Result<(), Self::Error> {
+        self.store
+            .store_proved_transaction(state, proven)
+            .map_err(|e| anyhow!("migration store proved-transaction write failed: {e}"))
     }
 }

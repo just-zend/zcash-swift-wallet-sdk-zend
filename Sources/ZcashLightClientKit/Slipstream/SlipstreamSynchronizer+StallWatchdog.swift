@@ -27,7 +27,15 @@ extension SlipstreamSynchronizer {
         // [Engine API v2 §4.4 / Phase D] The stall FACT is engine-owned now: `snap.stalledSeconds`
         // is stamped by the engine's own counters (0 unless state == Syncing). The watchdog keeps
         // only the POLICY — the once-per-episode loud log — re-armed whenever progress resumes.
-        let elapsed = TimeInterval(snap.stalledSeconds)
+        //
+        // CLAMPED to the current handle's lifetime: the engine-reported span can predate this
+        // handle (a restart resurfaces stall time accumulated before — and across — a deliberate
+        // stop, which fired the log at the precise moment recovery was succeeding; field-caught
+        // 2026-08-02). Only stall time the CURRENT handle actually accrued may fire it.
+        let elapsed = Self.effectiveStallSeconds(
+            engineReported: TimeInterval(snap.stalledSeconds),
+            secondsSinceHandleStart: Date().timeIntervalSince(watchdogHandleStartedAt)
+        )
         if elapsed < Self.stallWatchdogThresholdSeconds {
             watchdogStallLogged = false
             return
@@ -58,8 +66,9 @@ extension SlipstreamSynchronizer {
 
     /// B4: re-arms the stall watchdog for a new run/handle (start, switchTo, wipe).
     /// (The stall clock itself is engine-owned and resets with the pass; only the
-    /// once-per-episode log flag lives in Swift.)
+    /// once-per-episode log flag — and the handle-lifetime clamp's baseline — live in Swift.)
     func resetStallWatchdog() {
         watchdogStallLogged = false
+        watchdogHandleStartedAt = Date()
     }
 }

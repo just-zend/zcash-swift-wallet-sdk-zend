@@ -34,7 +34,15 @@ final class ScriptedBroadcaster: MigrationBroadcasting {
     }
 
     private(set) var receivedCalls: [(endpoint: LightWalletEndpoint, useTor: Bool)] = []
+    /// How many times the `onWillSubmit` hook fired. Mirrors the production contract: fired
+    /// exactly once per `.outcome` call (immediately before the "submit"), never on a
+    /// `.throwing` call (a fail-closed throw precedes any submit).
+    private(set) var onWillSubmitCallCount = 0
     var onBroadcast: (() -> Void)?
+    /// Invoked at the instant the fake fires the caller's `onWillSubmit` hook (right before it),
+    /// so hook-ordering tests can capture what other observable effects preceded the pre-submit
+    /// arm (A9).
+    var onWillSubmitObserver: (() -> Void)?
     private let script: Script
 
     init(script: Script) {
@@ -44,14 +52,22 @@ final class ScriptedBroadcaster: MigrationBroadcasting {
     func broadcast(
         rawTransaction: Data,
         to endpoint: LightWalletEndpoint,
-        useTor: Bool
+        useTor: Bool,
+        onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome {
         receivedCalls.append((endpoint: endpoint, useTor: useTor))
         onBroadcast?()
         switch script {
         case .outcome(let outcome):
+            // The production broadcaster fires the hook at the last pre-submit instant; a
+            // returned outcome means a submit happened, so the fake fires it exactly then.
+            onWillSubmitObserver?()
+            onWillSubmitCallCount += 1
+            onWillSubmit()
             return outcome
         case .throwing(let error):
+            // A throw means nothing reached the network — per the contract the hook must NOT
+            // have fired.
             throw error
         }
     }
