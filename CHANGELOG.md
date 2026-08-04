@@ -10,17 +10,21 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Changed
 
-- The librustzcash family rides an interim git pin (librustzcash main at the #2910 merge) so a
-  wallet's own scheduled migration transactions carry their ZIP 318 classification
-  (`Overview.zip318Kind`) from the moment they are STORED at proving time, instead of only after
-  they mine and are scanned. This is what lets a wallet present its stored-but-unmined migration
-  transactions as labeled in-flight activity. The rev also carries librustzcash #2907 — the
-  engine's advance-path selection (prove/broadcast steps) picks transfers by scheduled height
-  instead of internal id — and librustzcash #2910: a broadcast schedule whose slots were missed
-  (for example when the app was closed past several scheduled sends) is re-spread on resume
-  instead of coming due all at once. (The SDK's own next-due delivery query still selects by
-  id — tracked separately as the MOB-1466 M2 residual.) The pin reverts to published crates at
-  the first rc containing all of these.
+- The librustzcash family rides an interim git pin (the zcash/librustzcash#2927 branch head:
+  main at the #2910 merge plus the re-spread fix) so a wallet's own scheduled migration
+  transactions carry their ZIP 318 classification (`Overview.zip318Kind`) from the moment they
+  are STORED at proving time, instead of only after they mine and are scanned. This is what lets
+  a wallet present its stored-but-unmined migration transactions as labeled in-flight activity.
+  The rev also carries librustzcash #2907 — the engine's advance-path selection (prove/broadcast
+  steps) picks transfers by scheduled height instead of internal id — librustzcash #2910: a
+  broadcast schedule whose slots were missed (for example when the app was closed past several
+  scheduled sends) is re-spread on resume instead of coming due all at once — and
+  librustzcash #2927: the step that re-spread releases lands on scanned chain data (and the
+  re-spread fires only when more of the schedule is due behind it), so a wallet driven in short
+  foreground sessions can actually prove and broadcast the released step instead of livelocking
+  with its schedule re-pinned past the scan on every open. (The SDK's own next-due delivery
+  query still selects by id — tracked separately as the MOB-1466 M2 residual.) The pin reverts
+  to published crates at the first rc containing all of these.
 
 ## Fixed
 
