@@ -10,6 +10,23 @@ Last reviewed: 2026-08-02
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
+## Bleeding-edge refresh (2026-08-03)
+
+- Fresh fetches leave `origin/main=4497fe9e` and `upstream/main=f51ed74a`, with the same
+  `174 87` divergence. Zend draft PR [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  remains the only full-default-branch source-parity vehicle; it is still blocked on the voting
+  FFI/source mismatch, provenance review, and funded-device migration evidence.
+- Upstream [#1896](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1896) was retargeted to
+  `feature/ironwood-slipstream` and is therefore dirty and review-required there. Its three-file
+  `decrypt-and-store` FFI sentinel fix was independently verified against Zend's current ABI
+  (`1` success, `-1` failure) and carried as Zend draft
+  [#35](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/35). The carry deliberately
+  excludes the migration/release line and does not change the FFI artifact.
+- The active Slipstream branch now includes the broad migration-parity stack, so #1895 and all
+  remaining migration/FFI candidates stay wait-for-upstream. New maintenance PR #1933 is a
+  review-required, blocked Makefile-only change against `maint/v2.7.x`; do not carry it before
+  upstream integrates it into a Zend-compatible release line.
+
 ## Bleeding-edge refresh (2026-08-02)
 
 - Fresh fetches leave `origin/main=4497fe9e` and `upstream/main=f51ed74a`, with
