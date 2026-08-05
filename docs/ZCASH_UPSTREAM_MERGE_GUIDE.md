@@ -18,7 +18,8 @@ Last reviewed: 2026-08-04
   build-support, and changelog graph.
 - Zend draft PR [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
   remains the sole full-parity vehicle. It now merges upstream through `468d1e9f`
-  with no conflict resolution and has an identical source tree to `upstream/main`.
+  with no conflict resolution; its SDK source and release graph match `upstream/main`, while Zend
+  retains SHA-pinned, least-privilege SwiftLint workflow controls.
   `swift build` and `swift test --filter OfflineTests` both pass against the
   upstream release framework, resolving the prior voting Swift/FFI source mismatch.
   Keep it draft until product owners approve replacing Zend's divergent migration
