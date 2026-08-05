@@ -1078,30 +1078,6 @@ fn prove_one(
     }
 }
 
-/// The next prove-ready row, skipping ids a sweep already found transiently unprovable.
-///
-/// Prove-readiness is upstream's rule, not this crate's, so the skip is expressed by asking a
-/// SCRATCH clone: the skipped rows are flipped to `Proved` in the clone (with their own bytes —
-/// `set_transaction_proved` then only advances the lifecycle state), which is exactly what makes
-/// `next_provable` step past them. Nothing persists, and a skipped row cannot unblock a dependent
-/// one, because dependency readiness is keyed on `Mined`, not `Proved`. The same trick backs
-/// [`due_assuming_proving`].
-fn next_provable_excluding(
-    state: &MigrationState,
-    target: BlockHeight,
-    skip: &[MigrationTransferId],
-) -> Option<MigrationTransferId> {
-    state
-        .transaction_statuses(DuenessTargets::at(target))
-        .into_iter()
-        .find(|status| {
-            status.ready()
-                && status.action() == Some(NextAction::Prove)
-                && !skip.contains(&status.id())
-        })
-        .map(|status| status.id())
-}
-
 /// Proves every row that can be proved right now, persisting each, and returns how many were
 /// proved.
 ///
@@ -1110,6 +1086,12 @@ fn next_provable_excluding(
 /// delivery path — by broadcast time there is nothing left to do but broadcast. A row the wallet
 /// cannot prove yet (its anchor not scanned/retained) is SKIPPED, not fatal and not a reason to
 /// stop: the rows behind it still prove, and the skipped row is retried by the next sweep.
+///
+/// The next candidate is upstream's own read, [`MigrationState::next_provable`] — the drive's
+/// `(anchor_boundary | scheduled_height, id)`-min, oldest-anchor-first — with `deferred` passed
+/// straight through as its `skip`: exactly the call-local `set_aside` exclusion the drive loop
+/// itself uses, so a row this sweep already found transiently unprovable is not re-offered within
+/// the same call.
 ///
 /// `prove` is [`prove_one`] in production; tests substitute the generic
 /// [`migration_finalize::prove_due_transaction`] seam with a recording/failing test prover plus a
@@ -1122,7 +1104,7 @@ fn prove_pending_rows(
 ) -> anyhow::Result<u32> {
     let mut deferred: Vec<MigrationTransferId> = Vec::new();
     let mut proved = 0;
-    while let Some(id) = next_provable_excluding(state, target, &deferred) {
+    while let Some(id) = state.next_provable(DuenessTargets::at(target), &deferred) {
         // `max_proofs` caps SUCCESSFUL proofs per call so an FFI caller can chunk a sweep:
         // each proof is seconds of CPU, and a platform serializing DB access behind one
         // actor needs a seam between proofs for interactive reads to interleave. Deferred
@@ -1177,6 +1159,16 @@ enum DueOutcome {
 // expired), and the public transaction-status and advance APIs evaluate it. This module only
 // converts the FFI's `estimated_tip: i64` into the estimated-target side of
 // [`DuenessTargets::new`] — see [`dueness_targets`].
+//
+// WHICH ROW is next is upstream's call too, not just the heights it is judged against:
+// [`next_due`] and [`due_assuming_proving`] delegate straight to
+// [`MigrationState::next_due_broadcast`] / [`MigrationState::next_provable`] — the same exported
+// reads [`prove_pending_rows`] and [`zcashlc_migration_has_ready_broadcast`] use — so this module
+// no longer re-derives an ordering over `transaction_statuses`, and cannot drift from the drive's
+// own `(scheduled_height, id)` / `(anchor_boundary | scheduled_height, id)`-min. The one thing
+// still composed HERE, over that public API, is the virtual-prove scratch clone
+// [`due_assuming_proving`] drives to answer "what would be due once every outstanding proof
+// existed" without a prover or a persisted write.
 
 /// The estimated TARGET height (`estimated tip + 1`) for an FFI-supplied `estimated_tip`
 /// (`-1`, or any negative, = no estimate) — the `estimated_target` input of
@@ -1216,10 +1208,15 @@ fn dueness_targets(scanned_tip: BlockHeight, estimated_tip: i64) -> DuenessTarge
 /// proving latency, and a platform that is not sweeping learns that it must, instead of seeing an
 /// indefinite "nothing due". The chosen row's artifact is read by [`serve_proved`].
 ///
+/// The candidate itself is [`MigrationState::next_due_broadcast`], upstream's own exported
+/// broadcast-queue read — the drive's `(scheduled_height, id)`-min among due, `Proved`,
+/// dependency-mined rows — so this answers exactly what `advance_migration` would broadcast next,
+/// by construction rather than by a parallel re-derivation over `transaction_statuses`.
+///
 /// `targets` carries the scanned/estimated due-ness pair (coincident when no estimate is in
 /// play) — see the section comment above [`estimated_target_from_tip`].
 fn next_due(state: &MigrationState, targets: DuenessTargets) -> DueOutcome {
-    if let Some(id) = next_ready_action(state, targets, NextAction::Broadcast) {
+    if let Some(id) = state.next_due_broadcast(targets) {
         return DueOutcome::Ready { id };
     }
     match due_assuming_proving(state, targets) {
@@ -1242,18 +1239,25 @@ fn next_due(state: &MigrationState, targets: DuenessTargets) -> DueOutcome {
 /// report due work whether or not its proof exists: the work exists either way, and proving is
 /// [`prove_pending_rows`]' job, not the reporting path's.
 ///
+/// Every candidate read here — the broadcast checks and the scratch loop's own prove queue — is
+/// [`MigrationState::next_due_broadcast`] / [`MigrationState::next_provable`], upstream's exported
+/// reads: this function's only remaining composition is driving the scratch clone to EXHAUSTION
+/// (every prove-ready row gets virtually proved, in whatever order the engine offers them, since
+/// none of them can unblock another — dependency readiness is keyed on `Mined`, never `Proved`)
+/// before asking, once more, what the drive would broadcast from the result.
+///
 /// `targets` carries the scanned/estimated due-ness pair (coincident when no estimate is in
 /// play) — see the section comment above [`estimated_target_from_tip`].
 fn due_assuming_proving(
     state: &MigrationState,
     targets: DuenessTargets,
 ) -> Option<MigrationTransferId> {
-    if let Some(id) = next_ready_action(state, targets, NextAction::Broadcast) {
+    if let Some(id) = state.next_due_broadcast(targets) {
         return Some(id);
     }
-    next_ready_action(state, targets, NextAction::Prove)?;
+    state.next_provable(targets, &[])?;
     let mut scratch = state.clone();
-    while let Some(id) = next_ready_action(&scratch, targets, NextAction::Prove) {
+    while let Some(id) = scratch.next_provable(targets, &[]) {
         let bytes = scratch
             .transactions()
             .iter()
@@ -1262,19 +1266,7 @@ fn due_assuming_proving(
             .unwrap_or_default();
         scratch.set_transaction_proved(id, bytes);
     }
-    next_ready_action(&scratch, targets, NextAction::Broadcast)
-}
-
-fn next_ready_action(
-    state: &MigrationState,
-    targets: DuenessTargets,
-    action: NextAction,
-) -> Option<MigrationTransferId> {
-    state
-        .transaction_statuses(targets)
-        .into_iter()
-        .find(|status| status.ready() && status.action() == Some(action))
-        .map(|status| status.id())
+    scratch.next_due_broadcast(targets)
 }
 
 // ----- progress derivation (pure; unit-tested) -----
@@ -2802,9 +2794,7 @@ pub unsafe extern "C" fn zcashlc_migration_has_ready_broadcast(
             return Ok(0);
         }
         let targets = dueness_targets(ctx.tip()?, estimated_tip);
-        Ok(i32::from(
-            next_ready_action(&state, targets, NextAction::Broadcast).is_some(),
-        ))
+        Ok(i32::from(state.next_due_broadcast(targets).is_some()))
     });
     unwrap_exc_or(res, -1)
 }
@@ -2877,23 +2867,46 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
 
         let (mut state, _) = commit_or_resume(&mut ctx, Some(usk), false, proposal_handle)?;
 
-        // The first broadcastable preparation transaction (lowest scheduled height not yet
-        // broadcast): proven now, against the wallet's scanned-tip anchor, and returned for the
-        // platform's immediate broadcast — this lane exists to hand back something to broadcast,
-        // so its proof cannot wait for a sweep. Remaining preparation transactions are proved by
-        // `zcashlc_migration_prove_pending` and ride the normal delivery lane as they come due.
-        let first_prep = state
-            .transactions()
-            .iter()
-            .filter(|t| {
-                matches!(t.kind(), MigrationTxKind::Preparation { .. })
-                    && matches!(
-                        t.state(),
-                        MigrationTxState::Signed | MigrationTxState::Proved
-                    )
+        // The preparation transaction to prove now and return for immediate broadcast: upstream's
+        // own broadcast queue first, falling to its prove queue — a RESUMED ceremony must re-serve
+        // an earlier preparation that is already `Proved` and due before proving a later `Signed`
+        // sibling, something `next_provable` alone cannot see (it only ever names `Signed` rows); a
+        // fresh commit has no `Proved` row yet, so the order changes nothing there. Restricted to
+        // preparation rows, so this agrees with what `next_due`/`prove_pending_rows` will pick once
+        // the row is due — falling back (see the ceremony fallback below) only when neither read
+        // names a preparation, the same trigger as before this ordering. Proven now, against the
+        // wallet's scanned-tip anchor, and returned for the platform's immediate broadcast — this
+        // lane exists to hand back something to broadcast, so its proof cannot wait for a sweep.
+        // Remaining preparation transactions are proved by `zcashlc_migration_prove_pending` and
+        // ride the normal delivery lane as they come due.
+        let target = ctx.target()?;
+        let targets = DuenessTargets::at(target);
+        let engine_pick = state
+            .next_due_broadcast(targets)
+            .or_else(|| state.next_provable(targets, &[]))
+            .filter(|id| {
+                state.transactions().iter().any(|t| {
+                    t.id() == *id && matches!(t.kind(), MigrationTxKind::Preparation { .. })
+                })
+            });
+        // Ceremony fallback: the note-split hands the FIRST preparation back for immediate
+        // broadcast even when its drawn window opens a few blocks ahead — the engine's queues
+        // (schedule-due only) answer None there. Same row the engine will select once due.
+        let first_prep = engine_pick
+            .or_else(|| {
+                state
+                    .transactions()
+                    .iter()
+                    .filter(|t| {
+                        matches!(t.kind(), MigrationTxKind::Preparation { .. })
+                            && matches!(
+                                t.state(),
+                                MigrationTxState::Signed | MigrationTxState::Proved
+                            )
+                    })
+                    .min_by_key(|t| (t.scheduled_height(), t.id()))
+                    .map(|t| t.id())
             })
-            .min_by_key(|t| t.scheduled_height())
-            .map(|t| t.id())
             .ok_or_else(|| {
                 anyhow!("the committed migration has no broadcastable preparation transaction")
             })?;
@@ -7852,6 +7865,139 @@ mod tests {
         assert_eq!(
             due_assuming_proving(&proved, DuenessTargets::at(h(100))),
             Some(MigrationTransferId::new(1))
+        );
+    }
+
+    // ----- selection order is delegated to the engine's exported reads, not commit order -----
+
+    /// `next_due` must serve the drive's own `(scheduled_height, id)`-min among ready-to-broadcast
+    /// candidates, never merely the first match in commit/dependency order. Id 3 is committed
+    /// (appears in the transactions list) before id 4, but id 4 is scheduled EARLIER (3900 vs
+    /// 4000): a first-match scan over commit order would answer id 3; the engine's
+    /// `next_due_broadcast` answers id 4, the earliest-scheduled row.
+    #[test]
+    fn next_due_prefers_the_schedule_earliest_row_like_the_drive() {
+        let transactions = vec![
+            // Committed FIRST (id 3), but scheduled LATER — must lose.
+            test_transaction_from_parts(
+                MigrationTransferId::new(3),
+                MigrationTxKind::Transfer { crossing: 0 },
+                vec![0u8],
+                Vec::new(),
+                h(4_000),
+                h(10_000),
+                None,
+                MigrationTxState::Proved,
+                None,
+            ),
+            // Committed SECOND (id 4), but scheduled EARLIER — the drive's actual pick.
+            test_transaction_from_parts(
+                MigrationTransferId::new(4),
+                MigrationTxKind::Transfer { crossing: 1 },
+                vec![0u8],
+                Vec::new(),
+                h(3_900),
+                h(10_000),
+                None,
+                MigrationTxState::Proved,
+                None,
+            ),
+        ];
+        let state = test_state_from_parts(
+            MigrationStatus::InProgress,
+            DenominationPlan::from_stored_parts(
+                vec![zat(100_000_000), zat(100_000_000)],
+                zat(10_000),
+                None,
+                zat(20_000),
+                zat(1_000_000_000),
+                zat(999_000_000),
+            )
+            .unwrap(),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            transactions,
+            AnchorBucketInterval::ZIP_318,
+        );
+
+        assert_eq!(
+            next_due(&state, DuenessTargets::at(h(4_100))),
+            DueOutcome::Ready {
+                id: MigrationTransferId::new(4)
+            },
+            "the drive's (scheduled_height, id)-min must win: id 4 (scheduled 3900) over id 3 \
+             (scheduled 4000), even though id 3 was committed first"
+        );
+    }
+
+    /// `prove_pending_rows` must serve the drive's own `(anchor_boundary, id)`-min among
+    /// prove-ready candidates — oldest-anchor-first — never merely the first match in commit
+    /// order. Id 7 is committed before id 8, but id 8's boundary SETTLED EARLIER (3990 vs 4020): a
+    /// first-match scan over commit order would prove id 7 first; the engine's `next_provable`
+    /// proves id 8 first.
+    #[test]
+    fn prove_sweep_serves_the_oldest_anchor_first() {
+        let transactions = vec![
+            // Committed FIRST (id 7), but its boundary settled LATER — must lose.
+            test_transaction_from_parts(
+                MigrationTransferId::new(7),
+                MigrationTxKind::Transfer { crossing: 0 },
+                vec![0u8],
+                Vec::new(),
+                h(9_000),
+                h(20_000),
+                Some(h(4_020)),
+                MigrationTxState::Signed,
+                None,
+            ),
+            // Committed SECOND (id 8), but its boundary settled EARLIER — the drive's actual pick.
+            test_transaction_from_parts(
+                MigrationTransferId::new(8),
+                MigrationTxKind::Transfer { crossing: 1 },
+                vec![0u8],
+                Vec::new(),
+                h(9_000),
+                h(20_000),
+                Some(h(3_990)),
+                MigrationTxState::Signed,
+                None,
+            ),
+        ];
+        let mut state = test_state_from_parts(
+            MigrationStatus::InProgress,
+            DenominationPlan::from_stored_parts(
+                vec![zat(100_000_000), zat(100_000_000)],
+                zat(10_000),
+                None,
+                zat(20_000),
+                zat(1_000_000_000),
+                zat(999_000_000),
+            )
+            .unwrap(),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            transactions,
+            AnchorBucketInterval::ZIP_318,
+        );
+
+        // A recording prove closure: records which id it was asked to prove, flips that row
+        // `Signed -> Proved` (as a real prove would, so `prove_pending_rows`' own
+        // still-Signed-after-a-successful-prove guard does not trip), and always succeeds.
+        let mut proved_ids: Vec<MigrationTransferId> = Vec::new();
+        let proved = prove_pending_rows(&mut state, h(4_100), Some(1), |state, id| {
+            proved_ids.push(id);
+            state.set_transaction_proved(id, Vec::new());
+            Ok(true)
+        })
+        .expect("the recording prove closure must not fail");
+
+        assert_eq!(
+            proved, 1,
+            "max_proofs = Some(1) caps the sweep at one proof"
+        );
+        assert_eq!(
+            proved_ids,
+            vec![MigrationTransferId::new(8)],
+            "the drive's (anchor_boundary, id)-min — oldest anchor first — must prove id 8 \
+             (boundary 3990) before id 7 (boundary 4020), even though id 7 was committed first"
         );
     }
 
