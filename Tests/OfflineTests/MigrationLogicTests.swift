@@ -329,6 +329,34 @@ final class MigrationLogicTests: ZcashTestCase {
     // `privacySyncBufferDuration(for: .mainnet)` (U11), so no equality-policing test exists for
     // it — the mainnet pin above covers the one real constant.
 
+    // MARK: - Compressed-schedule spacing floors
+
+    /// Mainnet answers the zero pair unconditionally -- a hard requirement, not a derived
+    /// result. Three very different spacings all land on the same zero pair, pinning that the
+    /// mainnet branch never even evaluates the formula.
+    func testSpacingFloorsIsZeroOnMainnetForAnySpacing() {
+        XCTAssertEqual(OrchardMigration.spacingFloors(network: .mainnet, secondsPerBlock: 5), MigrationSpacingFloors.zero)
+        XCTAssertEqual(OrchardMigration.spacingFloors(network: .mainnet, secondsPerBlock: 75), MigrationSpacingFloors.zero)
+        XCTAssertEqual(OrchardMigration.spacingFloors(network: .mainnet, secondsPerBlock: 150), MigrationSpacingFloors.zero)
+    }
+
+    /// Testnet's 180 s privacy buffer over a measured 39 s spacing: `bufferBlocks = ceil(180/39)
+    /// = 5`, so `toleranceFloor = 5 + 2 = 7` and `releaseSpacingFloor = 2*5 + 2 = 12`.
+    func testSpacingFloorsDerivesFromMeasuredSpacingOnTestnet() {
+        let floors = OrchardMigration.spacingFloors(network: .testnet, secondsPerBlock: 39)
+        XCTAssertEqual(floors.toleranceFloor, 7)
+        XCTAssertEqual(floors.releaseSpacingFloor, 12)
+    }
+
+    /// The fallback-spacing case: a caller with no measurement in reach passes
+    /// `ChainTipEstimator.fallbackSecondsPerBlock` (the nominal 75 s Zcash target spacing).
+    /// `bufferBlocks = ceil(180/75) = 3`, so `toleranceFloor = 5` and `releaseSpacingFloor = 8`.
+    func testSpacingFloorsUsesNominalFallbackSpacingOnTestnet() {
+        let floors = OrchardMigration.spacingFloors(network: .testnet, secondsPerBlock: ChainTipEstimator.fallbackSecondsPerBlock)
+        XCTAssertEqual(floors.toleranceFloor, 5)
+        XCTAssertEqual(floors.releaseSpacingFloor, 8)
+    }
+
     // MARK: - MigrationSchedule persistence (A10)
 
     /// A10 round trip: `encode(to:)` omits `proposalHandle` (a process-lifetime plan-cache key no

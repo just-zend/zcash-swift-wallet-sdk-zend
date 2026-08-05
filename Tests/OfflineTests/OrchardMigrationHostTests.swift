@@ -42,7 +42,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     /// driving each actor reaches the welding with that actor's own account UUID.
     func testMigrationForAccountCachesPerAccountAndRoutesTheRightUUID() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
+        welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = .waiting
         welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
         let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
 
@@ -55,9 +55,9 @@ final class OrchardMigrationHostTests: ZcashTestCase {
 
         // Driving each actor (sequentially) reaches the welding with that actor's own account UUID.
         _ = try await firstA.advanceStep()
-        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountA)
+        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments?.account, accountA)
         _ = try await firstB.advanceStep()
-        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountB)
+        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments?.account, accountB)
     }
 
     // MARK: - Shared broadcaster (single Tor bootstrap across accounts)

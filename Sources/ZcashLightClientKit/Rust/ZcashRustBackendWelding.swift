@@ -428,9 +428,15 @@ protocol ZcashRustBackendWelding {
 
     /// Estimate-aware drive entry point. `estimatedTip` is the wall-clock chain-tip estimate;
     /// destructive judgments remain anchored to the wallet's fully-scanned height upstream.
+    /// `spacingFloors` passes straight through to the pinned engine's
+    /// `AdvanceConfig::with_compressed_schedule_floors`: ``MigrationSpacingFloors/zero`` (both
+    /// fields zero) is byte-identical to this call's behavior before the floors existed — what
+    /// every mainnet caller passes. See ``OrchardMigration/spacingFloors(network:secondsPerBlock:)``
+    /// for how a compressed-schedule consumer derives a nonzero pair.
     func migrationAdvanceStep(
         for account: AccountUUID,
-        estimatedTip: BlockHeight?
+        estimatedTip: BlockHeight?,
+        spacingFloors: MigrationSpacingFloors
     ) async throws -> MigrationAdvanceStep?
 
     /// Live migration progress, or `nil` when no snapshot is reportable: present only while an
@@ -851,9 +857,16 @@ protocol ZcashRustBackendWelding {
 }
 
 extension ZcashRustBackendWelding {
+    /// The estimate-and-floors overload's default body: forwards to the plain
+    /// ``migrationAdvanceStep(for:)`` compatibility overload, discarding BOTH `estimatedTip` and
+    /// `spacingFloors` — exactly as it already discarded `estimatedTip` before floors existed.
+    /// `migrationAdvanceStep(for:)` has no floors concept of its own (the ZIP 318-verbatim,
+    /// scanned-target-only path), so a conformer that only implements it and relies on this
+    /// default never applies a floor, on any network.
     func migrationAdvanceStep(
         for account: AccountUUID,
-        estimatedTip: BlockHeight?
+        estimatedTip: BlockHeight?,
+        spacingFloors: MigrationSpacingFloors
     ) async throws -> MigrationAdvanceStep? {
         try await migrationAdvanceStep(for: account)
     }
