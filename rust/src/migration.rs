@@ -215,6 +215,45 @@ fn open_store_conn(db_path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+/// Read-only twin of [`open_store_conn`]: same busy_timeout, but the connection can neither
+/// write nor create the database file. This is the Q2-1 enforcement layer — the pure read
+/// entry points open through this, so an accidental write anywhere down their call graph
+/// fails loudly with `SQLITE_READONLY` instead of silently reclassifying the call.
+fn open_store_conn_read_only(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| anyhow!("Error opening read-only migration store connection: {e}"))?;
+    conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
+        .map_err(|e| anyhow!("Error setting read-only migration store busy_timeout: {e}"))?;
+    Ok(conn)
+}
+
+/// Read-only twin of [`crate::wallet_db`] (lib.rs): open + array vtab + wrap, with
+/// `SQLITE_OPEN_READ_ONLY` so the wallet handle cannot write either. The vtab module load is
+/// connection-local registration, not a database write.
+unsafe fn wallet_db_read_only(
+    db_data: *const u8,
+    db_data_len: usize,
+    network: NetworkParams,
+) -> anyhow::Result<MigrationWallet> {
+    let db_data = Path::new(OsStr::from_bytes(unsafe {
+        slice::from_raw_parts(db_data, db_data_len)
+    }));
+    let conn = Connection::open_with_flags(
+        db_data,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| anyhow!("Error opening read-only wallet database connection: {e}"))?;
+    conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
+        .map_err(|e| anyhow!("Error setting read-only wallet database busy_timeout: {e}"))?;
+    rusqlite::vtab::array::load_module(&conn)
+        .map_err(|e| anyhow!("Error loading wallet database array module: {e}"))?;
+    Ok(MigrationWallet::from_connection(conn, network, SystemClock, OsRng)
+        .with_anchor_retention_interval(crate::anchor_retention_interval(network)))
+}
+
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
 /// drops it at the end (no persistent handle). All tables are created by the wallet schema
 /// migrations during `init_data_db`: the engine's store tables by `zcash_client_sqlite`'s own
@@ -246,6 +285,40 @@ unsafe fn open(
         .map(|metadata| metadata.block_height())
         .unwrap_or(BlockHeight::from(0));
     migrate_legacy_invalid_marks(&mut store_conn, network, fully_scanned_height)?;
+    let account = account_uuid_from_bytes(account_uuid_bytes)
+        .map_err(|e| anyhow!("account uuid must be 16 bytes: {e}"))?;
+    let account_bytes = *account.expose_uuid().as_bytes();
+    Ok(CallCtx {
+        network,
+        wallet,
+        store_conn,
+        db_path,
+        account,
+        account_bytes,
+    })
+}
+
+/// Read-only twin of [`open`]: both connections opened `SQLITE_OPEN_READ_ONLY`, and the two
+/// preamble writers deliberately skipped — `init_immediate_runs` (its table is created by any
+/// rw migration call; pure readers tolerate its absence via
+/// [`immediate_run_row_if_table_exists`]) and `migrate_legacy_invalid_marks` (a one-time fold
+/// only rw callers may perform). The pure read entry points open through this; see
+/// `open_store_conn_read_only` for what that enforces.
+///
+/// # Safety
+/// Same contract as [`open`].
+unsafe fn open_read(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> anyhow::Result<CallCtx> {
+    let network = parse_network(network_id)?;
+    let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
+        slice::from_raw_parts(db_data, db_data_len)
+    }));
+    let wallet = unsafe { wallet_db_read_only(db_data, db_data_len, network.clone())? };
+    let store_conn = open_store_conn_read_only(&db_path)?;
     let account = account_uuid_from_bytes(account_uuid_bytes)
         .map_err(|e| anyhow!("account uuid must be 16 bytes: {e}"))?;
     let account_bytes = *account.expose_uuid().as_bytes();
@@ -458,6 +531,25 @@ fn immediate_run_row(
         },
     )
     .optional()
+}
+
+/// [`immediate_run_row`] for the READ-ONLY paths: `sdk_immediate_runs` is created lazily by the
+/// rw [`open`], so a wallet whose migration surface has only ever been READ (fresh install,
+/// UI-before-first-drive) legitimately lacks the table — that is the "no immediate run recorded"
+/// answer, not an error.
+fn immediate_run_row_if_table_exists(
+    conn: &Connection,
+    account: &[u8; 16],
+) -> rusqlite::Result<Option<ImmediateRunRow>> {
+    match immediate_run_row(conn, account) {
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if msg.contains("no such table: sdk_immediate_runs") =>
+        {
+            let _ = e;
+            Ok(None)
+        }
+        other => other,
+    }
 }
 
 /// Resolves an immediate-run row against the wallet database's own `transactions` table: the same
@@ -6267,6 +6359,106 @@ mod tests {
             zero_expiry.expiry_height, None,
             "expiry_height=0 must read as missing"
         );
+    }
+
+    // ----- read-only open helpers (Q2-1 enforcement) -----
+
+    /// Q2-1 enforcement: the read-only store connection makes accidental writes on the pure
+    /// read paths impossible — any INSERT/UPDATE/DDL errors with SQLITE_READONLY, forever,
+    /// including after future pin moves change what the engine calls do internally.
+    #[test]
+    fn read_only_store_conn_rejects_writes() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_readonly_store_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let rw = Connection::open(&path).unwrap();
+            init_immediate_runs(&rw).unwrap();
+        }
+        let ro = open_store_conn_read_only(&path).unwrap();
+        let err = ro
+            .execute(
+                "INSERT INTO sdk_immediate_runs (account_uuid, txid, recorded_at_height) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&[9u8; 16][..], &[1u8; 32][..], 100i64],
+            )
+            .unwrap_err();
+        match err {
+            rusqlite::Error::SqliteFailure(e, _) => {
+                assert_eq!(e.code, rusqlite::ErrorCode::ReadOnly, "write must fail READONLY, got {e:?}")
+            }
+            other => panic!("expected SqliteFailure(ReadOnly), got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A read-only open of a wallet-database FILE that does not exist must error — and must NOT
+    /// create the file (the rw `open()` path's `Connection::open` would).
+    #[test]
+    fn read_only_store_conn_on_missing_file_errors_without_creating_it() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_readonly_missing_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert!(open_store_conn_read_only(&path).is_err());
+        assert!(!path.exists(), "a read-only open must not create the database file");
+    }
+
+    /// The pure `zcashlc_migration_progress` path may run before any rw migration call ever
+    /// created `sdk_immediate_runs` (the table is created lazily by the rw `open()`, not by the
+    /// schema graph) — the tolerant reader answers None instead of erroring on the missing table.
+    #[test]
+    fn immediate_run_row_if_table_exists_tolerates_a_missing_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        let account = [9u8; 16];
+        assert!(immediate_run_row_if_table_exists(&conn, &account).unwrap().is_none());
+        init_immediate_runs(&conn).unwrap();
+        record_immediate_run(&conn, &account, [1u8; 32], h(100)).unwrap();
+        assert_eq!(
+            immediate_run_row_if_table_exists(&conn, &account).unwrap().unwrap().txid,
+            [1u8; 32]
+        );
+    }
+
+    /// The accepted semantic shift, pinned: a pure statuses read reports what is PERSISTED — a
+    /// `Broadcast` row stays `Broadcast` in its answer until a write lane (`advance_step`'s
+    /// engine sweep, `prove_pending`, `next_due_transfer`) persists the Mined promotion. Display
+    /// green is unaffected (the app derives it from the wallet's own mined-txid set).
+    #[test]
+    fn pure_statuses_report_broadcast_until_a_write_lane_promotes() {
+        let tx = test_transaction_from_parts(
+            MigrationTransferId::new(1),
+            MigrationTxKind::Transfer { crossing: 0 },
+            vec![0u8; 8],
+            Vec::new(),
+            h(1_000),
+            h(1_040),
+            None,
+            MigrationTxState::Broadcast { txid: TxId::from_bytes([1u8; 32]) },
+            None,
+        );
+        let state = test_state_from_parts(
+            MigrationStatus::InProgress,
+            DenominationPlan::from_stored_parts(
+                vec![zat(100_000_000)],
+                zat(10_000),
+                None,
+                zat(20_000),
+                zat(1_000_000_000),
+                zat(999_000_000),
+            )
+            .unwrap(),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            vec![tx],
+            AnchorBucketInterval::ZIP_318,
+        );
+        let statuses = state.transaction_statuses(DuenessTargets::at(h(1_050)));
+        assert!(matches!(
+            statuses[0].state(),
+            MigrationTxState::Broadcast { .. }
+        ));
     }
 
     /// A freshly initialized wallet database has no stored migration, so
