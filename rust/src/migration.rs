@@ -591,7 +591,8 @@ fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bloc
 ///   that pays each transfer's own fee. Serving the funding note instead would overstate every row
 ///   by one transfer fee and show a value that is not a round denomination the user approved.
 /// - The engine numbers every preparation transaction first, then transfers in `schedule()`
-///   order, so transfer `i`'s real committed id is `prep_tx_count + i`.
+///   order (see [`MigrationPlan::planned_transactions`], the authority for this), so transfer
+///   `i`'s real committed id is `prep_tx_count + i`.
 /// - The sort makes the platform's row order chronological: ZIP 318 SHUFFLE deliberately makes
 ///   funding-note order differ from broadcast order.
 fn schedule_rows(
@@ -640,72 +641,98 @@ fn estimated_duration_hours(
 }
 
 /// The number of preparation transactions a plan commits (across all layers) — the id offset of
-/// the first transfer.
-fn prep_tx_count(plan: &MigrationPlan) -> u32 {
-    plan.preparation()
-        .layers()
-        .iter()
-        .map(|layer| layer.len() as u32)
-        .sum()
+/// the first transfer. Delegates to the engine's own
+/// [`MigrationPlan::preparation_tx_count`], the source of truth this count must agree with.
+fn prep_tx_count(plan: &MigrationPlan) -> anyhow::Result<u32> {
+    count_to_u32(plan.preparation_tx_count(), "preparation transaction count")
 }
 
 /// The plan's preparation transactions as schedule-preview rows — the PROPOSE-path derivation,
-/// read-only over a not-yet-committed [`MigrationPlan`], mirroring EXACTLY how
-/// `zcash_pool_migration::engine::commit_preparation`'s `Committer::build_preparation_layers`
-/// will number and schedule these once committed: ids are assigned layer-major/index-minor over
-/// `plan.preparation().layers()` (preparations before any transfer — the same traversal
-/// [`prep_tx_count`] sums), `depends_on` is the WHOLE preceding layer's ids (layer 0 depends on
-/// nothing — the commit path does not narrow this to the specific producer(s) a layer's inputs
-/// spend), and `broadcast_height` is `plan.prep_schedule()[layer][index]`, index-aligned with
-/// `layers()`. Do NOT invent a finer-grained dependency from `PrepInput`; the commit path itself
-/// does not.
+/// read-only over a not-yet-committed [`MigrationPlan`]. Ids, `layer`, and `index` come straight
+/// from [`MigrationPlan::planned_transactions`] — the engine's own enumeration of the STABLE
+/// ordinals `zcash_pool_migration::engine::commit_preparation`'s `Committer::build_preparation_layers`
+/// will assign once committed, so a preview id already equals the id the built transaction will
+/// carry. `depends_on` is the WHOLE preceding layer's ids (layer 0 depends on nothing — the
+/// commit path does not narrow this to the specific producer(s) a layer's inputs spend), tracked
+/// as a watermark over the layer-major enumeration (layer transitions only ever increment, so the
+/// watermark never needs to look back further than the layer immediately before).
+/// `broadcast_height` is `plan.prep_schedule()[layer][index]`, index-aligned with
+/// `plan.preparation().layers()`; a missing entry there, or an emitted count disagreeing with
+/// [`prep_tx_count`], is the same invariant-violation error style used elsewhere in this module.
+/// Do NOT invent a finer-grained dependency from `PrepInput`; the commit path itself does not.
 fn preparation_steps_from_plan(
     plan: &MigrationPlan,
 ) -> anyhow::Result<Vec<FfiMigrationPreparationStep>> {
-    let layers = plan.preparation().layers();
-    let schedule = plan.prep_schedule();
-    if layers.len() != schedule.len() {
-        return Err(anyhow!(
-            "migration plan invariant violated: {} preparation layers but {} schedule layers",
-            layers.len(),
-            schedule.len()
+    // Phase 1: derive every step's plain-data fields, including everything fallible (the
+    // broadcast-height lookup, the final count cross-check below) — no `Vec` is leaked into a
+    // raw pointer yet, so an early `?` return here cannot leak one (A15; see
+    // `encode_schedule_from_plan`'s caller-side comment for the same discipline one level up).
+    let mut rows: Vec<(u32, u32, u32, i64, Vec<u32>)> = Vec::new();
+    let mut prev_layer_ids: Vec<u32> = Vec::new();
+    let mut this_layer_ids: Vec<u32> = Vec::new();
+    let mut current_layer: Option<usize> = None;
+    for tx in plan.planned_transactions() {
+        let (layer, index) = match tx.kind() {
+            MigrationTxKind::Preparation { layer, index } => (layer, index),
+            MigrationTxKind::Transfer { .. } => continue,
+        };
+        if current_layer != Some(layer) {
+            // A new preparation layer starts: the layer just finished (if any) becomes the
+            // `depends_on` source for every step of this new layer.
+            prev_layer_ids = std::mem::take(&mut this_layer_ids);
+            current_layer = Some(layer);
+        }
+        let broadcast_height = plan
+            .prep_schedule()
+            .get(layer)
+            .and_then(|heights| heights.get(index))
+            .ok_or_else(|| {
+                anyhow!(
+                    "migration plan invariant violated: no scheduled height for preparation \
+                     layer {layer} index {index}"
+                )
+            })?;
+        let id = u32::from(tx.id());
+        this_layer_ids.push(id);
+        let depends_on = if layer == 0 {
+            Vec::new()
+        } else {
+            prev_layer_ids.clone()
+        };
+        rows.push((
+            id,
+            layer as u32,
+            index as u32,
+            i64::from(u32::from(*broadcast_height)),
+            depends_on,
         ));
     }
-    let mut next_id: u32 = 0;
-    let mut prev_layer_ids: Vec<u32> = Vec::new();
-    let mut steps = Vec::new();
-    for (layer_idx, (layer, heights)) in layers.iter().zip(schedule.iter()).enumerate() {
-        if layer.len() != heights.len() {
-            return Err(anyhow!(
-                "migration plan invariant violated: preparation layer {layer_idx} has {} \
-                 transactions but {} scheduled heights",
-                layer.len(),
-                heights.len()
-            ));
-        }
-        let mut this_layer_ids = Vec::with_capacity(layer.len());
-        for (index, height) in heights.iter().enumerate() {
-            let id = next_id;
-            next_id += 1;
-            this_layer_ids.push(id);
-            let depends_on = if layer_idx == 0 {
-                Vec::new()
-            } else {
-                prev_layer_ids.clone()
-            };
+
+    let expected = prep_tx_count(plan)?;
+    if rows.len() != expected as usize {
+        return Err(anyhow!(
+            "migration plan invariant violated: derived {} preparation steps but the plan \
+             reports {expected}",
+            rows.len()
+        ));
+    }
+
+    // Phase 2: every remaining step is infallible marshaling, so `ptr_from_vec` (each row's
+    // `depends_on`) only ever runs after every `?` above has already succeeded.
+    Ok(rows
+        .into_iter()
+        .map(|(id, layer, index, broadcast_height, depends_on)| {
             let (depends_on, depends_on_len) = ptr_from_vec(depends_on);
-            steps.push(FfiMigrationPreparationStep {
+            FfiMigrationPreparationStep {
                 id,
-                layer: layer_idx as u32,
-                index: index as u32,
-                broadcast_height: i64::from(u32::from(*height)),
+                layer,
+                index,
+                broadcast_height,
                 depends_on,
                 depends_on_len,
-            });
-        }
-        prev_layer_ids = this_layer_ids;
-    }
-    Ok(steps)
+            }
+        })
+        .collect())
 }
 
 /// The stored run's preparation transactions as schedule-preview rows — the RE-SERVE-path
@@ -742,7 +769,11 @@ fn encode_schedule_from_plan(
     now_reference: BlockHeight,
     plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
-    let rows = schedule_rows(plan.crossing_values(), plan.schedule(), prep_tx_count(plan))?;
+    let rows = schedule_rows(
+        plan.crossing_values(),
+        plan.schedule(),
+        prep_tx_count(plan)?,
+    )?;
     let transfers = rows
         .into_iter()
         .map(|(id, amount, broadcast, expiry)| {
@@ -5244,6 +5275,112 @@ mod tests {
         );
 
         unsafe { zcashlc_free_migration_schedule(reserve_ptr) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Safety net for #1806 (audit item 2): pins that this module's hand-rolled plan-preview
+    /// numbering ALREADY agrees with the engine's own [`MigrationPlan::planned_transactions`]
+    /// enumeration, before [`preparation_steps_from_plan`] and [`schedule_rows`]'s id input are
+    /// rewritten to read from it directly instead of re-deriving it. Refactor-under-green: this
+    /// is expected to pass against today's code unmodified (there is no new behavior to drive
+    /// out, only a new source of truth for numbers that must already match).
+    ///
+    /// (a) `preparation_steps_from_plan`'s `(id, layer, index)` triples, in order, against the
+    /// same triples read off `planned_transactions()`'s preparation-kind entries.
+    /// (b) `schedule_rows`' emitted ids, as a SET, against `planned_transactions()`'s
+    /// transfer-kind ids, also as a set (chosen over comparing the first/MIN row id: this
+    /// fixture's chronological re-sort makes "first row" not a stable comparison point, and the
+    /// set form is a strictly stronger check anyway — it pins every id, not just the smallest).
+    #[test]
+    fn preview_ids_come_from_the_engines_planned_enumeration() {
+        let path = init_fixture_db("zcashlc_migration_preview_ids_match_planned_enumeration");
+        let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
+        // Same near-`MAX_MONEY` fixture value as
+        // `migration_schedule_preparations_agree_between_propose_and_re_serve`: forces a SECOND
+        // preparation layer, so assertion (a) below exercises more than the trivial
+        // single-layer case.
+        fund_fixture_account_with_orchard_note(&path, &usk_bytes, 2_000_000_000_000_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+
+        let (plan, _reference_height, _handle) = plan_and_cache(&mut ctx, false)
+            .expect("planning must succeed")
+            .expect("the funded account has a real migration plan");
+
+        let planned = plan.planned_transactions();
+        assert!(
+            planned
+                .iter()
+                .filter(|t| t.is_preparation())
+                .any(|t| matches!(
+                    t.kind(),
+                    MigrationTxKind::Preparation { layer, .. } if layer > 0
+                )),
+            "the fixture value must actually reach a second preparation layer, or this test \
+             would not exercise the multi-layer case at all"
+        );
+
+        // (a)
+        let expected_preparations: Vec<(u32, u32, u32)> = planned
+            .iter()
+            .filter_map(|t| match t.kind() {
+                MigrationTxKind::Preparation { layer, index } => {
+                    Some((u32::from(t.id()), layer as u32, index as u32))
+                }
+                MigrationTxKind::Transfer { .. } => None,
+            })
+            .collect();
+        let steps = preparation_steps_from_plan(&plan).expect("preparation steps must compute");
+        let actual_preparations: Vec<(u32, u32, u32)> =
+            steps.iter().map(|s| (s.id, s.layer, s.index)).collect();
+        assert_eq!(
+            actual_preparations, expected_preparations,
+            "preparation_steps_from_plan's (id, layer, index) triples must match the engine's \
+             own planned enumeration, in order"
+        );
+        for step in &steps {
+            free_ptr_from_vec(step.depends_on, step.depends_on_len);
+        }
+
+        // (b)
+        let expected_transfer_ids: HashSet<MigrationTransferId> = planned
+            .iter()
+            .filter(|t| t.is_transfer())
+            .map(|t| t.id())
+            .collect();
+        let rows = schedule_rows(
+            plan.crossing_values(),
+            plan.schedule(),
+            prep_tx_count(&plan).expect("preparation count must compute"),
+        )
+        .expect("schedule rows must compute");
+        let actual_transfer_ids: HashSet<MigrationTransferId> =
+            rows.iter().map(|(id, _, _, _)| *id).collect();
+        assert_eq!(
+            actual_transfer_ids, expected_transfer_ids,
+            "schedule_rows' ids must be exactly the engine's own planned Transfer-kind ids"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
