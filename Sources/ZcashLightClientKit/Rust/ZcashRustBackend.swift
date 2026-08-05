@@ -1520,9 +1520,11 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return step
     }
 
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
-    @DBActor
+    // DB-READ (audited 2026-08-05): zcashlc_migration_sync_wakeups — opens through the
+    // FFI's `open_read` (both connections SQLITE_OPEN_READ_ONLY; no reconcile, no preamble
+    // writes), so read-only-ness is machine-enforced: a write anywhere down this path fails
+    // SQLITE_READONLY rather than silently reclassifying the call. Mined promotion is persisted
+    // by the write lanes (advance-step sweep, prove sweep, delivery serves).
     func migrationSyncWakeups(for account: AccountUUID) async throws -> [MigrationSyncWakeup] {
         let wakeupsPtr = zcashlc_migration_sync_wakeups(
             dbData.0,
@@ -1627,9 +1629,11 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return sizes
     }
 
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
-    @DBActor
+    // DB-READ (audited 2026-08-05): zcashlc_migration_progress — opens through the
+    // FFI's `open_read` (both connections SQLITE_OPEN_READ_ONLY; no reconcile, no preamble
+    // writes), so read-only-ness is machine-enforced: a write anywhere down this path fails
+    // SQLITE_READONLY rather than silently reclassifying the call. Mined promotion is persisted
+    // by the write lanes (advance-step sweep, prove sweep, delivery serves).
     func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress? {
         let progressPtr = zcashlc_migration_progress(
             dbData.0,
@@ -1647,9 +1651,11 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return progressPtr.pointee.unsafeToMigrationProgress()
     }
 
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
-    @DBActor
+    // DB-READ (audited 2026-08-05): zcashlc_migration_transaction_statuses — opens through the
+    // FFI's `open_read` (both connections SQLITE_OPEN_READ_ONLY; no reconcile, no preamble
+    // writes), so read-only-ness is machine-enforced: a write anywhere down this path fails
+    // SQLITE_READONLY rather than silently reclassifying the call. Mined promotion is persisted
+    // by the write lanes (advance-step sweep, prove sweep, delivery serves).
     func migrationTransactionStatuses(for account: AccountUUID) async throws -> [MigrationTransactionStatus] {
         let statusesPtr = zcashlc_migration_transaction_statuses(
             dbData.0,
@@ -1704,9 +1710,11 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return needed
     }
 
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
-    @DBActor
+    // DB-READ (audited 2026-08-05): zcashlc_migration_has_overdue_transfers — opens through the
+    // FFI's `open_read` (both connections SQLITE_OPEN_READ_ONLY; no reconcile, no preamble
+    // writes), so read-only-ness is machine-enforced: a write anywhere down this path fails
+    // SQLITE_READONLY rather than silently reclassifying the call. Mined promotion is persisted
+    // by the write lanes (advance-step sweep, prove sweep, delivery serves).
     func migrationHasOverdueTransfers(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
         // Clear any stale, unconsumed last-error before this sentinel read (see
         // `migrationIsNoteSplitNeeded` above).
@@ -1731,9 +1739,11 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return hasOverdue
     }
 
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
-    @DBActor
+    // DB-READ (audited 2026-08-05): zcashlc_migration_has_ready_broadcast — opens through the
+    // FFI's `open_read` (both connections SQLITE_OPEN_READ_ONLY; no reconcile, no preamble
+    // writes), so read-only-ness is machine-enforced: a write anywhere down this path fails
+    // SQLITE_READONLY rather than silently reclassifying the call. Mined promotion is persisted
+    // by the write lanes (advance-step sweep, prove sweep, delivery serves).
     func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
         let outcome = zcashlc_migration_has_ready_broadcast(
             dbData.0,
@@ -1755,9 +1765,11 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return outcome == 1
     }
 
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
-    @DBActor
+    // DB-READ (audited 2026-08-05): zcashlc_migration_has_invalid_transfers — opens through the
+    // FFI's `open_read` (both connections SQLITE_OPEN_READ_ONLY; no reconcile, no preamble
+    // writes), so read-only-ness is machine-enforced: a write anywhere down this path fails
+    // SQLITE_READONLY rather than silently reclassifying the call. Mined promotion is persisted
+    // by the write lanes (advance-step sweep, prove sweep, delivery serves).
     func migrationHasInvalidTransfers(for account: AccountUUID) async throws -> Bool {
         // Clear any stale, unconsumed last-error before this sentinel read (see
         // `migrationIsNoteSplitNeeded` above).
