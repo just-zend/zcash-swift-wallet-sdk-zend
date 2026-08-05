@@ -70,9 +70,9 @@ struct MigrationSpacingFloors: Equatable, Sendable {
 ///
 /// It composes three collaborators: the migration welding (the Rust engine surface), a fail-closed
 /// ``MigrationBroadcaster``, and a persisted ``MigrationSyncGate`` (the network-scaled
-/// post-broadcast privacy buffer, the in-flight broadcast marker, plus the ready-broadcast
-/// block). The engine owns all migration state, including
-/// the committed schedule; the SDK keeps no local copy of the proposal list.
+/// post-broadcast privacy buffer plus the in-flight broadcast marker — past/present holds only;
+/// see the gate's type doc for the removed forward-looking clause). The engine owns all migration
+/// state, including the committed schedule; the SDK keeps no local copy of the proposal list.
 actor OrchardMigration {
     /// The immutable configuration an ``OrchardMigration`` is built from.
     ///
@@ -318,14 +318,6 @@ actor OrchardMigration {
             directory: config.generalStorageURL,
             accountUUID: accountUUID,
             bufferDuration: OrchardMigration.privacySyncBufferDuration(for: config.network.networkType),
-            readyBroadcastProvider: {
-                // The gate's work-pending clause (D1): a PROVED, due, unexpired, valid transfer
-                // servable right now — never the broader overdue query, whose due-but-unproved
-                // `Signed` rows need MORE syncing rather than a broadcast session. Estimate-aware
-                // with the scanned tip asked FIRST (U8), degrading to "no ready broadcast" on any
-                // engine error so the reactive gate never crashes.
-                await OrchardMigration.gateReadyBroadcast(welding: welding, accountUUID: accountUUID, now: now)
-            },
             logger: logger
         )
     }
@@ -422,30 +414,10 @@ actor OrchardMigration {
     // same shared `MigrationTipEstimation` composition only for its gate/delivery due-ness
     // checks below.
 
-    /// The gate's estimate-aware work-pending clause (D1): whether a PROVED, schedule-due,
-    /// unexpired, valid transfer is servable RIGHT NOW — the one situation where the wallet
-    /// should broadcast instead of syncing. Never the broader overdue query: a due-but-unproved
-    /// `Signed` row needs MORE syncing, so it must never block sync.
-    ///
-    /// Asks at the SCANNED tip first (U8): the estimate may only ACCELERATE due-ness, so a `true`
-    /// scanned answer is final and the sample read is skipped entirely; only a `false` answer
-    /// pays for the projection and re-asks with the estimate. Any engine or estimator failure
-    /// degrades to `false`/`nil` (never blocks, never crashes the gate). Static (welding and
-    /// clock passed in) so the init-time `readyBroadcastProvider` closure can share it before
-    /// `self` exists.
-    private static func gateReadyBroadcast(
-        welding: ZcashRustBackendWelding,
-        accountUUID: AccountUUID,
-        now: @Sendable () -> Date
-    ) async -> Bool {
-        if (try? await welding.migrationHasReadyBroadcast(for: accountUUID, estimatedTip: nil)) ?? false {
-            return true
-        }
-        guard let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now()) else {
-            return false
-        }
-        return (try? await welding.migrationHasReadyBroadcast(for: accountUUID, estimatedTip: estimatedTip)) ?? false
-    }
+    // (`gateReadyBroadcast` — the estimate-aware ready-broadcast probe that fed the sync gate's
+    // forward-looking clause — was deleted with that clause on 2026-08-05, danny + nuttycom's
+    // ruling; see `MigrationSyncGate`'s type doc. The `migrationHasReadyBroadcast` welding/FFI
+    // surface remains for any non-gating consumer.)
 
     // MARK: - Note splitting
 
@@ -634,22 +606,15 @@ actor OrchardMigration {
 
     /// Whether ordinary wallet sync should currently be paused for this migration.
     ///
-    /// `true` when a READY broadcast is waiting (a proved, schedule-due, unexpired, valid
-    /// transfer the wallet should serve instead of syncing — never a `Signed` or awaiting-proof
-    /// row, which needs MORE syncing), **or** the post-broadcast privacy buffer has not yet
-    /// elapsed, **or** an in-flight broadcast marker is live. The ready-broadcast query is
-    /// engine-backed and estimate-aware (scanned tip asked first — U8); if it throws, this
-    /// degrades to the persisted gate-file (privacy-buffer/in-flight) state rather than crashing
-    /// the app's sync gating.
+    /// `true` while the post-broadcast privacy buffer has not yet elapsed, **or** an in-flight
+    /// broadcast marker is live — past/present conditions only. (The forward-looking
+    /// ready-broadcast clause was removed 2026-08-05 — danny + nuttycom's ruling; see
+    /// `MigrationSyncGate`'s type doc.)
     ///
     /// - Note: The gate is per-account (by file name). An app running several migrating accounts must
     ///   consult each account's `OrchardMigration`; this instance answers only for its bound account.
-    /// - Note: Always consults the ready-broadcast query fresh (`await`s the engine), unlike
-    ///   ``syncBlockedStream``'s synchronous subscribe-time seed -- see that property's documented
-    ///   caveat about the two briefly disagreeing right after relaunch.
     func isSyncBlocked() async -> Bool {
-        let hasReadyBroadcast = await OrchardMigration.gateReadyBroadcast(welding: welding, accountUUID: accountUUID, now: now)
-        return syncGate.currentlyBlocked(hasReadyBroadcast: hasReadyBroadcast)
+        syncGate.currentlyBlocked()
     }
 
     /// A stream of ``isSyncBlocked()``: emits the current value on subscribe, re-evaluates every 15 s
@@ -662,13 +627,10 @@ actor OrchardMigration {
     /// dropped rather than emitted — subscribers only ever see values in latest-wins order, never a
     /// stale one overwriting a fresher one.
     ///
-    /// - Important: The value delivered synchronously on subscribe reflects only the persisted
-    ///   privacy buffer and in-flight marker, not ready broadcasts -- ready-broadcast detection
-    ///   needs the engine query, which is asynchronous. On relaunch with a ready broadcast and no
-    ///   active buffer, that first emission can therefore briefly read `false` while
-    ///   ``isSyncBlocked()`` already reads `true`; the stream corrects itself with its first
-    ///   asynchronous re-evaluation (the next tick, or sooner if a broadcast happens first). A
-    ///   subscriber that must be correct from its very first value should pair this stream with
+    /// - Important: The value delivered synchronously on subscribe is EXACT — the gate's inputs
+    ///   are entirely its two persisted instants (see ``MigrationSyncGate``), so the old caveat
+    ///   about a briefly-wrong first emission is gone with the ready-broadcast clause. A
+    ///   subscriber that wants a belt anyway may still pair this stream with
     ///   an initial ``isSyncBlocked()`` call rather than trusting the seed alone.
     nonisolated var syncBlockedStream: AnyPublisher<Bool, Never> {
         syncGate.blockedStream
@@ -691,9 +653,8 @@ actor OrchardMigration {
     /// delivery lane's "is there actionable work" query, counting an already-proved due
     /// transaction AND a due, dependency-satisfied `Signed` one the delivery call would drive
     /// through proving. An informational query for hosts (re-arm background execution, launch
-    /// reconciliation); deliberately NOT consulted by any sync-gate path, which asks the
-    /// narrower ready-broadcast predicate instead (a due-but-unproved row must never block
-    /// sync — see ``isSyncBlocked()``).
+    /// reconciliation) and for the app's est-aware dispatch; deliberately NOT consulted by any
+    /// sync-gate path — since 2026-08-05 NO work-pending query is (see ``isSyncBlocked()``).
     ///
     /// `useEstimatedTip` opts the check into the wall-clock chain-tip estimate: the estimate may
     /// only ACCELERATE due-ness (expiry stays scanned-tip), and an estimator failure degrades to
@@ -841,7 +802,7 @@ actor OrchardMigration {
     /// broadcast once to the resolved endpoint, and classify the outcome. On a success outcome the
     /// privacy buffer starts *before* the result is recorded — ``MigrationSyncGate/markBroadcast()``
     /// is a non-throwing local write, and a record failure after a real broadcast must never skip
-    /// the buffer; a record failure on that path throws
+    /// the buffer (TRANSFERS only — a preparation arms no buffer, D2, see the body); a record failure on that path throws
     /// ``ZcashError/migrationRecordFailedAfterBroadcast(_:)``. Non-success outcomes are recorded
     /// first and returned with the gate untouched (only success outcomes mark it, unchanged); a
     /// record throw on that path clears the in-flight marker first only for a DEFINITIVE
@@ -863,6 +824,18 @@ actor OrchardMigration {
     /// ``MigrationSyncGate/broadcastInFlightGuardDuration`` (120 s); while it lives, sync (and
     /// with it the reconciliation probe that must not observe a just-broadcast transfer) stays
     /// blocked.
+    /// Whether `id` names a note-PREPARATION of this account's run — the D2 discriminator for
+    /// the privacy-buffer exemption above. One statuses read per broadcast; a failed read
+    /// degrades to `false` (the conservative TRANSFER treatment: the buffer arms).
+    private func isPreparationTransaction(id: UInt32) async -> Bool {
+        let statuses = (try? await welding.migrationTransactionStatuses(for: accountUUID)) ?? []
+        return statuses.contains { status in
+            guard status.id == id else { return false }
+            if case .preparation = status.kind { return true }
+            return false
+        }
+    }
+
     private func broadcastAndRecord(
         prepared: PreparedMigrationTransfer,
         options: MigrationNetworkPrivacyOptions
@@ -896,7 +869,20 @@ actor OrchardMigration {
         if case MigrationTransferResult.success = result {
             // The broadcast landed (or a duplicate rejection proved an earlier one did): start the
             // privacy buffer first, so a record failure cannot skip it.
-            syncGate.markBroadcast()
+            //
+            // D2 (danny + nuttycom, 2026-08-05): the buffer is a TRANSFER separation — a
+            // note-PREPARATION is a fully shielded orchard→orchard send-to-self, ZIP-318-exempt,
+            // and the engine's own contract is "a preparation is broadcast as soon as it is
+            // proved". Arming the buffer after a prep broadcast held the very sync its next
+            // layer's mine-observation needed, doubling every split phase. A failed kind read
+            // degrades to the conservative transfer treatment (buffer arms). The in-flight
+            // marker above is UNTOUCHED either way — it guards submit-to-record correctness,
+            // not ZIP-318 pacing.
+            if await isPreparationTransaction(id: prepared.id) {
+                logger.debug("migration preparation \(prepared.id) broadcast — no privacy buffer armed (ZIP-318 exempt)")
+            } else {
+                syncGate.markBroadcast()
+            }
             do {
                 try await welding.migrationRecordTransferResult(transferId: prepared.id, result: result, for: accountUUID)
             } catch {

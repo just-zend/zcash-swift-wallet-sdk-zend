@@ -60,6 +60,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             XCTAssertEqual(receivedAccount, self.accountA)
             return prepared
         }
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForClosure = { pczt, _ in
             recorder.record("extract")
             XCTAssertEqual(pczt, prepared.pczt)
@@ -96,6 +98,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         let prepared = makePreparedTransfer(id: 0)
         welding.migrationSignNoteSplitProposalUskForReturnValue = prepared
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x02, 0x03])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
@@ -125,6 +129,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         let prepared = makePreparedTransfer(id: 0)
         welding.migrationSignNoteSplitProposalUskForReturnValue = prepared
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x02, 0x03])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable))
@@ -189,6 +195,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testExecuteNextPendingTransferSuccessPathRecordsAndMarksGate() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
@@ -212,6 +220,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testExecuteNextPendingTransferInvalidNoteRejectionRecordsAndLeavesGateUntouched() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.rejected(errorCode: -25, message: "missing inputs")))
@@ -234,6 +244,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testExecuteNextPendingTransferExpiredRejectionRecordsAndLeavesGateUntouched() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.rejected(errorCode: -26, message: "tx-expiring-soon")))
@@ -257,6 +269,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testBroadcasterReceivesExactlyOneCallToTheResolvedEndpoint() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let overrideEndpoint = LightWalletEndpoint(address: "override.example", port: 443)
@@ -443,6 +457,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let expectedDisplayTxId = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
         let prepared = PreparedMigrationTransfer(id: 1, txid: Data(rawTxId), pczt: Data([0x01, 0x02]))
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
@@ -469,6 +485,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testExecuteNextPendingTransferRecordThrowAfterSuccessfulBroadcastMarksGateAndThrowsWrapped() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
@@ -494,6 +512,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testSubmitNoteSplitRecordThrowAfterSuccessfulBroadcastMarksGateAndThrowsWrapped() async throws {
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         welding.migrationSignNoteSplitProposalUskForReturnValue = makePreparedTransfer(id: 0)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x02, 0x03])
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
@@ -523,6 +543,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testExecuteNextPendingTransferRecordThrowOnTransportErrorPropagatesRawAndLeavesGateUntouched() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
@@ -560,6 +582,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         for (script, expected) in rejections {
             let prepared = makePreparedTransfer(id: 1)
             welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+            // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+            welding.migrationTransactionStatusesForReturnValue = []
             welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
             welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
             let broadcaster = ScriptedBroadcaster(script: .outcome(script))
@@ -592,6 +616,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testExecuteNextPendingTransferRecordSuccessOnNetworkErrorClearsInFlightMarker() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .outcome(.transportError)))
@@ -615,6 +641,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testExecuteNextPendingTransferReArmsTheInFlightMarkerAtSubmitTimeViaTheHook() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
@@ -657,6 +685,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testExecuteNextPendingTransferFailClosedThrowNeverFiresTheHook() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         let broadcaster = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -684,6 +714,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             // The engine contract: the transfer stays "next due" until its result is recorded.
             welding?.migrationRecordTransferResultTransferIdResultForCalled == true ? .nothingDue : .ready(prepared)
         }
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = GatedBroadcaster(outcome: MigrationBroadcastOutcome.submitted)
@@ -737,6 +769,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             recorder.record("sign")
             return splitTransfer
         }
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { transferId, _, _ in
             recorder.record("record:\(transferId)")
@@ -788,6 +822,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let prepTransfer = makePreparedTransfer(id: 0)
         welding.migrationStoreSignedNoteSplitPcztsForReturnValue = prepTransfer
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepTransfer)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForClosure = { pczt, _ in
             XCTAssertEqual(pczt, prepTransfer.pczt)
             return Data([0x0A])
@@ -833,13 +869,19 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
     /// The gate's work-pending clause is the READY-broadcast predicate: a proved, due transfer
     /// blocks sync. The very wedge D1 exists to prevent is pinned separately below.
-    func testIsSyncBlockedBlocksWhenAReadyBroadcastIsWaiting() async throws {
+    /// D1 REVERSAL PIN (danny + nuttycom, 2026-08-05): a servable ready broadcast no longer
+    /// blocks sync — the forward-looking clause is deleted, and no gate path consults the
+    /// ready-broadcast probe at all (the probe answering `true` here proves the assertion is
+    /// about consultation, not about the engine's answer).
+    func testIsSyncBlockedIgnoresAWaitingReadyBroadcast() async throws {
         welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         let blocked = await migration.isSyncBlocked()
 
-        XCTAssertTrue(blocked, "a proved, due, valid transfer must hold sync for a broadcast session")
+        XCTAssertFalse(blocked, "sync holds only for past/present broadcasts (buffer, in-flight marker)")
+        XCTAssertFalse(welding.migrationHasReadyBroadcastForEstimatedTipCalled, "no gate path consults the probe anymore")
+        XCTAssertFalse(welding.migrationBlockRateSamplesWindowCalled, "no gate path pays for the estimate anymore")
     }
 
     /// THE WEDGE (D1): a due-but-unproved row — `migrationHasOverdueTransfers` would answer `true`
@@ -864,76 +906,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// U8 ordering: the gate asks the ready-broadcast question at the SCANNED tip FIRST (nil
     /// estimate). When that answer is already `true`, the block-rate samples are never read — the
     /// estimate could not change the answer.
-    func testIsSyncBlockedAsksScannedTipFirstAndSkipsTheEstimateWhenAlreadyBlocked() async throws {
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
-        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
-        let blocked = await migration.isSyncBlocked()
 
-        XCTAssertTrue(blocked)
-        XCTAssertEqual(welding.migrationHasReadyBroadcastForEstimatedTipCallsCount, 1)
-        XCTAssertNil(
-            welding.migrationHasReadyBroadcastForEstimatedTipReceivedArguments?.estimatedTip,
-            "the first (and only) ask must be at the scanned tip"
-        )
-        XCTAssertFalse(
-            welding.migrationBlockRateSamplesWindowCalled,
-            "a true scanned answer must not pay for the sample read"
-        )
-    }
-
-    /// U8 ordering, second half: only a `false` scanned answer pays for the estimate projection
-    /// and re-asks with it — the estimate can only ACCELERATE due-ness, so it is consulted second.
-    func testIsSyncBlockedReAsksWithTheEstimateOnlyAfterAFalseScannedAnswer() async throws {
-        let sampleTime = referenceDate.addingTimeInterval(-100)
-        welding.migrationBlockRateSamplesWindowReturnValue = [
-            MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
-        ]
-        var receivedTips: [BlockHeight?] = []
-        welding.migrationHasReadyBroadcastForEstimatedTipClosure = { _, estimatedTip in
-            receivedTips.append(estimatedTip)
-            // Scanned tip says no; the estimate-accelerated re-ask says yes.
-            return estimatedTip != nil
-        }
-        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
-
-        let blocked = await migration.isSyncBlocked()
-
-        XCTAssertTrue(blocked, "an estimate-accelerated ready broadcast must block sync")
-        XCTAssertEqual(receivedTips.count, 2)
-        let firstTip = try XCTUnwrap(receivedTips.first)
-        XCTAssertNil(firstTip, "the scanned tip must be asked first")
-        let secondTip = try XCTUnwrap(receivedTips.last)
-        XCTAssertNotNil(secondTip, "the second ask must carry the projected estimate")
-    }
-
-    /// U7/U9: the estimate the gate feeds into the second ask is projected at the ACTOR'S injected
-    /// clock, not the wall clock — the deterministic fake-clock arithmetic only holds if the shared
-    /// tip-estimation helper received `clock.now`.
-    func testIsSyncBlockedProjectsTheEstimateAtTheInjectedClock() async throws {
-        // One sample 150 s (two 75 s target-spacing blocks) before the frozen test clock: the
-        // deterministic projection is height + 2 — any wall-clock leak (years past
-        // `referenceDate`) would project far beyond it.
-        let sampleTime = referenceDate.addingTimeInterval(-150)
-        welding.migrationBlockRateSamplesWindowReturnValue = [
-            MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
-        ]
-        var receivedTips: [BlockHeight?] = []
-        welding.migrationHasReadyBroadcastForEstimatedTipClosure = { _, estimatedTip in
-            receivedTips.append(estimatedTip)
-            return false
-        }
-        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
-
-        _ = await migration.isSyncBlocked()
-
-        let projectedTip = try XCTUnwrap(receivedTips.last)
-        XCTAssertEqual(
-            projectedTip,
-            3_000_002,
-            "the projection must be evaluated at the actor's injected clock (height + floor(150/75))"
-        )
-    }
 
     // MARK: - Helpers
 
@@ -968,7 +942,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             // A long tick keeps the background re-evaluation out of these deterministic assertions.
             tickInterval: 3600,
             now: { clock.now },
-            readyBroadcastProvider: { false },
             logger: logger
         )
     }

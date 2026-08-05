@@ -24,28 +24,35 @@ final class MigrationLogicTests: ZcashTestCase {
     func testGateBlockedImmediatelyAfterMark() {
         // The +600 s buffer starts at `now`, so `now` itself is inside the blocked window.
         let resumeAt = referenceDate.addingTimeInterval(buffer)
-        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, hasReadyBroadcast: false, resumeAt: resumeAt, inFlightUntil: nil))
+        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, resumeAt: resumeAt, inFlightUntil: nil))
     }
 
     func testGateUnblocksAtExactlyBufferBoundary() {
         // At exactly `resumeAt` the buffer has elapsed: `now < resumeAt` is false.
         let resumeAt = referenceDate.addingTimeInterval(buffer)
-        XCTAssertFalse(MigrationSyncGate.isBlocked(now: resumeAt, hasReadyBroadcast: false, resumeAt: resumeAt, inFlightUntil: nil))
+        XCTAssertFalse(MigrationSyncGate.isBlocked(now: resumeAt, resumeAt: resumeAt, inFlightUntil: nil))
     }
 
-    func testGateReadyBroadcastForcesBlockedEvenAfterBufferElapsed() {
+    /// D1 (danny + nuttycom, 2026-08-05): the forward-looking ready-broadcast clause is GONE.
+    /// The gate's inputs are exactly the two persisted instants — with the buffer elapsed and no
+    /// in-flight marker, sync is unblocked no matter how servable a pending broadcast is. This is
+    /// the anti-regression pin for the clause's removal (it froze an awake session for 50+ min by
+    /// blocking the very sync its pending broadcast needed — FIND-5).
+    func testGateHasNoForwardLookingClauseAfterBufferElapsed() {
         let resumeAt = referenceDate.addingTimeInterval(buffer)
         let afterBuffer = resumeAt.addingTimeInterval(1)
-        XCTAssertTrue(MigrationSyncGate.isBlocked(now: afterBuffer, hasReadyBroadcast: true, resumeAt: resumeAt, inFlightUntil: nil))
+        XCTAssertFalse(MigrationSyncGate.isBlocked(now: afterBuffer, resumeAt: resumeAt, inFlightUntil: nil))
     }
 
-    func testGateReadyBroadcastForcesBlockedWithoutAnyBuffer() {
-        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, hasReadyBroadcast: true, resumeAt: nil, inFlightUntil: nil))
+    /// D1's second half: with no buffer at all, nothing but an in-flight marker can block — a
+    /// fresh gate is open regardless of any pending work.
+    func testGateHasNoForwardLookingClauseWithoutAnyBuffer() {
+        XCTAssertFalse(MigrationSyncGate.isBlocked(now: referenceDate, resumeAt: nil, inFlightUntil: nil))
     }
 
     func testGateCorruptOrMissingFileUnblockedWhenNoReadyBroadcast() {
         // Corrupt/missing file resolves to `resumeAt == nil`, which is "no gate".
-        XCTAssertFalse(MigrationSyncGate.isBlocked(now: referenceDate, hasReadyBroadcast: false, resumeAt: nil, inFlightUntil: nil))
+        XCTAssertFalse(MigrationSyncGate.isBlocked(now: referenceDate, resumeAt: nil, inFlightUntil: nil))
     }
 
     // MARK: - Gate math: broadcast in-flight marker
@@ -54,30 +61,30 @@ final class MigrationLogicTests: ZcashTestCase {
     /// buffer -- the third, independent reason the gate blocks (see `MigrationSyncGate`'s type doc).
     func testGateBlockedWhileInFlightMarkerUnexpired() {
         let inFlightUntil = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration)
-        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, hasReadyBroadcast: false, resumeAt: nil, inFlightUntil: inFlightUntil))
+        XCTAssertTrue(MigrationSyncGate.isBlocked(now: referenceDate, resumeAt: nil, inFlightUntil: inFlightUntil))
     }
 
     /// At exactly `inFlightUntil` the marker has elapsed: `now < inFlightUntil` is false, mirroring
     /// the privacy buffer's own boundary rule.
     func testGateUnblocksAtExactlyInFlightMarkerBoundary() {
         let inFlightUntil = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration)
-        XCTAssertFalse(MigrationSyncGate.isBlocked(now: inFlightUntil, hasReadyBroadcast: false, resumeAt: nil, inFlightUntil: inFlightUntil))
+        XCTAssertFalse(MigrationSyncGate.isBlocked(now: inFlightUntil, resumeAt: nil, inFlightUntil: inFlightUntil))
     }
 
     /// `markBroadcastInFlight()` blocks sync immediately; `clearBroadcastInFlight()` releases it
     /// again -- without either an overdue transfer or a privacy buffer in play.
     func testMarkBroadcastInFlightBlocksAndClearReleases() {
         let gate = makeGate(account: accountA, clock: TestClock(referenceDate))
-        XCTAssertFalse(gate.currentlyBlocked(hasReadyBroadcast: false), "precondition: fresh gate is unblocked")
+        XCTAssertFalse(gate.currentlyBlocked(), "precondition: fresh gate is unblocked")
 
         gate.markBroadcastInFlight()
 
-        XCTAssertTrue(gate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertTrue(gate.currentlyBlocked())
         XCTAssertNotNil(gate.currentInFlightUntil())
 
         gate.clearBroadcastInFlight()
 
-        XCTAssertFalse(gate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertFalse(gate.currentlyBlocked())
         XCTAssertNil(gate.currentInFlightUntil())
     }
 
@@ -89,11 +96,11 @@ final class MigrationLogicTests: ZcashTestCase {
         let gate = makeGate(account: accountA, clock: clock)
 
         gate.markBroadcastInFlight()
-        XCTAssertTrue(gate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertTrue(gate.currentlyBlocked())
 
         clock.now = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration + 1)
 
-        XCTAssertFalse(gate.currentlyBlocked(hasReadyBroadcast: false), "an expired in-flight marker must stop blocking sync")
+        XCTAssertFalse(gate.currentlyBlocked(), "an expired in-flight marker must stop blocking sync")
     }
 
     /// `markBroadcastInFlight()` preserves an already-running privacy buffer (they are independent,
@@ -119,13 +126,13 @@ final class MigrationLogicTests: ZcashTestCase {
     func testIsBlockedIgnoresAnImplausiblyFarFutureInFlightMarker() {
         let farFuture = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration + 3600)
         XCTAssertFalse(
-            MigrationSyncGate.isBlocked(now: referenceDate, hasReadyBroadcast: false, resumeAt: nil, inFlightUntil: farFuture),
+            MigrationSyncGate.isBlocked(now: referenceDate, resumeAt: nil, inFlightUntil: farFuture),
             "a clock-step artifact must not wedge sync"
         )
         // The boundary itself is plausible: a freshly armed marker sits at exactly now + guard.
         let freshlyArmed = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration)
         XCTAssertTrue(
-            MigrationSyncGate.isBlocked(now: referenceDate, hasReadyBroadcast: false, resumeAt: nil, inFlightUntil: freshlyArmed)
+            MigrationSyncGate.isBlocked(now: referenceDate, resumeAt: nil, inFlightUntil: freshlyArmed)
         )
     }
 
@@ -155,11 +162,11 @@ final class MigrationLogicTests: ZcashTestCase {
 
         let ceiling = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration)
         XCTAssertEqual(relaunchedGate.currentInFlightUntil(), ceiling, "the load must clamp the marker into its plausible window")
-        XCTAssertTrue(relaunchedGate.currentlyBlocked(hasReadyBroadcast: false), "the protective window survives the clamp")
+        XCTAssertTrue(relaunchedGate.currentlyBlocked(), "the protective window survives the clamp")
 
         steppedBackClock.now = ceiling.addingTimeInterval(1)
         XCTAssertFalse(
-            relaunchedGate.currentlyBlocked(hasReadyBroadcast: false),
+            relaunchedGate.currentlyBlocked(),
             "the clamped marker must expire a guard-duration after the relaunch, not an hour later"
         )
     }
@@ -177,12 +184,12 @@ final class MigrationLogicTests: ZcashTestCase {
 
         let ceiling = referenceDate.addingTimeInterval(MigrationSyncGate.broadcastInFlightGuardDuration)
         XCTAssertEqual(gate.currentInFlightUntil(), ceiling, "the read must clamp the marker to now + guard")
-        XCTAssertTrue(gate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertTrue(gate.currentlyBlocked())
 
         // The clamp persisted (write-back): advancing past the ceiling expires the marker even
         // though the ORIGINAL expiry is still far in this clock's future.
         clock.now = ceiling.addingTimeInterval(1)
-        XCTAssertFalse(gate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertFalse(gate.currentlyBlocked())
     }
 
     // MARK: - Gate file round-trip
@@ -194,7 +201,7 @@ final class MigrationLogicTests: ZcashTestCase {
         gate.markBroadcast()
 
         XCTAssertEqual(gate.currentResumeAt(), referenceDate.addingTimeInterval(buffer))
-        XCTAssertTrue(gate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertTrue(gate.currentlyBlocked())
     }
 
     func testGateUnblocksOnceRealTimePassesTheBuffer() {
@@ -205,8 +212,9 @@ final class MigrationLogicTests: ZcashTestCase {
         // Advance the injected clock past the buffer; the persisted resumeAt is unchanged.
         clock.now = referenceDate.addingTimeInterval(buffer + 1)
 
-        XCTAssertFalse(gate.currentlyBlocked(hasReadyBroadcast: false))
-        XCTAssertTrue(gate.currentlyBlocked(hasReadyBroadcast: true))
+        // (This test's second half — "still blocked when a ready broadcast waits" — died with the
+        // gate's forward-looking clause, D1; the reversal pins above own that behavior now.)
+        XCTAssertFalse(gate.currentlyBlocked())
     }
 
     func testCorruptFileAtInitReadsAsNoGate() throws {
@@ -218,7 +226,7 @@ final class MigrationLogicTests: ZcashTestCase {
         let gate = makeGate(account: accountA, clock: TestClock(referenceDate))
 
         XCTAssertNil(gate.currentResumeAt())
-        XCTAssertFalse(gate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertFalse(gate.currentlyBlocked())
     }
 
     /// Finding 14: `currentResumeAt()`/`currentlyBlocked` read the in-memory `resumeAt` cache, not a
@@ -241,7 +249,7 @@ final class MigrationLogicTests: ZcashTestCase {
         otherProcessGate.markBroadcast()
 
         XCTAssertNil(gate.currentResumeAt(), "an out-of-band file write after init must not change the cached answer")
-        XCTAssertFalse(gate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertFalse(gate.currentlyBlocked())
     }
 
     /// Finding 14: the in-memory `resumeAt` cache is loaded from the gate file once, at init -- a
@@ -257,7 +265,7 @@ final class MigrationLogicTests: ZcashTestCase {
         let secondLaunchGate = makeGate(account: accountA, clock: clock)
 
         XCTAssertEqual(secondLaunchGate.currentResumeAt(), persistedResumeAt)
-        XCTAssertTrue(secondLaunchGate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertTrue(secondLaunchGate.currentlyBlocked())
     }
 
     /// The in-flight marker persists exactly like `resumeAt`: a fresh gate instance over the same
@@ -273,7 +281,7 @@ final class MigrationLogicTests: ZcashTestCase {
         let secondLaunchGate = makeGate(account: accountA, clock: clock)
 
         XCTAssertEqual(secondLaunchGate.currentInFlightUntil(), persistedInFlightUntil)
-        XCTAssertTrue(secondLaunchGate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertTrue(secondLaunchGate.currentlyBlocked())
 
         let fileOnlyInputs = MigrationSyncGate.persistedGateInputs(directory: testGeneralStorageDirectory, accountUUID: accountA, logger: logger)
         XCTAssertEqual(fileOnlyInputs.inFlightUntil, persistedInFlightUntil)
@@ -291,7 +299,7 @@ final class MigrationLogicTests: ZcashTestCase {
         let secondLaunchGate = makeGate(account: accountA, clock: clock)
 
         XCTAssertNil(secondLaunchGate.currentInFlightUntil())
-        XCTAssertFalse(secondLaunchGate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertFalse(secondLaunchGate.currentlyBlocked())
     }
 
     /// Back-compat: a gate file persisted before the in-flight marker existed never carries an
@@ -308,7 +316,7 @@ final class MigrationLogicTests: ZcashTestCase {
 
         XCTAssertEqual(gate.currentResumeAt(), referenceDate.addingTimeInterval(buffer))
         XCTAssertNil(gate.currentInFlightUntil())
-        XCTAssertTrue(gate.currentlyBlocked(hasReadyBroadcast: false))
+        XCTAssertTrue(gate.currentlyBlocked())
     }
 
     // MARK: - Network-scaled privacy buffer
@@ -428,47 +436,46 @@ final class MigrationLogicTests: ZcashTestCase {
 
     // MARK: - Ticker gated on subscribers
 
+
     /// Finding 14: the ticker must do zero periodic work with no subscriber attached, start
-    /// evaluating on the first subscriber (0 -> 1), and stop again once the last one detaches (1 -> 0)
-    /// -- the `readyBroadcastProvider` invocation count freezes rather than merely slowing down. A very
-    /// short `tickInterval` keeps the "prove nothing fires" waits fast; unlike `now`, the ticker's
-    /// inter-tick delay is real wall-clock sleep, not injected, so those two waits are real-time
-    /// (mirrors the inverted-expectation style already used by
-    /// `testStaleRecomputeIsDroppedInFavorOfAFresherPublishedValue` above).
+    /// evaluating on the first subscriber (0 -> 1), and stop again once the last one detaches
+    /// (1 -> 0). OBSERVABLE REWIRED 2026-08-05: the old probe was the `readyBroadcastProvider`
+    /// invocation count, deleted with the gate's forward-looking clause (D1) — the injected
+    /// clock now stands in, since every recompute (and each ticker iteration's delay
+    /// computation) reads `now()`, while an idle, unsubscribed gate reads it never.
     func testTickerTicksOnlyWhileSubscribed() async throws {
-        let counter = CallCountingOverdueProvider()
-        let tickedAtLeastTwice = expectation(description: "ticker evaluates at least twice while subscribed")
+        let clock = CountingClock(referenceDate)
         let gate = MigrationSyncGate(
             directory: testGeneralStorageDirectory,
             accountUUID: accountA,
             bufferDuration: buffer,
             tickInterval: 0.02,
-            readyBroadcastProvider: {
-                let count = await counter.increment()
-                if count == 2 { tickedAtLeastTwice.fulfill() }
-                return false
-            },
+            now: { clock.tick() },
             logger: logger
         )
 
-        // No subscriber yet: several tick intervals' worth of real time must produce zero calls.
+        // No subscriber yet: several tick intervals' worth of real time must produce no reads
+        // beyond construction's own.
+        let countAfterInit = clock.count
         try await Task.sleep(nanoseconds: 200_000_000)
-        let countBeforeSubscribing = await counter.count
-        XCTAssertEqual(countBeforeSubscribing, 0, "the ticker must not run with no subscriber attached")
+        XCTAssertEqual(clock.count, countAfterInit, "the ticker must not run with no subscriber attached")
 
-        // Attaching a subscriber starts evaluation.
+        // Attaching a subscriber starts evaluation: the clock-read count must grow.
         let cancellable = gate.blockedStream.sink { _ in }
-        await fulfillment(of: [tickedAtLeastTwice], timeout: 2)
+        let deadline = Date().addingTimeInterval(2)
+        while clock.count < countAfterInit + 4, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(clock.count, countAfterInit + 4, "the ticker must evaluate while subscribed")
 
-        // Detaching stops it: the invocation count must stop growing across a further quiet period.
+        // Detaching stops it: the count must stop growing across a further quiet period.
         cancellable.cancel()
         // A tick may already be in flight at the moment of cancellation; let it settle before
         // snapshotting the count both sides of the quiet period.
         try await Task.sleep(nanoseconds: 50_000_000)
-        let countAfterCancel = await counter.count
+        let countAfterCancel = clock.count
         try await Task.sleep(nanoseconds: 200_000_000)
-        let countAfterQuietPeriod = await counter.count
-        XCTAssertEqual(countAfterQuietPeriod, countAfterCancel, "the ticker must stop once the last subscriber detaches")
+        XCTAssertEqual(clock.count, countAfterCancel, "the ticker must stop once the last subscriber detaches")
     }
 
     // MARK: - Blocked stream behavior (finding 13)
@@ -495,7 +502,7 @@ final class MigrationLogicTests: ZcashTestCase {
     /// emission is `true`, without waiting for any tick. Exercises `MigrationSyncGate`'s documented
     /// init-time seed (loads `cachedResumeAt` from the file once, then seeds `blockedSubject` from it)
     /// through the public `blockedStream`, complementing `testMemoryCacheHonorsAPreExistingFileValueAtInit`
-    /// above (which checks the same init-time load via `currentResumeAt()`/`currentlyBlocked(hasReadyBroadcast:)`
+    /// above (which checks the same init-time load via `currentResumeAt()`/`currentlyBlocked()`
     /// rather than the stream).
     func testBlockedStreamSubscribeTimeSeedIsTrueWhenAlreadyLiveInTheGateFileAtInit() {
         let clock = TestClock(referenceDate)
@@ -527,7 +534,6 @@ final class MigrationLogicTests: ZcashTestCase {
             // Long enough that no real tick can plausibly fire during this test's timeout below.
             tickInterval: 3600,
             now: { clock.now },
-            readyBroadcastProvider: { false },
             logger: logger
         )
 
@@ -546,38 +552,10 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertEqual(received, [false, true])
     }
 
-    /// Tick re-evaluation, "overdue flips on" half: the ticker's OWN periodic re-evaluation -- not a
-    /// `markBroadcast()` -- must pick up an `readyBroadcastProvider` answer that flips from `false` to `true`
-    /// between ticks. `GatedOverdueProvider` (already used by
-    /// `testStaleRecomputeIsDroppedInFavorOfAFresherPublishedValue` above) pre-queues both ticks'
-    /// answers so each `next()` call resolves immediately -- no suspension, no `Task.sleep` in this
-    /// test -- while the real (short) `tickInterval` is what actually paces the two ticks.
-    func testBlockedStreamTickEmitsTrueAfterOverdueProviderFlipsFromFalseToTrue() async throws {
-        let provider = GatedOverdueProvider()
-        await provider.queue(false) // generation 1 (the ticker's startup recompute): agrees with the seed
-        await provider.queue(true) // generation 2 (the next tick): the flip
-        let fixedNow = referenceDate
-        let gate = MigrationSyncGate(
-            directory: testGeneralStorageDirectory,
-            accountUUID: accountA,
-            bufferDuration: buffer,
-            tickInterval: 0.02,
-            now: { fixedNow },
-            readyBroadcastProvider: { await provider.next() },
-            logger: logger
-        )
 
-        var received: [Bool] = []
-        let trueReceived = expectation(description: "a tick observed the readyBroadcastProvider flip to true")
-        let cancellable = gate.blockedStream.sink { value in
-            received.append(value)
-            if value { trueReceived.fulfill() }
-        }
-        defer { cancellable.cancel() }
-
-        await fulfillment(of: [trueReceived], timeout: 5)
-        XCTAssertEqual(received, [false, true])
-    }
+    // (The "overdue flips on" tick test was deleted 2026-08-05 with the gate's forward-looking
+    // ready-broadcast clause — D1, danny + nuttycom's ruling; see `MigrationSyncGate`'s type doc.
+    // The ticker's remaining job is time-based flips, pinned by the buffer-expiry test below.)
 
     /// Tick re-evaluation, "buffer expires" half: with a live buffer already seeded at subscribe time
     /// (so the gate reads `true`) and nothing ever overdue, advancing the INJECTED clock past the
@@ -598,7 +576,6 @@ final class MigrationLogicTests: ZcashTestCase {
             bufferDuration: buffer,
             tickInterval: 0.02,
             now: { clock.now },
-            readyBroadcastProvider: { false },
             logger: logger
         )
 
@@ -621,25 +598,14 @@ final class MigrationLogicTests: ZcashTestCase {
 
     /// Duplicate collapse: several ticks that all agree with the already-published value must not
     /// produce any additional emissions -- pins `.removeDuplicates()` in `blockedStream`'s pipeline.
-    /// Reuses `CallCountingOverdueProvider` (already used by `testTickerTicksOnlyWhileSubscribed`
-    /// above) to prove multiple recomputes actually ran, rather than merely that nothing arrived
-    /// because nothing ticked.
     func testBlockedStreamCollapsesConsecutiveIdenticalTickEvaluationsIntoNoExtraEmissions() async throws {
-        let counter = CallCountingOverdueProvider()
-        let tickedAtLeastThreeTimes = expectation(description: "the ticker evaluates at least three times")
-        let fixedNow = referenceDate
+        let clock = CountingClock(referenceDate)
         let gate = MigrationSyncGate(
             directory: testGeneralStorageDirectory,
             accountUUID: accountA,
             bufferDuration: buffer,
             tickInterval: 0.02,
-            now: { fixedNow },
-            readyBroadcastProvider: {
-                let count = await counter.increment()
-                if count == 3 { tickedAtLeastThreeTimes.fulfill() }
-                // No buffer, never overdue: every tick agrees with the fresh-gate seed.
-                return false
-            },
+            now: { clock.tick() },
             logger: logger
         )
 
@@ -648,73 +614,28 @@ final class MigrationLogicTests: ZcashTestCase {
         defer { cancellable.cancel() }
         XCTAssertEqual(received, [false], "precondition: fresh gate seeds false")
 
-        await fulfillment(of: [tickedAtLeastThreeTimes], timeout: 5)
+        // Recompute activity is observed through the injected clock (see
+        // `testTickerTicksOnlyWhileSubscribed`'s rewired observable): wait until enough reads
+        // prove several recomputes ran, rather than merely that nothing ticked.
+        let baseline = clock.count
+        let deadline = Date().addingTimeInterval(5)
+        while clock.count < baseline + 6, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(clock.count, baseline + 6, "several ticks must actually have evaluated")
 
-        XCTAssertEqual(received, [false], "three ticks agreeing with the seed must not add any emissions")
+        XCTAssertEqual(received, [false], "ticks agreeing with the seed must not add any emissions")
     }
 
     // MARK: - Concurrent send serialization
 
-    /// Reproduces finding 7's race directly: the ticker's very first recompute -- generation 1,
-    /// started by subscribing below (finding 14 gates the ticker on the first subscriber; it no
-    /// longer starts at construction) -- is held suspended in `readyBroadcastProvider`, standing in for "a
-    /// tick suspended when a broadcast lands", while a second, later-started `markBroadcast()`-
-    /// triggered recompute resolves immediately and publishes a fresher value. Releasing the stale
-    /// first recompute (with an answer engineered to compute a *different* `blocked` value, so
-    /// `removeDuplicates()` can't accidentally be the thing hiding the bug) must not publish a third,
-    /// stale emission: latest-wins, and a recompute that started earlier but finishes later is
-    /// dropped.
-    func testStaleRecomputeIsDroppedInFavorOfAFresherPublishedValue() async throws {
-        let clock = TestClock(referenceDate)
-        let provider = GatedOverdueProvider()
-        let gate = MigrationSyncGate(
-            directory: testGeneralStorageDirectory,
-            accountUUID: accountA,
-            bufferDuration: buffer,
-            // Long enough that only the ticker's own startup recompute fires during this test.
-            tickInterval: 3600,
-            now: { clock.now },
-            readyBroadcastProvider: { await provider.next() },
-            logger: logger
-        )
+    // (Finding 7's stale-recompute reproduction was deleted 2026-08-05: it held generation 1
+    // suspended INSIDE `recompute()` via the `readyBroadcastProvider` await, and that await —
+    // the only suspension point the recompute path ever had — is gone with the gate's
+    // forward-looking clause (D1). `recompute()` now runs draw-to-publish without suspending,
+    // so the reproduced interleaving is unbuildable; the generation-ordered `publish` funnel
+    // stays as the belt for plain cross-thread races.)
 
-        var received: [Bool] = []
-        let freshValuePublished = expectation(description: "fresher value published")
-        let noStaleValuePublished = expectation(description: "a stale third value must not publish")
-        noStaleValuePublished.isInverted = true
-        // Subscribing is what starts the ticker (finding 14): this kicks off generation 1, which
-        // immediately suspends in `readyBroadcastProvider` below.
-        let cancellable = gate.blockedStream.sink { value in
-            received.append(value)
-            if received.count == 2 { freshValuePublished.fulfill() }
-            if received.count >= 3 { noStaleValuePublished.fulfill() }
-        }
-        defer { cancellable.cancel() }
-
-        // Generation 1 is now in flight (started by the subscription above): wait for it to be
-        // suspended in `readyBroadcastProvider`, unresolved, until we explicitly release it below.
-        await provider.waitUntilWaiting()
-
-        // Generation 2: queued ahead of time, so `next()` returns immediately (no suspension) and
-        // this recompute -- started AFTER generation 1 -- finishes and publishes FIRST.
-        await provider.queue(true)
-        gate.markBroadcast()
-
-        await fulfillment(of: [freshValuePublished], timeout: 5)
-        XCTAssertEqual(received, [false, true])
-
-        // Advance the clock past the buffer `markBroadcast()` just started, so generation 1's
-        // eventual answer (`hasReadyBroadcast: false`) computes to `false` -- different from generation 2's
-        // published `true` -- rather than being incidentally deduplicated to the same value.
-        clock.now = referenceDate.addingTimeInterval(buffer + 1)
-
-        // Release the stale generation-1 call. Pre-fix this publishes a third, stale `false`;
-        // post-fix it is dropped (generation 1 < the already-published generation 2).
-        await provider.resolveOldestWaiting(false)
-
-        await fulfillment(of: [noStaleValuePublished], timeout: 0.5)
-        XCTAssertEqual(received, [false, true])
-    }
 
     // MARK: - Lock split regression (deadlock on synchronous cancel during publish)
 
@@ -1263,6 +1184,8 @@ final class MigrationLogicTests: ZcashTestCase {
         )
         let welding = ZcashRustBackendWeldingMock()
         welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x03, 0x04])
         // A no-op closure: if the fail-closed guard regresses and this ends up called anyway, it
         // completes instead of crashing the process, so the call-count assertion below fails cleanly
@@ -1310,7 +1233,6 @@ final class MigrationLogicTests: ZcashTestCase {
             // A long tick keeps the background re-evaluation out of these deterministic assertions.
             tickInterval: 3600,
             now: { clock.now },
-            readyBroadcastProvider: { false },
             logger: logger
         )
     }
@@ -1408,65 +1330,30 @@ final class MigrationLogicTests: ZcashTestCase {
     }
 }
 
-/// A controllable test double for `MigrationSyncGate`'s `readyBroadcastProvider` seam: each call to
-/// `next()` either returns an already-queued answer immediately, or suspends until `resolveOldestWaiting`
-/// releases the oldest still-waiting call. Lets a test pin the exact interleaving of two concurrent
-/// recomputes deterministically -- no `Task.sleep`, no polling -- by controlling which of two
-/// `readyBroadcastProvider` calls resolves first.
-private actor GatedOverdueProvider {
-    private var queuedAnswers: [Bool] = []
-    private var waiters: [CheckedContinuation<Bool, Never>] = []
-    private var suspensionSignals: [CheckedContinuation<Void, Never>] = []
+/// A `now` closure double that counts its reads — the rewired observable for the
+/// subscription-gated-ticker pins above (the old observable, `readyBroadcastProvider`, was
+/// deleted with the gate's forward-looking clause — D1). Always returns the same fixed instant,
+/// so the counted reads never move any time-based condition.
+private final class CountingClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fixed: Date
+    private var reads = 0
 
-    func next() async -> Bool {
-        if !queuedAnswers.isEmpty {
-            return queuedAnswers.removeFirst()
-        }
-        return await withCheckedContinuation { continuation in
-            waiters.append(continuation)
-            let signals = suspensionSignals
-            suspensionSignals = []
-            for signal in signals {
-                signal.resume()
-            }
-        }
+    init(_ fixed: Date) {
+        self.fixed = fixed
     }
 
-    /// Queues `answer` for the next call to `next()` that is not already suspended, so that call
-    /// returns immediately instead of waiting on `resolveOldestWaiting`.
-    func queue(_ answer: Bool) {
-        queuedAnswers.append(answer)
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return reads
     }
 
-    /// Resolves the oldest currently-suspended `next()` call with `answer`.
-    func resolveOldestWaiting(_ answer: Bool) {
-        guard !waiters.isEmpty else {
-            XCTFail("GatedOverdueProvider: no suspended `next()` call to resolve")
-            return
-        }
-        waiters.removeFirst().resume(returning: answer)
-    }
-
-    /// Suspends until at least one call to `next()` is itself suspended awaiting resolution.
-    func waitUntilWaiting() async {
-        if !waiters.isEmpty { return }
-        await withCheckedContinuation { continuation in
-            suspensionSignals.append(continuation)
-        }
-    }
-}
-
-/// A trivial, always-immediately-resolving `readyBroadcastProvider` double that just counts calls -- used
-/// to pin finding 14's subscription-gated ticker (``MigrationLogicTests/testTickerTicksOnlyWhileSubscribed()``):
-/// unlike `GatedOverdueProvider`, nothing here ever suspends, so the count only grows when the
-/// ticker itself actually decides to tick.
-private actor CallCountingOverdueProvider {
-    private(set) var count = 0
-
-    @discardableResult
-    func increment() -> Int {
-        count += 1
-        return count
+    func tick() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        reads += 1
+        return fixed
     }
 }
 

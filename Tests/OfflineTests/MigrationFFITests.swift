@@ -908,7 +908,6 @@ final class MigrationFFITests: XCTestCase {
                 accountUUID: account,
                 bufferDuration: 600,
                 tickInterval: 3600,
-                readyBroadcastProvider: { false },
                 logger: logger
             ),
             logger: logger
@@ -985,7 +984,7 @@ final class MigrationFFITests: XCTestCase {
     /// every migration FFI call on a `.regtest`/custom network id (2) throws "custom network (id 2)
     /// used before it was configured" (see `rust/src/lib.rs`'s `parse_network`), which
     /// `migrationAdvanceStep()` surfaces as `rustMigrationAdvanceStep`, and which
-    /// `isSyncBlocked()`/the gate's `readyBroadcastProvider` silently swallow via `try?` instead (finding
+    /// `isSyncBlocked()`-style callers silently swallow via `try?` instead (finding
     /// 5's "migration dead on .custom/.regtest").
     ///
     /// `NetworkActivationHeights` here intentionally matches

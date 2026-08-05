@@ -270,12 +270,11 @@ actor OrchardMigrationHost {
 
         let evaluatedAt = now()
 
-        // Pass 1 — no estimate: gate files, live gate views, and the SCANNED-tip ready-broadcast
-        // answer. Any block here makes the estimate unnecessary (it can only accelerate).
+        // Gate files + live gate views only — past/present holds (privacy buffer, in-flight
+        // marker). The per-account ready-broadcast probe (and the whole estimate-aware second
+        // pass it needed) was deleted with the gate's forward-looking clause on 2026-08-05 —
+        // danny + nuttycom's ruling; see `MigrationSyncGate`'s type doc.
         for account in accounts {
-            // Degrade to "no ready broadcast" on any engine error, exactly like
-            // OrchardMigration.isSyncBlocked().
-            let hasReadyBroadcast = (try? await welding.migrationHasReadyBroadcast(for: account.id, estimatedTip: nil)) ?? false
             let fileInputs = MigrationSyncGate.persistedGateInputs(
                 directory: generalStorageURL,
                 accountUUID: account.id,
@@ -283,7 +282,6 @@ actor OrchardMigrationHost {
             )
             let fileBlocked = MigrationSyncGate.isBlocked(
                 now: evaluatedAt,
-                hasReadyBroadcast: hasReadyBroadcast,
                 resumeAt: fileInputs.resumeAt,
                 inFlightUntil: fileInputs.inFlightUntil
             )
@@ -293,7 +291,6 @@ actor OrchardMigrationHost {
             let liveBlocked = liveGateRegistry.inputs(for: account.id).map { liveInputs in
                 MigrationSyncGate.isBlocked(
                     now: evaluatedAt,
-                    hasReadyBroadcast: hasReadyBroadcast,
                     resumeAt: liveInputs.resumeAt,
                     inFlightUntil: liveInputs.inFlightUntil
                 )
@@ -301,15 +298,6 @@ actor OrchardMigrationHost {
             if fileBlocked || liveBlocked {
                 return true
             }
-        }
-
-        // Pass 2 — nothing blocked at the scanned tip: project the estimate ONCE and re-ask the
-        // ready-broadcast question per account (U8). Only a `false` scanned answer can flip.
-        guard let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: evaluatedAt) else {
-            return false
-        }
-        for account in accounts where (try? await welding.migrationHasReadyBroadcast(for: account.id, estimatedTip: estimatedTip)) ?? false {
-            return true
         }
         return false
     }
