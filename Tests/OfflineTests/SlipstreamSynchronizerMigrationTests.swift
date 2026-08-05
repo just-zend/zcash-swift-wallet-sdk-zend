@@ -209,20 +209,6 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(received?.usk, usk)
     }
 
-    /// #1806: `debugRescheduleMigrationTransfers` -- DEBUG/QA ONLY -- forwards to the per-account
-    /// actor and returns the engine's rescheduled-transfer count untouched. Mirrors
-    /// `SDKSynchronizerMigrationTests.testDebugRescheduleMigrationTransfersForwardsToTheAccountsActor`.
-    func testDebugRescheduleMigrationTransfersForwardsToTheAccountsActor() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        welding.migrationDebugRescheduleTransfersForReturnValue = 3
-        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-
-        let rescheduled = try await synchronizer.debugRescheduleMigrationTransfers(accountUUID: accountUUID)
-
-        XCTAssertEqual(rescheduled, 3)
-        XCTAssertEqual(welding.migrationDebugRescheduleTransfersForReceivedAccount, accountUUID)
-    }
-
     /// #1806: `createUnsignedNoteSplitPCZTs` gained a required `schedule` parameter with the
     /// opaque-handle reshape (the welding call now needs it to identify which cached plan a
     /// fresh-build should be built from -- see `MigrationSchedule.proposalHandle`). Both the

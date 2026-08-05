@@ -191,19 +191,6 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(received?.usk, usk)
     }
 
-    /// #1806: `debugRescheduleMigrationTransfers` -- DEBUG/QA ONLY -- forwards to the per-account
-    /// actor and returns the engine's rescheduled-transfer count untouched.
-    func testDebugRescheduleMigrationTransfersForwardsToTheAccountsActor() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        welding.migrationDebugRescheduleTransfersForReturnValue = 3
-        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-
-        let rescheduled = try await synchronizer.debugRescheduleMigrationTransfers(accountUUID: accountUUID)
-
-        XCTAssertEqual(rescheduled, 3)
-        XCTAssertEqual(welding.migrationDebugRescheduleTransfersForReceivedAccount, accountUUID)
-    }
-
     /// The sequential-runs contract at the API level: `.complete` is per-run (terminal for the
     /// STORED run, never "nothing left to migrate"), and the authority for "does anything remain to
     /// migrate" is a fresh propose — an empty schedule means no, a non-empty one is the next run's

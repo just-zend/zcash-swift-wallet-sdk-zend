@@ -169,6 +169,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   promotes under, so a status read can no longer report `Mined` for a row `advance_migration`
   would refuse to promote.
 
+### Removed
+- `zcashlc_migration_debug_reschedule_transfers` is removed. It was the only FFI entry point that
+  wrote raw SQL directly against the engine-owned pool-migration tables, retro-compressing a
+  committed schedule so its transfers become due in quick succession for manual broadcast testing.
+  That testing purpose is now covered on the engine side by compressed test-network scheduling at
+  commit time plus the opt-in spacing floors (`_advance_step`'s
+  `overdue_tolerance_floor`/`release_spacing_floor` params, above).
+
 ### Fixed
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood
   outputs in the stored sent transaction. Every Ironwood output was previously

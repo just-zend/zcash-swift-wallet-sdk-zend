@@ -261,11 +261,11 @@ Changes are relative to `2.8.0-rc.3`.
   from a copy persisted before the field existed. Its `encode(to:)` omits `proposalHandle` (a
   process-lifetime plan-cache key no persisted copy could honor), so every decoded copy carries
   handle `0` — re-propose instead of committing a persisted schedule.
-- `debugRescheduleMigrationTransfers(accountUUID:)` (DEBUG builds only) compresses a committed
-  schedule for broadcast testing.
-- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, and `ZRUST0111`–`ZRUST0148`
-  (`ZRUST0098`, `rustMigrationState`, was retired pre-release with the SDK-side migration state
-  machine it served — the code is not reused).
+- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0138`, and
+  `ZRUST0140`–`ZRUST0148` (`ZRUST0098`, `rustMigrationState`, was retired pre-release with the
+  SDK-side migration state machine it served — the code is not reused; `ZRUST0139`,
+  `rustMigrationDebugRescheduleTransfers`, was likewise retired pre-release with the
+  debug-reschedule FFI it served — the code is not reused).
 
 ### Slipstream sync engine
 
