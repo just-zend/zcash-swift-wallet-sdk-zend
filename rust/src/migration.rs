@@ -2421,8 +2421,11 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
     network_id: u32,
 ) -> *mut FfiMigrationProgress {
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let engine_state = reconcile_mined(&mut ctx)?;
+        let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let engine_state = {
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend.get_migration()?
+        };
         if let Some(state) = engine_state.as_ref().filter(|state| !state.is_terminal()) {
             let (completed, total, next_ready) = active_run_progress(state);
             return Ok(Box::into_raw(Box::new(FfiMigrationProgress {
@@ -2436,7 +2439,7 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
         }
         // No active engine run (none stored, or terminal): the immediate lane is the only thing
         // left that could report progress.
-        let immediate_row = immediate_run_row(&ctx.store_conn, &ctx.account_bytes)
+        let immediate_row = immediate_run_row_if_table_exists(&ctx.store_conn, &ctx.account_bytes)
             .map_err(|e| anyhow!("immediate run read failed: {e}"))?;
         let Some(row) = immediate_row else {
             // No row either: absent, and (crucially) with no chain-tip lookup, which a
@@ -2469,7 +2472,10 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
 /// the transfer ids it is responsible for proving. Wake-up heights are floored at the tip (a row
 /// at exactly the tip means "right now"); jitter is re-drawn on every call, so two calls may
 /// legitimately differ — recompute (and re-register with the OS) after any state change rather
-/// than caching. Reconciles mined transactions first, like every other read.
+/// than caching. Pure read of the PERSISTED run (read-only connections; no reconcile): a Broadcast
+/// row the wallet has since scanned as mined is reported Mined only after a write lane — the
+/// advance-step engine sweep, the prove sweep, or a delivery serve — persists the promotion; while
+/// a run is live the platform drives one of those at least every open-lane pass and 30 s tick.
 ///
 /// No stored run, a terminal run, or no transfer still needing a proof returns the EMPTY schedule
 /// (`len == 0`, valid pointer) — not an error. A stored transfer that admits NO valid wake-up
@@ -2492,8 +2498,11 @@ pub unsafe extern "C" fn zcashlc_migration_sync_wakeups(
                 len: 0,
             }))
         };
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
+        let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let Some(state) = ({
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend.get_migration()?
+        }) else {
             return Ok(empty());
         };
         if state.is_terminal() {
@@ -2715,9 +2724,11 @@ fn encode_transaction_status(
 /// The LIVE status of every committed migration transaction, keyed by its stable id — a verbatim
 /// marshal of `MigrationState::transaction_statuses(target)` at `target = tip + 1` (see
 /// [`CallCtx::target`]), the engine's own per-transaction view a wallet renders progress from and
-/// decides what to sign/prove/broadcast next. Reconciles mined transactions first (the same
-/// read-path convention as [`zcashlc_migration_advance_step`]), so a `Broadcast` row the wallet's
-/// own scan has since observed mined is reported `Mined` here too. No stored run, or a stored run
+/// decides what to sign/prove/broadcast next. Pure read of the PERSISTED run (read-only
+/// connections; no reconcile): a Broadcast row the wallet has since scanned as mined is reported
+/// Mined only after a write lane — the advance-step engine sweep, the prove sweep, or a delivery
+/// serve — persists the promotion; while a run is live the platform drives one of those at least
+/// every open-lane pass and 30 s tick. No stored run, or a stored run
 /// with no transactions, returns an EMPTY container (`len == 0`) — not an error, the same
 /// convention as [`encode_empty_schedule`].
 ///
@@ -2735,8 +2746,14 @@ pub unsafe extern "C" fn zcashlc_migration_transaction_statuses(
     network_id: u32,
 ) -> *mut FfiMigrationTransactionStatuses {
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
+        let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let Some(state) = ({
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            // `latest_migration`, not the pending-only `get_migration`: unlike the sibling reads
+            // (whose terminal answer equals their no-run answer), this view keeps rendering a
+            // TERMINAL run's rows — a completed migration's mined transfers stay listed.
+            backend.latest_migration()?
+        }) else {
             return Ok(encode_empty_transaction_statuses());
         };
         if state.transactions().is_empty() {
@@ -2817,8 +2834,11 @@ pub unsafe extern "C" fn zcashlc_migration_has_overdue_transfers(
     estimated_tip: i64,
 ) -> bool {
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
+        let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let Some(state) = ({
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend.get_migration()?
+        }) else {
             return Ok(false);
         };
         if state.is_terminal() {
@@ -2848,8 +2868,11 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
     network_id: u32,
 ) -> bool {
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
+        let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let Some(state) = ({
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend.get_migration()?
+        }) else {
             return Ok(false);
         };
         if state.is_terminal() {
@@ -2883,9 +2906,12 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
 /// Whether the stored, NON-TERMINAL run has a broadcast the platform could serve RIGHT NOW: a
 /// `Proved`, schedule-due, dependency-mined, unexpired transaction, per upstream's own
 /// broadcast-queue read (`next_due_broadcast`) at the [`dueness_targets`] of the scanned tip and
-/// `estimated_tip` (`-1` = disabled). Reconciles mined transactions first, like every other
-/// read. Returns `1` for yes, `0` for no (including no stored run and a terminal run), `-1` on
-/// error (see `zcashlc_last_error_message`).
+/// `estimated_tip` (`-1` = disabled). Pure read of the PERSISTED run (read-only connections; no
+/// reconcile): a Broadcast row the wallet has since scanned as mined is reported Mined only after
+/// a write lane — the advance-step engine sweep, the prove sweep, or a delivery serve — persists
+/// the promotion; while a run is live the platform drives one of those at least every open-lane
+/// pass and 30 s tick. Returns `1` for yes, `0` for no (including no stored run and a terminal
+/// run), `-1` on error (see `zcashlc_last_error_message`).
 ///
 /// This is the sync-gate's work-pending predicate: `1` means exactly "a PROVED, due, unexpired,
 /// valid transfer is waiting", the one situation where the platform should broadcast instead of
@@ -2908,8 +2934,11 @@ pub unsafe extern "C" fn zcashlc_migration_has_ready_broadcast(
     estimated_tip: i64,
 ) -> i32 {
     let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
+        let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let Some(state) = ({
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend.get_migration()?
+        }) else {
             return Ok(0);
         };
         if state.is_terminal() {
@@ -8389,17 +8418,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 3. Reconciliation runs at the head of this read too (the same convention as
-    /// [`zcashlc_migration_advance_step`]): a stored `Broadcast` transfer whose txid the WALLET's own
-    /// `transactions` table now shows mined is reported — and PERSISTED — as `Mined`, not
-    /// `Broadcast`. Mirrors
-    /// [`resolve_immediate_run_reads_mined_and_expiry_from_transactions_table`]'s technique of
-    /// inserting directly into a `transactions` table, but against the REAL wallet schema (that
-    /// test's table is a hand-rolled two-column stand-in; `ctx.wallet.get_tx_height` reads the
-    /// real `zcash_client_sqlite` schema, so this fixture inserts the columns that schema
-    /// requires: `txid`, `mined_height`, and the `NOT NULL` `min_observed_height`).
+    /// 3. RO-T2: `zcashlc_migration_transaction_statuses` is a PURE read of the persisted run — it
+    /// no longer reconciles at the head of the read (unlike [`zcashlc_migration_advance_step`],
+    /// which still sweeps as part of driving). A stored `Broadcast` transfer whose txid the
+    /// WALLET's own `transactions` table already shows mined (and which the wallet has already
+    /// scanned through) is still reported — and stays stored — as `Broadcast`: only a write lane
+    /// (the advance-step sweep, the prove sweep, or a delivery serve) persists that promotion.
+    /// Mirrors [`resolve_immediate_run_reads_mined_and_expiry_from_transactions_table`]'s
+    /// technique of inserting directly into a `transactions` table, but against the REAL wallet
+    /// schema (that test's table is a hand-rolled two-column stand-in;
+    /// `ctx.wallet.get_tx_height` reads the real `zcash_client_sqlite` schema, so this fixture
+    /// inserts the columns that schema requires: `txid`, `mined_height`, and the `NOT NULL`
+    /// `min_observed_height`).
     #[test]
-    fn migration_transaction_statuses_reconciles_a_mined_broadcast_transfer() {
+    fn migration_transaction_statuses_does_not_reconcile_a_mined_broadcast_transfer() {
         let path = init_fixture_db("zcashlc_migration_tx_statuses_reconcile");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
@@ -8459,20 +8491,21 @@ mod tests {
         assert_eq!(statuses.len, 1);
         let row = unsafe { &*statuses.ptr };
         assert_eq!(
-            row.state, 4,
-            "the row must report Mined once the wallet shows it mined"
+            row.state, 3,
+            "a pure read reports the PERSISTED state (Broadcast) even once the wallet's own scan \
+             shows the txid mined"
         );
         assert_eq!(
-            row.mined_height,
-            i64::from(mined_at),
-            "the reported mined height must be the wallet's"
+            row.mined_height, -1,
+            "unreconciled, the row carries no mined height"
         );
-        assert!(row.has_txid, "the mined lifecycle state retains its txid");
-        assert_eq!(row.txid, txid, "the mined lifecycle state retains its txid");
+        assert!(row.has_txid, "the broadcast lifecycle state retains its txid");
+        assert_eq!(row.txid, txid, "the broadcast lifecycle state retains its txid");
         unsafe { zcashlc_free_migration_transaction_statuses(statuses_ptr) };
 
-        // The reconciliation must be PERSISTED, not just reported for this one read — the
-        // read-path convention every sibling read follows.
+        // No reconciliation happened, so nothing was persisted either — the read-only
+        // connections this entry point opens through (`open_read`) could not write even if it
+        // tried.
         let stored = read_fixture_state(&path, &account);
         let stored_tx = stored
             .transactions()
@@ -8482,9 +8515,9 @@ mod tests {
         assert!(
             matches!(
                 stored_tx.state(),
-                MigrationTxState::Mined { height, .. } if height == h(mined_at)
+                MigrationTxState::Broadcast { txid: stored_txid } if stored_txid == TxId::from_bytes(txid)
             ),
-            "reconciliation must persist Broadcast -> Mined"
+            "a pure read must not mutate the stored run"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -9546,6 +9579,75 @@ mod tests {
             matches!(stored.transactions()[1].state(), MigrationTxState::Signed),
             "the unrelated row must be untouched"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- pure-read rewire parity (RO-T2) -----
+
+    /// Parity harness for the pure-read rewire: on a freshly initialized wallet database (no
+    /// accounts, chain tip set) the four boolean/scalar read wrappers answer exactly what they
+    /// answer today. Written BEFORE the rewire (green against the reconcile-first bodies) and
+    /// kept green after it.
+    #[test]
+    fn pure_read_wrappers_fresh_db_answers_are_stable() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_pure_read_parity_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let init = unsafe {
+            crate::zcashlc_init_data_database(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                std::ptr::null(),
+                0,
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(init >= 0, "wallet-db initialization must succeed");
+        assert!(unsafe {
+            crate::zcashlc_update_chain_tip(path_bytes.as_ptr(), path_bytes.len(), 3_000_000, NETWORK_ID_MAINNET)
+        });
+        let account = [7u8; 16];
+        // Unknown account: the store constructor reports AccountUnknown down every one of these
+        // paths, and each wrapper coerces per ITS OWN error convention — pinned here verbatim.
+        let overdue = unsafe {
+            zcashlc_migration_has_overdue_transfers(
+                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET, -1,
+            )
+        };
+        assert!(!overdue, "error path coerces to false");
+        let invalid = unsafe {
+            zcashlc_migration_has_invalid_transfers(
+                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(!invalid, "error path coerces to false");
+        let ready = unsafe {
+            zcashlc_migration_has_ready_broadcast(
+                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET, -1,
+            )
+        };
+        assert_eq!(ready, -1, "error path reports -1");
+        let statuses = unsafe {
+            zcashlc_migration_transaction_statuses(
+                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(statuses.is_null(), "error path reports null");
+        let progress = unsafe {
+            zcashlc_migration_progress(
+                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(progress.is_null(), "error path reports null");
+        let wakeups = unsafe {
+            zcashlc_migration_sync_wakeups(
+                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(wakeups.is_null(), "error path reports null");
         let _ = std::fs::remove_file(&path);
     }
 }
