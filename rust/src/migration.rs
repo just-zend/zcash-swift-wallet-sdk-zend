@@ -250,8 +250,10 @@ unsafe fn wallet_db_read_only(
         .map_err(|e| anyhow!("Error setting read-only wallet database busy_timeout: {e}"))?;
     rusqlite::vtab::array::load_module(&conn)
         .map_err(|e| anyhow!("Error loading wallet database array module: {e}"))?;
-    Ok(MigrationWallet::from_connection(conn, network, SystemClock, OsRng)
-        .with_anchor_retention_interval(crate::anchor_retention_interval(network)))
+    Ok(
+        MigrationWallet::from_connection(conn, network, SystemClock, OsRng)
+            .with_anchor_retention_interval(crate::anchor_retention_interval(network)),
+    )
 }
 
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
@@ -6415,7 +6417,11 @@ mod tests {
             .unwrap_err();
         match err {
             rusqlite::Error::SqliteFailure(e, _) => {
-                assert_eq!(e.code, rusqlite::ErrorCode::ReadOnly, "write must fail READONLY, got {e:?}")
+                assert_eq!(
+                    e.code,
+                    rusqlite::ErrorCode::ReadOnly,
+                    "write must fail READONLY, got {e:?}"
+                )
             }
             other => panic!("expected SqliteFailure(ReadOnly), got {other:?}"),
         }
@@ -6432,7 +6438,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         assert!(open_store_conn_read_only(&path).is_err());
-        assert!(!path.exists(), "a read-only open must not create the database file");
+        assert!(
+            !path.exists(),
+            "a read-only open must not create the database file"
+        );
     }
 
     /// The pure `zcashlc_migration_progress` path may run before any rw migration call ever
@@ -6442,11 +6451,18 @@ mod tests {
     fn immediate_run_row_if_table_exists_tolerates_a_missing_table() {
         let conn = Connection::open_in_memory().unwrap();
         let account = [9u8; 16];
-        assert!(immediate_run_row_if_table_exists(&conn, &account).unwrap().is_none());
+        assert!(
+            immediate_run_row_if_table_exists(&conn, &account)
+                .unwrap()
+                .is_none()
+        );
         init_immediate_runs(&conn).unwrap();
         record_immediate_run(&conn, &account, [1u8; 32], h(100)).unwrap();
         assert_eq!(
-            immediate_run_row_if_table_exists(&conn, &account).unwrap().unwrap().txid,
+            immediate_run_row_if_table_exists(&conn, &account)
+                .unwrap()
+                .unwrap()
+                .txid,
             [1u8; 32]
         );
     }
@@ -6465,7 +6481,9 @@ mod tests {
             h(1_000),
             h(1_040),
             None,
-            MigrationTxState::Broadcast { txid: TxId::from_bytes([1u8; 32]) },
+            MigrationTxState::Broadcast {
+                txid: TxId::from_bytes([1u8; 32]),
+            },
             None,
         );
         let state = test_state_from_parts(
@@ -8499,8 +8517,14 @@ mod tests {
             row.mined_height, -1,
             "unreconciled, the row carries no mined height"
         );
-        assert!(row.has_txid, "the broadcast lifecycle state retains its txid");
-        assert_eq!(row.txid, txid, "the broadcast lifecycle state retains its txid");
+        assert!(
+            row.has_txid,
+            "the broadcast lifecycle state retains its txid"
+        );
+        assert_eq!(
+            row.txid, txid,
+            "the broadcast lifecycle state retains its txid"
+        );
         unsafe { zcashlc_free_migration_transaction_statuses(statuses_ptr) };
 
         // No reconciliation happened, so nothing was persisted either — the read-only
@@ -9607,44 +9631,69 @@ mod tests {
         };
         assert!(init >= 0, "wallet-db initialization must succeed");
         assert!(unsafe {
-            crate::zcashlc_update_chain_tip(path_bytes.as_ptr(), path_bytes.len(), 3_000_000, NETWORK_ID_MAINNET)
+            crate::zcashlc_update_chain_tip(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                3_000_000,
+                NETWORK_ID_MAINNET,
+            )
         });
         let account = [7u8; 16];
         // Unknown account: the store constructor reports AccountUnknown down every one of these
         // paths, and each wrapper coerces per ITS OWN error convention — pinned here verbatim.
         let overdue = unsafe {
             zcashlc_migration_has_overdue_transfers(
-                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET, -1,
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                -1,
             )
         };
         assert!(!overdue, "error path coerces to false");
         let invalid = unsafe {
             zcashlc_migration_has_invalid_transfers(
-                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET,
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
             )
         };
         assert!(!invalid, "error path coerces to false");
         let ready = unsafe {
             zcashlc_migration_has_ready_broadcast(
-                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET, -1,
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                -1,
             )
         };
         assert_eq!(ready, -1, "error path reports -1");
         let statuses = unsafe {
             zcashlc_migration_transaction_statuses(
-                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET,
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
             )
         };
         assert!(statuses.is_null(), "error path reports null");
         let progress = unsafe {
             zcashlc_migration_progress(
-                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET,
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
             )
         };
         assert!(progress.is_null(), "error path reports null");
         let wakeups = unsafe {
             zcashlc_migration_sync_wakeups(
-                path_bytes.as_ptr(), path_bytes.len(), account.as_ptr(), NETWORK_ID_MAINNET,
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
             )
         };
         assert!(wakeups.is_null(), "error path reports null");
