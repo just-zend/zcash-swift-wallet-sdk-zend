@@ -2,13 +2,34 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-02
+Last reviewed: 2026-08-04
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-04)
+
+- Fresh fetches confirm `origin/main=4497fe9e` and `upstream/main=468d1e9f`; the
+  default-branch divergence is `174 111`. The upstream delta adds the 2.7.0-rc.3
+  and 2.8.0-rc.2 release line, including the current FFI artifact, Rust dependency,
+  build-support, and changelog graph.
+- Zend draft PR [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  remains the sole full-parity vehicle. It now merges upstream through `468d1e9f`
+  with no conflict resolution and has an identical source tree to `upstream/main`.
+  `swift build` and `swift test --filter OfflineTests` both pass against the
+  upstream release framework, resolving the prior voting Swift/FFI source mismatch.
+  Keep it draft until product owners approve replacing Zend's divergent migration
+  path and funded-device migration evidence is recorded.
+- No additional early carry is justified. Upstream [#1946](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1946)
+  is draft, blocked, and coupled to the Slipstream/private-engine stack; #1944 is
+  review-required maintenance tooling against `maint/v2.7.x`; #1942 removes the
+  Darkside test suite and is not a Zend improvement; and the remaining open
+  migration, Tor, release, FFI, and dependency PRs remain draft, blocked,
+  review-required, stale, or too broad. The focused #1896 sentinel repair remains
+  independently carried in Zend draft [#35](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/35).
 
 ## Bleeding-edge refresh (2026-08-03)
 
