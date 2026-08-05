@@ -2790,8 +2790,8 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
 }
 
 /// Whether the stored, NON-TERMINAL run has a broadcast the platform could serve RIGHT NOW: a
-/// `Proved`, schedule-due, dependency-mined, unexpired transaction per upstream
-/// the upstream transaction-status evaluation at the [`dueness_targets`] of the scanned tip and
+/// `Proved`, schedule-due, dependency-mined, unexpired transaction, per upstream's own
+/// broadcast-queue read (`next_due_broadcast`) at the [`dueness_targets`] of the scanned tip and
 /// `estimated_tip` (`-1` = disabled). Reconciles mined transactions first, like every other
 /// read. Returns `1` for yes, `0` for no (including no stored run and a terminal run), `-1` on
 /// error (see `zcashlc_last_error_message`).
@@ -2920,9 +2920,10 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
                     t.id() == *id && matches!(t.kind(), MigrationTxKind::Preparation { .. })
                 })
             });
-        // Ceremony fallback: the note-split hands the FIRST preparation back for immediate
-        // broadcast even when its drawn window opens a few blocks ahead — the engine's queues
-        // (schedule-due only) answer None there. Same row the engine will select once due.
+        // Ceremony fallback: the engine's queues answer None here — its drawn window opens a few
+        // blocks ahead, or a due TRANSFER short-circuits `next_due_broadcast` before
+        // `next_provable` is even consulted, and the kind filter above drops it. Either way, this
+        // hands back the same preparation the pre-change scan (and the engine, once due) would have.
         let first_prep = engine_pick
             .or_else(|| {
                 state
@@ -2935,6 +2936,8 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
                                 MigrationTxState::Signed | MigrationTxState::Proved
                             )
                     })
+                    // Ties (equal `scheduled_height`) break by `id`, mirroring the engine's own
+                    // ordering key: deterministic on equal heights.
                     .min_by_key(|t| (t.scheduled_height(), t.id()))
                     .map(|t| t.id())
             })

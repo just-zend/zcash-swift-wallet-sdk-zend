@@ -33,9 +33,9 @@ Changes are relative to `2.8.0-rc.3`.
   `MigrationState`'s public read-only next-due selection (`next_due_broadcast`/`next_provable`):
   the engine's own delivery-lane choice, now exposed for a caller to read directly instead of
   recomputing it client-side — pinned so this SDK's FFI can delegate to it instead of
-  reimplementing the selection. (The SDK's own next-due delivery query still selects by id —
-  tracked separately as the MOB-1466 M2 residual.) The pin reverts to published crates at the
-  first rc containing all of it.
+  reimplementing the selection. (This branch replaces that delivery-lane selection with the
+  engine's exported reads, so the drive and read lanes now agree by construction.) The pin
+  reverts to published crates at the first rc containing all of it.
 
 ## Fixed
 
