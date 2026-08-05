@@ -163,32 +163,30 @@ lto = true
 slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "ab89ada45f2ef893a05fcefa0ead99f87d848a4e" }
 
 ## Update the `rev` value in the following lines to use a hash-pinned version of the librustzcash crates.
-# INTERIM PIN (MOB-1466): the michal/pool-migration-public-next-due branch head (the
-# michal/pool-migration-compressed-spacing-floor branch head plus MigrationState's
-# next_due_broadcast/next_provable exported as public read-only selection, so this SDK's FFI
-# can delegate its delivery-lane selection instead of reimplementing it). Carries #2909
-# (migration transactions classified against ZIP 318 at store time — what the app's Activity
-# labels key on), #2907 (engine next_* selection ordered by height), #2910 (a missed broadcast
-# schedule is re-spread on resume), #2927 (the released overdue step lands on scanned chain
-# data, and the re-spread fires only for a due cluster — without this a short-session wallet
-# livelocks, its schedule re-pinned past the scan on every foreground), the
-# compressed-schedule spacing floors (AdvanceConfig::with_compressed_schedule_floors, opt-in
-# and default 0 = byte-identical — a re-spread on a compressed schedule otherwise leaves a
-# post-release sync window and the overdue trigger stops re-arming every drive), and
-# MigrationState's public read-only next-due selection (next_due_broadcast/next_provable — a
-# caller reads the engine's own delivery-lane choice instead of recomputing it client-side).
+# INTERIM PIN (MOB-1466): the michal/pool-migration-public-next-due branch head, rebased onto
+# librustzcash main. Main itself now carries #2909 (migration transactions classified against
+# ZIP 318 at store time — what the app's Activity labels key on), #2907 (engine next_*
+# selection ordered by height), #2910 (a missed broadcast schedule is re-spread on resume),
+# and #2936 (advance_migration returns satisfiability::Advance: the verified step plus the
+# next-wake outlook). On top of main the pin adds #2927 (the released overdue step lands on
+# scanned chain data, and the re-spread fires only for a due cluster — without this a
+# short-session wallet livelocks, its schedule re-pinned past the scan on every foreground)
+# and MigrationState's public read-only next-due selection (next_due_broadcast/next_provable —
+# a caller reads the engine's own delivery-lane choice instead of recomputing it client-side).
+# The compressed-schedule spacing floors (#2932) left this lineage when the stack was
+# restructured and are no longer carried.
 # Remove the pin (recomment the block) at the first published rc that contains all of it.
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "5c94dcf38d6ce7233962749b85c3bb2729395fda" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "41a1e17c5ac49f30c7424210bfd90db366ef7689" }
 
 # Reinstate together with the voting dependencies above:
 # zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "e53e74487d31ad0f5713580fb2f0222b53ae9db8" }

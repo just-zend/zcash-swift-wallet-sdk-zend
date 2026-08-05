@@ -91,7 +91,7 @@ use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
 
 use zcash_pool_migration::engine::{
-    self, MigrationBackend, MigrationPlan, MigrationState, MigrationStatus, MigrationTransaction,
+    self, MigrationBackend, MigrationPlan, MigrationState, MigrationTransaction,
     MigrationTransferId, MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
 use zcash_pool_migration::satisfiability::{
@@ -494,9 +494,11 @@ fn resolve_immediate_run(
 
 // ----- reconciliation, planning, committing -----
 
-/// Loads the stored run with its `Broadcast` transactions promoted to `Mined` wherever the
-/// wallet's scan has since seen them, persisting once if anything changed. `None` means no
-/// migration is stored.
+/// Loads the stored run — TERMINAL RUNS INCLUDED, via [`Backend::latest_migration`], since
+/// upstream's `get_migration` went pending-only and the reads built on this must keep serving a
+/// completed, failed, or cancelled run (progress, statuses, history) — with its `Broadcast`
+/// transactions promoted to `Mined` wherever the wallet's scan has since seen them, persisting
+/// once if anything changed. `None` means no migration was ever stored.
 ///
 /// The promotion itself is the ENGINE's — [`PoolMigrationRead::mined_height`], the same query
 /// `advance_migration` sweeps with, bounded by the wallet's fully-scanned height rather than by
@@ -506,7 +508,7 @@ fn resolve_immediate_run(
 /// is not answered from a state the wallet's own scan has already moved past.
 fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> {
     let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-    let Some(mut state) = backend.get_migration()? else {
+    let Some(mut state) = backend.latest_migration()? else {
         return Ok(None);
     };
     if state.is_terminal() {
@@ -1259,7 +1261,8 @@ fn next_due(state: &MigrationState, targets: DuenessTargets) -> DueOutcome {
 /// The id [`zcashlc_migration_next_due_transfer`] WOULD serve once every outstanding
 /// proof exists: the next broadcastable row after virtually proving every prove-ready `Signed` row
 /// over a scratch copy — no prover runs and nothing persists (`set_transaction_proved` with the
-/// row's own bytes only flips the lifecycle state). `None` when the delivery lane has nothing
+/// row's own bytes and no lock owner only flips the lifecycle state). `None` when the delivery
+/// lane has nothing
 /// actionable: nothing schedule-due yet, dependencies unmined, rows awaiting an external signature
 /// (the signing ceremony, not the delivery lane, advances those), or everything already
 /// broadcast/mined.
@@ -1295,7 +1298,7 @@ fn due_assuming_proving(
             .find(|t| t.id() == id)
             .map(|t| t.pczt().clone())
             .unwrap_or_default();
-        scratch.set_transaction_proved(id, bytes);
+        scratch.set_transaction_proved(id, bytes, None);
     }
     scratch.next_due_broadcast(targets)
 }
@@ -2238,14 +2241,17 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
         // would only ask the same question twice.
         let Some(mut state) = ({
             let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
+            // `latest_migration`, not the trait's `get_migration`: upstream made the latter
+            // PENDING-ONLY, and this conduit's contract still reports `Complete` (below) for a
+            // terminal stored run rather than "no run".
+            backend.latest_migration()?
         }) else {
             // No stored run: NULL with NO error (see the function doc). Returned before any
             // chain-tip lookup, so it holds even before the wallet ever saw a chain tip.
             return Ok(ptr::null_mut());
         };
         // Upstream `next_step`'s own first check, hoisted ahead of the target lookup (not a
-        // carve-out — identical answers): a cancelled (Failed) run reports Complete even on a
+        // carve-out — identical answers): a cancelled or failed run reports Complete even on a
         // wallet with no chain tip, and is never driven further.
         if state.is_terminal() {
             return Ok(FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE));
@@ -2260,7 +2266,10 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
             // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
             // inter-broadcast gaps, so advancing needs entropy.
             &mut OsRng,
-        )?;
+        )?
+        // librustzcash #2936: the advance returns the verified step plus a next-wake outlook;
+        // this conduit marshals the step alone (no FFI field carries the outlook yet).
+        .step();
         Ok(match step {
             AdvanceStep::Reevaluate | AdvanceStep::Replan => {
                 let id = state
@@ -3498,9 +3507,10 @@ pub unsafe extern "C" fn zcashlc_migration_record_immediate_run(
     unwrap_exc_or(res, false)
 }
 
-/// Cancels the stored run (persisting it as `Failed` — its pre-signed transactions are abandoned;
-/// already-broadcast ones are unaffected on-chain) and previews a fresh plan against the live
-/// balance for the platform's re-confirm lane.
+/// Cancels the stored run through the engine's own cancel (persisting it as `Cancelled` and
+/// releasing every note reservation its never-broadcast transactions hold — its pre-signed
+/// transactions are abandoned; already-broadcast ones are unaffected on-chain) and previews a
+/// fresh plan against the live balance for the platform's re-confirm lane.
 ///
 /// Cancelling is also what clears the attention state: a terminal run surfaces neither
 /// `AdvanceStep::Attend` (upstream `next_step` answers `Complete` for it) nor
@@ -3521,19 +3531,12 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         {
             let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            if let Some(state) = backend.get_migration()? {
-                if !state.is_terminal() {
-                    let cancelled = MigrationState::from_parts(
-                        MigrationStatus::Failed,
-                        state.denominations().clone(),
-                        state.preparation().clone(),
-                        state.transactions().clone(),
-                        state.anchor_bucket_interval(),
-                        state.replan_threshold(),
-                    );
-                    backend.replace_migration(&cancelled)?;
-                }
-            }
+            // The engine's own cancel: releases every note reservation the pending run's
+            // never-broadcast transactions hold and records the terminal `Cancelled` status, in
+            // one store transaction. Hand-writing `Failed` (the pre-locking behavior) would
+            // leave those reservations standing, and the fresh plan below would select around
+            // notes the abandoned run still holds.
+            backend.cancel_migration()?;
         }
         match plan_and_cache(&mut ctx, false)? {
             Some((plan, reference_height, handle)) => {
@@ -4150,6 +4153,7 @@ mod tests {
     use rand::rngs::StdRng;
     use zcash_client_backend::data_api::WalletWrite;
     use zcash_pool_migration::denomination::DenominationPlan;
+    use zcash_pool_migration::engine::{MigrationLockOwner, MigrationStatus};
     use zcash_pool_migration::preparation::PreparationPlan;
     use zcash_pool_migration::scheduling::{self, AnchorBucketInterval, SchedulingParams};
     use zcash_pool_migration::signing_rounds::min_signing_rounds;
@@ -4172,7 +4176,7 @@ mod tests {
         expiry_height: BlockHeight,
         anchor_boundary: Option<BlockHeight>,
         state: MigrationTxState,
-        lock_owner: Option<[u8; 32]>,
+        lock_owner: Option<MigrationLockOwner>,
     ) -> MigrationTransaction {
         MigrationTransaction::from_parts(
             id,
@@ -6659,7 +6663,7 @@ mod tests {
         )
         .expect("the account-keyed store resolves the fixture account");
         let stored = store
-            .get_migration()
+            .latest_migration()
             .expect("the store reads")
             .expect("the fixture state is still stored");
         let tx = stored
@@ -6687,7 +6691,7 @@ mod tests {
     /// The prover error type the dispatch tests fail with: the REAL upstream
     /// [`WalletProveError`] (so the classification under test is the production one), with unit
     /// tree/note/chain-state error parameters.
-    type TestProveError = WalletProveError<(), (), ()>;
+    type TestProveError = WalletProveError<(), (), (), ()>;
 
     /// Which prover method the dispatch routed a transaction to, and with which anchor.
     #[derive(Debug, PartialEq, Eq)]
@@ -6722,6 +6726,17 @@ mod tests {
             Ok(pczt)
         }
 
+        /// Models no note-lock state: reserves nothing and reports no owner, deliberately (the
+        /// trait has no default so that taking no locks is always an explicit choice). These
+        /// provers exercise dispatch and error classification, not the reservation.
+        fn lock_spent_notes(
+            &mut self,
+            _pczt: &pczt::Pczt,
+            _lock_expiry_height: BlockHeight,
+        ) -> Result<Option<MigrationLockOwner>, Self::Error> {
+            Ok(None)
+        }
+
         fn anchor_bucket_interval(&self) -> AnchorBucketInterval {
             AnchorBucketInterval::ZIP_318
         }
@@ -6753,6 +6768,17 @@ mod tests {
             Err(engine::ProveFailure::Other(
                 self.error.take().expect("the prover is consulted once"),
             ))
+        }
+
+        /// Models no note-lock state: reserves nothing and reports no owner, deliberately (the
+        /// trait has no default so that taking no locks is always an explicit choice). These
+        /// provers exercise dispatch and error classification, not the reservation.
+        fn lock_spent_notes(
+            &mut self,
+            _pczt: &pczt::Pczt,
+            _lock_expiry_height: BlockHeight,
+        ) -> Result<Option<MigrationLockOwner>, Self::Error> {
+            Ok(None)
         }
 
         fn anchor_bucket_interval(&self) -> AnchorBucketInterval {
@@ -6830,6 +6856,17 @@ mod tests {
             anchor: BlockHeight,
         ) -> Result<pczt::Pczt, engine::ProveFailure<Self::Error>> {
             self.answer(ProveCall::Preparation(anchor), pczt)
+        }
+
+        /// Models no note-lock state: reserves nothing and reports no owner, deliberately (the
+        /// trait has no default so that taking no locks is always an explicit choice). These
+        /// provers exercise dispatch and error classification, not the reservation.
+        fn lock_spent_notes(
+            &mut self,
+            _pczt: &pczt::Pczt,
+            _lock_expiry_height: BlockHeight,
+        ) -> Result<Option<MigrationLockOwner>, Self::Error> {
+            Ok(None)
         }
 
         fn anchor_bucket_interval(&self) -> AnchorBucketInterval {
@@ -7244,7 +7281,7 @@ mod tests {
         )
         .expect("the account-keyed store resolves the fixture account");
         store
-            .get_migration()
+            .latest_migration()
             .expect("the store reads")
             .expect("a migration is stored")
     }
@@ -7712,7 +7749,7 @@ mod tests {
         let mut proved_ids: Vec<MigrationTransferId> = Vec::new();
         let proved = prove_pending_rows(&mut state, h(4_100), Some(1), |state, id| {
             proved_ids.push(id);
-            state.set_transaction_proved(id, Vec::new());
+            state.set_transaction_proved(id, Vec::new(), None);
             Ok(true)
         })
         .expect("the recording prove closure must not fail");
