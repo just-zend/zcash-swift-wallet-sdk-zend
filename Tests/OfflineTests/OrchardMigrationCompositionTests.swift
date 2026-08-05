@@ -343,13 +343,13 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         welding.migrationBlockRateSamplesWindowReturnValue = [
             MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
         ]
-        welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = .waiting
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         let step = try await migration.advanceStep()
 
         XCTAssertEqual(step, .waiting)
-        let received = try XCTUnwrap(welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments)
+        let received = try XCTUnwrap(welding.migrationAdvanceStepForEstimatedTipReceivedArguments)
         XCTAssertEqual(received.account, accountA)
         XCTAssertEqual(
             received.estimatedTip,
@@ -363,61 +363,16 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// engine's scheduled-height due-ness, never block the call that consults it.
     func testAdvanceStepDegradesToNilTipWhenBlockRateSamplesThrows() async throws {
         welding.migrationBlockRateSamplesWindowThrowableError = StubEngineError()
-        welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = .waiting
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         let step = try await migration.advanceStep()
 
         XCTAssertEqual(step, .waiting, "an estimator failure must not fail the advance step")
         XCTAssertNil(
-            welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments?.estimatedTip,
+            welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.estimatedTip,
             "an estimator failure must degrade to the scanned-tip behavior"
         )
-    }
-
-    /// The whole reason ``MigrationSpacingFloors`` exists: an actor built for testnet must reach
-    /// the welding with a NONZERO floor pair, not the mainnet zero default -- pinning that the
-    /// actor itself derives and forwards them (``OrchardMigration/spacingFloors(network:secondsPerBlock:)``'s
-    /// own unit tests cover the formula in isolation; this is the composition wire-up).
-    func testAdvanceStepPassesNonzeroSpacingFloorsOnTestnet() async throws {
-        welding.migrationBlockRateSamplesWindowReturnValue = []
-        welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = .waiting
-        let migration = makeMigration(
-            broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())),
-            network: .testnet
-        )
-
-        _ = try await migration.advanceStep()
-
-        let received = try XCTUnwrap(welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments)
-        XCTAssertNotEqual(
-            received.spacingFloors,
-            MigrationSpacingFloors.zero,
-            "testnet must derive nonzero spacing floors, never the mainnet zero pair"
-        )
-        XCTAssertGreaterThan(received.spacingFloors.toleranceFloor, 0)
-        XCTAssertGreaterThan(received.spacingFloors.releaseSpacingFloor, 0)
-    }
-
-    /// Mainnet's other half: even with a genuinely MEASURED `secondsPerBlock` in reach -- two
-    /// block-rate samples, enough for `ChainTipEstimator.secondsPerBlock()` to compute a real
-    /// delta rather than fall back to the nominal 75 s (which needs only one, or zero, samples
-    /// and so would not exercise this) -- a mainnet-built actor still reaches the welding with
-    /// the zero pair -- the hard requirement that mainnet never derives a floor, unconditionally.
-    func testAdvanceStepPassesZeroSpacingFloorsOnMainnetRegardlessOfMeasurement() async throws {
-        let firstSampleTime = referenceDate.addingTimeInterval(-150)
-        let secondSampleTime = referenceDate.addingTimeInterval(-90)
-        welding.migrationBlockRateSamplesWindowReturnValue = [
-            MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(firstSampleTime.timeIntervalSince1970)),
-            MigrationBlockRateSample(height: 3_000_001, unixTime: Int64(secondSampleTime.timeIntervalSince1970))
-        ]
-        welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = .waiting
-        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
-
-        _ = try await migration.advanceStep()
-
-        let received = try XCTUnwrap(welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments)
-        XCTAssertEqual(received.spacingFloors, MigrationSpacingFloors.zero)
     }
 
     /// `hasOverdueTransfers(useEstimatedTip:)` mirrors the same wiring as
@@ -911,7 +866,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
     // MARK: - Helpers
 
-    private func makeMigration(broadcaster: any MigrationBroadcasting, network: NetworkType = .mainnet) -> OrchardMigration {
+    private func makeMigration(broadcaster: any MigrationBroadcasting) -> OrchardMigration {
         // `isSyncBlocked()` and the `useEstimatedTip: true` paths unconditionally read
         // `migrationBlockRateSamples` (`ChainTipEstimator`'s raw input); default it to "no samples"
         // so a test that never cares about the estimate does not crash on the mock's un-stubbed,
@@ -929,8 +884,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             logger: logger,
             // The actor's estimate-consulting paths read the injected clock (U7), so the
             // fake-clock projection tests are deterministic.
-            now: { clockValue.now },
-            network: network
+            now: { clockValue.now }
         )
     }
 

@@ -61,12 +61,12 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         ]
 
         for expectedStep in cases {
-            welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = expectedStep
+            welding.migrationAdvanceStepForEstimatedTipReturnValue = expectedStep
 
             let step = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
 
             XCTAssertEqual(step, expectedStep)
-            XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments?.account, accountUUID)
+            XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountUUID)
         }
     }
 
@@ -197,7 +197,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     /// proposal. Hosts must not latch "never migrate again" off `migrationAdvanceStep` alone.
     func testAfterCompleteProposeMigrationTransfersAnswersWhetherAnythingRemains() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = .complete
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = .complete
         welding.migrationProposeTransfersForReturnValue = MigrationSchedule(
             transfers: [],
             estimatedDurationHours: 0,

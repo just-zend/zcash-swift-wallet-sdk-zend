@@ -19,10 +19,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     decision into `FfiMigrationAdvanceStep`, freed by
     `zcashlc_free_migration_advance_step`; `NULL` with no last error means no run is stored; the
     step discriminants are exported as `ZCASHLC_ADVANCE_STEP_*` constants; upstream `Reevaluate`
-    and `Replan` map to the compatibility `_ATTEND` case; two trailing `u32` params,
-    `overdue_tolerance_floor`/`release_spacing_floor`, pass through to
-    `AdvanceConfig::with_compressed_schedule_floors` — zero means no floor, and mainnet callers
-    pass zero on every call), `_progress`,
+    and `Replan` map to the compatibility `_ATTEND` case), `_progress`,
     `_is_note_split_needed`, `_has_overdue_transfers`, `_has_invalid_transfers` (true iff the
     NON-terminal stored run holds an engine-`Invalid` or expired-unmined transaction; a cancelled
     run answers `false`), `_has_ready_broadcast` (the sync-gate's work-pending predicate:
