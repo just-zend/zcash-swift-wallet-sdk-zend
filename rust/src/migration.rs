@@ -2476,8 +2476,9 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
 /// legitimately differ — recompute (and re-register with the OS) after any state change rather
 /// than caching. Pure read of the PERSISTED run (read-only connections; no reconcile): a Broadcast
 /// row the wallet has since scanned as mined is reported Mined only after a write lane — the
-/// advance-step engine sweep, the prove sweep, or a delivery serve — persists the promotion; while
-/// a run is live the platform drives one of those at least every open-lane pass and 30 s tick.
+/// advance-step engine sweep, the prove sweep, or a delivery serve — persists the promotion; a
+/// platform drives one of those on its open-lane passes, sync edges, and UI-refresh passes, so a
+/// live run's reads trail a just-mined broadcast by at most one such pass.
 ///
 /// No stored run, a terminal run, or no transfer still needing a proof returns the EMPTY schedule
 /// (`len == 0`, valid pointer) — not an error. A stored transfer that admits NO valid wake-up
@@ -2729,10 +2730,10 @@ fn encode_transaction_status(
 /// decides what to sign/prove/broadcast next. Pure read of the PERSISTED run (read-only
 /// connections; no reconcile): a Broadcast row the wallet has since scanned as mined is reported
 /// Mined only after a write lane — the advance-step engine sweep, the prove sweep, or a delivery
-/// serve — persists the promotion; while a run is live the platform drives one of those at least
-/// every open-lane pass and 30 s tick. No stored run, or a stored run
-/// with no transactions, returns an EMPTY container (`len == 0`) — not an error, the same
-/// convention as [`encode_empty_schedule`].
+/// serve — persists the promotion; a platform drives one of those on its open-lane passes, sync
+/// edges, and UI-refresh passes, so a live run's reads trail a just-mined broadcast by at most one
+/// such pass. No stored run, or a stored run with no transactions, returns an EMPTY container
+/// (`len == 0`) — not an error, the same convention as [`encode_empty_schedule`].
 ///
 /// This is a pure read: unlike [`zcashlc_migration_next_due_transfer`] it never drives a
 /// prove-ready `Signed` row through proving — a `Signed` row ready to prove is reported via
@@ -2911,9 +2912,10 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
 /// `estimated_tip` (`-1` = disabled). Pure read of the PERSISTED run (read-only connections; no
 /// reconcile): a Broadcast row the wallet has since scanned as mined is reported Mined only after
 /// a write lane — the advance-step engine sweep, the prove sweep, or a delivery serve — persists
-/// the promotion; while a run is live the platform drives one of those at least every open-lane
-/// pass and 30 s tick. Returns `1` for yes, `0` for no (including no stored run and a terminal
-/// run), `-1` on error (see `zcashlc_last_error_message`).
+/// the promotion; a platform drives one of those on its open-lane passes, sync edges, and
+/// UI-refresh passes, so a live run's reads trail a just-mined broadcast by at most one such pass.
+/// Returns `1` for yes, `0` for no (including no stored run and a terminal run), `-1` on error (see
+/// `zcashlc_last_error_message`).
 ///
 /// This is the sync-gate's work-pending predicate: `1` means exactly "a PROVED, due, unexpired,
 /// valid transfer is waiting", the one situation where the platform should broadcast instead of

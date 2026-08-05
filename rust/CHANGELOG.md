@@ -179,8 +179,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcashlc_migration_sync_wakeups`) now open the database read-only and report the persisted
   run without reconciling mined transactions first. Broadcast→Mined promotion is persisted by
   the write lanes (the advance-step engine sweep, the prove sweep, the delivery serves), which
-  every live run drives at least once per open-lane pass and 30 s tick; a read can therefore
-  trail a just-mined broadcast by at most one such pass. Reads no longer contend with proving.
+  every live run drives at least once per open-lane pass, sync edge, and UI refresh; a read can
+  therefore trail a just-mined broadcast by at most one such pass. Reads no longer contend with
+  proving.
 
 ### Removed
 - `zcashlc_migration_debug_reschedule_transfers` is removed. It was the only FFI entry point that
