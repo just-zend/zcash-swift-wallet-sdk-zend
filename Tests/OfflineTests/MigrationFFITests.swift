@@ -770,17 +770,23 @@ final class MigrationFFITests: XCTestCase {
     /// Every step discriminant decodes to its case; `requiresAttention` (ATTEND) carries the id
     /// like the other id-bearing steps.
     func testAdvanceStepDecodeMapsEveryStepIncludingAttend() throws {
-        let prove = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE), id: 4, kindIsPreparation: false, kindCrossing: 2)
-        XCTAssertEqual(prove.unsafeToMigrationAdvanceStep(), .prove(id: 4, kind: .transfer(crossing: 2)))
-
-        let provePreparation = makeAdvanceStep(
-            step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE),
-            id: 5,
-            kindIsPreparation: true,
-            kindLayer: 1,
-            kindIndex: 3
+        let prove = makeProveAdvanceStep([
+            FfiProveTarget(id: 4, kind_is_preparation: false, kind_layer: 0, kind_index: 0, kind_crossing: 2)
+        ])
+        defer { freeProveAdvanceStep(prove) }
+        XCTAssertEqual(
+            prove.unsafeToMigrationAdvanceStep(),
+            .prove(transactions: [MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))])
         )
-        XCTAssertEqual(provePreparation.unsafeToMigrationAdvanceStep(), .prove(id: 5, kind: .preparation(layer: 1, index: 3)))
+
+        let provePreparation = makeProveAdvanceStep([
+            FfiProveTarget(id: 5, kind_is_preparation: true, kind_layer: 1, kind_index: 3, kind_crossing: 0)
+        ])
+        defer { freeProveAdvanceStep(provePreparation) }
+        XCTAssertEqual(
+            provePreparation.unsafeToMigrationAdvanceStep(),
+            .prove(transactions: [MigrationProveTarget(id: 5, kind: .preparation(layer: 1, index: 3))])
+        )
 
         let broadcast = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_BROADCAST), id: 6)
         XCTAssertEqual(broadcast.unsafeToMigrationAdvanceStep(), .broadcast(id: 6))
@@ -804,6 +810,32 @@ final class MigrationFFITests: XCTestCase {
 
     func testAdvanceStepDecodeReturnsNilForAnOutOfRangeStep() {
         XCTAssertNil(makeAdvanceStep(step: 99, id: 1).unsafeToMigrationAdvanceStep())
+    }
+
+    /// A multi-entry Prove batch marshals every row, ordered and typed, mixing preparation and
+    /// transfer kinds in one batch (upstream #2939); an EMPTY batch is a malformed step (upstream
+    /// documents the batch never empty), so it decodes to `nil` rather than an empty-transactions
+    /// case.
+    func testAdvanceStepDecodeMapsAMultiEntryProveBatchAndRejectsAnEmptyOne() throws {
+        let prove = makeProveAdvanceStep([
+            FfiProveTarget(id: 5, kind_is_preparation: true, kind_layer: 1, kind_index: 3, kind_crossing: 0),
+            FfiProveTarget(id: 4, kind_is_preparation: false, kind_layer: 0, kind_index: 0, kind_crossing: 2)
+        ])
+        defer { freeProveAdvanceStep(prove) }
+        XCTAssertEqual(
+            prove.unsafeToMigrationAdvanceStep(),
+            .prove(transactions: [
+                MigrationProveTarget(id: 5, kind: .preparation(layer: 1, index: 3)),
+                MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))
+            ]),
+            "entries must marshal in array order, each keeping its own id and kind"
+        )
+
+        let empty = makeProveAdvanceStep([])
+        XCTAssertNil(
+            empty.unsafeToMigrationAdvanceStep(),
+            "an empty Prove batch is malformed (upstream never serves one empty), not a valid step"
+        )
     }
 
     // MARK: - Routed migration error parsing (U13)
@@ -1112,25 +1144,42 @@ final class MigrationFFITests: XCTestCase {
     ///   see `testDecodeMapsDependsOnIds` below, which scopes one via
     ///   `withUnsafeMutableBufferPointer`, mirroring `testDecodeContainerMapsMultipleRowsInEngineOrder`'s
     ///   existing pattern for the outer container.
-    /// Builds an `FfiMigrationAdvanceStep` with the per-kind payload fields defaulted to their
-    /// "not a Prove step" zeroes, mirroring the FFI contract (`kind_*` meaningful only for
-    /// `ZCASHLC_ADVANCE_STEP_PROVE`).
-    private func makeAdvanceStep(
-        step: UInt32,
-        id: UInt32,
-        kindIsPreparation: Bool = false,
-        kindLayer: UInt32 = 0,
-        kindIndex: UInt32 = 0,
-        kindCrossing: UInt32 = 0
-    ) -> FfiMigrationAdvanceStep {
-        FfiMigrationAdvanceStep(
-            step: step,
-            id: id,
-            kind_is_preparation: kindIsPreparation,
-            kind_layer: kindLayer,
-            kind_index: kindIndex,
-            kind_crossing: kindCrossing
+    /// Builds an `FfiMigrationAdvanceStep` with no Prove batch (`prove_targets: nil`,
+    /// `prove_targets_len: 0`) — every step but Prove, mirroring the FFI contract.
+    private func makeAdvanceStep(step: UInt32, id: UInt32) -> FfiMigrationAdvanceStep {
+        FfiMigrationAdvanceStep(step: step, id: id, prove_targets: nil, prove_targets_len: 0)
+    }
+
+    /// Builds an `FfiMigrationAdvanceStep` for `ZCASHLC_ADVANCE_STEP_PROVE`, heap-allocating one
+    /// `FfiProveTarget` per entry of `targets` in order (an empty array leaves `prove_targets`
+    /// `nil`, mirroring the malformed-empty-batch case). The caller must free the result with
+    /// `freeProveAdvanceStep` — these fixtures are constructed directly rather than through the
+    /// real FFI, so nothing else owns the allocation.
+    private func makeProveAdvanceStep(_ targets: [FfiProveTarget]) -> FfiMigrationAdvanceStep {
+        guard !targets.isEmpty else {
+            return FfiMigrationAdvanceStep(
+                step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE),
+                id: 0,
+                prove_targets: nil,
+                prove_targets_len: 0
+            )
+        }
+        let pointer = UnsafeMutablePointer<FfiProveTarget>.allocate(capacity: targets.count)
+        for (index, target) in targets.enumerated() {
+            pointer.advanced(by: index).initialize(to: target)
+        }
+        return FfiMigrationAdvanceStep(
+            step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE),
+            id: 0,
+            prove_targets: pointer,
+            prove_targets_len: UInt(targets.count)
         )
+    }
+
+    /// Frees the heap array `makeProveAdvanceStep` allocated (a no-op for an empty batch, whose
+    /// `prove_targets` is `nil`).
+    private func freeProveAdvanceStep(_ step: FfiMigrationAdvanceStep) {
+        step.prove_targets?.deallocate()
     }
 
     private func makeStatus(

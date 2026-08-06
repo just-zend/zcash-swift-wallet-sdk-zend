@@ -37,16 +37,18 @@ import Foundation
 ///   `restartCurrentMigrationStep(accountUUID:)` to cancel and re-plan.
 /// - ``broadcast(id:)`` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`:
 ///   submit the served transaction and end the session — a broadcast session must not sync.
-/// - ``prove(id:kind:)`` with a ``MigrationTransactionStatus/Kind/transfer(crossing:)`` kind →
+/// - ``prove(transactions:)`` → the WHOLE batch is ready: discharge it in one call with
 ///   `finalizeReadyMigrationTransfers(accountUUID:)` at a sync wake-up (see
-///   `migrationSyncWakeups(accountUUID:)`); the broadcast then follows in its own LATER session.
-///   Proving has no deadline of its own — a transfer's boundary anchor checkpoint is durably
-///   retained, so a missed wake-up defers the proof, never invalidates it.
-/// - ``prove(id:kind:)`` with a ``MigrationTransactionStatus/Kind/preparation(layer:index:)`` kind
-///   → the preparation is due by construction (the engine only reports a preparation prove once
-///   its broadcast height has arrived and its dependencies are mined), and a preparation proves
-///   against a near-tip witnessable anchor rather than a drawn boundary — so it may be proved
-///   (`finalizeReadyMigrationTransfers`) and broadcast at the SAME wake-up.
+///   `migrationSyncWakeups(accountUUID:)`), which proves every ready row in that pass. Each
+///   entry's ``MigrationProveTarget/kind`` distinguishes what follows for THAT transaction: a
+///   ``MigrationTransactionStatus/Kind/transfer(crossing:)`` entry's broadcast follows in its own
+///   LATER session — proving has no deadline of its own, a transfer's boundary anchor checkpoint
+///   is durably retained, so a missed wake-up defers the proof, never invalidates it — while a
+///   ``MigrationTransactionStatus/Kind/preparation(layer:index:)`` entry is due by construction
+///   (the engine only reports a preparation prove once its broadcast height has arrived and its
+///   dependencies are mined) and proves against a near-tip witnessable anchor rather than a drawn
+///   boundary, so it may broadcast at the SAME wake-up. Broadcast itself remains a separate later
+///   step, served one transaction at a time.
 /// - ``rebuild(id:)`` → `refreshStaleMigrationTransfers(accountUUID:usk:)` — needs spend
 ///   authority (a spending key in-process, or the external-signer re-serve ceremony).
 /// - ``waiting`` → nothing is actionable now: register OS wake-ups at the heights
@@ -58,11 +60,32 @@ import Foundation
 /// Per-run, not per-account: whether a migratable balance remains (several successive runs, or
 /// funds received later) is answered by `proposeMigrationTransfers(accountUUID:)` — an empty
 /// schedule means no.
+
+/// One transaction of a ``MigrationAdvanceStep/prove(transactions:)`` batch: the transaction to
+/// prove, with the kind that routes it — a verbatim marshal of the upstream engine's
+/// `ProveTarget`. A preparation may prove and broadcast at the same wake-up; a transfer proves
+/// now and broadcasts in its own later session (see the type doc's discharge mapping).
+public struct MigrationProveTarget: Equatable, Sendable {
+    /// The engine's stable transaction id.
+    public let id: UInt32
+    /// The preparation/transfer distinction, with its payload.
+    public let kind: MigrationTransactionStatus.Kind
+
+    /// Creates a `MigrationProveTarget`.
+    public init(id: UInt32, kind: MigrationTransactionStatus.Kind) {
+        self.id = id
+        self.kind = kind
+    }
+}
+
 public enum MigrationAdvanceStep: Equatable, Sendable {
-    /// The transaction identified by `id` is ready to be proved; `kind` tells a preparation (may
-    /// prove and broadcast at the same wake-up) from a transfer (prove now, broadcast in its own
-    /// later session) — see the type doc's discharge mapping.
-    case prove(id: UInt32, kind: MigrationTransactionStatus.Kind)
+    /// The WHOLE provable set is ready to be proved in one synced session (upstream #2939):
+    /// earliest-ready first, never empty, preparations and transfers possibly mixed. Proving
+    /// emits nothing on-chain, so nothing is gained by leaving provable work on the table while
+    /// a synced session is open — discharge the entire batch with
+    /// `finalizeReadyMigrationTransfers(accountUUID:)`, which proves every ready row in one
+    /// pass. Broadcast remains a separate later step, served one transaction at a time.
+    case prove(transactions: [MigrationProveTarget])
     /// The transaction identified by `id` is proved and due: broadcast it (and end the session).
     case broadcast(id: UInt32)
     /// The transfer identified by `id` expired unmined and must be rebuilt in place.

@@ -103,7 +103,9 @@ use zcash_pool_migration::signing_rounds::{
     NextFit, PREPARATION_ACTIONS, PlannedTx, SigningRoundBudget, SigningRoundStrategy,
     TRANSFER_ACTIONS, action_weight,
 };
-use zcash_pool_migration::state::{AdvanceStep, Blocker, NextAction, TransactionStatus};
+use zcash_pool_migration::state::{
+    AdvanceStep, Blocker, NextAction, ProveTarget, TransactionStatus,
+};
 use zcash_pool_migration::wallet::WalletMigrationProver;
 
 use crate::migration_engine::{Backend, MigrationWallet};
@@ -1539,41 +1541,49 @@ pub const ZCASHLC_ADVANCE_STEP_WAITING: u32 = 3;
 pub const ZCASHLC_ADVANCE_STEP_COMPLETE: u32 = 4;
 pub const ZCASHLC_ADVANCE_STEP_ATTEND: u32 = 5;
 
+/// One transaction of a Prove batch (element of [`FfiMigrationAdvanceStep::prove_targets`]): a
+/// verbatim marshal of upstream `state::ProveTarget` — the transaction to prove, with the kind
+/// that routes it (a preparation proves against the tip anchor and may broadcast at the same
+/// wake-up; a transfer proves against its drawn boundary and broadcasts in its own later
+/// session).
+#[repr(C)]
+pub struct FfiProveTarget {
+    /// The engine's raw transaction id.
+    pub id: u32,
+    /// Whether the transaction is a preparation (`true`) or a transfer (`false`).
+    pub kind_is_preparation: bool,
+    /// The preparation's layer, when `kind_is_preparation`; `0` otherwise.
+    pub kind_layer: u32,
+    /// The preparation's index within its layer, when `kind_is_preparation`; `0` otherwise.
+    pub kind_index: u32,
+    /// The transfer's crossing index, when `!kind_is_preparation`; `0` otherwise.
+    pub kind_crossing: u32,
+}
+
 /// The engine's next-step decision for the stored run (returned by
 /// [`zcashlc_migration_advance_step`]) — a verbatim marshal of upstream
 /// the public satisfiability advance API's [`AdvanceStep`].
 #[repr(C)]
 pub struct FfiMigrationAdvanceStep {
-    /// The step discriminant (see the `ZCASHLC_ADVANCE_STEP_*` constants): `0` = Prove,
-    /// `1` = Broadcast, `2` = Rebuild, `3` = Waiting, `4` = Complete, `5` = Attend (a
-    /// transaction is marked invalid and no automatic step can advance the run — resolve
-    /// out-of-band, typically by cancelling and re-planning).
+    /// The step discriminant (see the `ZCASHLC_ADVANCE_STEP_*` constants).
     pub step: u32,
-    /// The engine's raw transaction id for Prove/Broadcast/Rebuild/Attend; `0` for
-    /// Waiting/Complete.
+    /// The engine's raw transaction id for Broadcast/Rebuild/Attend; `0` for Prove (the batch
+    /// entries carry their own ids) and for Waiting/Complete.
     pub id: u32,
-    /// Whether the Prove step's transaction is a preparation (`true`) or a transfer (`false`).
-    /// Meaningful only for `step == 0`; `false` otherwise.
-    pub kind_is_preparation: bool,
-    /// The preparation's layer, when `step == 0` and `kind_is_preparation`; `0` otherwise.
-    pub kind_layer: u32,
-    /// The preparation's index within its layer, when `step == 0` and `kind_is_preparation`; `0`
-    /// otherwise.
-    pub kind_index: u32,
-    /// The transfer's crossing index, when `step == 0` and `!kind_is_preparation`; `0` otherwise.
-    pub kind_crossing: u32,
+    /// Heap array of `prove_targets_len` batch entries when `step == 0` (Prove) — the WHOLE
+    /// provable set, earliest-ready first, never empty for a served Prove; null/0 otherwise.
+    pub prove_targets: *mut FfiProveTarget,
+    pub prove_targets_len: usize,
 }
 
 impl FfiMigrationAdvanceStep {
-    /// A step that names a transaction but carries no kind payload (Broadcast/Rebuild/Attend).
+    /// A step that names a transaction but carries no batch payload (Broadcast/Rebuild/Attend).
     fn with_id(step: u32, id: MigrationTransferId) -> *mut Self {
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step,
             id: u32::from(id),
-            kind_is_preparation: false,
-            kind_layer: 0,
-            kind_index: 0,
-            kind_crossing: 0,
+            prove_targets: ptr::null_mut(),
+            prove_targets_len: 0,
         }))
     }
 
@@ -1582,27 +1592,38 @@ impl FfiMigrationAdvanceStep {
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step,
             id: 0,
-            kind_is_preparation: false,
-            kind_layer: 0,
-            kind_index: 0,
-            kind_crossing: 0,
+            prove_targets: ptr::null_mut(),
+            prove_targets_len: 0,
         }))
     }
 
-    /// The Prove step, carrying the transaction's kind so the platform can route it (preparations
-    /// prove against the tip anchor, transfers against their drawn boundary).
-    fn prove(id: MigrationTransferId, kind: MigrationTxKind) -> *mut Self {
-        let (kind_is_preparation, kind_layer, kind_index, kind_crossing) = match kind {
-            MigrationTxKind::Preparation { layer, index } => (true, layer as u32, index as u32, 0),
-            MigrationTxKind::Transfer { crossing } => (false, 0, 0, crossing as u32),
-        };
+    /// The Prove step, carrying the whole provable set (upstream #2939): each entry's kind lets the
+    /// platform route it without a lookup.
+    fn prove(transactions: &[ProveTarget]) -> *mut Self {
+        let targets: Vec<FfiProveTarget> = transactions
+            .iter()
+            .map(|t| {
+                let (kind_is_preparation, kind_layer, kind_index, kind_crossing) = match t.kind() {
+                    MigrationTxKind::Preparation { layer, index } => {
+                        (true, layer as u32, index as u32, 0)
+                    }
+                    MigrationTxKind::Transfer { crossing } => (false, 0, 0, crossing as u32),
+                };
+                FfiProveTarget {
+                    id: u32::from(t.id()),
+                    kind_is_preparation,
+                    kind_layer,
+                    kind_index,
+                    kind_crossing,
+                }
+            })
+            .collect();
+        let (prove_targets, prove_targets_len) = ptr_from_vec(targets);
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step: ZCASHLC_ADVANCE_STEP_PROVE,
-            id: u32::from(id),
-            kind_is_preparation,
-            kind_layer,
-            kind_index,
-            kind_crossing,
+            id: 0,
+            prove_targets,
+            prove_targets_len,
         }))
     }
 }
@@ -2085,15 +2106,16 @@ fn cstring_raw(s: &str, what: &str) -> anyhow::Result<*mut c_char> {
 
 // ----- free functions -----
 
-/// Frees a [`FfiMigrationAdvanceStep`].
+/// Frees a [`FfiMigrationAdvanceStep`], including its `prove_targets` batch array (if any).
 ///
 /// # Safety
 /// `ptr` must be null or point to a [`FfiMigrationAdvanceStep`] handed out by this module.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_free_migration_advance_step(ptr: *mut FfiMigrationAdvanceStep) {
     if !ptr.is_null() {
-        // Every field is plain data, so dropping the box is the whole of the cleanup.
-        drop(unsafe { Box::from_raw(ptr) });
+        let boxed = unsafe { Box::from_raw(ptr) };
+        free_ptr_from_vec(boxed.prove_targets, boxed.prove_targets_len);
+        drop(boxed);
     }
 }
 
@@ -2352,7 +2374,10 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
         }
         let targets = dueness_targets(ctx.tip()?, estimated_tip);
         let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        let step = advance_migration(
+        // librustzcash #2936: the advance returns the verified step plus a next-wake outlook;
+        // this conduit marshals the step via the borrow `.step()` now returns (Task 2a adds the
+        // outlook fields to the FFI struct).
+        let advance = advance_migration(
             &mut backend,
             &mut state,
             targets,
@@ -2360,11 +2385,8 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
             // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
             // inter-broadcast gaps, so advancing needs entropy.
             &mut OsRng,
-        )?
-        // librustzcash #2936: the advance returns the verified step plus a next-wake outlook;
-        // this conduit marshals the step alone (no FFI field carries the outlook yet).
-        .step();
-        Ok(match step {
+        )?;
+        Ok(match advance.step() {
             AdvanceStep::Reevaluate | AdvanceStep::Replan => {
                 let id = state
                     .transaction_statuses(targets)
@@ -2383,12 +2405,12 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
                     .unwrap_or_else(|| MigrationTransferId::new(0));
                 FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_ATTEND, id)
             }
-            AdvanceStep::Prove { id, kind } => FfiMigrationAdvanceStep::prove(id, kind),
+            AdvanceStep::Prove { transactions } => FfiMigrationAdvanceStep::prove(transactions),
             AdvanceStep::Broadcast { id } => {
-                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_BROADCAST, id)
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_BROADCAST, *id)
             }
             AdvanceStep::Rebuild { id } => {
-                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_REBUILD, id)
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_REBUILD, *id)
             }
             AdvanceStep::Waiting => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_WAITING),
             AdvanceStep::Complete => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE),
@@ -4552,6 +4574,43 @@ mod tests {
             rusqlite::params![birthday, height + 1],
         )
         .expect("the scanned range inserts");
+    }
+
+    /// Seeds a synthetic RECEIVED Orchard note whose nullifier is `nf`, so the satisfiability
+    /// oracle's per-nullifier input observation resolves a fixture migration transaction's
+    /// `spend_nullifiers` to "known, unspent" rather than `Unknown` — an unknown nullifier defers
+    /// the candidate silently (`Waiting`) rather than ever offering it as `Prove`.
+    /// [`test_transaction_from_parts`] gives every non-`Mined` fixture transaction the SAME
+    /// placeholder nullifier (`[0u8; 32]`), so one seeded row here covers every `Signed` row a
+    /// fixture adds. The note's other fields are meaningless placeholders — the oracle's
+    /// observation query joins only on `nf`/`account_id` and whether a MINED spend exists (there
+    /// is none here), never touching diversifier/rho/rseed.
+    fn seed_placeholder_received_note(path: &std::path::Path, nf: [u8; 32]) {
+        let conn = Connection::open(path).expect("the wallet connection opens");
+        let account_id: i64 = conn
+            .query_row("SELECT id FROM accounts", [], |row| row.get(0))
+            .expect("the fixture account exists");
+        conn.execute(
+            "INSERT INTO transactions (txid, min_observed_height) VALUES (?1, ?2)",
+            rusqlite::params![&[0xABu8; 32][..], 0],
+        )
+        .expect("the placeholder receiving-transaction row inserts");
+        let transaction_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO orchard_received_notes \
+             (transaction_id, action_index, account_id, diversifier, value, rho, rseed, nf, is_change) \
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            rusqlite::params![
+                transaction_id,
+                account_id,
+                &[0u8; 11][..],
+                100_000_000i64,
+                &[0u8; 32][..],
+                &[0u8; 32][..],
+                &nf[..],
+            ],
+        )
+        .expect("the placeholder received-note row inserts");
     }
 
     /// A view-only account imported by UFVK (no seed) — the negative-path counterpart to
@@ -8648,9 +8707,16 @@ mod tests {
         );
     }
 
-    /// Reads one advance step over the FFI, asserting success, and frees the DTO after copying it
-    /// out (every field is plain data).
-    fn read_advance_step(path_bytes: &[u8], account: &[u8; 16]) -> (u32, u32, bool, u32, u32, u32) {
+    /// One copied-out `FfiProveTarget` row, as `(id, kind_is_preparation, kind_layer, kind_index,
+    /// kind_crossing)` — the tuple shape [`read_advance_step`] collects `prove_targets` into.
+    type ProveTargetTuple = (u32, bool, u32, u32, u32);
+
+    /// Reads one advance step over the FFI, asserting success, and frees the DTO (and its
+    /// `prove_targets` batch array, if any) after copying everything out.
+    fn read_advance_step(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+    ) -> (u32, u32, Vec<ProveTargetTuple>) {
         let ptr = unsafe {
             zcashlc_migration_advance_step(
                 path_bytes.as_ptr(),
@@ -8666,14 +8732,19 @@ mod tests {
             ffi_helpers::error_handling::error_message()
         );
         let step = unsafe { &*ptr };
-        let out = (
-            step.step,
-            step.id,
-            step.kind_is_preparation,
-            step.kind_layer,
-            step.kind_index,
-            step.kind_crossing,
-        );
+        let targets = unsafe { slice_or_empty(step.prove_targets, step.prove_targets_len) }
+            .iter()
+            .map(|t| {
+                (
+                    t.id,
+                    t.kind_is_preparation,
+                    t.kind_layer,
+                    t.kind_index,
+                    t.kind_crossing,
+                )
+            })
+            .collect();
+        let out = (step.step, step.id, targets);
         unsafe { zcashlc_free_migration_advance_step(ptr) };
         out
     }
@@ -8729,11 +8800,11 @@ mod tests {
     /// run is terminal, so the conduit answers `Complete` and the attention queries answer
     /// `false`, with no separate clearing machinery involved.
 
-    /// A provable PREPARATION reports `Prove` with `kind_is_preparation` and its layer/index —
-    /// carried natively by upstream's `AdvanceStep::Prove { id, kind }`, no stored-row lookup
-    /// involved.
+    /// A provable PREPARATION reports `Prove` with a batch entry whose `kind_is_preparation` and
+    /// layer/index are set — carried natively by upstream's `AdvanceStep::Prove { transactions }`,
+    /// no stored-row lookup involved.
 
-    /// A provable TRANSFER reports `Prove` with its crossing index populated.
+    /// A provable TRANSFER reports `Prove` with a batch entry whose crossing index is populated.
 
     /// Every transaction mined -> the `Complete` step (upstream's own all-mined arm).
     #[test]
@@ -8798,6 +8869,69 @@ mod tests {
         let (step, id, ..) = read_advance_step(path_bytes, &account);
         assert_eq!(step, 3, "nothing actionable must report Waiting");
         assert_eq!(id, 0, "the Waiting step names no transaction");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The batch marshal pin (librustzcash #2939): with MULTIPLE provable rows outstanding, the
+    /// Prove step carries the WHOLE provable set in one call rather than one candidate at a time
+    /// — each entry keeping its own id and kind, ordered earliest-ready-first (a transfer by its
+    /// settled anchor boundary) with distinct ids — and the step's own `id` is `0` (the batch
+    /// entries carry their own).
+    #[test]
+    fn advance_step_prove_carries_the_whole_batch() {
+        let path = init_fixture_db("zcashlc_advance_step_prove_batch");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        // The satisfiability oracle verifies a transfer's boundary checkpoint against SCANNED
+        // data, not just the stored schedule — an unscanned wallet cannot vouch for either
+        // boundary however far below the tip they sit.
+        mark_fixture_scanned_through(&path, 3_600_000);
+        // Both rows below share the fixture's placeholder spend nullifier; the oracle must find
+        // it as a known, unspent input before either row is satisfiable.
+        seed_placeholder_received_note(&path, [0u8; 32]);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                tx_row(
+                    0,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    &[],
+                    3_700_000,
+                    4_000_000,
+                    Some(3_500_000), // settled well below the tip: provable now
+                    MigrationTxState::Signed,
+                ),
+                tx_row(
+                    1,
+                    MigrationTxKind::Transfer { crossing: 1 },
+                    &[],
+                    3_750_000,
+                    4_000_000,
+                    Some(3_550_000), // also settled, but later than row 0's boundary
+                    MigrationTxState::Signed,
+                ),
+            ],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, id, targets) = read_advance_step(path_bytes, &account);
+        assert_eq!(step, 0, "multiple provable rows must report Prove");
+        assert_eq!(id, 0, "the step itself names no single transaction");
+        assert!(
+            targets.len() >= 2,
+            "the batch must carry every provable row, got {targets:?}"
+        );
+        let ids: Vec<u32> = targets.iter().map(|t| t.0).collect();
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "entries must be earliest-ready-first (row 0's boundary settled first) with distinct ids"
+        );
+        assert!(
+            targets.iter().all(|t| !t.1),
+            "both rows are transfers, so kind_is_preparation must be false throughout"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

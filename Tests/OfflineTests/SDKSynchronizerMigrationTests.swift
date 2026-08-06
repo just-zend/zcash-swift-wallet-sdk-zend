@@ -51,8 +51,8 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
         let cases: [MigrationAdvanceStep?] = [
             nil,
-            .prove(id: 3, kind: .preparation(layer: 0, index: 1)),
-            .prove(id: 4, kind: .transfer(crossing: 2)),
+            .prove(transactions: [MigrationProveTarget(id: 3, kind: .preparation(layer: 0, index: 1))]),
+            .prove(transactions: [MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))]),
             .broadcast(id: 5),
             .rebuild(id: 6),
             .waiting,

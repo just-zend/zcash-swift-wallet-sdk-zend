@@ -10,6 +10,14 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Changed
 
+- `MigrationAdvanceStep.prove` now carries the WHOLE provable set —
+  `prove(transactions: [MigrationProveTarget])`, earliest-ready first, never empty — instead of a
+  single `prove(id:kind:)` (librustzcash #2939: proving emits nothing on-chain, so a synced
+  session proves everything provable at once; broadcast stays one-at-a-time on the privacy
+  schedule). An exhaustive `switch` stops compiling until the case is renamed; the discharge is
+  unchanged (`finalizeReadyMigrationTransfers(accountUUID:)` already proves every ready row), so
+  most call sites destructure the first element or the count. `MigrationProveTarget` is the new
+  per-entry pair (`id`, `kind`).
 - The librustzcash family rides an interim git pin (the michal/pool-migration-public-next-due
   branch head, rebased onto librustzcash main) so a wallet's own scheduled migration transactions
   carry their ZIP 318 classification (`Overview.zip318Kind`) from the moment they are STORED at
@@ -23,7 +31,8 @@ Changes are relative to `2.8.0-rc.3`.
   the schedule is due behind it), so a wallet driven in short foreground sessions can actually
   prove and broadcast the released step instead of livelocking with its schedule re-pinned past
   the scan on every open — librustzcash #2936: `advance_migration` returns the verified step
-  together with a next-wake outlook (this FFI marshals the step alone for now) — and the engine's
+  together with a next-wake outlook (this FFI marshals the step — now the batch-Prove generation
+  described above — alone for now) — and the engine's
   note-locking generation: a proved migration transaction's spent notes are reserved in the
   wallet database, so an ordinary payment proposed mid-migration can no longer spend a note a
   stored, proved transfer is already committed to. It also carries `MigrationState`'s public

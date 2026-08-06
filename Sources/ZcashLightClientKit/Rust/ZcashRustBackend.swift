@@ -3033,18 +3033,29 @@ extension FfiMigrationTransactionStatuses {
 
 extension FfiMigrationAdvanceStep {
     /// Converts an [`FfiMigrationAdvanceStep`] into a [`MigrationAdvanceStep`], or `nil` for an
-    /// unrecognized step discriminant (should not happen; defensive only). The per-kind payload
-    /// fields (`kind_layer`/`kind_index`/`kind_crossing`) are meaningful only for the Prove step
-    /// and are zeroed otherwise — a verbatim mirror of the FFI contract. The step discriminants
-    /// are matched against the header's exported `ZCASHLC_ADVANCE_STEP_*` constants (U3), so this
-    /// marshal and the rust side share one set of names instead of re-hardcoding the numbers.
+    /// unrecognized step discriminant (should not happen; defensive only) or an EMPTY Prove batch
+    /// (`prove_targets_len == 0` — upstream documents the batch never empty, so this is a
+    /// malformed step, not the ordinary "nothing to prove" answer, which is `.waiting`). The
+    /// per-kind payload fields (`kind_layer`/`kind_index`/`kind_crossing`) now live on each
+    /// `FfiProveTarget` row rather than on the step itself. The step discriminants are matched
+    /// against the header's exported `ZCASHLC_ADVANCE_STEP_*` constants (U3), so this marshal and
+    /// the rust side share one set of names instead of re-hardcoding the numbers.
     func unsafeToMigrationAdvanceStep() -> MigrationAdvanceStep? {
         switch Int32(bitPattern: step) {
         case ZCASHLC_ADVANCE_STEP_PROVE:
-            let kind: MigrationTransactionStatus.Kind = kind_is_preparation
-                ? .preparation(layer: Int(kind_layer), index: Int(kind_index))
-                : .transfer(crossing: Int(kind_crossing))
-            return .prove(id: id, kind: kind)
+            var transactions: [MigrationProveTarget] = []
+            transactions.reserveCapacity(Int(prove_targets_len))
+            if let proveTargets = prove_targets {
+                for index in 0 ..< Int(prove_targets_len) {
+                    let target = proveTargets.advanced(by: index).pointee
+                    let kind: MigrationTransactionStatus.Kind = target.kind_is_preparation
+                        ? .preparation(layer: Int(target.kind_layer), index: Int(target.kind_index))
+                        : .transfer(crossing: Int(target.kind_crossing))
+                    transactions.append(MigrationProveTarget(id: target.id, kind: kind))
+                }
+            }
+            guard !transactions.isEmpty else { return nil }
+            return .prove(transactions: transactions)
         case ZCASHLC_ADVANCE_STEP_BROADCAST:
             return .broadcast(id: id)
         case ZCASHLC_ADVANCE_STEP_REBUILD:

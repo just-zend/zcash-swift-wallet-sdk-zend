@@ -10,7 +10,7 @@ upstream engine's public `advance_migration` API. The broadcast-first ordering a
 kind are native to the pinned librustzcash revision (upstream PR #2871); its `Reevaluate` and
 `Replan` results project onto the existing `.requiresAttention(id:)` case.
 `nil` means no run is stored at all (nothing was ever committed for the account); a stored run
-answers `.requiresAttention(id:)`, `.prove(id:kind:)`, `.broadcast(id:)`, `.rebuild(id:)`,
+answers `.requiresAttention(id:)`, `.prove(transactions:)`, `.broadcast(id:)`, `.rebuild(id:)`,
 `.waiting`, or the terminal `.complete` — priority order attend > broadcast > prove > rebuild, and
 a cancelled run also reports `.complete` rather than ever being driven further.
 
@@ -46,13 +46,19 @@ Discharging each step:
   transfer is never served and gates nothing.
 - `.broadcast(id:)` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)` —
   submit and end the session (a broadcast session must not sync).
-- `.prove(id:kind:)` with a `.transfer(crossing:)` kind → `finalizeReadyMigrationTransfers(accountUUID:)`
-  at a sync wake-up (see `migrationSyncWakeups(accountUUID:)`); the broadcast then follows in its own
-  LATER session. Proving has no deadline of its own — a missed wake-up defers the proof, never
-  invalidates it.
-- `.prove(id:kind:)` with a `.preparation(layer:index:)` kind → the preparation is due by
-  construction and may be proved (`finalizeReadyMigrationTransfers`) and broadcast at the SAME
-  wake-up.
+- `.prove(transactions:)` → the WHOLE provable batch is ready: `finalizeReadyMigrationTransfers(accountUUID:)`
+  proves every ready row in ONE pass, at a sync wake-up (see `migrationSyncWakeups(accountUUID:)`).
+  Each entry's `kind` says what follows for THAT transaction: a `.transfer(crossing:)` entry's
+  broadcast follows in its own LATER session (proving has no deadline of its own — a missed
+  wake-up defers the proof, never invalidates it), while a `.preparation(layer:index:)` entry is
+  due by construction and may broadcast at the SAME wake-up.
+
+  ```swift
+  // Before
+  case let .prove(id, kind): ...
+  // After
+  case let .prove(transactions): ...  // transactions.first carries what the old single step did
+  ```
 - `.rebuild(id:)` → `refreshStaleMigrationTransfers(accountUUID:usk:)` (needs spend authority — a
   spending key in-process, or the external-signer re-serve ceremony for `usk: nil`).
 - `.waiting` → nothing is actionable now: register OS wake-ups at the heights
