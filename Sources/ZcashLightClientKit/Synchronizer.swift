@@ -607,8 +607,8 @@ public protocol Synchronizer: AnyObject {
     /// advisory OUTLOOK (upstream #2936) — the replacement for the removed SDK-side migration
     /// state machine, and a VERBATIM conduit of the upstream engine's own `advance_migration`: no
     /// SDK ordering shims, no carve-outs — the attention step, the broadcast-first ordering, and
-    /// the prove step's kind are all the engine's own answer, marshaled field-for-field. Call it on
-    /// launch and after every migration operation.
+    /// the prove batch's per-entry kinds are all the engine's own answer, marshaled field-for-field.
+    /// Call it on launch and after every migration operation.
     ///
     /// `nil` means NO run is stored (none was ever committed) — nothing to advance, nothing to
     /// poll. A non-`nil` answer is a ``MigrationAdvance``: `.step` is the step to perform NOW
@@ -631,12 +631,13 @@ public protocol Synchronizer: AnyObject {
     ///   the sync gate (a dead transfer gates nothing).
     /// - `.broadcast` → ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``
     ///   — submit and END the session (no sync).
-    /// - `.prove` with a `.transfer` kind → ``finalizeReadyMigrationTransfers(accountUUID:)`` at a
-    ///   sync wake-up; the broadcast follows in its own LATER session. Proving has no deadline —
-    ///   boundary anchor checkpoints are durably retained, so a missed wake-up only defers it.
-    /// - `.prove` with a `.preparation` kind → the preparation is due by construction and may be
-    ///   proved AND broadcast at the same wake-up (it anchors near-tip, not against a drawn
-    ///   boundary).
+    /// - `.prove` → the WHOLE batch discharges in one call: ``finalizeReadyMigrationTransfers(accountUUID:)``
+    ///   at a sync wake-up, which proves every ready row in that pass. Each entry's `kind` decides
+    ///   what follows for THAT transaction: a `.preparation` entry is due by construction and may
+    ///   be proved AND broadcast at the SAME wake-up (it anchors near-tip, not against a drawn
+    ///   boundary), while a `.transfer` entry's broadcast follows in its own LATER session —
+    ///   proving has no deadline of its own, since its boundary anchor checkpoint is durably
+    ///   retained, so a missed wake-up only defers it.
     /// - `.rebuild` → ``refreshStaleMigrationTransfers(accountUUID:usk:)`` (needs spend
     ///   authority).
     /// - `.waiting` → register OS wake-ups from ``migrationSyncWakeups(accountUUID:)`` plus each

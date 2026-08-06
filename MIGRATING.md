@@ -5,14 +5,16 @@
 The public 5-state `MigrationState` enum, `MigrationAttentionReason`, and
 `migrationState(accountUUID:)` are removed (this was never in a released SDK, so there is no
 deprecation period). The SDK no longer derives a state machine of its own on top of the engine at
-all: `migrationAdvanceStep(accountUUID:) async throws -> MigrationAdvanceStep?` drives the
-upstream engine's public `advance_migration` API. The broadcast-first ordering and prove step's
-kind are native to the pinned librustzcash revision (upstream PR #2871); its `Reevaluate` and
-`Replan` results project onto the existing `.requiresAttention(id:)` case.
-`nil` means no run is stored at all (nothing was ever committed for the account); a stored run
-answers `.requiresAttention(id:)`, `.prove(transactions:)`, `.broadcast(id:)`, `.rebuild(id:)`,
-`.waiting`, or the terminal `.complete` — priority order attend > broadcast > prove > rebuild, and
-a cancelled run also reports `.complete` rather than ever being driven further.
+all: `migrationAdvanceStep(accountUUID:) async throws -> MigrationAdvance?` drives the upstream
+engine's public `advance_migration` API (the return type wraps the step with an advisory outlook —
+see "`migrationAdvanceStep` returns `MigrationAdvance`" below). The broadcast-first ordering and
+prove step's kind are native to the pinned librustzcash revision (upstream PR #2871); its
+`Reevaluate` and `Replan` results project onto the existing `.requiresAttention(id:)` case.
+`nil` means no run is stored at all (nothing was ever committed for the account); a stored run's
+`.step` answers `.requiresAttention(id:)`, `.prove(transactions:)`, `.broadcast(id:)`,
+`.rebuild(id:)`, `.waiting`, or the terminal `.complete` — priority order attend > broadcast >
+prove > rebuild, and a cancelled run also reports `.complete` rather than ever being driven
+further.
 
 Every `MigrationState` case a host rendered UI off has a direct replacement — table below — but note
 the shape is different: `migrationAdvanceStep` answers "what does the run need next", not "what is

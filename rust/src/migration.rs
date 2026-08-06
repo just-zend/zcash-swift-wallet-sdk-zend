@@ -1602,6 +1602,7 @@ pub struct FfiMigrationAdvanceStep {
     /// Heap array of `prove_targets_len` batch entries when `step == 0` (Prove) — the WHOLE
     /// provable set, earliest-ready first, never empty for a served Prove; null/0 otherwise.
     pub prove_targets: *mut FfiProveTarget,
+    /// Length of `prove_targets`.
     pub prove_targets_len: usize,
     /// The OUTLOOK (upstream #2936, `Advance::next`): the earliest target height (`tip + 1`
     /// convention, directly comparable with the drive's own targets) at which the migration next

@@ -190,14 +190,14 @@ Changes are relative to `2.8.0-rc.3`.
   `MigrationTransactionStatus`, `DueMigrationTransfer`, `KeystoneBatchDecodeResult`, and
   `KeystoneFirmwareVersion`. Migration transaction ids are `UInt32`.
 - State: `migrationAdvanceStep(accountUUID:)` drives the migration engine's public
-  `advance_migration` decision at the scanned chain tip — `nil` when no run is stored, otherwise
-  `.requiresAttention(id:)` (the engine returned `Reevaluate` after a node rejection or `Replan`
-  after determining a transaction unsatisfiable), `.prove(transactions:)`, `.broadcast(id:)`, `.rebuild(id:)`,
-  `.waiting`, or the terminal `.complete` (per-run, including a cancelled run — never "nothing
-  left to migrate"; ask `proposeMigrationTransfers` for that). The SDK adds no state machine, no
-  ordering shims, and no carve-outs of its own on top of the engine's answer — the attention step
-  and the broadcast-first ordering are native to the pinned librustzcash revision (upstream PR
-  #2871).
+  `advance_migration` decision at the scanned chain tip — `nil` when no run is stored, otherwise a
+  `MigrationAdvance` whose `.step` is `.requiresAttention(id:)` (the engine returned `Reevaluate`
+  after a node rejection or `Replan` after determining a transaction unsatisfiable),
+  `.prove(transactions:)`, `.broadcast(id:)`, `.rebuild(id:)`, `.waiting`, or the terminal
+  `.complete` (per-run, including a cancelled run — never "nothing left to migrate"; ask
+  `proposeMigrationTransfers` for that). The SDK adds no state machine, no ordering shims, and no
+  carve-outs of its own on top of the engine's answer — the attention step and the broadcast-first
+  ordering are native to the pinned librustzcash revision (upstream PR #2871).
 - Planning and delivery: a randomized-cadence schedule proposal committed by
   `signAndStoreMigrationSchedule`, proved opportunistically during sync by the new
   `finalizeReadyMigrationTransfers(accountUUID:)`, then delivered by
