@@ -1180,17 +1180,6 @@ final class MigrationFFITests: XCTestCase {
         return bytes.withUnsafeBytes { $0.load(as: Bytes32.self) }
     }
 
-    /// Builds a valid row -- transfer 0, awaiting signature, ready, no next action, not blocked,
-    /// no txid, no dependencies, no drawn anchor boundary -- with every field defaulted; override
-    /// only the field(s) under test. Mirrors `FfiMigrationTransactionStatus`'s field-by-field
-    /// contract (see `rust/src/migration.rs`'s doc comments).
-    ///
-    /// - Note: `dependsOnPtr`/`dependsOnLen` default to `nil`/`0` (no dependencies -- the C side's
-    ///   own "empty" encoding, not a null-vs-empty distinction the decode makes). A test exercising
-    ///   a non-empty `dependsOn` must supply a pointer that stays valid for the call's duration --
-    ///   see `testDecodeMapsDependsOnIds` below, which scopes one via
-    ///   `withUnsafeMutableBufferPointer`, mirroring `testDecodeContainerMapsMultipleRowsInEngineOrder`'s
-    ///   existing pattern for the outer container.
     /// Builds an `FfiMigrationAdvanceStep` with no Prove batch (`prove_targets: nil`,
     /// `prove_targets_len: 0`) — every step but Prove, mirroring the FFI contract. `nextHeight`/
     /// `nextKind` default to the no-outlook sentinel (`-1`/`0`); override them for the outlook
@@ -1241,6 +1230,17 @@ final class MigrationFFITests: XCTestCase {
         step.prove_targets?.deallocate()
     }
 
+    /// Builds a valid row -- transfer 0, awaiting signature, ready, no next action, not blocked,
+    /// no txid, no dependencies, no drawn anchor boundary -- with every field defaulted; override
+    /// only the field(s) under test. Mirrors `FfiMigrationTransactionStatus`'s field-by-field
+    /// contract (see `rust/src/migration.rs`'s doc comments).
+    ///
+    /// - Note: `dependsOnPtr`/`dependsOnLen` default to `nil`/`0` (no dependencies -- the C side's
+    ///   own "empty" encoding, not a null-vs-empty distinction the decode makes). A test exercising
+    ///   a non-empty `dependsOn` must supply a pointer that stays valid for the call's duration --
+    ///   see `testDecodeMapsDependsOnIds` below, which scopes one via
+    ///   `withUnsafeMutableBufferPointer`, mirroring `testDecodeContainerMapsMultipleRowsInEngineOrder`'s
+    ///   existing pattern for the outer container.
     private func makeStatus(
         id: UInt32 = 7,
         isTransfer: Bool = true,
