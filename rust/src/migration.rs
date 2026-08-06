@@ -1570,6 +1570,15 @@ fn step_kind_to_ffi(kind: StepKind) -> u32 {
     }
 }
 
+/// The outlook pair as the FFI carries it: `(-1, 0)` for "no outlook", else the target height
+/// widened to `i64` beside the kind discriminant — one encoding, shared by every constructor.
+fn outlook_to_ffi(next: Option<(BlockHeight, StepKind)>) -> (i64, u32) {
+    (
+        next.map_or(-1, |(h, _)| i64::from(u32::from(h))),
+        next.map_or(0, |(_, k)| step_kind_to_ffi(k)),
+    )
+}
+
 /// One transaction of a Prove batch (element of [`FfiMigrationAdvanceStep::prove_targets`]): a
 /// verbatim marshal of upstream `state::ProveTarget` — the transaction to prove, with the kind
 /// that routes it (a preparation proves against the tip anchor and may broadcast at the same
@@ -1622,25 +1631,27 @@ impl FfiMigrationAdvanceStep {
         id: MigrationTransferId,
         next: Option<(BlockHeight, StepKind)>,
     ) -> *mut Self {
+        let (next_height, next_kind) = outlook_to_ffi(next);
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step,
             id: u32::from(id),
             prove_targets: ptr::null_mut(),
             prove_targets_len: 0,
-            next_height: next.map_or(-1, |(h, _)| i64::from(u32::from(h))),
-            next_kind: next.map_or(0, |(_, k)| step_kind_to_ffi(k)),
+            next_height,
+            next_kind,
         }))
     }
 
     /// A payload-free step (Waiting/Complete).
     fn bare(step: u32, next: Option<(BlockHeight, StepKind)>) -> *mut Self {
+        let (next_height, next_kind) = outlook_to_ffi(next);
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step,
             id: 0,
             prove_targets: ptr::null_mut(),
             prove_targets_len: 0,
-            next_height: next.map_or(-1, |(h, _)| i64::from(u32::from(h))),
-            next_kind: next.map_or(0, |(_, k)| step_kind_to_ffi(k)),
+            next_height,
+            next_kind,
         }))
     }
 
@@ -1666,13 +1677,14 @@ impl FfiMigrationAdvanceStep {
             })
             .collect();
         let (prove_targets, prove_targets_len) = ptr_from_vec(targets);
+        let (next_height, next_kind) = outlook_to_ffi(next);
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step: ZCASHLC_ADVANCE_STEP_PROVE,
             id: 0,
             prove_targets,
             prove_targets_len,
-            next_height: next.map_or(-1, |(h, _)| i64::from(u32::from(h))),
-            next_kind: next.map_or(0, |(_, k)| step_kind_to_ffi(k)),
+            next_height,
+            next_kind,
         }))
     }
 }
@@ -2431,7 +2443,7 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
         let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         // librustzcash #2936: the advance returns the verified step plus a next-wake OUTLOOK
         // (`Advance::next`) — this conduit marshals both, the step via the borrow `.step()`
-        // returns and the outlook via `.next()`, onto every arm below (Task 2a).
+        // returns and the outlook via `.next()`, onto every arm below.
         let advance = advance_migration(
             &mut backend,
             &mut state,
@@ -9103,14 +9115,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The batch marshal pin (librustzcash #2939): with MULTIPLE provable rows outstanding, the
-    /// Prove step carries the WHOLE provable set in one call rather than one candidate at a time
-    /// — each entry keeping its own id and kind, ordered earliest-ready-first (a transfer by its
-    /// settled anchor boundary) with distinct ids — and the step's own `id` is `0` (the batch
-    /// entries carry their own).
-    #[test]
-    fn advance_step_prove_carries_the_whole_batch() {
-        let path = init_fixture_db("zcashlc_advance_step_prove_batch");
+    /// The two-provable-transfers state both the batch pin and the outlook pin drive: two
+    /// Signed transfers, both settled below the tip — row 0 is earliest-ready, its boundary
+    /// settling before row 1's.
+    fn store_two_provable_transfers(db_name: &str) -> (std::path::PathBuf, [u8; 16]) {
+        let path = init_fixture_db(db_name);
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
         set_fixture_tip(path_bytes);
@@ -9145,6 +9154,18 @@ mod tests {
             ],
         );
         store_fixture_state(&path, &account, &state);
+        (path, account)
+    }
+
+    /// The batch marshal pin (librustzcash #2939): with MULTIPLE provable rows outstanding, the
+    /// Prove step carries the WHOLE provable set in one call rather than one candidate at a time
+    /// — each entry keeping its own id and kind, ordered earliest-ready-first (a transfer by its
+    /// settled anchor boundary) with distinct ids — and the step's own `id` is `0` (the batch
+    /// entries carry their own).
+    #[test]
+    fn advance_step_prove_carries_the_whole_batch() {
+        let (path, account) = store_two_provable_transfers("zcashlc_advance_step_prove_batch");
+        let path_bytes = path.to_str().unwrap().as_bytes();
 
         let (step, id, targets, ..) = read_advance_step(path_bytes, &account);
         assert_eq!(step, 0, "multiple provable rows must report Prove");
@@ -9173,39 +9194,8 @@ mod tests {
     /// broadcast schedule is what the outlook reports next.
     #[test]
     fn advance_step_outlook_reports_next_work() {
-        // Served step: the whole provable batch (the `advance_step_prove_carries_the_whole_batch`
-        // fixture, reused verbatim); once proved, the earliest entry's own (still-future)
-        // broadcast schedule is the outlook -- a proved-and-scheduled follower.
-        let path = init_fixture_db("zcashlc_advance_step_outlook_prove");
+        let (path, account) = store_two_provable_transfers("zcashlc_advance_step_outlook_prove");
         let path_bytes = path.to_str().unwrap().as_bytes();
-        let account = create_fixture_account(&path);
-        set_fixture_tip(path_bytes);
-        mark_fixture_scanned_through(&path, 3_600_000);
-        seed_placeholder_received_note(&path, [0u8; 32]);
-        let state = custom_state(
-            MigrationStatus::InProgress,
-            vec![
-                tx_row(
-                    0,
-                    MigrationTxKind::Transfer { crossing: 0 },
-                    &[],
-                    3_700_000,
-                    4_000_000,
-                    Some(3_500_000), // settled well below the tip: provable now
-                    MigrationTxState::Signed,
-                ),
-                tx_row(
-                    1,
-                    MigrationTxKind::Transfer { crossing: 1 },
-                    &[],
-                    3_750_000,
-                    4_000_000,
-                    Some(3_550_000), // also settled, but later than row 0's boundary
-                    MigrationTxState::Signed,
-                ),
-            ],
-        );
-        store_fixture_state(&path, &account, &state);
 
         let (step, _id, targets, next_height, next_kind) = read_advance_step(path_bytes, &account);
         assert_eq!(
