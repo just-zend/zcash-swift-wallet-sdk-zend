@@ -10,6 +10,25 @@ Last reviewed: 2026-08-04
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
+## Parity and bleeding-edge refresh (2026-08-05)
+
+- Fresh fetches confirm that both defaults remain `main`, with
+  `origin/main=4497fe9e` and `upstream/main=468d1e9f`. The default-branch
+  divergence remains `174 111`; `upstream/main` is not yet contained in
+  `origin/main`, but Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  at `3a7e9ee0` already contains that exact upstream tip. It is therefore the
+  single parity vehicle, rather than a reason to create a duplicate sync branch.
+- PR #34 remains draft and clean. Its GitHub `build`, `SwiftLint`, and both
+  `zizmor` checks are successful. Product/migration-owner approval and
+  funded-device migration evidence remain separate merge gates.
+- The newly active upstream stack (`#1946` through `#1951`) is draft, blocked,
+  and chained through Ironwood migration selection plus interim `librustzcash`
+  pins. It is coupled to the private-engine/artifact reconciliation surface and
+  is not a safe early Zend carry. Existing upstream release, Darkside-test,
+  Tor, dependency, and migration branches are either maintenance-line-only,
+  blocked/dirty, or lack a Zend-specific low-risk use case. The focused
+  decrypt-and-store sentinel repair remains separately tracked by Zend draft #35.
+
 ## Parity and bleeding-edge refresh (2026-08-04)
 
 - Fresh fetches confirm `origin/main=4497fe9e` and `upstream/main=468d1e9f`; the
