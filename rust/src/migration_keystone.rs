@@ -382,14 +382,16 @@ mod tests {
         base.serialize().expect("serialize")
     }
 
-    /// The batch request RETAINS a pre-existing Orchard `spend_auth_sig` rather than stripping it.
-    /// The only pre-signed actions in a wallet PCZT are the protocol padding dummies, which carry
-    /// no ZIP 32 derivation and whose `dummy_sk` the compact view has already cleared — stripping
-    /// their signature would leave an action neither the signer nor the wallet could ever
-    /// authorize. Upstream's `redact_pczt_for_batch_signer` states and enforces that contract; this
-    /// pins that we get the redacted request it produces.
+    /// The batch request STRIPS a pre-existing Orchard `spend_auth_sig` rather than retaining it.
+    /// The only pre-signed actions in a wallet PCZT are the protocol padding dummies, and the
+    /// Keystone batch-signing firmware rejects any request that carries an Orchard spend
+    /// authorization signature at all. Stripping strands nothing: the request is a signing
+    /// request, not the authoritative PCZT, and `apply_batch_signatures` puts the device's
+    /// signatures back onto the caller's retained unredacted bytes, which still hold the dummy's.
+    /// Upstream's `redact_pczt_for_batch_signer` states and enforces that contract; this pins that
+    /// we get the redacted request it produces.
     #[test]
-    fn build_sign_batch_qr_parts_retains_the_dummy_orchard_spend_auth_sig() {
+    fn build_sign_batch_qr_parts_strips_the_dummy_orchard_spend_auth_sig() {
         let unsigned = build_single_pool_orchard_pczt();
 
         // Sanity-check the premise: the IO-finalized PCZT already carries a dummy spend_auth_sig
@@ -432,14 +434,27 @@ mod tests {
         let request = BatchSignRequest::parse(batch.get_data()).expect("parse batch sign request");
 
         assert_eq!(request.pczts().len(), 1);
-        // The pre-signed dummy keeps its signature; the signer needs nothing further for it.
+        // No action reaches the device carrying a signature; the firmware rejects the whole
+        // request if one does.
         assert!(
             request.pczts()[0]
                 .orchard()
                 .actions()
                 .iter()
+                .all(|action| action.spend().spend_auth_sig().is_none()),
+            "redaction must strip every Orchard spend_auth_sig from the batch request",
+        );
+
+        // The caller's retained bytes are untouched, so the dummy's signature is still there to
+        // be combined with whatever the device returns.
+        assert!(
+            pczt::parse(&unsigned)
+                .expect("re-parse retained pczt")
+                .orchard()
+                .actions()
+                .iter()
                 .any(|action| action.spend().spend_auth_sig().is_some()),
-            "the dummy's signature must survive redaction",
+            "redaction must not disturb the caller's retained PCZT",
         );
     }
 
