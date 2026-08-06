@@ -58,11 +58,18 @@ public final class VotingRustBackend: @unchecked Sendable {
 
     // MARK: - Database lifecycle
 
-    /// Open the voting database at `path`.
+    /// Open the voting database at `path` for `networkId`.
+    ///
+    /// The network is fixed for the lifetime of the handle: every
+    /// database-bound call takes its voting identity from `networkId` rather
+    /// than accepting one of its own, so no later call can disagree with the
+    /// network the database was opened for. A custom (regtest) network takes
+    /// its voting identity from the registered base network, and opening fails
+    /// if that network has not been configured yet.
     ///
     /// Throws `VotingRustBackendError.databaseAlreadyOpen` if the backend
     /// already holds an open handle.
-    public func open(path: String) throws {
+    public func open(path: String, networkId: UInt32) throws {
         lock.lock()
         defer { lock.unlock() }
 
@@ -72,7 +79,7 @@ public final class VotingRustBackend: @unchecked Sendable {
 
         let pathBytes = [UInt8](path.utf8)
         guard let ptr = pathBytes.withUnsafeBufferPointer({ buf in
-            zcashlc_voting_db_open(buf.baseAddress, UInt(buf.count))
+            zcashlc_voting_db_open(buf.baseAddress, UInt(buf.count), networkId)
         }) else {
             throw VotingRustBackendError.rustError(
                 Self.staticLastErrorMessage(fallback: "`voting_db_open` failed")
@@ -128,14 +135,12 @@ extension VotingRustBackend {
     /// `pirEndpoints` are probed in parallel via `pirResolver`. The first
     /// endpoint whose served snapshot height equals `expectedSnapshotHeight`
     /// exactly is used. See `PirSnapshotResolver` for the failure semantics.
-    // swiftlint:disable:next function_parameter_count
     public func precomputeDelegationPir(
         roundId: String,
         bundleIndex: UInt32,
         notes: [VotingNoteInfo],
         pirEndpoints: [String],
         expectedSnapshotHeight: UInt64,
-        networkId: UInt32,
         pirResolver: PirSnapshotResolver = PirSnapshotResolver()
     ) async throws -> VotingDelegationPirPrecomputeResult {
         try requireOpenDatabase()
@@ -165,8 +170,7 @@ extension VotingRustBackend {
                             notesBuf.baseAddress,
                             UInt(notesBuf.count),
                             urlBuf.baseAddress,
-                            UInt(urlBuf.count),
-                            networkId
+                            UInt(urlBuf.count)
                         )
                     }
                 }
@@ -341,7 +345,6 @@ extension VotingRustBackend {
         roundId: String,
         bundleIndex: UInt32,
         hotkeyStoredSecret: [UInt8],
-        networkId: UInt32,
         proposalId: UInt32,
         choice: UInt32,
         numOptions: UInt32,
@@ -356,7 +359,6 @@ extension VotingRustBackend {
             roundId: roundId,
             bundleIndex: bundleIndex,
             hotkeyStoredSecret: hotkeyStoredSecret,
-            networkId: networkId,
             proposalId: proposalId,
             choice: choice,
             numOptions: numOptions,
@@ -619,16 +621,15 @@ extension VotingRustBackend {
 extension VotingRustBackend {
     /// Initialize a voting round.
     ///
-    /// `networkId` is persisted with the round so that governance PCZT consensus
-    /// branch identifiers can later be validated against the round's snapshot.
+    /// The round is persisted with the network the database was opened for, so
+    /// that governance PCZT consensus branch identifiers can later be validated
+    /// against the round's snapshot.
     ///
     /// Round-parameter byte arrays are validated by Rust; invalid lengths
     /// throw `.rustError` rather than persisting a partial round.
     /// `sessionJson` is optional; pass `nil` to leave it unset.
-    // swiftlint:disable:next function_parameter_count
     public func initRound(
         roundId: String,
-        networkId: UInt32,
         snapshotHeight: UInt64,
         eaPublicKey: [UInt8],
         ncRoot: [UInt8],
@@ -646,7 +647,6 @@ extension VotingRustBackend {
                             withOptionalBufferPointer(sessionBytes) { sessionBuf in
                                 zcashlc_voting_init_round(
                                     dbh,
-                                    networkId,
                                     ridBuf.baseAddress,
                                     UInt(ridBuf.count),
                                     snapshotHeight,
@@ -1373,7 +1373,6 @@ extension VotingRustBackend {
                                 roundNameBytes.withUnsafeBufferPointer { nameBuf in
                                     zcashlc_voting_build_pczt(
                                         dbh,
-                                        keys.networkId,
                                         ridBuf.baseAddress,
                                         UInt(ridBuf.count),
                                         params.bundleIndex,
@@ -1679,7 +1678,6 @@ private extension VotingRustBackend {
                             draft.bundleIndex,
                             secretBuf.baseAddress,
                             UInt(secretBuf.count),
-                            draft.networkId,
                             draft.proposalId,
                             draft.choice,
                             draft.numOptions,
@@ -1835,7 +1833,6 @@ private extension VotingRustBackend {
                                             UInt(nameBuf.count),
                                             urlBuf.baseAddress,
                                             UInt(urlBuf.count),
-                                            keys.networkId,
                                             trampoline,
                                             progressContext
                                         )
@@ -1869,7 +1866,6 @@ private struct VoteCommitDraft: Sendable, Undescribable {
     let roundId: String
     let bundleIndex: UInt32
     let hotkeyStoredSecret: [UInt8]
-    let networkId: UInt32
     let proposalId: UInt32
     let choice: UInt32
     let numOptions: UInt32

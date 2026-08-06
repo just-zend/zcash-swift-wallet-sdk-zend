@@ -7,7 +7,7 @@ use zcash_voting as voting;
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
 use super::db::VotingDatabaseHandle;
-use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr, voting_network};
+use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
 use super::json::JsonVoteCommit;
 use super::progress::ProgressBridge;
 
@@ -57,7 +57,6 @@ pub unsafe extern "C" fn zcashlc_voting_commit_vote(
     bundle_index: u32,
     hotkey_stored_secret: *const u8,
     hotkey_stored_secret_len: usize,
-    network_id: u32,
     proposal_id: u32,
     choice: u32,
     num_options: u32,
@@ -77,7 +76,7 @@ pub unsafe extern "C" fn zcashlc_voting_commit_vote(
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
 
-        let network = voting_network(network_id)?;
+        let network = handle.network;
         let stored_secret =
             unsafe { bytes_from_ptr(hotkey_stored_secret, hotkey_stored_secret_len) }?;
         let hotkey = voting::VotingHotkey::from_stored_secret(stored_secret, network)
@@ -209,7 +208,6 @@ mod tests {
                 0,
                 stored_secret.as_ptr(),
                 stored_secret.len(),
-                crate::NETWORK_ID_MAINNET,
                 1,
                 0,
                 2,
@@ -306,40 +304,6 @@ mod tests {
         let auth_path_json = well_formed_auth_path_json();
 
         let result = call_commit_vote(db, round, &short_secret, &auth_path_json);
-
-        unsafe { zcashlc_voting_db_free(db) };
-        assert!(result.is_null());
-    }
-
-    #[test]
-    fn commit_vote_rejects_invalid_network_id() {
-        let db = open_memory_db();
-        let round = b"round";
-        let stored_secret = valid_stored_secret();
-        let auth_path_json = well_formed_auth_path_json();
-
-        let result = unsafe {
-            zcashlc_voting_commit_vote(
-                db,
-                round.as_ptr(),
-                round.len(),
-                0,
-                stored_secret.as_ptr(),
-                stored_secret.len(),
-                99,
-                1,
-                0,
-                2,
-                0,
-                auth_path_json.as_ptr(),
-                auth_path_json.len(),
-                0,
-                0,
-                None,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
 
         unsafe { zcashlc_voting_db_free(db) };
         assert!(result.is_null());

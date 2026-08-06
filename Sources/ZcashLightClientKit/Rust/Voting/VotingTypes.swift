@@ -449,12 +449,13 @@ public struct VotingKeystoneSignatureRecord: Codable, Sendable, Equatable {
 ///
 /// `hotkeyStoredSecret` is the ``VotingHotkey/storedSecret`` the application
 /// persisted. The hotkey's Orchard address, address index and network are all
-/// derived from it, so no separate hotkey address is supplied.
+/// derived from it, so no separate hotkey address is supplied. The network
+/// itself comes from the database handle these inputs are used with, so it is
+/// not carried here where it could drift from the one the round was opened for.
 ///
 /// Conforms to `Undescribable` because `hotkeyStoredSecret` is the voting
 /// hotkey's key material.
 public struct VotingDelegationKeyInputs: Sendable, Undescribable {
-    public let networkId: UInt32
     public let fvk: [UInt8]
     public let hotkeyStoredSecret: [UInt8]
     public let seedFingerprint: [UInt8]
@@ -462,14 +463,12 @@ public struct VotingDelegationKeyInputs: Sendable, Undescribable {
     public let roundName: String
 
     public init(
-        networkId: UInt32,
         fvk: [UInt8],
         hotkeyStoredSecret: [UInt8],
         seedFingerprint: [UInt8],
         accountIndex: UInt32,
         roundName: String
     ) {
-        self.networkId = networkId
         self.fvk = fvk
         self.hotkeyStoredSecret = hotkeyStoredSecret
         self.seedFingerprint = seedFingerprint

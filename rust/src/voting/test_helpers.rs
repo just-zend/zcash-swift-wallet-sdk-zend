@@ -2,7 +2,8 @@ use super::db::{VotingDatabaseHandle, zcashlc_voting_db_open, zcashlc_voting_set
 
 pub(crate) fn open_memory_db() -> *mut VotingDatabaseHandle {
     let path = b":memory:";
-    let db = unsafe { zcashlc_voting_db_open(path.as_ptr(), path.len()) };
+    let db =
+        unsafe { zcashlc_voting_db_open(path.as_ptr(), path.len(), crate::NETWORK_ID_MAINNET) };
     assert!(!db.is_null());
 
     let wallet = b"wallet";

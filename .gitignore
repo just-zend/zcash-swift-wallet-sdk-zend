@@ -70,7 +70,7 @@ iOSInjectionProject/
 .AppleDouble
 .LSOverride
 
-#ignore Pods directory for example project 
+#ignore Pods directory for example project
 Pods
 
 # do not commit generated libraries to this repo

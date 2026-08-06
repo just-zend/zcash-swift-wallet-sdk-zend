@@ -31,8 +31,12 @@ struct Checkpoint: Equatable {
     let time: UInt32
     let saplingTree: String
     let orchardTree: String?
+    /// The Ironwood (Orchard note-version V3 / NU6.3) commitment tree at this height. Optional and
+    /// absent for every current checkpoint — populated only once NU6.3 activates.
     let ironwoodTree: String?
 
+    /// The optional pool trees default to `nil`, since they are absent before their respective
+    /// activation (Orchard pre-NU5, Ironwood pre-NU6.3).
     init(
         height: BlockHeight,
         hash: String,
