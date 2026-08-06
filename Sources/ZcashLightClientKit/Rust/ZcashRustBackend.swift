@@ -1474,13 +1474,17 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep? {
-        try await migrationAdvanceStep(for: account, estimatedTip: nil)
+        // The bare compatibility overload: scanned target only, and — matching that — no
+        // compressed-schedule policy either. `MigrationSpacingFloors.zero` is the ZIP
+        // 318-verbatim behavior, identical to this call's behavior before the floors existed.
+        try await migrationAdvanceStep(for: account, estimatedTip: nil, spacingFloors: MigrationSpacingFloors.zero)
     }
 
     @DBActor
     func migrationAdvanceStep(
         for account: AccountUUID,
-        estimatedTip: BlockHeight?
+        estimatedTip: BlockHeight?,
+        spacingFloors: MigrationSpacingFloors
     ) async throws -> MigrationAdvanceStep? {
         // Clear any stale, unconsumed last-error before this sentinel read (see
         // `migrationIsNoteSplitNeeded` below): a NULL return overloads "no stored run" and
@@ -1492,7 +1496,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             dbData.1,
             account.id,
             networkType.networkId,
-            estimatedTip.map(Int64.init) ?? -1
+            estimatedTip.map(Int64.init) ?? -1,
+            spacingFloors.toleranceFloor,
+            spacingFloors.releaseSpacingFloor
         )
 
         // NULL with no recorded error is the benign "no migration run is stored" answer (the

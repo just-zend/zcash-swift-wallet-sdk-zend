@@ -2198,6 +2198,13 @@ fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
 /// chain-tip lookup — the same answer `next_step` would give, available on a wallet that never
 /// saw a chain tip.)
 ///
+/// `overdue_tolerance_floor` and `release_spacing_floor` pass straight through to
+/// [`AdvanceConfig::with_compressed_schedule_floors`]: zero means no floor — the schedule runs
+/// exactly as ZIP 318 documents, byte-identical to this function's behavior before the floors
+/// existed. Production mainnet callers pass zero for both. A caller whose committed schedule is
+/// compressed below its own wall-clock privacy buffer derives nonzero floors from that buffer
+/// and its own block spacing and passes them here instead.
+///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_advance_step`].
 #[unsafe(no_mangle)]
@@ -2207,6 +2214,8 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
     account_uuid_bytes: *const u8,
     network_id: u32,
     estimated_tip: i64,
+    overdue_tolerance_floor: u32,
+    release_spacing_floor: u32,
 ) -> *mut FfiMigrationAdvanceStep {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
@@ -2233,7 +2242,11 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
             &mut backend,
             &mut state,
             targets,
-            &AdvanceConfig::new(ReorgSettleDepth::new(10)),
+            &AdvanceConfig::new(ReorgSettleDepth::new(10))
+                .with_compressed_schedule_floors(overdue_tolerance_floor, release_spacing_floor),
+            // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
+            // inter-broadcast gaps, so advancing needs entropy.
+            &mut OsRng,
         )?;
         Ok(match step {
             AdvanceStep::Reevaluate | AdvanceStep::Replan => {
@@ -6543,6 +6556,8 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 -1,
+                0,
+                0,
             )
         };
         assert!(
@@ -8481,6 +8496,8 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 -1,
+                0,
+                0,
             )
         };
         assert!(

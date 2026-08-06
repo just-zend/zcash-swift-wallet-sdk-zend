@@ -34,6 +34,31 @@ public struct MigrationNetworkPrivacyOptions: Equatable {
     }
 }
 
+/// Consumer spacing floors for a compressed migration schedule — threaded into the pinned
+/// engine's `AdvanceConfig::with_compressed_schedule_floors` via
+/// `zcashlc_migration_advance_step`'s two trailing `u32` parameters. Both fields at zero
+/// (``zero``) is the ZIP 318 verbatim behavior, byte-identical to the engine's behavior before
+/// these floors existed — what every mainnet caller passes. See
+/// ``OrchardMigration/spacingFloors(network:secondsPerBlock:)`` for how a compressed-schedule
+/// consumer (this SDK's testnet) derives nonzero values.
+///
+/// Internal: floors are derived policy, not a consumer-facing choice, so this never reaches the
+/// public `Synchronizer` surface.
+struct MigrationSpacingFloors: Equatable, Sendable {
+    /// The floor under the re-spread trigger's overdue-shift tolerance.
+    let toleranceFloor: UInt32
+    /// The floor under the re-spread release's spacing to the deferred rows behind it.
+    let releaseSpacingFloor: UInt32
+
+    /// Both floors at zero — no floor applied, byte-identical to the engine's behavior before
+    /// these floors existed. What every mainnet caller passes.
+    ///
+    /// Named `zero`, not `none`: a `static let none` on a non-Optional type shadows
+    /// `Optional.none` in optional contexts (`MigrationSpacingFloors?.none` silently means "this
+    /// value", not "no value") — a silent footgun for any future optional use of this type.
+    static let zero = MigrationSpacingFloors(toleranceFloor: 0, releaseSpacingFloor: 0)
+}
+
 /// The app-facing entry point for driving an Orchard -> Ironwood pool migration for one
 /// account.
 ///
@@ -141,6 +166,53 @@ actor OrchardMigration {
     /// network to scale by; real synchronizers forward their host's network-scaled value instead).
     static let privacySyncBufferDuration: TimeInterval = privacySyncBufferDuration(for: .mainnet)
 
+    /// The consumer spacing floors this SDK passes to the migration advance engine for `network`,
+    /// given a measured `secondsPerBlock`. Pure — no I/O, no clock, no wallet state.
+    ///
+    /// Mainnet ALWAYS answers ``MigrationSpacingFloors/zero`` — a hard requirement, not a derived
+    /// result: production mainnet callers must stay byte-identical to the floor-free engine, so
+    /// this branch never even reads `secondsPerBlock`.
+    ///
+    /// testnet/regtest derive nonzero floors because ZIP 318's schedule scale is compressed
+    /// there: a shortened test-network anchor bucket interval shrinks the schedule's own
+    /// overdue-tolerance and deferred-gap scale in proportion, while the wallet's wall-clock
+    /// privacy buffer (``privacySyncBufferDuration(for:)``) stays wall-clock-fixed — see
+    /// `AdvanceConfig::with_compressed_schedule_floors` in the pinned engine for the mechanism
+    /// this corrects. The buffer is a WALL-CLOCK quantity; converting it to a block count needs
+    /// `secondsPerBlock`: `bufferBlocks = ceil(privacyBuffer / secondsPerBlock)`.
+    ///
+    /// `toleranceFloor` is `bufferBlocks + 2`: the re-spread trigger must not be able to re-arm
+    /// inside less than one privacy buffer's worth of blocks, plus 2 blocks of slack for
+    /// estimation error in `secondsPerBlock`.
+    ///
+    /// A shift whose lag is at or below `toleranceFloor` is suppressed outright — the re-spread
+    /// trigger does not re-arm, so the backlog stays at its compressed drawn gaps for that drive.
+    /// Accepted: suppression only ever covers a lag up to roughly one buffer, and the next drive
+    /// whose lag clears the floor re-spreads with the full `releaseSpacingFloor` window below.
+    ///
+    /// `releaseSpacingFloor` is `2 * bufferBlocks + 2`: before the NEXT transfer may come due,
+    /// the just-released one needs its own post-broadcast sync buffer, then a sync session, then
+    /// the sync-to-send buffer ahead of the next send — two buffers' worth of blocks end to end,
+    /// not one, hence the doubling — plus the same 2-block estimation slack.
+    ///
+    /// `secondsPerBlock` should be the SDK's own measured seconds-per-block — the same value the
+    /// wall-clock chain-tip estimate rides (``ChainTipEstimator/secondsPerBlock()`` /
+    /// ``OrchardMigrationHost/estimatedSecondsPerBlock()``). Where a caller has no measurement in
+    /// reach, pass ``ChainTipEstimator/fallbackSecondsPerBlock`` (the nominal 75 s Zcash target
+    /// block spacing) instead.
+    static func spacingFloors(network: NetworkType, secondsPerBlock: Double) -> MigrationSpacingFloors {
+        switch network {
+        case .mainnet:
+            return MigrationSpacingFloors.zero
+        case .testnet, .regtest:
+            let bufferBlocks = UInt32((privacySyncBufferDuration(for: network) / secondsPerBlock).rounded(.up))
+            return MigrationSpacingFloors(
+                toleranceFloor: bufferBlocks + 2,
+                releaseSpacingFloor: 2 * bufferBlocks + 2
+            )
+        }
+    }
+
     /// The NU6.3 (Ironwood) activation height for `networkType`, or `nil` when NU6.3 is unset for
     /// that network. Stateless — no database access, and safe to call before constructing an
     /// ``OrchardMigration``.
@@ -161,6 +233,11 @@ actor OrchardMigration {
     private let broadcaster: any MigrationBroadcasting
     private let syncGate: MigrationSyncGate
     private let logger: Logger
+
+    /// This account's network — the sole input to ``OrchardMigration/spacingFloors(network:secondsPerBlock:)``.
+    /// Mainnet here is a hard requirement, not a default: every mainnet-built actor passes
+    /// ``MigrationSpacingFloors/zero`` on every advance step, unconditionally.
+    private let network: NetworkType
 
     /// The clock every estimate-consulting path on this actor reads (mirroring
     /// ``OrchardMigrationHost``'s injected `now`), so tests can drive the wall-clock tip
@@ -236,6 +313,7 @@ actor OrchardMigration {
         self.logger = logger
         self.broadcaster = sharedBroadcaster
         self.now = now
+        self.network = config.network.networkType
         self.syncGate = MigrationSyncGate(
             directory: config.generalStorageURL,
             accountUUID: accountUUID,
@@ -255,14 +333,17 @@ actor OrchardMigration {
     /// Injecting initializer for tests: supply the welding, broadcaster, sync gate (with its test
     /// clock/ticker), logger, and — for the actor's own estimate-consulting paths — a clock,
     /// directly. `now` defaults to the real clock so call sites that do not exercise the
-    /// estimate stay unchanged.
+    /// estimate stay unchanged. `network` defaults to `.mainnet` — ``MigrationSpacingFloors/zero``
+    /// on every advance step — so call sites that do not exercise the spacing-floor derivation
+    /// stay unchanged; a test exercising testnet's nonzero floors passes `.testnet` explicitly.
     init(
         welding: ZcashRustBackendWelding,
         accountUUID: AccountUUID,
         broadcaster: any MigrationBroadcasting,
         syncGate: MigrationSyncGate,
         logger: Logger,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        network: NetworkType = .mainnet
     ) {
         self.welding = welding
         self.accountUUID = accountUUID
@@ -270,6 +351,7 @@ actor OrchardMigration {
         self.syncGate = syncGate
         self.logger = logger
         self.now = now
+        self.network = network
     }
 
     // MARK: - State
@@ -278,9 +360,25 @@ actor OrchardMigration {
     /// and wall-clock estimated target. `nil` means no run is stored; a
     /// terminal (complete or cancelled) run reports ``MigrationAdvanceStep/complete``. See
     /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping.
+    ///
+    /// Also derives this account's ``MigrationSpacingFloors`` (see
+    /// ``OrchardMigration/spacingFloors(network:secondsPerBlock:)``) from the SAME chain-tip
+    /// projection that produces `estimatedTip`, so the floor derivation costs no extra sample
+    /// read. A failed projection degrades `secondsPerBlock` to
+    /// ``ChainTipEstimator/fallbackSecondsPerBlock`` exactly as it degrades `estimatedTip` to
+    /// `nil` — inlined here (rather than going through ``MigrationTipEstimation/gatingEstimatedTip(welding:now:)``)
+    /// only so both values come from the one read.
     func advanceStep() async throws -> MigrationAdvanceStep? {
-        let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now())
-        return try await welding.migrationAdvanceStep(for: accountUUID, estimatedTip: estimatedTip)
+        let projection = try? await MigrationTipEstimation.project(welding: welding, now: now())
+        let spacingFloors = OrchardMigration.spacingFloors(
+            network: network,
+            secondsPerBlock: projection?.secondsPerBlock ?? ChainTipEstimator.fallbackSecondsPerBlock
+        )
+        return try await welding.migrationAdvanceStep(
+            for: accountUUID,
+            estimatedTip: projection?.estimatedTip,
+            spacingFloors: spacingFloors
+        )
     }
 
     /// Live migration progress, or `nil` when no snapshot is reportable: present only while an
