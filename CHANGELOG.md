@@ -10,28 +10,32 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Changed
 
-- The librustzcash family rides an interim git pin (the
-  michal/pool-migration-compressed-spacing-floor branch head: the zcash/librustzcash#2927 branch
-  head — main at the #2910 merge plus the re-spread fix — plus opt-in compressed-schedule
-  spacing floors) so a wallet's own scheduled migration transactions carry their ZIP 318
-  classification (`Overview.zip318Kind`) from the moment they are STORED at proving time,
-  instead of only after they mine and are scanned. This is what lets a wallet present its
-  stored-but-unmined migration transactions as labeled in-flight activity. The rev also carries
-  librustzcash #2907 — the engine's advance-path selection (prove/broadcast steps) picks
-  transfers by scheduled height instead of internal id — librustzcash #2910: a broadcast
-  schedule whose slots were missed (for example when the app was closed past several scheduled
-  sends) is re-spread on resume instead of coming due all at once — librustzcash #2927: the step
-  that re-spread releases lands on scanned chain data (and the re-spread fires only when more of
-  the schedule is due behind it), so a wallet driven in short foreground sessions can actually
-  prove and broadcast the released step instead of livelocking with its schedule re-pinned past
-  the scan on every open — and the compressed-schedule spacing floors
-  (`AdvanceConfig::with_compressed_schedule_floors`): two opt-in floors, under the re-spread
-  trigger's overdue-shift tolerance and its release spacing, for a consumer whose committed
-  schedule is compressed below its own wall-clock privacy buffer — this SDK's testnet. Mainnet
-  passes the zero pair on every call, byte-identical to the engine's behavior before the floors
-  existed; the floors take effect on testnet only. (The SDK's own next-due delivery query still
-  selects by id — tracked separately as the MOB-1466 M2 residual.) The pin reverts to published
-  crates at the first rc containing all of it.
+- The librustzcash family rides an interim git pin (the michal/pool-migration-public-next-due
+  branch head: the michal/pool-migration-compressed-spacing-floor branch head plus
+  `MigrationState`'s `next_due_broadcast`/`next_provable` exported as public read-only selection,
+  so this SDK's FFI can delegate its delivery-lane selection instead of reimplementing it) so a
+  wallet's own scheduled migration transactions carry their ZIP 318 classification
+  (`Overview.zip318Kind`) from the moment they are STORED at proving time, instead of only after
+  they mine and are scanned. This is what lets a wallet present its stored-but-unmined migration
+  transactions as labeled in-flight activity. The rev also carries librustzcash #2907 — the
+  engine's advance-path selection (prove/broadcast steps) picks transfers by scheduled height
+  instead of internal id — librustzcash #2910: a broadcast schedule whose slots were missed (for
+  example when the app was closed past several scheduled sends) is re-spread on resume instead of
+  coming due all at once — librustzcash #2927: the step that re-spread releases lands on scanned
+  chain data (and the re-spread fires only when more of the schedule is due behind it), so a
+  wallet driven in short foreground sessions can actually prove and broadcast the released step
+  instead of livelocking with its schedule re-pinned past the scan on every open — and the
+  compressed-schedule spacing floors (`AdvanceConfig::with_compressed_schedule_floors`): two
+  opt-in floors, under the re-spread trigger's overdue-shift tolerance and its release spacing,
+  for a consumer whose committed schedule is compressed below its own wall-clock privacy buffer —
+  this SDK's testnet. Mainnet passes the zero pair on every call, byte-identical to the engine's
+  behavior before the floors existed; the floors take effect on testnet only. It also carries
+  `MigrationState`'s public read-only next-due selection (`next_due_broadcast`/`next_provable`):
+  the engine's own delivery-lane choice, now exposed for a caller to read directly instead of
+  recomputing it client-side — pinned so this SDK's FFI can delegate to it instead of
+  reimplementing the selection. (This branch replaces that delivery-lane selection with the
+  engine's exported reads, so the drive and read lanes now agree by construction.) The pin
+  reverts to published crates at the first rc containing all of it.
 
 ## Fixed
 
@@ -257,11 +261,11 @@ Changes are relative to `2.8.0-rc.3`.
   from a copy persisted before the field existed. Its `encode(to:)` omits `proposalHandle` (a
   process-lifetime plan-cache key no persisted copy could honor), so every decoded copy carries
   handle `0` — re-propose instead of committing a persisted schedule.
-- `debugRescheduleMigrationTransfers(accountUUID:)` (DEBUG builds only) compresses a committed
-  schedule for broadcast testing.
-- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, and `ZRUST0111`–`ZRUST0148`
-  (`ZRUST0098`, `rustMigrationState`, was retired pre-release with the SDK-side migration state
-  machine it served — the code is not reused).
+- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0138`, and
+  `ZRUST0140`–`ZRUST0148` (`ZRUST0098`, `rustMigrationState`, was retired pre-release with the
+  SDK-side migration state machine it served — the code is not reused; `ZRUST0139`,
+  `rustMigrationDebugRescheduleTransfers`, was likewise retired pre-release with the
+  debug-reschedule FFI it served — the code is not reused).
 
 ### Slipstream sync engine
 

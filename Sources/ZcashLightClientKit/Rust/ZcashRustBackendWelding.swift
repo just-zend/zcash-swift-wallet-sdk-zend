@@ -737,17 +737,6 @@ protocol ZcashRustBackendWelding {
         for account: AccountUUID
     ) async throws -> MigrationSchedule
 
-    /// DEBUG/QA ONLY — rewrites the committed migration schedule's transfer heights (first due in
-    /// ~2 blocks, then 4-block strides) and the earliest transfer's anchor boundary so real
-    /// broadcast delivery can be exercised without waiting out ZIP 318's privacy delay. Not for
-    /// production flows.
-    ///
-    /// Returns the number of transfers rescheduled (`0` when the account has no stored migration).
-    /// Already-broadcast and already-mined transfers, and every preparation (note-split)
-    /// transaction, are left untouched.
-    /// - Throws: `rustMigrationDebugRescheduleTransfers` if the rust layer returns an error.
-    func migrationDebugRescheduleTransfers(for account: AccountUUID) async throws -> Int
-
     /// Builds the whole previewed migration UNSIGNED for an external signer — the run is created
     /// by this call, with every transaction persisted awaiting its signature — and returns the
     /// preparation (note-split) subset of the PCZTs for the signing ceremony. The transfer subset

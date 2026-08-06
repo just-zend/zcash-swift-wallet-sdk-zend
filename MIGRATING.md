@@ -395,20 +395,15 @@ New error codes `rustMigrationKeystoneBuildSignBatchQrParts` (ZRUST0136),
 `rustMigrationKeystoneApplyBatchSignatures` (ZRUST0138). Like the rest of the migration group, the
 Closure/Combine wrapper synchronizers do not mirror these four members.
 
-## The debug fast-reschedule joins the migration group
+## The debug fast-reschedule endpoint is removed
 
-The `Synchronizer` migration group gains one account-scoped, DEBUG/QA-only requirement. Like the
-rest of the group it comes with a protocol-extension default that throws an "unimplemented"
-`LocalizedError`, so a custom `Synchronizer` conformer keeps compiling — but it must override it to
-offer the real behavior (`SDKSynchronizer` does):
+`debugRescheduleMigrationTransfers(accountUUID:) async throws -> Int` (DEBUG/QA only) and its error
+code `rustMigrationDebugRescheduleTransfers` (ZRUST0139) are gone before ever shipping in a release.
+Its purpose — rewriting a committed migration schedule's transfer heights so real broadcast delivery
+could be exercised without waiting out ZIP 318's privacy delay — is superseded on the engine side by
+compressed test-network scheduling at commit time plus the opt-in spacing floors. There is no
+replacement; drop the call.
 
-- **New: `debugRescheduleMigrationTransfers(accountUUID:) async throws -> Int`.** DEBUG/QA ONLY:
-  rewrites the committed migration schedule's transfer heights (first due in ~2 blocks, then
-  4-block strides) and the earliest transfer's anchor boundary so real broadcast delivery can be
-  exercised without waiting out ZIP 318's privacy delay — not for production flows. Returns the
-  number of transfers rescheduled (`0` when the account has no stored migration);
-  already-broadcast/mined transfers and preparations are left untouched. New error code
-  `rustMigrationDebugRescheduleTransfers` (ZRUST0139).
 ## Custom (regtest-style) networks and `NetworkType.regtest`
 
 `NetworkType` gained a third case, `regtest`. **This is a source-breaking change for exhaustive

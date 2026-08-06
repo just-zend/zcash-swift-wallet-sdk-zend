@@ -1273,10 +1273,6 @@ public actor SlipstreamSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).refreshStaleTransfers(usk: usk)
     }
 
-    public func debugRescheduleMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
-        try await migrationHost.migration(for: accountUUID).debugRescheduleTransfers()
-    }
-
     public func createUnsignedNoteSplitPCZTs(
         accountUUID: AccountUUID,
         for schedule: MigrationSchedule

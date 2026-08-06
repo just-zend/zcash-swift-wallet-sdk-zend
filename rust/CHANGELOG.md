@@ -160,6 +160,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
   hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
   doomed-broadcast withhold (above).
+- Delivery- and prove-lane selection — `zcashlc_migration_next_due_transfer`,
+  `_has_ready_broadcast`, `_prove_pending`, and the `_has_overdue_transfers`/
+  `_pending_transfer_proposal` queries built on them — now delegates to the pinned engine's own
+  exported reads, `MigrationState::next_due_broadcast` and `next_provable`, instead of re-deriving
+  an ordering over `transaction_statuses`; the SDK-side hand-rolled twin of that ordering is gone.
+  The plan-preview numbering (`preparation_steps_from_plan`) likewise takes its ids, `layer`, and
+  `index` straight from the engine's own `MigrationPlan::planned_transactions` enumeration, so a
+  previewed id already equals the id the committed transaction will carry.
 - Mined-transaction promotion is the upstream engine's: `advance_migration` sweeps every in-flight
   transaction and promotes the ones the wallet's scan has seen mine, so the drive path no longer
   reconciles first, and the read-only entry points reconcile through the engine's own
@@ -168,6 +176,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside the region a reorg truncation would roll back — and is the same bound the drive path
   promotes under, so a status read can no longer report `Mined` for a row `advance_migration`
   would refuse to promote.
+
+### Removed
+- `zcashlc_migration_debug_reschedule_transfers` is removed. It was the only FFI entry point that
+  wrote raw SQL directly against the engine-owned pool-migration tables, retro-compressing a
+  committed schedule so its transfers become due in quick succession for manual broadcast testing.
+  That testing purpose is now covered on the engine side by compressed test-network scheduling at
+  commit time plus the opt-in spacing floors (`_advance_step`'s
+  `overdue_tolerance_floor`/`release_spacing_floor` params, above).
 
 ### Fixed
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood

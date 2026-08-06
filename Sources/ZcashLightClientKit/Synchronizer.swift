@@ -1017,17 +1017,6 @@ public protocol Synchronizer: AnyObject {
     ///   was atomically persisted, never a partial batch.
     func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule
 
-    /// DEBUG/QA ONLY — rewrites `accountUUID`'s committed migration schedule's transfer heights
-    /// (first due in ~2 blocks, then 4-block strides) and the earliest transfer's anchor boundary
-    /// so real broadcast delivery can be exercised without waiting out ZIP 318's privacy delay.
-    /// Not for production flows.
-    ///
-    /// Returns the number of transfers rescheduled (`0` when the account has no stored
-    /// migration). Already-broadcast and already-mined transfers, and every preparation
-    /// (note-split) transaction, are left untouched.
-    /// - Parameter accountUUID: the account whose schedule should be compressed.
-    func debugRescheduleMigrationTransfers(accountUUID: AccountUUID) async throws -> Int
-
     /// Builds `accountUUID`'s whole previewed migration UNSIGNED — the run is created by this
     /// call, with every transaction persisted awaiting its signature — and returns the preparation
     /// (note-split) subset of the PCZTs for the signing ceremony. The transfer subset of the same
@@ -1428,10 +1417,6 @@ public extension Synchronizer {
     }
 
     func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
-        throw MigrationUnimplemented(member: #function)
-    }
-
-    func debugRescheduleMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
         throw MigrationUnimplemented(member: #function)
     }
 
