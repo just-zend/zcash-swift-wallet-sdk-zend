@@ -9,10 +9,13 @@
 //  test controls. The block being synchronous is the point: an `await` inside the actor is a
 //  suspension point that RELEASES the actor (reentrancy, SE-0306) and would hold nothing.
 //
-//  Three converted reads are pinned — one per conversion area: the migration family
-//  (blockRateSamples), the turnstile proposal (proposeOrchardToIronwoodMigration, which needs
-//  the account fixture), and the wallet getters (maxScannedHeight). The DAO conversions are
-//  exercised transitively by the rest of OfflineTests.
+//  Four conversion areas are pinned, one test per converted call: the migration family
+//  (blockRateSamples); the migration UI/gate reads reclassified 2026-08-05 — migrationSyncWakeups,
+//  migrationProgress, migrationTransactionStatuses, migrationHasOverdueTransfers,
+//  migrationHasReadyBroadcast, migrationHasInvalidTransfers — pinned individually so a re-add on
+//  any single one of the six fails on its own, not just as a group; the turnstile proposal
+//  (proposeOrchardToIronwoodMigration, which needs the account fixture); and the wallet getters
+//  (maxScannedHeight). The DAO conversions are exercised transitively by the rest of OfflineTests.
 //
 
 import XCTest
@@ -65,6 +68,54 @@ final class DBActorIsolationTests: XCTestCase {
         let backend = rustBackend!
         await assertCompletesWhileDBActorIsHeld("migrationBlockRateSamples completed while actor held") {
             _ = try? await backend.migrationBlockRateSamples(window: 100)
+        }
+    }
+
+    func testSyncWakeupsReadCompletesWhileDBActorIsHeld() async throws {
+        let backend = rustBackend!
+        let accountUUID = account!
+        await assertCompletesWhileDBActorIsHeld("migrationSyncWakeups completed while actor held") {
+            _ = try? await backend.migrationSyncWakeups(for: accountUUID)
+        }
+    }
+
+    func testProgressReadCompletesWhileDBActorIsHeld() async throws {
+        let backend = rustBackend!
+        let accountUUID = account!
+        await assertCompletesWhileDBActorIsHeld("migrationProgress completed while actor held") {
+            _ = try? await backend.migrationProgress(for: accountUUID)
+        }
+    }
+
+    func testTransactionStatusesReadCompletesWhileDBActorIsHeld() async throws {
+        let backend = rustBackend!
+        let accountUUID = account!
+        await assertCompletesWhileDBActorIsHeld("migrationTransactionStatuses completed while actor held") {
+            _ = try? await backend.migrationTransactionStatuses(for: accountUUID)
+        }
+    }
+
+    func testHasOverdueTransfersReadCompletesWhileDBActorIsHeld() async throws {
+        let backend = rustBackend!
+        let accountUUID = account!
+        await assertCompletesWhileDBActorIsHeld("migrationHasOverdueTransfers completed while actor held") {
+            _ = try? await backend.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: nil)
+        }
+    }
+
+    func testHasReadyBroadcastReadCompletesWhileDBActorIsHeld() async throws {
+        let backend = rustBackend!
+        let accountUUID = account!
+        await assertCompletesWhileDBActorIsHeld("migrationHasReadyBroadcast completed while actor held") {
+            _ = try? await backend.migrationHasReadyBroadcast(for: accountUUID, estimatedTip: nil)
+        }
+    }
+
+    func testHasInvalidTransfersReadCompletesWhileDBActorIsHeld() async throws {
+        let backend = rustBackend!
+        let accountUUID = account!
+        await assertCompletesWhileDBActorIsHeld("migrationHasInvalidTransfers completed while actor held") {
+            _ = try? await backend.migrationHasInvalidTransfers(for: accountUUID)
         }
     }
 

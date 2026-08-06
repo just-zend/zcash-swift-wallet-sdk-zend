@@ -16,6 +16,10 @@ import Foundation
 /// with a comment saying so. When the librustzcash pin moves, any FFI function whose Rust body
 /// changed needs its classification re-checked before the marker date is trusted.
 ///
+/// The migration read entry points are the exception that needs no re-check: they open through
+/// the FFI's `open_read` (SQLITE_OPEN_READ_ONLY on both connections), so their read-only-ness
+/// is enforced by SQLite itself, not by audit.
+///
 /// WHAT THIS ACTOR GUARANTEES: no two Swift-initiated writes ever interleave.
 ///
 /// WHAT IT DOES NOT AND CANNOT GUARANTEE: the slipstream engine writes to the same database

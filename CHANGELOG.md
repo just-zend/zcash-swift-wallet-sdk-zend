@@ -41,6 +41,14 @@ Changes are relative to `2.8.0-rc.3`.
   note reservation its never-broadcast transactions held is released in the same store
   transaction — so the fresh plan the restart previews sees the full balance immediately instead
   of selecting around notes the abandoned run still holds until their locks expire.
+- Migration UI/gate reads (`migrationTransactionStatuses`, `migrationProgress`,
+  `migrationHasOverdueTransfers`, `migrationHasInvalidTransfers`, `migrationHasReadyBroadcast`,
+  `migrationSyncWakeups`) no longer take the database write actor: the FFI now serves them from
+  read-only connections without reconciling first, so they answer in milliseconds even while a
+  proof is being generated. A just-mined broadcast can trail in these answers by at most one
+  write-lane pass (the platform's next advance-step, prove, or delivery call — typically its next
+  sync edge or UI refresh); checkmark/"done" rendering is unaffected (it derives from the
+  wallet's own mined transactions).
 
 ## Fixed
 
