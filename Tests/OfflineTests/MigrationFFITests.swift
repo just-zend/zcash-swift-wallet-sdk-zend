@@ -762,10 +762,11 @@ final class MigrationFFITests: XCTestCase {
 
     // MARK: - Advance step decode mapping
     //
-    // `FfiMigrationAdvanceStep`'s marshal into `MigrationAdvanceStep`, constructed directly like
+    // `FfiMigrationAdvanceStep`'s marshal into `MigrationAdvance`, constructed directly like
     // the status rows above. The discriminants are asserted through the header's exported
     // `ZCASHLC_ADVANCE_STEP_*` constants (U3) — the same names the decode itself matches on — so
-    // a renumbering on either side surfaces here.
+    // a renumbering on either side surfaces here. Assertions unwrap `.step`; the outlook
+    // (`.next`) has its own dedicated section below.
 
     /// Every step discriminant decodes to its case; `requiresAttention` (ATTEND) carries the id
     /// like the other id-bearing steps.
@@ -775,7 +776,7 @@ final class MigrationFFITests: XCTestCase {
         ])
         defer { freeProveAdvanceStep(prove) }
         XCTAssertEqual(
-            prove.unsafeToMigrationAdvanceStep(),
+            prove.unsafeToMigrationAdvance()?.step,
             .prove(transactions: [MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))])
         )
 
@@ -784,32 +785,32 @@ final class MigrationFFITests: XCTestCase {
         ])
         defer { freeProveAdvanceStep(provePreparation) }
         XCTAssertEqual(
-            provePreparation.unsafeToMigrationAdvanceStep(),
+            provePreparation.unsafeToMigrationAdvance()?.step,
             .prove(transactions: [MigrationProveTarget(id: 5, kind: .preparation(layer: 1, index: 3))])
         )
 
         let broadcast = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_BROADCAST), id: 6)
-        XCTAssertEqual(broadcast.unsafeToMigrationAdvanceStep(), .broadcast(id: 6))
+        XCTAssertEqual(broadcast.unsafeToMigrationAdvance()?.step, .broadcast(id: 6))
 
         let rebuild = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_REBUILD), id: 7)
-        XCTAssertEqual(rebuild.unsafeToMigrationAdvanceStep(), .rebuild(id: 7))
+        XCTAssertEqual(rebuild.unsafeToMigrationAdvance()?.step, .rebuild(id: 7))
 
         let waiting = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_WAITING), id: 0)
-        XCTAssertEqual(waiting.unsafeToMigrationAdvanceStep(), .waiting)
+        XCTAssertEqual(waiting.unsafeToMigrationAdvance()?.step, .waiting)
 
         let complete = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_COMPLETE), id: 0)
-        XCTAssertEqual(complete.unsafeToMigrationAdvanceStep(), .complete)
+        XCTAssertEqual(complete.unsafeToMigrationAdvance()?.step, .complete)
 
         let attend = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_ATTEND), id: 9)
         XCTAssertEqual(
-            attend.unsafeToMigrationAdvanceStep(),
+            attend.unsafeToMigrationAdvance()?.step,
             .requiresAttention(id: 9),
             "the engine's Attend step must pass through verbatim, carrying the invalid transaction's id"
         )
     }
 
     func testAdvanceStepDecodeReturnsNilForAnOutOfRangeStep() {
-        XCTAssertNil(makeAdvanceStep(step: 99, id: 1).unsafeToMigrationAdvanceStep())
+        XCTAssertNil(makeAdvanceStep(step: 99, id: 1).unsafeToMigrationAdvance())
     }
 
     /// A multi-entry Prove batch marshals every row, ordered and typed, mixing preparation and
@@ -823,7 +824,7 @@ final class MigrationFFITests: XCTestCase {
         ])
         defer { freeProveAdvanceStep(prove) }
         XCTAssertEqual(
-            prove.unsafeToMigrationAdvanceStep(),
+            prove.unsafeToMigrationAdvance()?.step,
             .prove(transactions: [
                 MigrationProveTarget(id: 5, kind: .preparation(layer: 1, index: 3)),
                 MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))
@@ -833,9 +834,55 @@ final class MigrationFFITests: XCTestCase {
 
         let empty = makeProveAdvanceStep([])
         XCTAssertNil(
-            empty.unsafeToMigrationAdvanceStep(),
+            empty.unsafeToMigrationAdvance(),
             "an empty Prove batch is malformed (upstream never serves one empty), not a valid step"
         )
+    }
+
+    // MARK: - Outlook decode mapping (librustzcash #2936)
+    //
+    // `FfiMigrationAdvanceStep.next_height`/`next_kind`'s marshal into `MigrationAdvance.next`,
+    // independent of which step they ride along with (`.waiting` here is an arbitrary carrier —
+    // the outlook decodes the same regardless of `.step`'s own case).
+
+    /// A non-negative `next_height` paired with a recognized `next_kind` decodes to the matching
+    /// `MigrationNextWork`.
+    func testAdvanceStepDecodeMapsAPresentOutlook() throws {
+        let step = makeAdvanceStep(
+            step: UInt32(ZCASHLC_ADVANCE_STEP_WAITING),
+            id: 0,
+            nextHeight: 850_000,
+            nextKind: UInt32(ZCASHLC_STEP_KIND_BROADCAST)
+        )
+        XCTAssertEqual(
+            step.unsafeToMigrationAdvance()?.next,
+            MigrationNextWork(height: 850_000, kind: .broadcast)
+        )
+    }
+
+    /// The `next_height == -1` sentinel decodes to `next == nil` -- nothing is height-schedulable.
+    func testAdvanceStepDecodeMapsTheNoOutlookSentinelToNil() throws {
+        let step = makeAdvanceStep(
+            step: UInt32(ZCASHLC_ADVANCE_STEP_WAITING),
+            id: 0,
+            nextHeight: -1,
+            nextKind: 0
+        )
+        XCTAssertNil(step.unsafeToMigrationAdvance()?.next)
+    }
+
+    /// An out-of-range `next_kind` alongside a non-negative `next_height` is a malformed outlook,
+    /// so the WHOLE decode fails -- mirroring the step discriminant's own defensive-nil contract
+    /// (`testAdvanceStepDecodeReturnsNilForAnOutOfRangeStep`), never a `MigrationAdvance` whose
+    /// `next` silently drops the unrecognized kind.
+    func testAdvanceStepDecodeReturnsNilForAnOutOfRangeOutlookKind() throws {
+        let step = makeAdvanceStep(
+            step: UInt32(ZCASHLC_ADVANCE_STEP_WAITING),
+            id: 0,
+            nextHeight: 850_000,
+            nextKind: 99
+        )
+        XCTAssertNil(step.unsafeToMigrationAdvance())
     }
 
     // MARK: - Routed migration error parsing (U13)
@@ -1145,23 +1192,40 @@ final class MigrationFFITests: XCTestCase {
     ///   `withUnsafeMutableBufferPointer`, mirroring `testDecodeContainerMapsMultipleRowsInEngineOrder`'s
     ///   existing pattern for the outer container.
     /// Builds an `FfiMigrationAdvanceStep` with no Prove batch (`prove_targets: nil`,
-    /// `prove_targets_len: 0`) — every step but Prove, mirroring the FFI contract.
-    private func makeAdvanceStep(step: UInt32, id: UInt32) -> FfiMigrationAdvanceStep {
-        FfiMigrationAdvanceStep(step: step, id: id, prove_targets: nil, prove_targets_len: 0)
+    /// `prove_targets_len: 0`) — every step but Prove, mirroring the FFI contract. `nextHeight`/
+    /// `nextKind` default to the no-outlook sentinel (`-1`/`0`); override them for the outlook
+    /// decode tests below.
+    private func makeAdvanceStep(
+        step: UInt32,
+        id: UInt32,
+        nextHeight: Int64 = -1,
+        nextKind: UInt32 = 0
+    ) -> FfiMigrationAdvanceStep {
+        FfiMigrationAdvanceStep(
+            step: step,
+            id: id,
+            prove_targets: nil,
+            prove_targets_len: 0,
+            next_height: nextHeight,
+            next_kind: nextKind
+        )
     }
 
     /// Builds an `FfiMigrationAdvanceStep` for `ZCASHLC_ADVANCE_STEP_PROVE`, heap-allocating one
     /// `FfiProveTarget` per entry of `targets` in order (an empty array leaves `prove_targets`
     /// `nil`, mirroring the malformed-empty-batch case). The caller must free the result with
     /// `freeProveAdvanceStep` — these fixtures are constructed directly rather than through the
-    /// real FFI, so nothing else owns the allocation.
+    /// real FFI, so nothing else owns the allocation. Carries no outlook (`next_height: -1`): the
+    /// outlook decode is exercised independently, in the dedicated section above.
     private func makeProveAdvanceStep(_ targets: [FfiProveTarget]) -> FfiMigrationAdvanceStep {
         guard !targets.isEmpty else {
             return FfiMigrationAdvanceStep(
                 step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE),
                 id: 0,
                 prove_targets: nil,
-                prove_targets_len: 0
+                prove_targets_len: 0,
+                next_height: -1,
+                next_kind: 0
             )
         }
         let pointer = UnsafeMutablePointer<FfiProveTarget>.allocate(capacity: targets.count)
@@ -1172,7 +1236,9 @@ final class MigrationFFITests: XCTestCase {
             step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE),
             id: 0,
             prove_targets: pointer,
-            prove_targets_len: UInt(targets.count)
+            prove_targets_len: UInt(targets.count),
+            next_height: -1,
+            next_kind: 0
         )
     }
 

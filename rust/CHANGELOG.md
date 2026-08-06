@@ -22,7 +22,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and `Replan` map to the compatibility `_ATTEND` case; a `Prove` step's `kind_*` fields moved
     off the step itself onto `FfiProveTarget` rows — `prove_targets`/`prove_targets_len`, freed by
     the step's own destructor — one per transaction of the WHOLE provable batch upstream now
-    serves in one call; `id` is `0` for `Prove`, the batch entries carrying their own), `_progress`,
+    serves in one call; `id` is `0` for `Prove`, the batch entries carrying their own; the step now
+    also carries the engine's advisory OUTLOOK (upstream #2936, `Advance::next`) as
+    `next_height`/`next_kind` — the earliest target height and kind of the migration's next
+    serviceable work, assuming the served step is executed and recorded, `next_height = -1` when
+    nothing is height-schedulable — with the kind exported as the `ZCASHLC_STEP_KIND_*` constants,
+    a verbatim mirror of upstream `state::StepKind`), `_progress`,
     `_is_note_split_needed`, `_has_overdue_transfers`, `_has_invalid_transfers` (true iff the
     NON-terminal stored run holds an engine-`Invalid` or expired-unmined transaction; a cancelled
     run answers `false`), `_has_ready_broadcast` (the sync-gate's work-pending predicate:

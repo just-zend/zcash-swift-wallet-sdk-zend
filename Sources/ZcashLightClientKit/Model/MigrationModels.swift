@@ -102,6 +102,70 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     case requiresAttention(id: UInt32)
 }
 
+/// The kind of upcoming work named by a ``MigrationAdvance/next`` outlook — a verbatim marshal of
+/// the upstream engine's `state::StepKind` (the outlook's kind ALONE: WHICH transaction a wake-up
+/// serves is decided by the `migrationAdvanceStep` call that serves it, not by this value).
+///
+/// ``prove``, ``broadcast``, ``rebuild`` and ``replan`` are the only outlooks the engine
+/// constructs today (upstream's own outlook derivation maps every other case to no outlook); the
+/// SDK still mirrors the full upstream enum — ``reevaluate``, ``waiting``, ``complete`` included —
+/// so this marshal never invents a projection of its own.
+public enum MigrationStepKind: Equatable, Sendable {
+    case prove
+    case broadcast
+    case rebuild
+    case replan
+    case reevaluate
+    case waiting
+    case complete
+}
+
+/// The engine's OUTLOOK (upstream #2936, `Advance::next`): what session to plan for next,
+/// assuming the step it rode in on (``MigrationAdvance/step``) is executed and recorded.
+public struct MigrationNextWork: Equatable, Sendable {
+    /// The earliest height at which the outlook's work becomes serviceable — upstream's `tip + 1`
+    /// target convention, directly comparable with a caller's own scanned/estimated targets. A
+    /// FLOOR, not an appointment: dependencies still have to mine, and the wake-up's own
+    /// `migrationAdvanceStep` call re-verifies (and may displace) it — this value holds only as of
+    /// the call that returned it, and the NEXT call's outlook supersedes it.
+    public let height: BlockHeight
+    /// What session to plan for the upcoming work: a ``MigrationStepKind/broadcast`` outlook needs
+    /// no sync, a ``MigrationStepKind/prove`` one is sync-bound (the ZIP 318 session separation
+    /// `migrationAdvanceStep`'s own doc describes), and ``MigrationStepKind/replan``/
+    /// ``MigrationStepKind/rebuild`` need user or spend-authority action.
+    /// ``MigrationStepKind/reevaluate``/``MigrationStepKind/waiting``/``MigrationStepKind/complete``
+    /// are not constructible outlooks upstream (see ``MigrationStepKind``'s doc) but are mirrored
+    /// so the marshal never projects one case onto another.
+    public let kind: MigrationStepKind
+
+    /// Creates a `MigrationNextWork`.
+    public init(height: BlockHeight, kind: MigrationStepKind) {
+        self.height = height
+        self.kind = kind
+    }
+}
+
+/// The engine's answer to `Synchronizer.migrationAdvanceStep(accountUUID:)` /
+/// `ZcashRustBackendWelding.migrationAdvanceStep(for:)`: the step to perform NOW
+/// (``MigrationAdvanceStep``, unchanged) plus the advisory OUTLOOK (upstream #2936) — what the
+/// migration will next need, assuming this step is executed. `next == nil` means nothing is
+/// height-schedulable: what follows is chain-driven (an in-flight transaction mining), user-driven
+/// (a signature, a replan), or the migration is terminal — see ``MigrationNextWork`` for the full
+/// contract.
+public struct MigrationAdvance: Equatable, Sendable {
+    /// The step to perform now — see ``MigrationAdvanceStep`` for the full discharge contract.
+    public let step: MigrationAdvanceStep
+    /// The advisory outlook: what session to plan for next, or `nil` when nothing is
+    /// height-schedulable.
+    public let next: MigrationNextWork?
+
+    /// Creates a `MigrationAdvance`.
+    public init(step: MigrationAdvanceStep, next: MigrationNextWork?) {
+        self.step = step
+        self.next = next
+    }
+}
+
 /// The outcome of one broadcast-lane delivery attempt
 /// (`Synchronizer.executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`).
 ///

@@ -1206,7 +1206,7 @@ public class SDKSynchronizer: Synchronizer {
     // mutual-exclusion lock: sync and migration broadcasts must never share a session, and hosts
     // still sequence sessions themselves.
 
-    public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep? {
+    public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
         try await migrationHost.migration(for: accountUUID).advanceStep()
     }
 

@@ -104,7 +104,7 @@ use zcash_pool_migration::signing_rounds::{
     TRANSFER_ACTIONS, action_weight,
 };
 use zcash_pool_migration::state::{
-    AdvanceStep, Blocker, NextAction, ProveTarget, TransactionStatus,
+    AdvanceStep, Blocker, NextAction, ProveTarget, StepKind, TransactionStatus,
 };
 use zcash_pool_migration::wallet::WalletMigrationProver;
 
@@ -1541,6 +1541,35 @@ pub const ZCASHLC_ADVANCE_STEP_WAITING: u32 = 3;
 pub const ZCASHLC_ADVANCE_STEP_COMPLETE: u32 = 4;
 pub const ZCASHLC_ADVANCE_STEP_ATTEND: u32 = 5;
 
+/// The step-kind discriminants of [`FfiMigrationAdvanceStep::next_kind`], a verbatim export of
+/// upstream `state::StepKind` (the outlook's kind — WHICH transaction a wake-up serves is decided
+/// by the `advance_migration` call that serves it). Only Prove, Broadcast, Rebuild and Replan are
+/// constructible outlooks today (upstream's `upcoming_step` maps the rest to "no outlook"), but
+/// the export mirrors the full enum so the marshal never invents a projection.
+pub const ZCASHLC_STEP_KIND_PROVE: u32 = 0;
+pub const ZCASHLC_STEP_KIND_BROADCAST: u32 = 1;
+pub const ZCASHLC_STEP_KIND_REBUILD: u32 = 2;
+pub const ZCASHLC_STEP_KIND_REPLAN: u32 = 3;
+pub const ZCASHLC_STEP_KIND_REEVALUATE: u32 = 4;
+pub const ZCASHLC_STEP_KIND_WAITING: u32 = 5;
+pub const ZCASHLC_STEP_KIND_COMPLETE: u32 = 6;
+
+/// Marshals upstream `state::StepKind` into the [`ZCASHLC_STEP_KIND_*`] discriminants — the
+/// [`FfiMigrationAdvanceStep::next_kind`] counterpart of the step discriminants above. Exhaustive
+/// (no wildcard arm): a new upstream variant must be assigned an explicit number here rather than
+/// silently falling into whatever the last arm was.
+fn step_kind_to_ffi(kind: StepKind) -> u32 {
+    match kind {
+        StepKind::Prove => ZCASHLC_STEP_KIND_PROVE,
+        StepKind::Broadcast => ZCASHLC_STEP_KIND_BROADCAST,
+        StepKind::Rebuild => ZCASHLC_STEP_KIND_REBUILD,
+        StepKind::Replan => ZCASHLC_STEP_KIND_REPLAN,
+        StepKind::Reevaluate => ZCASHLC_STEP_KIND_REEVALUATE,
+        StepKind::Waiting => ZCASHLC_STEP_KIND_WAITING,
+        StepKind::Complete => ZCASHLC_STEP_KIND_COMPLETE,
+    }
+}
+
 /// One transaction of a Prove batch (element of [`FfiMigrationAdvanceStep::prove_targets`]): a
 /// verbatim marshal of upstream `state::ProveTarget` — the transaction to prove, with the kind
 /// that routes it (a preparation proves against the tip anchor and may broadcast at the same
@@ -1574,32 +1603,49 @@ pub struct FfiMigrationAdvanceStep {
     /// provable set, earliest-ready first, never empty for a served Prove; null/0 otherwise.
     pub prove_targets: *mut FfiProveTarget,
     pub prove_targets_len: usize,
+    /// The OUTLOOK (upstream #2936, `Advance::next`): the earliest target height (`tip + 1`
+    /// convention, directly comparable with the drive's own targets) at which the migration next
+    /// has serviceable work, assuming this step is executed and recorded; `-1` when nothing is
+    /// height-schedulable (chain- or user-driven followers, terminal runs — upstream documents
+    /// the cases). ADVISORY: a floor, not an appointment; the serving call re-verifies.
+    pub next_height: i64,
+    /// The kind of that upcoming work (see the `ZCASHLC_STEP_KIND_*` constants); meaningful only
+    /// when `next_height >= 0`.
+    pub next_kind: u32,
 }
 
 impl FfiMigrationAdvanceStep {
     /// A step that names a transaction but carries no batch payload (Broadcast/Rebuild/Attend).
-    fn with_id(step: u32, id: MigrationTransferId) -> *mut Self {
+    fn with_id(
+        step: u32,
+        id: MigrationTransferId,
+        next: Option<(BlockHeight, StepKind)>,
+    ) -> *mut Self {
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step,
             id: u32::from(id),
             prove_targets: ptr::null_mut(),
             prove_targets_len: 0,
+            next_height: next.map_or(-1, |(h, _)| i64::from(u32::from(h))),
+            next_kind: next.map_or(0, |(_, k)| step_kind_to_ffi(k)),
         }))
     }
 
     /// A payload-free step (Waiting/Complete).
-    fn bare(step: u32) -> *mut Self {
+    fn bare(step: u32, next: Option<(BlockHeight, StepKind)>) -> *mut Self {
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step,
             id: 0,
             prove_targets: ptr::null_mut(),
             prove_targets_len: 0,
+            next_height: next.map_or(-1, |(h, _)| i64::from(u32::from(h))),
+            next_kind: next.map_or(0, |(_, k)| step_kind_to_ffi(k)),
         }))
     }
 
     /// The Prove step, carrying the whole provable set (upstream #2939): each entry's kind lets the
     /// platform route it without a lookup.
-    fn prove(transactions: &[ProveTarget]) -> *mut Self {
+    fn prove(transactions: &[ProveTarget], next: Option<(BlockHeight, StepKind)>) -> *mut Self {
         let targets: Vec<FfiProveTarget> = transactions
             .iter()
             .map(|t| {
@@ -1624,6 +1670,8 @@ impl FfiMigrationAdvanceStep {
             id: 0,
             prove_targets,
             prove_targets_len,
+            next_height: next.map_or(-1, |(h, _)| i64::from(u32::from(h))),
+            next_kind: next.map_or(0, |(_, k)| step_kind_to_ffi(k)),
         }))
     }
 }
@@ -2328,14 +2376,15 @@ fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
 }
 
 /// Advances the stored run with upstream's public satisfiability API, using scanned and estimated
-/// targets plus a ten-block reorg-settle depth. Reevaluate and Replan are projected onto the
-/// existing Attend DTO case so the Swift public enum remains source-compatible.
+/// targets plus the provable-anchor reorg-settle depth. Reevaluate and Replan are projected onto
+/// the existing Attend DTO case so the Swift public enum remains source-compatible.
 ///
 /// Returns NULL **with no error recorded** when `get_migration()` returns `None` — no run is
 /// stored, so there is nothing to advance and no step to report. Distinguish that benign NULL
 /// from an error NULL via `zcashlc_last_error_length`. A stored TERMINAL run (Complete, or
 /// Failed/cancelled) reports the `Complete` step VERBATIM, exactly as upstream's `next_step`
-/// does — a cancelled run is never driven further, and is NEVER remapped to any other step.
+/// does — a cancelled run is never driven further, and is NEVER remapped to any other step; it
+/// also carries no outlook (`next_height = -1`), same as every other terminal answer below.
 /// (The terminal check here is upstream's own first check, hoisted only so the answer needs no
 /// chain-tip lookup — the same answer `next_step` would give, available on a wallet that never
 /// saw a chain tip.)
@@ -2368,24 +2417,32 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
         };
         // Upstream `next_step`'s own first check, hoisted ahead of the target lookup (not a
         // carve-out — identical answers): a cancelled or failed run reports Complete even on a
-        // wallet with no chain tip, and is never driven further.
+        // wallet with no chain tip, and is never driven further. No outlook is knowable either
+        // (no targets were even looked up), so this hoisted answer carries `None`, same as every
+        // other Complete below.
         if state.is_terminal() {
-            return Ok(FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE));
+            return Ok(FfiMigrationAdvanceStep::bare(
+                ZCASHLC_ADVANCE_STEP_COMPLETE,
+                None,
+            ));
         }
         let targets = dueness_targets(ctx.tip()?, estimated_tip);
         let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        // librustzcash #2936: the advance returns the verified step plus a next-wake outlook;
-        // this conduit marshals the step via the borrow `.step()` now returns (Task 2a adds the
-        // outlook fields to the FFI struct).
+        // librustzcash #2936: the advance returns the verified step plus a next-wake OUTLOOK
+        // (`Advance::next`) — this conduit marshals both, the step via the borrow `.step()`
+        // returns and the outlook via `.next()`, onto every arm below (Task 2a).
         let advance = advance_migration(
             &mut backend,
             &mut state,
             targets,
-            &AdvanceConfig::new(ReorgSettleDepth::new(10)),
+            &AdvanceConfig::new(ReorgSettleDepth::new(
+                zcash_pool_migration::scheduling::PROVABLE_ANCHOR_DEPTH,
+            )),
             // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
             // inter-broadcast gaps, so advancing needs entropy.
             &mut OsRng,
         )?;
+        let next = advance.next();
         Ok(match advance.step() {
             AdvanceStep::Reevaluate | AdvanceStep::Replan => {
                 let id = state
@@ -2403,17 +2460,23 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
                     })
                     .map(|status| status.id())
                     .unwrap_or_else(|| MigrationTransferId::new(0));
-                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_ATTEND, id)
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_ATTEND, id, next)
             }
-            AdvanceStep::Prove { transactions } => FfiMigrationAdvanceStep::prove(transactions),
+            AdvanceStep::Prove { transactions } => {
+                FfiMigrationAdvanceStep::prove(transactions, next)
+            }
             AdvanceStep::Broadcast { id } => {
-                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_BROADCAST, *id)
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_BROADCAST, *id, next)
             }
             AdvanceStep::Rebuild { id } => {
-                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_REBUILD, *id)
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_REBUILD, *id, next)
             }
-            AdvanceStep::Waiting => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_WAITING),
-            AdvanceStep::Complete => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE),
+            AdvanceStep::Waiting => {
+                FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_WAITING, next)
+            }
+            AdvanceStep::Complete => {
+                FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE, next)
+            }
         })
     });
     unwrap_exc_or_null(res)
@@ -8712,11 +8775,12 @@ mod tests {
     type ProveTargetTuple = (u32, bool, u32, u32, u32);
 
     /// Reads one advance step over the FFI, asserting success, and frees the DTO (and its
-    /// `prove_targets` batch array, if any) after copying everything out.
+    /// `prove_targets` batch array, if any) after copying everything out. The trailing pair is
+    /// the OUTLOOK (upstream #2936): `next_height` (`-1` = no outlook) and `next_kind`.
     fn read_advance_step(
         path_bytes: &[u8],
         account: &[u8; 16],
-    ) -> (u32, u32, Vec<ProveTargetTuple>) {
+    ) -> (u32, u32, Vec<ProveTargetTuple>, i64, u32) {
         let ptr = unsafe {
             zcashlc_migration_advance_step(
                 path_bytes.as_ptr(),
@@ -8744,7 +8808,13 @@ mod tests {
                 )
             })
             .collect();
-        let out = (step.step, step.id, targets);
+        let out = (
+            step.step,
+            step.id,
+            targets,
+            step.next_height,
+            step.next_kind,
+        );
         unsafe { zcashlc_free_migration_advance_step(ptr) };
         out
     }
@@ -8915,7 +8985,7 @@ mod tests {
         );
         store_fixture_state(&path, &account, &state);
 
-        let (step, id, targets) = read_advance_step(path_bytes, &account);
+        let (step, id, targets, ..) = read_advance_step(path_bytes, &account);
         assert_eq!(step, 0, "multiple provable rows must report Prove");
         assert_eq!(id, 0, "the step itself names no single transaction");
         assert!(
@@ -8931,6 +9001,109 @@ mod tests {
         assert!(
             targets.iter().all(|t| !t.1),
             "both rows are transfers, so kind_is_preparation must be false throughout"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The OUTLOOK (upstream #2936, `Advance::next`): the earliest height at which the migration
+    /// next has serviceable work, assuming the served step is executed — mirrors upstream's own
+    /// `outlook_after_a_prove_is_the_broadcast_that_follows` (satisfiability.rs ~3089): a served
+    /// Prove batch's own entries become `Proved` in the hypothetical, so their own (still-future)
+    /// broadcast schedule is what the outlook reports next.
+    #[test]
+    fn advance_step_outlook_reports_next_work() {
+        // Served step: the whole provable batch (the `advance_step_prove_carries_the_whole_batch`
+        // fixture, reused verbatim); once proved, the earliest entry's own (still-future)
+        // broadcast schedule is the outlook -- a proved-and-scheduled follower.
+        let path = init_fixture_db("zcashlc_advance_step_outlook_prove");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        mark_fixture_scanned_through(&path, 3_600_000);
+        seed_placeholder_received_note(&path, [0u8; 32]);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                tx_row(
+                    0,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    &[],
+                    3_700_000,
+                    4_000_000,
+                    Some(3_500_000), // settled well below the tip: provable now
+                    MigrationTxState::Signed,
+                ),
+                tx_row(
+                    1,
+                    MigrationTxKind::Transfer { crossing: 1 },
+                    &[],
+                    3_750_000,
+                    4_000_000,
+                    Some(3_550_000), // also settled, but later than row 0's boundary
+                    MigrationTxState::Signed,
+                ),
+            ],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, _id, targets, next_height, next_kind) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_PROVE,
+            "the whole provable batch is served now"
+        );
+        assert_eq!(targets.len(), 2, "both rows are provable now");
+        assert!(
+            next_height > 0,
+            "once proved, row 0's own (still-future) broadcast schedule is a real height: {next_height}"
+        );
+        assert_eq!(
+            next_height, 3_700_000,
+            "the earliest of the two proved-and-scheduled followers wins"
+        );
+        assert_eq!(
+            next_kind, ZCASHLC_STEP_KIND_BROADCAST,
+            "once proved, a transfer's own later broadcast is the outlook"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // Nothing height-schedulable: the sole transaction is already in flight (Broadcast,
+        // unmined) -- mining is chain-derived, so upstream's `step_floor` reports no floor for
+        // it, and the Waiting step's outlook is `None` (mirrors upstream's own
+        // `outlook_is_none_when_nothing_is_height_schedulable`, satisfiability.rs, second case).
+        // No anchor boundary: an in-flight row's boundary would otherwise route the drive's own
+        // reorg-displacement check through the stored PCZT, which this fixture's placeholder
+        // bytes cannot satisfy -- orthogonal to what this scenario exercises (`step_floor`
+        // reports no floor for a `Broadcast`-state row regardless of its boundary).
+        let path = init_fixture_db("zcashlc_advance_step_outlook_none");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        mark_fixture_scanned_through(&path, 3_600_000);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![tx_row(
+                0,
+                MigrationTxKind::Transfer { crossing: 0 },
+                &[],
+                3_100_000,
+                4_000_000,
+                None,
+                MigrationTxState::Broadcast {
+                    txid: TxId::from_bytes([9u8; 32]),
+                },
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, _id, _targets, next_height, _next_kind) =
+            read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_WAITING,
+            "an in-flight-only run must report Waiting"
+        );
+        assert_eq!(
+            next_height, -1,
+            "mining is chain-derived: nothing is height-schedulable"
         );
         let _ = std::fs::remove_file(&path);
     }

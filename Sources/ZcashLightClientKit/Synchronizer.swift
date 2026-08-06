@@ -603,17 +603,21 @@ public protocol Synchronizer: AnyObject {
     // external (PCZT) signing. None of these methods require `prepare()` to have been called — a
     // host may broadcast a migration transfer from a background session without ever starting sync.
 
-    /// The migration engine's next step to advance `accountUUID`'s stored run — the replacement
-    /// for the removed SDK-side migration state machine, and a VERBATIM conduit of the upstream
-    /// engine's own `next_step`: no SDK ordering shims, no carve-outs — the attention step, the
-    /// broadcast-first ordering, and the prove step's kind are all the engine's own answer,
-    /// marshaled field-for-field. Call it on launch and after every migration operation.
+    /// The migration engine's next step to advance `accountUUID`'s stored run, paired with its
+    /// advisory OUTLOOK (upstream #2936) — the replacement for the removed SDK-side migration
+    /// state machine, and a VERBATIM conduit of the upstream engine's own `advance_migration`: no
+    /// SDK ordering shims, no carve-outs — the attention step, the broadcast-first ordering, and
+    /// the prove step's kind are all the engine's own answer, marshaled field-for-field. Call it on
+    /// launch and after every migration operation.
     ///
     /// `nil` means NO run is stored (none was ever committed) — nothing to advance, nothing to
-    /// poll. Evaluated on the SCANNED tip only (the estimated tip never enters this decision),
-    /// with the engine's attend > broadcast > prove > rebuild priority, and memoryless about
-    /// sessions: it reports what the run needs next, while session policy (one broadcast per
-    /// session, no sync in a broadcast session) stays with the caller and the sync gate.
+    /// poll. A non-`nil` answer is a ``MigrationAdvance``: `.step` is the step to perform NOW
+    /// (evaluated on the SCANNED tip only — the estimated tip never enters this decision — with the
+    /// engine's attend > broadcast > prove > rebuild priority, and memoryless about sessions: it
+    /// reports what the run needs next, while session policy — one broadcast per session, no sync
+    /// in a broadcast session — stays with the caller and the sync gate); `.next` is the advisory
+    /// outlook (``MigrationNextWork``) — what session to plan for once `.step` is executed, or
+    /// `nil` when nothing is height-schedulable.
     ///
     /// Discharging each step (see ``MigrationAdvanceStep`` for the full contract):
     /// - `.requiresAttention` — surfaced FIRST, before any actionable step, when a transaction of
@@ -636,18 +640,23 @@ public protocol Synchronizer: AnyObject {
     /// - `.rebuild` → ``refreshStaleMigrationTransfers(accountUUID:usk:)`` (needs spend
     ///   authority).
     /// - `.waiting` → register OS wake-ups from ``migrationSyncWakeups(accountUUID:)`` plus each
-    ///   ``migrationTransactionStatuses(accountUUID:)`` row's `scheduledHeight`.
+    ///   ``migrationTransactionStatuses(accountUUID:)`` row's `scheduledHeight`; the outlook's
+    ///   `.next`, when present, sharpens which of those wake-ups to arm FIRST — its `kind` says
+    ///   what session to plan (a `.broadcast` outlook needs no sync, a `.prove` one is sync-bound)
+    ///   — but ``migrationSyncWakeups(accountUUID:)`` remains the proving-schedule authority: the
+    ///   outlook is one call's lookahead, superseded by the next.
     ///
     /// `.complete` is terminal for the STORED run — including a CANCELLED one — and means "stop
-    /// polling". It is PER-RUN, never "nothing left to migrate": whether a migratable balance
-    /// remains is answered by ``proposeMigrationTransfers(accountUUID:)`` (an empty schedule
-    /// means no). For the other signals the removed state machine used to carry: "preparations
-    /// still confirming" is `isPreparationPhaseComplete` over
-    /// ``migrationTransactionStatuses(accountUUID:)``, live progress is
-    /// ``migrationProgress(accountUUID:)``, and invalid/expired transfers surface through
-    /// ``hasInvalidMigrationTransfers(accountUUID:)`` and per-row `state`/`blockedOn` values.
+    /// polling" (its outlook is always `nil`). It is PER-RUN, never "nothing left to migrate":
+    /// whether a migratable balance remains is answered by
+    /// ``proposeMigrationTransfers(accountUUID:)`` (an empty schedule means no). For the other
+    /// signals the removed state machine used to carry: "preparations still confirming" is
+    /// `isPreparationPhaseComplete` over ``migrationTransactionStatuses(accountUUID:)``, live
+    /// progress is ``migrationProgress(accountUUID:)``, and invalid/expired transfers surface
+    /// through ``hasInvalidMigrationTransfers(accountUUID:)`` and per-row `state`/`blockedOn`
+    /// values.
     /// - Parameter accountUUID: the account whose next step is of interest.
-    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep?
+    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance?
 
     /// Live migration progress for `accountUUID`, or `nil` when no snapshot is reportable:
     /// present only while an engine run is ACTIVE (not terminal) or a recorded immediate sweep is
@@ -1283,7 +1292,7 @@ public extension Synchronizer {
     // members get inert defaults instead, documented below — conformers must override them to offer
     // real migration behavior.
 
-    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep? {
+    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
         throw MigrationUnimplemented(member: #function)
     }
 

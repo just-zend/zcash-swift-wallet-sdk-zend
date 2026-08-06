@@ -343,12 +343,12 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         welding.migrationBlockRateSamplesWindowReturnValue = [
             MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
         ]
-        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .waiting, next: nil)
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
-        let step = try await migration.advanceStep()
+        let advance = try await migration.advanceStep()
 
-        XCTAssertEqual(step, .waiting)
+        XCTAssertEqual(advance?.step, .waiting)
         let received = try XCTUnwrap(welding.migrationAdvanceStepForEstimatedTipReceivedArguments)
         XCTAssertEqual(received.account, accountA)
         XCTAssertEqual(
@@ -363,12 +363,12 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// engine's scheduled-height due-ness, never block the call that consults it.
     func testAdvanceStepDegradesToNilTipWhenBlockRateSamplesThrows() async throws {
         welding.migrationBlockRateSamplesWindowThrowableError = StubEngineError()
-        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .waiting, next: nil)
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
-        let step = try await migration.advanceStep()
+        let advance = try await migration.advanceStep()
 
-        XCTAssertEqual(step, .waiting, "an estimator failure must not fail the advance step")
+        XCTAssertEqual(advance?.step, .waiting, "an estimator failure must not fail the advance step")
         XCTAssertNil(
             welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.estimatedTip,
             "an estimator failure must degrade to the scanned-tip behavior"

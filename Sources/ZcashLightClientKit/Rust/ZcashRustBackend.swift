@@ -1475,7 +1475,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     // MARK: - Ironwood migration
 
     @DBActor
-    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep? {
+    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvance? {
         try await migrationAdvanceStep(for: account, estimatedTip: nil)
     }
 
@@ -1483,7 +1483,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     func migrationAdvanceStep(
         for account: AccountUUID,
         estimatedTip: BlockHeight?
-    ) async throws -> MigrationAdvanceStep? {
+    ) async throws -> MigrationAdvance? {
         // Clear any stale, unconsumed last-error before this sentinel read (see
         // `migrationIsNoteSplitNeeded` below): a NULL return overloads "no stored run" and
         // "error", and only a recorded last-error distinguishes the two.
@@ -1511,13 +1511,13 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         defer { zcashlc_free_migration_advance_step(stepPtr) }
 
-        guard let step = stepPtr.pointee.unsafeToMigrationAdvanceStep() else {
+        guard let advance = stepPtr.pointee.unsafeToMigrationAdvance() else {
             throw ZcashError.rustMigrationAdvanceStep(
                 lastErrorMessage(fallback: "`migrationAdvanceStep` returned a malformed step")
             )
         }
 
-        return step
+        return advance
     }
 
     // DB-READ (audited 2026-08-05): zcashlc_migration_sync_wakeups — opens through the
@@ -3032,16 +3032,20 @@ extension FfiMigrationTransactionStatuses {
 }
 
 extension FfiMigrationAdvanceStep {
-    /// Converts an [`FfiMigrationAdvanceStep`] into a [`MigrationAdvanceStep`], or `nil` for an
-    /// unrecognized step discriminant (should not happen; defensive only) or an EMPTY Prove batch
+    /// Converts an [`FfiMigrationAdvanceStep`] into a [`MigrationAdvance`], or `nil` for an
+    /// unrecognized step discriminant (should not happen; defensive only), an EMPTY Prove batch
     /// (`prove_targets_len == 0` — upstream documents the batch never empty, so this is a
-    /// malformed step, not the ordinary "nothing to prove" answer, which is `.waiting`). The
-    /// per-kind payload fields (`kind_layer`/`kind_index`/`kind_crossing`) now live on each
-    /// `FfiProveTarget` row rather than on the step itself. The step discriminants are matched
-    /// against the header's exported `ZCASHLC_ADVANCE_STEP_*` constants (U3), so this marshal and
-    /// the rust side share one set of names instead of re-hardcoding the numbers.
-    func unsafeToMigrationAdvanceStep() -> MigrationAdvanceStep? {
-        switch Int32(bitPattern: step) {
+    /// malformed step, not the ordinary "nothing to prove" answer, which is `.waiting`), or an
+    /// unrecognized `next_kind` while `next_height >= 0` (a malformed outlook — same defensive
+    /// contract as the step discriminant). The per-kind payload fields
+    /// (`kind_layer`/`kind_index`/`kind_crossing`) live on each `FfiProveTarget` row rather than on
+    /// the step itself. The step discriminants are matched against the header's exported
+    /// `ZCASHLC_ADVANCE_STEP_*` constants (U3), so this marshal and the rust side share one set of
+    /// names instead of re-hardcoding the numbers; the outlook's kind is matched the same way
+    /// against `ZCASHLC_STEP_KIND_*` (see [`MigrationStepKind.init(ffiValue:)`]).
+    func unsafeToMigrationAdvance() -> MigrationAdvance? {
+        let step: MigrationAdvanceStep
+        switch Int32(bitPattern: self.step) {
         case ZCASHLC_ADVANCE_STEP_PROVE:
             var transactions: [MigrationProveTarget] = []
             transactions.reserveCapacity(Int(prove_targets_len))
@@ -3055,17 +3059,50 @@ extension FfiMigrationAdvanceStep {
                 }
             }
             guard !transactions.isEmpty else { return nil }
-            return .prove(transactions: transactions)
+            step = .prove(transactions: transactions)
         case ZCASHLC_ADVANCE_STEP_BROADCAST:
-            return .broadcast(id: id)
+            step = .broadcast(id: self.id)
         case ZCASHLC_ADVANCE_STEP_REBUILD:
-            return .rebuild(id: id)
+            step = .rebuild(id: self.id)
         case ZCASHLC_ADVANCE_STEP_WAITING:
-            return .waiting
+            step = .waiting
         case ZCASHLC_ADVANCE_STEP_COMPLETE:
-            return .complete
+            step = .complete
         case ZCASHLC_ADVANCE_STEP_ATTEND:
-            return .requiresAttention(id: id)
+            step = .requiresAttention(id: self.id)
+        default:
+            return nil
+        }
+
+        var next: MigrationNextWork?
+        if next_height >= 0 {
+            guard let kind = MigrationStepKind(ffiValue: next_kind) else { return nil }
+            next = MigrationNextWork(height: BlockHeight(next_height), kind: kind)
+        }
+        return MigrationAdvance(step: step, next: next)
+    }
+}
+
+extension MigrationStepKind {
+    /// Marshals the header's `ZCASHLC_STEP_KIND_*` constants into a `MigrationStepKind`, or `nil`
+    /// for an unrecognized discriminant (should not happen; defensive only, same contract as the
+    /// step discriminant itself).
+    init?(ffiValue: UInt32) {
+        switch Int32(bitPattern: ffiValue) {
+        case ZCASHLC_STEP_KIND_PROVE:
+            self = .prove
+        case ZCASHLC_STEP_KIND_BROADCAST:
+            self = .broadcast
+        case ZCASHLC_STEP_KIND_REBUILD:
+            self = .rebuild
+        case ZCASHLC_STEP_KIND_REPLAN:
+            self = .replan
+        case ZCASHLC_STEP_KIND_REEVALUATE:
+            self = .reevaluate
+        case ZCASHLC_STEP_KIND_WAITING:
+            self = .waiting
+        case ZCASHLC_STEP_KIND_COMPLETE:
+            self = .complete
         default:
             return nil
         }

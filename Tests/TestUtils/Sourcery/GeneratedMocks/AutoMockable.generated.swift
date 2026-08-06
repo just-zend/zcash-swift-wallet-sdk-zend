@@ -2709,10 +2709,10 @@ class SynchronizerMock: Synchronizer {
         return migrationAdvanceStepAccountUUIDCallsCount > 0
     }
     var migrationAdvanceStepAccountUUIDReceivedAccountUUID: AccountUUID?
-    var migrationAdvanceStepAccountUUIDReturnValue: MigrationAdvanceStep?
-    var migrationAdvanceStepAccountUUIDClosure: ((AccountUUID) async throws -> MigrationAdvanceStep?)?
+    var migrationAdvanceStepAccountUUIDReturnValue: MigrationAdvance?
+    var migrationAdvanceStepAccountUUIDClosure: ((AccountUUID) async throws -> MigrationAdvance?)?
 
-    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep? {
+    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
         if let error = migrationAdvanceStepAccountUUIDThrowableError {
             throw error
         }
@@ -2770,30 +2770,6 @@ class SynchronizerMock: Synchronizer {
             return try await closure(accountUUID)
         } else {
             return finalizeReadyMigrationTransfersAccountUUIDReturnValue
-        }
-    }
-
-    // MARK: - reconcileUnrecordedMigrationBroadcasts
-
-    var reconcileUnrecordedMigrationBroadcastsAccountUUIDThrowableError: Error?
-    var reconcileUnrecordedMigrationBroadcastsAccountUUIDCallsCount = 0
-    var reconcileUnrecordedMigrationBroadcastsAccountUUIDCalled: Bool {
-        return reconcileUnrecordedMigrationBroadcastsAccountUUIDCallsCount > 0
-    }
-    var reconcileUnrecordedMigrationBroadcastsAccountUUIDReceivedAccountUUID: AccountUUID?
-    var reconcileUnrecordedMigrationBroadcastsAccountUUIDReturnValue: Bool!
-    var reconcileUnrecordedMigrationBroadcastsAccountUUIDClosure: ((AccountUUID) async throws -> Bool)?
-
-    func reconcileUnrecordedMigrationBroadcasts(accountUUID: AccountUUID) async throws -> Bool {
-        if let error = reconcileUnrecordedMigrationBroadcastsAccountUUIDThrowableError {
-            throw error
-        }
-        reconcileUnrecordedMigrationBroadcastsAccountUUIDCallsCount += 1
-        reconcileUnrecordedMigrationBroadcastsAccountUUIDReceivedAccountUUID = accountUUID
-        if let closure = reconcileUnrecordedMigrationBroadcastsAccountUUIDClosure {
-            return try await closure(accountUUID)
-        } else {
-            return reconcileUnrecordedMigrationBroadcastsAccountUUIDReturnValue
         }
     }
 
@@ -5031,10 +5007,10 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         return migrationAdvanceStepForCallsCount > 0
     }
     var migrationAdvanceStepForReceivedAccount: AccountUUID?
-    var migrationAdvanceStepForReturnValue: MigrationAdvanceStep?
-    var migrationAdvanceStepForClosure: ((AccountUUID) async throws -> MigrationAdvanceStep?)?
+    var migrationAdvanceStepForReturnValue: MigrationAdvance?
+    var migrationAdvanceStepForClosure: ((AccountUUID) async throws -> MigrationAdvance?)?
 
-    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep? {
+    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvance? {
         if let error = migrationAdvanceStepForThrowableError {
             throw error
         }
@@ -5055,10 +5031,10 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         return migrationAdvanceStepForEstimatedTipCallsCount > 0
     }
     var migrationAdvanceStepForEstimatedTipReceivedArguments: (account: AccountUUID, estimatedTip: BlockHeight?)?
-    var migrationAdvanceStepForEstimatedTipReturnValue: MigrationAdvanceStep?
-    var migrationAdvanceStepForEstimatedTipClosure: ((AccountUUID, BlockHeight?) async throws -> MigrationAdvanceStep?)?
+    var migrationAdvanceStepForEstimatedTipReturnValue: MigrationAdvance?
+    var migrationAdvanceStepForEstimatedTipClosure: ((AccountUUID, BlockHeight?) async throws -> MigrationAdvance?)?
 
-    func migrationAdvanceStep(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> MigrationAdvanceStep? {
+    func migrationAdvanceStep(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> MigrationAdvance? {
         if let error = migrationAdvanceStepForEstimatedTipThrowableError {
             throw error
         }
@@ -5140,30 +5116,6 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(window)
         } else {
             return migrationBlockRateSamplesWindowReturnValue
-        }
-    }
-
-    // MARK: - migrationReconcileUnrecordedBroadcasts
-
-    var migrationReconcileUnrecordedBroadcastsForThrowableError: Error?
-    var migrationReconcileUnrecordedBroadcastsForCallsCount = 0
-    var migrationReconcileUnrecordedBroadcastsForCalled: Bool {
-        return migrationReconcileUnrecordedBroadcastsForCallsCount > 0
-    }
-    var migrationReconcileUnrecordedBroadcastsForReceivedAccount: AccountUUID?
-    var migrationReconcileUnrecordedBroadcastsForReturnValue: Bool!
-    var migrationReconcileUnrecordedBroadcastsForClosure: ((AccountUUID) async throws -> Bool)?
-
-    func migrationReconcileUnrecordedBroadcasts(for account: AccountUUID) async throws -> Bool {
-        if let error = migrationReconcileUnrecordedBroadcastsForThrowableError {
-            throw error
-        }
-        migrationReconcileUnrecordedBroadcastsForCallsCount += 1
-        migrationReconcileUnrecordedBroadcastsForReceivedAccount = account
-        if let closure = migrationReconcileUnrecordedBroadcastsForClosure {
-            return try await closure(account)
-        } else {
-            return migrationReconcileUnrecordedBroadcastsForReturnValue
         }
     }
 

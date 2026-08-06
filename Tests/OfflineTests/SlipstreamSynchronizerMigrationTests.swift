@@ -71,23 +71,29 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         let welding = ZcashRustBackendWeldingMock()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
 
-        let cases: [MigrationAdvanceStep?] = [
+        let cases: [MigrationAdvance?] = [
             nil,
-            .prove(transactions: [MigrationProveTarget(id: 3, kind: .preparation(layer: 0, index: 1))]),
-            .prove(transactions: [MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))]),
-            .broadcast(id: 5),
-            .rebuild(id: 6),
-            .waiting,
-            .complete,
-            .requiresAttention(id: 7)
+            MigrationAdvance(
+                step: .prove(transactions: [MigrationProveTarget(id: 3, kind: .preparation(layer: 0, index: 1))]),
+                next: nil
+            ),
+            MigrationAdvance(
+                step: .prove(transactions: [MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))]),
+                next: nil
+            ),
+            MigrationAdvance(step: .broadcast(id: 5), next: nil),
+            MigrationAdvance(step: .rebuild(id: 6), next: nil),
+            MigrationAdvance(step: .waiting, next: MigrationNextWork(height: 850_000, kind: .broadcast)),
+            MigrationAdvance(step: .complete, next: nil),
+            MigrationAdvance(step: .requiresAttention(id: 7), next: nil)
         ]
 
-        for expectedStep in cases {
-            welding.migrationAdvanceStepForEstimatedTipReturnValue = expectedStep
+        for expectedAdvance in cases {
+            welding.migrationAdvanceStepForEstimatedTipReturnValue = expectedAdvance
 
-            let step = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
+            let advance = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
 
-            XCTAssertEqual(step, expectedStep)
+            XCTAssertEqual(advance, expectedAdvance)
             XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountUUID)
         }
     }
@@ -537,13 +543,13 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
     /// `testMigrationSyncBlockedStreamForwardsToHostStream`).
     func testThrowingMigrationMemberIsSlipstreamSynchronizersOwnWitnessNotTheProtocolDefault() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .waiting, next: nil)
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
 
         // If SlipstreamSynchronizer still fell through to the protocol default, this would throw
         // `MigrationUnimplemented` instead of returning the host-scripted value.
-        let step = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
-        XCTAssertEqual(step, .waiting)
+        let advance = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
+        XCTAssertEqual(advance?.step, .waiting)
     }
 
     // MARK: - Enforcement: start() privacy gate

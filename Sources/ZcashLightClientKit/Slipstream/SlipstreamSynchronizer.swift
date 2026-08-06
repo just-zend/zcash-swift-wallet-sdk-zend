@@ -1150,7 +1150,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // -- an advisory point-in-time check, not a hard mutual-exclusion lock: sync and migration
     // broadcasts must never share a session, and hosts still sequence sessions themselves.
 
-    public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep? {
+    public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
         try await migrationHost.migration(for: accountUUID).advanceStep()
     }
 

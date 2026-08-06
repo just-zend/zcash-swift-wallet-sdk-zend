@@ -31,8 +31,8 @@ Changes are relative to `2.8.0-rc.3`.
   the schedule is due behind it), so a wallet driven in short foreground sessions can actually
   prove and broadcast the released step instead of livelocking with its schedule re-pinned past
   the scan on every open — librustzcash #2936: `advance_migration` returns the verified step
-  together with a next-wake outlook (this FFI marshals the step — now the batch-Prove generation
-  described above — alone for now) — and the engine's
+  together with a next-wake outlook; this FFI marshals both (the outlook surfaces on the Swift
+  side as `MigrationAdvance.next` — see the `migrationAdvanceStep` entry below) — and the engine's
   note-locking generation: a proved migration transaction's spent notes are reserved in the
   wallet database, so an ordinary payment proposed mid-migration can no longer spend a note a
   stored, proved transfer is already committed to. It also carries `MigrationState`'s public
@@ -44,6 +44,14 @@ Changes are relative to `2.8.0-rc.3`.
   (`AdvanceConfig::with_compressed_schedule_floors`) left the pinned lineage, and this SDK no
   longer derives or passes them. The pin reverts to published crates at the first rc containing
   all of it.
+- `migrationAdvanceStep(accountUUID:)` (and the welding pair) now returns `MigrationAdvance?` —
+  the same step wrapped with the engine's advisory OUTLOOK (librustzcash #2936): `next` names the
+  kind of the migration's next serviceable work and the earliest target height it becomes
+  serviceable at, assuming the returned step is executed (`nil` = nothing height-schedulable).
+  Call sites unwrap `.step` where they switched on the step before; the outlook lets a host
+  register its next wake-up from the engine's own plan — a `.broadcast` outlook needs no sync
+  session, a `.prove` one is sync-bound. `migrationSyncWakeups` remains the proving-schedule
+  authority; the outlook is one step of lookahead, superseded by the next call.
 - Restarting a migration (`restartCurrentMigrationStep`) now cancels the stored run through the
   engine's own cancel: the run is recorded with the terminal `Cancelled` status (previously
   `Failed`, which left a deliberate abandonment indistinguishable from a broken run) and every
@@ -184,7 +192,7 @@ Changes are relative to `2.8.0-rc.3`.
 - State: `migrationAdvanceStep(accountUUID:)` drives the migration engine's public
   `advance_migration` decision at the scanned chain tip — `nil` when no run is stored, otherwise
   `.requiresAttention(id:)` (the engine returned `Reevaluate` after a node rejection or `Replan`
-  after determining a transaction unsatisfiable), `.prove(id:kind:)`, `.broadcast(id:)`, `.rebuild(id:)`,
+  after determining a transaction unsatisfiable), `.prove(transactions:)`, `.broadcast(id:)`, `.rebuild(id:)`,
   `.waiting`, or the terminal `.complete` (per-run, including a cancelled run — never "nothing
   left to migrate"; ask `proposeMigrationTransfers` for that). The SDK adds no state machine, no
   ordering shims, and no carve-outs of its own on top of the engine's answer — the attention step

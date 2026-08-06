@@ -267,10 +267,12 @@ actor OrchardMigration {
     // MARK: - State
 
     /// The engine's next step to advance the stored run, driven with the wallet's scanned target
-    /// and wall-clock estimated target. `nil` means no run is stored; a
-    /// terminal (complete or cancelled) run reports ``MigrationAdvanceStep/complete``. See
-    /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping.
-    func advanceStep() async throws -> MigrationAdvanceStep? {
+    /// and wall-clock estimated target, paired with its advisory outlook (upstream #2936). `nil`
+    /// means no run is stored; a terminal (complete or cancelled) run reports the returned
+    /// advance's `.step` as ``MigrationAdvanceStep/complete`` (`.next` is always `nil` for it). See
+    /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping, and
+    /// ``MigrationAdvance`` / ``MigrationNextWork`` for the outlook's contract.
+    func advanceStep() async throws -> MigrationAdvance? {
         let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now())
         return try await welding.migrationAdvanceStep(for: accountUUID, estimatedTip: estimatedTip)
     }

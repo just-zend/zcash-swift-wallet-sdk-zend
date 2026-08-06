@@ -415,23 +415,25 @@ protocol ZcashRustBackendWelding {
 
     // MARK: - Ironwood migration
 
-    /// The engine's next step to advance `account`'s stored migration run. This compatibility
-    /// overload drives at the scanned target; migration hosts use the estimate-aware overload.
-    /// Upstream `Reevaluate` and `Replan` project to ``MigrationAdvanceStep/requiresAttention(id:)``.
+    /// The engine's next step to advance `account`'s stored migration run, wrapped with its
+    /// advisory OUTLOOK (upstream #2936; see ``MigrationAdvance``). This compatibility overload
+    /// drives at the scanned target; migration hosts use the estimate-aware overload. Upstream
+    /// `Reevaluate` and `Replan` project to ``MigrationAdvanceStep/requiresAttention(id:)``.
     /// Mined
     /// transactions reconciled first like every other read. `nil` means NO run is stored at all
     /// (nothing to advance); a stored TERMINAL run — complete or cancelled — reports
-    /// ``MigrationAdvanceStep/complete`` verbatim and is never driven further. See
-    /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping.
+    /// ``MigrationAdvanceStep/complete`` verbatim (`next` is always `nil` for it) and is never
+    /// driven further. See ``MigrationAdvanceStep`` for the step semantics and the discharge
+    /// mapping, and ``MigrationAdvance`` / ``MigrationNextWork`` for the outlook's contract.
     /// - Throws: `rustMigrationAdvanceStep` if the rust layer returns an error.
-    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep?
+    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvance?
 
     /// Estimate-aware drive entry point. `estimatedTip` is the wall-clock chain-tip estimate;
     /// destructive judgments remain anchored to the wallet's fully-scanned height upstream.
     func migrationAdvanceStep(
         for account: AccountUUID,
         estimatedTip: BlockHeight?
-    ) async throws -> MigrationAdvanceStep?
+    ) async throws -> MigrationAdvance?
 
     /// Live migration progress, or `nil` when no snapshot is reportable: present only while an
     /// engine run is ACTIVE (not terminal) or a recorded immediate sweep is pending (unmined and
@@ -843,7 +845,7 @@ extension ZcashRustBackendWelding {
     func migrationAdvanceStep(
         for account: AccountUUID,
         estimatedTip: BlockHeight?
-    ) async throws -> MigrationAdvanceStep? {
+    ) async throws -> MigrationAdvance? {
         try await migrationAdvanceStep(for: account)
     }
 }

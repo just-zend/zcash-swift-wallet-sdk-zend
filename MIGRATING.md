@@ -199,6 +199,39 @@ reasons:
    informational query (re-arm background execution, launch reconciliation); it is no longer
    consulted by any gate path.
 
+## `migrationAdvanceStep` returns `MigrationAdvance`, wrapping the step with an advisory outlook
+
+`migrationAdvanceStep(accountUUID:)` (and the welding pair) now returns `MigrationAdvance?`
+instead of `MigrationAdvanceStep?`: the same step, plus the engine's advisory OUTLOOK
+(librustzcash #2936) — `next: MigrationNextWork?`, naming the kind of the migration's next
+serviceable work and the earliest target height it becomes serviceable at, assuming the returned
+step is executed (`nil` means nothing height-schedulable: what follows is chain-driven,
+user-driven, or the migration is terminal).
+
+```swift
+// Before
+let step = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
+switch step {
+case .prove(let transactions): ...
+case .broadcast(let id): ...
+...
+}
+
+// After
+let advance = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
+switch advance?.step {
+case .prove(let transactions): ...
+case .broadcast(let id): ...
+...
+}
+// `advance?.next`, when present, says what session to plan for once `.step` is executed -- a
+// `.broadcast` outlook needs no sync, a `.prove` one is sync-bound. `migrationSyncWakeups`
+// remains the proving-schedule authority; the outlook is one call's lookahead only.
+```
+
+Existing call sites that only pattern-matched the step's cases now unwrap `.step` first (or switch
+over `advance?.step` directly, as above); the outlook is additive and safe to ignore.
+
 ## The pool-migration surface rides the final engine
 
 The Orchard→Ironwood migration group (never in a released SDK) is rewired onto the final engine
