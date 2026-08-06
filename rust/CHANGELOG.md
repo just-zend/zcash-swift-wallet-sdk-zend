@@ -58,7 +58,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     length, for the caller to re-slice its own ordered PCZT array by.
   - Note split: `zcashlc_migration_prepare_note_split`, `_sign_note_split`.
   - Proposal and commit: `zcashlc_migration_residual_after_migration`, `_propose_transfers`,
-    `_sign_and_store_schedule`.
+    `_sign_and_store_schedule`. Committing a plan is linear in the wallet's note count: the FFI's
+    wallet adapter snapshots its spendable-note selection per call (the pattern librustzcash #2946
+    set for the upstream adapter).
   - Proving: `zcashlc_migration_prove_pending` proves everything currently provable and returns the
     count proved (`-1` = error), skipping rather than failing on a row whose anchor is not yet
     scanned or retained. Call it from the sync path.
@@ -241,11 +243,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zcashlc_slipstream_wallet_summary` no longer returns the empty sentinel during the ~30 s gap after
   a restore completes, and once NU6.3 is active reports the collapsed recovery balance in the
   Ironwood pool rather than Orchard.
-- Committing (signing) a migration plan is linear in the wallet's note count again: the FFI's
-  wallet adapter now snapshots the spendable-note selection per call (the same fix librustzcash
-  #2946 applied to the upstream adapter), where it previously re-ran the full selection for every
-  input being signed — on a large wallet, accepting a plan could stall for many minutes and get
-  the app killed.
 
 ## 2.8.0-rc.2 - 2026-07-28
 
