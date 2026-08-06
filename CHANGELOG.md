@@ -335,6 +335,13 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- `ZcashRustBackend.decryptAndStoreTransaction` misread the FFI's -1 error sentinel as success (the
+  FFI returns 1 on success and -1 on error, never 0, so the `result != 0` guard could not fire). A
+  failed decrypt-and-store now throws `ZcashError.rustDecryptAndStoreTransaction` with the
+  underlying Rust error instead of silently returning an all-zero txid — previously such failures
+  were treated as completed work by transaction enhancement, the mempool monitor, and
+  `enhanceTransactionBy`, hiding missing transaction data (memos, transparent history) without any
+  error or retry.
 - The witnesses-fix gate compared the recorded and current app versions with a plain String
   comparison, which orders versions lexicographically: whenever the shorter number's leading digit
   was the larger one (for example 2.9.0 → 2.10.0, 2.4.9 → 2.4.10, or 2.99.0 → 2.100.0) the upgrade
