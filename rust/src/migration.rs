@@ -5683,10 +5683,12 @@ mod tests {
     /// — through the production [`scan_cached_blocks`] entry point: the same trial-decryption and
     /// commitment-tree insert the real sync pipeline runs, just fed an in-memory block instead of
     /// the filesystem cache `zcashlc_scan_blocks` reads from (so no FS block-metadata-db setup is
-    /// needed for one block). Each note is its own transaction (txid `[0xAB + i; 32]`, distinct
-    /// nullifier/rho/rseed via [`fixture_orchard_compact_action`]'s `seed_offset = i`), so the
-    /// wallet ends up with `values_zat.len()` independently addressable spendable notes after the
-    /// one scan — needed to exercise ordering/snapshot behavior a single note cannot.
+    /// needed for one block). Each note is its own transaction (txid tag byte `0xAC` plus a
+    /// little-endian `u16` index at bytes 1-2 over a zero background, disjoint from
+    /// `seed_placeholder_received_note`'s `[0xAB; 32]`, and distinct nullifier/rho/rseed via
+    /// [`fixture_orchard_compact_action`]'s `seed_offset = i`), so the wallet ends up with
+    /// `values_zat.len()` independently addressable spendable notes after the one scan — needed to
+    /// exercise ordering/snapshot behavior a single note cannot.
     fn fund_fixture_account_with_orchard_notes(
         path: &std::path::Path,
         usk_bytes: &[u8],
@@ -5711,7 +5713,16 @@ mod tests {
                 let action = fixture_orchard_compact_action(&usk, value_zat, i as u64);
                 CompactTx {
                     index: (i + 1) as u64,
-                    txid: vec![0xABu8 + i as u8; 32],
+                    txid: {
+                        // Disjoint from `seed_placeholder_received_note`'s [0xAB; 32] by the tag
+                        // byte, and unique for arbitrary i via the two-byte index — the old
+                        // `0xAB + i` scheme overflowed u8 at i = 85 and collided with the
+                        // placeholder at i = 0.
+                        let mut txid = vec![0u8; 32];
+                        txid[0] = 0xAC;
+                        txid[1..3].copy_from_slice(&(i as u16).to_le_bytes());
+                        txid
+                    },
                     actions: vec![action],
                     ..Default::default()
                 }
