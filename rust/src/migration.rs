@@ -9187,6 +9187,51 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The preparation arm of the batch marshal: `kind_is_preparation`, `kind_layer`, and
+    /// `kind_index` survive the crossing into the FFI row with layer and index NOT transposed
+    /// (both cast to `u32`, so a swap would compile silently).
+    #[test]
+    fn advance_step_prove_marshals_a_preparation_target() {
+        let path = init_fixture_db("zcashlc_advance_step_prove_preparation");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        mark_fixture_scanned_through(&path, 3_600_000);
+        seed_placeholder_received_note(&path, [0u8; 32]);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![tx_row(
+                0,
+                MigrationTxKind::Preparation { layer: 2, index: 5 },
+                &[],
+                3_500_000, // due: at or below the scanned target, so the schedule offers it
+                4_000_000,
+                None, // a preparation draws no anchor boundary
+                MigrationTxState::Signed,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, id, targets, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_PROVE,
+            "a due preparation is provable"
+        );
+        assert_eq!(id, 0, "the step itself names no single transaction");
+        assert_eq!(
+            targets.len(),
+            1,
+            "exactly the one preparation, got {targets:?}"
+        );
+        let (target_id, is_preparation, layer, index, crossing) = targets[0];
+        assert_eq!(target_id, 0);
+        assert!(is_preparation, "the kind must marshal as a preparation");
+        assert_eq!(layer, 2, "layer must not be transposed with index");
+        assert_eq!(index, 5, "index must not be transposed with layer");
+        assert_eq!(crossing, 0, "a preparation carries no crossing");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The OUTLOOK (upstream #2936, `Advance::next`): the earliest height at which the migration
     /// next has serviceable work, assuming the served step is executed — mirrors upstream's own
     /// `outlook_after_a_prove_is_the_broadcast_that_follows` (satisfiability.rs ~3089): a served
