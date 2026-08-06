@@ -93,7 +93,7 @@ build-release: ## Build the Swift package in release mode
 test: test-offline ## Run the offline test suite
 
 .PHONY: check
-check: build test ## Build and run the offline tests
+check: build test test-rust ## Build, run the offline tests, then the Rust tests
 
 # `build` links whatever FFI is already in place; these build the Rust from
 # source first, so the XCFramework matches the tree.
@@ -136,6 +136,12 @@ test-offline: ## Run the offline tests (no network, no lightwalletd)
 .PHONY: test-all
 test-all: ## Run the whole test suite, including networked tests
 	$(SWIFT) test
+
+# The Rust unit tests. These cover the FFI layer below the Swift package, so
+# they are not reached by any `swift test` filter and need their own target.
+.PHONY: test-rust
+test-rust: ## Run the Rust unit tests
+	cargo test
 
 .PHONY: lint
 lint: ## Lint the Swift sources with SwiftLint
