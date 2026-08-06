@@ -1219,14 +1219,7 @@ final class MigrationFFITests: XCTestCase {
     /// outlook decode is exercised independently, in the dedicated section above.
     private func makeProveAdvanceStep(_ targets: [FfiProveTarget]) -> FfiMigrationAdvanceStep {
         guard !targets.isEmpty else {
-            return FfiMigrationAdvanceStep(
-                step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE),
-                id: 0,
-                prove_targets: nil,
-                prove_targets_len: 0,
-                next_height: -1,
-                next_kind: 0
-            )
+            return makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_PROVE), id: 0)
         }
         let pointer = UnsafeMutablePointer<FfiProveTarget>.allocate(capacity: targets.count)
         for (index, target) in targets.enumerated() {

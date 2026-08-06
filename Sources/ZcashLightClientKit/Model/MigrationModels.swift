@@ -60,24 +60,6 @@ import Foundation
 /// Per-run, not per-account: whether a migratable balance remains (several successive runs, or
 /// funds received later) is answered by `proposeMigrationTransfers(accountUUID:)` — an empty
 /// schedule means no.
-
-/// One transaction of a ``MigrationAdvanceStep/prove(transactions:)`` batch: the transaction to
-/// prove, with the kind that routes it — a verbatim marshal of the upstream engine's
-/// `ProveTarget`. A preparation may prove and broadcast at the same wake-up; a transfer proves
-/// now and broadcasts in its own later session (see the type doc's discharge mapping).
-public struct MigrationProveTarget: Equatable, Sendable {
-    /// The engine's stable transaction id.
-    public let id: UInt32
-    /// The preparation/transfer distinction, with its payload.
-    public let kind: MigrationTransactionStatus.Kind
-
-    /// Creates a `MigrationProveTarget`.
-    public init(id: UInt32, kind: MigrationTransactionStatus.Kind) {
-        self.id = id
-        self.kind = kind
-    }
-}
-
 public enum MigrationAdvanceStep: Equatable, Sendable {
     /// The WHOLE provable set is ready to be proved in one synced session (upstream #2939):
     /// earliest-ready first, never empty, preparations and transfers possibly mixed. Proving
@@ -100,6 +82,23 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     /// remains, show the status and use `restartCurrentMigrationStep` (see the type doc's
     /// mapping).
     case requiresAttention(id: UInt32)
+}
+
+/// One transaction of a ``MigrationAdvanceStep/prove(transactions:)`` batch: the transaction to
+/// prove, with the kind that routes it — a verbatim marshal of the upstream engine's
+/// `ProveTarget`. A preparation may prove and broadcast at the same wake-up; a transfer proves
+/// now and broadcasts in its own later session (see the type doc's discharge mapping).
+public struct MigrationProveTarget: Equatable, Sendable {
+    /// The engine's stable transaction id.
+    public let id: UInt32
+    /// The preparation/transfer distinction, with its payload.
+    public let kind: MigrationTransactionStatus.Kind
+
+    /// Creates a `MigrationProveTarget`.
+    public init(id: UInt32, kind: MigrationTransactionStatus.Kind) {
+        self.id = id
+        self.kind = kind
+    }
 }
 
 /// The kind of upcoming work named by a ``MigrationAdvance/next`` outlook — a verbatim marshal of
