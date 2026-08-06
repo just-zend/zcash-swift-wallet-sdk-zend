@@ -241,6 +241,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zcashlc_slipstream_wallet_summary` no longer returns the empty sentinel during the ~30 s gap after
   a restore completes, and once NU6.3 is active reports the collapsed recovery balance in the
   Ironwood pool rather than Orchard.
+- Committing (signing) a migration plan is linear in the wallet's note count again: the FFI's
+  wallet adapter now snapshots the spendable-note selection per call (the same fix librustzcash
+  #2946 applied to the upstream adapter), where it previously re-ran the full selection for every
+  input being signed — on a large wallet, accepting a plan could stall for many minutes and get
+  the app killed.
 
 ## 2.8.0-rc.2 - 2026-07-28
 

@@ -19,6 +19,7 @@
 //! [`crate::migration_finalize`].
 
 use anyhow::anyhow;
+use core::cell::{Ref, RefCell};
 use incrementalmerkletree::Position;
 use orchard::keys::{FullViewingKey, SpendAuthorizingKey};
 use orchard::note::Note as OrchardNote;
@@ -60,6 +61,13 @@ pub(crate) struct Backend<'a> {
     account: AccountUuid,
     usk: Option<UnifiedSpendingKey>,
     store: PoolMigrations<&'a mut rusqlite::Connection, NetworkParams, SystemClock>,
+    /// The spendable-note snapshot every read is served from, filled on first use — the same
+    /// contract upstream's `WalletMigration` adapter adopted in #2946: the engine addresses a
+    /// note by its index into this sequence, so every read through one adapter must see the same
+    /// set, and resolving each spent note through a fresh selection made signing a large plan
+    /// quadratic in the wallet's note count. Wallet changes are observed by constructing a fresh
+    /// adapter (every FFI entry point does).
+    spendable: RefCell<Option<Vec<SpendableNote>>>,
 }
 
 impl<'a> Backend<'a> {
@@ -86,6 +94,7 @@ impl<'a> Backend<'a> {
                 account,
             )
             .map_err(|e| anyhow!("opening the account-scoped migration store failed: {e}"))?,
+            spendable: RefCell::new(None),
         })
     }
 
@@ -123,31 +132,42 @@ impl<'a> Backend<'a> {
     }
 
     /// The account's spendable Orchard notes as `(note, tree position, value)`, sorted by tree
-    /// position so the index is stable across calls (the engine maps a value index from
-    /// `spendable_orchard_note_values` back to a note by the same order).
-    pub(crate) fn spendable_orchard_notes(&self) -> anyhow::Result<Vec<SpendableNote>> {
-        let target = self.selection_target()?;
-        let received = self
-            .wallet
-            .select_unspent_notes(
-                self.account,
-                &[ShieldedPool::Orchard],
-                target,
-                &[],
-                LockFilter::Policy(&LockedInputPolicy::Exclude),
-            )
-            .map_err(|e| anyhow!("spendable-note selection failed: {e}"))?;
-        let mut notes: Vec<SpendableNote> = received
-            .orchard()
-            .iter()
-            .map(|rn| {
-                let note = *rn.note();
-                let value = note.value().inner();
-                (note, rn.note_commitment_tree_position(), value)
-            })
-            .collect();
-        notes.sort_by_key(|(_, pos, _)| *pos);
-        Ok(notes)
+    /// position and SNAPSHOTTED on the first read: the engine addresses a note by its index into
+    /// this sequence (a plan's `PrepInput::Wallet { index, .. }` names the selection its planning
+    /// call observed), so every read through one adapter must see the same set. The snapshot also
+    /// keeps a commit linear in the plan's inputs — resolving each spent note through a fresh
+    /// selection made signing a large plan quadratic in the wallet's note count (librustzcash
+    /// #2946 fixed the same defect in the upstream `WalletMigration` adapter; this mirrors it).
+    ///
+    /// Wallet changes are observed by constructing a fresh adapter; this one's selection is fixed.
+    pub(crate) fn spendable_orchard_notes(&self) -> anyhow::Result<Ref<'_, [SpendableNote]>> {
+        if self.spendable.borrow().is_none() {
+            let target = self.selection_target()?;
+            let received = self
+                .wallet
+                .select_unspent_notes(
+                    self.account,
+                    &[ShieldedPool::Orchard],
+                    target,
+                    &[],
+                    LockFilter::Policy(&LockedInputPolicy::Exclude),
+                )
+                .map_err(|e| anyhow!("spendable-note selection failed: {e}"))?;
+            let mut notes: Vec<SpendableNote> = received
+                .orchard()
+                .iter()
+                .map(|rn| {
+                    let note = *rn.note();
+                    let value = note.value().inner();
+                    (note, rn.note_commitment_tree_position(), value)
+                })
+                .collect();
+            notes.sort_by_key(|(_, pos, _)| *pos);
+            *self.spendable.borrow_mut() = Some(notes);
+        }
+        Ok(Ref::map(self.spendable.borrow(), |cached| {
+            cached.as_deref().expect("filled above")
+        }))
     }
 
     /// The account's Orchard full viewing key, from its STORED unified full viewing key (not the
@@ -173,9 +193,9 @@ impl MigrationBackend for Backend<'_> {
 
     fn spendable_orchard_note_values(&self) -> Result<Vec<Zatoshis>, Self::Error> {
         self.spendable_orchard_notes()?
-            .into_iter()
+            .iter()
             .enumerate()
-            .map(|(i, (_, _, value))| {
+            .map(|(i, &(_, _, value))| {
                 Zatoshis::from_u64(value)
                     .map_err(|_| anyhow!("spendable note {i} has an out-of-range value"))
             })

@@ -5596,9 +5596,13 @@ mod tests {
     /// behind the `test-dependencies` feature this crate does not enable) using only the
     /// non-test-gated `orchard`/`zcash_note_encryption` APIs that helper itself is built from —
     /// the same relationship [`fixture_transfer_pczt_bytes`] already has to a hand-built PCZT.
+    /// `seed_offset` displaces the deterministic RNG seed, so [`fund_fixture_account_with_orchard_notes`]
+    /// can fund several distinct notes (distinct nullifier/rho/rseed) in one call; `0` reproduces
+    /// the single-note fixture's original, byte-for-byte fixed output.
     fn fixture_orchard_compact_action(
         usk: &zcash_keys::keys::UnifiedSpendingKey,
         value_zat: u64,
+        seed_offset: u64,
     ) -> zcash_client_backend::proto::compact_formats::CompactOrchardAction {
         use orchard::keys::{FullViewingKey, Scope};
         use orchard::note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho};
@@ -5611,7 +5615,7 @@ mod tests {
         let fvk = FullViewingKey::from(usk.orchard());
         let recipient = fvk.address_at(0u32, Scope::External);
 
-        let mut rng = StdRng::seed_from_u64(0x1806_0002);
+        let mut rng = StdRng::seed_from_u64(0x1806_0002 + seed_offset);
         // The wire `nullifier` field IS the spend half of this same action: by construction the
         // new note's `rho` always equals the nullifier revealed by the action's spend
         // (`Rho::from_nf_old(nf) == Rho(nf.inner())` -- same underlying field element, just
@@ -5659,20 +5663,33 @@ mod tests {
         }
     }
 
-    /// Funds the account whose spending key is `usk_bytes` ([`Era::Orchard`]-encoded exactly as
-    /// [`create_fixture_account_with_usk`] returns it) with one real, spendable Orchard note of
-    /// `value_zat`, by scanning ONE synthetic compact block at height 1 — right after the empty
-    /// birthday frontier every [`create_fixture_account_with_usk`] fixture starts from — through
-    /// the production [`scan_cached_blocks`] entry point: the same trial-decryption and
-    /// commitment-tree insert the real sync pipeline runs, just fed an in-memory block instead of
-    /// the filesystem cache `zcashlc_scan_blocks` reads from (so no FS block-metadata-db setup is
-    /// needed for one block). `value_zat` should be an amount that is not itself a single
+    /// [`fund_fixture_account_with_orchard_notes`] for exactly one note — the common case nearly
+    /// every fixture wallet wants. `value_zat` should be an amount that is not itself a single
     /// canonical ZIP 318 denomination (e.g. not an exact `{1,2,5}·10^k` ZEC amount), so the note
     /// actually needs splitting — exercising preparation transactions, not just a transfer.
     fn fund_fixture_account_with_orchard_note(
         path: &std::path::Path,
         usk_bytes: &[u8],
         value_zat: u64,
+    ) {
+        fund_fixture_account_with_orchard_notes(path, usk_bytes, &[value_zat]);
+    }
+
+    /// Funds the account whose spending key is `usk_bytes` ([`Era::Orchard`]-encoded exactly as
+    /// [`create_fixture_account_with_usk`] returns it) with one real, spendable Orchard note per
+    /// entry of `values_zat`, by scanning ONE synthetic compact block at height 1 — right after
+    /// the empty birthday frontier every [`create_fixture_account_with_usk`] fixture starts from
+    /// — through the production [`scan_cached_blocks`] entry point: the same trial-decryption and
+    /// commitment-tree insert the real sync pipeline runs, just fed an in-memory block instead of
+    /// the filesystem cache `zcashlc_scan_blocks` reads from (so no FS block-metadata-db setup is
+    /// needed for one block). Each note is its own transaction (txid `[0xAB + i; 32]`, distinct
+    /// nullifier/rho/rseed via [`fixture_orchard_compact_action`]'s `seed_offset = i`), so the
+    /// wallet ends up with `values_zat.len()` independently addressable spendable notes after the
+    /// one scan — needed to exercise ordering/snapshot behavior a single note cannot.
+    fn fund_fixture_account_with_orchard_notes(
+        path: &std::path::Path,
+        usk_bytes: &[u8],
+        values_zat: &[u64],
     ) {
         use zcash_client_backend::data_api::chain::scan_cached_blocks;
         use zcash_client_backend::proto::compact_formats::{
@@ -5685,22 +5702,28 @@ mod tests {
 
         let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
             .expect("the fixture usk decodes");
-        let action = fixture_orchard_compact_action(&usk, value_zat);
 
-        let ctx = CompactTx {
-            index: 1,
-            txid: vec![0xABu8; 32],
-            actions: vec![action],
-            ..Default::default()
-        };
+        let vtx: Vec<CompactTx> = values_zat
+            .iter()
+            .enumerate()
+            .map(|(i, &value_zat)| {
+                let action = fixture_orchard_compact_action(&usk, value_zat, i as u64);
+                CompactTx {
+                    index: (i + 1) as u64,
+                    txid: vec![0xABu8 + i as u8; 32],
+                    actions: vec![action],
+                    ..Default::default()
+                }
+            })
+            .collect();
         let block = CompactBlock {
             height: 1,
             hash: vec![0x11u8; 32],
             prev_hash: vec![0x00u8; 32],
-            vtx: vec![ctx],
+            vtx,
             chain_metadata: Some(ChainMetadata {
                 sapling_commitment_tree_size: 0,
-                orchard_commitment_tree_size: 1,
+                orchard_commitment_tree_size: values_zat.len() as u32,
                 ironwood_commitment_tree_size: 0,
             }),
             ..Default::default()
@@ -5730,9 +5753,135 @@ mod tests {
         .expect("scanning the one fixture block must succeed");
         assert_eq!(
             summary.received_orchard_note_count(),
-            1,
-            "the fixture block's one action must be detected as belonging to this wallet"
+            values_zat.len(),
+            "every funded action must be detected as belonging to this wallet"
         );
+    }
+
+    /// #1806 / MOB-1466 (librustzcash #2946 parity): `Backend::spendable_orchard_notes` must
+    /// serve every read through ONE adapter from a snapshot taken on first use, never re-running
+    /// the wallet's full note selection per call — the quadratic-in-note-count behavior #2946
+    /// fixed upstream in `zcash_pool_migration::wallet::WalletMigration`, which this SDK's own
+    /// `Backend` cannot use (it requires an unconditional spending key; this adapter exists
+    /// precisely to also serve imported hardware-wallet accounts whose `usk` is `None`).
+    ///
+    /// The mutation locks both funded notes through a SECOND wallet connection
+    /// (`zcashlc_migration_lock_residual`, the same kind of reservation a real migration commit
+    /// takes over the notes it is about to spend) — exactly the sort of wallet change a per-call
+    /// re-selection is unsafe against: a plan's `PrepInput::Wallet { index }` names a position in
+    /// the FIRST read's selection, so a later read observing a different set would resolve the
+    /// wrong note (or none) for an index the plan already committed to. The backend under test
+    /// must not observe the lock: a second read through the SAME backend stays identical to the
+    /// first. A FRESH backend, constructed after the lock, must observe it.
+    #[test]
+    fn spendable_orchard_notes_snapshots_per_backend_not_per_call() {
+        use incrementalmerkletree::Position;
+        use orchard::note::ExtractedNoteCommitment;
+        use zcash_pool_migration::engine::MigrationCrypto;
+
+        let path = init_fixture_db("zcashlc_migration_spendable_snapshot");
+        let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_notes(&path, &usk_bytes, &[1_000_000_000, 2_000_000_000]);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+
+        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)
+            .expect("backend construction must succeed");
+
+        let first_snapshot: Vec<(Position, u64)> = {
+            let first = backend
+                .spendable_orchard_notes()
+                .expect("selection must succeed");
+            assert_eq!(
+                first.len(),
+                2,
+                "the fixture funds exactly two spendable notes"
+            );
+            // Index-space stability: `resolve_wallet_note(i)` must name the SAME note
+            // `spendable_orchard_notes()[i]` does, through the SAME backend — the property the
+            // engine's `PrepInput::Wallet { index }` depends on.
+            for (i, &(note, _, value)) in first.iter().enumerate() {
+                let resolved = backend
+                    .resolve_wallet_note(i)
+                    .unwrap_or_else(|e| panic!("resolve_wallet_note({i}) must succeed: {e}"));
+                assert_eq!(
+                    ExtractedNoteCommitment::from(resolved.commitment()).to_bytes(),
+                    ExtractedNoteCommitment::from(note.commitment()).to_bytes(),
+                    "resolve_wallet_note({i}) must name the same note spendable_orchard_notes()[{i}] does"
+                );
+                assert_eq!(
+                    resolved.value().inner(),
+                    value,
+                    "resolve_wallet_note({i})'s value must match the selection's own"
+                );
+            }
+            first.iter().map(|&(_, pos, value)| (pos, value)).collect()
+        };
+
+        // Mutate the wallet through a SECOND connection: lock every currently-spendable note,
+        // exactly what a real migration commit does when it reserves the notes it is about to
+        // spend.
+        let locked = unsafe {
+            zcashlc_migration_lock_residual(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(
+            locked, 3_000_000_000,
+            "locking must report both notes' total value"
+        );
+
+        // SAME backend: a second read must be served from the snapshot, unaffected by the lock
+        // the second connection just took.
+        let second_snapshot: Vec<(Position, u64)> = {
+            let second = backend
+                .spendable_orchard_notes()
+                .expect("the cached selection must still succeed");
+            second.iter().map(|&(_, pos, value)| (pos, value)).collect()
+        };
+        assert_eq!(
+            first_snapshot, second_snapshot,
+            "a second read through the SAME backend must be unchanged by the second \
+             connection's note lock"
+        );
+
+        // A FRESH backend (same wallet connection, new instance) must observe the mutation.
+        drop(backend);
+        let fresh = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)
+            .expect("backend construction must succeed");
+        let third = fresh
+            .spendable_orchard_notes()
+            .expect("the fresh selection must succeed");
+        assert!(
+            third.is_empty(),
+            "a fresh backend must see every note the second connection locked, got {} notes",
+            third.len()
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Item 1 of the plan-cache supersession contract: `plan_and_cache` → `commit_or_resume`
