@@ -89,6 +89,29 @@ impl<'a> Backend<'a> {
         })
     }
 
+    /// The account's most recent migration WHATEVER its status — the store's history-inclusive
+    /// read. `PoolMigrationRead::get_migration` (this backend's trait impl) is PENDING-ONLY
+    /// upstream: a terminal run is retained history and leaves that accessor, so every SDK read
+    /// that must keep serving a completed, failed, or cancelled run (progress, statuses, the
+    /// advance conduit's terminal `Complete` answer) reads through here instead.
+    pub(crate) fn latest_migration(&self) -> anyhow::Result<Option<MigrationState>> {
+        self.store
+            .latest_migration()
+            .map_err(|e| anyhow!("migration store read failed: {e}"))
+    }
+
+    /// Cancel the account's pending migration through the store: releases every note reservation
+    /// its never-broadcast transactions hold and moves the record to the terminal `Cancelled`
+    /// status, in one database transaction. With no pending migration it still performs the
+    /// repair half on the latest retained record (releasing reservations, e.g. of a run an older
+    /// client recorded `Failed` without unlocking).
+    pub(crate) fn cancel_migration(&mut self) -> anyhow::Result<()> {
+        self.store
+            .cancel_migration()
+            .map(|_outcome| ())
+            .map_err(|e| anyhow!("cancelling the migration failed: {e}"))
+    }
+
     /// The target height for note selection (the chain tip plus one).
     fn selection_target(&self) -> anyhow::Result<TargetHeight> {
         let tip = self

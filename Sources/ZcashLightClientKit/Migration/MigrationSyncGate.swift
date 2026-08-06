@@ -9,24 +9,26 @@ import Foundation
 /// The persisted, per-account gate that decides whether ordinary wallet sync must pause for the
 /// benefit of an in-flight migration.
 ///
-/// Three independent reasons block sync:
-/// 1. **Ready broadcast** — a PROVED, schedule-due, unexpired, valid transfer is servable RIGHT
-///    NOW: the one situation where the wallet should broadcast instead of starting a sync (ZIP
-///    318's broadcast-or-sync session split). Engine-derived (`migrationHasReadyBroadcast`) and
-///    passed in as `hasReadyBroadcast`. Deliberately NOT the broader "overdue" query
-///    (`migrationHasOverdueTransfers`): a due-but-unproved `Signed` row needs MORE syncing (its
-///    proof is produced at sync wake-ups), so it must never hold sync hostage.
-/// 2. **Privacy buffer** — for a fixed window after each broadcast, sync stays paused so the
+/// Two independent reasons block sync — both PAST/PRESENT-looking, never future:
+/// 1. **Privacy buffer** — for a fixed window after each broadcast, sync stays paused so the
 ///    broadcast is not correlated with a fresh sync. This is the `resumeAt` timestamp persisted here.
-/// 3. **Broadcast in flight** — from just before a migration submit hits the network until its
+/// 2. **Broadcast in flight** — from just before a migration submit hits the network until its
 ///    outcome is recorded, sync must not run: the engine's own in-flight sweep (inside
 ///    `migrationAdvanceStep`) would otherwise meet a transfer that is neither recorded broadcast
 ///    nor yet visible on chain. This is the `inFlightUntil` timestamp persisted here; a crash
 ///    between submit and record leaves the marker behind, and it self-expires
 ///    ``broadcastInFlightGuardDuration`` (120 s) after it was set.
 ///
-/// The gate owns the privacy-buffer and in-flight halves; the ready-broadcast half is supplied by
-/// the caller (and, for the reactive `blockedStream`, by an injected `readyBroadcastProvider`).
+/// A THIRD condition — "ready broadcast": block sync whenever a proved, schedule-due transfer was
+/// servable — lived here until 2026-08-05 and was REMOVED on danny + nuttycom's ruling (relayed by
+/// Lukas): sync is held only when a broadcast happened recently in the PAST (the buffer, and the
+/// submit-to-record marker), never because one is expected in the FUTURE. The forward-looking
+/// clause was also field-implicated in a live wedge: it blocked the very sync whose scanned
+/// progress the pending broadcast needed, freezing an awake session for 50+ minutes (FIND-5,
+/// campaign 7/8a receipts). The broadcast-or-sync session split itself is unaffected — an app
+/// open whose `next_step` answers `.broadcast` runs a no-sync delivery session (the consumer's
+/// visit classification), which is a statement about THAT session, not a hold on sync in general.
+///
 /// State is durably persisted to an atomically written JSON file, but every read in this process is
 /// served from an in-memory cache (see `cachedResumeAt`/`cachedInFlightUntil`) -- the file exists
 /// for durability across launches, not as the read path. The other in-memory mutable state is the
@@ -58,7 +60,6 @@ final class MigrationSyncGate: @unchecked Sendable {
     private let bufferDuration: TimeInterval
     private let tickInterval: TimeInterval
     private let now: @Sendable () -> Date
-    private let readyBroadcastProvider: @Sendable () async -> Bool
     private let logger: Logger
     private let blockedSubject: CurrentValueSubject<Bool, Never>
 
@@ -80,9 +81,8 @@ final class MigrationSyncGate: @unchecked Sendable {
     /// The in-memory cache of the persisted privacy-buffer expiry, guarded by `emissionLock`. Loaded
     /// once from the gate file at init; `markBroadcast()` is the only writer thereafter (persists to
     /// the file first, then updates this cache -- see `markBroadcast()` for why the file must win
-    /// that race). Every read in this process (`currentResumeAt()`, hence
-    /// `currentlyBlocked(hasReadyBroadcast:)` and `recompute()`) serves this cache rather than re-reading
-    /// the file.
+    /// that race). Every read in this process (`currentResumeAt()`, hence `currentlyBlocked()`
+    /// and `recompute()`) serves this cache rather than re-reading the file.
     ///
     /// A plain lock-guarded value suffices here, unlike `publish(_:generation:)`'s generation
     /// ordering: the writers (`markBroadcast()`, `markBroadcastInFlight()`,
@@ -149,9 +149,6 @@ final class MigrationSyncGate: @unchecked Sendable {
     ///   - tickInterval: how often the reactive stream re-evaluates (time passing alone can flip the
     ///     answer even with no data change). Injectable for tests.
     ///   - now: the clock. Injectable for tests.
-    ///   - readyBroadcastProvider: supplies the engine's "has a ready broadcast" answer (a proved,
-    ///     due, unexpired, valid transfer is servable right now) for the reactive stream; must
-    ///     degrade to `false` (never throw) on failure.
     ///   - logger: sink for the single warning emitted on a corrupt read or a failed write.
     init(
         directory: URL,
@@ -159,7 +156,6 @@ final class MigrationSyncGate: @unchecked Sendable {
         bufferDuration: TimeInterval,
         tickInterval: TimeInterval = 15,
         now: @escaping @Sendable () -> Date = { Date() },
-        readyBroadcastProvider: @escaping @Sendable () async -> Bool,
         logger: Logger
     ) {
         let url = directory.appendingPathComponent(Self.fileName(accountUUID: accountUUID))
@@ -167,7 +163,6 @@ final class MigrationSyncGate: @unchecked Sendable {
         self.bufferDuration = bufferDuration
         self.tickInterval = tickInterval
         self.now = now
-        self.readyBroadcastProvider = readyBroadcastProvider
         self.logger = logger
 
         do {
@@ -182,9 +177,9 @@ final class MigrationSyncGate: @unchecked Sendable {
         // its plausible window at this load (the A13 backwards-clock-step guard — see
         // `clampedInFlightUntil(_:now:)`), so a marker persisted before a clock step back expires
         // within `broadcastInFlightGuardDuration` of THIS launch rather than wedging sync for the
-        // whole displacement. Also seeds the synchronous subscribe-time value (buffer + in-flight
-        // only -- see `blockedStream`'s documented caveat: the first tick refines it with the real
-        // ready-broadcast signal) so subscribers get an immediate value.
+        // whole displacement. Also seeds the synchronous subscribe-time value, which is EXACT —
+        // the gate's inputs are entirely these two persisted instants — so subscribers get an
+        // immediate, correct value.
         let loadedAt = now()
         let initialInputs = Self.readGateInputs(fileURL: url, logger: logger)
         self.cachedResumeAt = initialInputs.resumeAt
@@ -192,7 +187,6 @@ final class MigrationSyncGate: @unchecked Sendable {
         self.cachedInFlightUntil = clampedInFlightUntil
         let initialBlocked = Self.isBlocked(
             now: loadedAt,
-            hasReadyBroadcast: false,
             resumeAt: initialInputs.resumeAt,
             inFlightUntil: clampedInFlightUntil
         )
@@ -223,7 +217,7 @@ final class MigrationSyncGate: @unchecked Sendable {
     /// instance's own init so the on-disk format has a single reader. The raw file values are
     /// returned UNCLAMPED — this static read has nowhere to persist a clamp, so an
     /// implausibly-far-future in-flight marker (a backwards clock-step artifact) is instead
-    /// neutralized at evaluation time by ``isBlocked(now:hasReadyBroadcast:resumeAt:inFlightUntil:)``'s
+    /// neutralized at evaluation time by ``isBlocked(now:resumeAt:inFlightUntil:)``'s
     /// plausible-window rule.
     static func persistedGateInputs(
         directory: URL,
@@ -245,10 +239,10 @@ final class MigrationSyncGate: @unchecked Sendable {
         inFlightUntil.map { min($0, now.addingTimeInterval(broadcastInFlightGuardDuration)) }
     }
 
-    /// The gate's core predicate: sync is blocked when a ready broadcast is waiting (a proved,
-    /// due, unexpired, valid transfer the wallet should serve instead of syncing), while the
-    /// privacy buffer has not yet elapsed, or while an unexpired in-flight broadcast marker
-    /// exists. Pure, so it is exhaustively table-testable.
+    /// The gate's core predicate: sync is blocked while the privacy buffer has not yet elapsed,
+    /// or while an unexpired in-flight broadcast marker exists — past/present conditions only
+    /// (see the type doc for the removed forward-looking third clause). Pure, so it is
+    /// exhaustively table-testable.
     ///
     /// The in-flight clause honors the marker only within its PLAUSIBLE window (`inFlightUntil`
     /// at most ``broadcastInFlightGuardDuration`` in the future — see
@@ -258,10 +252,7 @@ final class MigrationSyncGate: @unchecked Sendable {
     /// a fresh block forever. The marker is designed to be safe to leak, so failing open on clock
     /// weirdness matches its contract; the in-process cache paths additionally clamp (load +
     /// `currentInFlightUntil()`), which keeps the protective window instead.
-    static func isBlocked(now: Date, hasReadyBroadcast: Bool, resumeAt: Date?, inFlightUntil: Date?) -> Bool {
-        if hasReadyBroadcast {
-            return true
-        }
+    static func isBlocked(now: Date, resumeAt: Date?, inFlightUntil: Date?) -> Bool {
         if let inFlightUntil,
             now < inFlightUntil,
             inFlightUntil.timeIntervalSince(now) <= Self.broadcastInFlightGuardDuration {
@@ -380,12 +371,11 @@ final class MigrationSyncGate: @unchecked Sendable {
         return now() < inFlightUntil
     }
 
-    /// Whether sync is currently blocked, combining the supplied `hasReadyBroadcast` with the
-    /// persisted privacy buffer and in-flight broadcast marker. Never throws.
-    func currentlyBlocked(hasReadyBroadcast: Bool) -> Bool {
+    /// Whether sync is currently blocked by the persisted privacy buffer or the in-flight
+    /// broadcast marker. Never throws, never suspends — the gate's inputs are entirely local.
+    func currentlyBlocked() -> Bool {
         Self.isBlocked(
             now: now(),
-            hasReadyBroadcast: hasReadyBroadcast,
             resumeAt: currentResumeAt(),
             inFlightUntil: currentInFlightUntil()
         )
@@ -396,17 +386,10 @@ final class MigrationSyncGate: @unchecked Sendable {
     /// expiry, see `nextRecomputeDelay`) — and after every ``markBroadcast()``, and collapses
     /// consecutive duplicates.
     /// Internally synchronized: the ticker loop and every `markBroadcast()`-triggered recompute can
-    /// be in flight concurrently (both suspend awaiting the injected `readyBroadcastProvider`), but every
-    /// send is serialized and generation-ordered -- latest-wins, so a recompute that started earlier
+    /// be in flight concurrently, and every send is serialized and generation-ordered -- latest-wins, so a recompute that started earlier
     /// but finishes later after a fresher one already published is dropped rather than emitted as a
     /// stale overwrite. See `publish(_:generation:)`.
     ///
-    /// - Important: The synchronous subscribe-time seed reflects only the persisted privacy buffer
-    ///   and in-flight marker (see the `hasReadyBroadcast: false` seed in `init`) --
-    ///   ready-broadcast detection arrives with the first asynchronous recompute. On relaunch with
-    ///   a ready broadcast and no active buffer, the first emission can therefore briefly read
-    ///   `false` while a fresh `isBlocked`/`currentlyBlocked` call (which always consults the
-    ///   ready-broadcast answer) already reads `true`.
     /// - Important: Subscription-gated (finding 14): the periodic ticker only runs while at least one
     ///   subscriber is attached (`subscriberAttached()`/`subscriberDetached()`, via `handleEvents`
     ///   below), so a `blockedStream` with no subscribers costs nothing beyond the seed already
@@ -455,8 +438,7 @@ final class MigrationSyncGate: @unchecked Sendable {
     /// could leave a cleared gate unnoticed for a whole interval. On a foregrounded device that
     /// read as a dead half-minute between "gate expired" and "sync resumed", with the app doing
     /// nothing wrong. Each iteration now sleeps only until the SOONEST future boundary (plus a
-    /// small epsilon so the recompute lands strictly after the flip), capped at `tickInterval`;
-    /// ready-broadcast flips carry no deadline and keep the interval cadence as before.
+    /// small epsilon so the recompute lands strictly after the flip), capped at `tickInterval`.
     private func startTicking() {
         tickerTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -508,19 +490,17 @@ final class MigrationSyncGate: @unchecked Sendable {
     private func recompute() async {
         let generation = drawNextGeneration()
 
-        let hasReadyBroadcast = await readyBroadcastProvider()
         let blocked = Self.isBlocked(
             now: now(),
-            hasReadyBroadcast: hasReadyBroadcast,
             resumeAt: currentResumeAt(),
             inFlightUntil: currentInFlightUntil()
         )
         publish(blocked, generation: generation)
     }
 
-    /// Snapshots this recompute's generation, under `emissionLock`, at the moment it *starts* --
-    /// before the `readyBroadcastProvider` suspension point -- so `publish(_:generation:)` can later tell
-    /// whether a later-started recompute has already published.
+    /// Snapshots this recompute's generation, under `emissionLock`, at the moment it *starts*, so
+    /// `publish(_:generation:)` can later tell whether a later-started recompute has already
+    /// published.
     private func drawNextGeneration() -> UInt64 {
         emissionLock.lock()
         defer { emissionLock.unlock() }
@@ -543,7 +523,7 @@ final class MigrationSyncGate: @unchecked Sendable {
     ///
     /// - Warning: That safety is specific to the cancel path. A subscriber's synchronous
     ///   value-handling callback must never call back into `currentResumeAt()`,
-    ///   `currentlyBlocked(hasReadyBroadcast:)`, or `markBroadcast()` from inside its handler for this
+    ///   `currentlyBlocked()`, or `markBroadcast()` from inside its handler for this
     ///   emission: all three acquire `emissionLock`, which -- unlike `subscriptionLock` -- this
     ///   thread is already holding right here, and `NSLock` is non-recursive, so a same-thread
     ///   re-acquisition would deadlock. No shipped subscriber does this today (only cancellation

@@ -11,31 +11,36 @@ Changes are relative to `2.8.0-rc.3`.
 ## Changed
 
 - The librustzcash family rides an interim git pin (the michal/pool-migration-public-next-due
-  branch head: the michal/pool-migration-compressed-spacing-floor branch head plus
-  `MigrationState`'s `next_due_broadcast`/`next_provable` exported as public read-only selection,
-  so this SDK's FFI can delegate its delivery-lane selection instead of reimplementing it) so a
-  wallet's own scheduled migration transactions carry their ZIP 318 classification
-  (`Overview.zip318Kind`) from the moment they are STORED at proving time, instead of only after
-  they mine and are scanned. This is what lets a wallet present its stored-but-unmined migration
-  transactions as labeled in-flight activity. The rev also carries librustzcash #2907 — the
-  engine's advance-path selection (prove/broadcast steps) picks transfers by scheduled height
-  instead of internal id — librustzcash #2910: a broadcast schedule whose slots were missed (for
-  example when the app was closed past several scheduled sends) is re-spread on resume instead of
-  coming due all at once — librustzcash #2927: the step that re-spread releases lands on scanned
-  chain data (and the re-spread fires only when more of the schedule is due behind it), so a
-  wallet driven in short foreground sessions can actually prove and broadcast the released step
-  instead of livelocking with its schedule re-pinned past the scan on every open — and the
-  compressed-schedule spacing floors (`AdvanceConfig::with_compressed_schedule_floors`): two
-  opt-in floors, under the re-spread trigger's overdue-shift tolerance and its release spacing,
-  for a consumer whose committed schedule is compressed below its own wall-clock privacy buffer —
-  this SDK's testnet. Mainnet passes the zero pair on every call, byte-identical to the engine's
-  behavior before the floors existed; the floors take effect on testnet only. It also carries
-  `MigrationState`'s public read-only next-due selection (`next_due_broadcast`/`next_provable`):
-  the engine's own delivery-lane choice, now exposed for a caller to read directly instead of
-  recomputing it client-side — pinned so this SDK's FFI can delegate to it instead of
-  reimplementing the selection. (This branch replaces that delivery-lane selection with the
-  engine's exported reads, so the drive and read lanes now agree by construction.) The pin
-  reverts to published crates at the first rc containing all of it.
+  branch head, rebased onto librustzcash main) so a wallet's own scheduled migration transactions
+  carry their ZIP 318 classification (`Overview.zip318Kind`) from the moment they are STORED at
+  proving time, instead of only after they mine and are scanned. This is what lets a wallet
+  present its stored-but-unmined migration transactions as labeled in-flight activity. The rev
+  also carries librustzcash #2907 — the engine's advance-path selection (prove/broadcast steps)
+  picks transfers by scheduled height instead of internal id — librustzcash #2910: a broadcast
+  schedule whose slots were missed (for example when the app was closed past several scheduled
+  sends) is re-spread on resume instead of coming due all at once — librustzcash #2927: the step
+  that re-spread releases lands on scanned chain data (and the re-spread fires only when more of
+  the schedule is due behind it), so a wallet driven in short foreground sessions can actually
+  prove and broadcast the released step instead of livelocking with its schedule re-pinned past
+  the scan on every open — librustzcash #2936: `advance_migration` returns the verified step
+  together with a next-wake outlook (this FFI marshals the step alone for now) — and the engine's
+  note-locking generation: a proved migration transaction's spent notes are reserved in the
+  wallet database, so an ordinary payment proposed mid-migration can no longer spend a note a
+  stored, proved transfer is already committed to. It also carries `MigrationState`'s public
+  read-only next-due selection (`next_due_broadcast`/`next_provable`): the engine's own
+  delivery-lane choice, now exposed for a caller to read directly instead of recomputing it
+  client-side — pinned so this SDK's FFI can delegate to it instead of reimplementing the
+  selection. (This branch replaces that delivery-lane selection with the engine's exported reads,
+  so the drive and read lanes now agree by construction.) The compressed-schedule spacing floors
+  (`AdvanceConfig::with_compressed_schedule_floors`) left the pinned lineage, and this SDK no
+  longer derives or passes them. The pin reverts to published crates at the first rc containing
+  all of it.
+- Restarting a migration (`restartCurrentMigrationStep`) now cancels the stored run through the
+  engine's own cancel: the run is recorded with the terminal `Cancelled` status (previously
+  `Failed`, which left a deliberate abandonment indistinguishable from a broken run) and every
+  note reservation its never-broadcast transactions held is released in the same store
+  transaction — so the fresh plan the restart previews sees the full balance immediately instead
+  of selecting around notes the abandoned run still holds until their locks expire.
 
 ## Fixed
 

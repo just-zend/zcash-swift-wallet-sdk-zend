@@ -61,12 +61,12 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         ]
 
         for expectedStep in cases {
-            welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = expectedStep
+            welding.migrationAdvanceStepForEstimatedTipReturnValue = expectedStep
 
             let step = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
 
             XCTAssertEqual(step, expectedStep)
-            XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments?.account, accountUUID)
+            XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountUUID)
         }
     }
 
@@ -197,7 +197,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     /// proposal. Hosts must not latch "never migrate again" off `migrationAdvanceStep` alone.
     func testAfterCompleteProposeMigrationTransfersAnswersWhetherAnythingRemains() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = .complete
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = .complete
         welding.migrationProposeTransfersForReturnValue = MigrationSchedule(
             transfers: [],
             estimatedDurationHours: 0,
@@ -492,10 +492,21 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
 
     // MARK: - Forwarding: wallet-scope gate members
 
+    /// D1: the forwarding tests' "engineered-non-default blocked" driver — a gate FILE with a
+    /// live privacy buffer, written where `makeHost`'s storage points so the host's wallet-scope
+    /// predicate reads it. (The old lever — the ready-broadcast probe — died with the gate's
+    /// forward-looking clause, 2026-08-05.)
+    private func writeLiveBufferGateFile(accountUUID: AccountUUID) throws {
+        let fileURL = testGeneralStorageDirectory!
+            .appendingPathComponent(MigrationSyncGate.fileName(accountUUID: accountUUID))
+        let json = "{\"version\":1,\"resumeAtEpochSeconds\":\(Date().addingTimeInterval(3600).timeIntervalSince1970)}"
+        try Data(json.utf8).write(to: fileURL)
+    }
+
     func testIsMigrationSyncBlockedForwardsToHostPredicate() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountUUID)]
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
+        try writeLiveBufferGateFile(accountUUID: accountUUID)
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
 
         let blocked = await synchronizer.isMigrationSyncBlocked()
@@ -508,7 +519,6 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     func testMigrationSyncBlockedStreamForwardsToHostStream() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountUUID)]
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, tickInterval: 0.02))
 
         var received: [Bool] = []
@@ -520,6 +530,14 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
             }
         }
         cancellables.append(cancellable)
+
+        // D1: the flip is driven by the gate FILE now — written only after the seed emission, so
+        // the "fresh host seeds false" precondition stays observable; the host's next 0.02 s
+        // recompute reads the file and flips.
+        while received.isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try writeLiveBufferGateFile(accountUUID: accountUUID)
 
         await fulfillment(of: [sawBlocked], timeout: 5)
         // The inert protocol default only ever emits false; observing true here proves this is
@@ -540,7 +558,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     func testStartThrowsMigrationSyncBlockedWhenHostReportsBlocked() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountUUID)]
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
+        try writeLiveBufferGateFile(accountUUID: accountUUID)
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
         await synchronizer.updateStatus(.stopped)
 
@@ -842,7 +860,6 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
                         bufferDuration: 600,
                         tickInterval: tickInterval,
                         now: { Date() },
-                        readyBroadcastProvider: { (try? await welding.migrationHasReadyBroadcast(for: accountUUID, estimatedTip: nil)) ?? false },
                         logger: logger
                     ),
                     logger: logger

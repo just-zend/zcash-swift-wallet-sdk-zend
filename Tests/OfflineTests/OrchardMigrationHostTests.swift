@@ -42,7 +42,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     /// driving each actor reaches the welding with that actor's own account UUID.
     func testMigrationForAccountCachesPerAccountAndRoutesTheRightUUID() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReturnValue = .waiting
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
         welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
         let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
 
@@ -55,9 +55,9 @@ final class OrchardMigrationHostTests: ZcashTestCase {
 
         // Driving each actor (sequentially) reaches the welding with that actor's own account UUID.
         _ = try await firstA.advanceStep()
-        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments?.account, accountA)
+        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountA)
         _ = try await firstB.advanceStep()
-        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipSpacingFloorsReceivedArguments?.account, accountB)
+        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountB)
     }
 
     // MARK: - Shared broadcaster (single Tor bootstrap across accounts)
@@ -90,6 +90,8 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         let perAccountFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { [testGeneralStorageDirectory, buffer, clock, accountB] accountUUID, broadcaster in
             let accountWelding = ZcashRustBackendWeldingMock()
             accountWelding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+            // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+            accountWelding.migrationTransactionStatusesForReturnValue = []
             accountWelding.migrationExtractBroadcastTxPcztForClosure = { _, _ in
                 if accountUUID == accountB {
                     accountBReachedTheBroadcaster.fulfill()
@@ -107,7 +109,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
                     bufferDuration: buffer,
                     tickInterval: 3600,
                     now: { clock!.now },
-                    readyBroadcastProvider: { false },
                     logger: logger
                 ),
                 logger: logger
@@ -170,7 +171,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
             bufferDuration: buffer,
             tickInterval: 3600,
             now: { [clock] in clock!.now },
-            readyBroadcastProvider: { false },
             logger: logger
         )
         dormantGateB.markBroadcast()
@@ -202,49 +202,22 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     /// The wallet-scope gate consults the READY-broadcast predicate (D1): a proved, due transfer
     /// on any enumerated account blocks sync — and per U8 the scanned tip is asked first, so a
     /// `true` scanned answer never pays for the block-rate sample read.
-    func testIsSyncBlockedBlocksOnAReadyBroadcastWithoutReadingSamplesWhenScannedAnswers() async throws {
+    /// D1 REVERSAL PIN at wallet scope: a servable ready broadcast no longer blocks sync, and
+    /// the wallet-scope predicate consults neither the probe nor the estimate — its whole
+    /// second pass died with the gate's forward-looking clause.
+    func testIsSyncBlockedIgnoresReadyBroadcastsAcrossAllAccounts() async throws {
         let welding = ZcashRustBackendWeldingMock()
-        welding.listAccountsReturnValue = [makeAccount(accountA)]
+        welding.listAccountsReturnValue = [makeAccount(accountA), makeAccount(accountB)]
         welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
         let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
 
         let blocked = await host.isSyncBlocked()
 
-        XCTAssertTrue(blocked)
-        XCTAssertEqual(welding.migrationHasReadyBroadcastForEstimatedTipCallsCount, 1)
-        XCTAssertNil(welding.migrationHasReadyBroadcastForEstimatedTipReceivedArguments?.estimatedTip)
-        XCTAssertFalse(welding.migrationBlockRateSamplesWindowCalled, "a true scanned answer must skip the estimate")
+        XCTAssertFalse(blocked, "sync holds only for past/present broadcasts (gate files, live views)")
+        XCTAssertFalse(welding.migrationHasReadyBroadcastForEstimatedTipCalled, "no gate path consults the probe anymore")
+        XCTAssertFalse(welding.migrationBlockRateSamplesWindowCalled, "the estimate pass is deleted")
     }
 
-    /// U8's second half at wallet scope: with every scanned answer `false`, the estimate is
-    /// projected ONCE (the samples are wallet-scoped) and each account is re-asked with it — an
-    /// estimate-accelerated ready broadcast then blocks.
-    func testIsSyncBlockedProjectsTheEstimateOnceAndReAsksEveryAccount() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        welding.listAccountsReturnValue = [makeAccount(accountA), makeAccount(accountB)]
-        let sampleTime = referenceDate.addingTimeInterval(-150)
-        welding.migrationBlockRateSamplesWindowReturnValue = [
-            MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
-        ]
-        var receivedAsks: [(account: AccountUUID, estimatedTip: BlockHeight?)] = []
-        welding.migrationHasReadyBroadcastForEstimatedTipClosure = { account, estimatedTip in
-            receivedAsks.append((account: account, estimatedTip: estimatedTip))
-            // Scanned answers are false; only account B is due under the estimate.
-            return estimatedTip != nil && account == self.accountB
-        }
-        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
-
-        let blocked = await host.isSyncBlocked()
-
-        XCTAssertTrue(blocked, "an estimate-accelerated ready broadcast on any account must block sync")
-        XCTAssertEqual(welding.migrationBlockRateSamplesWindowCallsCount, 1, "the wallet-scoped samples are read exactly once")
-        XCTAssertEqual(receivedAsks.filter { $0.estimatedTip == nil }.count, 2, "both accounts are asked at the scanned tip first")
-        // The frozen fake clock makes the projection deterministic: height + floor(150/75) (U7).
-        XCTAssertTrue(
-            receivedAsks.filter { $0.estimatedTip != nil }.allSatisfy { $0.estimatedTip == 3_000_002 },
-            "the estimate re-asks must carry the clock-injected projection; got \(receivedAsks)"
-        )
-    }
 
     /// A8: a mark whose gate-FILE write failed (the gate directory is made read-only, so
     /// `markBroadcast()`'s persist fails while its in-memory cache updates) must still block the
@@ -269,7 +242,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
                 bufferDuration: bufferDuration,
                 tickInterval: 3600,
                 now: { clockValue.now },
-                readyBroadcastProvider: { false },
                 logger: logger
             )
             capturedGates.append(gate)
@@ -341,6 +313,8 @@ final class OrchardMigrationHostTests: ZcashTestCase {
             txid: Data(repeating: 0xAB, count: 32),
             pczt: Data([0x01, 0x02])
         ))
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
 
@@ -384,7 +358,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
             bufferDuration: buffer,
             tickInterval: 3600,
             now: { [clock] in clock!.now },
-            readyBroadcastProvider: { false },
             logger: logger
         )
         dormantGateD.markBroadcast()
@@ -557,7 +530,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
                     bufferDuration: bufferDuration,
                     tickInterval: gateTickInterval,
                     now: { clockValue.now },
-                    readyBroadcastProvider: { (try? await welding.migrationHasReadyBroadcast(for: accountUUID, estimatedTip: nil)) ?? false },
                     logger: logger
                 ),
                 logger: logger
