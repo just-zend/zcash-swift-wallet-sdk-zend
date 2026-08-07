@@ -310,14 +310,49 @@ actor OrchardMigration {
     }
 
 
-    /// Proves every migration transaction whose anchor the wallet can resolve right now and
-    /// returns how many were proved (`0` is the ordinary "nothing left to prove" answer). Run it
-    /// at sync wake-ups (``syncWakeups()``), never on the broadcast path — proving needs the
-    /// wallet's commitment tree and takes real time, while a broadcast session must stay a pure
-    /// delivery step. A straight delegation to the welding proving sweep, bound to this actor's
-    /// own account.
+    /// Proves every migration transaction the engine currently offers for proving and returns how
+    /// many were proved (`0` is the ordinary "nothing left to prove" answer). Run it at sync
+    /// wake-ups (``syncWakeups()``), never on the broadcast path — proving needs the wallet's
+    /// commitment tree and takes real time, while a broadcast session must stay a pure delivery
+    /// step.
+    ///
+    /// THE SWEEP IS A LOOP OVER THE DRIVE, not a single call that decides for itself what to
+    /// prove: ``advanceStep(useEstimatedTip:)`` is the top-level call and the prove executor only
+    /// discharges the ``MigrationAdvanceStep/prove(transactions:)`` batch it returns. Proving a batch can unblock
+    /// rows that were not in it, so the loop re-advances after each productive pass and stops as
+    /// soon as a pass proves nothing — the batch is exhausted, or its remainder is transiently
+    /// unprovable and a later wake-up will retry.
+    ///
+    /// ANY OTHER STEP ENDS THE SWEEP with the count so far. Most notably a
+    /// ``MigrationAdvanceStep/broadcast(id:)``: a due broadcast outranks proving in the engine's
+    /// own precedence, which is what lets a woken session deliver without ever paying proving
+    /// latency (ZIP 318 permits a sync session to broadcast). This call never broadcasts — the
+    /// caller's own delivery pass handles or defers it.
+    ///
+    /// IT ADVANCES AT THE SCANNED TIP (`useEstimatedTip: false`): the sweep runs as the wallet
+    /// scans, and only the delivery lane accepts a wall-clock estimate. The estimate has no
+    /// acceleration to offer a sweep — prove-readiness is gated on an anchor the wallet must have
+    /// SCANNED, which no projection brings forward — so its only two effects here are
+    /// decelerations: an earlier broadcast-precedence stop, and an earlier (and PERSISTED)
+    /// ZIP 318 re-spread. Worse, they would desynchronize the two lanes: with
+    /// `executeNextPendingTransfer`'s own default judging at the scanned tip, an estimate-advanced
+    /// sweep inside the estimate's lead window sees `.broadcast` and proves nothing while the
+    /// delivery lane sees nothing due — and neither lane progresses until the scan catches up.
     func finalizeReadyTransfers() async throws -> Int {
-        try await welding.migrationProvePending(for: accountUUID)
+        var totalProved = 0
+        while true {
+            guard case .prove(let transactions)? = try await advanceStep(useEstimatedTip: false)?.step else {
+                return totalProved
+            }
+            let proved = try await welding.migrationProveTransactions(
+                ids: transactions.map(\.id),
+                for: accountUUID
+            )
+            guard proved > 0 else {
+                return totalProved
+            }
+            totalProved += proved
+        }
     }
 
     // MARK: - Chain-tip estimation

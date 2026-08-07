@@ -6,7 +6,7 @@
 //! [`crate::migration_finalize`] proves transactions as soon as they become provable (ZIP 374
 //! deferred anchors/witnesses, resolved through the upstream prover — transfers against their
 //! drawn ZIP 318 boundary anchor, preparations against the wallet's scanned tip; see its module
-//! doc), driven by [`zcashlc_migration_prove_pending`] rather than by the broadcast path;
+//! doc), driven by [`zcashlc_migration_prove_transactions`] rather than by the broadcast path;
 //! [`crate::migration_plan_cache`] carries the previewed plan from propose to commit.
 //! This module keeps the platform-facing C ABI of the v1 integration: the same entry points, the
 //! same `#[repr(C)]` DTOs, the same sentinels — the engine swap is absorbed here, with two
@@ -1245,43 +1245,68 @@ fn prove_one(
     }
 }
 
-/// Proves every row that can be proved right now, persisting each, and returns how many were
-/// proved.
+/// Proves the NAMED rows, persisting each, and returns how many were proved.
+///
+/// The ids are an instruction, not a query: they are the batch a prior
+/// [`zcashlc_migration_advance_step`] returned as its `Prove` step, already verified against the
+/// store's satisfiability oracle and ordered oldest-anchor-first by the drive that produced them.
+/// THIS FUNCTION NEVER CRANKS THE DRIVE — see [`drive_advance`]'s invariant. Which rows are worth
+/// proving, and whether a due broadcast outranks proving at all, are the advance's decisions; the
+/// sweep only executes what it was told.
 ///
 /// This is the opportunistic seam: a transaction's anchor becomes witnessable long before its
 /// broadcast schedule arrives, so proofs are produced as the wallet scans rather than on the
-/// delivery path — by broadcast time there is nothing left to do but broadcast. A row the wallet
-/// cannot prove yet (its anchor not scanned/retained) is SKIPPED, not fatal and not a reason to
-/// stop: the rows behind it still prove, and the skipped row is retried by the next sweep.
+/// delivery path — by broadcast time there is nothing left to do but broadcast.
 ///
-/// The next candidate is upstream's own read, [`MigrationState::next_provable`] — the drive's
-/// `(anchor_boundary | scheduled_height, id)`-min, oldest-anchor-first — with `deferred` passed
-/// straight through as its `skip`: exactly the call-local `set_aside` exclusion the drive loop
-/// itself uses, so a row this sweep already found transiently unprovable is not re-offered within
-/// the same call.
+/// TWO KINDS OF SKIP, neither fatal and neither a reason to stop — the rows behind still prove:
+///
+/// - A row that is no longer `Signed` (already `Proved` by an earlier chunk, broadcast, mined, or
+///   awaiting a signature) is passed over. A STALE INSTRUCTION IS THEREFORE SAFE: the engine
+///   re-offers work it has not recorded on the next crank, so acting on an out-of-date batch can
+///   at worst do nothing.
+/// - A row the wallet cannot prove YET (its anchor witness not scanned/retained) is left `Signed`
+///   for a later call, which the next crank re-offers among the still-unproved remainder.
+///
+/// A row that only becomes provable BECAUSE an earlier member proved is NOT picked up here: the
+/// ids are a snapshot, not re-derived mid-call. The caller advances again to collect it.
 ///
 /// `prove` is [`prove_one`] in production; tests substitute the generic
 /// [`migration_finalize::prove_due_transaction`] seam with a recording/failing test prover plus a
-/// fixture-store persist.
-fn prove_pending_rows(
+/// fixture-store persist. It takes `ctx` as a parameter rather than capturing it, so the caller
+/// keeps the sole borrow.
+fn prove_named_rows(
+    ctx: &mut CallCtx,
     state: &mut MigrationState,
-    target: BlockHeight,
+    ids: &[MigrationTransferId],
     max_proofs: Option<u32>,
-    mut prove: impl FnMut(&mut MigrationState, MigrationTransferId) -> anyhow::Result<bool>,
+    mut prove: impl FnMut(
+        &mut CallCtx,
+        &mut MigrationState,
+        MigrationTransferId,
+    ) -> anyhow::Result<bool>,
 ) -> anyhow::Result<u32> {
-    let mut deferred: Vec<MigrationTransferId> = Vec::new();
     let mut proved = 0;
-    while let Some(id) = state.next_provable(DuenessTargets::at(target), &deferred) {
+    for &id in ids {
         // `max_proofs` caps SUCCESSFUL proofs per call so an FFI caller can chunk a sweep:
         // each proof is seconds of CPU, and a platform serializing DB access behind one
-        // actor needs a seam between proofs for interactive reads to interleave. Deferred
-        // (transient) rows don't count against the cap — they cost no proving time.
+        // actor needs a seam between proofs for interactive reads to interleave. A skip
+        // below doesn't count against the cap — it costs no proving time, which is what lets a
+        // cap-1 caller re-pass the WHOLE batch each chunk and still make progress.
         if max_proofs.is_some_and(|max| proved >= max) {
             break;
         }
-        if prove(state, id)? {
-            // `next_provable` only offers `Signed` rows, so a successful prove must have advanced
-            // this one; were that ever untrue the loop would re-select it forever, which as an FFI
+        // The staleness skip. Only a `Signed` row is proving work; anything else the instruction
+        // still names has been overtaken, and re-proving it would be wasted CPU at best.
+        let still_signed = state
+            .transactions()
+            .iter()
+            .any(|t| t.id() == id && matches!(t.state(), MigrationTxState::Signed));
+        if !still_signed {
+            continue;
+        }
+        if prove(ctx, state, id)? {
+            // Guarded above as `Signed`, so a successful prove must have advanced this one; were
+            // that ever untrue a cap-1 caller's loop would re-select it forever, which as an FFI
             // call means a hung app. Fail loudly instead.
             let advanced = state
                 .transactions()
@@ -1295,9 +1320,9 @@ fn prove_pending_rows(
                 ));
             }
             proved += 1;
-        } else {
-            deferred.push(id);
         }
+        // A `false` (transient) result — the anchor not yet witnessable — moves on without
+        // marking anything: the next crank re-offers this row among the still-unproved remainder.
     }
     Ok(proved)
 }
@@ -1316,14 +1341,18 @@ fn prove_pending_rows(
 // converts the FFI's `estimated_tip: i64` into the estimated-target side of
 // [`DuenessTargets::new`] — see [`dueness_targets`].
 //
-// WHICH ROW is next is upstream's call too, not just the heights it is judged against. The
-// DELIVERY lane takes it from the drive itself ([`drive_advance`], whose step names the row the
-// engine verified); the reporting queries delegate to
-// [`MigrationState::next_due_broadcast`] / [`MigrationState::next_provable`] — the same exported
-// reads [`prove_pending_rows`] and [`zcashlc_migration_has_ready_broadcast`] use — so this module
-// no longer re-derives an ordering over `transaction_statuses`, and cannot drift from the drive's
-// own `(scheduled_height, id)` / `(anchor_boundary | scheduled_height, id)`-min. The one thing
-// still composed HERE, over that public API, is the virtual-prove scratch clone
+// WHICH ROW is next is upstream's call too, not just the heights it is judged against, and it is
+// the CONDUIT's alone to ask: [`zcashlc_migration_advance_step`] cranks [`drive_advance`] and the
+// two executors — [`zcashlc_migration_take_broadcast_transaction`] and
+// [`zcashlc_migration_prove_transactions`] — discharge the instruction it returned without asking
+// again (a due broadcast outranks proving exactly as the engine documents, and that precedence is
+// therefore decided once, in the advance). The REPORTING queries alone still delegate to the
+// exported pure reads — [`MigrationState::next_due_broadcast`] / [`MigrationState::next_provable`],
+// used by [`zcashlc_migration_has_ready_broadcast`] and [`due_assuming_proving`] — so this module
+// no longer re-derives an ordering over `transaction_statuses`, and a display read cannot drift
+// from the drive's own `(scheduled_height, id)` / `(anchor_boundary | scheduled_height, id)`-min,
+// though (being unverified) it can still disagree with what the drive would actually serve. The
+// one thing still composed HERE, over that public API, is the virtual-prove scratch clone
 // [`due_assuming_proving`] drives to answer "what would be due once every outstanding proof
 // existed" without a prover or a persisted write.
 
@@ -1370,8 +1399,8 @@ fn dueness_targets(scanned_tip: BlockHeight, estimated_tip: i64) -> DuenessTarge
 /// What it does separate is "nothing is due" from "due, but its proof has not been produced yet",
 /// and the queries built on it ([`zcashlc_migration_has_overdue_transfers`],
 /// [`zcashlc_migration_pending_transfer_proposal`]) report due work whether or not its proof
-/// exists: the work exists either way, and proving is [`prove_pending_rows`]' job, not the
-/// reporting path's.
+/// exists: the work exists either way, and proving is [`zcashlc_migration_prove_transactions`]'
+/// job, not the reporting path's.
 ///
 /// Every candidate read here — the broadcast checks and the scratch loop's own prove queue — is
 /// [`MigrationState::next_due_broadcast`] / [`MigrationState::next_provable`], upstream's exported
@@ -2395,6 +2424,22 @@ fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
 /// One verified crank of the engine's drive: builds the store adapter, judges dueness at the
 /// scanned target plus the FFI's optional `estimated_tip` (`-1` = none), and returns the
 /// engine's `Advance` with every determination it made already persisted.
+///
+/// # Invariant: this is the CONDUIT's crank, and nothing else's
+///
+/// [`zcashlc_migration_advance_step`] is its only caller, and must stay so. Per the design ruling
+/// (kris, 2026-08-07): "`advance_migration` is the top-level call, and every invocation is
+/// subservient to it"; "there is no invocation to prove without *first* having called
+/// `advance_migration` — which gives the caller the instruction of what must be proved"; and
+/// "`advance_migration` should never be used for an internal call of a more specialized
+/// operation."
+///
+/// So the specialized operations — [`zcashlc_migration_prove_transactions`] and
+/// [`zcashlc_migration_take_broadcast_transaction`] — take the instruction the platform already
+/// holds and execute it. Cranking from inside one of them would both invert that relationship and
+/// double-crank whenever the platform had already advanced to learn what to do: each crank
+/// persists the engine's determinations, including the ZIP 318 overdue re-spread, so a hidden
+/// second one is not free.
 fn drive_advance(
     ctx: &mut CallCtx,
     state: &mut MigrationState,
@@ -3140,13 +3185,14 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
         // an earlier preparation that is already `Proved` and due before proving a later `Signed`
         // sibling, something `next_provable` alone cannot see (it only ever names `Signed` rows); a
         // fresh commit has no `Proved` row yet, so the order changes nothing there. Restricted to
-        // preparation rows, so this agrees with what the delivery drive/`prove_pending_rows` will
+        // preparation rows, so this agrees with what the drive will
         // pick once the row is due — falling back (see the ceremony fallback below) only when
         // neither read names a preparation, the same trigger as before this ordering. Proven now,
         // against the wallet's scanned-tip anchor, and returned for the platform's immediate
         // broadcast — this lane exists to hand back something to broadcast, so its proof cannot
         // wait for a sweep.
-        // Remaining preparation transactions are proved by `zcashlc_migration_prove_pending` and
+        // Remaining preparation transactions are proved by `zcashlc_migration_prove_transactions`
+        // and
         // ride the normal delivery lane as they come due.
         let target = ctx.target()?;
         let targets = DuenessTargets::at(target);
@@ -3471,44 +3517,66 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
     unwrap_exc_or(res, false)
 }
 
-/// Proves every migration transaction of the stored run whose anchor the wallet can resolve right
-/// now, persisting each proof, and returns HOW MANY were proved (`0` is the ordinary "nothing left
-/// to prove" answer; `-1` signals an error — see `zcashlc_last_error_message`).
+/// Proves the NAMED migration transactions — the instruction a prior
+/// [`zcashlc_migration_advance_step`] call returned as its PROVE step — persisting each proof, and
+/// returns HOW MANY were proved (`0` is the ordinary "nothing left to prove NOW" answer; `-1`
+/// signals an error — see `zcashlc_last_error_message`).
+///
+/// THIS EXECUTOR NEVER ASKS THE ENGINE WHAT TO PROVE. `advance_migration` is the top-level call
+/// and every invocation is subservient to it: there is no proving to do without first having been
+/// instructed what to prove, so this takes the ids it was told and does not crank the drive to
+/// second-guess them (see [`drive_advance`]). Whether a candidate is worth proving at all — the
+/// store's satisfiability verification — and whether a due broadcast outranks proving this session
+/// are the advance's decisions, made before the batch was handed out.
+///
+/// PER ROW (see [`prove_named_rows`]): a transaction that is no longer `Signed` is a SKIP, so a
+/// stale instruction is safe (the engine re-offers un-recorded work on the next crank); a
+/// transaction whose anchor is not scanned/retained yet is likewise skipped and retried later; and
+/// a successful proof persists through the store seam before this returns.
+///
+/// `max_proofs <= 0` means unlimited. A platform whose database access serializes behind one actor
+/// should pass `1` and loop with a yield between calls, re-passing the SAME ids: the rows it
+/// already proved skip for free, so the chunking works without re-cranking the drive between
+/// chunks.
 ///
 /// Call this opportunistically as the wallet scans (proofs are wanted long before their
 /// transactions come due), not on the broadcast path: proving needs the wallet's commitment tree
-/// and takes real time, while the broadcast executor must only broadcast. A
-/// transaction whose anchor is not scanned/retained yet is skipped and retried by a later call, so
-/// this is safe to run on any schedule, including mid-sync.
+/// and takes real time, while the broadcast executor must only broadcast.
 ///
 /// # Safety
-/// See [`open`].
+/// See [`open`]; `ids` must be valid for reads of `ids_len` `u32` values.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_prove_pending(
+pub unsafe extern "C" fn zcashlc_migration_prove_transactions(
     db_data: *const u8,
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
+    ids: *const u32,
+    ids_len: usize,
     max_proofs: i64,
 ) -> i64 {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(mut state) = reconcile_mined(&mut ctx)? else {
+        let ids: Vec<MigrationTransferId> = unsafe { slice_or_empty(ids, ids_len) }
+            .iter()
+            .map(|id| MigrationTransferId::new(*id))
+            .collect();
+        // A plain load, NOT `reconcile_mined`: the advance that issued this instruction already
+        // swept in-flight transactions and promoted the ones the wallet's scan had seen mine, so
+        // reconciling here would ask the same `mined_height` question twice. A row promoted since
+        // is simply no longer `Signed`, which the per-row skip handles.
+        let Some(mut state) = ({
+            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            backend.latest_migration()?
+        }) else {
             return Ok(0);
         };
         if state.is_terminal() {
             return Ok(0);
         }
-        // `target = tip + 1`, the height every `MigrationState` query is defined over (see
-        // `CallCtx::target`; A1 — this sweep briefly fed the raw tip, which left a preparation
-        // scheduled exactly at the target un-proved for one extra block).
-        let target = ctx.target()?;
-        // `max_proofs <= 0` means unlimited. A platform whose DB access serializes behind one
-        // actor should pass 1 and loop with a yield between calls, so interactive reads
-        // interleave between proofs instead of waiting out the whole sweep.
         let cap = u32::try_from(max_proofs).ok().filter(|&n| n > 0);
-        let proved = prove_pending_rows(&mut state, target, cap, |state, id| {
-            prove_one(&mut ctx, state, id)
+        let proved = prove_named_rows(&mut ctx, &mut state, &ids, cap, |ctx, state, id| {
+            prove_one(ctx, state, id)
         })?;
         Ok(i64::from(proved))
     });
@@ -6801,7 +6869,7 @@ mod tests {
 
     /// The accepted semantic shift, pinned: a pure statuses read reports what is PERSISTED — a
     /// `Broadcast` row stays `Broadcast` in its answer until a write lane (`advance_step`'s
-    /// engine sweep, `prove_pending`, the delivery executor) persists the Mined promotion. Display
+    /// engine sweep, the prove executor, the delivery executor) persists the Mined promotion. Display
     /// green is unaffected (the app derives it from the wallet's own mined-txid set).
     #[test]
     fn pure_statuses_report_broadcast_until_a_write_lane_promotes() {
@@ -7805,7 +7873,7 @@ mod tests {
         )
     }
 
-    /// The test-side counterpart of [`prove_one`] for [`prove_pending_rows`]: proves through the
+    /// The test-side counterpart of [`prove_one`] for [`prove_named_rows`]: proves through the
     /// same generic [`migration_finalize::prove_due_transaction`] seam with the given test prover
     /// instead of the production `WalletMigrationProver`, and persists through the same
     /// account-keyed store. The preparation anchor is never resolved (these fixtures sweep
@@ -7857,22 +7925,84 @@ mod tests {
             .expect("a migration is stored")
     }
 
+    /// The ids a `Prove` INSTRUCTION over `state` would name: every `Signed` row, in stored order.
+    /// The sweep is an executor now — it is told what to prove rather than deriving it — so this
+    /// stands in for the [`zcashlc_migration_advance_step`] call a platform makes first. (The real
+    /// drive additionally verifies each candidate against the store's oracle and orders the batch
+    /// oldest-anchor-first; neither bears on what [`prove_named_rows`] then does with the ids,
+    /// which is what these tests are about. The drive's own batch is pinned by
+    /// `advance_step_prove_carries_the_whole_batch`.)
+    fn prove_instruction(state: &MigrationState) -> Vec<MigrationTransferId> {
+        state
+            .transactions()
+            .iter()
+            .filter(|t| matches!(t.state(), MigrationTxState::Signed))
+            .map(|t| t.id())
+            .collect()
+    }
+
+    /// Opens a fixture [`CallCtx`] with the chain tip set so `target_from_tip` yields `target`,
+    /// plus the two prerequisites the sweep's now-verified drive needs that the pre-drive
+    /// `next_provable` selector never touched: the wallet scanned through `target`, and the
+    /// placeholder spend nullifier every non-`Mined` fixture row carries
+    /// ([`test_transaction_from_parts`]) seeded as a known, unspent note. Without both, the
+    /// store's satisfiability oracle can vouch for nothing and every candidate degrades silently
+    /// to `Waiting` — the safe answer, but not the one under test. `target` is the sweep tests'
+    /// own convention (what the pre-drive sweep took as a raw `BlockHeight`), kept so their
+    /// existing schedule/boundary/expiry fixture numbers stay valid under a real wallet tip.
+    fn sweep_fixture_ctx(prefix: &str, target: u32) -> (PathBuf, [u8; 16], CallCtx) {
+        let path = init_fixture_db(prefix);
+        let account = create_fixture_account(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let tip = target - 1;
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    tip as i32,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        mark_fixture_scanned_through(&path, tip);
+        seed_placeholder_received_note(&path, [0u8; 32]);
+        let ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture call context opens");
+        (path, account, ctx)
+    }
+
     /// `max_proofs` chunks a sweep: the first call proves exactly the cap and leaves the rest
     /// `Signed`; the next (uncapped) call finishes the remainder. This is the seam platforms use
     /// to interleave interactive DB reads between seconds-long proofs.
+    ///
+    /// The two transfers are scheduled ABOVE the target (unlike [`provable_state`]'s uniform
+    /// default): schedule plays no part in prove-readiness (only the anchor boundary does), and
+    /// keeping both comfortably undue sidesteps the drive's ZIP 318 overdue re-spread, which
+    /// (unlike the pre-drive selector) a `Prove` batch can also trigger when two or more live
+    /// candidates sit far enough behind the target — a concern this test has nothing to do with.
     #[test]
     fn sweep_cap_proves_at_most_max_and_the_next_call_finishes() {
-        let path = init_fixture_db("zcashlc_sweep_cap_chunks");
-        let account = create_fixture_account(&path);
-        let mut state = provable_state(
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_cap_chunks", 5_000);
+        let mut state = scheduled_state(
             &[MINED],
-            &[MigrationTxState::Signed, MigrationTxState::Signed],
-            Some(h(1440)),
+            &[
+                (MigrationTxState::Signed, 6_000, Some(h(1440))),
+                (MigrationTxState::Signed, 6_000, Some(h(1440))),
+            ],
         );
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let first = prove_pending_rows(&mut state, h(5_000), Some(1), |state, id| {
+        let ids = prove_instruction(&state);
+        let first = prove_named_rows(&mut ctx, &mut state, &ids, Some(1), |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("a capped sweep must not fail");
@@ -7892,12 +8022,13 @@ mod tests {
             "one transfer must remain Signed for the next chunk"
         );
 
-        let second = prove_pending_rows(&mut state, h(5_000), None, |state, id| {
+        let second = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("the follow-up sweep must not fail");
         assert_eq!(second, 1, "the uncapped follow-up must prove the remainder");
         assert_eq!(prover.calls.len(), 2, "two proofs total across the chunks");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The sweep proves a provable `Signed` transfer — `Signed -> Proved`, PERSISTED — against the
@@ -7905,13 +8036,12 @@ mod tests {
     /// consulting a prover: proving and broadcasting are separate steps.
     #[test]
     fn sweep_proves_a_signed_transfer_that_delivery_then_serves_without_proving() {
-        let path = init_fixture_db("zcashlc_sweep_then_serve");
-        let account = create_fixture_account(&path);
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_then_serve", 5_000);
         let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let proved = prove_pending_rows(&mut state, h(5_000), None, |state, id| {
+        let ids = prove_instruction(&state);
+        let proved = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("sweeping a provable transfer must not fail");
@@ -7980,8 +8110,7 @@ mod tests {
     /// BEHIND the transiently-unprovable one are still proved on the same pass.
     #[test]
     fn sweep_skips_a_transiently_unprovable_row_and_proves_the_rest() {
-        let path = init_fixture_db("zcashlc_sweep_transient");
-        let account = create_fixture_account(&path);
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_transient", 100);
         // Both transfers are provable and due; the prover fails the FIRST one transiently and
         // proves the second.
         let mut state = scheduled_state(
@@ -7991,13 +8120,13 @@ mod tests {
                 (MigrationTxState::Signed, 90, Some(h(40))),
             ],
         );
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = FirstFailsProver {
             error: Some(WalletProveError::AnchorNotFound(h(40))),
             calls: Vec::new(),
         };
-        let proved = prove_pending_rows(&mut state, h(100), None, |state, id| {
+        let ids = prove_instruction(&state);
+        let proved = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("a transient prove outcome must not be an error");
@@ -8040,15 +8169,14 @@ mod tests {
     /// time the artifact already exists.
     #[test]
     fn sweep_proves_a_provable_but_undue_transfer_ahead_of_its_schedule() {
-        let path = init_fixture_db("zcashlc_sweep_undue");
-        let account = create_fixture_account(&path);
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_undue", 100);
         // Provable (boundary settled) but scheduled far ABOVE the tip.
         let mut state =
             scheduled_state(&[MINED], &[(MigrationTxState::Signed, 9_000, Some(h(40)))]);
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let proved = prove_pending_rows(&mut state, h(100), None, |state, id| {
+        let ids = prove_instruction(&state);
+        let proved = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("the sweep must not fail");
@@ -8074,76 +8202,87 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// THE A1 BOUNDARY PIN: the sweep is driven at `target = tip + 1` (the height every
-    /// `MigrationState` query is defined over — `zcashlc_migration_prove_pending` reads
-    /// `ctx.target()`, not the raw tip), so a PREPARATION scheduled EXACTLY at the target is
-    /// proved now rather than one block late. A preparation is the kind whose prove-readiness
-    /// IS schedule due-ness, which is why the raw-tip regression only ever bit preparations; the
-    /// raw-tip counterfactual is pinned alongside.
+    /// THE A1 BOUNDARY PIN: the drive's target is always `tip + 1` (never the raw tip —
+    /// [`target_from_tip`], baked into [`dueness_targets`] and applied uniformly by
+    /// [`drive_advance`]), so a PREPARATION scheduled EXACTLY at the target is OFFERED for proving
+    /// now rather than one block late. A preparation is the kind whose prove-readiness IS schedule
+    /// due-ness, which is why the raw-tip regression A1 fixed only ever bit preparations.
+    ///
+    /// The pin is read off the CONDUIT, because that is now the only thing that decides which rows
+    /// a sweep is told to prove; the executor below then proves the row it was handed, against the
+    /// caller-resolved preparation anchor. The raw-tip COUNTERFACTUAL the pre-drive version of
+    /// this test also pinned (feeding the sweep the bare tip and asserting it wrongly swept
+    /// nothing) is gone: no entry point accepts a raw height at all any more — the wallet's chain
+    /// tip is the only knob a caller has, and `drive_advance` converts it to `tip + 1` the same
+    /// uniform way every time — so the off-by-one class A1 fixed is structurally unrepresentable
+    /// rather than merely untested.
     #[test]
     fn sweep_proves_a_preparation_scheduled_exactly_at_target() {
         let tip = h(100);
-        let build_state = || {
-            custom_state(
-                MigrationStatus::InProgress,
-                vec![test_transaction_from_parts(
-                    MigrationTransferId::new(0),
-                    MigrationTxKind::Preparation { layer: 0, index: 0 },
-                    minimal_pczt_bytes(),
-                    Vec::new(),
-                    h(101), // scheduled exactly at target = tip + 1
-                    h(10_000),
-                    None,
-                    MigrationTxState::Signed,
-                    None,
-                )],
-            )
-        };
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_prep_at_target", 101);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let mut state = custom_state(
+            MigrationStatus::InProgress,
+            vec![test_transaction_from_parts(
+                MigrationTransferId::new(0),
+                MigrationTxKind::Preparation { layer: 0, index: 0 },
+                minimal_pczt_bytes(),
+                Vec::new(),
+                h(101), // scheduled exactly at target = tip + 1
+                h(10_000),
+                None,
+                MigrationTxState::Signed,
+                None,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, _id, batch, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_PROVE,
+            "a preparation scheduled exactly at tip + 1 is due for proving NOW, not one block \
+             later"
+        );
+        let instruction: Vec<MigrationTransferId> = batch
+            .iter()
+            .map(|t| MigrationTransferId::new(t.0))
+            .collect();
+        assert_eq!(
+            instruction,
+            vec![MigrationTransferId::new(0)],
+            "the boundary row must be the one named, got {batch:?}"
+        );
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let mut state = build_state();
-        let proved = prove_pending_rows(&mut state, target_from_tip(tip), None, |state, id| {
-            Ok(prove_due_for_test(&mut prover, state, id, Some(tip))?.is_some())
-        })
+        let proved = prove_named_rows(
+            &mut ctx,
+            &mut state,
+            &instruction,
+            None,
+            |_ctx, state, id| Ok(prove_due_for_test(&mut prover, state, id, Some(tip))?.is_some()),
+        )
         .expect("the boundary sweep must not fail");
-        assert_eq!(
-            proved, 1,
-            "a preparation scheduled exactly at tip + 1 is due the sweep NOW"
-        );
+        assert_eq!(proved, 1, "the named preparation is proved");
         assert_eq!(
             prover.calls,
             vec![ProveCall::Preparation(tip)],
             "the preparation proves against the caller-resolved anchor"
         );
-
-        // The raw-tip counterfactual (the exact off-by-one A1 fixed): fed the tip instead of the
-        // target, the same state sweeps nothing.
-        let mut prover = RecordingProver { calls: Vec::new() };
-        let mut state = build_state();
-        let proved = prove_pending_rows(&mut state, tip, None, |state, id| {
-            Ok(prove_due_for_test(&mut prover, state, id, Some(tip))?.is_some())
-        })
-        .expect("the counterfactual sweep must not fail");
-        assert_eq!(
-            proved, 0,
-            "at the raw tip the target-scheduled preparation is (wrongly) not yet due — the \
-             convention the FFI must therefore never feed the sweep"
-        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A HARD prover failure aborts the sweep and propagates: an unprovable-for-real row is not
     /// something a later sweep fixes, and swallowing it would hide a corrupt store.
     #[test]
     fn sweep_propagates_a_hard_prover_failure() {
-        let path = init_fixture_db("zcashlc_sweep_hard_failure");
-        let account = create_fixture_account(&path);
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_hard_failure", 5_000);
         let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = FailingProver {
             error: Some(WalletProveError::Prove("proof backend failure".into())),
         };
-        let err = prove_pending_rows(&mut state, h(5_000), None, |state, id| {
+        let ids = prove_instruction(&state);
+        let err = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect_err("a hard prover failure must not be swallowed");
@@ -8151,6 +8290,120 @@ mod tests {
         assert!(
             err.to_string().starts_with(PROVING_UNAVAILABLE_PREFIX),
             "the hard failure must carry the proving-unavailable prefix, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE DUE-BROADCAST PRECEDENCE (RED against the pre-drive selector this arc replaced): a
+    /// Proved, schedule-due, dependency-satisfied row is delivery work the drive names as
+    /// `AdvanceStep::Broadcast`, which OUTRANKS proving in the engine's own precedence — a due
+    /// broadcast is what lets a woken session submit and end without ever proving. The pre-drive
+    /// selector (`MigrationState::next_provable`) had no notion of that precedence and offered an
+    /// independently-provable Signed row regardless of the due broadcast sitting right beside it.
+    ///
+    /// The pin now sits on the CONDUIT, which is where the precedence is decided: the sweep is an
+    /// executor and proves whatever it is handed, so "prove nothing this session" can only be an
+    /// instruction the advance declined to issue. What the executor does with an instruction that
+    /// names a row it must not touch is
+    /// [`prove_transactions_skips_a_row_that_is_no_longer_signed`].
+    #[test]
+    fn advance_defers_to_a_due_broadcast_and_offers_no_prove_batch() {
+        let (path, account, _ctx) = sweep_fixture_ctx("zcashlc_sweep_due_broadcast", 100);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let transactions = vec![
+            // Proved, scheduled well under the target, no dependencies: ready to broadcast.
+            test_transaction_from_parts(
+                MigrationTransferId::new(1),
+                MigrationTxKind::Transfer { crossing: 0 },
+                minimal_pczt_bytes(),
+                Vec::new(),
+                h(50),
+                h(10_000),
+                Some(h(40)),
+                MigrationTxState::Proved,
+                None,
+            ),
+            // Signed, boundary settled: independently provable, but must not be offered while a
+            // broadcast is due.
+            test_transaction_from_parts(
+                MigrationTransferId::new(2),
+                MigrationTxKind::Transfer { crossing: 1 },
+                minimal_pczt_bytes(),
+                Vec::new(),
+                h(9_000),
+                h(10_000),
+                Some(h(40)),
+                MigrationTxState::Signed,
+                None,
+            ),
+        ];
+        let state = test_state_from_parts(
+            MigrationStatus::InProgress,
+            DenominationPlan::from_stored_parts(
+                vec![zat(100_000_000), zat(100_000_000)],
+                zat(10_000),
+                None,
+                zat(20_000),
+                zat(1_000_000_000),
+                zat(999_000_000),
+            )
+            .unwrap(),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            transactions,
+            AnchorBucketInterval::ZIP_318,
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, id, targets, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_BROADCAST,
+            "a due broadcast outranks proving: the drive must instruct a broadcast, not a sweep"
+        );
+        assert_eq!(id, 1, "the due, proved row is the one named");
+        assert!(
+            targets.is_empty(),
+            "a Broadcast step carries no prove batch, so a sweeping platform is told to prove \
+             nothing this session, got {targets:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE EXECUTOR'S STALENESS SKIP. `prove_named_rows` never re-asks the engine what to prove,
+    /// so the one thing standing between a stale instruction and wasted (or wrong) work is the
+    /// per-row check that the named transaction is still `Signed`. A row that has been proved
+    /// since the instruction was issued is skipped — the prover is never consulted, the count is
+    /// 0, and nothing is persisted — which is what makes acting on an out-of-date batch safe: the
+    /// engine re-offers whatever it has not recorded on the next crank.
+    #[test]
+    fn prove_transactions_skips_a_row_that_is_no_longer_signed() {
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_stale_instruction", 5_000);
+        let mut state = provable_state(&[MINED], &[MigrationTxState::Proved], Some(h(1440)));
+        let stale = MigrationTransferId::new(1);
+
+        let mut prover = RecordingProver { calls: Vec::new() };
+        // The instruction names the row anyway — exactly the shape a batch that has gone stale
+        // between the advance and this call arrives in.
+        let proved = prove_named_rows(&mut ctx, &mut state, &[stale], None, |_ctx, state, id| {
+            prove_with_test_prover(&path, &account, &mut prover, state, id)
+        })
+        .expect("a stale instruction must not be an error");
+
+        assert_eq!(proved, 0, "an already-proved row is a skip, not a re-prove");
+        assert!(
+            prover.calls.is_empty(),
+            "the prover must never be consulted for a row that is not Signed"
+        );
+        assert!(
+            matches!(
+                state
+                    .transactions()
+                    .iter()
+                    .find(|t| t.id() == stale)
+                    .expect("the row remains")
+                    .state(),
+                MigrationTxState::Proved
+            ),
+            "the skipped row must be left exactly as it was"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -8266,13 +8519,16 @@ mod tests {
         );
     }
 
-    /// `prove_pending_rows` must serve the drive's own `(anchor_boundary, id)`-min among
-    /// prove-ready candidates — oldest-anchor-first — never merely the first match in commit
-    /// order. Id 7 is committed before id 8, but id 8's boundary SETTLED EARLIER (3990 vs 4020): a
-    /// first-match scan over commit order would prove id 7 first; the engine's `next_provable`
-    /// proves id 8 first.
+    /// OLDEST-ANCHOR-FIRST, pinned on both sides of the instruction. The DRIVE orders the batch
+    /// by its own `(anchor_boundary, id)` key, never commit order: id 7 is committed before id 8,
+    /// but id 8's boundary SETTLED EARLIER (3990 vs 4020), so the batch must name 8 first. The
+    /// EXECUTOR then honours that order verbatim — with `max_proofs = 1` it proves the batch's
+    /// head — because it has no ordering of its own to impose and must not reintroduce one.
     #[test]
     fn prove_sweep_serves_the_oldest_anchor_first() {
+        let (path, account, mut ctx) =
+            sweep_fixture_ctx("zcashlc_sweep_oldest_anchor_first", 4_100);
+        let path_bytes = path.to_str().unwrap().as_bytes();
         let transactions = vec![
             // Committed FIRST (id 7), but its boundary settled LATER — must lose.
             test_transaction_from_parts(
@@ -8314,16 +8570,37 @@ mod tests {
             transactions,
             AnchorBucketInterval::ZIP_318,
         );
+        store_fixture_state(&path, &account, &state);
+
+        // The drive's own instruction, read over the conduit the platform actually calls.
+        let (step, _id, batch, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(step, ZCASHLC_ADVANCE_STEP_PROVE, "both rows are provable");
+        let instruction: Vec<MigrationTransferId> = batch
+            .iter()
+            .map(|t| MigrationTransferId::new(t.0))
+            .collect();
+        assert_eq!(
+            instruction,
+            vec![MigrationTransferId::new(8), MigrationTransferId::new(7)],
+            "the drive's (anchor_boundary, id)-min — oldest anchor first — must name id 8 \
+             (boundary 3990) before id 7 (boundary 4020), even though id 7 was committed first"
+        );
 
         // A recording prove closure: records which id it was asked to prove, flips that row
-        // `Signed -> Proved` (as a real prove would, so `prove_pending_rows`' own
+        // `Signed -> Proved` (as a real prove would, so `prove_named_rows`' own
         // still-Signed-after-a-successful-prove guard does not trip), and always succeeds.
         let mut proved_ids: Vec<MigrationTransferId> = Vec::new();
-        let proved = prove_pending_rows(&mut state, h(4_100), Some(1), |state, id| {
-            proved_ids.push(id);
-            state.set_transaction_proved(id, Vec::new(), None);
-            Ok(true)
-        })
+        let proved = prove_named_rows(
+            &mut ctx,
+            &mut state,
+            &instruction,
+            Some(1),
+            |_ctx, state, id| {
+                proved_ids.push(id);
+                state.set_transaction_proved(id, Vec::new(), None);
+                Ok(true)
+            },
+        )
         .expect("the recording prove closure must not fail");
 
         assert_eq!(
@@ -8333,9 +8610,9 @@ mod tests {
         assert_eq!(
             proved_ids,
             vec![MigrationTransferId::new(8)],
-            "the drive's (anchor_boundary, id)-min — oldest anchor first — must prove id 8 \
-             (boundary 3990) before id 7 (boundary 4020), even though id 7 was committed first"
+            "the executor must take the instruction's head, imposing no order of its own"
         );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A stored run whose next transaction is `Signed`, schedule-due, dependency-satisfied, and

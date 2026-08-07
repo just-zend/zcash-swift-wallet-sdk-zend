@@ -639,19 +639,24 @@ protocol ZcashRustBackendWelding {
         for account: AccountUUID
     ) async throws
 
-    /// Proves every migration transaction whose anchor the wallet can resolve right now,
-    /// persisting each proof, and returns how many were proved (`0` is the ordinary "nothing left
-    /// to prove" answer).
+    /// Proves the NAMED migration transactions — the batch a prior
+    /// ``migrationAdvanceStep(for:estimatedTip:)`` call returned as its
+    /// ``MigrationAdvanceStep/prove(transactions:)`` step — persisting each proof, and returns how
+    /// many were proved (`0` is the ordinary "nothing left to prove right now" answer).
     ///
-    /// Call this as the wallet scans, NOT when about to broadcast: a transaction's anchor becomes
-    /// witnessable long before its broadcast schedule arrives, and proving is expensive, so the
-    /// work belongs in the sync path. The delivery lane deliberately does no proving.
+    /// This NEVER asks the engine what to prove: `migrationAdvanceStep` is the top-level call and
+    /// every executor is subservient to it, so there is no proving to do without having first been
+    /// instructed what to prove. Whether a candidate is worth proving at all, and whether a due
+    /// broadcast outranks proving this session, were settled by the advance that issued the batch.
     ///
-    /// A transaction the wallet cannot prove yet (its anchor not scanned/retained) is skipped and
-    /// retried by a later call, so this is safe to run on any schedule, including mid-sync.
+    /// Per row: a transaction that is no longer awaiting its proof is SKIPPED, so acting on a
+    /// stale batch is safe (the engine re-offers whatever it has not recorded on the next
+    /// advance); so is one whose anchor the wallet cannot resolve yet, which a later call retries.
+    /// Safe to run on any schedule, including mid-sync — but call it as the wallet scans, NOT when
+    /// about to broadcast: proving is expensive, and the delivery lane deliberately does none.
     /// - Throws: `migrationProvingUnavailable` when proving fails for a non-transient reason;
-    ///   `rustMigrationProvePending` for other rust-layer errors.
-    func migrationProvePending(for account: AccountUUID) async throws -> Int
+    ///   `rustMigrationProveTransactions` for other rust-layer errors.
+    func migrationProveTransactions(ids: [UInt32], for account: AccountUUID) async throws -> Int
 
     /// Serves the transaction `id` for broadcast — the instruction a prior
     /// ``migrationAdvanceStep(for:estimatedTip:)`` call returned as its

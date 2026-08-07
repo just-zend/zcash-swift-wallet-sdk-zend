@@ -349,8 +349,8 @@ public enum ZcashErrorCode: String {
     case rustMigrationKeystoneDecodeSignBatchPart = "ZRUST0137"
     /// Error from rust layer when calling ZcashRustBackend.migrationKeystoneApplyBatchSignatures
     case rustMigrationKeystoneApplyBatchSignatures = "ZRUST0138"
-    /// Error from rust layer when calling ZcashRustBackend.migrationProvePending
-    case rustMigrationProvePending = "ZRUST0140"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProveTransactions
+    case rustMigrationProveTransactions = "ZRUST0140"
     /// A stored migration transfer admits NO valid sync/proving wake-up height.
     case migrationWakeupInfeasible = "ZRUST0141"
     /// Error from rust layer when calling ZcashRustBackend.migrationAdvanceStep

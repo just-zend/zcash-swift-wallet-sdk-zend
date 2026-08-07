@@ -88,8 +88,10 @@ step's batch; any other step reads as `.nothingDue`, and the host reaches those 
 
 The call is now strictly BROADCAST-ONLY: it never proves. Proving moved to the new
 `finalizeReadyMigrationTransfers(accountUUID:) async throws -> Int` sweep member, which proves every
-migration transaction whose anchor the wallet can resolve right now and returns how many were
-proved (`0` is the ordinary "nothing left to prove" answer). Run it at sync wake-ups
+migration transaction the engine currently offers for proving and returns how many were
+proved (`0` is the ordinary "nothing left to prove" answer). It too is driven by
+`migrationAdvanceStep`: each pass proves the batch that advance named and then advances again,
+ending when a pass proves nothing or the engine names some other step. Run it at sync wake-ups
 (`migrationSyncWakeups(accountUUID:)`) — never in a broadcast session, since proving needs the
 wallet's commitment tree and takes real time, while a broadcast session must stay a pure delivery
 step.

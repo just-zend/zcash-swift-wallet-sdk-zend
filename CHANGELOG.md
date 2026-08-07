@@ -196,7 +196,11 @@ Changes are relative to `2.8.0-rc.3`.
   proving a batch ordinarily represents.
 - Planning and delivery: a randomized-cadence schedule proposal committed by
   `signAndStoreMigrationSchedule`, proved opportunistically during sync by the new
-  `finalizeReadyMigrationTransfers(accountUUID:)`, then delivered by
+  `finalizeReadyMigrationTransfers(accountUUID:)` — a LOOP over `migrationAdvanceStep`, proving
+  exactly the batch each advance names and re-advancing after every productive pass (proving can
+  unblock rows that were not in the batch), stopping on the first pass that proves nothing or on
+  any step that is not `.prove`; a due `.broadcast` ends it, which is what lets a woken session
+  deliver without paying proving latency — then delivered by
   `executeNextPendingMigrationTransfer`, which is BROADCAST-ONLY (it never proves) and answers
   `MigrationTransferAttempt.nothingDue`, `.awaitingProof(id:)` (due but not proved yet — run
   `finalizeReadyMigrationTransfers` and retry in a later session), or

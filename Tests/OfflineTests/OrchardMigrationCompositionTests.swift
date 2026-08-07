@@ -691,6 +691,113 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         XCTAssertNil(gate.currentInFlightUntil(), "the early belt marker is cleared when nothing reached the network")
     }
 
+    // MARK: - finalizeReadyTransfers composition
+
+    /// The sweep is a LOOP OVER THE DRIVE, not a single call that decides for itself what to
+    /// prove: each pass advances, proves exactly the ids that pass named, and advances again —
+    /// because proving a batch can unblock rows that were not in it. Pins the whole shape: the
+    /// second batch's ids are the ones the SECOND advance named (not the first's), the total is
+    /// the sum, and the loop stops on the pass that proves nothing rather than spinning on it.
+    func testFinalizeReadyTransfersProvesEachAdvanceBatchUntilAPassProvesNothing() async throws {
+        let batches: [[UInt32]] = [[7, 8], [9], [9]]
+        var advanceCount = 0
+        welding.migrationAdvanceStepForEstimatedTipClosure = { _, _ in
+            defer { advanceCount += 1 }
+            let ids = advanceCount < batches.count ? batches[advanceCount] : []
+            return MigrationAdvance(
+                step: .prove(transactions: ids.map {
+                    MigrationProveTarget(id: $0, kind: .transfer(crossing: 0), isScheduleDue: false)
+                }),
+                next: nil
+            )
+        }
+        var provedBatches: [[UInt32]] = []
+        welding.migrationProveTransactionsIdsForClosure = { ids, _ in
+            provedBatches.append(ids)
+            // Two proofs from the first batch, one from the second, and the third pass — the same
+            // still-unprovable row again — yields nothing, which must end the sweep.
+            return provedBatches.count == 1 ? 2 : (provedBatches.count == 2 ? 1 : 0)
+        }
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        let total = try await migration.finalizeReadyTransfers()
+
+        XCTAssertEqual(total, 3, "the sweep reports every proof it made across the passes")
+        XCTAssertEqual(
+            provedBatches,
+            [[7, 8], [9], [9]],
+            "each pass must prove exactly the ids ITS advance named, re-advancing in between"
+        )
+        XCTAssertEqual(advanceCount, 3, "the pass that proved nothing is the last one")
+    }
+
+    /// A step the sweep cannot discharge ends it with the count so far, and the prove executor is
+    /// never called. A due `.broadcast` is the load-bearing case: it outranks proving in the
+    /// engine's own precedence, so a woken session delivers without ever paying proving latency
+    /// (ZIP 318 permits a sync session to broadcast) — and this call, which never broadcasts,
+    /// leaves that to the caller's own delivery pass.
+    func testFinalizeReadyTransfersStopsOnANonProveStepWithoutProving() async throws {
+        for step in [MigrationAdvanceStep.broadcast(id: 3), .waiting, .complete, .rebuild(id: 4)] {
+            welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: step, next: nil)
+            welding.migrationProveTransactionsIdsForCallsCount = 0
+            let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+            let total = try await migration.finalizeReadyTransfers()
+
+            XCTAssertEqual(total, 0, "\(step) is not proving work")
+            XCTAssertEqual(
+                welding.migrationProveTransactionsIdsForCallsCount,
+                0,
+                "\(step) must never reach the prove executor"
+            )
+        }
+    }
+
+    /// THE SWEEP ADVANCES AT THE SCANNED TIP, never the wall-clock estimate — pinned with samples
+    /// available, so a `nil` here is the sweep's own choice rather than an absent projection (the
+    /// companion `testAdvanceStepPassesTheProjectedTipEstimateToTheWelding` proves the same
+    /// samples DO project a tip through `advanceStep()`).
+    ///
+    /// The estimate has no acceleration to offer a sweep — prove-readiness is anchor-gated at the
+    /// SCANNED tip — so it could only decelerate: an earlier broadcast-precedence stop, and an
+    /// earlier PERSISTED re-spread. It would also desynchronize the lanes, since
+    /// `executeNextPendingTransfer`'s default judges at the scanned tip: inside the estimate's
+    /// lead window the sweep would see `.broadcast` and prove nothing while delivery saw nothing
+    /// due, and neither lane would progress until the scan caught up.
+    func testFinalizeReadyTransfersAdvancesAtTheScannedTipNotTheEstimate() async throws {
+        let sampleTime = referenceDate.addingTimeInterval(-150)
+        welding.migrationBlockRateSamplesWindowReturnValue = [
+            MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
+        ]
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .waiting, next: nil)
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        _ = try await migration.finalizeReadyTransfers()
+
+        let received = try XCTUnwrap(welding.migrationAdvanceStepForEstimatedTipReceivedArguments)
+        XCTAssertEqual(received.account, accountA)
+        XCTAssertNil(
+            received.estimatedTip,
+            "the sweep must advance at the scanned tip even when a projectable sample exists"
+        )
+        XCTAssertFalse(
+            welding.migrationBlockRateSamplesWindowCalled,
+            "and must not even pay for the projection it would then discard"
+        )
+    }
+
+    /// No stored run: the drive returns `nil` and the sweep is a benign `0`, so a host may call it
+    /// unconditionally from its sync path.
+    func testFinalizeReadyTransfersWithNoStoredRunProvesNothing() async throws {
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = nil
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        let total = try await migration.finalizeReadyTransfers()
+
+        XCTAssertEqual(total, 0)
+        XCTAssertFalse(welding.migrationProveTransactionsIdsForCalled)
+    }
+
     // MARK: - Broadcast single-flight
 
     /// Pins the single-flight discipline of the broadcast flows: with one `executeNextPendingTransfer`

@@ -64,9 +64,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `_sign_and_store_schedule`. Committing a plan is linear in the wallet's note count: the FFI's
     wallet adapter snapshots its spendable-note selection per call (the pattern librustzcash #2946
     set for the upstream adapter).
-  - Proving: `zcashlc_migration_prove_pending` proves everything currently provable and returns the
-    count proved (`-1` = error), skipping rather than failing on a row whose anchor is not yet
-    scanned or retained. Call it from the sync path.
+  - Proving: `zcashlc_migration_prove_transactions(ids, ids_len, max_proofs)` proves the
+    transactions the caller NAMES — the batch a prior `_advance_step` returned as its PROVE step —
+    and returns the count proved (`-1` = error). Like the delivery executor it never cranks the
+    engine: `advance_migration` is the top-level call, and there is no proving to do without an
+    instruction saying what to prove. Per row, a transaction that is no longer `Signed` is a SKIP
+    rather than an error (a stale instruction is safe — the engine re-offers un-recorded work on
+    the next crank), as is one whose anchor is not yet scanned or retained; every successful proof
+    persists through the store seam. `max_proofs <= 0` means unlimited, and a platform that
+    serializes database access behind one actor can pass `1` and loop, chunking a sweep without
+    re-cranking between chunks. Call it from the sync path.
   - Delivery: `zcashlc_migration_take_broadcast_transaction` serves the transaction the caller
     NAMES — the instruction a prior `_advance_step` returned as its BROADCAST step. It never
     proves and never cranks the engine: `advance_migration` is the top-level call and every

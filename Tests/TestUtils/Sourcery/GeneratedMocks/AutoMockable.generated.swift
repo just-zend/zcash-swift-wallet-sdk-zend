@@ -5474,27 +5474,27 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         try await migrationSignAndStoreScheduleUskForClosure!(schedule, usk, account)
     }
 
-    // MARK: - migrationProvePending
+    // MARK: - migrationProveTransactions
 
-    var migrationProvePendingForThrowableError: Error?
-    var migrationProvePendingForCallsCount = 0
-    var migrationProvePendingForCalled: Bool {
-        return migrationProvePendingForCallsCount > 0
+    var migrationProveTransactionsIdsForThrowableError: Error?
+    var migrationProveTransactionsIdsForCallsCount = 0
+    var migrationProveTransactionsIdsForCalled: Bool {
+        return migrationProveTransactionsIdsForCallsCount > 0
     }
-    var migrationProvePendingForReceivedAccount: AccountUUID?
-    var migrationProvePendingForReturnValue: Int!
-    var migrationProvePendingForClosure: ((AccountUUID) async throws -> Int)?
+    var migrationProveTransactionsIdsForReceivedArguments: (ids: [UInt32], account: AccountUUID)?
+    var migrationProveTransactionsIdsForReturnValue: Int!
+    var migrationProveTransactionsIdsForClosure: (([UInt32], AccountUUID) async throws -> Int)?
 
-    func migrationProvePending(for account: AccountUUID) async throws -> Int {
-        if let error = migrationProvePendingForThrowableError {
+    func migrationProveTransactions(ids: [UInt32], for account: AccountUUID) async throws -> Int {
+        if let error = migrationProveTransactionsIdsForThrowableError {
             throw error
         }
-        migrationProvePendingForCallsCount += 1
-        migrationProvePendingForReceivedAccount = account
-        if let closure = migrationProvePendingForClosure {
-            return try await closure(account)
+        migrationProveTransactionsIdsForCallsCount += 1
+        migrationProveTransactionsIdsForReceivedArguments = (ids: ids, account: account)
+        if let closure = migrationProveTransactionsIdsForClosure {
+            return try await closure(ids, account)
         } else {
-            return migrationProvePendingForReturnValue
+            return migrationProveTransactionsIdsForReturnValue
         }
     }
 

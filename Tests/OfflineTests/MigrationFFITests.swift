@@ -130,12 +130,17 @@ final class MigrationFFITests: XCTestCase {
         }
     }
 
-    /// The proving sweep is safe to run against a wallet with no migration run at all: there is
+    /// The prove executor is safe to run against a wallet with no migration run at all: there is
     /// nothing to prove, which is the benign `0` — not a throw. This is what lets a host call it
-    /// unconditionally from its sync path without first asking whether a migration exists.
-    func testFreshWalletProvePendingProvesNothing() async throws {
-        let proved = try await rustBackend.migrationProvePending(for: account)
-        XCTAssertEqual(proved, 0)
+    /// unconditionally from its sync path without first asking whether a migration exists. An
+    /// EMPTY instruction is likewise `0`: naming no transactions asks for no work, so a host need
+    /// not special-case a batch it has already exhausted.
+    func testFreshWalletProveTransactionsProvesNothing() async throws {
+        let named = try await rustBackend.migrationProveTransactions(ids: [0, 1], for: account)
+        XCTAssertEqual(named, 0)
+
+        let empty = try await rustBackend.migrationProveTransactions(ids: [], for: account)
+        XCTAssertEqual(empty, 0)
     }
 
     /// Unlike `isNoteSplitNeeded`/`residualAfterMigration` (which read the spendable Orchard balance
@@ -453,11 +458,11 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertEqual(first, second)
     }
 
-    /// The sweep is idempotent on a wallet with nothing to prove: no accumulating side effect, so
-    /// a host may call it on every scan pass.
-    func testMigrationProvePendingIsStableAcrossRepeatedCalls() async throws {
-        let first = try await rustBackend.migrationProvePending(for: account)
-        let second = try await rustBackend.migrationProvePending(for: account)
+    /// The executor is idempotent on a wallet with nothing to prove: no accumulating side effect,
+    /// so a host may call it on every scan pass.
+    func testMigrationProveTransactionsIsStableAcrossRepeatedCalls() async throws {
+        let first = try await rustBackend.migrationProveTransactions(ids: [0], for: account)
+        let second = try await rustBackend.migrationProveTransactions(ids: [0], for: account)
         XCTAssertEqual(first, 0)
         XCTAssertEqual(first, second)
     }
@@ -940,7 +945,7 @@ final class MigrationFFITests: XCTestCase {
 
         let provingUnavailable = backend.migrationRoutedError(
             "MIGRATION_PROVING_UNAVAILABLE: prover parameters missing",
-            fallback: ZcashError.rustMigrationProvePending
+            fallback: ZcashError.rustMigrationProveTransactions
         )
         guard case .migrationProvingUnavailable(let message) = provingUnavailable else {
             XCTFail("expected migrationProvingUnavailable, got \(provingUnavailable)")
