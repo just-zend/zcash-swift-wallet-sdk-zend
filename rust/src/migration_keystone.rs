@@ -503,7 +503,7 @@ mod tests {
     /// success. Constructs a `ZcashBatchSigResult` directly (its `new` is public — see
     /// keystone-sdk-rust's `zcash_batch_sig_result.rs`), CBOR- and UR-encodes it exactly the way
     /// a real device response arrives on the wire (the encode-side mirror of
-    /// [`build_sign_batch_qr_parts_strips_preexisting_orchard_spend_auth_sig`]'s decode step),
+    /// [`build_sign_batch_qr_parts_strips_the_dummy_orchard_spend_auth_sig`]'s decode step),
     /// then feeds the resulting frame(s) through the production decode path twice — once under
     /// the wrong `expected_request_id`, once under the right one.
     #[test]
@@ -518,7 +518,7 @@ mod tests {
             .expect("cbor-encode zcash-batch-sig-result");
 
         // `ur::Encoder` always emits the indexed multi-part wire format, even for a single
-        // fragment (see `build_sign_batch_qr_parts_strips_preexisting_orchard_spend_auth_sig`'s
+        // fragment (see `build_sign_batch_qr_parts_strips_the_dummy_orchard_spend_auth_sig`'s
         // comment) — `decode_sign_batch_part` is exercised exactly as a real scan would, whatever
         // the fragment count.
         let mut encoder = ur::Encoder::new(
