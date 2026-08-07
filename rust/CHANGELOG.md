@@ -161,9 +161,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report the device's firmware version on completion, erroring on a request-id mismatch; and
   `_keystone_apply_batch_signatures` applies the response's signatures positionally to the caller's
   unsigned PCZTs, erroring if the counts disagree.
-- `zcashlc_migration_create_unsigned_note_split_pczts` and `_create_unsigned_transfer_pczts` annotate
-  every returned PCZT with the account's ZIP 32 seed fingerprint and account index. Without it
-  Keystone rejects the batch with "None of inputs belongs to the provided account".
+- `zcashlc_migration_create_unsigned_note_split_pczts` and `_create_unsigned_transfer_pczts` return
+  PCZTs carrying the account's ZIP 32 spend derivation on every spend still awaiting a signature,
+  across the Orchard and Ironwood bundles alike. Without it Keystone rejects the batch with "None of
+  inputs belongs to the provided account". The migration engine stamps it during the build
+  (`Committer::start` resolves the account derivation and both builders pass it to
+  `build::finalize_pczt`), so these entry points marshal the engine's bytes through unmodified; an
+  account whose ZIP 32 derivation the wallet does not know (a UFVK import made without one) yields
+  unstamped PCZTs rather than an error from these calls.
 - `Balance` (inside `FfiAccountBalance` / `FfiWalletSummary`) gains a trailing `locked_value` field,
   keeping "the sum of the fields is the account's total" true.
 - `zcashlc_migration_propose_immediate_transfers` — briefly part of this unreleased cycle, never

@@ -85,7 +85,7 @@ use zcash_client_sqlite::pool_migration::orchard_ironwood::{
 };
 use zcash_client_sqlite::util::SystemClock;
 use zcash_protocol::consensus::{
-    BLOCKS_PER_HOUR, BlockHeight, Network, NetworkConstants, NetworkUpgrade, Parameters,
+    BLOCKS_PER_HOUR, BlockHeight, Network, NetworkUpgrade, Parameters,
 };
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
@@ -3882,38 +3882,6 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
     unwrap_exc_or_null(res)
 }
 
-/// Fetches the account's ZIP 32 seed fingerprint and account index, required to annotate
-/// external-signer (Keystone) migration PCZTs with `spend_zip32_derivation` — see
-/// [`crate::migration_keystone::annotate_spend_zip32_derivation`]'s doc comment for why this is
-/// needed.
-///
-/// Applied as a post-processing step on whatever unsigned PCZT bytes `commit_or_resume` returns
-/// (freshly built, or resumed from an already-committed migration) rather than inside the engine
-/// build call itself: `commit_or_resume` only calls the engine builder on first commit, so
-/// annotating only there would silently skip already-committed migrations (e.g. ones committed
-/// before this annotation existed) on every later re-entry into the Keystone sign screen.
-fn account_zip32_derivation(
-    wallet: &MigrationWallet,
-    account: AccountUuid,
-) -> anyhow::Result<([u8; 32], zip32::AccountId)> {
-    use zcash_client_backend::data_api::Account;
-
-    let account_info = wallet
-        .get_account(account)
-        .map_err(|e| anyhow!("account lookup failed: {}", e))?
-        .ok_or_else(|| anyhow!("Account not found"))?;
-    let derivation = account_info.source().key_derivation().ok_or_else(|| {
-        anyhow!(
-            "Account has no known ZIP 32 seed fingerprint/account index — cannot annotate \
-             migration PCZTs for external-signer batch signing"
-        )
-    })?;
-    Ok((
-        derivation.seed_fingerprint().to_bytes(),
-        derivation.account_index(),
-    ))
-}
-
 /// Builds the whole migration UNSIGNED (external-signer lane): every transaction is persisted
 /// `AwaitingSignature`, and the preparation (note-split) subset is returned for the signing
 /// ceremony. The run is created HERE; the transfer subset of the same build is served by
@@ -3924,10 +3892,10 @@ fn account_zip32_derivation(
 /// the platform displayed. A fresh build fails with `MIGRATION_PLAN_STALE` when that plan is
 /// missing or superseded; the resume path does not consult the handle (see [`commit_or_resume`]).
 ///
-/// Every returned PCZT is annotated with the account's ZIP 32 spend derivation (see
-/// [`account_zip32_derivation`]) so an external signer (Keystone) can identify which of its
-/// accounts each spend belongs to — annotation happens here, after `commit_or_resume`, so it
-/// covers both a freshly built and a resumed (already-committed) run alike.
+/// Every returned PCZT already carries the account's ZIP 32 spend derivation, so an external
+/// signer (Keystone) can identify which of its accounts each spend belongs to: the engine stamps
+/// it during the build (see [`crate::migration_keystone`]'s module doc), on the freshly built and
+/// the resumed (already-committed) run alike.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with
@@ -3953,20 +3921,6 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczts(
             .into_iter()
             .filter(|(id, _, _)| prep_ids.contains(id))
             .collect();
-        let (seed_fingerprint, account_index) = account_zip32_derivation(&ctx.wallet, ctx.account)?;
-        let preps = preps
-            .into_iter()
-            .map(|(id, pczt_bytes, actions)| {
-                let pczt_bytes = crate::migration_keystone::annotate_spend_zip32_derivation(
-                    &pczt_bytes,
-                    seed_fingerprint,
-                    ctx.network.coin_type(),
-                    account_index,
-                )
-                .map_err(|e| anyhow!("Error annotating note-split PCZT derivation: {:?}", e))?;
-                Ok::<_, anyhow::Error>((id, pczt_bytes, actions))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
         FfiUnsignedTransferPczts::from_pairs(preps)
     });
     unwrap_exc_or_null(res)
@@ -4027,11 +3981,8 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
 /// gates the fresh-build case where this call is the one creating the run — see
 /// [`commit_or_resume`]).
 ///
-/// Every returned PCZT is annotated with the account's ZIP 32 spend derivation — see
-/// [`account_zip32_derivation`] and `zcashlc_migration_create_unsigned_note_split_pczts`'s doc.
-///
-/// Every returned PCZT is annotated with the account's ZIP 32 spend derivation — see
-/// [`account_zip32_derivation`] and `zcashlc_migration_create_unsigned_note_split_pczts`'s doc.
+/// Every returned PCZT already carries the account's ZIP 32 spend derivation, stamped by the
+/// engine during the build — see `zcashlc_migration_create_unsigned_note_split_pczts`'s doc.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with
@@ -4057,20 +4008,6 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_transfer_pczts(
             .into_iter()
             .filter(|(id, _, _)| transfer_ids.contains(id))
             .collect();
-        let (seed_fingerprint, account_index) = account_zip32_derivation(&ctx.wallet, ctx.account)?;
-        let transfers: Vec<_> = transfers
-            .into_iter()
-            .map(|(id, pczt_bytes, actions)| {
-                let pczt_bytes = crate::migration_keystone::annotate_spend_zip32_derivation(
-                    &pczt_bytes,
-                    seed_fingerprint,
-                    ctx.network.coin_type(),
-                    account_index,
-                )
-                .map_err(|e| anyhow!("Error annotating transfer PCZT derivation: {:?}", e))?;
-                Ok::<_, anyhow::Error>((id, pczt_bytes, actions))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
         FfiUnsignedTransferPczts::from_pairs(transfers)
     });
     unwrap_exc_or_null(res)
@@ -4697,77 +4634,6 @@ mod tests {
             ],
         )
         .expect("the placeholder received-note row inserts");
-    }
-
-    /// A view-only account imported by UFVK (no seed) — the negative-path counterpart to
-    /// [`create_fixture_account_with_usk`], which only ever produces seed-derived accounts.
-    /// Returns the wallet handle itself (not just the uuid bytes), since the caller exercises
-    /// [`account_zip32_derivation`] directly, off the FFI boundary.
-    fn create_fixture_view_only_account(path: &std::path::Path) -> (MigrationWallet, AccountUuid) {
-        use zcash_client_backend::data_api::{Account, AccountBirthday, AccountPurpose};
-        use zcash_client_backend::proto::service::TreeState;
-        use zcash_keys::keys::UnifiedSpendingKey;
-        use zcash_protocol::consensus::MAIN_NETWORK;
-
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let mut wallet = unsafe {
-            crate::wallet_db(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                parse_network(NETWORK_ID_MAINNET).expect("mainnet parses"),
-            )
-        }
-        .expect("the wallet database must open");
-
-        // A throwaway seed, only to derive SOME validly-shaped UFVK to import — the wallet is
-        // never given this seed (that is the entire point of `import_account_ufvk`), so it has
-        // no ZIP 32 path to recover from it later.
-        let usk = UnifiedSpendingKey::from_seed(&MAIN_NETWORK, &[9u8; 32], zip32::AccountId::ZERO)
-            .expect("valid ZIP 32 seed derivation");
-        let ufvk = usk.to_unified_full_viewing_key();
-        let treestate = TreeState {
-            hash: "00".repeat(32),
-            ..TreeState::default()
-        };
-        let birthday = match AccountBirthday::from_treestate(treestate, None) {
-            Ok(birthday) => birthday,
-            Err(_) => panic!("the fixture treestate must convert to a birthday"),
-        };
-        let account = wallet
-            .import_account_ufvk(
-                "fixture-view-only",
-                &ufvk,
-                &birthday,
-                AccountPurpose::ViewOnly,
-                None,
-            )
-            .expect("ufvk import must succeed");
-        let account_id = account.id();
-        (wallet, account_id)
-    }
-
-    /// `account_zip32_derivation` is this SDK's own addition (annotating Keystone migration
-    /// PCZTs with the spend derivation path — see its doc comment), so it has no Android
-    /// original to mirror. A UFVK-imported (view-only) account is exactly the case its error
-    /// branch guards: the wallet was never given a seed for it, so there is no ZIP 32 path to
-    /// annotate with, and Keystone has no way to recognize which of its accounts a spend belongs
-    /// to.
-    #[test]
-    fn account_zip32_derivation_errors_for_a_view_only_account() {
-        let path = init_fixture_db("zcashlc_migration_account_zip32_derivation_view_only");
-        let (wallet, account) = create_fixture_view_only_account(&path);
-
-        let result = account_zip32_derivation(&wallet, account);
-        let err = match result {
-            Ok(_) => panic!("a view-only account must have no known ZIP 32 derivation"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string()
-                .contains("Account has no known ZIP 32 seed fingerprint/account index"),
-            "unexpected error message: {err}"
-        );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A minimal stored migration: `n_preps` preparation transactions then `n_transfers`
@@ -6278,6 +6144,176 @@ mod tests {
             );
         }
         unsafe { zcashlc_free_migration_unsigned_transfer_pczts(transfers_ptr) };
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The ENGINE, not this SDK, stamps the ZIP 32 spend derivation an external signer (Keystone)
+    /// needs in order to recognize a migration spend as the account's. `Committer::start` resolves
+    /// it once from `MigrationBackend::account_derivation` (this crate's impl lives in
+    /// `migration_engine.rs`) and hands it to both builders; their shared `build::finalize_pczt`
+    /// runs an `Updater` pass AFTER IO finalization that stamps every action whose spend carries
+    /// no `spend_auth_sig`, across the Orchard and Ironwood bundles alike.
+    ///
+    /// This asserts that on the engine's OWN output — `commit_or_resume`'s return value, which is
+    /// what `zcashlc_migration_create_unsigned_note_split_pczts` and `_transfer_pczts` marshal —
+    /// every spend still awaiting a signature already resolves to this account's
+    /// `m/32'/coin_type'/account'` path. `Zip32Derivation::extract_account_index` checks the seed
+    /// fingerprint and the path shape together against values derived from the fixture's own seed,
+    /// so a derivation naming a different seed, coin type, or account fails here rather than
+    /// passing as merely "present".
+    ///
+    /// Regression guard for a re-stamp this SDK used to apply on top: an
+    /// `annotate_spend_zip32_derivation` pass over each PCZT the two create-unsigned entry points
+    /// returned, which recomputed the identical path under the identical predicate with the
+    /// identical setter. Should the engine ever stop stamping, that duplication is gone, so this
+    /// test is what fails — instead of the failure surfacing only on-device, as Keystone's "None
+    /// of inputs belongs to the provided account".
+    #[test]
+    fn the_engine_stamps_the_spend_zip32_derivation_on_every_unsigned_pczt() {
+        use zcash_protocol::consensus::NetworkConstants;
+
+        /// Checks one bundle's still-unsigned spends, adding each to `checked`. Shared by the
+        /// Orchard and Ironwood arms, which the engine stamps identically.
+        fn check_bundle(
+            bundle: &orchard::pczt::Bundle,
+            seed_fingerprint: &zip32::fingerprint::SeedFingerprint,
+            coin_type: zip32::ChildIndex,
+            account_index: zip32::AccountId,
+            label: &str,
+            seen: &mut usize,
+            checked: &mut usize,
+        ) {
+            *seen += bundle.actions().len();
+            for (index, action) in bundle.actions().iter().enumerate() {
+                // An already-signed action is a protocol padding dummy the IO Finalizer signed
+                // with its own throwaway key: it needs no derivation, and the engine's predicate
+                // deliberately skips it.
+                if action.spend().spend_auth_sig().is_some() {
+                    continue;
+                }
+                let derivation = action
+                    .spend()
+                    .zip32_derivation()
+                    .as_ref()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{label} action {index} awaits a signature but carries no ZIP 32 \
+                         derivation, so no external signer can identify it as the account's",
+                        )
+                    });
+                assert_eq!(
+                    derivation.extract_account_index(seed_fingerprint, coin_type),
+                    Some(account_index),
+                    "{label} action {index} must be stamped with this account's own \
+                     m/32'/coin_type'/account' path",
+                );
+                *checked += 1;
+            }
+        }
+
+        let path = init_fixture_db("zcashlc_migration_engine_stamps_spend_zip32_derivation");
+        let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_note(&path, &usk_bytes, 1_234_567_890);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+        let (_plan, _reference_height, handle) = plan_and_cache(&mut ctx, false)
+            .expect("planning must succeed")
+            .expect("the funded account has a real migration plan");
+
+        // The EXTERNAL-SIGNER lane, exactly as the two create-unsigned entry points drive it: no
+        // spending key, `unsigned_out` set. The returned PCZTs are the engine's own bytes, with no
+        // SDK post-processing between the builder and this assertion.
+        let (_state, unsigned) = commit_or_resume(&mut ctx, None, true, handle)
+            .expect("the unsigned external-signer commit must succeed");
+        assert!(
+            !unsigned.is_empty(),
+            "a funded account's unsigned run must serve at least one PCZT"
+        );
+
+        // Derived from the fixture's own seed rather than read back out of the wallet record the
+        // engine itself consulted, so this pins the VALUE, not just the round-trip.
+        let expected_seed_fingerprint = zip32::fingerprint::SeedFingerprint::from_seed(&[7u8; 32])
+            .expect("the fixture seed has a valid ZIP 32 fingerprint");
+        let expected_coin_type = zip32::ChildIndex::hardened(ctx.network.coin_type());
+        let expected_account_index = zip32::AccountId::ZERO;
+
+        let (mut orchard_seen, mut orchard_checked) = (0usize, 0usize);
+        let (mut ironwood_seen, mut ironwood_checked) = (0usize, 0usize);
+        for (id, pczt_bytes, _actions) in &unsigned {
+            let label = format!("transaction {}", u32::from(*id));
+            let pczt = pczt::parse(pczt_bytes)
+                .unwrap_or_else(|e| panic!("{label} must parse as a PCZT: {e:?}"));
+            pczt::roles::verifier::Verifier::new(pczt)
+                .with_orchard::<core::convert::Infallible, _>(|bundle| {
+                    check_bundle(
+                        bundle,
+                        &expected_seed_fingerprint,
+                        expected_coin_type,
+                        expected_account_index,
+                        &format!("{label} Orchard"),
+                        &mut orchard_seen,
+                        &mut orchard_checked,
+                    );
+                    Ok(())
+                })
+                .expect("the Orchard bundle parses")
+                .with_ironwood::<core::convert::Infallible, _>(|bundle| {
+                    check_bundle(
+                        bundle,
+                        &expected_seed_fingerprint,
+                        expected_coin_type,
+                        expected_account_index,
+                        &format!("{label} Ironwood"),
+                        &mut ironwood_seen,
+                        &mut ironwood_checked,
+                    );
+                    Ok(())
+                })
+                .expect("the Ironwood bundle parses");
+        }
+
+        // Guards against a vacuous pass: a run of nothing but pre-signed padding dummies would
+        // satisfy every assertion above while exercising the stamping not at all. The funded
+        // fixture builds one preparation transaction plus six transfers, whose Orchard spends are
+        // what the signer has to authorize.
+        assert!(
+            orchard_checked > 0,
+            "the run must contain Orchard spends awaiting a signature \
+             (Orchard actions seen: {orchard_seen})"
+        );
+        // The Ironwood arm is walked over real actions, not skipped over an absent bundle: each
+        // transfer carries one, holding the Ironwood output it crosses value into. That action's
+        // spend half is a padding dummy the IO Finalizer already signed, so a migration run has no
+        // Ironwood spend awaiting a signature — it is Orchard notes a migration spends, and the
+        // account owns no Ironwood note to spend until one of these transfers is mined. So
+        // `ironwood_checked` is legitimately 0 today; it is deliberately not asserted to stay 0,
+        // because the per-action assertion above is what must hold if that ever changes.
+        assert!(
+            ironwood_seen > 0,
+            "each transfer must carry an Ironwood action, so the Ironwood arm is not vacuous \
+             (Ironwood spends awaiting a signature: {ironwood_checked})"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
