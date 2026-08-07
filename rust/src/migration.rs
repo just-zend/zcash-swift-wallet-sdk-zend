@@ -727,19 +727,30 @@ fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bloc
 /// The row set the platform sees for a plan's transfer schedule: `(engine tx id, crossing amount,
 /// broadcast height, expiry height)`, sorted chronologically by broadcast height.
 ///
-/// - Amounts are what each transfer CROSSES, straight from the engine's `crossing_values()`:
-///   index-aligned with `funding_notes()` and with `schedule()`, and already net of the fee buffer
-///   that pays each transfer's own fee. Serving the funding note instead would overstate every row
-///   by one transfer fee and show a value that is not a round denomination the user approved.
-/// - The engine numbers every preparation transaction first, then transfers in `schedule()`
-///   order (see [`MigrationPlan::planned_transactions`], the authority for this), so transfer
-///   `i`'s real committed id is `prep_tx_count + i`.
+/// `planned` is the engine's own enumeration of the run
+/// ([`MigrationPlan::planned_transactions`]) — the very rows `commit_preparation` builds from — so
+/// each transfer's id and broadcast height are READ off it rather than worked out again here. The
+/// id is the ordinal the built transaction will carry (the engine numbers every preparation
+/// transaction first, then transfers in crossing order), and `scheduled_height` is the height the
+/// commit will stamp on the row, so a previewed timeline and the committed one cannot disagree.
+///
+/// - Amounts are what each transfer CROSSES, straight from the engine's `crossing_values()`
+///   indexed by the row's OWN crossing: index-aligned with `funding_notes()` and with
+///   `schedule()`, and already net of the fee buffer that pays each transfer's own fee. Serving
+///   the funding note instead would overstate every row by one transfer fee and show a value that
+///   is not a round denomination the user approved.
+/// - The expiry comes from `schedule()`: it is the one field of a transfer's timeline the
+///   enumeration does not publish.
+/// - A row carrying no scheduled height (the malformed-plan case the enumeration reports as
+///   `None`, which `commit_preparation` likewise refuses to build), or a crossing with no
+///   schedule entry or crossing value, is the same invariant-violation error style used elsewhere
+///   in this module.
 /// - The sort makes the platform's row order chronological: ZIP 318 SHUFFLE deliberately makes
 ///   funding-note order differ from broadcast order.
 fn schedule_rows(
+    planned: &[PlannedTx],
     crossing_values: &[Zatoshis],
     schedule: &[zcash_pool_migration::scheduling::Schedule],
-    prep_tx_count: u32,
 ) -> anyhow::Result<Vec<(MigrationTransferId, Zatoshis, BlockHeight, BlockHeight)>> {
     if crossing_values.len() != schedule.len() {
         return Err(anyhow!(
@@ -748,19 +759,29 @@ fn schedule_rows(
             schedule.len()
         ));
     }
-    let mut rows: Vec<_> = crossing_values
-        .iter()
-        .zip(schedule.iter())
-        .enumerate()
-        .map(|(i, (crossing, entry))| {
-            (
-                MigrationTransferId::new(prep_tx_count + i as u32),
-                *crossing,
-                entry.broadcast_height(),
-                entry.expiry_height(),
+    let mut rows = Vec::new();
+    for tx in planned {
+        let MigrationTxKind::Transfer { crossing } = tx.kind() else {
+            continue;
+        };
+        let amount = *crossing_values.get(crossing).ok_or_else(|| {
+            anyhow!("migration plan invariant violated: no crossing value for transfer {crossing}")
+        })?;
+        let expiry = schedule
+            .get(crossing)
+            .ok_or_else(|| {
+                anyhow!(
+                    "migration plan invariant violated: no schedule entry for transfer {crossing}"
+                )
+            })?
+            .expiry_height();
+        let broadcast = tx.scheduled_height().ok_or_else(|| {
+            anyhow!(
+                "migration plan invariant violated: no scheduled height for transfer {crossing}"
             )
-        })
-        .collect();
+        })?;
+        rows.push((tx.id(), amount, broadcast, expiry));
+    }
     rows.sort_by_key(|(_, _, broadcast, _)| *broadcast);
     Ok(rows)
 }
@@ -781,71 +802,52 @@ fn estimated_duration_hours(
         .map_or(0, |max| max.saturating_sub(now) / BLOCKS_PER_HOUR)
 }
 
-/// The number of preparation transactions a plan commits (across all layers) — the id offset of
-/// the first transfer. Delegates to the engine's own
-/// [`MigrationPlan::preparation_tx_count`], the source of truth this count must agree with.
+/// The number of preparation transactions a plan commits (across all layers). Delegates to the
+/// engine's own [`MigrationPlan::preparation_tx_count`], the source of truth the preview's own
+/// row count is cross-checked against.
 fn prep_tx_count(plan: &MigrationPlan) -> anyhow::Result<u32> {
     count_to_u32(plan.preparation_tx_count(), "preparation transaction count")
 }
 
 /// The plan's preparation transactions as schedule-preview rows — the PROPOSE-path derivation,
-/// read-only over a not-yet-committed [`MigrationPlan`]. Ids, `layer`, and `index` come straight
-/// from [`MigrationPlan::planned_transactions`] — the engine's own enumeration of the STABLE
-/// ordinals `zcash_pool_migration::engine::commit_preparation`'s `Committer::build_preparation_layers`
-/// will assign once committed, so a preview id already equals the id the built transaction will
-/// carry. `depends_on` is the WHOLE preceding layer's ids (layer 0 depends on nothing — the
-/// commit path does not narrow this to the specific producer(s) a layer's inputs spend), tracked
-/// as a watermark over the layer-major enumeration (layer transitions only ever increment, so the
-/// watermark never needs to look back further than the layer immediately before).
-/// `broadcast_height` is `plan.prep_schedule()[layer][index]`, index-aligned with
-/// `plan.preparation().layers()`; a missing entry there, or an emitted count disagreeing with
-/// [`prep_tx_count`], is the same invariant-violation error style used elsewhere in this module.
-/// Do NOT invent a finer-grained dependency from `PrepInput`; the commit path itself does not.
+/// read-only over a not-yet-committed [`MigrationPlan`]. Every field is read off
+/// [`MigrationPlan::planned_transactions`], the engine's own enumeration of the run: the STABLE
+/// ordinals `zcash_pool_migration::engine::commit_preparation` will assign, each row's
+/// `depends_on`, and each row's `scheduled_height`. Nothing here re-derives any of them, which is
+/// the point — the enumeration is what the commit itself builds from, so a previewed row and the
+/// committed transaction it becomes cannot describe different things. (The dependency rule is
+/// therefore the engine's: a layer waits on the WHOLE layer before it, never narrowed to the
+/// specific producer(s) its inputs spend.)
+///
+/// The two invariant violations this can report are the ones the enumeration itself surfaces as
+/// absences: a row holding no scheduled height (`None`, unconstructible through the engine's
+/// public API and refused by `commit_preparation`), and an emitted count disagreeing with
+/// [`prep_tx_count`].
 fn preparation_steps_from_plan(
     plan: &MigrationPlan,
 ) -> anyhow::Result<Vec<FfiMigrationPreparationStep>> {
     // Phase 1: derive every step's plain-data fields, including everything fallible (the
-    // broadcast-height lookup, the final count cross-check below) — no `Vec` is leaked into a
+    // scheduled-height read, the final count cross-check below) — no `Vec` is leaked into a
     // raw pointer yet, so an early `?` return here cannot leak one (A15; see
     // `encode_schedule_from_plan`'s caller-side comment for the same discipline one level up).
     let mut rows: Vec<(u32, u32, u32, i64, Vec<u32>)> = Vec::new();
-    let mut prev_layer_ids: Vec<u32> = Vec::new();
-    let mut this_layer_ids: Vec<u32> = Vec::new();
-    let mut current_layer: Option<usize> = None;
     for tx in plan.planned_transactions() {
         let (layer, index) = match tx.kind() {
             MigrationTxKind::Preparation { layer, index } => (layer, index),
             MigrationTxKind::Transfer { .. } => continue,
         };
-        if current_layer != Some(layer) {
-            // A new preparation layer starts: the layer just finished (if any) becomes the
-            // `depends_on` source for every step of this new layer.
-            prev_layer_ids = std::mem::take(&mut this_layer_ids);
-            current_layer = Some(layer);
-        }
-        let broadcast_height = plan
-            .prep_schedule()
-            .get(layer)
-            .and_then(|heights| heights.get(index))
-            .ok_or_else(|| {
-                anyhow!(
-                    "migration plan invariant violated: no scheduled height for preparation \
-                     layer {layer} index {index}"
-                )
-            })?;
-        let id = u32::from(tx.id());
-        this_layer_ids.push(id);
-        let depends_on = if layer == 0 {
-            Vec::new()
-        } else {
-            prev_layer_ids.clone()
-        };
+        let broadcast_height = tx.scheduled_height().ok_or_else(|| {
+            anyhow!(
+                "migration plan invariant violated: no scheduled height for preparation \
+                 layer {layer} index {index}"
+            )
+        })?;
         rows.push((
-            id,
+            u32::from(tx.id()),
             layer as u32,
             index as u32,
-            i64::from(u32::from(*broadcast_height)),
-            depends_on,
+            i64::from(u32::from(broadcast_height)),
+            tx.depends_on().iter().map(|id| u32::from(*id)).collect(),
         ));
     }
 
@@ -911,9 +913,9 @@ fn encode_schedule_from_plan(
     plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
     let rows = schedule_rows(
+        &plan.planned_transactions(),
         plan.crossing_values(),
         plan.schedule(),
-        prep_tx_count(plan)?,
     )?;
     let transfers = rows
         .into_iter()
@@ -4992,6 +4994,29 @@ mod tests {
         assert_eq!(transfer_amount(&state, tx), Some(zat(100_000_000)));
     }
 
+    /// The TRANSFER rows of a plan's enumeration as [`MigrationPlan::planned_transactions`]
+    /// emits them for `schedule`: `prep_tx_count` preparation transactions are numbered first, so
+    /// crossing `i` carries id `prep_tx_count + i` and the broadcast height its schedule entry
+    /// drew. `schedule_rows` reads exactly these two fields off the row, so this is what a real
+    /// plan hands it.
+    fn planned_transfers(
+        prep_tx_count: u32,
+        schedule: &[zcash_pool_migration::scheduling::Schedule],
+    ) -> Vec<PlannedTx> {
+        schedule
+            .iter()
+            .enumerate()
+            .map(|(crossing, entry)| {
+                PlannedTx::new(
+                    MigrationTransferId::new(prep_tx_count + crossing as u32),
+                    MigrationTxKind::Transfer { crossing },
+                    Vec::new(),
+                    Some(entry.broadcast_height()),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn schedule_rows_sort_chronologically_with_prep_offset() {
         let mut rng = StdRng::seed_from_u64(7);
@@ -4999,7 +5024,12 @@ mod tests {
         // The engine hands the crossing values straight over; they are already net of the fee
         // buffer that pays each transfer's own fee.
         let crossing_values: Vec<Zatoshis> = (1..=5).map(|i| zat(i * 100_000_000)).collect();
-        let rows = schedule_rows(&crossing_values, &schedule, 3).unwrap();
+        let rows = schedule_rows(
+            &planned_transfers(3, &schedule),
+            &crossing_values,
+            &schedule,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 5);
         // Chronological by broadcast height.
         for pair in rows.windows(2) {
@@ -5027,11 +5057,21 @@ mod tests {
 
         let mut rng_a = StdRng::seed_from_u64(1);
         let schedule_a = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng_a);
-        let rows_a = schedule_rows(&crossing_values, &schedule_a, 0).unwrap();
+        let rows_a = schedule_rows(
+            &planned_transfers(0, &schedule_a),
+            &crossing_values,
+            &schedule_a,
+        )
+        .unwrap();
 
         let mut rng_b = StdRng::seed_from_u64(99);
         let schedule_b = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng_b);
-        let rows_b = schedule_rows(&crossing_values, &schedule_b, 0).unwrap();
+        let rows_b = schedule_rows(
+            &planned_transfers(0, &schedule_b),
+            &crossing_values,
+            &schedule_b,
+        )
+        .unwrap();
 
         let total_a: u64 = rows_a
             .iter()
@@ -5062,7 +5102,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 3, &mut rng);
         let crossing_values = vec![zat(100)];
-        assert!(schedule_rows(&crossing_values, &schedule, 0).is_err());
+        assert!(
+            schedule_rows(
+                &planned_transfers(0, &schedule),
+                &crossing_values,
+                &schedule
+            )
+            .is_err()
+        );
     }
 
     /// F3 pin: `schedule_rows`' amount is BOTH the engine's authoritative
@@ -5089,7 +5136,12 @@ mod tests {
             crossing_values.len(),
             &mut rng,
         );
-        let rows = schedule_rows(note_split.crossing_values(), &schedule, 0).unwrap();
+        let rows = schedule_rows(
+            &planned_transfers(0, &schedule),
+            note_split.crossing_values(),
+            &schedule,
+        )
+        .unwrap();
         assert_eq!(rows.len(), crossing_values.len());
         for (id, amount, _, _) in &rows {
             let crossing = u32::from(*id) as usize;
@@ -5368,12 +5420,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Safety net for #1806 (audit item 2): pins that this module's hand-rolled plan-preview
-    /// numbering ALREADY agrees with the engine's own [`MigrationPlan::planned_transactions`]
-    /// enumeration, before [`preparation_steps_from_plan`] and [`schedule_rows`]'s id input are
-    /// rewritten to read from it directly instead of re-deriving it. Refactor-under-green: this
-    /// is expected to pass against today's code unmodified (there is no new behavior to drive
-    /// out, only a new source of truth for numbers that must already match).
+    /// Safety net for #1806 (audit item 2): pins that this module's plan preview reports the
+    /// engine's own [`MigrationPlan::planned_transactions`] enumeration. It was written while
+    /// [`preparation_steps_from_plan`] and [`schedule_rows`] still RE-DERIVED those numbers, to
+    /// catch the rewrite that made them read the enumeration directly changing any answer; it
+    /// passed unmodified across that rewrite, and now guards the marshalling on top — that no id
+    /// is renumbered, dropped or reordered between the enumeration and the DTO rows.
     ///
     /// (a) `preparation_steps_from_plan`'s `(id, layer, index)` triples, in order, against the
     /// same triples read off `planned_transactions()`'s preparation-kind entries.
@@ -5458,12 +5510,8 @@ mod tests {
             .filter(|t| t.is_transfer())
             .map(|t| t.id())
             .collect();
-        let rows = schedule_rows(
-            plan.crossing_values(),
-            plan.schedule(),
-            prep_tx_count(&plan).expect("preparation count must compute"),
-        )
-        .expect("schedule rows must compute");
+        let rows = schedule_rows(&planned, plan.crossing_values(), plan.schedule())
+            .expect("schedule rows must compute");
         let actual_transfer_ids: HashSet<MigrationTransferId> =
             rows.iter().map(|(id, _, _, _)| *id).collect();
         assert_eq!(

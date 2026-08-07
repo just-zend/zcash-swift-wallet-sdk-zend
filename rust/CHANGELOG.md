@@ -250,10 +250,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstream's readiness predicates are gone, leaving only the `(scheduled_height, id)` ordering key
   that display read composes over the view. The note-split ceremony's immediate-broadcast pick
   reads the same view, so a resumed ceremony re-serves an already-proved, due preparation rather
-  than proving another. The plan-preview numbering (`preparation_steps_from_plan`) likewise takes
-  its ids, `layer`, and `index` straight from the engine's own
-  `MigrationPlan::planned_transactions` enumeration, so a previewed id already equals the id the
-  committed transaction will carry.
+  than proving another. The plan preview is likewise a READ of the engine's own
+  `MigrationPlan::planned_transactions` enumeration — the same rows `commit_preparation` builds
+  from — rather than a second derivation beside it: every preparation step's id, `layer`, `index`,
+  `depends_on` and `broadcast_height`, and every transfer row's id and
+  `next_executable_after_height`, come off that enumeration. A previewed row therefore describes
+  exactly the transaction the commit will build, by construction rather than by two derivations
+  agreeing; the values are unchanged (the enumeration's dependency and scheduling rules are the
+  ones the preview used to reproduce by hand).
 - Mined-transaction promotion is the upstream engine's: `advance_migration` sweeps every in-flight
   transaction and promotes the ones the wallet's scan has seen mine, so the drive path no longer
   reconciles first, and the read-only entry points reconcile through the engine's own
