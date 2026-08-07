@@ -2023,8 +2023,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationProveTransactions(ids: [UInt32], for account: AccountUUID) async throws -> Int {
-        guard !ids.isEmpty else { return 0 }
+    func migrationProveTransactions(ids: [UInt32], maxProofs: Int, for account: AccountUUID) async throws -> Int {
+        guard !ids.isEmpty, maxProofs > 0 else { return 0 }
 
         // The batch is CHUNKED: one proof per FFI call, with a suspension between calls. Each
         // proof is seconds of CPU. Since the read/write split, every read-only call runs OFF
@@ -2039,9 +2039,12 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         // re-advance between chunks: the rust executor skips a row that is no longer awaiting its
         // proof, so the rows earlier chunks already proved cost nothing to re-name, and the cap of
         // 1 lands on the first row still outstanding. The loop ends when a chunk proves nothing —
-        // either the batch is exhausted or the remainder is transiently unprovable.
+        // either the batch is exhausted or the remainder is transiently unprovable — or when the
+        // caller's `maxProofs` budget is spent. Because each chunk is capped at 1 and a skip never
+        // counts against the rust cap, the budget is honoured EXACTLY: this returns at most
+        // `maxProofs`, all of them real proofs.
         var totalProved = 0
-        while true {
+        while totalProved < maxProofs {
             // `-1` is never a legitimate count, so the return value alone decides success.
             // The last-error is cleared first so the message read on failure cannot be a
             // leftover from an earlier call on this thread.
@@ -2073,6 +2076,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             // Let queued `DBActor` writers run before the next proof.
             await Task.yield()
         }
+
+        // The budget is spent, with the batch possibly still holding provable rows: the caller
+        // advances again and re-passes whatever the next crank offers.
+        return totalProved
     }
 
     // DB-AUDIT (2026-08-03): WRITE — the broadcast seam records the transaction in the wallet's
@@ -3004,6 +3011,7 @@ extension FfiMigrationAdvanceStep {
             if let proveTargets = prove_targets {
                 for index in 0 ..< Int(prove_targets_len) {
                     let target = proveTargets.advanced(by: index).pointee
+                    // Likewise the sole producer of a `MigrationProveTarget` (internal init).
                     let kind: MigrationTransactionStatus.Kind = target.kind_is_preparation
                         ? .preparation(layer: Int(target.kind_layer), index: Int(target.kind_index))
                         : .transfer(crossing: Int(target.kind_crossing))
@@ -3015,7 +3023,10 @@ extension FfiMigrationAdvanceStep {
             guard !transactions.isEmpty else { return nil }
             step = .prove(transactions: transactions)
         case ZCASHLC_ADVANCE_STEP_BROADCAST:
-            step = .broadcast(id: self.id)
+            // THE SOLE PRODUCER of a `MigrationBroadcastInstruction`: its initializer is internal,
+            // so an instruction exists only because this marshal minted one for a crank that
+            // returned a BROADCAST step (see the type's doc).
+            step = .broadcast(MigrationBroadcastInstruction(id: self.id))
         case ZCASHLC_ADVANCE_STEP_REBUILD:
             step = .rebuild(id: self.id)
         case ZCASHLC_ADVANCE_STEP_WAITING:

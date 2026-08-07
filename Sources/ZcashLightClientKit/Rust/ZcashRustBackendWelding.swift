@@ -636,9 +636,15 @@ protocol ZcashRustBackendWelding {
     /// advance); so is one whose anchor the wallet cannot resolve yet, which a later call retries.
     /// Safe to run on any schedule, including mid-sync — but call it as the wallet scans, NOT when
     /// about to broadcast: proving is expensive, and the delivery lane deliberately does none.
+    ///
+    /// `maxProofs` bounds how many proofs this call PRODUCES — the caller's session budget, since
+    /// each proof is seconds of CPU. Skips do not count against it (that is the rust executor's
+    /// own rule), so a bounded call always spends its whole budget on rows that actually needed
+    /// proving. A budget below `1` proves nothing; the executor in front of this rejects that as a
+    /// caller bug rather than silently no-op'ing.
     /// - Throws: `migrationProvingUnavailable` when proving fails for a non-transient reason;
     ///   `rustMigrationProveTransactions` for other rust-layer errors.
-    func migrationProveTransactions(ids: [UInt32], for account: AccountUUID) async throws -> Int
+    func migrationProveTransactions(ids: [UInt32], maxProofs: Int, for account: AccountUUID) async throws -> Int
 
     /// Serves the transaction `id` for broadcast — the instruction a prior
     /// ``migrationAdvanceStep(for:estimatedTip:)`` call returned as its

@@ -1104,14 +1104,13 @@ final class MigrationLogicTests: ZcashTestCase {
     /// transport), a real ``MigrationSyncGate``, and a welding mock, so a future regression that
     /// reorders "record" before "broadcast", or adds a direct-transport fallback on Tor failure, would
     /// turn this test red.
-    func testExecuteNextPendingTransferFailsClosedOnTorUnavailableWithoutRecordingOrGating() async throws {
+    func testPerformBroadcastFailsClosedOnTorUnavailableWithoutRecordingOrGating() async throws {
         let prepared = PreparedMigrationTransfer(
             id: 0,
             txid: Data(repeating: 0xAB, count: 32),
             pczt: Data([0x01, 0x02])
         )
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .broadcast(id: prepared.id), next: nil)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
         // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
         welding.migrationTransactionStatusesForReturnValue = []
@@ -1133,12 +1132,12 @@ final class MigrationLogicTests: ZcashTestCase {
         )
 
         do {
-            _ = try await migration.executeNextPendingTransfer(
+            _ = try await migration.performBroadcast(
+                MigrationBroadcastInstruction(id: prepared.id),
                 options: MigrationNetworkPrivacyOptions(
                     useTor: true,
                     submissionEndpoint: LightWalletEndpoint(address: "default.example", port: 9067)
-                ),
-                useEstimatedTip: false
+                )
             )
             XCTFail("Expected migrationTorUnavailable to be thrown")
         } catch ZcashError.migrationTorUnavailable {

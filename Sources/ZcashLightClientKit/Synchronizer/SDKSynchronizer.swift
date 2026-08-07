@@ -1201,10 +1201,11 @@ public class SDKSynchronizer: Synchronizer {
     //
     // Thin forwards to `migrationHost.migration(for:)`'s per-account `OrchardMigration` actor (or,
     // for the three wallet-scope gate members, to the host itself). The two members that can
-    // broadcast (`submitNoteSplit`, `executeNextPendingMigrationTransfer`) are guarded here by
+    // broadcast (`submitNoteSplit`, `performMigrationBroadcast`) are guarded here by
     // `throwIfSyncingForMigrationBroadcast()` — an advisory point-in-time check, not a hard
     // mutual-exclusion lock: sync and migration broadcasts must never share a session, and hosts
-    // still sequence sessions themselves.
+    // still sequence sessions themselves. `proveMigrationTransactions` is deliberately NOT guarded:
+    // proving is what a SYNC session is for.
 
     public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
         try await migrationHost.migration(for: accountUUID).advanceStep()
@@ -1214,10 +1215,13 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).migrationProgress()
     }
 
-    public func finalizeReadyMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
-        try await migrationHost.migration(for: accountUUID).finalizeReadyTransfers()
+    public func proveMigrationTransactions(
+        accountUUID: AccountUUID,
+        _ instruction: [MigrationProveTarget],
+        maxProofs: Int
+    ) async throws -> Int {
+        try await migrationHost.migration(for: accountUUID).proveTransactions(instruction, maxProofs: maxProofs)
     }
-
 
     public func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
         try await migrationHost.migration(for: accountUUID).syncWakeups()
@@ -1291,14 +1295,13 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).signAndStoreMigrationSchedule(schedule, usk: usk)
     }
 
-    public func executeNextPendingMigrationTransfer(
+    public func performMigrationBroadcast(
         accountUUID: AccountUUID,
-        options: MigrationNetworkPrivacyOptions,
-        useEstimatedTip: Bool
-    ) async throws -> MigrationTransferAttempt {
+        _ instruction: MigrationBroadcastInstruction,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferResult {
         try await throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID)
-            .executeNextPendingTransfer(options: options, useEstimatedTip: useEstimatedTip)
+        return try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
     }
 
     public func isMigrationSyncBlocked() async -> Bool {
@@ -1398,7 +1401,7 @@ public class SDKSynchronizer: Synchronizer {
     /// Throws ``ZcashError/migrationBroadcastDuringSync`` when the synchronizer is actively syncing.
     ///
     /// Guards the two migration entry points that broadcast (``submitNoteSplit(accountUUID:proposal:usk:options:)``
-    /// and ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``): sync and migration
+    /// and ``performMigrationBroadcast(accountUUID:_:options:)``): sync and migration
     /// broadcasts must never share a session. Reads `status` -- the same source `start(retry:)`
     /// switches on -- so the guard triggers on the syncing case only; stopped/synced/disconnected/
     /// error/unprepared all proceed.

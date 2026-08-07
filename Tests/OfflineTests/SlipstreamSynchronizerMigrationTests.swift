@@ -7,7 +7,7 @@
 //  to a seamed `OrchardMigrationHost` -- except the DB-free, account-free Keystone batch-signing
 //  bridge (4 members, #1806), which forwards straight to `initializer.rustBackend` instead,
 //  bypassing the host entirely -- plus the two SDK-enforced session-separation behaviors -- the
-//  `start()` privacy gate and the `submitNoteSplit`/`executeNextPendingMigrationTransfer` broadcast
+//  `start()` privacy gate and the `submitNoteSplit`/`performMigrationBroadcast` broadcast
 //  guard -- mirrored onto the actor.
 //
 //  Driven through the host's injecting initializer + a scripted actor factory, exactly like
@@ -81,7 +81,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
                 step: .prove(transactions: [MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))]),
                 next: nil
             ),
-            MigrationAdvance(step: .broadcast(id: 5), next: nil),
+            MigrationAdvance(step: .broadcast(MigrationBroadcastInstruction(id: 5)), next: nil),
             MigrationAdvance(step: .rebuild(id: 6), next: nil),
             MigrationAdvance(step: .waiting, next: MigrationNextWork(height: 850_000, kind: .broadcast)),
             MigrationAdvance(step: .complete, next: nil),
@@ -631,7 +631,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertFalse(welding.migrationSignNoteSplitProposalUskForCalled, "the engine must never see a during-sync submission")
     }
 
-    func testExecuteNextPendingMigrationTransferThrowsDuringSyncWithoutTouchingTheHost() async throws {
+    func testPerformMigrationBroadcastThrowsDuringSyncWithoutTouchingTheHost() async throws {
         let welding = ZcashRustBackendWeldingMock()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
@@ -640,7 +640,11 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint)
 
         do {
-            _ = try await synchronizer.executeNextPendingMigrationTransfer(accountUUID: accountUUID, options: options)
+            _ = try await synchronizer.performMigrationBroadcast(
+                accountUUID: accountUUID,
+                MigrationBroadcastInstruction(id: 1),
+                options: options
+            )
             XCTFail("expected migrationBroadcastDuringSync")
         } catch let error as ZcashError {
             guard case .migrationBroadcastDuringSync = error else {
@@ -653,7 +657,10 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         }
 
         XCTAssertEqual(recorder.callCount, 0, "the guard must throw before the host is ever consulted")
-        XCTAssertFalse(welding.migrationAdvanceStepForEstimatedTipCalled, "the engine must never see a during-sync execution attempt")
+        XCTAssertFalse(
+            welding.migrationTakeBroadcastTransactionIdForCalled,
+            "the engine must never see a during-sync execution attempt"
+        )
     }
 
     /// Not-syncing companion: proves the guard does NOT trip outside the syncing case, and the call
@@ -691,19 +698,23 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(recorder.callCount, 1, "the host must be consulted when the synchronizer is not syncing")
     }
 
-    /// Not-syncing companion for `executeNextPendingMigrationTransfer`, mirroring
+    /// Not-syncing companion for `performMigrationBroadcast`, mirroring
     /// `testSubmitNoteSplitForwardsWhenNotSyncing()`.
-    func testExecuteNextPendingMigrationTransferForwardsWhenNotSyncing() async throws {
+    func testPerformMigrationBroadcastForwardsWhenNotSyncing() async throws {
         struct StubNextDueTransferFailure: Error, Equatable {}
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationAdvanceStepForEstimatedTipThrowableError = StubNextDueTransferFailure()
+        welding.migrationTakeBroadcastTransactionIdForThrowableError = StubNextDueTransferFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
 
         let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint)
 
         do {
-            _ = try await synchronizer.executeNextPendingMigrationTransfer(accountUUID: accountUUID, options: options)
+            _ = try await synchronizer.performMigrationBroadcast(
+                accountUUID: accountUUID,
+                MigrationBroadcastInstruction(id: 1),
+                options: options
+            )
             XCTFail("expected the stubbed next-due-transfer failure to propagate")
         } catch let error as StubNextDueTransferFailure {
             XCTAssertEqual(error, StubNextDueTransferFailure())

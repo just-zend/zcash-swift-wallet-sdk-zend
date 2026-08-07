@@ -35,11 +35,12 @@ import Foundation
 ///   out-of-band resolution — surface the attention UX over the
 ///   ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
 ///   `restartCurrentMigrationStep(accountUUID:)` to cancel and re-plan.
-/// - ``broadcast(id:)`` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`:
-///   submit the served transaction and end the session — a broadcast session must not sync.
-/// - ``prove(transactions:)`` → the WHOLE batch is ready: discharge it in one call with
-///   `finalizeReadyMigrationTransfers(accountUUID:)` at a sync wake-up (see
-///   `migrationSyncWakeups(accountUUID:)`), which proves every ready row in that pass. Each
+/// - ``broadcast(_:)`` → `performMigrationBroadcast(accountUUID:_:options:)`: hand the case's
+///   opaque ``MigrationBroadcastInstruction`` straight to the executor and end the session — a
+///   broadcast session must not sync.
+/// - ``prove(transactions:)`` → the WHOLE batch is ready, and the batch IS the instruction: hand
+///   it to `proveMigrationTransactions(accountUUID:_:maxProofs:)` at a sync wake-up (see
+///   `migrationSyncWakeups(accountUUID:)`), which proves up to the caller's budget from that pass. Each
 ///   entry's ``MigrationProveTarget/kind`` distinguishes what follows for THAT transaction: a
 ///   ``MigrationTransactionStatus/Kind/transfer(crossing:)`` entry's broadcast follows in its own
 ///   LATER session — proving has no deadline of its own, a transfer's boundary anchor checkpoint
@@ -64,12 +65,21 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     /// The WHOLE provable set is ready to be proved in one synced session (upstream #2939):
     /// earliest-ready first, never empty, preparations and transfers possibly mixed. Proving
     /// emits nothing on-chain, so nothing is gained by leaving provable work on the table while
-    /// a synced session is open — discharge the entire batch with
-    /// `finalizeReadyMigrationTransfers(accountUUID:)`, which proves every ready row in one
-    /// pass. Broadcast remains a separate later step, served one transaction at a time.
+    /// a synced session is open — hand the entire batch to
+    /// `proveMigrationTransactions(accountUUID:_:maxProofs:)`, which proves as much of it as the
+    /// caller's budget allows. Broadcast remains a separate later step, served one transaction at
+    /// a time.
+    ///
+    /// The batch is also the INSTRUCTION: ``MigrationProveTarget`` has no public initializer, so
+    /// the only way to hold one is to have cranked `migrationAdvanceStep(accountUUID:)` and been
+    /// handed this step.
     case prove(transactions: [MigrationProveTarget])
-    /// The transaction identified by `id` is proved and due: broadcast it (and end the session).
-    case broadcast(id: UInt32)
+    /// A proved, due transaction is ready to broadcast: hand the payload to
+    /// `performMigrationBroadcast(accountUUID:_:options:)` (and end the session).
+    ///
+    /// The payload is the opaque ``MigrationBroadcastInstruction`` rather than a bare id: holding
+    /// one is the proof that this crank issued the instruction (see that type's doc).
+    case broadcast(MigrationBroadcastInstruction)
     /// The transfer identified by `id` expired unmined and must be rebuilt in place.
     case rebuild(id: UInt32)
     /// Nothing is actionable right now: wake again at the sync-wakeup/scheduled heights.
@@ -84,6 +94,43 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     case requiresAttention(id: UInt32)
 }
 
+/// The drive's instruction to broadcast one transaction — the payload of
+/// ``MigrationAdvanceStep/broadcast(_:)``, and the only thing
+/// `performMigrationBroadcast(accountUUID:_:options:)` accepts.
+///
+/// OPAQUE BY CONSTRUCTION: it has no public initializer, so an app cannot manufacture one. The
+/// only way to hold an instruction is to have called `migrationAdvanceStep(accountUUID:)` and been
+/// handed it, which is what makes "broadcast a migration transaction the drive did not ask for"
+/// unrepresentable at the Swift surface. Quoting the ruling this shape implements: *"And as such it
+/// should be provided with no capabilities for such semantic goals."*
+///
+/// The ``id`` is readable — a host correlates it with a
+/// ``MigrationTransactionStatus`` row for display and logging — but reading an id is not a
+/// capability: nothing consumes a bare `UInt32`.
+///
+/// - Important: This is a SWIFT-SURFACE property, not a security boundary. At the C ABI everything
+///   is forgeable, and the Rust executors' per-row state gating (a non-`Proved` row is refused)
+///   remains the actual safety backstop. The instruction type makes the correct call shape the
+///   only one that compiles; it does not make the incorrect one impossible.
+public struct MigrationBroadcastInstruction: Equatable, Sendable {
+    /// The engine's stable transaction id for the transaction to broadcast — for correlating with
+    /// ``MigrationTransactionStatus/id`` and for logging.
+    public let id: UInt32
+
+    /// Creates an instruction. INTERNAL by design: instructions are produced only by the advance
+    /// marshaling (`FfiMigrationAdvanceStep.unsafeToMigrationAdvance()`); SDK tests reach it
+    /// through `@testable`.
+    ///
+    /// Written out rather than left to synthesis even though the two are identical today: the
+    /// internal access level is the whole capability discipline, and this declaration is where it
+    /// is stated and documented. Deleting it would leave the same behavior with the reasoning
+    /// nowhere, one `public` away from silently becoming forgeable.
+    // swiftlint:disable:next unneeded_synthesized_initializer
+    init(id: UInt32) {
+        self.id = id
+    }
+}
+
 /// One transaction of a ``MigrationAdvanceStep/prove(transactions:)`` batch: the transaction to
 /// prove, with the kind that routes it, plus whether its broadcast window has already opened. A
 /// preparation may prove and broadcast at the same wake-up; a transfer proves now and broadcasts
@@ -92,6 +139,10 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
 /// ``id`` and ``kind`` are a verbatim marshal of the upstream engine's `ProveTarget`;
 /// ``isScheduleDue`` is NOT an upstream field but the SDK's own reading of the row against the
 /// same dueness targets the advance that produced the batch judged with.
+///
+/// OPAQUE BY CONSTRUCTION, exactly as ``MigrationBroadcastInstruction`` is: the initializer is
+/// internal, so the batch an app holds can only be one the drive handed it. A `[MigrationProveTarget]`
+/// IS the prove instruction — see `proveMigrationTransactions(accountUUID:_:maxProofs:)`.
 public struct MigrationProveTarget: Equatable, Sendable {
     /// The engine's stable transaction id.
     public let id: UInt32
@@ -103,16 +154,20 @@ public struct MigrationProveTarget: Equatable, Sendable {
     ///
     /// A transaction becomes provable long BEFORE it comes due — that head start is the whole
     /// point of the prove/broadcast split — so most of a batch is ordinarily `false`, meaning
-    /// "proving is opportunistic work for the next sync wake-up". A `true` entry is what
-    /// `executeNextPendingMigrationTransfer` reports as
-    /// ``MigrationTransferAttempt/awaitingProof(id:)``: sweep, then advance again.
+    /// "proving is opportunistic work for the next sync wake-up". A `true` entry means the
+    /// schedule has already reached that row: its missing proof is what stands between the run and
+    /// a broadcast, so a host with a proof budget to spend has a reason to spend it NOW and crank
+    /// again rather than wait for the next wake-up. Informational either way — the batch is
+    /// discharged whole, and the engine, not the host, decides what a later crank offers.
     ///
     /// Unlike ``id`` and ``kind`` this is not an upstream `ProveTarget` field but the SDK's
     /// reading of the row against the same dueness targets the advance judged with.
     public let isScheduleDue: Bool
 
-    /// Creates a `MigrationProveTarget`.
-    public init(id: UInt32, kind: MigrationTransactionStatus.Kind, isScheduleDue: Bool = false) {
+    /// Creates a `MigrationProveTarget`. INTERNAL by design: prove targets are produced only by
+    /// the advance marshaling (`FfiMigrationAdvanceStep.unsafeToMigrationAdvance()`); SDK tests
+    /// reach it through `@testable`.
+    init(id: UInt32, kind: MigrationTransactionStatus.Kind, isScheduleDue: Bool = false) {
         self.id = id
         self.kind = kind
         self.isScheduleDue = isScheduleDue
@@ -181,25 +236,6 @@ public struct MigrationAdvance: Equatable, Sendable {
         self.step = step
         self.next = next
     }
-}
-
-/// The outcome of one broadcast-lane delivery attempt
-/// (`Synchronizer.executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`).
-///
-/// Distinguishes the two empty outcomes from an actual broadcast: ``nothingDue`` ends the session
-/// with nothing to do, ``awaitingProof(id:)`` means the due transaction's proof has not been
-/// produced yet (run `finalizeReadyMigrationTransfers` at a sync wake-up, then retry in a later
-/// broadcast session), and ``executed(_:)`` carries the broadcast's recorded
-/// ``MigrationTransferResult``.
-public enum MigrationTransferAttempt: Equatable, Sendable {
-    /// Nothing is due: nothing scheduled yet, dependencies unmined, rows awaiting an external
-    /// signature, or everything already broadcast.
-    case nothingDue
-    /// The transaction identified by `id` is due but has not been proved yet; nothing was
-    /// broadcast. Proofs are produced by `finalizeReadyMigrationTransfers` as the wallet syncs.
-    case awaitingProof(id: UInt32)
-    /// A broadcast was attempted and its outcome recorded.
-    case executed(MigrationTransferResult)
 }
 
 /// One sync/proving wake-up of the stored run's schedule, as returned by

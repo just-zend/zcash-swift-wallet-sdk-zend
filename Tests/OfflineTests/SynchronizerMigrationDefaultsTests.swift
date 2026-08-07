@@ -42,8 +42,14 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationProgress(accountUUID: self.accountUUID) }
     }
 
-    func testFinalizeReadyMigrationTransfersDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.finalizeReadyMigrationTransfers(accountUUID: self.accountUUID) }
+    func testProveMigrationTransactionsDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.proveMigrationTransactions(
+                accountUUID: self.accountUUID,
+                [MigrationProveTarget(id: 1, kind: .transfer(crossing: 0), isScheduleDue: false)],
+                maxProofs: 1
+            )
+        }
     }
 
     func testMigrationSyncWakeupsDefaultThrowsUnimplemented() async {
@@ -123,22 +129,13 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         }
     }
 
-    /// The two-argument convenience overload (`useEstimatedTip` defaulted to `false`) must reach
-    /// the same protocol-extension default as the three-argument requirement it forwards to.
-    func testExecuteNextPendingMigrationTransferTwoArgOverloadDefaultThrowsUnimplemented() async {
+    func testPerformMigrationBroadcastDefaultThrowsUnimplemented() async {
         let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067))
         await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.executeNextPendingMigrationTransfer(accountUUID: self.accountUUID, options: options)
-        }
-    }
-
-    func testExecuteNextPendingMigrationTransferDefaultThrowsUnimplemented() async {
-        let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067))
-        await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.executeNextPendingMigrationTransfer(
+            _ = try await self.synchronizer.performMigrationBroadcast(
                 accountUUID: self.accountUUID,
-                options: options,
-                useEstimatedTip: true
+                MigrationBroadcastInstruction(id: 1),
+                options: options
             )
         }
     }

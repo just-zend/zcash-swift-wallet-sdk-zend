@@ -175,9 +175,9 @@ actor OrchardMigration {
     /// Callers waiting for the in-flight broadcast flow to finish, resumed in bulk when it does.
     private var broadcastFlowWaiters: [CheckedContinuation<Void, Never>] = []
 
-    /// The outlook (``MigrationAdvance/next``) most recently returned by
-    /// ``advanceStep(useEstimatedTip:)`` -- from ANY caller (the sweep, the delivery lane, or a
-    /// direct host call, all of which fold through that one method). Replaced on every crank,
+    /// The outlook (``MigrationAdvance/next``) most recently returned by ``advanceStep()`` --
+    /// from ANY caller (the app's driver, or a direct host call, both of which fold through that
+    /// one method). Replaced on every crank,
     /// including with `nil` when that crank's step carried none: the outlook holds only as of the
     /// state its call returned, so a stale value must never outlive the crank that superseded it.
     /// Read side for hosts is ``nextMigrationWake``.
@@ -280,18 +280,14 @@ actor OrchardMigration {
     /// advance's `.step` as ``MigrationAdvanceStep/complete`` (`.next` is always `nil` for it). See
     /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping, and
     /// ``MigrationAdvance`` / ``MigrationNextWork`` for the outlook's contract.
+    ///
+    /// IT ALWAYS PROJECTS THE ESTIMATE, and takes no parameter for it. The opt-out overload existed
+    /// for the kind-filtered lanes that cranked with their own tip rule; there is one crank site
+    /// now, so an opt-out would be a capability for a distinction the surface no longer draws. The
+    /// estimate may only ever ACCELERATE schedule due-ness — expiry stays scanned-tip — and an
+    /// estimator failure degrades to scanned-tip behavior rather than blocking the advance.
     func advanceStep() async throws -> MigrationAdvance? {
-        try await advanceStep(useEstimatedTip: true)
-    }
-
-    /// ``advanceStep()`` with the wall-clock chain-tip estimate made optional, for the lanes that
-    /// choose whether to accelerate schedule due-ness (the estimate may only ever ACCELERATE it;
-    /// expiry stays scanned-tip, and an estimator failure degrades to scanned-tip behavior rather
-    /// than blocking the advance).
-    func advanceStep(useEstimatedTip: Bool) async throws -> MigrationAdvance? {
-        let estimatedTip = useEstimatedTip
-            ? await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now())
-            : nil
+        let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now())
         let advance = try await welding.migrationAdvanceStep(for: accountUUID, estimatedTip: estimatedTip)
         // Every crank -- regardless of which caller drove it -- replaces the retained outlook,
         // including with `nil`: a stale outlook must not outlive the crank that superseded it (see
@@ -301,8 +297,8 @@ actor OrchardMigration {
         return advance
     }
 
-    /// The engine's OUTLOOK retained from the most recent ``advanceStep(useEstimatedTip:)`` crank —
-    /// by ANY caller (the sweep, the delivery lane, or a direct host call) — so a host can ask
+    /// The engine's OUTLOOK retained from the most recent ``advanceStep()`` crank —
+    /// by ANY caller (the app's driver, or a direct host call) — so a host can ask
     /// "when is the next migration wake, per the drive's own plan" without re-cranking the engine
     /// itself.
     ///
@@ -317,7 +313,7 @@ actor OrchardMigration {
     /// host registering OS wake-ups should min-fold this outlook's height in alongside the
     /// schedule's own heights, as zodl-ios already does, never treat it as a replacement source.
     ///
-    /// `nil` means either no crank has run yet this session (``advanceStep(useEstimatedTip:)`` has
+    /// `nil` means either no crank has run yet this session (``advanceStep()`` has
     /// never completed), or the last step's own outcome decides what follows — a chain condition
     /// (a mining confirmation) or a user/spend-authority action, not a height.
     var nextMigrationWake: MigrationNextWork? {
@@ -338,57 +334,109 @@ actor OrchardMigration {
     }
 
     /// The stored run's sync/proving wake-up schedule as of the scanned tip — the heights at
-    /// which the host should wake, sync, and run ``finalizeReadyTransfers()``, plus the transfer
-    /// ids each wake-up covers. Jitter is re-drawn on every call; recompute (and re-register with
-    /// the OS) after any state change rather than caching. Empty when there is nothing left to
-    /// prove.
+    /// which the host should wake, sync, crank ``advanceStep()`` and discharge the prove
+    /// instruction it returns, plus the transfer ids each wake-up covers. Jitter is re-drawn on
+    /// every call; recompute (and re-register with the OS) after any state change rather than
+    /// caching. Empty when there is nothing left to prove.
     func syncWakeups() async throws -> [MigrationSyncWakeup] {
         try await welding.migrationSyncWakeups(for: accountUUID)
     }
 
+    // MARK: - Instruction executors
 
-    /// Proves every migration transaction the engine currently offers for proving and returns how
-    /// many were proved (`0` is the ordinary "nothing left to prove" answer). Run it at sync
-    /// wake-ups (``syncWakeups()``), never on the broadcast path — proving needs the wallet's
-    /// commitment tree and takes real time, while a broadcast session must stay a pure delivery
-    /// step.
+    /// Proves up to `maxProofs` of the transactions `instruction` NAMES, and returns how many were
+    /// proved (`0` is the ordinary "nothing in this batch is provable right now" answer).
     ///
-    /// THE SWEEP IS A LOOP OVER THE DRIVE, not a single call that decides for itself what to
-    /// prove: ``advanceStep(useEstimatedTip:)`` is the top-level call and the prove executor only
-    /// discharges the ``MigrationAdvanceStep/prove(transactions:)`` batch it returns. Proving a batch can unblock
-    /// rows that were not in it, so the loop re-advances after each productive pass and stops as
-    /// soon as a pass proves nothing — the batch is exhausted, or its remainder is transiently
-    /// unprovable and a later wake-up will retry.
+    /// THE INSTRUCTION IS THE AUTHORITY: this never asks the engine what to prove.
+    /// ``advanceStep()`` is the top-level call, and `instruction` is a
+    /// ``MigrationAdvanceStep/prove(transactions:)`` batch that a crank handed out — the only way
+    /// to hold one, since ``MigrationProveTarget`` has no public initializer. Whether a candidate
+    /// is worth proving at all, its order, and whether a due broadcast outranks proving this
+    /// session were all settled by the advance that issued the batch.
     ///
-    /// ANY OTHER STEP ENDS THE SWEEP with the count so far. Most notably a
-    /// ``MigrationAdvanceStep/broadcast(id:)``: a due broadcast outranks proving in the engine's
-    /// own precedence, which is what lets a woken session deliver without ever paying proving
-    /// latency (ZIP 318 permits a sync session to broadcast). This call never broadcasts — the
-    /// caller's own delivery pass handles or defers it.
+    /// THERE IS NO LOOP HERE. Proving a batch can unblock rows that were not in it, so a host that
+    /// wants to drain the run cranks again and discharges the NEXT instruction — the drive, not
+    /// this executor, decides whether more proving (or a now-due broadcast) follows.
     ///
-    /// IT ADVANCES AT THE SCANNED TIP (`useEstimatedTip: false`): the sweep runs as the wallet
-    /// scans, and only the delivery lane accepts a wall-clock estimate. The estimate has no
-    /// acceleration to offer a sweep — prove-readiness is gated on an anchor the wallet must have
-    /// SCANNED, which no projection brings forward — so its only two effects here are
-    /// decelerations: an earlier broadcast-precedence stop, and an earlier (and PERSISTED)
-    /// ZIP 318 re-spread. Worse, they would desynchronize the two lanes: with
-    /// `executeNextPendingTransfer`'s own default judging at the scanned tip, an estimate-advanced
-    /// sweep inside the estimate's lead window sees `.broadcast` and proves nothing while the
-    /// delivery lane sees nothing due — and neither lane progresses until the scan catches up.
-    func finalizeReadyTransfers() async throws -> Int {
-        var totalProved = 0
-        while true {
-            guard case .prove(let transactions)? = try await advanceStep(useEstimatedTip: false)?.step else {
-                return totalProved
-            }
-            let proved = try await welding.migrationProveTransactions(
-                ids: transactions.map(\.id),
-                for: accountUUID
+    /// Per row the rust executor SKIPS what it cannot prove — a row no longer awaiting its proof,
+    /// or one whose anchor the wallet cannot resolve yet — so acting on a stale instruction is
+    /// safe, and a skip never spends the budget.
+    ///
+    /// Run it at sync wake-ups (``syncWakeups()``), never on the broadcast path: proving needs the
+    /// wallet's commitment tree and takes real time, while a broadcast session must stay a pure
+    /// delivery step.
+    /// - Parameters:
+    ///   - instruction: the prove batch a crank returned. An EMPTY batch proves nothing (the
+    ///     engine never issues one; a caller that slices its instruction down to nothing gets the
+    ///     benign `0`).
+    ///   - maxProofs: the session's proof budget, at least `1`.
+    /// - Throws: ``ZcashError/rustMigrationProveTransactions(_:)`` when `maxProofs` is below `1` —
+    ///   a caller bug, named rather than silently treated as "prove nothing";
+    ///   ``ZcashError/migrationProvingUnavailable(_:)`` when proving fails for a non-transient
+    ///   reason.
+    func proveTransactions(_ instruction: [MigrationProveTarget], maxProofs: Int) async throws -> Int {
+        guard maxProofs >= 1 else {
+            throw ZcashError.rustMigrationProveTransactions(
+                "`proveTransactions` was given a proof budget of \(maxProofs); it must be at least 1"
             )
-            guard proved > 0 else {
-                return totalProved
-            }
-            totalProved += proved
+        }
+
+        return try await welding.migrationProveTransactions(
+            ids: instruction.map(\.id),
+            maxProofs: maxProofs,
+            for: accountUUID
+        )
+    }
+
+    /// Broadcasts the transaction `instruction` names and returns the recorded outcome.
+    ///
+    /// THE INSTRUCTION IS THE AUTHORITY: this never advances the drive and never chooses a
+    /// transaction. A ``MigrationBroadcastInstruction`` exists only because a
+    /// ``advanceStep()`` crank returned
+    /// ``MigrationAdvanceStep/broadcast(_:)`` (its initializer is internal), so holding one IS the
+    /// proof that the re-spread, the satisfiability verification and the dueness judgement already
+    /// happened. There is consequently no "nothing due" and no "awaiting proof" outcome to report:
+    /// the driver saw the step itself.
+    ///
+    /// Composition (identical to ``submitNoteSplit(proposal:usk:options:)``'s, which shares the
+    /// same private helper): serve the named transaction's already-finalized bytes through the
+    /// store's atomic broadcast seam, broadcast once, and — only on a success outcome — start the
+    /// privacy buffer *before* recording the mapped result, so the gate marks on submit success
+    /// independent of record bookkeeping. Transport/rejection outcomes are RETURNED (recorded
+    /// first, gate untouched).
+    ///
+    /// - Throws: a pre-broadcast failure throws untouched and nothing is recorded — a fail-closed
+    ///   ``ZcashError/migrationTorUnavailable`` when `options.useTor` is set and Tor cannot be
+    ///   established, or the seam's STALENESS refusal
+    ///   (``ZcashError/rustMigrationTakeBroadcastTransaction(_:)``) of a row that is no longer
+    ///   proved-and-servable. The staleness throw is the honest answer to a stale instruction —
+    ///   discharge it by cranking ``advanceStep()`` again rather than retrying the executor. A
+    ///   record failure *after* a successful broadcast throws
+    ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast DID land and the
+    ///   privacy buffer is already running; the failure is transient from the migration's point of
+    ///   view, because a later execution window self-heals (re-submitting draws a duplicate
+    ///   rejection, which records as success).
+    ///
+    /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
+    /// (this method or ``submitNoteSplit(proposal:usk:options:)``) is in flight, this call first
+    /// waits for it to finish and only then serves — so a concurrent call can never re-broadcast
+    /// the in-flight transfer's bytes. It never throws on contention. A concurrent caller holding
+    /// the SAME instruction meets the seam's staleness refusal once the first flow has recorded,
+    /// which is the engine's per-row state gating doing exactly the job the removed re-advance
+    /// used to do here.
+    ///
+    /// - Important: This method must run only in a session that does **not** also sync. This actor
+    ///   does not check sync state itself; the `Synchronizer` surface in front of it adds an
+    ///   advisory point-in-time guard (``ZcashError/migrationBroadcastDuringSync``) plus the
+    ///   privacy gate (see ``isSyncBlocked()``) — neither is a hard mutual-exclusion
+    ///   lock, so hosts must still sequence sync and broadcast sessions.
+    func performBroadcast(
+        _ instruction: MigrationBroadcastInstruction,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferResult {
+        try await serializedBroadcastFlow { () async throws -> MigrationTransferResult in
+            let prepared = try await welding.migrationTakeBroadcastTransaction(id: instruction.id, for: accountUUID)
+            return try await broadcastAndRecord(prepared: prepared, options: options)
         }
     }
 
@@ -433,7 +481,7 @@ actor OrchardMigration {
     /// draws a duplicate rejection, which records as success).
     ///
     /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
-    /// (this method or ``executeNextPendingTransfer(options:useEstimatedTip:)``) is in flight, this call first waits
+    /// (this method or ``performBroadcast(_:options:)``) is in flight, this call first waits
     /// for it to finish — it never broadcasts concurrently with it and never throws on contention.
     func submitNoteSplit(
         proposal: NoteSplitProposal,
@@ -524,79 +572,6 @@ actor OrchardMigration {
         try await welding.migrationSignAndStoreSchedule(schedule, usk: usk, for: accountUUID)
     }
 
-    // MARK: - Background execution
-
-    /// Broadcasts the next height-due, ALREADY-PROVEN transaction, or reports why nothing was
-    /// broadcast — see ``MigrationTransferAttempt`` for the three outcomes. BROADCAST-ONLY: this
-    /// call never proves (``MigrationTransferAttempt/awaitingProof(id:)`` is cleared by
-    /// ``finalizeReadyTransfers()`` at a sync wake-up, never here), so a broadcast session stays a
-    /// pure delivery step.
-    ///
-    /// `useEstimatedTip` opts the due-ness check into the wall-clock chain-tip estimate (see
-    /// ``ChainTipEstimator``): the estimate may only ACCELERATE scheduled-height due-ness — expiry
-    /// is always evaluated against the scanned tip — and an estimator failure degrades to the
-    /// scanned-tip behavior rather than blocking the attempt.
-    ///
-    /// Composition mirrors ``submitNoteSplit(proposal:usk:options:)``: advance the drive, serve the
-    /// transaction it names for broadcast (empty outcomes leave the gate untouched), broadcast
-    /// once, and — only on a
-    /// success outcome — start the privacy buffer, *before* recording the mapped result: the gate
-    /// marks on submit success, independent of record bookkeeping. Transport/rejection outcomes are
-    /// returned (recorded first, gate untouched). Pre-broadcast failures throw untouched; a record
-    /// failure *after* a successful broadcast throws
-    /// ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast DID land and the
-    /// privacy buffer is already running; a later execution window self-heals the engine state
-    /// (re-submitting draws a duplicate rejection, which records as success).
-    ///
-    /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
-    /// (this method or ``submitNoteSplit(proposal:usk:options:)``) is in flight, this call first
-    /// waits for it to finish and only then advances the drive — so a concurrent call
-    /// can never re-broadcast the in-flight transfer, and typically reports
-    /// ``MigrationTransferAttempt/nothingDue`` once the in-flight flow has recorded. It never
-    /// throws on contention.
-    ///
-    /// - Important: This method must run only in a session that does **not** also sync. This actor
-    ///   does not check sync state itself; the `Synchronizer` surface in front of it adds an
-    ///   advisory point-in-time guard (``ZcashError/migrationBroadcastDuringSync``) plus the
-    ///   privacy gate (see ``isSyncBlocked()``) — neither is a hard mutual-exclusion
-    ///   lock, so hosts must still sequence sync and broadcast sessions.
-    /// - Note: The engine serves preparation transactions and transfers alike, in scheduled
-    ///   order — after an external-signer store, the pending preparations are what comes due
-    ///   first, and only once they are broadcast (and mined) do the scheduled transfers follow.
-    func executeNextPendingTransfer(
-        options: MigrationNetworkPrivacyOptions,
-        useEstimatedTip: Bool
-    ) async throws -> MigrationTransferAttempt {
-        try await serializedBroadcastFlow { () async throws -> MigrationTransferAttempt in
-            // THE SESSION OPENS WITH THE ADVANCE. `migrationAdvanceStep` is the top-level call and
-            // this lane is subservient to it: the drive decides what (if anything) may be
-            // broadcast — running the ZIP 318 overdue re-spread and the store's satisfiability
-            // oracle on the way — and the executor below only discharges the instruction it
-            // returns.
-            let advance = try await advanceStep(useEstimatedTip: useEstimatedTip)
-            switch advance?.step {
-            case .broadcast(let id):
-                let prepared = try await welding.migrationTakeBroadcastTransaction(id: id, for: accountUUID)
-                return .executed(try await broadcastAndRecord(prepared: prepared, options: options))
-            case .prove(let transactions):
-                // Prove work, not delivery work — unless the schedule has already reached one of
-                // the batch's rows, in which case that row's missing proof is exactly what blocks
-                // this broadcast window. Say so, rather than reporting the indefinite "nothing
-                // due" that leaves a host polling an empty lane; `finalizeReadyTransfers()` at a
-                // sync wake-up clears it.
-                guard let due = transactions.first(where: \.isScheduleDue) else {
-                    return .nothingDue
-                }
-                logger.debug("migration transfer \(due.id) is due but awaiting its proof; nothing broadcast")
-                return .awaitingProof(id: due.id)
-            default:
-                // No stored run, or a step this lane cannot deliver (`waiting`, `rebuild`, the
-                // attention steps, `complete`). The host reaches those through `advanceStep()`.
-                return .nothingDue
-            }
-        }
-    }
-
     // MARK: - Sync coordination
 
     /// Whether ordinary wallet sync should currently be paused for this migration.
@@ -644,17 +619,17 @@ actor OrchardMigration {
 
     // MARK: - On-launch reconciliation
 
-    /// Whether any scheduled transfer is past its send height but not yet broadcast — the
-    /// delivery lane's "is there actionable work" query, counting an already-proved due
-    /// transaction AND a due, dependency-satisfied `Signed` one the delivery call would drive
-    /// through proving. An informational query for hosts (re-arm background execution, launch
-    /// reconciliation) and for the app's est-aware dispatch; deliberately NOT consulted by any
-    /// sync-gate path — since 2026-08-05 NO work-pending query is (see ``isSyncBlocked()``).
+    /// Whether any scheduled transfer is past its send height but not yet broadcast — the "is
+    /// there actionable work" query, counting an already-proved due transaction AND a due,
+    /// dependency-satisfied `Signed` one that still needs its proof. An informational query for
+    /// hosts (re-arm background execution, launch reconciliation) and for the app's est-aware
+    /// dispatch; deliberately NOT consulted by any sync-gate path — since 2026-08-05 NO
+    /// work-pending query is (see ``isSyncBlocked()``). It is a READ, never a substitute for
+    /// ``advanceStep()``: it says whether cranking is worth the wake-up, never what to do.
     ///
     /// `useEstimatedTip` opts the check into the wall-clock chain-tip estimate: the estimate may
     /// only ACCELERATE due-ness (expiry stays scanned-tip), and an estimator failure degrades to
-    /// the scanned-tip behavior — the same plumbing as
-    /// ``executeNextPendingTransfer(options:useEstimatedTip:)``.
+    /// the scanned-tip behavior — the same plumbing ``advanceStep()`` always applies.
     func hasOverdueTransfers(useEstimatedTip: Bool) async throws -> Bool {
         let estimatedTip = useEstimatedTip ? await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now()) : nil
         return try await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: estimatedTip)
@@ -722,7 +697,8 @@ actor OrchardMigration {
 
     /// Applies the ceremony's signatures to the run's preparation (note-split) transactions,
     /// all-or-nothing, and returns a STORAGE RECEIPT for the first one (its `txid` is zeroed — the
-    /// broadcastable, proven value is served by the delivery lane).
+    /// broadcastable, proven value is served by ``performBroadcast(_:options:)``, once a crank
+    /// names it).
     func storeSignedNoteSplitPCZTs(_ signed: [MigrationSignedTransferPczt]) async throws -> PreparedMigrationTransfer {
         try await welding.migrationStoreSignedNoteSplitPczts(signed, for: accountUUID)
     }
@@ -748,11 +724,12 @@ actor OrchardMigration {
     /// The actor's methods are reentrant: the broadcast composition suspends at the welding hops and
     /// for the whole broadcast (a Tor bootstrap can take seconds), while the drive keeps naming the
     /// same transfer for broadcast until its result is recorded — so without this guard, a
-    /// concurrent `executeNextPendingTransfer`/`submitNoteSplit` could re-fetch and re-broadcast the
+    /// concurrent `performBroadcast`/`submitNoteSplit` could re-fetch and re-broadcast the
     /// same bytes mid-flight. The serialization contract:
     /// - A concurrent caller never throws on contention and is never dropped: it awaits the
     ///   in-flight flow's completion (success or failure), then runs its own flow fresh, so its own
-    ///   advance observes the recorded outcome (typically nothing due, or the next transfer).
+    ///   serve meets the state the finished flow recorded (for the same instruction, the seam's
+    ///   staleness refusal).
     /// - Waiting is a suspension on a continuation that the finishing flow resumes exactly once —
     ///   no busy-waiting, and no unstructured tasks.
     /// - Cancelling a waiting caller never cancels the in-flight flow: the waiter holds no

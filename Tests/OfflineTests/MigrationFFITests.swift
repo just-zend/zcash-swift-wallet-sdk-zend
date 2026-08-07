@@ -125,10 +125,10 @@ final class MigrationFFITests: XCTestCase {
     /// EMPTY instruction is likewise `0`: naming no transactions asks for no work, so a host need
     /// not special-case a batch it has already exhausted.
     func testFreshWalletProveTransactionsProvesNothing() async throws {
-        let named = try await rustBackend.migrationProveTransactions(ids: [0, 1], for: account)
+        let named = try await rustBackend.migrationProveTransactions(ids: [0, 1], maxProofs: 8, for: account)
         XCTAssertEqual(named, 0)
 
-        let empty = try await rustBackend.migrationProveTransactions(ids: [], for: account)
+        let empty = try await rustBackend.migrationProveTransactions(ids: [], maxProofs: 8, for: account)
         XCTAssertEqual(empty, 0)
     }
 
@@ -440,8 +440,8 @@ final class MigrationFFITests: XCTestCase {
     /// The executor is idempotent on a wallet with nothing to prove: no accumulating side effect,
     /// so a host may call it on every scan pass.
     func testMigrationProveTransactionsIsStableAcrossRepeatedCalls() async throws {
-        let first = try await rustBackend.migrationProveTransactions(ids: [0], for: account)
-        let second = try await rustBackend.migrationProveTransactions(ids: [0], for: account)
+        let first = try await rustBackend.migrationProveTransactions(ids: [0], maxProofs: 8, for: account)
+        let second = try await rustBackend.migrationProveTransactions(ids: [0], maxProofs: 8, for: account)
         XCTAssertEqual(first, 0)
         XCTAssertEqual(first, second)
     }
@@ -769,7 +769,7 @@ final class MigrationFFITests: XCTestCase {
         )
 
         let broadcast = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_BROADCAST), id: 6)
-        XCTAssertEqual(broadcast.unsafeToMigrationAdvance()?.step, .broadcast(id: 6))
+        XCTAssertEqual(broadcast.unsafeToMigrationAdvance()?.step, .broadcast(MigrationBroadcastInstruction(id: 6)))
 
         let rebuild = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_REBUILD), id: 7)
         XCTAssertEqual(rebuild.unsafeToMigrationAdvance()?.step, .rebuild(id: 7))
@@ -946,11 +946,14 @@ final class MigrationFFITests: XCTestCase {
 
     /// Constructs a real `OrchardMigration` via the injecting initializer, wired to the SAME
     /// real-FFI-backed welding as the rest of this file (not a mock) plus a real, temp-file-backed
-    /// `MigrationSyncGate`. On this fresh wallet the drive legitimately has no run to advance,
-    /// so `executeNextPendingTransfer` must short-circuit to `.nothingDue` before ever
-    /// reaching the broadcaster -- proven here with a fake that fails the assertion (via a non-zero
-    /// call count) rather than the test itself if that contract regresses.
-    func testFreshWalletActorExecuteNextPendingTransferOverRealFFI() async throws {
+    /// `MigrationSyncGate`, and hands the broadcast executor an instruction no crank could have
+    /// issued on this fresh wallet (there is no stored run at all).
+    ///
+    /// THE BACKSTOP, OVER REAL FFI: the Swift surface makes the instruction un-forgeable, but this
+    /// test forges one through `@testable` precisely to prove the honest-boundary claim in the
+    /// surface docs — the rust seam refuses it on its own per-row state, so nothing reaches the
+    /// broadcaster and nothing is recorded. A pre-broadcast refusal, not a silent no-op.
+    func testFreshWalletActorPerformBroadcastRefusesAnUninstructedIdOverRealFFI() async throws {
         let storageDirectory = try makeUniqueStorageDirectory()
         defer { try? FileManager.default.removeItem(at: storageDirectory) }
 
@@ -969,15 +972,22 @@ final class MigrationFFITests: XCTestCase {
             logger: logger
         )
 
-        let result = try await migration.executeNextPendingTransfer(
-            options: MigrationNetworkPrivacyOptions(
-                useTor: false,
-                submissionEndpoint: LightWalletEndpoint(address: "default.example", port: 9067)
-            ),
-            useEstimatedTip: false
-        )
-        XCTAssertEqual(result, .nothingDue)
-        XCTAssertEqual(broadcaster.receivedCalls.count, 0)
+        do {
+            _ = try await migration.performBroadcast(
+                MigrationBroadcastInstruction(id: 0),
+                options: MigrationNetworkPrivacyOptions(
+                    useTor: false,
+                    submissionEndpoint: LightWalletEndpoint(address: "default.example", port: 9067)
+                )
+            )
+            XCTFail("Expected the rust seam to refuse an id no stored run can serve")
+        } catch ZcashError.rustMigrationTakeBroadcastTransaction {
+            // expected: "no migration run is stored, so transaction 0 cannot be served"
+        } catch {
+            XCTFail("Expected rustMigrationTakeBroadcastTransaction but got \(error)")
+        }
+
+        XCTAssertEqual(broadcaster.receivedCalls.count, 0, "a refused serve must never reach the network")
     }
 
     // MARK: - Gate ticker boundary wake (field-caught 2026-08-02)

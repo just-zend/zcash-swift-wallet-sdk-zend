@@ -88,7 +88,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         // A fresh mock per account keeps the two concurrent broadcast flows off a shared mutable mock.
         let perAccountFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { [testGeneralStorageDirectory, buffer, clock, accountB] accountUUID, broadcaster in
             let accountWelding = ZcashRustBackendWeldingMock()
-            accountWelding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .broadcast(id: prepared.id), next: nil)
             // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
             accountWelding.migrationTransactionStatusesForReturnValue = []
             accountWelding.migrationTakeBroadcastTransactionIdForClosure = { _, _ in
@@ -128,10 +127,10 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         let migrationB = await host.migration(for: accountB)
         let options = MigrationNetworkPrivacyOptions(useTor: true, submissionEndpoint: submissionEndpoint)
 
-        let taskA = Task { try await migrationA.executeNextPendingTransfer(options: options, useEstimatedTip: false) }
+        let taskA = Task { try await migrationA.performBroadcast(MigrationBroadcastInstruction(id: prepared.id), options: options) }
         // Wait for account A's broadcast to have started the (single) bootstrap.
         await factory.awaitCallsStarted(1)
-        let taskB = Task { try await migrationB.executeNextPendingTransfer(options: options, useEstimatedTip: false) }
+        let taskB = Task { try await migrationB.performBroadcast(MigrationBroadcastInstruction(id: prepared.id), options: options) }
         // Deterministic: B has reached its own extract step, one short hop from the shared
         // broadcaster's cache check.
         await fulfillment(of: [accountBReachedTheBroadcaster], timeout: 5)
@@ -298,7 +297,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     func testSyncBlockedStreamEmitsTrueAfterAHostedActorBroadcasts() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA)]
-        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .broadcast(id: 0), next: nil)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = PreparedMigrationTransfer(
             id: 0,
             txid: Data(repeating: 0xAB, count: 32),
@@ -328,9 +326,9 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         defer { cancellable.cancel() }
 
         let migration = await host.migration(for: accountA)
-        _ = try await migration.executeNextPendingTransfer(
-            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint),
-            useEstimatedTip: false
+        _ = try await migration.performBroadcast(
+            MigrationBroadcastInstruction(id: 0),
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint)
         )
 
         await fulfillment(of: [blockedEmitted], timeout: 5)
@@ -538,7 +536,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         )
     }
 
-    private func assertThrowsMigrationTorUnavailable(_ task: Task<MigrationTransferAttempt, Error>) async {
+    private func assertThrowsMigrationTorUnavailable(_ task: Task<MigrationTransferResult, Error>) async {
         do {
             _ = try await task.value
             XCTFail("Expected migrationTorUnavailable to be thrown")
