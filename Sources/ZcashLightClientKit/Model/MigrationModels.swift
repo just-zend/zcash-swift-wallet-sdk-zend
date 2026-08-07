@@ -25,8 +25,8 @@ import Foundation
 /// uses the estimate only for reversible scheduling/withholding; persisted or destructive
 /// judgments remain anchored to scanned data. It is also memoryless about sessions: it reports
 /// what the run needs next, not whether doing it now would pair a broadcast
-/// with a sync — session policy (one broadcast per session, no sync in a broadcast session, the
-/// post-broadcast privacy buffer) belongs to the caller and the sync gate, not to this value.
+/// with a sync — session policy (one broadcast per session, no sync in a broadcast session)
+/// belongs to the caller and the sync gate, not to this value.
 ///
 /// Discharging each step:
 /// - ``requiresAttention(id:)`` → SYNC, then call `migrationAdvanceStep(accountUUID:)` again: the

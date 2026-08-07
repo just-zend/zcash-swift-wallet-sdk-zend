@@ -600,12 +600,12 @@ public enum ZcashError: Equatable, Error {
     /// The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult.
     /// ZRUST0122
     case migrationInvalidTxId(_ txId: String)
-    /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land and the privacy sync gate is already marked; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned.
+    /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned. The sync gate's in-flight marker is deliberately left set on this path and self-expires.
     /// - `error` is the underlying failure from ZcashRustBackend.migrationRecordTransferResult.
     /// ZRUST0124
     case migrationRecordFailedAfterBroadcast(_ error: Error)
     /// Synchronizer.start() was refused because the migration privacy gate is active.
-    /// A migration broadcast happened less than the privacy buffer ago, or overdue migration transfers exist. Wait until `isMigrationSyncBlocked()` returns false, or observe `migrationSyncBlockedStream`.
+    /// A migration submission is in flight for some account: the transaction has reached the network but its outcome is not recorded yet. This is a seconds-long hold, and the only one the gate imposes — nothing is blocked because a broadcast happened recently. Wait until `isMigrationSyncBlocked()` returns false, or observe `migrationSyncBlockedStream`.
     /// ZRUST0125
     case migrationSyncBlocked
     /// A broadcast-performing migration method was called while the synchronizer is actively syncing.
@@ -1140,7 +1140,7 @@ public enum ZcashError: Equatable, Error {
         case .rustMigrationStoreSignedSchedulePczts: return "Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePczts"
         case .migrationTorUnavailable: return "Tor was requested for a migration broadcast but could not be established."
         case .migrationInvalidTxId: return "The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult."
-        case .migrationRecordFailedAfterBroadcast: return "The migration engine failed to record a successfully submitted broadcast. The broadcast DID land and the privacy sync gate is already marked; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned."
+        case .migrationRecordFailedAfterBroadcast: return "The migration engine failed to record a successfully submitted broadcast. The broadcast DID land; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned. The sync gate's in-flight marker is deliberately left set on this path and self-expires."
         case .migrationSyncBlocked: return "Synchronizer.start() was refused because the migration privacy gate is active."
         case .migrationBroadcastDuringSync: return "A broadcast-performing migration method was called while the synchronizer is actively syncing."
         case .migrationProvingUnavailable: return "Proving a migration transaction failed."

@@ -73,6 +73,73 @@ final class ScriptedBroadcaster: MigrationBroadcasting {
     }
 }
 
+/// A ``MigrationBroadcasting`` fake with a test-controlled suspension: every `broadcast` call
+/// suspends until ``open()`` is called, giving single-flight tests a deterministic in-flight window.
+/// Starts are observable via ``awaitBroadcastsStarted(_:)``; once opened, suspended and future
+/// broadcasts complete immediately with the scripted outcome. An actor, because these tests
+/// deliberately call it from concurrent tasks.
+///
+/// Promoted here (from `OrchardMigrationCompositionTests`) so `OrchardMigrationHostTests` can hold
+/// a submit open long enough to observe the wallet-scope stream's in-flight `true`.
+actor GatedBroadcaster: MigrationBroadcasting {
+    private let outcome: MigrationBroadcastOutcome
+    private var isOpen = false
+    private(set) var startedCount = 0
+    private var pendingBroadcasts: [CheckedContinuation<Void, Never>] = []
+    private var startObservers: [(threshold: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    init(outcome: MigrationBroadcastOutcome) {
+        self.outcome = outcome
+    }
+
+    func broadcast(
+        rawTransaction: Data,
+        to endpoint: LightWalletEndpoint,
+        useTor: Bool,
+        onWillSubmit: @Sendable () -> Void
+    ) async throws -> MigrationBroadcastOutcome {
+        startedCount += 1
+        notifyStartObservers()
+        if !isOpen {
+            await withCheckedContinuation { continuation in
+                pendingBroadcasts.append(continuation)
+            }
+        }
+        // Per the production contract the hook fires at the last pre-submit instant; a returned
+        // outcome means a submit happened.
+        onWillSubmit()
+        return outcome
+    }
+
+    /// Returns once at least `count` broadcasts have started (immediately when they already have).
+    func awaitBroadcastsStarted(_ count: Int) async {
+        if startedCount >= count {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            startObservers.append((threshold: count, continuation: continuation))
+        }
+    }
+
+    /// Releases every suspended broadcast and lets all future ones complete immediately.
+    func open() {
+        isOpen = true
+        let pending = pendingBroadcasts
+        pendingBroadcasts = []
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func notifyStartObservers() {
+        let ready = startObservers.filter { $0.threshold <= startedCount }
+        startObservers.removeAll { $0.threshold <= startedCount }
+        for observer in ready {
+            observer.continuation.resume()
+        }
+    }
+}
+
 /// A generic, non-`ZcashError` failure for stubbing a `GatedTorClientFactory` bootstrap failure.
 /// Promoted here (from `MigrationLogicTests`) so `OrchardMigrationHostTests` can reuse it.
 struct StubTorBootstrapError: Error {}

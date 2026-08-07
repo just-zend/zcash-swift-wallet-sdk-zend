@@ -249,8 +249,8 @@ instead.
 defaulting `useEstimatedTip` to `false`). The two `estimated*` members take NO account: the
 projection reads the wallet-shared blocks table, so — like the batching group — one answer serves
 every account (an earlier unreleased iteration carried an unused `accountUUID:`; drop the argument).
-See each member's doc comment for its full contract; the estimated-tip and privacy-buffer notes
-below cover the cross-cutting parts.
+See each member's doc comment for its full contract; the estimated-tip and sync-gate notes below
+cover the cross-cutting parts.
 
 There is no repair entry point at all, and nothing to call to get one. Every repair the SDK once
 exposed is now the engine's, performed on every `migrationAdvanceStep(accountUUID:)`: a funding
@@ -277,30 +277,41 @@ The same rule applies to `migrationAdvanceStep(accountUUID:)`, which needs no pa
 conduit ALWAYS projects and passes the estimate. That is the only place the acceleration enters
 now — the instruction executors judge nothing, so they take no tip.
 
-### The sync gate's predicate: privacy buffer, in-flight marker
+### The sync gate is behavior-based: one condition, no timer
 
-`isMigrationSyncBlocked()`/`migrationSyncBlockedStream` block sync, per account, for exactly two
-reasons — both PAST/PRESENT-looking, never future:
+`isMigrationSyncBlocked()`/`migrationSyncBlockedStream` block sync for exactly ONE reason now, and
+it is present-tense: **a migration submission is in flight** — the transaction has reached the
+network but its outcome is not recorded yet. Ordinarily that is a matter of seconds. The
+120 s self-expiring marker behind it is (re-)armed at the last pre-submit instant, after the Tor
+bootstrap, so a slow bootstrap does not burn its window; its deadline is a CRASH-RECOVERY ceiling
+(a crash between submit and record must not wedge sync forever), not a privacy interval, and a
+marker observed implausibly far in the future (a backwards clock step) is clamped/ignored rather
+than wedging sync.
 
-1. **Privacy buffer** — network-scaled after every migration broadcast: 600 s on mainnet
-   (unchanged from the previous fixed value), 180 s on testnet/regtest — the full 10 minutes only
-   slowed QA cycles down there, where traffic-correlation privacy is moot.
-   `Synchronizer.migrationPrivacySyncBufferDuration` still reports the value a real synchronizer
-   resolves for its own network; the network-less protocol-extension default keeps forwarding the
-   mainnet constant.
-2. **In-flight broadcast marker** — a 120 s self-expiring marker blocks sync from just before a
-   migration submit hits the network until its outcome is recorded, so the engine's in-flight
-   sweep never meets a transfer that is neither recorded broadcast nor yet visible on chain. The marker is (re-)armed at the last pre-submit
-   instant — after the Tor bootstrap — so a slow bootstrap does not burn its window, and a marker
-   observed implausibly far in the future (a backwards clock step) is clamped/ignored rather than
-   wedging sync.
-A third clause — **a READY broadcast is waiting**, blocking sync whenever a proved, schedule-due
-transfer was servable — existed earlier in this pre-release window and is REMOVED (danny +
-nuttycom, 2026-08-05). Sync is held only when a broadcast happened recently in the PAST, never
-because one is expected in the FUTURE; the forward-looking clause was also field-implicated in a
-live wedge, where it blocked the very sync whose scanned progress the pending broadcast needed. The
-probe it consulted had no consumer left afterwards and has since been removed from the FFI and the
-welding entirely. Nothing replaces it: no gate path consults any work-pending query.
+Two conditions that blocked sync earlier in this pre-release window are gone.
+
+**The post-broadcast privacy buffer is REMOVED**, along with
+`Synchronizer.migrationPrivacySyncBufferDuration` (both the protocol requirement and its
+protocol-extension default) — delete any reference; nothing replaces the property, because there
+is no duration left to report. The buffer paused sync for a fixed window after each broadcast so
+the broadcast would not be correlated with a fresh sync. That reasoning was backwards: a fixed
+delay is itself a correlation SIGNATURE — broadcast at T, sync reliably at T + delay, repeated
+across every broadcast of a migration that runs for days — so time-based spacing was the wrong
+abstraction, not an insufficient dose of the right one. It is not lengthened or randomized; it is
+deleted. What replaces it is behavioral and belongs to the host: a wake serves the drive's
+instruction and does not auto-append a sync, so a sync session starts for a REASON (the outlook
+naming sync-bound work, an organic scheduled sync, or the user). User intent that requires sync — a
+manual balance refresh, an attempt to create a transaction — is never held; the seconds-scale
+in-flight marker is the only wait, and only because a submission is genuinely mid-flight. A gate
+file persisted by an earlier build still carries the buffer's `resumeAt` field; it is read
+gracefully and ignored, so an in-flight marker beside it survives the upgrade and a stale buffer
+never blocks a post-upgrade launch.
+
+**A READY-broadcast clause is REMOVED** (danny + nuttycom, 2026-08-05) — it blocked sync whenever a
+proved, schedule-due transfer was servable, and was field-implicated in a live wedge where it
+blocked the very sync whose scanned progress the pending broadcast needed. The probe it consulted
+had no consumer left afterwards and has since been removed from the FFI and the welding entirely.
+No gate path consults any work-pending query.
 `hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)` remains available, but purely as an
 informational one (re-arm background execution, launch reconciliation) — it deliberately counts
 due-but-unproved `Signed` rows too, whose proofs are produced AT sync wake-ups, so gating sync on

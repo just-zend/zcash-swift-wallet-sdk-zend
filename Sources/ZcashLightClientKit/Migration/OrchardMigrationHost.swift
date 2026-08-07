@@ -28,12 +28,6 @@ actor OrchardMigrationHost {
     private let now: @Sendable () -> Date
     private let logger: Logger
 
-    /// The network-scaled post-broadcast privacy buffer this host's synchronizer exposes —
-    /// resolved once at construction (from the initializer's network in production) since the
-    /// host's network never changes. Stored rather than forwarded so the nonisolated accessor
-    /// needs no network plumbing of its own.
-    private nonisolated let resolvedPrivacySyncBufferDuration: TimeInterval
-
     /// Builds a per-account ``OrchardMigration`` bound to `accountUUID`, wired to the given shared
     /// broadcaster. Injected so tests can substitute mock-welded actors; production builds each from
     /// the initializer's config via ``OrchardMigration/init(config:sharedBroadcaster:)``.
@@ -95,16 +89,13 @@ actor OrchardMigrationHost {
             tickInterval: 15,
             now: { Date() },
             logger: logger,
-            actorFactory: factory,
-            privacySyncBufferDuration: OrchardMigration.privacySyncBufferDuration(for: network.networkType)
+            actorFactory: factory
         )
     }
 
     /// Injecting initializer for tests: supply the welding, the shared broadcaster, the storage
     /// directory the gate files live in, the ticker interval and clock, the logger, and the
     /// per-account actor factory directly — mirroring ``OrchardMigration``'s own injecting init.
-    /// `privacySyncBufferDuration` defaults to the mainnet value; production resolves it from the
-    /// initializer's network (see ``init(initializer:)``).
     init(
         welding: ZcashRustBackendWelding,
         sharedBroadcaster: any MigrationBroadcasting,
@@ -112,8 +103,7 @@ actor OrchardMigrationHost {
         tickInterval: TimeInterval,
         now: @escaping @Sendable () -> Date,
         logger: Logger,
-        actorFactory: @escaping (AccountUUID, any MigrationBroadcasting) -> OrchardMigration,
-        privacySyncBufferDuration: TimeInterval = OrchardMigration.privacySyncBufferDuration
+        actorFactory: @escaping (AccountUUID, any MigrationBroadcasting) -> OrchardMigration
     ) {
         self.welding = welding
         self.sharedBroadcaster = sharedBroadcaster
@@ -121,7 +111,6 @@ actor OrchardMigrationHost {
         self.now = now
         self.logger = logger
         self.actorFactory = actorFactory
-        self.resolvedPrivacySyncBufferDuration = privacySyncBufferDuration
 
         let liveGateRegistry = MigrationLiveGateRegistry()
         self.liveGateRegistry = liveGateRegistry
@@ -143,12 +132,6 @@ actor OrchardMigrationHost {
         )
     }
 
-    /// The post-broadcast privacy buffer duration — the network-scaled
-    /// ``OrchardMigration/privacySyncBufferDuration(for:)`` value resolved at construction.
-    nonisolated var privacySyncBufferDuration: TimeInterval {
-        resolvedPrivacySyncBufferDuration
-    }
-
     /// The ``OrchardMigration`` bound to `accountUUID`, lazily created and cached on first request.
     ///
     /// The same account resolves to the same instance thereafter; distinct accounts get distinct
@@ -164,15 +147,15 @@ actor OrchardMigrationHost {
         let migration = actorFactory(accountUUID, sharedBroadcaster)
         migrations[accountUUID] = migration
         blockedPublisher.watchBroadcastSignal(migration.syncBlockedStream)
-        liveGateRegistry.register(accountUUID) { migration.liveGateInputs() }
+        liveGateRegistry.register(accountUUID) { migration.liveInFlightUntil() }
         return migration
     }
 
     /// Whether ordinary wallet sync should currently be paused for *any* migrating account.
     ///
     /// Enumerates every wallet account via the welding (not the lazy actor cache, so a dormant
-    /// account with a persisted gate file still counts after a fresh launch) and blocks if any
-    /// account is still inside its privacy buffer / in-flight window. Non-throwing: an account
+    /// account whose gate file records a marker a crash left behind still counts after a fresh
+    /// launch) and blocks if any account has a submission in flight. Non-throwing: an account
     /// enumeration failure logs and degrades to "unblocked" (sync allowed) — matching
     /// ``OrchardMigration/isSyncBlocked()``.
     func isSyncBlocked() async -> Bool {
@@ -226,7 +209,7 @@ actor OrchardMigrationHost {
     ///
     /// - Important: The value delivered synchronously on subscribe is a conservative "unblocked"
     ///   seed (the wallet predicate needs the async welding enumeration, so it cannot be computed
-    ///   synchronously — unlike ``MigrationSyncGate/blockedStream``'s per-account buffer seed). It is
+    ///   synchronously — unlike ``MigrationSyncGate/blockedStream``'s per-account marker seed). It is
     ///   corrected by the first asynchronous re-evaluation (the ticker's immediate startup recompute,
     ///   or sooner if a broadcast happens first). A subscriber that must be correct from its very
     ///   first value should pair this stream with an initial ``isSyncBlocked()`` call.
@@ -242,16 +225,13 @@ actor OrchardMigrationHost {
     ///
     /// Per account, the gate state is evaluated over BOTH views and blocked wins (A8): the
     /// persisted gate file (covers dormant accounts from previous launches) and — when the
-    /// account's actor exists this launch — its live in-memory gate inputs from
-    /// `liveGateRegistry`, so a failed gate-file write cannot hide a mark this process just made.
+    /// account's actor exists this launch — its live in-memory marker from `liveGateRegistry`, so
+    /// a failed gate-file write cannot hide a mark this process just made.
     ///
-    /// The work-pending clause is the ready-broadcast predicate (D1; never the broader overdue
-    /// query, whose due-but-unproved rows must not block sync), asked at the SCANNED tip for
-    /// every account FIRST (U8): a `true` scanned answer is final, so the estimate projection —
-    /// computed at most ONCE, the block-rate samples being wallet-scoped — is paid for only when
-    /// every scanned answer came back `false`, and it may only accelerate due-ness; an
-    /// estimator/sample failure degrades to a nil estimate (scanned-tip behavior), never to
-    /// "blocked".
+    /// There is nothing else to consult. No work-pending query gates sync (the forward-looking
+    /// ready-broadcast predicate went on 2026-08-05, taking the estimate-aware second pass it
+    /// needed with it), and no elapsed-time condition does either (the post-broadcast privacy
+    /// buffer went on 2026-08-07) — see ``MigrationSyncGate``'s type doc.
     private static func computeSyncBlocked(
         welding: ZcashRustBackendWelding,
         generalStorageURL: URL,
@@ -269,31 +249,24 @@ actor OrchardMigrationHost {
 
         let evaluatedAt = now()
 
-        // Gate files + live gate views only — past/present holds (privacy buffer, in-flight
-        // marker). The per-account ready-broadcast probe (and the whole estimate-aware second
-        // pass it needed) was deleted with the gate's forward-looking clause on 2026-08-05 —
-        // danny + nuttycom's ruling; see `MigrationSyncGate`'s type doc.
+        // Gate files + live gate views only — the in-flight broadcast marker is the single
+        // condition left (see `MigrationSyncGate`'s type doc).
         for account in accounts {
-            let fileInputs = MigrationSyncGate.persistedGateInputs(
-                directory: generalStorageURL,
-                accountUUID: account.id,
-                logger: logger
-            )
             let fileBlocked = MigrationSyncGate.isBlocked(
                 now: evaluatedAt,
-                resumeAt: fileInputs.resumeAt,
-                inFlightUntil: fileInputs.inFlightUntil
+                inFlightUntil: MigrationSyncGate.persistedInFlightUntil(
+                    directory: generalStorageURL,
+                    accountUUID: account.id,
+                    logger: logger
+                )
             )
             // A8: the live view exists only for accounts whose actor was created this launch;
             // evaluating it separately (rather than merging timestamps) keeps "blocked wins"
             // exact under the in-flight plausible-window rule.
-            let liveBlocked = liveGateRegistry.inputs(for: account.id).map { liveInputs in
-                MigrationSyncGate.isBlocked(
-                    now: evaluatedAt,
-                    resumeAt: liveInputs.resumeAt,
-                    inFlightUntil: liveInputs.inFlightUntil
-                )
-            } ?? false
+            let liveBlocked = MigrationSyncGate.isBlocked(
+                now: evaluatedAt,
+                inFlightUntil: liveGateRegistry.inFlightUntil(for: account.id)
+            )
             if fileBlocked || liveBlocked {
                 return true
             }
@@ -304,24 +277,26 @@ actor OrchardMigrationHost {
 
 /// The lock-synchronized registry of live per-account gate views behind
 /// ``OrchardMigrationHost``'s A8 defense: `register(_:provider:)` is called from the host actor as
-/// each per-account ``OrchardMigration`` is created, and `inputs(for:)` is read by the
+/// each per-account ``OrchardMigration`` is created, and `inFlightUntil(for:)` is read by the
 /// wallet-scope predicate closure off-actor. The lock guards only the dictionary; a provider (a
-/// tiny nonisolated read — `OrchardMigration.liveGateInputs()`, itself lock-guarded) is invoked
+/// tiny nonisolated read — `OrchardMigration.liveInFlightUntil()`, itself lock-guarded) is invoked
 /// AFTER release, so the two locks never nest.
 final class MigrationLiveGateRegistry: @unchecked Sendable {
     private let lock = NSLock()
-    private var providers: [AccountUUID: @Sendable () -> (resumeAt: Date?, inFlightUntil: Date?)] = [:]
+    private var providers: [AccountUUID: @Sendable () -> Date?] = [:]
 
     /// Registers (or replaces) `accountUUID`'s live gate view.
-    func register(_ accountUUID: AccountUUID, provider: @escaping @Sendable () -> (resumeAt: Date?, inFlightUntil: Date?)) {
+    func register(_ accountUUID: AccountUUID, provider: @escaping @Sendable () -> Date?) {
         lock.lock()
         providers[accountUUID] = provider
         lock.unlock()
     }
 
-    /// The live gate inputs for `accountUUID`, or `nil` when no actor (and therefore no live
-    /// gate) exists for it this launch — the dormant case the persisted gate file covers alone.
-    func inputs(for accountUUID: AccountUUID) -> (resumeAt: Date?, inFlightUntil: Date?)? {
+    /// The live in-flight marker expiry for `accountUUID`, or `nil` when it has none — which
+    /// covers both a live gate with no marker set and a dormant account whose actor was never
+    /// created this launch (that case is the persisted gate file's alone). The two collapse
+    /// safely: neither blocks sync.
+    func inFlightUntil(for accountUUID: AccountUUID) -> Date? {
         lock.lock()
         let provider = providers[accountUUID]
         lock.unlock()
@@ -397,7 +372,7 @@ private final class HostSyncBlockedPublisher: @unchecked Sendable {
     }
 
     /// Registers a hosted account's per-account blocked stream. While this stream has a subscriber, an
-    /// emission on `signal` (in particular the account's own `markBroadcast()`-triggered emission)
+    /// emission on `signal` (in particular the account's own in-flight-marker arm/clear emission)
     /// triggers an immediate wallet-scope re-evaluation.
     func watchBroadcastSignal(_ signal: AnyPublisher<Bool, Never>) {
         subscriptionLock.lock()

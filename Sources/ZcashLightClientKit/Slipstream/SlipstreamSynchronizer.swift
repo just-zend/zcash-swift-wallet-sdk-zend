@@ -293,8 +293,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
             throw ZcashError.synchronizerNotPrepared
         }
         // Migration privacy gate — parity with SDKSynchronizer.start's `.stopped, .synced,
-        // .disconnected, .error` branch: a migration broadcast's post-broadcast privacy buffer must
-        // not be immediately followed by a sync session. Only blocks a NEW start(); an already-running
+        // .disconnected, .error` branch: a sync session must not start while a migration
+        // submission is still in flight. Only blocks a NEW start(); an already-running
         // engine is unaffected (this synchronizer has no separate "already syncing" branch to skip
         // into, unlike SDKSynchronizer's status switch), and stop() is untouched.
         if await migrationHost.isSyncBlocked() {
@@ -1251,10 +1251,6 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     public nonisolated var migrationSyncBlockedStream: AnyPublisher<Bool, Never> {
         migrationHost.syncBlockedStream
-    }
-
-    public nonisolated var migrationPrivacySyncBufferDuration: TimeInterval {
-        migrationHost.privacySyncBufferDuration
     }
 
     public func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool {

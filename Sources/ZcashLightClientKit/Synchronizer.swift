@@ -166,8 +166,9 @@ public protocol Synchronizer: AnyObject {
     /// Implementations should leverage structured concurrency and
     /// cancel all jobs when this scope completes.
     ///
-    /// - Throws: ``ZcashError/migrationSyncBlocked`` when a migration privacy gate is active for any
-    ///   account in the wallet. Wait until ``isMigrationSyncBlocked()`` is false, or observe
+    /// - Throws: ``ZcashError/migrationSyncBlocked`` when a migration submission is in flight for
+    ///   any account in the wallet — a seconds-long hold, and the only one the migration gate
+    ///   imposes. Wait until ``isMigrationSyncBlocked()`` is false, or observe
     ///   ``migrationSyncBlockedStream``, then retry.
     func start(retry: Bool) async throws
 
@@ -599,8 +600,8 @@ public protocol Synchronizer: AnyObject {
     //
     // Exposes the host's per-account `OrchardMigration` machinery and its wallet-scope privacy gate
     // to the app: note-split preparation and submission, transfer scheduling, the drive and its
-    // instruction executors, the gate that pauses ordinary sync after a broadcast, on-launch
-    // reconciliation/recovery, and external (PCZT) signing. None of these methods require
+    // instruction executors, the gate that pauses ordinary sync while a submission is in flight,
+    // on-launch reconciliation/recovery, and external (PCZT) signing. None of these methods require
     // `prepare()` to have been called — a host may broadcast a migration transfer from a background
     // session without ever starting sync.
     //
@@ -858,10 +859,11 @@ public protocol Synchronizer: AnyObject {
     ///   sync and migration broadcasts must never share a session; this is enforced by the SDK on
     ///   this call, so stop sync first. Otherwise, a pre-broadcast failure throws untouched (nothing
     ///   was broadcast); a failure to record a broadcast that did land throws
-    ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the privacy buffer is already
-    ///   running and a later attempt self-heals.
-    /// - Note: On a success outcome, the broadcast starts the privacy buffer that
-    ///   ``isMigrationSyncBlocked()``/``start(retry:)`` consult; there is exactly one submission
+    ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast is real and a
+    ///   later attempt self-heals.
+    /// - Note: A completed submission leaves no timed hold behind — the migration gate blocks
+    ///   ``isMigrationSyncBlocked()``/``start(retry:)`` only while this submission is in flight.
+    ///   There is exactly one submission
     ///   endpoint per attempt, and no txid polling — confirmation comes from scanning. Calls for
     ///   different accounts are unserialized and safe to run concurrently; calls for the *same*
     ///   account are single-flight (a concurrent call waits for the in-flight one rather than
@@ -1002,8 +1004,10 @@ public protocol Synchronizer: AnyObject {
     ///
     /// It wraps exactly what an app cannot do for itself: serving the transaction's finalized
     /// bytes through the store's atomic broadcast seam, submitting them under the given privacy
-    /// options, marking the privacy gate, and recording the result — see the throws/notes below
-    /// for the order those happen in and what each failure means.
+    /// options — always over the dedicated migration Tor runtime when `options.useTor` is set,
+    /// independent of the global `tor(enabled:)` toggle and fail-closed — bracketing the submit in
+    /// the sync gate's in-flight marker, and recording the result; see the throws/notes below for
+    /// the order those happen in and what each failure means.
     ///
     /// BROADCAST-ONLY: it never proves. A due row still awaiting its proof is never named by a
     /// `.broadcast` step in the first place; the crank reports it inside the `.prove` batch (with
@@ -1023,10 +1027,12 @@ public protocol Synchronizer: AnyObject {
     ///   broadcast). Discharge a staleness throw by cranking
     ///   ``migrationAdvanceStep(accountUUID:)`` again, not by retrying the executor. A failure to
     ///   record a broadcast that did land throws
-    ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the privacy buffer is already
-    ///   running and a later attempt self-heals.
-    /// - Note: On a success outcome, the broadcast starts the privacy buffer that
-    ///   ``isMigrationSyncBlocked()``/``start(retry:)`` consult; there is exactly one submission
+    ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast is real and a
+    ///   later attempt self-heals.
+    /// - Note: A completed broadcast leaves NO timed hold behind: the gate is behavior-based, so
+    ///   ``isMigrationSyncBlocked()``/``start(retry:)`` block only for the seconds this submission
+    ///   is in flight, and a caller is free to sync the instant it is recorded. There is exactly
+    ///   one submission
     ///   endpoint per attempt, and no txid polling — confirmation comes from scanning. Calls for
     ///   different accounts are unserialized and safe to run concurrently; calls for the *same*
     ///   account are single-flight (a concurrent call waits for the in-flight one rather than
@@ -1040,16 +1046,28 @@ public protocol Synchronizer: AnyObject {
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult
 
-    /// Whether ordinary wallet sync should currently be paused because a migration privacy gate is
-    /// active for any account in the wallet — including an account with no live activity this
-    /// session (a persisted gate file from a previous launch still counts).
+    /// Whether ordinary wallet sync should currently be paused because a migration submission is
+    /// in flight for any account in the wallet — including an account with no live activity this
+    /// session (a gate file a crashed launch left a marker in still counts).
     ///
-    /// The predicate, per account, is PAST/PRESENT ONLY: the post-broadcast privacy buffer has not
-    /// elapsed, OR a broadcast's 120 s in-flight marker is live. No work-pending query gates sync
-    /// (the forward-looking ready-broadcast clause was removed 2026-08-05): a due row that still
-    /// needs its proof needs MORE syncing, so
-    /// ``hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)``'s broader answer
-    /// deliberately does not gate sync either.
+    /// The gate is BEHAVIOR-BASED, and the predicate is now a single PRESENT-TENSE condition: a
+    /// migration submit is between reaching the network and having its outcome recorded. That
+    /// lasts seconds. Nothing else holds sync:
+    ///
+    /// - No elapsed-time condition. The post-broadcast privacy buffer was deleted on 2026-08-07:
+    ///   a fixed delay between a broadcast and the next sync is itself an identifiable pattern —
+    ///   a correlation signature rather than a defense against one — so spacing sync from
+    ///   broadcasts by the clock was the wrong abstraction, not merely an insufficient dose of the
+    ///   right one. What replaces it is behavioral and lives in the host: a wake serves the
+    ///   drive's instruction and does not auto-append a sync, so sync sessions start for a reason
+    ///   (the outlook naming sync-bound work, an organic scheduled sync, or the user).
+    /// - No user intent is ever held. A manual balance refresh or an attempt to create a
+    ///   transaction requires sync, and this gate does not stand in its way — the in-flight marker
+    ///   is the only wait, and only while a submission is genuinely mid-flight.
+    /// - No work-pending query (the forward-looking ready-broadcast clause was removed
+    ///   2026-08-05): a due row that still needs its proof needs MORE syncing, so
+    ///   ``hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)``'s broader answer
+    ///   deliberately does not gate sync either.
     ///
     /// Non-throwing: degrades open (returns `false`, i.e. sync allowed) if the check itself fails
     /// rather than blocking sync on an internal error. ``start(retry:)`` consults this and throws
@@ -1058,7 +1076,7 @@ public protocol Synchronizer: AnyObject {
 
     /// A stream of ``isMigrationSyncBlocked()`` at wallet scope: emits the current value on subscribe
     /// and re-evaluates reactively thereafter. The predicate is ``isMigrationSyncBlocked()``'s —
-    /// the privacy buffer or the in-flight marker, nothing forward-looking.
+    /// an in-flight submission, and nothing else.
     ///
     /// - Important: The value delivered synchronously on subscribe is a conservative `false` seed; it
     ///   is corrected by the first asynchronous re-evaluation. A subscriber that must be correct from
@@ -1066,17 +1084,13 @@ public protocol Synchronizer: AnyObject {
     ///   call.
     var migrationSyncBlockedStream: AnyPublisher<Bool, Never> { get }
 
-    /// The post-broadcast privacy buffer: how long ordinary sync stays paused after a migration
-    /// broadcast so the broadcast is not correlated with a fresh sync.
-    var migrationPrivacySyncBufferDuration: TimeInterval { get }
-
     /// Whether `accountUUID` has any scheduled transfer that is past its send height but not yet
     /// broadcast — the "is there actionable work" query, counting an already-proved due
     /// transaction AND a due, dependency-satisfied `Signed` one that still needs its proof.
     /// Informational (re-arm background execution, launch
     /// reconciliation): it is deliberately NOT the sync-gate predicate — a due-but-unproved row
-    /// needs MORE syncing and must never block sync, so ``isMigrationSyncBlocked()`` holds only on
-    /// past/present broadcast state (the privacy buffer and the in-flight marker). It is a READ,
+    /// needs MORE syncing and must never block sync, so ``isMigrationSyncBlocked()`` holds only
+    /// while a submission is in flight. It is a READ,
     /// never a substitute for ``migrationAdvanceStep(accountUUID:)``: it says whether cranking is
     /// worth a wake-up, never what to do.
     /// - Parameters:
@@ -1504,12 +1518,6 @@ public extension Synchronizer {
     /// Inert default: conformers must override to provide the wallet-scope migration privacy gate.
     var migrationSyncBlockedStream: AnyPublisher<Bool, Never> {
         Just(false).eraseToAnyPublisher()
-    }
-
-    /// Not inert: `OrchardMigration.privacySyncBufferDuration` is a true SDK-wide constant, so
-    /// forwarding it here is safe even for conformers that don't override the rest of the group.
-    var migrationPrivacySyncBufferDuration: TimeInterval {
-        OrchardMigration.privacySyncBufferDuration
     }
 
     func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool {

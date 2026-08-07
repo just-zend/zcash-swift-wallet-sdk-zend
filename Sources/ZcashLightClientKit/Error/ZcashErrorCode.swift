@@ -317,7 +317,7 @@ public enum ZcashErrorCode: String {
     case migrationTorUnavailable = "ZRUST0121"
     /// The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult.
     case migrationInvalidTxId = "ZRUST0122"
-    /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land and the privacy sync gate is already marked; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned.
+    /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned. The sync gate's in-flight marker is deliberately left set on this path and self-expires.
     case migrationRecordFailedAfterBroadcast = "ZRUST0124"
     /// Synchronizer.start() was refused because the migration privacy gate is active.
     case migrationSyncBlocked = "ZRUST0125"

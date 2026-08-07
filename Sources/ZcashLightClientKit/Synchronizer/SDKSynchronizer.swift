@@ -1312,10 +1312,6 @@ public class SDKSynchronizer: Synchronizer {
         migrationHost.syncBlockedStream
     }
 
-    public var migrationPrivacySyncBufferDuration: TimeInterval {
-        migrationHost.privacySyncBufferDuration
-    }
-
     public func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool {
         try await migrationHost.migration(for: accountUUID).hasOverdueTransfers(useEstimatedTip: useEstimatedTip)
     }

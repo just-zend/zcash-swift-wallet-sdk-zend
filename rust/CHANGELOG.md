@@ -296,10 +296,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays — it is the row type of `FfiMigrationSchedule::transfers` — but is no longer handed out
   standalone.
 - `zcashlc_migration_has_ready_broadcast` is removed. It had no consumer anywhere: the 2026-08-05
-  D1 ruling deleted the sync gate's forward-looking clause, the only caller, and sync is held only
-  for past/present broadcasts (the privacy buffer and the in-flight marker), never because one is
-  expected in the future. `zcashlc_migration_has_overdue_transfers` — an honest "the delivery lane
-  has actionable work" boolean, not a kind-filtered id peek — stays.
+  D1 ruling deleted the sync gate's forward-looking clause, the only caller, and sync is now held
+  only while a migration submission is in flight — never because a broadcast is expected in the
+  future, and never for a fixed interval after one happened.
+  `zcashlc_migration_has_overdue_transfers` — an honest "the delivery lane has actionable work"
+  boolean, not a kind-filtered id peek — stays.
 
 ### Fixed
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood

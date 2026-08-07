@@ -256,14 +256,6 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         XCTAssertEqual(received, [false], "the inert default stream must seed (and only ever emit) false")
     }
 
-    func testMigrationPrivacySyncBufferDurationDefaultForwardsTheRealConstant() {
-        XCTAssertEqual(
-            synchronizer.migrationPrivacySyncBufferDuration,
-            OrchardMigration.privacySyncBufferDuration,
-            "the constant default must forward OrchardMigration's real privacy-buffer duration, not a placeholder"
-        )
-    }
-
     /// Infallible by protocol contract (see `Synchronizer.resetKeystoneSignBatchDecoder()`'s doc):
     /// the inert default simply returns, unlike its three throwing Keystone-batch-signing siblings
     /// above.

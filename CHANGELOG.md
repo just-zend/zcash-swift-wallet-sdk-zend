@@ -10,6 +10,24 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Changed
 
+- The migration sync gate is now BEHAVIOR-BASED, and its post-broadcast privacy buffer is gone
+  along with `Synchronizer.migrationPrivacySyncBufferDuration` (the protocol requirement and its
+  protocol-extension default): any reference stops compiling, and there is nothing to replace it
+  with, because no duration remains to report. `isMigrationSyncBlocked()` /
+  `migrationSyncBlockedStream` / `start(retry:)` now hold sync only while a migration submission is
+  in flight — the seconds between the transaction reaching the network and its outcome being
+  recorded. A host that scheduled work around the buffer (deferring a refresh for 600 s after a
+  broadcast, say) should stop: a fixed post-broadcast delay is itself a correlation signature —
+  broadcast at T, sync reliably at T + delay, across every broadcast of a migration that runs for
+  days — so spacing sync from broadcasts by the clock was the wrong mechanism, not too short a one.
+  The privacy property it was reaching for is behavioral and belongs to the host: serve the drive's
+  instruction on a wake without auto-appending a sync, and start sync sessions for a reason (the
+  advance's outlook naming sync-bound work, an organic scheduled sync, or the user). User intent
+  that requires sync — a manual balance refresh, an attempted send — must never be deferred for
+  this; the in-flight marker is the only wait the SDK imposes. Gate files persisted by an earlier
+  build load unchanged: the buffer field is read and ignored, and an in-flight marker beside it
+  still counts.
+
 - The librustzcash family rides an interim git pin (the michal/pool-migration-public-next-due
   branch head, rebased onto librustzcash main) so a wallet's own scheduled migration transactions
   carry their ZIP 318 classification (`Overview.zip318Kind`) from the moment they are STORED at
@@ -70,13 +88,12 @@ Changes are relative to `2.8.0-rc.3`.
   minutes the engine was stopped behind the migration gate), tripping the loud hung-engine log
   at the exact moment recovery was working. The evaluated span is now clamped to the current
   handle's own lifetime.
-- The migration sync gate's blocked stream now wakes AT its own known boundaries: `resumeAt` and
-  `inFlightUntil` are wall-clock deadlines the gate itself persists, yet the stream only
+- The migration sync gate's blocked stream now wakes AT its own known boundary: the in-flight
+  marker's expiry is a wall-clock deadline the gate itself persists, yet the stream only
   re-evaluated on a flat 15-second ticker, leaving a cleared gate unnoticed for up to a whole
-  interval — on a foregrounded device that read as a dead half-minute between "privacy buffer
-  expired" and "sync resumed". Each ticker iteration now sleeps only until the soonest future
-  boundary (capped at the interval); with no future boundary pending it keeps the flat interval
-  cadence.
+  interval — on a foregrounded device that read as a dead half-minute between "gate expired" and
+  "sync resumed". Each ticker iteration now sleeps only until that boundary (capped at the
+  interval); with no future boundary pending it keeps the flat interval cadence.
 - Proved migration transactions are recorded in the wallet's own transaction tables at proving
   time: their inputs are marked spent from the moment the proof exists, so the wallet's own sends
   can no longer
@@ -315,16 +332,16 @@ Changes are relative to `2.8.0-rc.3`.
   requested but unavailable throws `ZcashError.migrationTorUnavailable`, never a silent clearnet
   fallback. `MigrationNetworkPrivacyOptions.submissionEndpoint` is required: exactly one server per
   attempt, chosen by the host, and confirmation comes from block scanning rather than txid polling.
-  `start()` throws `ZcashError.migrationSyncBlocked` while a per-account privacy gate is open, and
-  only ever for a broadcast that already happened: for the network-scaled buffer (600 s on mainnet,
-  180 s on testnet/regtest) after a broadcast, or while a broadcast is in flight (a 120 s
-  self-expiring marker — re-armed at the last pre-submit instant, after the Tor bootstrap — guards
-  the submit-to-record window so the reconciliation probe above never treats a just-broadcast
-  transfer as a submit crash). Sync is never held because a broadcast is merely EXPECTED: a proved,
+  The migration sync gate is BEHAVIOR-BASED and imposes exactly one hold: `start()` throws
+  `ZcashError.migrationSyncBlocked` while a submission is IN FLIGHT — the transaction has reached
+  the network but its outcome is not recorded yet, ordinarily a matter of seconds (a 120 s
+  self-expiring marker, re-armed at the last pre-submit instant after the Tor bootstrap, guards the
+  submit-to-record window so the reconciliation probe above never treats a just-broadcast transfer
+  as a submit crash; that deadline is a crash-recovery ceiling, not a privacy interval). Nothing
+  else holds sync — not elapsed time since a broadcast, and not pending work: a proved,
   schedule-due, servable transfer does not gate sync, and neither does the broader
-  `hasOverdueMigrationTransfers` answer, whose due-but-unproved `Signed` rows need MORE syncing —
-  see `isMigrationSyncBlocked()`, `migrationSyncBlockedStream`,
-  `migrationPrivacySyncBufferDuration`. The broadcasting members throw
+  `hasOverdueMigrationTransfers` answer, whose due-but-unproved `Signed` rows need MORE syncing.
+  See `isMigrationSyncBlocked()` and `migrationSyncBlockedStream`. The broadcasting members throw
   `ZcashError.migrationBroadcastDuringSync` while a sync runs. A record failure after a successful
   broadcast throws the distinguishable `ZcashError.migrationRecordFailedAfterBroadcast`, which a
   later execution window heals.

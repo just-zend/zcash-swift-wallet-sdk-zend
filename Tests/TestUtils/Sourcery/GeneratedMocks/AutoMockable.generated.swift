@@ -1585,10 +1585,6 @@ class SynchronizerMock: Synchronizer {
         get { return underlyingMigrationSyncBlockedStream }
     }
     var underlyingMigrationSyncBlockedStream: AnyPublisher<Bool, Never>!
-    var migrationPrivacySyncBufferDuration: TimeInterval {
-        get { return underlyingMigrationPrivacySyncBufferDuration }
-    }
-    var underlyingMigrationPrivacySyncBufferDuration: TimeInterval!
 
     // MARK: - prepare
 
@@ -2751,25 +2747,25 @@ class SynchronizerMock: Synchronizer {
 
     // MARK: - proveMigrationTransactions
 
-    var proveMigrationTransactionsAccountUUIDInstructionMaxProofsThrowableError: Error?
-    var proveMigrationTransactionsAccountUUIDInstructionMaxProofsCallsCount = 0
-    var proveMigrationTransactionsAccountUUIDInstructionMaxProofsCalled: Bool {
-        return proveMigrationTransactionsAccountUUIDInstructionMaxProofsCallsCount > 0
+    var proveMigrationTransactionsAccountUUIDMaxProofsThrowableError: Error?
+    var proveMigrationTransactionsAccountUUIDMaxProofsCallsCount = 0
+    var proveMigrationTransactionsAccountUUIDMaxProofsCalled: Bool {
+        return proveMigrationTransactionsAccountUUIDMaxProofsCallsCount > 0
     }
-    var proveMigrationTransactionsAccountUUIDInstructionMaxProofsReceivedArguments: (accountUUID: AccountUUID, instruction: [MigrationProveTarget], maxProofs: Int)?
-    var proveMigrationTransactionsAccountUUIDInstructionMaxProofsReturnValue: Int!
-    var proveMigrationTransactionsAccountUUIDInstructionMaxProofsClosure: ((AccountUUID, [MigrationProveTarget], Int) async throws -> Int)?
+    var proveMigrationTransactionsAccountUUIDMaxProofsReceivedArguments: (accountUUID: AccountUUID, instruction: [MigrationProveTarget], maxProofs: Int)?
+    var proveMigrationTransactionsAccountUUIDMaxProofsReturnValue: Int!
+    var proveMigrationTransactionsAccountUUIDMaxProofsClosure: ((AccountUUID, [MigrationProveTarget], Int) async throws -> Int)?
 
     func proveMigrationTransactions(accountUUID: AccountUUID, _ instruction: [MigrationProveTarget], maxProofs: Int) async throws -> Int {
-        if let error = proveMigrationTransactionsAccountUUIDInstructionMaxProofsThrowableError {
+        if let error = proveMigrationTransactionsAccountUUIDMaxProofsThrowableError {
             throw error
         }
-        proveMigrationTransactionsAccountUUIDInstructionMaxProofsCallsCount += 1
-        proveMigrationTransactionsAccountUUIDInstructionMaxProofsReceivedArguments = (accountUUID: accountUUID, instruction: instruction, maxProofs: maxProofs)
-        if let closure = proveMigrationTransactionsAccountUUIDInstructionMaxProofsClosure {
+        proveMigrationTransactionsAccountUUIDMaxProofsCallsCount += 1
+        proveMigrationTransactionsAccountUUIDMaxProofsReceivedArguments = (accountUUID: accountUUID, instruction: instruction, maxProofs: maxProofs)
+        if let closure = proveMigrationTransactionsAccountUUIDMaxProofsClosure {
             return try await closure(accountUUID, instruction, maxProofs)
         } else {
-            return proveMigrationTransactionsAccountUUIDInstructionMaxProofsReturnValue
+            return proveMigrationTransactionsAccountUUIDMaxProofsReturnValue
         }
     }
 
@@ -3141,25 +3137,25 @@ class SynchronizerMock: Synchronizer {
 
     // MARK: - performMigrationBroadcast
 
-    var performMigrationBroadcastAccountUUIDInstructionOptionsThrowableError: Error?
-    var performMigrationBroadcastAccountUUIDInstructionOptionsCallsCount = 0
-    var performMigrationBroadcastAccountUUIDInstructionOptionsCalled: Bool {
-        return performMigrationBroadcastAccountUUIDInstructionOptionsCallsCount > 0
+    var performMigrationBroadcastAccountUUIDOptionsThrowableError: Error?
+    var performMigrationBroadcastAccountUUIDOptionsCallsCount = 0
+    var performMigrationBroadcastAccountUUIDOptionsCalled: Bool {
+        return performMigrationBroadcastAccountUUIDOptionsCallsCount > 0
     }
-    var performMigrationBroadcastAccountUUIDInstructionOptionsReceivedArguments: (accountUUID: AccountUUID, instruction: MigrationBroadcastInstruction, options: MigrationNetworkPrivacyOptions)?
-    var performMigrationBroadcastAccountUUIDInstructionOptionsReturnValue: MigrationTransferResult!
-    var performMigrationBroadcastAccountUUIDInstructionOptionsClosure: ((AccountUUID, MigrationBroadcastInstruction, MigrationNetworkPrivacyOptions) async throws -> MigrationTransferResult)?
+    var performMigrationBroadcastAccountUUIDOptionsReceivedArguments: (accountUUID: AccountUUID, instruction: MigrationBroadcastInstruction, options: MigrationNetworkPrivacyOptions)?
+    var performMigrationBroadcastAccountUUIDOptionsReturnValue: MigrationTransferResult!
+    var performMigrationBroadcastAccountUUIDOptionsClosure: ((AccountUUID, MigrationBroadcastInstruction, MigrationNetworkPrivacyOptions) async throws -> MigrationTransferResult)?
 
     func performMigrationBroadcast(accountUUID: AccountUUID, _ instruction: MigrationBroadcastInstruction, options: MigrationNetworkPrivacyOptions) async throws -> MigrationTransferResult {
-        if let error = performMigrationBroadcastAccountUUIDInstructionOptionsThrowableError {
+        if let error = performMigrationBroadcastAccountUUIDOptionsThrowableError {
             throw error
         }
-        performMigrationBroadcastAccountUUIDInstructionOptionsCallsCount += 1
-        performMigrationBroadcastAccountUUIDInstructionOptionsReceivedArguments = (accountUUID: accountUUID, instruction: instruction, options: options)
-        if let closure = performMigrationBroadcastAccountUUIDInstructionOptionsClosure {
+        performMigrationBroadcastAccountUUIDOptionsCallsCount += 1
+        performMigrationBroadcastAccountUUIDOptionsReceivedArguments = (accountUUID: accountUUID, instruction: instruction, options: options)
+        if let closure = performMigrationBroadcastAccountUUIDOptionsClosure {
             return try await closure(accountUUID, instruction, options)
         } else {
-            return performMigrationBroadcastAccountUUIDInstructionOptionsReturnValue
+            return performMigrationBroadcastAccountUUIDOptionsReturnValue
         }
     }
 

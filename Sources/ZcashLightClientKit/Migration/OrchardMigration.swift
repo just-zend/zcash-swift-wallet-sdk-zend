@@ -44,10 +44,10 @@ public struct MigrationNetworkPrivacyOptions: Equatable {
 /// (``Config/accountUUID``).
 ///
 /// It composes three collaborators: the migration welding (the Rust engine surface), a fail-closed
-/// ``MigrationBroadcaster``, and a persisted ``MigrationSyncGate`` (the network-scaled
-/// post-broadcast privacy buffer plus the in-flight broadcast marker — past/present holds only;
-/// see the gate's type doc for the removed forward-looking clause). The engine owns all migration
-/// state, including the committed schedule; the SDK keeps no local copy of the proposal list.
+/// ``MigrationBroadcaster``, and a persisted ``MigrationSyncGate`` (the in-flight broadcast marker,
+/// and nothing else — the gate is behavior-based, so see its type doc for why no timed
+/// post-broadcast spacing lives there any more). The engine owns all migration state, including
+/// the committed schedule; the SDK keeps no local copy of the proposal list.
 actor OrchardMigration {
     /// The immutable configuration an ``OrchardMigration`` is built from.
     ///
@@ -120,26 +120,6 @@ actor OrchardMigration {
             self.loggingPolicy = loggingPolicy
         }
     }
-
-    /// The post-broadcast privacy buffer for `networkType`: how long sync stays paused after a
-    /// migration broadcast so the broadcast is not correlated with a fresh sync. Network-scaled:
-    /// 600 s on mainnet (the production privacy requirement), 180 s on testnet/regtest — where
-    /// traffic-correlation privacy is moot and the full 10 minutes only slows QA cycles down.
-    static func privacySyncBufferDuration(for networkType: NetworkType) -> TimeInterval {
-        switch networkType {
-        case .mainnet:
-            return 600
-        case .testnet, .regtest:
-            return 180
-        }
-    }
-
-    /// The mainnet post-broadcast privacy buffer — DERIVED from
-    /// ``privacySyncBufferDuration(for:)`` for `.mainnet` (never an independently maintained
-    /// number), kept as a static constant for the network-less contexts that need one (the
-    /// `Synchronizer` protocol's default `migrationPrivacySyncBufferDuration`, which has no
-    /// network to scale by; real synchronizers forward their host's network-scaled value instead).
-    static let privacySyncBufferDuration: TimeInterval = privacySyncBufferDuration(for: .mainnet)
 
     /// The NU6.3 (Ironwood) activation height for `networkType`, or `nil` when NU6.3 is unset for
     /// that network. Stateless — no database access, and safe to call before constructing an
@@ -247,7 +227,6 @@ actor OrchardMigration {
         self.syncGate = MigrationSyncGate(
             directory: config.generalStorageURL,
             accountUUID: accountUUID,
-            bufferDuration: OrchardMigration.privacySyncBufferDuration(for: config.network.networkType),
             logger: logger
         )
     }
@@ -400,10 +379,8 @@ actor OrchardMigration {
     ///
     /// Composition (identical to ``submitNoteSplit(proposal:usk:options:)``'s, which shares the
     /// same private helper): serve the named transaction's already-finalized bytes through the
-    /// store's atomic broadcast seam, broadcast once, and — only on a success outcome — start the
-    /// privacy buffer *before* recording the mapped result, so the gate marks on submit success
-    /// independent of record bookkeeping. Transport/rejection outcomes are RETURNED (recorded
-    /// first, gate untouched).
+    /// store's atomic broadcast seam, broadcast once under the in-flight marker, and record the
+    /// mapped result. Transport/rejection outcomes are RETURNED, not thrown.
     ///
     /// - Throws: a pre-broadcast failure throws untouched and nothing is recorded — a fail-closed
     ///   ``ZcashError/migrationTorUnavailable`` when `options.useTor` is set and Tor cannot be
@@ -412,10 +389,9 @@ actor OrchardMigration {
     ///   proved-and-servable. The staleness throw is the honest answer to a stale instruction —
     ///   discharge it by cranking ``advanceStep()`` again rather than retrying the executor. A
     ///   record failure *after* a successful broadcast throws
-    ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast DID land and the
-    ///   privacy buffer is already running; the failure is transient from the migration's point of
-    ///   view, because a later execution window self-heals (re-submitting draws a duplicate
-    ///   rejection, which records as success).
+    ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast DID land; the
+    ///   failure is transient from the migration's point of view, because a later execution window
+    ///   self-heals (re-submitting draws a duplicate rejection, which records as success).
     ///
     /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
     /// (this method or ``submitNoteSplit(proposal:usk:options:)``) is in flight, this call first
@@ -467,18 +443,17 @@ actor OrchardMigration {
     /// outcome.
     ///
     /// Composition: sign the split (which serves the first preparation back as a finalized
-    /// transaction through the store's broadcast seam), broadcast once, and — only on a
-    /// success outcome — start the privacy buffer, *before* recording the mapped result: the gate
-    /// marks on submit success, independent of record bookkeeping. A transport failure or a server
-    /// rejection is *returned* as a ``MigrationTransferResult`` (and recorded first, gate untouched).
+    /// transaction through the store's broadcast seam), broadcast once under the in-flight marker,
+    /// and record the mapped result. A transport failure or a server rejection is *returned* as a
+    /// ``MigrationTransferResult``, not thrown.
     ///
     /// Throws: a pre-broadcast failure throws untouched (a signing error, or
     /// ``ZcashError/migrationTorUnavailable`` when `options.useTor` is set and Tor cannot be
     /// established — nothing was broadcast and nothing is recorded). A record failure *after* a
     /// successful broadcast throws ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the
-    /// broadcast DID land and the privacy buffer is already running; the failure is transient from
-    /// the migration's point of view, because a later execution window self-heals (re-submitting
-    /// draws a duplicate rejection, which records as success).
+    /// broadcast DID land; the failure is transient from the migration's point of view, because a
+    /// later execution window self-heals (re-submitting draws a duplicate rejection, which records
+    /// as success).
     ///
     /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
     /// (this method or ``performBroadcast(_:options:)``) is in flight, this call first waits
@@ -576,10 +551,12 @@ actor OrchardMigration {
 
     /// Whether ordinary wallet sync should currently be paused for this migration.
     ///
-    /// `true` while the post-broadcast privacy buffer has not yet elapsed, **or** an in-flight
-    /// broadcast marker is live — past/present conditions only. (The forward-looking
-    /// ready-broadcast clause was removed 2026-08-05 — danny + nuttycom's ruling; see
-    /// `MigrationSyncGate`'s type doc.)
+    /// `true` only while a submission is IN FLIGHT — the seconds between a migration submit
+    /// reaching the network and its outcome being recorded. Nothing timed remains: the
+    /// post-broadcast privacy buffer was deleted on 2026-08-07 (kris' ruling — a fixed delay is an
+    /// identifiable pattern, so the gate is behavior-based; see `MigrationSyncGate`'s type doc),
+    /// as the forward-looking ready-broadcast clause had been on 2026-08-05. A user action that
+    /// requires sync is never held here.
     ///
     /// - Note: The gate is per-account (by file name). An app running several migrating accounts must
     ///   consult each account's `OrchardMigration`; this instance answers only for its bound account.
@@ -588,33 +565,33 @@ actor OrchardMigration {
     }
 
     /// A stream of ``isSyncBlocked()``: emits the current value on subscribe, re-evaluates every 15 s
-    /// and after every broadcast, and collapses consecutive duplicates.
+    /// (and at the in-flight marker's own expiry), and after every arm/clear of that marker, and
+    /// collapses consecutive duplicates.
     ///
     /// `nonisolated` so sync-gating UI/logic can subscribe without awaiting the actor; it is backed by
     /// the internally synchronized ``MigrationSyncGate``: concurrent recomputes (the ticker and every
-    /// post-broadcast re-evaluation) publish through one lock-guarded, generation-ordered funnel, so a
+    /// marking-triggered re-evaluation) publish through one lock-guarded, generation-ordered funnel, so a
     /// recompute that started earlier but finishes later after a fresher one already published is
     /// dropped rather than emitted — subscribers only ever see values in latest-wins order, never a
     /// stale one overwriting a fresher one.
     ///
-    /// - Important: The value delivered synchronously on subscribe is EXACT — the gate's inputs
-    ///   are entirely its two persisted instants (see ``MigrationSyncGate``), so the old caveat
-    ///   about a briefly-wrong first emission is gone with the ready-broadcast clause. A
-    ///   subscriber that wants a belt anyway may still pair this stream with
-    ///   an initial ``isSyncBlocked()`` call rather than trusting the seed alone.
+    /// - Important: The value delivered synchronously on subscribe is EXACT — the gate's input is
+    ///   entirely its one persisted instant (see ``MigrationSyncGate``), so there is no caveat
+    ///   about a briefly-wrong first emission. A subscriber that wants a belt anyway may still
+    ///   pair this stream with an initial ``isSyncBlocked()`` call rather than trusting the seed
+    ///   alone.
     nonisolated var syncBlockedStream: AnyPublisher<Bool, Never> {
         syncGate.blockedStream
     }
 
-    /// The sync gate's LIVE in-memory inputs — the privacy-buffer expiry and the (clamped)
-    /// in-flight marker expiry — for the host's wallet-scope predicate (A8): the gate persists
-    /// file-first, but a FAILED file write still updates the cache, so the wallet-scope reader
-    /// must consult this live view alongside the file and let blocked win, or a full disk (or any
-    /// write failure) would silently blind it to a mark this process just made. `nonisolated`
-    /// (the gate is internally lock-synchronized) so the host can read it without awaiting the
-    /// actor.
-    nonisolated func liveGateInputs() -> (resumeAt: Date?, inFlightUntil: Date?) {
-        (syncGate.currentResumeAt(), syncGate.currentInFlightUntil())
+    /// The sync gate's LIVE in-memory input — the (clamped) in-flight marker expiry — for the
+    /// host's wallet-scope predicate (A8): the gate persists file-first, but a FAILED file write
+    /// still updates the cache, so the wallet-scope reader must consult this live view alongside
+    /// the file and let blocked win, or a full disk (or any write failure) would silently blind it
+    /// to a mark this process just made. `nonisolated` (the gate is internally lock-synchronized)
+    /// so the host can read it without awaiting the actor.
+    nonisolated func liveInFlightUntil() -> Date? {
+        syncGate.currentInFlightUntil()
     }
 
     // MARK: - On-launch reconciliation
@@ -753,45 +730,30 @@ actor OrchardMigration {
         return try await flow()
     }
 
-    /// Whether `id` names a note-PREPARATION of this account's run — the D2 discriminator for
-    /// the privacy-buffer exemption ``broadcastAndRecord(prepared:options:)`` applies. One
-    /// statuses read per broadcast; a failed read degrades to `false` (the conservative TRANSFER
-    /// treatment: the buffer arms).
-    private func isPreparationTransaction(id: UInt32) async -> Bool {
-        let statuses = (try? await welding.migrationTransactionStatuses(for: accountUUID)) ?? []
-        return statuses.contains { status in
-            guard status.id == id else { return false }
-            if case .preparation = status.kind { return true }
-            return false
-        }
-    }
-
     /// Shared broadcast/record composition for a prepared transfer: broadcast its already-finalized
-    /// bytes once to the resolved endpoint, and classify the outcome. On a success outcome the
-    /// privacy buffer starts *before* the result is recorded — ``MigrationSyncGate/markBroadcast()``
-    /// is a non-throwing local write, and a record failure after a real broadcast must never skip
-    /// the buffer (TRANSFERS only — a preparation arms no buffer, D2, see the body); a record failure on that path throws
-    /// ``ZcashError/migrationRecordFailedAfterBroadcast(_:)``. Non-success outcomes are recorded
-    /// first and returned with the gate untouched (only success outcomes mark it, unchanged); a
-    /// record throw on that path clears the in-flight marker first only for a DEFINITIVE
-    /// rejection (`.expired`/`.invalidNote` — the server's answer proves nothing landed, so the
-    /// window is over), while a `.networkError` record throw keeps the marker (protective: a
-    /// transport failure cannot prove the submit did not land, exactly the ambiguity the marker
-    /// exists for) — the raw record error rethrows either way. Only pre-broadcast failures throw
-    /// untouched.
+    /// bytes once to the resolved endpoint, and classify the outcome. A record failure after a
+    /// successful broadcast throws ``ZcashError/migrationRecordFailedAfterBroadcast(_:)``.
+    /// Non-success outcomes are recorded first and returned; a record throw on that path clears
+    /// the in-flight marker first only for a DEFINITIVE rejection (`.expired`/`.invalidNote` —
+    /// the server's answer proves nothing landed, so the window is over), while a `.networkError`
+    /// record throw keeps the marker (protective: a transport failure cannot prove the submit did
+    /// not land, exactly the ambiguity the marker exists for) — the raw record error rethrows
+    /// either way. Only pre-broadcast failures throw untouched.
     ///
-    /// The whole submit-to-record window is additionally bracketed by the sync gate's persisted
-    /// in-flight marker (``MigrationSyncGate/markBroadcastInFlight()``): armed before the flow as
-    /// a belt, RE-armed at the last instant before the submit RPC via the broadcaster's
-    /// `onWillSubmit` hook (A9 — after the Tor bootstrap/connection setup, which can take many
-    /// seconds and would otherwise burn the marker's 120 s window before anything reached the
-    /// network), and cleared once the outcome is recorded — or immediately when the broadcaster
-    /// throws before submitting anything (its fail-closed contract: a throw means nothing reached
-    /// the network). A crash — or a record throw the rules above retain it for — between submit
-    /// and record leaves the marker behind, and it self-expires at
-    /// ``MigrationSyncGate/broadcastInFlightGuardDuration`` (120 s); while it lives, sync (and
-    /// with it the reconciliation probe that must not observe a just-broadcast transfer) stays
-    /// blocked.
+    /// The whole submit-to-record window is bracketed by the sync gate's persisted in-flight
+    /// marker (``MigrationSyncGate/markBroadcastInFlight()``) — the gate's ONLY condition, and the
+    /// only sync hold a broadcast produces: armed before the flow as a belt, RE-armed at the last
+    /// instant before the submit RPC via the broadcaster's `onWillSubmit` hook (A9 — after the Tor
+    /// bootstrap/connection setup, which can take many seconds and would otherwise burn the
+    /// marker's 120 s window before anything reached the network), and cleared once the outcome is
+    /// recorded — or immediately when the broadcaster throws before submitting anything (its
+    /// fail-closed contract: a throw means nothing reached the network). Once cleared, sync is
+    /// open again immediately; no timed spacing follows a broadcast (see
+    /// ``MigrationSyncGate``'s type doc for the ruling). A crash — or a record throw the rules
+    /// above retain it for — between submit and record leaves the marker behind, and it
+    /// self-expires at ``MigrationSyncGate/broadcastInFlightGuardDuration`` (120 s), a
+    /// crash-recovery ceiling rather than a privacy interval; while it lives, sync (and with it
+    /// the reconciliation probe that must not observe a just-broadcast transfer) stays blocked.
     private func broadcastAndRecord(
         prepared: PreparedMigrationTransfer,
         options: MigrationNetworkPrivacyOptions
@@ -827,22 +789,11 @@ actor OrchardMigration {
 
         let result = MigrationBroadcaster.map(outcome: outcome, successTxId: prepared.txid.toHexStringTxId())
         if case MigrationTransferResult.success = result {
-            // The broadcast landed (or a duplicate rejection proved an earlier one did): start the
-            // privacy buffer first, so a record failure cannot skip it.
-            //
-            // D2 (danny + nuttycom, 2026-08-05): the buffer is a TRANSFER separation — a
-            // note-PREPARATION is a fully shielded orchard→orchard send-to-self, ZIP-318-exempt,
-            // and the engine's own contract is "a preparation is broadcast as soon as it is
-            // proved". Arming the buffer after a prep broadcast held the very sync its next
-            // layer's mine-observation needed, doubling every split phase. A failed kind read
-            // degrades to the conservative transfer treatment (buffer arms). The in-flight
-            // marker above is UNTOUCHED either way — it guards submit-to-record correctness,
-            // not ZIP-318 pacing.
-            if await isPreparationTransaction(id: prepared.id) {
-                logger.debug("migration preparation \(prepared.id) broadcast — no privacy buffer armed (ZIP-318 exempt)")
-            } else {
-                syncGate.markBroadcast()
-            }
+            // The broadcast landed (or a duplicate rejection proved an earlier one did). Nothing
+            // is armed here: the gate is behavior-based, so a completed broadcast leaves behind
+            // no timed hold at all — only the in-flight marker above, which the record below
+            // releases. (Until 2026-08-07 a post-broadcast privacy buffer started here, with a D2
+            // carve-out that exempted note preparations from it; both are gone with the buffer.)
             do {
                 try await welding.migrationRecordTransferResult(transferId: prepared.id, result: result, for: accountUUID)
             } catch {

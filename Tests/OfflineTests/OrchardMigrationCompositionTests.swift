@@ -6,7 +6,8 @@
 //  initializer against `ZcashRustBackendWeldingMock` plus hand-written fakes for the
 //  `MigrationBroadcasting` seam and a real, temp-file-backed `MigrationSyncGate` (as established by
 //  MigrationLogicTests.swift's I1 canary test). No network, no real FFI: this file exercises the
-//  composition wiring (call order, what gets recorded, when the sync gate is marked) over those
+//  composition wiring (call order, what gets recorded, when the sync gate's in-flight marker is
+//  armed and released) over those
 //  seams, complementing MigrationFFITests.swift (real FFI) and MigrationLogicTests.swift (pure
 //  logic).
 //
@@ -18,7 +19,6 @@ import XCTest
 final class OrchardMigrationCompositionTests: ZcashTestCase {
     private let accountA = AccountUUID(id: [UInt8](repeating: 0x33, count: 16))
     private let referenceDate = Date(timeIntervalSince1970: 1_700_000_000)
-    private let buffer: TimeInterval = 600
     private let defaultEndpoint = LightWalletEndpoint(address: "default.example", port: 9067)
     private let usk = UnifiedSpendingKey(network: .testnet, bytes: [UInt8](repeating: 0xEE, count: 32))
 
@@ -42,14 +42,13 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
     // MARK: - submitNoteSplit composition
 
-    /// Proves the full `sign -> broadcast -> gate marked -> record` order for the
-    /// success path, and that the mapped result is returned. There is no extract step any more:
-    /// the ceremony's handback comes through the store's broadcast seam already finalized, so what
-    /// reaches the broadcaster is `prepared.pczt` verbatim. The `record` closure additionally
-    /// asserts the gate is already marked at the moment it runs, pinning "the privacy gate marks
-    /// strictly before record" — the buffer protects a landed broadcast even when the engine's
-    /// record bookkeeping subsequently fails.
-    func testSubmitNoteSplitOrdersSignBroadcastMarksGateThenRecordsOnSuccess() async throws {
+    /// Proves the full `sign -> broadcast -> record` order for the success path, and that the
+    /// mapped result is returned. There is no extract step any more: the ceremony's handback comes
+    /// through the store's broadcast seam already finalized, so what reaches the broadcaster is
+    /// `prepared.pczt` verbatim. The `record` closure additionally asserts the in-flight marker is
+    /// still armed at the moment it runs, pinning "the submit-to-record window stays bracketed
+    /// until the record lands"; the marker is released only afterwards.
+    func testSubmitNoteSplitOrdersSignBroadcastThenRecordsOnSuccess() async throws {
         let recorder = CompositionOrderRecorder()
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         let prepared = makePreparedTransfer(id: 0)
@@ -61,14 +60,12 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             XCTAssertEqual(receivedAccount, self.accountA)
             return prepared
         }
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { transferId, result, _ in
             recorder.record("record")
             XCTAssertEqual(transferId, prepared.id)
             XCTAssertEqual(result, MigrationTransferResult.success(txId: prepared.txid.toHexStringTxId()))
-            // Ordering proof: the gate must already be marked when record runs.
-            XCTAssertNotNil(self.gate.currentResumeAt())
+            // Ordering proof: the submit-to-record window must still be open when record runs.
+            XCTAssertNotNil(self.gate.currentInFlightUntil())
         }
 
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
@@ -94,17 +91,16 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             welding.migrationExtractBroadcastTxPcztForCalled,
             "the broadcast path must not extract: its bytes are already a consensus transaction"
         )
-        XCTAssertNotNil(gate.currentResumeAt(), "gate must be marked after a successful broadcast")
+        XCTAssertNil(gate.currentInFlightUntil(), "the recorded outcome closes the submit-to-record window")
+        XCTAssertFalse(gate.currentlyBlocked(), "a completed broadcast leaves no timed hold behind")
     }
 
-    /// Transport failure is *returned*, not thrown: recorded as a retryable network error, and the
-    /// privacy-buffer gate is left untouched (only a `.success` marks it).
-    func testSubmitNoteSplitOnTransportFailureRecordsNetworkErrorAndLeavesGateUntouched() async throws {
+    /// Transport failure is *returned*, not thrown: recorded as a retryable network error, with
+    /// the gate released once the outcome is durably recorded.
+    func testSubmitNoteSplitOnTransportFailureRecordsNetworkErrorAndReleasesTheGate() async throws {
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         let prepared = makePreparedTransfer(id: 0)
         welding.migrationSignNoteSplitProposalUskForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -122,7 +118,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             welding.migrationRecordTransferResultTransferIdResultForReceivedArguments?.result,
             MigrationTransferResult.networkError(retryable: true)
         )
-        XCTAssertNil(gate.currentResumeAt())
+        XCTAssertNil(gate.currentInFlightUntil(), "the recorded outcome closes the submit-to-record window")
+        XCTAssertFalse(gate.currentlyBlocked())
     }
 
     /// The sibling of MigrationLogicTests' `testPerformBroadcastFailsClosedOnTor...`
@@ -133,8 +130,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         let prepared = makePreparedTransfer(id: 0)
         welding.migrationSignNoteSplitProposalUskForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -154,7 +149,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
         XCTAssertEqual(broadcaster.receivedCalls.count, 1)
         XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
-        XCTAssertNil(gate.currentResumeAt())
+        XCTAssertNil(gate.currentInFlightUntil(), "a fail-closed pre-submit throw must leave no marker behind")
+        XCTAssertFalse(gate.currentlyBlocked())
     }
 
     // MARK: - performBroadcast composition
@@ -206,15 +202,12 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
         XCTAssertEqual(broadcaster.receivedCalls.count, 0)
         XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
-        XCTAssertNil(gate.currentResumeAt())
         XCTAssertNil(gate.currentInFlightUntil(), "a serve that never reached the network arms no marker")
     }
 
-    func testPerformBroadcastSuccessPathRecordsAndMarksGate() async throws {
+    func testPerformBroadcastSuccessPathRecordsAndReleasesTheGate() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -229,16 +222,15 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             welding.migrationRecordTransferResultTransferIdResultForReceivedArguments?.result,
             MigrationTransferResult.success(txId: prepared.txid.toHexStringTxId())
         )
-        XCTAssertNotNil(gate.currentResumeAt())
+        XCTAssertNil(gate.currentInFlightUntil(), "the recorded outcome closes the submit-to-record window")
+        XCTAssertFalse(gate.currentlyBlocked(), "a completed broadcast leaves no timed hold behind")
     }
 
     /// M5: seam-based coverage of the rejection branch's generic (non-expiry) message, at the
     /// composition level -- not just the pure `map` table already covered by MigrationLogicTests.
-    func testPerformBroadcastInvalidNoteRejectionRecordsAndLeavesGateUntouched() async throws {
+    func testPerformBroadcastInvalidNoteRejectionRecordsAndReleasesTheGate() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.rejected(errorCode: -25, message: "missing inputs")))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -253,15 +245,14 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             welding.migrationRecordTransferResultTransferIdResultForReceivedArguments?.result,
             MigrationTransferResult.invalidNote
         )
-        XCTAssertNil(gate.currentResumeAt())
+        XCTAssertNil(gate.currentInFlightUntil())
+        XCTAssertFalse(gate.currentlyBlocked())
     }
 
     /// M5: seam-based coverage of the rejection branch's expiry message, at the composition level.
-    func testPerformBroadcastExpiredRejectionRecordsAndLeavesGateUntouched() async throws {
+    func testPerformBroadcastExpiredRejectionRecordsAndReleasesTheGate() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.rejected(errorCode: -26, message: "tx-expiring-soon")))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -276,7 +267,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             welding.migrationRecordTransferResultTransferIdResultForReceivedArguments?.result,
             MigrationTransferResult.expired
         )
-        XCTAssertNil(gate.currentResumeAt())
+        XCTAssertNil(gate.currentInFlightUntil())
+        XCTAssertFalse(gate.currentlyBlocked())
     }
 
     /// Broadcaster single-endpoint discipline: exactly one call, to the options' required
@@ -284,8 +276,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testBroadcasterReceivesExactlyOneCallToTheResolvedEndpoint() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let overrideEndpoint = LightWalletEndpoint(address: "override.example", port: 443)
         XCTAssertNotEqual(overrideEndpoint, defaultEndpoint)
@@ -387,8 +377,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let expectedDisplayTxId = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
         let prepared = PreparedMigrationTransfer(id: 1, txid: Data(rawTxId), pczt: Data([0x01, 0x02]))
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -407,15 +395,14 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
     // MARK: - Record failure after a successful broadcast
 
-    /// When the broadcast succeeded but recording the result throws, the privacy gate must already
-    /// be marked (the broadcast DID land — the 10-minute buffer protects it independently of engine
-    /// bookkeeping), and the call must surface the distinguishable
-    /// `migrationRecordFailedAfterBroadcast` so the host knows the engine reconciles later.
-    func testPerformBroadcastRecordThrowAfterSuccessfulBroadcastMarksGateAndThrowsWrapped() async throws {
+    /// When the broadcast succeeded but recording the result throws, the in-flight marker must be
+    /// RETAINED — the result was never recorded, which is exactly the submit-to-record gap the
+    /// marker guards, and it self-expires on its own — and the call must surface the
+    /// distinguishable `migrationRecordFailedAfterBroadcast` so the host knows the engine
+    /// reconciles later.
+    func testPerformBroadcastRecordThrowAfterSuccessfulBroadcastRetainsMarkerAndThrowsWrapped() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -433,15 +420,16 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         }
 
         XCTAssertEqual(broadcaster.receivedCalls.count, 1)
-        XCTAssertNotNil(gate.currentResumeAt(), "a real broadcast must start the privacy buffer even when recording fails")
+        XCTAssertNotNil(
+            gate.currentInFlightUntil(),
+            "an unrecorded but landed broadcast must retain the protective in-flight marker"
+        )
     }
 
     /// The sibling of the test above for the other public broadcast flow.
-    func testSubmitNoteSplitRecordThrowAfterSuccessfulBroadcastMarksGateAndThrowsWrapped() async throws {
+    func testSubmitNoteSplitRecordThrowAfterSuccessfulBroadcastRetainsMarkerAndThrowsWrapped() async throws {
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         welding.migrationSignNoteSplitProposalUskForReturnValue = makePreparedTransfer(id: 0)
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -459,19 +447,20 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             XCTFail("Expected migrationRecordFailedAfterBroadcast but got \(error)")
         }
 
-        XCTAssertNotNil(gate.currentResumeAt(), "a real broadcast must start the privacy buffer even when recording fails")
+        XCTAssertNotNil(
+            gate.currentInFlightUntil(),
+            "an unrecorded but landed broadcast must retain the protective in-flight marker"
+        )
     }
 
     /// A record failure on a non-success outcome (here a transport error — nothing verifiably
-    /// landed) propagates the raw error unwrapped and the gate stays untouched: the
+    /// landed) propagates the raw error unwrapped: the
     /// record-failed-after-broadcast contract is reserved for outcomes that map to success.
     /// A11: the in-flight marker is RETAINED — a transport failure cannot prove the submit did
     /// not land, exactly the submit-to-record ambiguity the marker exists for (it self-expires).
     func testPerformBroadcastRecordThrowOnTransportErrorPropagatesRawAndLeavesGateUntouched() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -488,7 +477,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             XCTFail("Expected StubEngineError but got \(error)")
         }
 
-        XCTAssertNil(gate.currentResumeAt())
         XCTAssertNotNil(
             gate.currentInFlightUntil(),
             "A11: a record throw on a network error must retain the protective in-flight marker"
@@ -508,8 +496,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         for (script, expected) in rejections {
             let prepared = makePreparedTransfer(id: 1)
             welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-            // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-            welding.migrationTransactionStatusesForReturnValue = []
             welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
             let broadcaster = ScriptedBroadcaster(script: .outcome(script))
             let migration = makeMigration(broadcaster: broadcaster)
@@ -528,7 +514,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
             // The mock throws before capturing arguments, so the mapped-result routing is pinned
             // by the non-throwing rejection tests above; here only the gate effects matter.
-            XCTAssertNil(gate.currentResumeAt(), "a rejection must not start the privacy buffer")
             XCTAssertNil(
                 gate.currentInFlightUntil(),
                 "A11: a definitive rejection proves nothing landed — the marker must be cleared before the rethrow (\(expected))"
@@ -541,8 +526,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testPerformBroadcastRecordSuccessOnNetworkErrorClearsInFlightMarker() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .outcome(.transportError)))
 
@@ -565,8 +548,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testPerformBroadcastReArmsTheInFlightMarkerAtSubmitTimeViaTheHook() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
 
@@ -608,8 +589,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testPerformBroadcastFailClosedThrowNeverFiresTheHook() async throws {
         let prepared = makePreparedTransfer(id: 1)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         let broadcaster = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable))
         let migration = makeMigration(broadcaster: broadcaster)
 
@@ -712,8 +691,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             }
             return prepared
         }
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = GatedBroadcaster(outcome: MigrationBroadcastOutcome.submitted)
         let migration = makeMigration(broadcaster: broadcaster)
@@ -773,8 +750,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             recorder.record("sign")
             return splitTransfer
         }
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { transferId, _, _ in
             recorder.record("record:\(transferId)")
         }
@@ -830,8 +805,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             next: nil
         )
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepTransfer
-        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
-        welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForClosure = { pczt, _ in
             XCTAssertEqual(pczt, prepTransfer.pczt)
             return Data([0x0A])
@@ -861,32 +834,38 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
     // MARK: - isSyncBlocked gate-file state
 
-    /// `isSyncBlocked` answers from the persisted gate-file (privacy-buffer) state -- checked both
-    /// with no gate file (unblocked) and with an active buffer (blocked), so the answer is proven
-    /// to actually read the file rather than being a hardcoded constant.
-    func testIsSyncBlockedAnswersFromThePersistedGateFileState() async throws {
+    /// `isSyncBlocked` answers from the persisted gate state -- checked with no marker
+    /// (unblocked), with a live in-flight marker (blocked), and once it is cleared (unblocked
+    /// again, immediately), so the answer is proven to actually read the gate rather than being a
+    /// hardcoded constant, and proven to leave nothing behind once the submit is over.
+    func testIsSyncBlockedAnswersFromThePersistedGateState() async throws {
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
-        let blockedWithNoGateFile = await migration.isSyncBlocked()
-        XCTAssertFalse(blockedWithNoGateFile)
+        let blockedWithNoMarker = await migration.isSyncBlocked()
+        XCTAssertFalse(blockedWithNoMarker)
 
-        gate.markBroadcast()
+        gate.markBroadcastInFlight()
 
-        let blockedWithGateFile = await migration.isSyncBlocked()
-        XCTAssertTrue(blockedWithGateFile)
+        let blockedWhileInFlight = await migration.isSyncBlocked()
+        XCTAssertTrue(blockedWhileInFlight)
+
+        gate.clearBroadcastInFlight()
+
+        let blockedAfterTheOutcomeLanded = await migration.isSyncBlocked()
+        XCTAssertFalse(blockedAfterTheOutcomeLanded, "the clock has not moved: nothing timed may hold sync")
     }
 
     // MARK: - isSyncBlocked forward-looking policy (D1)
 
     /// D1 REVERSAL PIN (danny + nuttycom, 2026-08-05): the gate's forward-looking clause is
-    /// deleted, so a migration with no buffer and no in-flight marker never blocks sync, and no
-    /// gate path pays for the wall-clock chain-tip estimate the clause needed.
+    /// deleted, so a migration with no in-flight marker never blocks sync, and no gate path pays
+    /// for the wall-clock chain-tip estimate the clause needed.
     func testIsSyncBlockedIgnoresForwardLookingWork() async throws {
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         let blocked = await migration.isSyncBlocked()
 
-        XCTAssertFalse(blocked, "sync holds only for past/present broadcasts (buffer, in-flight marker)")
+        XCTAssertFalse(blocked, "sync holds only while a submission is in flight")
         XCTAssertFalse(welding.migrationBlockRateSamplesWindowCalled, "no gate path pays for the estimate anymore")
     }
 
@@ -978,7 +957,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         MigrationSyncGate(
             directory: testGeneralStorageDirectory,
             accountUUID: account,
-            bufferDuration: buffer,
             // A long tick keeps the background re-evaluation out of these deterministic assertions.
             tickInterval: 3600,
             now: { clock.now },
@@ -1000,70 +978,6 @@ private final class CompositionOrderRecorder {
 
     func record(_ event: String) {
         events.append(event)
-    }
-}
-
-/// A ``MigrationBroadcasting`` fake with a test-controlled suspension: every `broadcast` call
-/// suspends until ``open()`` is called, giving single-flight tests a deterministic in-flight window.
-/// Starts are observable via ``awaitBroadcastsStarted(_:)``; once opened, suspended and future
-/// broadcasts complete immediately with the scripted outcome. An actor, because these tests
-/// deliberately call it from concurrent tasks.
-private actor GatedBroadcaster: MigrationBroadcasting {
-    private let outcome: MigrationBroadcastOutcome
-    private var isOpen = false
-    private(set) var startedCount = 0
-    private var pendingBroadcasts: [CheckedContinuation<Void, Never>] = []
-    private var startObservers: [(threshold: Int, continuation: CheckedContinuation<Void, Never>)] = []
-
-    init(outcome: MigrationBroadcastOutcome) {
-        self.outcome = outcome
-    }
-
-    func broadcast(
-        rawTransaction: Data,
-        to endpoint: LightWalletEndpoint,
-        useTor: Bool,
-        onWillSubmit: @Sendable () -> Void
-    ) async throws -> MigrationBroadcastOutcome {
-        startedCount += 1
-        notifyStartObservers()
-        if !isOpen {
-            await withCheckedContinuation { continuation in
-                pendingBroadcasts.append(continuation)
-            }
-        }
-        // Per the production contract the hook fires at the last pre-submit instant; a returned
-        // outcome means a submit happened.
-        onWillSubmit()
-        return outcome
-    }
-
-    /// Returns once at least `count` broadcasts have started (immediately when they already have).
-    func awaitBroadcastsStarted(_ count: Int) async {
-        if startedCount >= count {
-            return
-        }
-        await withCheckedContinuation { continuation in
-            startObservers.append((threshold: count, continuation: continuation))
-        }
-    }
-
-    /// Releases every suspended broadcast and lets all future ones complete immediately.
-    func open() {
-        isOpen = true
-        let pending = pendingBroadcasts
-        pendingBroadcasts = []
-        for continuation in pending {
-            continuation.resume()
-        }
-    }
-
-    private func notifyStartObservers() {
-        let ready = startObservers.filter { $0.threshold <= startedCount }
-        startObservers.removeAll { $0.threshold <= startedCount }
-        for observer in ready {
-            observer.continuation.resume()
-        }
     }
 }
 
