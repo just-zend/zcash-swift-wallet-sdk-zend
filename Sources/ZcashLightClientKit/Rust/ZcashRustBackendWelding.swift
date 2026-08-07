@@ -455,7 +455,7 @@ protocol ZcashRustBackendWelding {
     /// The most recently scanned blocks' `(height, header time)` samples, at most `window` rows,
     /// ASCENDING by height — the raw inputs ``ChainTipEstimator`` projects an ESTIMATED chain tip
     /// from (fed back into ``migrationHasOverdueTransfers(for:estimatedTip:)`` /
-    /// ``migrationNextDueTransfer(for:estimatedTip:)``). A read-only, best-effort read of
+    /// ``migrationAdvanceStep(for:estimatedTip:)``). A read-only, best-effort read of
     /// scanned-block metadata: a wallet with no scanned blocks yet returns the EMPTY list, never
     /// an error. Wallet-scoped, not account-scoped — the blocks table is shared.
     /// - Throws: `rustMigrationBlockRateSamples` if the rust layer returns an error.
@@ -645,8 +645,7 @@ protocol ZcashRustBackendWelding {
     ///
     /// Call this as the wallet scans, NOT when about to broadcast: a transaction's anchor becomes
     /// witnessable long before its broadcast schedule arrives, and proving is expensive, so the
-    /// work belongs in the sync path. `migrationNextDueTransfer` deliberately does no proving, and
-    /// reports `.awaitingProof` for a due transaction whose proof has not been produced yet.
+    /// work belongs in the sync path. The delivery lane deliberately does no proving.
     ///
     /// A transaction the wallet cannot prove yet (its anchor not scanned/retained) is skipped and
     /// retried by a later call, so this is safe to run on any schedule, including mid-sync.
@@ -654,27 +653,38 @@ protocol ZcashRustBackendWelding {
     ///   `rustMigrationProvePending` for other rust-layer errors.
     func migrationProvePending(for account: AccountUUID) async throws -> Int
 
-    /// The next height-due pre-signed transfer, if one is both due and already proved — see
-    /// `DueMigrationTransfer` for the three outcomes. Never proves; run `migrationProvePending`
-    /// for that.
+    /// Serves the transaction `id` for broadcast — the instruction a prior
+    /// ``migrationAdvanceStep(for:estimatedTip:)`` call returned as its
+    /// ``MigrationAdvanceStep/broadcast(id:)`` step.
     ///
-    /// `estimatedTip` (`nil` = disabled) may only ACCELERATE scheduled-height due-ness; expiry is
-    /// always evaluated against the SCANNED tip — the same rule as
-    /// ``migrationHasOverdueTransfers(for:estimatedTip:)``.
-    /// - Throws: `rustMigrationNextDueTransfer` if the rust layer returns an error.
-    func migrationNextDueTransfer(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> DueMigrationTransfer
+    /// This NEVER asks the engine what to serve: `migrationAdvanceStep` is the top-level call and
+    /// every executor is subservient to it, so there is no broadcast to make without having first
+    /// been instructed to make it. The re-spread, the satisfiability verification and the dueness
+    /// judgement all happened in the advance that issued the instruction.
+    ///
+    /// The serve goes through the store's atomic broadcast seam: the transaction is finalized,
+    /// extracted, and recorded in the wallet's own tables in the same database transaction that
+    /// hands the bytes back, so the wallet's record binds at the broadcast ATTEMPT. The returned
+    /// ``PreparedMigrationTransfer/pczt`` is therefore the FINALIZED CONSENSUS TRANSACTION,
+    /// submittable as-is with no `migrationExtractBroadcastTx` step. Retrying a failed submission
+    /// re-serves the same transaction over the same record.
+    /// - Throws: `migrationProvingUnavailable` when the stored artifact cannot be turned into
+    ///   servable bytes; `rustMigrationTakeBroadcastTransaction` for other rust-layer errors —
+    ///   including the STALENESS refusal of a row that is no longer proved-and-servable, which a
+    ///   caller discharges by advancing again rather than retrying the executor.
+    func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer
 
     /// The next height-due scheduled transfer's full proposal (amount, anchor, timing) for the
     /// active run, or `nil` when nothing is currently pending (no active run, or only the note-split
-    /// prep is pending). The proposal-level counterpart of `migrationNextDueTransfer`: it exposes the
+    /// prep is pending). The proposal-level counterpart of the delivery lane: it exposes the
     /// heights (notably `nextExecutableAfterHeight`) so a host can re-arm its own background window
     /// without parsing the signed PCZT.
     /// - Throws: `rustMigrationPendingTransferProposal` if the rust layer returns an error.
     func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal?
 
     /// Extracts the broadcast-ready consensus transaction bytes from a signed PCZT (the
-    /// `PreparedMigrationTransfer.pczt` returned by `migrationNextDueTransfer` or
-    /// `migrationSignNoteSplit`).
+    /// `PreparedMigrationTransfer.pczt` returned by `migrationStoreSignedNoteSplitPczts`, the one
+    /// producer whose artifact is still a PCZT).
     /// - Throws: `rustMigrationExtractBroadcastTx` if the rust layer returns an error.
     func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data
 

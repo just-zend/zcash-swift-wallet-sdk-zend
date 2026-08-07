@@ -5498,27 +5498,27 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
-    // MARK: - migrationNextDueTransfer
+    // MARK: - migrationTakeBroadcastTransaction
 
-    var migrationNextDueTransferForEstimatedTipThrowableError: Error?
-    var migrationNextDueTransferForEstimatedTipCallsCount = 0
-    var migrationNextDueTransferForEstimatedTipCalled: Bool {
-        return migrationNextDueTransferForEstimatedTipCallsCount > 0
+    var migrationTakeBroadcastTransactionIdForThrowableError: Error?
+    var migrationTakeBroadcastTransactionIdForCallsCount = 0
+    var migrationTakeBroadcastTransactionIdForCalled: Bool {
+        return migrationTakeBroadcastTransactionIdForCallsCount > 0
     }
-    var migrationNextDueTransferForEstimatedTipReceivedArguments: (account: AccountUUID, estimatedTip: BlockHeight?)?
-    var migrationNextDueTransferForEstimatedTipReturnValue: DueMigrationTransfer!
-    var migrationNextDueTransferForEstimatedTipClosure: ((AccountUUID, BlockHeight?) async throws -> DueMigrationTransfer)?
+    var migrationTakeBroadcastTransactionIdForReceivedArguments: (id: UInt32, account: AccountUUID)?
+    var migrationTakeBroadcastTransactionIdForReturnValue: PreparedMigrationTransfer!
+    var migrationTakeBroadcastTransactionIdForClosure: ((UInt32, AccountUUID) async throws -> PreparedMigrationTransfer)?
 
-    func migrationNextDueTransfer(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> DueMigrationTransfer {
-        if let error = migrationNextDueTransferForEstimatedTipThrowableError {
+    func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
+        if let error = migrationTakeBroadcastTransactionIdForThrowableError {
             throw error
         }
-        migrationNextDueTransferForEstimatedTipCallsCount += 1
-        migrationNextDueTransferForEstimatedTipReceivedArguments = (account: account, estimatedTip: estimatedTip)
-        if let closure = migrationNextDueTransferForEstimatedTipClosure {
-            return try await closure(account, estimatedTip)
+        migrationTakeBroadcastTransactionIdForCallsCount += 1
+        migrationTakeBroadcastTransactionIdForReceivedArguments = (id: id, account: account)
+        if let closure = migrationTakeBroadcastTransactionIdForClosure {
+            return try await closure(id, account)
         } else {
-            return migrationNextDueTransferForEstimatedTipReturnValue
+            return migrationTakeBroadcastTransactionIdForReturnValue
         }
     }
 

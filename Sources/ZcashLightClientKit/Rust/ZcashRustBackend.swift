@@ -2089,35 +2089,34 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
+    // DB-AUDIT (2026-08-03): WRITE — the broadcast seam records the transaction in the wallet's
+    // own tables in the same database transaction that hands the bytes back. Stays serialized.
     @DBActor
-    func migrationNextDueTransfer(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> DueMigrationTransfer {
-        let preparedPtr = zcashlc_migration_next_due_transfer(
+    func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
+        let preparedPtr = zcashlc_migration_take_broadcast_transaction(
             dbData.0,
             dbData.1,
             account.id,
             networkType.networkId,
-            // `-1` disables the estimate on the rust side.
-            estimatedTip.map(Int64.init) ?? -1
+            id
         )
 
         guard let preparedPtr else {
             throw migrationRoutedError(
-                lastErrorMessage(fallback: "`migrationNextDueTransfer` failed with unknown error"),
-                fallback: ZcashError.rustMigrationNextDueTransfer
+                lastErrorMessage(fallback: "`migrationTakeBroadcastTransaction` failed with unknown error"),
+                fallback: ZcashError.rustMigrationTakeBroadcastTransaction
             )
         }
 
         defer { zcashlc_free_migration_prepared_transfer(preparedPtr) }
 
-        guard let due = preparedPtr.pointee.unsafeToDueMigrationTransfer() else {
-            throw ZcashError.rustMigrationNextDueTransfer(
-                lastErrorMessage(fallback: "`migrationNextDueTransfer` returned a malformed outcome")
+        guard let prepared = preparedPtr.pointee.unsafeToPreparedMigrationTransfer() else {
+            throw ZcashError.rustMigrationTakeBroadcastTransaction(
+                lastErrorMessage(fallback: "`migrationTakeBroadcastTransaction` returned a malformed transaction")
             )
         }
 
-        return due
+        return prepared
     }
 
     // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
@@ -3055,7 +3054,9 @@ extension FfiMigrationAdvanceStep {
                     let kind: MigrationTransactionStatus.Kind = target.kind_is_preparation
                         ? .preparation(layer: Int(target.kind_layer), index: Int(target.kind_index))
                         : .transfer(crossing: Int(target.kind_crossing))
-                    transactions.append(MigrationProveTarget(id: target.id, kind: kind))
+                    transactions.append(
+                        MigrationProveTarget(id: target.id, kind: kind, isScheduleDue: target.schedule_due)
+                    )
                 }
             }
             guard !transactions.isEmpty else { return nil }
@@ -3125,8 +3126,8 @@ extension FfiNoteSplitProposal {
 
 extension FfiPreparedTransfer {
     /// Converts an [`FfiPreparedTransfer`] into a [`PreparedMigrationTransfer`], or `nil` when it
-    /// carries no broadcastable artifact (a null `pczt` — the "nothing due" sentinel and the
-    /// "awaiting proof" outcome both have one; their `id` is meaningless).
+    /// carries no artifact at all (a null `pczt` — should not happen; defensive only, since every
+    /// producer of this DTO either populates it or fails).
     func unsafeToPreparedMigrationTransfer() -> PreparedMigrationTransfer? {
         guard let pcztPtr = pczt else {
             return nil
@@ -3137,22 +3138,6 @@ extension FfiPreparedTransfer {
             txid: Data(FfiTxId(tuple: txid).array),
             pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
         )
-    }
-
-    /// Converts an [`FfiPreparedTransfer`] into the delivery lane's three-way outcome, or `nil`
-    /// when the rust side reported a status whose payload is malformed (a `Ready` without an
-    /// artifact, or an `AwaitingProof` without an id — should not happen; defensive only).
-    func unsafeToDueMigrationTransfer() -> DueMigrationTransfer? {
-        switch status {
-        case MigrationNothingDue:
-            return .nothingDue
-        case MigrationReady:
-            return unsafeToPreparedMigrationTransfer().map { .ready($0) }
-        case MigrationAwaitingProof:
-            return .awaitingProof(id: id)
-        default:
-            return nil
-        }
     }
 }
 

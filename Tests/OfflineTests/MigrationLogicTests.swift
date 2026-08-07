@@ -1155,7 +1155,8 @@ final class MigrationLogicTests: ZcashTestCase {
             pczt: Data([0x01, 0x02])
         )
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .broadcast(id: prepared.id), next: nil)
+        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
         // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
         welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x03, 0x04])

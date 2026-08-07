@@ -33,7 +33,7 @@ final class ScriptedBroadcaster: MigrationBroadcasting {
         case throwing(Error)
     }
 
-    private(set) var receivedCalls: [(endpoint: LightWalletEndpoint, useTor: Bool)] = []
+    private(set) var receivedCalls: [(rawTransaction: Data, endpoint: LightWalletEndpoint, useTor: Bool)] = []
     /// How many times the `onWillSubmit` hook fired. Mirrors the production contract: fired
     /// exactly once per `.outcome` call (immediately before the "submit"), never on a
     /// `.throwing` call (a fail-closed throw precedes any submit).
@@ -55,7 +55,7 @@ final class ScriptedBroadcaster: MigrationBroadcasting {
         useTor: Bool,
         onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome {
-        receivedCalls.append((endpoint: endpoint, useTor: useTor))
+        receivedCalls.append((rawTransaction: rawTransaction, endpoint: endpoint, useTor: useTor))
         onBroadcast?()
         switch script {
         case .outcome(let outcome):

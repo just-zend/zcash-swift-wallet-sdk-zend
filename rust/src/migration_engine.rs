@@ -30,7 +30,9 @@ use zcash_client_backend::data_api::wallet::{
 };
 use zcash_client_backend::data_api::{Account, InputSource, WalletRead};
 use zcash_client_sqlite::AccountUuid;
-use zcash_client_sqlite::pool_migration::orchard_ironwood::PoolMigrations;
+use zcash_client_sqlite::pool_migration::orchard_ironwood::{
+    Error as PoolMigrationStoreError, PoolMigrations,
+};
 use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_pool_migration::build::{AccountDerivation, sign_pczt};
@@ -107,6 +109,32 @@ impl<'a> Backend<'a> {
         self.store
             .latest_migration()
             .map_err(|e| anyhow!("migration store read failed: {e}"))
+    }
+
+    /// The store's atomic BROADCAST seam: finalize the `Proved` transaction `id`'s stored PCZT,
+    /// extract the transaction it authorizes, and record it in the WALLET's own tables — raw
+    /// bytes, sent outputs, hard input-spend marks, and the status-retrieval queue entry — in one
+    /// database transaction with handing it back. The wallet record therefore binds at the
+    /// broadcast ATTEMPT: a caller that obtains these bytes and dies mid-submit has already left
+    /// the record the drive's promotion sweep and the status queue rely on, and there is no way
+    /// to hold broadcastable bytes the wallet does not know about. Idempotent — every write it
+    /// makes upserts — so a retry re-serves the same transaction over the same record.
+    ///
+    /// Extraction re-verifies the proofs and signatures it assembles, so a stored artifact that
+    /// would not survive broadcast is refused here rather than recorded.
+    ///
+    /// The store's TYPED error crosses unwrapped, unlike this adapter's other methods: the
+    /// delivery lane routes a "cannot turn the stored artifact into servable bytes" failure onto
+    /// the platform's proving-unavailable channel and everything else onto its generic one, and
+    /// that split is only decidable from the variant (see
+    /// [`crate::migration::broadcast_seam_error`], the one caller and the only place the
+    /// distinction is made).
+    pub(crate) fn take_transaction_for_broadcast(
+        &mut self,
+        state: &MigrationState,
+        id: MigrationTransferId,
+    ) -> Result<zcash_primitives::transaction::Transaction, PoolMigrationStoreError> {
+        self.store.take_transaction_for_broadcast(state, id)
     }
 
     /// Cancel the account's pending migration through the store: releases every note reservation

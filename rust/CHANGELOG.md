@@ -33,7 +33,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     run answers `false`), `_has_ready_broadcast` (the sync-gate's work-pending predicate:
     `1`/`0`/`-1`, true iff a PROVED, due, unexpired, valid transaction is servable right now —
     `Signed` or awaiting-proof rows never gate sync), and `_pending_transfer_proposal`.
-    `_has_overdue_transfers`, `_has_ready_broadcast` and `_next_due_transfer` (below) take an
+    `_advance_step`, `_has_overdue_transfers` and `_has_ready_broadcast` take an
     `estimated_tip: i64` parameter (`-1` = disabled) evaluated under the upstream engine's
     `DuenessTargets` rule: the estimate may only ACCELERATE scheduled-height due-ness, expiry and
     boundary settledness stay on the SCANNED tip, and a broadcast whose expiry only the ESTIMATED
@@ -56,7 +56,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sessions bounded by a caller-supplied action budget, returning `FfiMigrationBatchSizes` (freed by
     `zcashlc_free_migration_batch_sizes`) — the per-session transaction COUNTS, summing to the input
     length, for the caller to re-slice its own ordered PCZT array by.
-  - Note split: `zcashlc_migration_prepare_note_split`, `_sign_note_split`.
+  - Note split: `zcashlc_migration_prepare_note_split`, `_sign_note_split`. The latter's
+    handback — the first note-split transaction, proved now and returned for immediate broadcast —
+    goes through the same atomic broadcast seam as the delivery executor, so its artifact is
+    likewise the finalized consensus transaction rather than a PCZT.
   - Proposal and commit: `zcashlc_migration_residual_after_migration`, `_propose_transfers`,
     `_sign_and_store_schedule`. Committing a plan is linear in the wallet's note count: the FFI's
     wallet adapter snapshots its spendable-note selection per call (the pattern librustzcash #2946
@@ -64,9 +67,27 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Proving: `zcashlc_migration_prove_pending` proves everything currently provable and returns the
     count proved (`-1` = error), skipping rather than failing on a row whose anchor is not yet
     scanned or retained. Call it from the sync path.
-  - Delivery: `zcashlc_migration_next_due_transfer` never proves, and its
-    `FfiPreparedTransfer.status` separates `MigrationNothingDue` from `MigrationAwaitingProof` and
-    `MigrationReady`; then `_extract_broadcast_tx`, `_record_transfer_result` (whose terminal
+  - Delivery: `zcashlc_migration_take_broadcast_transaction` serves the transaction the caller
+    NAMES — the instruction a prior `_advance_step` returned as its BROADCAST step. It never
+    proves and never cranks the engine: `advance_migration` is the top-level call and every
+    executor is subservient to it, so there is no broadcast to make without having first been
+    instructed to make it, and the re-spread, the satisfiability verification and the dueness
+    judgement all belong to that advance. Serving goes through the store's atomic broadcast seam
+    (`PoolMigrations::take_transaction_for_broadcast`), which finalizes and extracts the
+    transaction and records it in the wallet's own tables — raw bytes, sent outputs, input-spend
+    marks, status-queue entry — in the same database transaction that hands the bytes back, so the
+    wallet record binds at the broadcast attempt rather than after it. `FfiPreparedTransfer`'s
+    `pczt`/`pczt_len` therefore carry the FINALIZED CONSENSUS TRANSACTION bytes, submittable as-is
+    with no `_extract_broadcast_tx` step (which is unchanged and remains for callers holding a PCZT
+    of their own, including the `_store_signed_note_split_pczts` storage receipt). The seam's own
+    refusal of a row that is not `Proved` is the STALENESS GUARD — an instruction that went stale
+    between the advance and the serve fails here rather than being acted on, and the caller
+    discharges it by advancing again. `FfiPreparedTransfer` accordingly loses its `status` field
+    and `FfiPreparedTransferStatus` is gone: an executor either serves or errors, so there is no
+    "nothing due"/"awaiting proof" shape left to carry. WHETHER a missing proof is what blocks
+    delivery is now reported on the advance step itself — each `FfiProveTarget` row gains a
+    trailing `schedule_due` bool, true when the effective dueness target has already reached that
+    transaction's scheduled height. Then `_extract_broadcast_tx`, `_record_transfer_result` (whose terminal
     tags — 2 invalid, 3 expired — record `report_broadcast_failure` testimony stamped at the
     observed wallet tip; the next drive call adjudicates it through sqlite's satisfiability
     oracle, while unknown and already-mined rows remain no-ops), and
@@ -167,7 +188,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
   hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
   doomed-broadcast withhold (above).
-- Delivery- and prove-lane selection — `zcashlc_migration_next_due_transfer`,
+- Delivery- and prove-lane selection — `zcashlc_migration_advance_step`,
   `_has_ready_broadcast`, `_prove_pending`, and the `_has_overdue_transfers`/
   `_pending_transfer_proposal` queries built on them — now delegates to the pinned engine's own
   exported reads, `MigrationState::next_due_broadcast` and `next_provable`, instead of re-deriving
@@ -211,7 +232,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scanned. Shielded sent outputs stored by this call are also now tagged with
   their note commitment tree, as the transaction-builder spend path already did.
 - The migration prover's transient-vs-hard error classification (`ProveErrorClass::is_transient`,
-  behind `zcashlc_migration_prove_pending` / `_next_due_transfer`): `UnknownSpentNote` (a
+  behind `zcashlc_migration_prove_pending` / `_advance_step`): `UnknownSpentNote` (a
   late-mining dependency's note the wallet has not seen yet) and `Tree(ShardTreeError::Query(_))`
   (shard-tree query races during sync — this exact case crash-looped a prove batch on Android on
   2026-07-28) now correctly resolve as the transient "retry on a later sweep" outcome instead of a

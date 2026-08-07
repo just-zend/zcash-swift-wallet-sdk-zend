@@ -653,7 +653,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         }
 
         XCTAssertEqual(recorder.callCount, 0, "the guard must throw before the host is ever consulted")
-        XCTAssertFalse(welding.migrationNextDueTransferForEstimatedTipCalled, "the engine must never see a during-sync execution attempt")
+        XCTAssertFalse(welding.migrationAdvanceStepForEstimatedTipCalled, "the engine must never see a during-sync execution attempt")
     }
 
     /// Not-syncing companion: proves the guard does NOT trip outside the syncing case, and the call
@@ -696,7 +696,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
     func testExecuteNextPendingMigrationTransferForwardsWhenNotSyncing() async throws {
         struct StubNextDueTransferFailure: Error, Equatable {}
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationNextDueTransferForEstimatedTipThrowableError = StubNextDueTransferFailure()
+        welding.migrationAdvanceStepForEstimatedTipThrowableError = StubNextDueTransferFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
 

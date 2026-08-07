@@ -85,19 +85,37 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
 }
 
 /// One transaction of a ``MigrationAdvanceStep/prove(transactions:)`` batch: the transaction to
-/// prove, with the kind that routes it — a verbatim marshal of the upstream engine's
-/// `ProveTarget`. A preparation may prove and broadcast at the same wake-up; a transfer proves
-/// now and broadcasts in its own later session (see the type doc's discharge mapping).
+/// prove, with the kind that routes it, plus whether its broadcast window has already opened. A
+/// preparation may prove and broadcast at the same wake-up; a transfer proves now and broadcasts
+/// in its own later session (see the type doc's discharge mapping).
+///
+/// ``id`` and ``kind`` are a verbatim marshal of the upstream engine's `ProveTarget`;
+/// ``isScheduleDue`` is NOT an upstream field but the SDK's own reading of the row against the
+/// same dueness targets the advance that produced the batch judged with.
 public struct MigrationProveTarget: Equatable, Sendable {
     /// The engine's stable transaction id.
     public let id: UInt32
     /// The preparation/transfer distinction, with its payload.
     public let kind: MigrationTransactionStatus.Kind
+    /// Whether the schedule has already reached this transaction's broadcast window — i.e. whether
+    /// its missing proof is what stands between the run and a broadcast that could otherwise be
+    /// made right now.
+    ///
+    /// A transaction becomes provable long BEFORE it comes due — that head start is the whole
+    /// point of the prove/broadcast split — so most of a batch is ordinarily `false`, meaning
+    /// "proving is opportunistic work for the next sync wake-up". A `true` entry is what
+    /// `executeNextPendingMigrationTransfer` reports as
+    /// ``MigrationTransferAttempt/awaitingProof(id:)``: sweep, then advance again.
+    ///
+    /// Unlike ``id`` and ``kind`` this is not an upstream `ProveTarget` field but the SDK's
+    /// reading of the row against the same dueness targets the advance judged with.
+    public let isScheduleDue: Bool
 
     /// Creates a `MigrationProveTarget`.
-    public init(id: UInt32, kind: MigrationTransactionStatus.Kind) {
+    public init(id: UInt32, kind: MigrationTransactionStatus.Kind, isScheduleDue: Bool = false) {
         self.id = id
         self.kind = kind
+        self.isScheduleDue = isScheduleDue
     }
 }
 
@@ -762,8 +780,14 @@ public struct ImmediateMigrationProposal: Equatable {
     }
 }
 
-/// A fully proven, signed migration transaction persisted by the engine, ready for the platform
-/// to broadcast (see `ZcashRustBackendWelding.migrationExtractBroadcastTx(pczt:for:)`).
+/// A migration transaction handed to the platform.
+///
+/// WHAT ``pczt`` CARRIES depends on the producer: the delivery executor
+/// (`migrationTakeBroadcastTransaction(id:for:)`) and the note-split ceremony
+/// (`migrationSignNoteSplit`) both serve through the store's atomic broadcast seam, so theirs is
+/// the FINALIZED CONSENSUS TRANSACTION — submittable as-is. The storage receipt
+/// `migrationStoreSignedNoteSplitPczts` returns is a serialized PCZT, not submittable until run
+/// through `ZcashRustBackendWelding.migrationExtractBroadcastTx(pczt:for:)`.
 public struct PreparedMigrationTransfer: Equatable, Sendable {
     /// The transfer's engine-issued id.
     public let id: UInt32
@@ -772,7 +796,8 @@ public struct PreparedMigrationTransfer: Equatable, Sendable {
     /// value is a STORAGE RECEIPT (`migrationStoreSignedNoteSplitPczts`) whose transaction has not
     /// been proven yet — the broadcastable value is served by the delivery lane.
     public let txid: Data
-    /// The serialized, signed PCZT backing this transfer.
+    /// The artifact: a finalized consensus transaction or a serialized PCZT per the producer, as
+    /// the type doc above spells out. The property keeps its historical name.
     public let pczt: Data
 
     /// Creates a `PreparedMigrationTransfer`.
@@ -781,23 +806,6 @@ public struct PreparedMigrationTransfer: Equatable, Sendable {
         self.txid = txid
         self.pczt = pczt
     }
-}
-
-/// What the migration delivery lane has to offer right now.
-///
-/// The delivery lane never proves: proofs are produced opportunistically by
-/// `ZcashRustBackendWelding.migrationProvePending(for:)` while the wallet scans, so broadcasting is
-/// a pure delivery step. That makes "a transaction is due but its proof does not exist yet" a
-/// distinct outcome from "nothing is due" — the former is cleared by running the proving sweep.
-public enum DueMigrationTransfer: Equatable, Sendable {
-    /// Nothing is due: nothing scheduled yet, dependencies unmined, rows awaiting an external
-    /// signature, or everything already broadcast.
-    case nothingDue
-    /// A proven transaction, ready for the platform to broadcast.
-    case ready(PreparedMigrationTransfer)
-    /// The transaction identified by `id` is due but has not been proved yet. Run
-    /// `migrationProvePending(for:)` and ask again.
-    case awaitingProof(id: UInt32)
 }
 
 /// The platform's outcome of broadcasting (or attempting to broadcast) a prepared migration

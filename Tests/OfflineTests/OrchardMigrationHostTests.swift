@@ -84,19 +84,19 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         // (its next step, `syncGate.markBroadcastInFlight()`, is synchronous, so this fires at most
         // one actor-hop before B's `dedicatedTorClient()` cache check) -- a much tighter, and
         // therefore far less flaky, synchronization point than counting `Task.yield()`s from B's
-        // Task start, which has to cross B's own mocked `migrationNextDueTransfer` call first too.
+        // Task start, which has to cross B's own mocked advance/serve calls first too.
         let accountBReachedTheBroadcaster = expectation(description: "account B's actor reached the point just before calling the shared broadcaster")
         // A fresh mock per account keeps the two concurrent broadcast flows off a shared mutable mock.
         let perAccountFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { [testGeneralStorageDirectory, buffer, clock, accountB] accountUUID, broadcaster in
             let accountWelding = ZcashRustBackendWeldingMock()
-            accountWelding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+            accountWelding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .broadcast(id: prepared.id), next: nil)
             // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
             accountWelding.migrationTransactionStatusesForReturnValue = []
-            accountWelding.migrationExtractBroadcastTxPcztForClosure = { _, _ in
+            accountWelding.migrationTakeBroadcastTransactionIdForClosure = { _, _ in
                 if accountUUID == accountB {
                     accountBReachedTheBroadcaster.fulfill()
                 }
-                return Data([0x07])
+                return prepared
             }
             accountWelding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
             return OrchardMigration(
@@ -308,14 +308,14 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA)]
         welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
-        welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(PreparedMigrationTransfer(
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .broadcast(id: 0), next: nil)
+        welding.migrationTakeBroadcastTransactionIdForReturnValue = PreparedMigrationTransfer(
             id: 0,
             txid: Data(repeating: 0xAB, count: 32),
             pczt: Data([0x01, 0x02])
-        ))
+        )
         // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
         welding.migrationTransactionStatusesForReturnValue = []
-        welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
 
         // A tick far longer than the timeout, so only the broadcast (not a coincidental tick) can

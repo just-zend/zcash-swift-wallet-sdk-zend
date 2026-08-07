@@ -79,6 +79,13 @@ Discharging each step:
   session.
 - `.executed(MigrationTransferResult)` — a broadcast was attempted and its outcome recorded.
 
+Internally the call now OPENS WITH `migrationAdvanceStep`, which is the top-level engine call:
+the drive decides what may be broadcast (running the ZIP 318 overdue re-spread and the
+satisfiability oracle on the way) and the delivery step only discharges the `.broadcast(id:)`
+instruction it returns. `.awaitingProof(id:)` is the first `isScheduleDue` member of a `.prove`
+step's batch; any other step reads as `.nothingDue`, and the host reaches those through
+`migrationAdvanceStep(accountUUID:)` itself.
+
 The call is now strictly BROADCAST-ONLY: it never proves. Proving moved to the new
 `finalizeReadyMigrationTransfers(accountUUID:) async throws -> Int` sweep member, which proves every
 migration transaction whose anchor the wallet can resolve right now and returns how many were
@@ -249,8 +256,8 @@ the unreleased surface:
   the run; a stored non-terminal run resumes handle-free), and
   `storeSignedNoteSplitPCZT(accountUUID:_: Data)` is now
   `storeSignedNoteSplitPCZTs(accountUUID:_: [MigrationSignedTransferPczt])` (all-or-nothing; the
-  returned `PreparedMigrationTransfer` is a storage receipt with a zeroed `txid` — the
-  broadcastable value is served by the delivery lane). One signing ceremony still covers the whole
+  returned `PreparedMigrationTransfer` is a storage receipt whose `pczt` really is a PCZT and whose
+  `txid` is zeroed — the broadcastable value is served by the delivery lane). One signing ceremony still covers the whole
   migration together with `createUnsignedMigrationTransferPCZTs`.
 - **`MigrationState.complete` is PER-RUN.** It means "the stored run is fully mined", never
   "nothing left to migrate": ask `proposeMigrationTransfers` whether anything remains (an empty

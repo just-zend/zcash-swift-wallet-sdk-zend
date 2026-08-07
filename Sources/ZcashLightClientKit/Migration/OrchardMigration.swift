@@ -273,7 +273,17 @@ actor OrchardMigration {
     /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping, and
     /// ``MigrationAdvance`` / ``MigrationNextWork`` for the outlook's contract.
     func advanceStep() async throws -> MigrationAdvance? {
-        let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now())
+        try await advanceStep(useEstimatedTip: true)
+    }
+
+    /// ``advanceStep()`` with the wall-clock chain-tip estimate made optional, for the lanes that
+    /// choose whether to accelerate schedule due-ness (the estimate may only ever ACCELERATE it;
+    /// expiry stays scanned-tip, and an estimator failure degrades to scanned-tip behavior rather
+    /// than blocking the advance).
+    func advanceStep(useEstimatedTip: Bool) async throws -> MigrationAdvance? {
+        let estimatedTip = useEstimatedTip
+            ? await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now())
+            : nil
         return try await welding.migrationAdvanceStep(for: accountUUID, estimatedTip: estimatedTip)
     }
 
@@ -341,7 +351,8 @@ actor OrchardMigration {
     /// Signs, extracts, broadcasts, and records the note-split transaction, returning the broadcast
     /// outcome.
     ///
-    /// Composition: sign the split, extract the broadcast bytes, broadcast once, and — only on a
+    /// Composition: sign the split (which serves the first preparation back as a finalized
+    /// transaction through the store's broadcast seam), broadcast once, and — only on a
     /// success outcome — start the privacy buffer, *before* recording the mapped result: the gate
     /// marks on submit success, independent of record bookkeeping. A transport failure or a server
     /// rejection is *returned* as a ``MigrationTransferResult`` (and recorded first, gate untouched).
@@ -459,8 +470,9 @@ actor OrchardMigration {
     /// is always evaluated against the scanned tip — and an estimator failure degrades to the
     /// scanned-tip behavior rather than blocking the attempt.
     ///
-    /// Composition mirrors ``submitNoteSplit(proposal:usk:options:)``: fetch the next due transfer
-    /// (empty outcomes leave the gate untouched), extract, broadcast once, and — only on a
+    /// Composition mirrors ``submitNoteSplit(proposal:usk:options:)``: advance the drive, serve the
+    /// transaction it names for broadcast (empty outcomes leave the gate untouched), broadcast
+    /// once, and — only on a
     /// success outcome — start the privacy buffer, *before* recording the mapped result: the gate
     /// marks on submit success, independent of record bookkeeping. Transport/rejection outcomes are
     /// returned (recorded first, gate untouched). Pre-broadcast failures throw untouched; a record
@@ -471,7 +483,7 @@ actor OrchardMigration {
     ///
     /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
     /// (this method or ``submitNoteSplit(proposal:usk:options:)``) is in flight, this call first
-    /// waits for it to finish and only then fetches the next due transfer — so a concurrent call
+    /// waits for it to finish and only then advances the drive — so a concurrent call
     /// can never re-broadcast the in-flight transfer, and typically reports
     /// ``MigrationTransferAttempt/nothingDue`` once the in-flight flow has recorded. It never
     /// throws on contention.
@@ -489,19 +501,31 @@ actor OrchardMigration {
         useEstimatedTip: Bool
     ) async throws -> MigrationTransferAttempt {
         try await serializedBroadcastFlow { () async throws -> MigrationTransferAttempt in
-            // The estimate only ever accelerates due-ness; estimator failure degrades to nil
-            // (scanned-tip behavior) and never blocks the attempt.
-            let estimatedTip = useEstimatedTip ? await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now()) : nil
-            switch try await welding.migrationNextDueTransfer(for: accountUUID, estimatedTip: estimatedTip) {
-            case .nothingDue:
-                return .nothingDue
-            case .ready(let prepared):
+            // THE SESSION OPENS WITH THE ADVANCE. `migrationAdvanceStep` is the top-level call and
+            // this lane is subservient to it: the drive decides what (if anything) may be
+            // broadcast — running the ZIP 318 overdue re-spread and the store's satisfiability
+            // oracle on the way — and the executor below only discharges the instruction it
+            // returns.
+            let advance = try await advanceStep(useEstimatedTip: useEstimatedTip)
+            switch advance?.step {
+            case .broadcast(let id):
+                let prepared = try await welding.migrationTakeBroadcastTransaction(id: id, for: accountUUID)
                 return .executed(try await broadcastAndRecord(prepared: prepared, options: options))
-            case .awaitingProof(let id):
-                // Due, but the proving sweep has not produced its proof yet. Nothing to broadcast
-                // this window; `finalizeReadyTransfers()` at a sync wake-up clears it.
-                logger.debug("migration transfer \(id) is due but awaiting its proof; nothing broadcast")
-                return .awaitingProof(id: id)
+            case .prove(let transactions):
+                // Prove work, not delivery work — unless the schedule has already reached one of
+                // the batch's rows, in which case that row's missing proof is exactly what blocks
+                // this broadcast window. Say so, rather than reporting the indefinite "nothing
+                // due" that leaves a host polling an empty lane; `finalizeReadyTransfers()` at a
+                // sync wake-up clears it.
+                guard let due = transactions.first(where: \.isScheduleDue) else {
+                    return .nothingDue
+                }
+                logger.debug("migration transfer \(due.id) is due but awaiting its proof; nothing broadcast")
+                return .awaitingProof(id: due.id)
+            default:
+                // No stored run, or a step this lane cannot deliver (`waiting`, `rebuild`, the
+                // attention steps, `complete`). The host reaches those through `advanceStep()`.
+                return .nothingDue
             }
         }
     }
@@ -672,13 +696,13 @@ actor OrchardMigration {
     /// Runs `flow` as the only broadcast-performing flow on this actor.
     ///
     /// The actor's methods are reentrant: the broadcast composition suspends at the welding hops and
-    /// for the whole broadcast (a Tor bootstrap can take seconds), while the engine keeps reporting
-    /// the same transfer as next-due until its result is recorded — so without this guard, a
+    /// for the whole broadcast (a Tor bootstrap can take seconds), while the drive keeps naming the
+    /// same transfer for broadcast until its result is recorded — so without this guard, a
     /// concurrent `executeNextPendingTransfer`/`submitNoteSplit` could re-fetch and re-broadcast the
     /// same bytes mid-flight. The serialization contract:
     /// - A concurrent caller never throws on contention and is never dropped: it awaits the
     ///   in-flight flow's completion (success or failure), then runs its own flow fresh, so its own
-    ///   due-transfer fetch observes the recorded outcome (typically nil, or the next transfer).
+    ///   advance observes the recorded outcome (typically nothing due, or the next transfer).
     /// - Waiting is a suspension on a continuation that the finishing flow resumes exactly once —
     ///   no busy-waiting, and no unstructured tasks.
     /// - Cancelling a waiting caller never cancels the in-flight flow: the waiter holds no
@@ -702,8 +726,21 @@ actor OrchardMigration {
         return try await flow()
     }
 
-    /// Shared broadcast/record composition for a prepared transfer: extract the broadcast bytes,
-    /// broadcast once to the resolved endpoint, and classify the outcome. On a success outcome the
+    /// Whether `id` names a note-PREPARATION of this account's run — the D2 discriminator for
+    /// the privacy-buffer exemption ``broadcastAndRecord(prepared:options:)`` applies. One
+    /// statuses read per broadcast; a failed read degrades to `false` (the conservative TRANSFER
+    /// treatment: the buffer arms).
+    private func isPreparationTransaction(id: UInt32) async -> Bool {
+        let statuses = (try? await welding.migrationTransactionStatuses(for: accountUUID)) ?? []
+        return statuses.contains { status in
+            guard status.id == id else { return false }
+            if case .preparation = status.kind { return true }
+            return false
+        }
+    }
+
+    /// Shared broadcast/record composition for a prepared transfer: broadcast its already-finalized
+    /// bytes once to the resolved endpoint, and classify the outcome. On a success outcome the
     /// privacy buffer starts *before* the result is recorded — ``MigrationSyncGate/markBroadcast()``
     /// is a non-throwing local write, and a record failure after a real broadcast must never skip
     /// the buffer (TRANSFERS only — a preparation arms no buffer, D2, see the body); a record failure on that path throws
@@ -728,23 +765,15 @@ actor OrchardMigration {
     /// ``MigrationSyncGate/broadcastInFlightGuardDuration`` (120 s); while it lives, sync (and
     /// with it the reconciliation probe that must not observe a just-broadcast transfer) stays
     /// blocked.
-    /// Whether `id` names a note-PREPARATION of this account's run — the D2 discriminator for
-    /// the privacy-buffer exemption above. One statuses read per broadcast; a failed read
-    /// degrades to `false` (the conservative TRANSFER treatment: the buffer arms).
-    private func isPreparationTransaction(id: UInt32) async -> Bool {
-        let statuses = (try? await welding.migrationTransactionStatuses(for: accountUUID)) ?? []
-        return statuses.contains { status in
-            guard status.id == id else { return false }
-            if case .preparation = status.kind { return true }
-            return false
-        }
-    }
-
     private func broadcastAndRecord(
         prepared: PreparedMigrationTransfer,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
-        let rawTransaction = try await welding.migrationExtractBroadcastTx(pczt: prepared.pczt, for: accountUUID)
+        // Both producers that reach here — the delivery executor and the note-split ceremony —
+        // serve through the store's atomic broadcast seam, so `prepared.pczt` is ALREADY the
+        // finalized consensus transaction. There is no extract step: the wallet's own record of
+        // this transaction was written in the same database transaction that produced these bytes.
+        let rawTransaction = prepared.pczt
 
         // Arm the in-flight marker before the submit can reach the network (belt); the
         // broadcaster's onWillSubmit hook re-arms it at the last pre-submit instant so the 120 s

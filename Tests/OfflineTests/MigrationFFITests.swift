@@ -117,9 +117,17 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertTrue(statuses.isEmpty)
     }
 
-    func testFreshWalletHasNoNextDueTransfer() async throws {
-        let nextDue = try await rustBackend.migrationNextDueTransfer(for: account, estimatedTip: nil)
-        XCTAssertEqual(nextDue, .nothingDue)
+    /// The delivery executor has no benign empty answer: on a wallet with no stored run there is
+    /// no instruction to discharge, so naming a transaction is a caller error and throws rather
+    /// than reporting "nothing due". A host learns there is nothing to broadcast from
+    /// `migrationAdvanceStep`, never from this call.
+    func testFreshWalletTakeBroadcastTransactionThrows() async throws {
+        do {
+            _ = try await rustBackend.migrationTakeBroadcastTransaction(id: 0, for: account)
+            XCTFail("a wallet with no stored run has no transaction to serve")
+        } catch let error as ZcashError {
+            XCTAssertEqual(error.code.rawValue, "ZRUST0111")
+        }
     }
 
     /// The proving sweep is safe to run against a wallet with no migration run at all: there is
@@ -445,13 +453,6 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertEqual(first, second)
     }
 
-    func testMigrationNextDueTransferNothingDueIsStableAcrossRepeatedCalls() async throws {
-        let first = try await rustBackend.migrationNextDueTransfer(for: account, estimatedTip: nil)
-        let second = try await rustBackend.migrationNextDueTransfer(for: account, estimatedTip: nil)
-        XCTAssertEqual(first, .nothingDue)
-        XCTAssertEqual(first, second)
-    }
-
     /// The sweep is idempotent on a wallet with nothing to prove: no accumulating side effect, so
     /// a host may call it on every scan pass.
     func testMigrationProvePendingIsStableAcrossRepeatedCalls() async throws {
@@ -772,21 +773,22 @@ final class MigrationFFITests: XCTestCase {
     /// like the other id-bearing steps.
     func testAdvanceStepDecodeMapsEveryStepIncludingAttend() throws {
         let prove = makeProveAdvanceStep([
-            FfiProveTarget(id: 4, kind_is_preparation: false, kind_layer: 0, kind_index: 0, kind_crossing: 2)
+            FfiProveTarget(id: 4, kind_is_preparation: false, kind_layer: 0, kind_index: 0, kind_crossing: 2, schedule_due: false)
         ])
         defer { freeProveAdvanceStep(prove) }
         XCTAssertEqual(
             prove.unsafeToMigrationAdvance()?.step,
-            .prove(transactions: [MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))])
+            .prove(transactions: [MigrationProveTarget(id: 4, kind: .transfer(crossing: 2), isScheduleDue: false)])
         )
 
         let provePreparation = makeProveAdvanceStep([
-            FfiProveTarget(id: 5, kind_is_preparation: true, kind_layer: 1, kind_index: 3, kind_crossing: 0)
+            FfiProveTarget(id: 5, kind_is_preparation: true, kind_layer: 1, kind_index: 3, kind_crossing: 0, schedule_due: true)
         ])
         defer { freeProveAdvanceStep(provePreparation) }
         XCTAssertEqual(
             provePreparation.unsafeToMigrationAdvance()?.step,
-            .prove(transactions: [MigrationProveTarget(id: 5, kind: .preparation(layer: 1, index: 3))])
+            .prove(transactions: [MigrationProveTarget(id: 5, kind: .preparation(layer: 1, index: 3), isScheduleDue: true)]),
+            "the schedule_due flag must cross the marshal per row, not be defaulted away"
         )
 
         let broadcast = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_BROADCAST), id: 6)
@@ -819,17 +821,17 @@ final class MigrationFFITests: XCTestCase {
     /// case.
     func testAdvanceStepDecodeMapsAMultiEntryProveBatchAndRejectsAnEmptyOne() throws {
         let prove = makeProveAdvanceStep([
-            FfiProveTarget(id: 5, kind_is_preparation: true, kind_layer: 1, kind_index: 3, kind_crossing: 0),
-            FfiProveTarget(id: 4, kind_is_preparation: false, kind_layer: 0, kind_index: 0, kind_crossing: 2)
+            FfiProveTarget(id: 5, kind_is_preparation: true, kind_layer: 1, kind_index: 3, kind_crossing: 0, schedule_due: true),
+            FfiProveTarget(id: 4, kind_is_preparation: false, kind_layer: 0, kind_index: 0, kind_crossing: 2, schedule_due: false)
         ])
         defer { freeProveAdvanceStep(prove) }
         XCTAssertEqual(
             prove.unsafeToMigrationAdvance()?.step,
             .prove(transactions: [
-                MigrationProveTarget(id: 5, kind: .preparation(layer: 1, index: 3)),
-                MigrationProveTarget(id: 4, kind: .transfer(crossing: 2))
+                MigrationProveTarget(id: 5, kind: .preparation(layer: 1, index: 3), isScheduleDue: true),
+                MigrationProveTarget(id: 4, kind: .transfer(crossing: 2), isScheduleDue: false)
             ]),
-            "entries must marshal in array order, each keeping its own id and kind"
+            "entries must marshal in array order, each keeping its own id, kind and dueness"
         )
 
         let empty = makeProveAdvanceStep([])
@@ -967,8 +969,8 @@ final class MigrationFFITests: XCTestCase {
 
     /// Constructs a real `OrchardMigration` via the injecting initializer, wired to the SAME
     /// real-FFI-backed welding as the rest of this file (not a mock) plus a real, temp-file-backed
-    /// `MigrationSyncGate`. On this fresh wallet `migrationNextDueTransfer` legitimately reports
-    /// nothing due, so `executeNextPendingTransfer` must short-circuit to `.nothingDue` before ever
+    /// `MigrationSyncGate`. On this fresh wallet the drive legitimately has no run to advance,
+    /// so `executeNextPendingTransfer` must short-circuit to `.nothingDue` before ever
     /// reaching the broadcaster -- proven here with a fake that fails the assertion (via a non-zero
     /// call count) rather than the test itself if that contract regresses. `pendingTransferProposal`
     /// (the renamed `rescheduleOverdueTransfer`) likewise resolves `nil` (no active run), exercising

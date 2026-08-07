@@ -171,7 +171,7 @@ Changes are relative to `2.8.0-rc.3`.
   `MigrationRunEstimate` (with `MigrationRunEstimate.Run`), `MigrationSyncWakeup`,
   `MigrationPreparationStep`, `MigrationSigningBudget`, `NoteSplitProposal`,
   `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`,
-  `MigrationTransactionStatus`, `DueMigrationTransfer`, `KeystoneBatchDecodeResult`, and
+  `MigrationTransactionStatus`, `KeystoneBatchDecodeResult`, and
   `KeystoneFirmwareVersion`. Migration transaction ids are `UInt32`.
 - State: `migrationAdvanceStep(accountUUID:)` drives the migration engine's public
   `advance_migration` decision at the scanned chain tip — `nil` when no run is stored, otherwise a
@@ -190,7 +190,10 @@ Changes are relative to `2.8.0-rc.3`.
   carries the WHOLE provable set (`[MigrationProveTarget]`, earliest-ready first, never empty;
   librustzcash #2939: proving emits nothing on-chain, so a synced session proves everything
   provable at once while broadcast stays one-at-a-time on the privacy schedule) — discharge the
-  batch with `finalizeReadyMigrationTransfers(accountUUID:)`.
+  batch with `finalizeReadyMigrationTransfers(accountUUID:)`. Each `MigrationProveTarget` carries
+  `isScheduleDue`: `true` means the schedule has already reached that transaction's broadcast
+  window, so its missing proof is what blocks delivery right now, rather than the opportunistic
+  proving a batch ordinarily represents.
 - Planning and delivery: a randomized-cadence schedule proposal committed by
   `signAndStoreMigrationSchedule`, proved opportunistically during sync by the new
   `finalizeReadyMigrationTransfers(accountUUID:)`, then delivered by
@@ -199,7 +202,12 @@ Changes are relative to `2.8.0-rc.3`.
   `finalizeReadyMigrationTransfers` and retry in a later session), or
   `.executed(MigrationTransferResult)`. A submit rejection identifying the transaction as already
   known is recorded as success, so a retried broadcast whose first attempt landed completes the
-  transfer.
+  transfer. That call OPENS WITH `migrationAdvanceStep`: the engine decides what (if anything) may
+  be broadcast — running the ZIP 318 overdue re-spread and the satisfiability oracle on the way —
+  and the delivery step only discharges the instruction it returns. `.awaitingProof(id:)` is the
+  first `isScheduleDue` member of a `.prove` batch; anything the lane cannot deliver reads as
+  `.nothingDue`, and the host reaches those steps through `migrationAdvanceStep(accountUUID:)`
+  itself.
 - New: `migrationSyncWakeups(accountUUID:)` — the stored run's minimal sync/proving wake-up
   schedule (heights at which to wake, sync, and call `finalizeReadyMigrationTransfers`, plus the
   transfer ids each wake-up covers) — and `estimatedMigrationChainTip()` /
@@ -226,6 +234,10 @@ Changes are relative to `2.8.0-rc.3`.
   `rescheduleOverdueMigrationTransfer`) returns the engine's next height-due pending transfer
   proposal untouched, for a host that wants to re-arm its own background execution window without
   parsing a signed PCZT.
+- Note split: `submitNoteSplit(accountUUID:proposal:usk:options:)` signs the run, serves the first
+  note-split transaction back through the same atomic broadcast seam the delivery step uses, and
+  submits it — so what it broadcasts is a finalized consensus transaction whose wallet-side record
+  was written in the database transaction that produced it, with no extract step in between.
 - External signer: `createUnsignedNoteSplitPCZTs` / `storeSignedNoteSplitPCZTs` and
   `createUnsignedMigrationTransferPCZTs` / `storeSignedMigrationSchedulePCZTs`. All are plural: a run
   has N preparation transactions, and one signing ceremony covers them together.

@@ -612,7 +612,11 @@ public protocol Synchronizer: AnyObject {
     ///
     /// `nil` means NO run is stored (none was ever committed) — nothing to advance, nothing to
     /// poll. A non-`nil` answer is a ``MigrationAdvance``: `.step` is the step to perform NOW
-    /// (evaluated on the SCANNED tip only — the estimated tip never enters this decision — with the
+    /// (judged under the engine's `DuenessTargets` rule — the wall-clock chain-tip estimate, which
+    /// this member always projects and passes, may only ACCELERATE scheduled-height due-ness,
+    /// while expiry, boundary settledness and every destructive determination evaluate on the
+    /// SCANNED tip, and an estimator failure degrades to scanned-tip behavior rather than failing
+    /// the call — with the
     /// engine's attend > broadcast > prove > rebuild priority, and memoryless about sessions: it
     /// reports what the run needs next, while session policy — one broadcast per session, no sync
     /// in a broadcast session — stays with the caller and the sync gate); `.next` is the advisory
