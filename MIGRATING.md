@@ -11,7 +11,7 @@ see "`migrationAdvanceStep` returns `MigrationAdvance`" below). The broadcast-fi
 prove step's kind are native to the pinned librustzcash revision (upstream PR #2871); its
 `Reevaluate` and `Replan` results project onto the existing `.requiresAttention(id:)` case.
 `nil` means no run is stored at all (nothing was ever committed for the account); a stored run's
-`.step` answers `.requiresAttention(id:)`, `.prove(transactions:)`, `.broadcast(id:)`,
+`.step` answers `.requiresAttention(id:)`, `.prove(transactions:)`, `.broadcast(_:)`,
 `.rebuild(id:)`, `.waiting`, or the terminal `.complete` — priority order attend > broadcast >
 prove > rebuild, and a cancelled run also reports `.complete` rather than ever being driven
 further.
@@ -335,7 +335,7 @@ user-driven, or the migration is terminal).
 let step = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
 switch step {
 case .prove(let transactions): ...
-case .broadcast(let id): ...
+case .broadcast(let instruction): ...
 ...
 }
 
@@ -343,7 +343,7 @@ case .broadcast(let id): ...
 let advance = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
 switch advance?.step {
 case .prove(let transactions): ...
-case .broadcast(let id): ...
+case .broadcast(let instruction): ...
 ...
 }
 // `advance?.next`, when present, says what session to plan for once `.step` is executed -- a
@@ -357,8 +357,8 @@ over `advance?.step` directly, as above); the outlook is additive and safe to ig
 ## The pool-migration surface rides the final engine
 
 The Orchard→Ironwood migration group (never in a released SDK) is rewired onto the final engine
-crates (`zcash_pool_migration_backend` + `zcash_pool_migration_sqlite`). For integrators tracking
-the unreleased surface:
+crates (`zcash_pool_migration` and `zcash_client_sqlite`'s pool-migration store). For integrators
+tracking the unreleased surface:
 
 - **The external-signer note-split pair went plural.** The engine builds N preparation
   transactions, not one split transaction, so
@@ -476,7 +476,7 @@ behavior (`SDKSynchronizer` does):
   preview for the multi-round migration UI: how many migration RUNS ("rounds") migrating the whole
   spendable Orchard balance takes, per run both what it migrates and what preparing it costs, and
   the final residual that never migrates. External-signer session counts are a query on the result
-  (`totalSigningSessions(maxTransactionsPerSession:)`), not a parameter. The zero-run estimate is a
+  (`totalActions`/`totalKeystoneSigningSessions`), not a parameter. The zero-run estimate is a
   legitimate answer, not an error.
 ## `WalletInitMode` removed — `prepare()` derives the init flow
 
@@ -562,8 +562,7 @@ Closure/Combine wrapper synchronizers do not mirror these four members.
 code `rustMigrationDebugRescheduleTransfers` (ZRUST0139) are gone before ever shipping in a release.
 Its purpose — rewriting a committed migration schedule's transfer heights so real broadcast delivery
 could be exercised without waiting out ZIP 318's privacy delay — is superseded on the engine side by
-compressed test-network scheduling at commit time plus the opt-in spacing floors. There is no
-replacement; drop the call.
+compressed test-network scheduling at commit time. There is no replacement; drop the call.
 
 ## Custom (regtest-style) networks and `NetworkType.regtest`
 

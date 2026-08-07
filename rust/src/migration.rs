@@ -2502,8 +2502,8 @@ fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
 /// # Invariant: this is the CONDUIT's crank, and nothing else's
 ///
 /// [`zcashlc_migration_advance_step`] is its only caller, and must stay so. Per the design ruling
-/// (kris, 2026-08-07): "`advance_migration` is the top-level call, and every invocation is
-/// subservient to it"; "there is no invocation to prove without *first* having called
+/// (kris, 2026-08-06): "`advance_migration` is intended to be the top-level call, and every
+/// invocation is subservient to it"; "there is no invocation to prove without *first* having called
 /// `advance_migration` — which gives the caller the instruction of what must be proved"; and
 /// "`advance_migration` should never be used for an internal call of a more specialized
 /// operation."

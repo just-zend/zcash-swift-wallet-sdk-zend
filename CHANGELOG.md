@@ -28,32 +28,27 @@ Changes are relative to `2.8.0-rc.3`.
   build load unchanged: the buffer field is read and ignored, and an in-flight marker beside it
   still counts.
 
-- The librustzcash family rides an interim git pin (the michal/pool-migration-public-next-due
-  branch head, rebased onto librustzcash main) so a wallet's own scheduled migration transactions
-  carry their ZIP 318 classification (`Overview.zip318Kind`) from the moment they are STORED at
-  proving time, instead of only after they mine and are scanned. This is what lets a wallet
-  present its stored-but-unmined migration transactions as labeled in-flight activity. The rev
-  also carries librustzcash #2907 — the engine's advance-path selection (prove/broadcast steps)
-  picks transfers by scheduled height instead of internal id — librustzcash #2910: a broadcast
-  schedule whose slots were missed (for example when the app was closed past several scheduled
-  sends) is re-spread on resume instead of coming due all at once — librustzcash #2927: the step
-  that re-spread releases lands on scanned chain data (and the re-spread fires only when more of
-  the schedule is due behind it), so a wallet driven in short foreground sessions can actually
-  prove and broadcast the released step instead of livelocking with its schedule re-pinned past
-  the scan on every open — librustzcash #2936: `advance_migration` returns the verified step
-  together with a next-wake outlook; this FFI marshals both (the outlook surfaces on the Swift
-  side as `MigrationAdvance.next` — see the `migrationAdvanceStep` bullet under Added) — and the engine's
-  note-locking generation: a proved migration transaction's spent notes are reserved in the
-  wallet database, so an ordinary payment proposed mid-migration can no longer spend a note a
-  stored, proved transfer is already committed to. It also carries `MigrationState`'s public
-  read-only next-due selection (`next_due_broadcast`/`next_provable`): the engine's own
-  delivery-lane choice, now exposed for a caller to read directly instead of recomputing it
-  client-side — pinned so this SDK's FFI can delegate to it instead of reimplementing the
-  selection. (This branch replaces that delivery-lane selection with the engine's exported reads,
-  so the drive and read lanes now agree by construction.) The compressed-schedule spacing floors
-  (`AdvanceConfig::with_compressed_schedule_floors`) left the pinned lineage, and this SDK no
-  longer derives or passes them. The pin reverts to published crates at the first rc containing
-  all of it.
+- The librustzcash family rides an interim git pin — the `kris/tmp-respread-plus-adapter-2` branch
+  head (rev `fa3e1de5`), librustzcash main merged with two PRs this SDK consumes together:
+  librustzcash #2927, the scanned-chain-tip overdue re-spread (the released overdue step lands on
+  scanned chain data, and the re-spread fires only when more of the schedule is due behind it, so a
+  wallet driven in short foreground sessions can actually prove and broadcast the released step
+  instead of livelocking with its schedule re-pinned past the scan on every open), and #2951, the
+  adapter and planned-transaction-graph work: `wallet::WalletMigration` takes the account's viewing
+  key as a constructor parameter and holds no spend authority (the engine's two signing entry
+  points take an `orchard::keys::SpendingKey` per call, deriving its full viewing key and checking
+  it against the account's before building anything — a foreign key is refused eagerly, as
+  `CommitError::WrongSpendAuthority` / `RebuildError::WrongSpendAuthority`, rather than silently
+  signing nothing), and `MigrationPlan::planned_transactions` publishes the run's execution shape —
+  each row's `depends_on` and `scheduled_height` — as the same enumeration the commit builds from,
+  retiring this SDK's own fork of the adapter and its re-derivation of the plan preview. The pin
+  deliberately EXCLUDES #2938's read-only next-due selectors (`next_due_broadcast`/
+  `next_provable`): every SDK lane instead drives through the engine's public `advance_migration`
+  (the verified step plus its advisory outlook) and takes its read-only views from
+  `MigrationState::transaction_statuses`, rather than delegating to those selectors. The
+  compressed-schedule spacing floors (`AdvanceConfig::with_compressed_schedule_floors`) left the
+  pinned lineage, and this SDK no longer derives or passes them. The pin reverts to published
+  crates at the first rc containing both #2927 and #2951.
 - Restarting a migration (`restartCurrentMigrationStep`) now cancels the stored run through the
   engine's own cancel: the run is recorded with the terminal `Cancelled` status (previously
   `Failed`, which left a deliberate abandonment indistinguishable from a broken run) and every
@@ -179,7 +174,7 @@ Changes are relative to `2.8.0-rc.3`.
 
 ### Orchard → Ironwood migration
 
-- A 39-member migration group on the `Synchronizer` protocol, account-scoped by `AccountUUID`. Two
+- A 35-member migration group on the `Synchronizer` protocol, account-scoped by `AccountUUID`. Two
   accounts (for example one software and one hardware-wallet account) can migrate concurrently. Its
   members work without `prepare()`, so a background session can deliver a transfer without starting
   sync, and on custom networks without a prior `Initializer`. `ClosureSynchronizer` and

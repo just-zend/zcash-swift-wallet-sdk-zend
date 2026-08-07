@@ -8,7 +8,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Pool-migration (Orchard→Ironwood) FFI: 24 `zcashlc_migration_*` entry points with their
+- Pool-migration (Orchard→Ironwood) FFI: 32 `zcashlc_migration_*` entry points with their
   `#[repr(C)]` return types and `zcashlc_free_migration_*` destructors, plus
   `zcashlc_ironwood_activation_height`. Each call takes the wallet-db path, a 16-byte account uuid
   and a network id, opens the wallet database and the account-keyed migration store, and reports
@@ -284,8 +284,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrote raw SQL directly against the engine-owned pool-migration tables, retro-compressing a
   committed schedule so its transfers become due in quick succession for manual broadcast testing.
   That testing purpose is now covered on the engine side by compressed test-network scheduling at
-  commit time plus the opt-in spacing floors (`_advance_step`'s
-  `overdue_tolerance_floor`/`release_spacing_floor` params, above).
+  commit time.
 - `zcashlc_migration_pending_transfer_proposal` is removed, together with the standalone
   `zcashlc_free_migration_transfer_proposal` destructor that freed its answer. It was a
   KIND-FILTERED peek at the queue ("the next TRANSFER, specifically"), which the advance design
