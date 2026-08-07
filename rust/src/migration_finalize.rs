@@ -3,8 +3,8 @@
 //! The engine (`zcash_pool_migration`) commits every migration transaction fully built and
 //! signed, with its Orchard spend witnesses and anchors left unset — the durable artifact in
 //! `MigrationTransaction::pczt()` never changes after commit. A transaction's anchor becomes
-//! resolvable long before its broadcast schedule arrives, and upstream separates the two selectors
-//! (`next_provable` / `next_broadcastable`) precisely so proving can happen in that window:
+//! resolvable long before its broadcast schedule arrives, and upstream separates the two actions
+//! (`NextAction::Prove` / `NextAction::Broadcast`) precisely so proving can happen in that window:
 //! `crate::migration`'s sweep proves opportunistically as the wallet scans, and the delivery lane
 //! only ever broadcasts what is already proved. This module is the proving step itself, routing
 //! each transaction through the UPSTREAM prover: [`prove_due_transaction`] dispatches on the

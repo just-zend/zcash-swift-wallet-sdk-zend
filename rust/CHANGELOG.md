@@ -30,9 +30,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a verbatim mirror of upstream `state::StepKind`), `_progress`,
     `_is_note_split_needed`, `_has_overdue_transfers`, `_has_invalid_transfers` (true iff the
     NON-terminal stored run holds an engine-`Invalid` or expired-unmined transaction; a cancelled
-    run answers `false`), `_has_ready_broadcast` (the sync-gate's work-pending predicate:
-    `1`/`0`/`-1`, true iff a PROVED, due, unexpired, valid transaction is servable right now —
-    `Signed` or awaiting-proof rows never gate sync), and `_pending_transfer_proposal`.
+    run answers `false`), `_has_ready_broadcast` (`1`/`0`/`-1`, true iff some transaction is
+    reported `ready` with next action `Broadcast` by the engine's public status view — a PROVED,
+    due, dependency-mined, unexpired, unmarked row; `Signed` or awaiting-proof rows never qualify.
+    ADVISORY: it agrees with the engine's broadcast queue by construction, but performs no
+    store-oracle verification of its own, so it says a broadcast session is warranted, NOT that
+    the next `_advance_step` will issue a BROADCAST instruction), and `_pending_transfer_proposal`.
     `_advance_step`, `_has_overdue_transfers` and `_has_ready_broadcast` take an
     `estimated_tip: i64` parameter (`-1` = disabled) evaluated under the upstream engine's
     `DuenessTargets` rule: the estimate may only ACCELERATE scheduled-height due-ness, expiry and
@@ -195,14 +198,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
   hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
   doomed-broadcast withhold (above).
-- Delivery- and prove-lane selection — `zcashlc_migration_advance_step`,
-  `_has_ready_broadcast`, `_prove_pending`, and the `_has_overdue_transfers`/
-  `_pending_transfer_proposal` queries built on them — now delegates to the pinned engine's own
-  exported reads, `MigrationState::next_due_broadcast` and `next_provable`, instead of re-deriving
-  an ordering over `transaction_statuses`; the SDK-side hand-rolled twin of that ordering is gone.
-  The plan-preview numbering (`preparation_steps_from_plan`) likewise takes its ids, `layer`, and
-  `index` straight from the engine's own `MigrationPlan::planned_transactions` enumeration, so a
-  previewed id already equals the id the committed transaction will carry.
+- Which transaction each lane acts on is the engine's decision, not an SDK re-derivation, and it
+  is made ONCE: `zcashlc_migration_advance_step` cranks `advance_migration`, and the two EXECUTORS
+  — `_take_broadcast_transaction` and `_prove_transactions` — discharge the instruction it
+  returned (see their entries above), so what they act on was verified against the store's
+  satisfiability oracle before it was handed out. The READ-ONLY reporting queries —
+  `_has_ready_broadcast`, `_has_overdue_transfers`, `_pending_transfer_proposal` — cannot drive,
+  and read the engine's public per-row status view instead; the SDK's hand-rolled twins of
+  upstream's readiness predicates are gone, leaving only the `(scheduled_height, id)` ordering key
+  those display reads compose over the view. The note-split ceremony's immediate-broadcast pick
+  reads the same view, so a resumed ceremony re-serves an already-proved, due preparation rather
+  than proving another. The plan-preview numbering (`preparation_steps_from_plan`) likewise takes
+  its ids, `layer`, and `index` straight from the engine's own
+  `MigrationPlan::planned_transactions` enumeration, so a previewed id already equals the id the
+  committed transaction will carry.
 - Mined-transaction promotion is the upstream engine's: `advance_migration` sweeps every in-flight
   transaction and promotes the ones the wallet's scan has seen mine, so the drive path no longer
   reconciles first, and the read-only entry points reconcile through the engine's own
@@ -239,7 +248,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scanned. Shielded sent outputs stored by this call are also now tagged with
   their note commitment tree, as the transaction-builder spend path already did.
 - The migration prover's transient-vs-hard error classification (`ProveErrorClass::is_transient`,
-  behind `zcashlc_migration_prove_pending` / `_advance_step`): `UnknownSpentNote` (a
+  behind `zcashlc_migration_prove_transactions` / `_advance_step`): `UnknownSpentNote` (a
   late-mining dependency's note the wallet has not seen yet) and `Tree(ShardTreeError::Query(_))`
   (shard-tree query races during sync — this exact case crash-looped a prove batch on Android on
   2026-07-28) now correctly resolve as the transient "retry on a later sweep" outcome instead of a
@@ -254,8 +263,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Due-ness and expiry are evaluated on the engine's target-height contract (`chain tip + 1`) in every
   read path, with the "never expires" case honoured. Transfers now become due and expire one block
   earlier, consistently, and a doomed transfer is no longer served for broadcast. This now includes
-  the `zcashlc_migration_prove_pending` sweep — the one remaining raw-tip caller — so a preparation
-  scheduled exactly at the target is proved on the sweep that sees it rather than one block late.
+  the proving sweep — the one remaining raw-tip caller — so a preparation scheduled exactly at the
+  target is offered for proving on the advance that sees it rather than one block late.
 - An `estimated_tip` at or beyond `u32::MAX` saturates below the height ceiling instead of
   overflowing the `+ 1` target conversion.
 - `FfiMigrationProgress.next_transfer_ready_at_height` reports the next transfer still awaiting

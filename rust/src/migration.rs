@@ -210,11 +210,11 @@ unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
 }
 
 /// The engine's target height for a given chain tip: `tip + 1`, the height of the next block.
-/// Every [`MigrationState`] query (`next_provable`, `next_broadcastable`, `expired_transactions`)
-/// is defined over this height, never the raw tip — see [`CallCtx::target`], the primary way
-/// callers reach this from a live wallet handle. Exposed as a pure function too for the callers
-/// (like the estimated-tip due-ness split) that already hold a `tip` value rather than a
-/// [`CallCtx`].
+/// Every [`MigrationState`] query (`transaction_statuses`, `expired_transactions`, and the
+/// drive's own `advance_migration`) is defined over this height, never the raw tip — see
+/// [`CallCtx::target`], the primary way callers reach this from a live wallet handle. Exposed as
+/// a pure function too for the callers (like the estimated-tip due-ness split) that already hold
+/// a `tip` value rather than a [`CallCtx`].
 fn target_from_tip(tip: BlockHeight) -> BlockHeight {
     BlockHeight::from(u32::from(tip) + 1)
 }
@@ -377,8 +377,9 @@ impl CallCtx {
     /// mined only in a block at or below its expiry (ZIP 203), so it first becomes un-mineable in
     /// the NEXT block once the tip reaches its expiry height, and a scheduled transaction first
     /// becomes due once the NEXT block reaches its scheduled height. Every call that feeds a
-    /// [`MigrationState`] query (`next_provable`, `next_broadcastable`, `expired_transactions`,
-    /// `commit_preparation`, `build_preparation_unsigned`) must use this, never `tip()` directly.
+    /// [`MigrationState`] query (`transaction_statuses`, `expired_transactions`,
+    /// `commit_preparation`, `build_preparation_unsigned`, and the drive's own
+    /// `advance_migration`) must use this, never `tip()` directly.
     /// SDK-owned, tip-based policy (the immediate lane's fallback expiry bound, display-only "now"
     /// references) keeps using `tip()`.
     fn target(&self) -> anyhow::Result<BlockHeight> {
@@ -1341,20 +1342,24 @@ fn prove_named_rows(
 // converts the FFI's `estimated_tip: i64` into the estimated-target side of
 // [`DuenessTargets::new`] — see [`dueness_targets`].
 //
-// WHICH ROW is next is upstream's call too, not just the heights it is judged against, and it is
-// the CONDUIT's alone to ask: [`zcashlc_migration_advance_step`] cranks [`drive_advance`] and the
-// two executors — [`zcashlc_migration_take_broadcast_transaction`] and
+// WHICH ROW is next is upstream's call too, not just the heights it is judged against, and among
+// the ACTION lanes it is the CONDUIT's alone to ask: [`zcashlc_migration_advance_step`] cranks
+// [`drive_advance`], and the two executors — [`zcashlc_migration_take_broadcast_transaction`] and
 // [`zcashlc_migration_prove_transactions`] — discharge the instruction it returned without asking
 // again (a due broadcast outranks proving exactly as the engine documents, and that precedence is
-// therefore decided once, in the advance). The REPORTING queries alone still delegate to the
-// exported pure reads — [`MigrationState::next_due_broadcast`] / [`MigrationState::next_provable`],
-// used by [`zcashlc_migration_has_ready_broadcast`] and [`due_assuming_proving`] — so this module
-// no longer re-derives an ordering over `transaction_statuses`, and a display read cannot drift
-// from the drive's own `(scheduled_height, id)` / `(anchor_boundary | scheduled_height, id)`-min,
-// though (being unverified) it can still disagree with what the drive would actually serve. The
-// one thing still composed HERE, over that public API, is the virtual-prove scratch clone
-// [`due_assuming_proving`] drives to answer "what would be due once every outstanding proof
-// existed" without a prover or a persisted write.
+// therefore decided once, in the advance). The READ-ONLY REPORTING queries —
+// [`zcashlc_migration_has_ready_broadcast`] and [`due_assuming_proving`], the latter behind
+// [`zcashlc_migration_has_overdue_transfers`] and
+// [`zcashlc_migration_pending_transfer_proposal`] — cannot drive anything (they open read-only
+// connections and must not mutate), so they read the engine's public PER-ROW status view,
+// `MigrationState::transaction_statuses`. That view agrees with the kernel's queues by
+// construction: `ready && action == Broadcast` holds exactly when `advance_migration` would offer
+// the broadcast, and the doomed-broadcast withhold is rendered as neither ready nor actionable.
+// What those queries do compose here is the ORDER among several actionable rows — the
+// `(scheduled_height, id)`-min re-derived in [`due_assuming_proving`] — which is the module's one
+// accepted drift risk (recorded on librustzcash #2938, 2026-08-06); and being unverified, a
+// display read can still disagree with what the drive, having consulted the store's oracle, would
+// actually serve.
 
 /// The estimated TARGET height (`estimated tip + 1`) for an FFI-supplied `estimated_tip`
 /// (`-1`, or any negative, = no estimate) — the `estimated_target` input of
@@ -1384,30 +1389,50 @@ fn dueness_targets(scanned_tip: BlockHeight, estimated_tip: i64) -> DuenessTarge
     )
 }
 
-/// The id the delivery lane WOULD be driven toward once every outstanding proof exists: the next
-/// broadcastable row after virtually proving every prove-ready `Signed` row over a scratch copy —
-/// no prover runs and nothing persists (`set_transaction_proved` with the row's own bytes and no
-/// lock owner only flips the lifecycle state). `None` when the delivery lane has nothing
-/// actionable: nothing schedule-due yet, dependencies unmined, rows awaiting an external signature
-/// (the signing ceremony, not the delivery lane, advances those), or everything already
-/// broadcast/mined.
+/// The id the delivery lane WOULD be driven toward once every outstanding proof exists, derived
+/// over upstream's public status view ([`MigrationState::transaction_statuses`]). `None` when the
+/// delivery lane has nothing actionable: nothing schedule-due yet, dependencies unmined, rows
+/// awaiting an external signature (the signing ceremony, not the delivery lane, advances those),
+/// or everything already broadcast/mined.
 ///
-/// This is the REPORTING answer, an approximation of the lane rather than the lane itself:
-/// [`zcashlc_migration_advance_step`] is the verified drive, which also puts each candidate to the
-/// store's oracle and may re-spread a slept-through backlog before answering, so a row named here
-/// can still come back as a `Prove` step, or (once re-spread) as not due yet.
-/// What it does separate is "nothing is due" from "due, but its proof has not been produced yet",
-/// and the queries built on it ([`zcashlc_migration_has_overdue_transfers`],
-/// [`zcashlc_migration_pending_transfer_proposal`]) report due work whether or not its proof
-/// exists: the work exists either way, and proving is [`zcashlc_migration_prove_transactions`]'
-/// job, not the reporting path's.
+/// TWO TIERS, mirroring the drive's own precedence (upstream `MigrationState::next_step` consults
+/// its broadcast queue FIRST and reaches its prove queue only when that queue is empty — a due
+/// broadcast outranks all proving, whatever the two rows' relative schedules):
 ///
-/// Every candidate read here — the broadcast checks and the scratch loop's own prove queue — is
-/// [`MigrationState::next_due_broadcast`] / [`MigrationState::next_provable`], upstream's exported
-/// reads: this function's only remaining composition is driving the scratch clone to EXHAUSTION
-/// (every prove-ready row gets virtually proved, in whatever order the engine offers them, since
-/// none of them can unblock another — dependency readiness is keyed on `Mined`, never `Proved`)
-/// before asking, once more, what the drive would broadcast from the result.
+/// 1. The broadcast-queue min: the `(scheduled_height, id)`-min among rows reported `ready` with
+///    [`NextAction::Broadcast`].
+/// 2. Only if that tier is empty, the earliest-scheduled row still awaiting its proof: the
+///    `(scheduled_height, id)`-min among rows reported `ready` with [`NextAction::Prove`] whose
+///    schedule the effective target has already reached. Prove-readiness arrives long before the
+///    broadcast window — that head start is the whole point of the prove/broadcast split — so an
+///    undue prove-ready row is not delivery work and is excluded.
+///
+/// ONE PASS PER TIER suffices, with no virtual-prove closure to drive and no scratch clone to
+/// drive it over: dependency readiness is keyed on `Mined`, never `Proved`, so proving a row
+/// cannot make any OTHER row actionable. The transitive "once every proof exists" answer is
+/// therefore exactly these two filters over the statuses as they already stand.
+///
+/// The per-row predicates are upstream's by construction: a row is `ready` with
+/// [`NextAction::Broadcast`] exactly when the drive would offer its broadcast, and a
+/// doomed-broadcast withhold ([`Blocker::ExpiryImminent`]) is reported as neither `ready` nor
+/// carrying an action, so this query honours the withhold without restating it. What is RE-DERIVED
+/// here, the queues themselves not being exported, is the ORDER within each tier — the
+/// `(scheduled_height, id)`-min — which is this module's accepted drift risk, recorded on
+/// librustzcash #2938 (2026-08-06).
+///
+/// ADVISORY, exactly as the exported queue reads it replaces were: a status carries no
+/// store-oracle verification. [`zcashlc_migration_advance_step`] is the verified drive, which puts
+/// each candidate to the store's satisfiability oracle and may re-spread a slept-through backlog
+/// before answering, so a row named here can still come back as a `Prove` step, or (once
+/// re-spread) as not due yet, or be set aside entirely — and where the drive would answer `Replan`
+/// (a slot that sits BETWEEN the two tiers above, preempting proving but not a due broadcast) this
+/// query still names a row while the delivery lane has nothing to serve, a divergence by design.
+/// What this DOES separate, for the display queries built on it
+/// ([`zcashlc_migration_has_overdue_transfers`],
+/// [`zcashlc_migration_pending_transfer_proposal`]), is "nothing is due" from "due, but its proof
+/// has not been produced yet": they report due work whether or not its proof exists, because the
+/// work exists either way and proving is [`zcashlc_migration_prove_transactions`]' job, not the
+/// reporting path's.
 ///
 /// `targets` carries the scanned/estimated due-ness pair (coincident when no estimate is in
 /// play) — see the section comment above [`estimated_target_from_tip`].
@@ -1415,21 +1440,73 @@ fn due_assuming_proving(
     state: &MigrationState,
     targets: DuenessTargets,
 ) -> Option<MigrationTransferId> {
-    if let Some(id) = state.next_due_broadcast(targets) {
-        return Some(id);
-    }
-    state.next_provable(targets, &[])?;
-    let mut scratch = state.clone();
-    while let Some(id) = scratch.next_provable(targets, &[]) {
-        let bytes = scratch
+    let statuses = state.transaction_statuses(targets);
+    statuses
+        .iter()
+        .filter(|s| s.ready() && s.action() == Some(NextAction::Broadcast))
+        .min_by_key(|s| (s.scheduled_height(), s.id()))
+        .or_else(|| {
+            statuses
+                .iter()
+                .filter(|s| {
+                    s.ready()
+                        && s.action() == Some(NextAction::Prove)
+                        && s.scheduled_height() <= targets.effective()
+                })
+                .min_by_key(|s| (s.scheduled_height(), s.id()))
+        })
+        .map(|s| s.id())
+}
+
+/// The PREPARATION [`zcashlc_migration_sign_note_split`] proves now and hands back for the
+/// platform's immediate broadcast, as a pure function of stored state. `None` only when the run
+/// holds no unbroadcast preparation at all, which the caller reports as an error.
+///
+/// RESUME FIRST. A resumed ceremony must re-serve a preparation that is already `Proved` and due
+/// rather than prove another one: the artifact exists, re-proving it is seconds of wasted CPU,
+/// and it is the row the engine's own broadcast queue is holding right now. Those rows are
+/// exactly the ones upstream's status view reports `ready` with [`NextAction::Broadcast`]
+/// (`Proved`, schedule-due, dependency-mined, unexpired, unmarked), and the
+/// `(scheduled_height, id)`-min among them mirrors that queue's order.
+///
+/// FRESH COMMIT otherwise, which is also the ordinary path: nothing is broadcast-ready yet,
+/// because the first preparation's drawn window opens a few blocks ahead — the engine will not
+/// offer it until then, and this lane must still hand it back NOW, which is the whole reason the
+/// ceremony does not simply defer to the delivery lane. The `(scheduled_height, id)`-min over the
+/// run's own unbroadcast preparation rows is what the engine itself picks once that window opens:
+/// preparation layers are serialized in schedule order (a later layer starts past the previous
+/// layer's last scheduled height), so the earliest-scheduled row is also the one whose
+/// dependencies mine first.
+fn ceremony_preparation_pick(
+    state: &MigrationState,
+    targets: DuenessTargets,
+) -> Option<MigrationTransferId> {
+    let resume_pick = state
+        .transaction_statuses(targets)
+        .iter()
+        .filter(|s| {
+            s.ready()
+                && s.action() == Some(NextAction::Broadcast)
+                && matches!(s.kind(), MigrationTxKind::Preparation { .. })
+        })
+        .min_by_key(|s| (s.scheduled_height(), s.id()))
+        .map(|s| s.id());
+    resume_pick.or_else(|| {
+        state
             .transactions()
             .iter()
-            .find(|t| t.id() == id)
-            .map(|t| t.pczt().clone())
-            .unwrap_or_default();
-        scratch.set_transaction_proved(id, bytes, None);
-    }
-    scratch.next_due_broadcast(targets)
+            .filter(|t| {
+                matches!(t.kind(), MigrationTxKind::Preparation { .. })
+                    && matches!(
+                        t.state(),
+                        MigrationTxState::Signed | MigrationTxState::Proved
+                    )
+            })
+            // Ties (equal `scheduled_height`) break by `id`, mirroring the engine's own ordering
+            // key: deterministic on equal heights.
+            .min_by_key(|t| (t.scheduled_height(), t.id()))
+            .map(|t| t.id())
+    })
 }
 
 // ----- progress derivation (pure; unit-tested) -----
@@ -2968,15 +3045,21 @@ pub unsafe extern "C" fn zcashlc_migration_is_note_split_needed(
 
 /// Whether any transaction of the stored run is due-and-unbroadcast — that is, whether the
 /// delivery lane has actionable work: an already-`Proved` transaction due for broadcast, or a
-/// due, dependency-satisfied, prove-ready `Signed` one the drive would offer for proving and then
-/// serve for broadcast (proofs are assumed to succeed — a transiently unwitnessable anchor defers the delivery, not this
-/// report; see [`due_assuming_proving`]). A row awaiting an EXTERNAL signature is not delivery
-/// work (the signing ceremony advances it). Returns `false` on error (see
-/// `zcashlc_last_error_message`).
+/// due, dependency-satisfied, prove-ready `Signed` one whose proof the platform's sweep
+/// ([`zcashlc_migration_prove_transactions`]) is expected to produce. Proofs are assumed to
+/// succeed: a transiently unwitnessable anchor defers the delivery, not this report. A row
+/// awaiting an EXTERNAL signature is not delivery work (the signing ceremony advances it). Returns
+/// `false` on error (see `zcashlc_last_error_message`).
 ///
-/// NOT the sync-gate's work-pending predicate: a `Signed` row it counts (due, but its proof not
-/// produced yet) must never hold sync hostage — that predicate is
-/// [`zcashlc_migration_has_ready_broadcast`], which answers for PROVED, servable work only.
+/// A display read over upstream's public status view (see [`due_assuming_proving`]), not a
+/// prediction of the lane: [`zcashlc_migration_advance_step`] is the verified drive, which
+/// additionally consults the store's oracle and may re-spread a slept-through backlog, so `true`
+/// here means "the run has work the platform owes it", not "the next advance will name that
+/// row".
+///
+/// NOT a sync gate: a `Signed` row it counts (due, but its proof not produced yet) must never
+/// hold sync hostage — that predicate is [`zcashlc_migration_has_ready_broadcast`], which answers
+/// for PROVED, broadcast-actionable work only.
 ///
 /// `estimated_tip` (`-1` = disabled) is the platform's wall-clock chain-tip projection (from
 /// [`zcashlc_migration_block_rate_samples`]). Its handling is upstream's
@@ -3064,26 +3147,41 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
     unwrap_exc_or(res, false)
 }
 
-/// Whether the stored, NON-TERMINAL run has a broadcast the platform could serve RIGHT NOW: a
-/// `Proved`, schedule-due, dependency-mined, unexpired transaction, per upstream's own
-/// broadcast-queue read (`next_due_broadcast`) at the [`dueness_targets`] of the scanned tip and
-/// `estimated_tip` (`-1` = disabled). Pure read of the PERSISTED run (read-only connections; no
-/// reconcile): a Broadcast row the wallet has since scanned as mined is reported Mined only after
-/// a write lane — the advance-step engine sweep, the prove sweep, or a delivery serve — persists
-/// the promotion; a platform drives one of those on its open-lane passes, sync edges, and
-/// UI-refresh passes, so a live run's reads trail a just-mined broadcast by at most one such pass.
-/// Returns `1` for yes, `0` for no (including no stored run and a terminal run), `-1` on error (see
+/// Whether any transaction of the stored, NON-TERMINAL run is reported ACTIONABLE FOR BROADCAST
+/// by upstream's public status view — `ready() && action() == Some(NextAction::Broadcast)`, the
+/// sync-gate contract `MigrationState::transaction_statuses` documents — at the
+/// [`dueness_targets`] of the scanned tip and `estimated_tip` (`-1` = disabled). That holds for a
+/// `Proved`, schedule-due, dependency-mined, unexpired, unmarked row and nothing else. Returns `1`
+/// for yes, `0` for no (including no stored run and a terminal run), `-1` on error (see
 /// `zcashlc_last_error_message`).
 ///
-/// This is the sync-gate's work-pending predicate: `1` means exactly "a PROVED, due, unexpired,
-/// valid transfer is waiting", the one situation where the platform should broadcast instead of
+/// ADVISORY, not a serve guarantee. The predicate agrees with the engine's broadcast queue by
+/// construction (upstream builds the view to agree, and renders the doomed-broadcast withhold as
+/// neither ready nor actionable, precisely so a status-driven gate never wakes a session the drive
+/// would refuse), but it performs no store-oracle verification of its own, and the delivery lane
+/// it advises is DRIVEN by the engine: [`zcashlc_migration_advance_step`] additionally puts the
+/// row to sqlite's satisfiability oracle and may re-spread a slept-through backlog first, so a `1`
+/// here means "a broadcast session is warranted", not "that transaction will be handed to you".
+///
+/// Pure read of the PERSISTED run (read-only connections; no reconcile): a Broadcast row the
+/// wallet has since scanned as mined is reported Mined only after a write lane — the advance-step
+/// engine sweep, the prove sweep, or a delivery serve — persists the promotion; a platform drives
+/// one of those on its open-lane passes, sync edges, and UI-refresh passes, so a live run's reads
+/// trail a just-mined broadcast by at most one such pass.
+///
+/// This is the shape a sync gate wants: `1` means the platform should broadcast instead of
 /// starting a sync (ZIP 318's broadcast-or-sync session split). `Signed` rows — even due ones —
 /// and rows awaiting a proof or an external signature must NEVER block sync (they need MORE
-/// syncing/other work, not a broadcast session), which is why the gate cannot be derived from
+/// syncing/other work, not a broadcast session), which is why such a gate cannot be derived from
 /// [`zcashlc_migration_has_overdue_transfers`] (that query deliberately counts due-but-unproved
 /// work). Rows marked `Invalid` are excluded upstream (a dead transfer gates nothing), and so is
 /// a doomed broadcast whose expiry only the ESTIMATED target has passed (upstream's protective
 /// withhold — served again once the scanned tip proves it either way).
+///
+/// KEPT FOR NON-GATING CONSUMERS: the Swift sync gate no longer calls this (the 2026-08-05 D1
+/// ruling removed the forward-looking clause that did), so it currently has no live consumer. It
+/// stays because the question it answers — "is a broadcast session warranted right now?" — is a
+/// legitimate read for a UI or a scheduler, and is not derivable from the sibling queries.
 ///
 /// # Safety
 /// See [`open`].
@@ -3107,7 +3205,9 @@ pub unsafe extern "C" fn zcashlc_migration_has_ready_broadcast(
             return Ok(0);
         }
         let targets = dueness_targets(ctx.tip()?, estimated_tip);
-        Ok(i32::from(state.next_due_broadcast(targets).is_some()))
+        Ok(i32::from(state.transaction_statuses(targets).iter().any(
+            |s| s.ready() && s.action() == Some(NextAction::Broadcast),
+        )))
     });
     unwrap_exc_or(res, -1)
 }
@@ -3180,52 +3280,16 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
 
         let (mut state, _) = commit_or_resume(&mut ctx, Some(usk), false, proposal_handle)?;
 
-        // The preparation transaction to prove now and return for immediate broadcast: upstream's
-        // own broadcast queue first, falling to its prove queue — a RESUMED ceremony must re-serve
-        // an earlier preparation that is already `Proved` and due before proving a later `Signed`
-        // sibling, something `next_provable` alone cannot see (it only ever names `Signed` rows); a
-        // fresh commit has no `Proved` row yet, so the order changes nothing there. Restricted to
-        // preparation rows, so this agrees with what the drive will
-        // pick once the row is due — falling back (see the ceremony fallback below) only when
-        // neither read names a preparation, the same trigger as before this ordering. Proven now,
-        // against the wallet's scanned-tip anchor, and returned for the platform's immediate
-        // broadcast — this lane exists to hand back something to broadcast, so its proof cannot
-        // wait for a sweep.
-        // Remaining preparation transactions are proved by `zcashlc_migration_prove_transactions`
-        // and
+        // The preparation transaction to prove now and return for immediate broadcast (see
+        // [`ceremony_preparation_pick`] for which row and why). Proven now, against the wallet's
+        // scanned-tip anchor, and returned for the platform's immediate broadcast — this lane
+        // exists to hand back something to broadcast, so its proof cannot wait for a sweep.
+        // Remaining preparation transactions are proved by
+        // `zcashlc_migration_prove_transactions` and
         // ride the normal delivery lane as they come due.
         let target = ctx.target()?;
-        let targets = DuenessTargets::at(target);
-        let engine_pick = state
-            .next_due_broadcast(targets)
-            .or_else(|| state.next_provable(targets, &[]))
-            .filter(|id| {
-                state.transactions().iter().any(|t| {
-                    t.id() == *id && matches!(t.kind(), MigrationTxKind::Preparation { .. })
-                })
-            });
-        // Ceremony fallback: the engine's queues answer None here — its drawn window opens a few
-        // blocks ahead, or a due TRANSFER short-circuits `next_due_broadcast` before
-        // `next_provable` is even consulted, and the kind filter above drops it. Either way, this
-        // hands back the same preparation the pre-change scan (and the engine, once due) would have.
-        let first_prep = engine_pick
-            .or_else(|| {
-                state
-                    .transactions()
-                    .iter()
-                    .filter(|t| {
-                        matches!(t.kind(), MigrationTxKind::Preparation { .. })
-                            && matches!(
-                                t.state(),
-                                MigrationTxState::Signed | MigrationTxState::Proved
-                            )
-                    })
-                    // Ties (equal `scheduled_height`) break by `id`, mirroring the engine's own
-                    // ordering key: deterministic on equal heights.
-                    .min_by_key(|t| (t.scheduled_height(), t.id()))
-                    .map(|t| t.id())
-            })
-            .ok_or_else(|| {
+        let first_prep =
+            ceremony_preparation_pick(&state, DuenessTargets::at(target)).ok_or_else(|| {
                 anyhow!("the committed migration has no broadcastable preparation transaction")
             })?;
         if !prove_one(&mut ctx, &mut state, first_prep)? {
@@ -3642,14 +3706,15 @@ pub unsafe extern "C" fn zcashlc_migration_take_broadcast_transaction(
 /// NULL meanings via `zcashlc_last_error_length`.
 ///
 /// "Due-and-unbroadcast" APPROXIMATES what the delivery lane would serve:
-/// an already-`Proved` due transfer, or a due, prove-ready `Signed` one whose proof the platform's
-/// sweep is expected to produce (see [`due_assuming_proving`] — this query itself never proves; it
-/// reports the row the delivery lane is being driven toward, assuming its proof succeeds). It is
-/// an approximation because the delivery lane is served by the verified drive, which also puts
-/// the row to the store's oracle and may re-spread a slept-through backlog first — this is a
-/// display read, and never a substitute for calling the lane. NULL when the would-be-served
-/// transaction is a preparation, when due rows still await an external signature, or when nothing
-/// is due.
+/// the earliest-scheduled row upstream's public status view reports actionable — an already-
+/// `Proved` due transfer, or a due, prove-ready `Signed` one whose proof the platform's sweep is
+/// expected to produce (see [`due_assuming_proving`] — this query itself never proves; it reports
+/// the row the delivery lane is being driven toward, assuming its proof succeeds). It is an
+/// approximation because a status carries no store-oracle verification, while the delivery lane
+/// is driven by [`zcashlc_migration_advance_step`], which also puts the row to that oracle and may
+/// re-spread a slept-through backlog first — this is a display read, and never a substitute for
+/// advancing. NULL when the would-be-served transaction is a preparation, when due rows still
+/// await an external signature, or when nothing is due.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_transfer_proposal`].
@@ -7941,9 +8006,27 @@ mod tests {
             .collect()
     }
 
+    /// The head of the engine's BROADCAST QUEUE as the public status view renders it: the
+    /// `(scheduled_height, id)`-min among the rows reported `ready` with
+    /// [`NextAction::Broadcast`]. Exactly the derivation
+    /// [`zcashlc_migration_has_ready_broadcast`] answers over and [`due_assuming_proving`]'s
+    /// broadcast arm contributes, so a test asserting "what is offered for broadcast" pins the
+    /// same read the production queries make rather than a second one of its own.
+    fn ready_broadcast_head(
+        state: &MigrationState,
+        targets: DuenessTargets,
+    ) -> Option<MigrationTransferId> {
+        state
+            .transaction_statuses(targets)
+            .iter()
+            .filter(|s| s.ready() && s.action() == Some(NextAction::Broadcast))
+            .min_by_key(|s| (s.scheduled_height(), s.id()))
+            .map(|s| s.id())
+    }
+
     /// Opens a fixture [`CallCtx`] with the chain tip set so `target_from_tip` yields `target`,
     /// plus the two prerequisites the sweep's now-verified drive needs that the pre-drive
-    /// `next_provable` selector never touched: the wallet scanned through `target`, and the
+    /// prove-queue selector never touched: the wallet scanned through `target`, and the
     /// placeholder spend nullifier every non-`Mined` fixture row carries
     /// ([`test_transaction_from_parts`]) seeded as a known, unspent note. Without both, the
     /// store's satisfiability oracle can vouch for nothing and every candidate degrades silently
@@ -8070,7 +8153,7 @@ mod tests {
         // for.
         let calls_before = prover.calls.len();
         assert_eq!(
-            stored.next_due_broadcast(DuenessTargets::at(h(5_000))),
+            ready_broadcast_head(&stored, DuenessTargets::at(h(5_000))),
             Some(MigrationTransferId::new(1)),
             "the proved, due row must be the one offered for broadcast"
         );
@@ -8094,7 +8177,7 @@ mod tests {
         let state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
 
         assert_eq!(
-            state.next_due_broadcast(DuenessTargets::at(h(5_000))),
+            ready_broadcast_head(&state, DuenessTargets::at(h(5_000))),
             None,
             "an unproved row is not broadcastable, whatever its schedule says"
         );
@@ -8298,7 +8381,7 @@ mod tests {
     /// Proved, schedule-due, dependency-satisfied row is delivery work the drive names as
     /// `AdvanceStep::Broadcast`, which OUTRANKS proving in the engine's own precedence — a due
     /// broadcast is what lets a woken session submit and end without ever proving. The pre-drive
-    /// selector (`MigrationState::next_provable`) had no notion of that precedence and offered an
+    /// prove-queue selector had no notion of that precedence and offered an
     /// independently-provable Signed row regardless of the due broadcast sitting right beside it.
     ///
     /// The pin now sits on the CONDUIT, which is where the precedence is decided: the sweep is an
@@ -8459,14 +8542,131 @@ mod tests {
         );
     }
 
-    // ----- selection order is delegated to the engine's exported reads, not commit order -----
+    /// THE DUE-BROADCAST PRECEDENCE, as [`due_assuming_proving`] must mirror it. The engine's own
+    /// `MigrationState::next_step` consults its broadcast queue UNCONDITIONALLY first and reaches
+    /// its prove queue only when that queue is empty: a row that can be broadcast right now
+    /// outranks all proving, whatever the two rows' relative schedules. So with a `Proved`, due
+    /// transfer (id 1, scheduled 1000) beside a prove-ready `Signed` one scheduled EARLIER (id 2,
+    /// scheduled 900), the answer is id 1 — the drive would broadcast it this crank and only reach
+    /// id 2's proof on a later one.
+    ///
+    /// This is what makes the two-tier shape load-bearing rather than cosmetic: a FLAT
+    /// `(scheduled_height, id)`-min over both actions answers id 2 and fails here.
+    #[test]
+    fn due_assuming_proving_serves_the_broadcastable_row_before_an_earlier_scheduled_unproved_one()
+    {
+        let state = scheduled_state(
+            &[MINED],
+            &[
+                (MigrationTxState::Proved, 1_000, Some(h(40))),
+                (MigrationTxState::Signed, 900, Some(h(40))),
+            ],
+        );
+        assert_eq!(
+            due_assuming_proving(&state, DuenessTargets::at(h(1_100))),
+            Some(MigrationTransferId::new(1)),
+            "a due broadcast outranks proving in the engine's own precedence: the schedule-earlier \
+             row still awaiting its proof must not preempt it"
+        );
+    }
 
-    /// The broadcast queue every delivery decision rests on — the drive's own
-    /// `(scheduled_height, id)`-min among ready-to-broadcast candidates — never answers merely
-    /// the first match in commit/dependency order. Id 3 is committed (appears in the transactions
+    /// THE NOTE-SPLIT CEREMONY'S RESUME ORDERING ([`ceremony_preparation_pick`]). A RESUMED
+    /// ceremony walks into a run that already holds a `Proved`, due preparation, and must hand
+    /// that artifact back rather than prove another row: re-proving what exists is seconds of
+    /// wasted CPU, and the proved row is the one the engine's broadcast queue is offering right
+    /// now. The fixture makes both wrong answers reachable — a still-`Signed` sibling scheduled
+    /// EARLIER (which wins the fresh-commit fallback's `(scheduled_height, id)`-min), and a due
+    /// `Proved` TRANSFER scheduled earlier still (which wins the broadcast queue outright, and
+    /// which this lane must never hand back: the ceremony exists to serve a preparation).
+    #[test]
+    fn ceremony_pick_prefers_a_proved_due_preparation() {
+        let prep = |id: u32, scheduled: u32, state: MigrationTxState| {
+            tx_row(
+                id,
+                MigrationTxKind::Preparation {
+                    layer: 0,
+                    index: id as usize,
+                },
+                &[],
+                scheduled,
+                10_000,
+                None,
+                state,
+            )
+        };
+        let transfer = |id: u32, deps: &[u32], scheduled: u32, state: MigrationTxState| {
+            tx_row(
+                id,
+                MigrationTxKind::Transfer { crossing: 0 },
+                deps,
+                scheduled,
+                10_000,
+                None,
+                state,
+            )
+        };
+
+        let resumed = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                prep(0, 100, MigrationTxState::Signed),
+                prep(1, 110, MigrationTxState::Proved),
+                transfer(2, &[], 90, MigrationTxState::Proved),
+            ],
+        );
+        assert_eq!(
+            ceremony_preparation_pick(&resumed, DuenessTargets::at(h(200))),
+            Some(MigrationTransferId::new(1)),
+            "a resume must re-serve the proved, due PREPARATION — not re-prove the \
+             earlier-scheduled Signed sibling, and not hand back the transfer that outranks \
+             both in the broadcast queue"
+        );
+
+        // A fresh commit holds no `Proved` row, so the fallback answers: the earliest-scheduled
+        // preparation, and it answers even BEFORE the drawn window opens — the engine's queues
+        // offer nothing there, and handing back that first preparation now is the whole reason
+        // this lane does not simply defer to the delivery drive.
+        let fresh = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                prep(0, 100, MigrationTxState::Signed),
+                prep(1, 110, MigrationTxState::Signed),
+                transfer(2, &[0], 90, MigrationTxState::Signed),
+            ],
+        );
+        for target in [h(50), h(200)] {
+            assert_eq!(
+                ceremony_preparation_pick(&fresh, DuenessTargets::at(target)),
+                Some(MigrationTransferId::new(0)),
+                "a fresh commit serves its earliest-scheduled preparation, due or not"
+            );
+        }
+
+        // Every preparation is already out the door: nothing to serve, which the FFI reports as
+        // an error rather than an empty answer.
+        let spent = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                prep(0, 100, MINED),
+                transfer(1, &[0], 90, MigrationTxState::Signed),
+            ],
+        );
+        assert_eq!(
+            ceremony_preparation_pick(&spent, DuenessTargets::at(h(200))),
+            None,
+            "a run whose preparations have all been broadcast has no ceremony row left"
+        );
+    }
+
+    // ----- selection order follows the engine's ordering keys, not commit order -----
+
+    /// The broadcast queue every delivery decision rests on — the `(scheduled_height, id)`-min
+    /// among ready-to-broadcast candidates, the drive's own order — never answers merely the
+    /// first match in commit/dependency order. Id 3 is committed (appears in the transactions
     /// list) before id 4, but id 4 is scheduled EARLIER (3900 vs 4000): a first-match scan over
-    /// commit order would answer id 3; the engine's `next_due_broadcast` answers id 4, the
-    /// earliest-scheduled row.
+    /// commit order would answer id 3; the ordering key answers id 4, the earliest-scheduled row.
+    /// Pinned through [`due_assuming_proving`], which composes that key over the public status
+    /// view — the one place this module still re-derives the queue's order.
     #[test]
     fn next_due_prefers_the_schedule_earliest_row_like_the_drive() {
         let transactions = vec![
@@ -8512,7 +8712,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.next_due_broadcast(DuenessTargets::at(h(4_100))),
+            due_assuming_proving(&state, DuenessTargets::at(h(4_100))),
             Some(MigrationTransferId::new(4)),
             "the drive's (scheduled_height, id)-min must win: id 4 (scheduled 3900) over id 3 \
              (scheduled 4000), even though id 3 was committed first"
@@ -8521,9 +8721,10 @@ mod tests {
 
     /// OLDEST-ANCHOR-FIRST, pinned on both sides of the instruction. The DRIVE orders the batch
     /// by its own `(anchor_boundary, id)` key, never commit order: id 7 is committed before id 8,
-    /// but id 8's boundary SETTLED EARLIER (3990 vs 4020), so the batch must name 8 first. The
-    /// EXECUTOR then honours that order verbatim — with `max_proofs = 1` it proves the batch's
-    /// head — because it has no ordering of its own to impose and must not reintroduce one.
+    /// but id 8's boundary SETTLED EARLIER (3990 vs 4020), so the batch must name 8 first — a
+    /// first-match scan over commit order would name id 7. The EXECUTOR then honours that order
+    /// verbatim — with `max_proofs = 1` it proves the batch's head — because it has no ordering of
+    /// its own to impose and must not reintroduce one.
     #[test]
     fn prove_sweep_serves_the_oldest_anchor_first() {
         let (path, account, mut ctx) =
@@ -8662,10 +8863,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ----- engine target-height boundary (F2): `next_broadcastable`/`next_provable`/
-    // `expired_transactions` are all defined over `target = tip + 1`, never the raw tip -----
+    // ----- engine target-height boundary (F2): `transaction_statuses`, `expired_transactions`
+    // and the drive are all defined over `target = tip + 1`, never the raw tip -----
 
-    /// Engine semantics: `next_broadcastable` is defined over `target = tip + 1` (the height of
+    /// Engine semantics: the broadcast queue is defined over `target = tip + 1` (the height of
     /// the NEXT block), with schedule test `scheduled_height <= target` — so a `Proved` transfer
     /// scheduled at EXACTLY `tip + 1` is due for broadcast right now, one block earlier than a
     /// raw-tip check (`scheduled_height <= tip`) would have admitted it.
@@ -10234,7 +10435,7 @@ mod tests {
         // The pure queue read the drive plans from: offered on the scanned view, withheld under
         // the estimate.
         assert_eq!(
-            state.next_due_broadcast(dueness_targets(scanned_tip, -1)),
+            ready_broadcast_head(&state, dueness_targets(scanned_tip, -1)),
             Some(MigrationTransferId::new(0)),
             "without the estimate the proved, due, unexpired row is offered"
         );
