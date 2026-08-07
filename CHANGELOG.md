@@ -167,18 +167,22 @@ Changes are relative to `2.8.0-rc.3`.
   members work without `prepare()`, so a background session can deliver a transfer without starting
   sync, and on custom networks without a prior `Initializer`. `ClosureSynchronizer` and
   `CombineSynchronizer` do not mirror the group.
-- Value types: `MigrationAdvanceStep`, `MigrationProgress`, `MigrationSchedule`,
-  `MigrationTransferProposal`, `MigrationTransferResult`, `MigrationTransferAttempt`,
+- Value types: `MigrationAdvanceStep`, `MigrationBroadcastInstruction`, `MigrationProveTarget`,
+  `MigrationProgress`, `MigrationSchedule`,
+  `MigrationTransferProposal`, `MigrationTransferResult`,
   `MigrationRunEstimate` (with `MigrationRunEstimate.Run`), `MigrationSyncWakeup`,
   `MigrationPreparationStep`, `MigrationSigningBudget`, `NoteSplitProposal`,
   `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`,
   `MigrationTransactionStatus`, `KeystoneBatchDecodeResult`, and
   `KeystoneFirmwareVersion`. Migration transaction ids are `UInt32`.
 - State: `migrationAdvanceStep(accountUUID:)` drives the migration engine's public
-  `advance_migration` decision at the scanned chain tip — `nil` when no run is stored, otherwise a
+  `advance_migration` decision, ALWAYS projecting the wall-clock chain-tip estimate alongside the
+  scanned target (it takes no parameter for it; the estimate may only ACCELERATE scheduled-height
+  due-ness, expiry and every destructive determination stay on the scanned tip, and an estimator
+  failure degrades to scanned-tip behavior) — `nil` when no run is stored, otherwise a
   `MigrationAdvance` whose `.step` is `.requiresAttention(id:)` (the engine returned `Reevaluate`
   after a node rejection or `Replan` after determining a transaction unsatisfiable),
-  `.prove(transactions:)`, `.broadcast(id:)`, `.rebuild(id:)`, `.waiting`, or the terminal
+  `.prove(transactions:)`, `.broadcast(_:)`, `.rebuild(id:)`, `.waiting`, or the terminal
   `.complete` (per-run, including a cancelled run — never "nothing left to migrate"; ask
   `proposeMigrationTransfers` for that). The SDK adds no state machine, no ordering shims, and no
   carve-outs of its own on top of the engine's answer — the attention step and the broadcast-first
@@ -190,14 +194,40 @@ Changes are relative to `2.8.0-rc.3`.
   sync-bound, and `migrationSyncWakeups` remains the proving-schedule authority. A `.prove` step
   carries the WHOLE provable set (`[MigrationProveTarget]`, earliest-ready first, never empty;
   librustzcash #2939: proving emits nothing on-chain, so a synced session proves everything
-  provable at once while broadcast stays one-at-a-time on the privacy schedule) — discharge the
-  batch with `finalizeReadyMigrationTransfers(accountUUID:)`. Each `MigrationProveTarget` carries
+  provable at once while broadcast stays one-at-a-time on the privacy schedule) — and that batch
+  IS the instruction the prove executor takes. Each `MigrationProveTarget` carries
   `isScheduleDue`: `true` means the schedule has already reached that transaction's broadcast
   window, so its missing proof is what blocks delivery right now, rather than the opportunistic
   proving a batch ordinarily represents.
+- The migration ACTION surface is the CONDUIT, the INSTRUCTION EXECUTORS, and READS — nothing on
+  it decides for itself what the migration needs. Quoting the ruling: *"The app should have no
+  semantic goal except to advance the migration and perform the advancement's dictates."* A driver
+  cranks `migrationAdvanceStep(accountUUID:)` and switches over `.step`, handing each actionable
+  arm's own payload to an executor: `.prove(let instruction)` to
+  `proveMigrationTransactions(accountUUID:_:maxProofs:)`, `.broadcast(let instruction)` to
+  `performMigrationBroadcast(accountUUID:_:options:)`, `.rebuild` to
+  `refreshStaleMigrationTransfers(accountUUID:usk:)`. The executors never crank the drive
+  themselves: which transactions are worth proving, their order, the ZIP 318 re-spread, the
+  satisfiability verification and the dueness judgement all happened in the crank that issued the
+  instruction. `proveMigrationTransactions` additionally takes a per-session PROOF BUDGET
+  (`maxProofs`, at least `1`; skips do not spend it), so a background session bounds seconds of
+  proving CPU and cranks again next time; `performMigrationBroadcast` returns the recorded
+  `MigrationTransferResult` directly, there being no empty outcome to distinguish it from.
+- Instructions are OPAQUE: `MigrationBroadcastInstruction` (the `.broadcast` step's payload, in
+  place of a bare id) and `MigrationProveTarget` have no public initializers, so the advance
+  marshaling is their only producer and holding one is the proof that the caller cranked.
+  Un-instructed proving or broadcasting does not compile. Quoting the ruling: *"And as such it
+  should be provided with no capabilities for such semantic goals."* This is a Swift-surface
+  property and NOT a security boundary — at the C ABI everything is forgeable, and the Rust
+  executors' per-row state gating (a non-`Proved` row is refused; a row not awaiting its proof is
+  skipped) remains the safety backstop, not the authority model. One consequence to plan for: a
+  stale instruction now throws `rustMigrationTakeBroadcastTransaction` from the broadcast seam
+  where the previous delivery lane's internal re-advance would have reported "nothing due" —
+  discharge it by cranking again, not by retrying the executor. Broadcast single-flight per
+  account, the privacy-gate marking, and the record-after-submit ordering are unchanged.
 - New: `nextMigrationWake(accountUUID:)` — the drive's own retained outlook, from the most recent
-  `migrationAdvanceStep(accountUUID:)` crank by ANY caller (the sweep, the delivery lane, or a
-  direct call), so a host can ask "when is the next migration wake, per the drive's own plan"
+  `migrationAdvanceStep(accountUUID:)` crank by ANY caller (the app's driver, or any other call
+  for the account), so a host can ask "when is the next migration wake, per the drive's own plan"
   without re-cranking the engine. Same advisory-FLOOR contract as `MigrationAdvance.next`: a
   height, not an appointment, unconditionally superseded by the very next crank's outlook —
   including to `nil`, so a stale outlook never outlives the crank that replaced it. Complements,
@@ -206,34 +236,30 @@ Changes are relative to `2.8.0-rc.3`.
   heights, as zodl-ios already does. `nil` also means no crank has run yet this session, or the
   last step's own outcome (not a height) decides what follows.
 - Planning and delivery: a randomized-cadence schedule proposal committed by
-  `signAndStoreMigrationSchedule`, proved opportunistically during sync by the new
-  `finalizeReadyMigrationTransfers(accountUUID:)` — a LOOP over `migrationAdvanceStep`, proving
-  exactly the batch each advance names and re-advancing after every productive pass (proving can
-  unblock rows that were not in the batch), stopping on the first pass that proves nothing or on
-  any step that is not `.prove`; a due `.broadcast` ends it, which is what lets a woken session
-  deliver without paying proving latency — then delivered by
-  `executeNextPendingMigrationTransfer`, which is BROADCAST-ONLY (it never proves) and answers
-  `MigrationTransferAttempt.nothingDue`, `.awaitingProof(id:)` (due but not proved yet — run
-  `finalizeReadyMigrationTransfers` and retry in a later session), or
-  `.executed(MigrationTransferResult)`. A submit rejection identifying the transaction as already
-  known is recorded as success, so a retried broadcast whose first attempt landed completes the
-  transfer. That call OPENS WITH `migrationAdvanceStep`: the engine decides what (if anything) may
-  be broadcast — running the ZIP 318 overdue re-spread and the satisfiability oracle on the way —
-  and the delivery step only discharges the instruction it returns. `.awaitingProof(id:)` is the
-  first `isScheduleDue` member of a `.prove` batch; anything the lane cannot deliver reads as
-  `.nothingDue`, and the host reaches those steps through `migrationAdvanceStep(accountUUID:)`
-  itself.
+  `signAndStoreMigrationSchedule`, proved opportunistically during sync by
+  `proveMigrationTransactions(accountUUID:_:maxProofs:)` at the wake-ups
+  `migrationSyncWakeups(accountUUID:)` schedules, then delivered by
+  `performMigrationBroadcast(accountUUID:_:options:)` in a session that does not sync. Proving a
+  batch can unblock rows it did not name, so a driver draining a run cranks again after each pass —
+  and, unlike a fixed proving sweep, a driver that sees the crank turn to `.broadcast` can deliver
+  instead of merely stopping. Broadcast remains BROADCAST-ONLY (it never proves); a due row still
+  awaiting its proof appears in the `.prove` batch with `isScheduleDue` set rather than as a
+  delivery outcome. A submit rejection identifying the transaction as already known is recorded as
+  success, so a retried broadcast whose first attempt landed completes the transfer.
 - New: `migrationSyncWakeups(accountUUID:)` — the stored run's minimal sync/proving wake-up
-  schedule (heights at which to wake, sync, and call `finalizeReadyMigrationTransfers`, plus the
+  schedule (heights at which to wake, sync, crank the conduit and discharge the prove instruction
+  it returns, plus the
   transfer ids each wake-up covers) — and `estimatedMigrationChainTip()` /
   `estimatedMigrationSecondsPerBlock()`, a measured-block-rate wall-clock chain-tip
   projection (Android-SDK-parity constants: a window of the last 100 scanned blocks, a 5–150 s
   per-delta/result clamp, a 75 s fallback with fewer than two samples; wallet-scoped — the
-  projection reads the shared blocks table, so the pair takes no account). `executeNextPendingMigrationTransfer`
-  and `hasOverdueMigrationTransfers(accountUUID:)` gain a `useEstimatedTip: Bool` parameter
-  (one/two-argument convenience overloads default it to `false`) that lets the estimated tip only
+  projection reads the shared blocks table, so the pair takes no account).
+  `hasOverdueMigrationTransfers(accountUUID:)` gains a `useEstimatedTip: Bool` parameter
+  (a one-argument convenience overload defaults it to `false`) that lets the estimated tip only
   ACCELERATE scheduled-height due-ness; expiry always evaluates against the scanned tip, and an
-  estimator failure silently degrades to the scanned-tip behavior. There is no repair member: every
+  estimator failure silently degrades to the scanned-tip behavior. `migrationAdvanceStep` applies
+  the same rule with no parameter at all: the conduit always projects the estimate, and it is now
+  the only place the acceleration enters — the executors judge nothing, so they take no tip. There is no repair member: every
   repair happens inside `migrationAdvanceStep(accountUUID:)`. A funding note spent outside the
   migration is discovered by the sqlite satisfiability oracle from scanned wallet data; a recorded
   broadcast is promoted to mined; and a transaction this process submitted whose broadcast was
