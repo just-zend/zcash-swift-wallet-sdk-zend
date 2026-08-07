@@ -43,7 +43,11 @@ A release is three commands, described in full under "Cutting a release" in
 - `./Scripts/prepare-release.sh build <remote> <version>` — bump versions, build
   and verify the artifacts, upload them, ready the PR
 - `./Scripts/release.sh <remote> <version>` — tag and publish, after the PR
-  merges
+  merges. It refuses unless the local release branch matches the remote, and
+  pushes nothing but the tag.
+
+A version with a pre-release suffix, such as `2.8.0-rc.1`, is marked as a
+pre-release on GitHub at every point it is created, re-uploaded or published.
 
 Pass `--dry-run` to any of them first. See each subcommand's `--help` for
 options.

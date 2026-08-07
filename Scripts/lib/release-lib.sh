@@ -28,6 +28,25 @@ die() {
     exit 1
 }
 
+warn() {
+    echo "warning: $1" >&2
+    shift
+    while [ $# -gt 0 ]; do echo "         $1" >&2; shift; done
+}
+
+# A precondition that only a real run has to satisfy: fatal normally, advisory
+# under --dry-run. Reserved for checks nothing in the dry run itself depends on,
+# so that a rehearsal still reports the problem rather than refusing to start.
+# A check the dry run does depend on must stay fatal: silencing it there only
+# relocates the failure to a message that blames the wrong thing.
+die_unless_dry_run() {
+    if [ "$DRY_RUN" = "true" ]; then
+        warn "$@"
+    else
+        die "$@"
+    fi
+}
+
 # Run a command, or describe it under --dry-run. Only state-changing commands
 # go through this: preflight reads run unconditionally, so a dry run still
 # reports what it found rather than what it assumed.
@@ -54,6 +73,31 @@ version_le() {
 # 2.7.0-rc.3 -> 2.7.0. Apple rejects a CFBundleShortVersionString that is not a
 # dotted numeric string, so the pre-release suffix cannot go into the plist.
 strip_prerelease() { printf '%s\n' "${1%%-*}"; }
+
+# SemVer: the hyphen introduces the pre-release identifiers, so 2.8.0-rc.1 is a
+# pre-release and 2.8.0 is not.
+is_prerelease() {
+    case "$1" in
+        *-*) return 0 ;;
+        *)   return 1 ;;
+    esac
+}
+
+# The `gh release` argument that makes a release's pre-release bit agree with
+# its version. GitHub keeps that bit separately from the tag, and it is what
+# stops a release candidate from being served as `latest` to everyone who asks
+# the API for the newest release.
+#
+# Stated in both directions rather than only when set, because `gh release
+# upload` replaces assets but not release properties: a draft created before
+# the version gained or shed its suffix would otherwise keep the stale bit.
+prerelease_flag() {
+    if is_prerelease "$1"; then
+        printf '%s\n' "--prerelease=true"
+    else
+        printf '%s\n' "--prerelease=false"
+    fi
+}
 
 # owner/repo from any form of GitHub remote URL: scp-style ssh, ssh://, or
 # https, with or without a .git suffix.
@@ -216,13 +260,20 @@ require_remote() {
     fi
 }
 
+# $1 names how to report a failure, defaulting to `die`. Callers whose
+# --dry-run path makes no authenticated call pass `die_unless_dry_run`, so a
+# rehearsal reports the problem instead of refusing to run. Callers whose dry
+# run does reach GitHub keep the default: without a token those reads fail
+# anyway, and further along, with a message that misdiagnoses the cause.
 require_gh_auth() {
+    local report="${1:-die}"
     if ! command -v gh >/dev/null 2>&1; then
-        die "the GitHub CLI (gh) is not installed." \
+        "$report" "the GitHub CLI (gh) is not installed." \
             "See https://cli.github.com/"
+        return
     fi
     if ! gh auth status >/dev/null 2>&1; then
-        die "gh is not authenticated." "Run: gh auth login"
+        "$report" "gh is not authenticated." "Run: gh auth login"
     fi
 }
 

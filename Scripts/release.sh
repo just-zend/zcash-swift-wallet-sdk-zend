@@ -42,7 +42,8 @@ EOF
 
 main() {
     local remote version release_branch declared_version declared_checksum
-    local asset_checksum dir is_draft
+    local asset_checksum dir is_draft prerelease
+    local local_sha remote_sha ahead behind
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -60,11 +61,21 @@ main() {
     remote="$1"
     version="${2#v}"
     release_branch="release/${version}"
+    # Every `gh release edit` below carries this, including the ones quoted in
+    # the recovery instructions, so a hand-finished release ends up with the
+    # same pre-release bit an automated one would have had.
+    prerelease="$(prerelease_flag "$version")"
 
     step "Checking preconditions"
     require_clean_tree
     require_remote "$remote"
+    # Fatal even under --dry-run: the verification below downloads the release
+    # asset, so a dry run without a token cannot do the one thing it exists for.
     require_gh_auth
+
+    if is_prerelease "$version"; then
+        echo "  ${version} carries a pre-release suffix; it will be published as a pre-release"
+    fi
 
     GH_REPO="$(repo_for_remote "$remote")"
     export GH_REPO
@@ -81,7 +92,8 @@ main() {
     echo "  fetching ${remote} ..."
     if ! git fetch --tags "$remote" >/dev/null 2>&1; then
         die "git fetch ${remote} failed." \
-            "The already-tagged check below would otherwise run on stale tags."
+            "The already-tagged and up-to-date checks below would otherwise run" \
+            "on stale refs, and would report agreement that does not exist."
     fi
 
     # A local tag with no remote counterpart is the signature of a previous run
@@ -91,18 +103,46 @@ main() {
         if git ls-remote --tags --exit-code "$remote" "refs/tags/${version}" >/dev/null 2>&1; then
             die "${version} is already tagged on ${remote}; this release is out." \
                 "If it still shows as a draft, publish it with:" \
-                "  gh release edit ${version} --repo ${GH_REPO} --draft=false"
+                "  gh release edit ${version} --repo ${GH_REPO} --draft=false ${prerelease}"
         fi
         die "${version} is tagged locally but not on ${remote}." \
             "A previous run probably stopped between tagging and pushing." \
             "Resume with:" \
-            "  git push ${remote} ${release_branch} ${version}" \
-            "  gh release edit ${version} --repo ${GH_REPO} --draft=false" \
+            "  git push ${remote} refs/tags/${version}" \
+            "  gh release edit ${version} --repo ${GH_REPO} --draft=false ${prerelease}" \
             "Or discard the local tag and start over: git tag -d ${version}"
     fi
 
+    # The tag is cut from this checkout, but what was reviewed and merged is
+    # what sits on the remote. Requiring the two to be identical is what makes
+    # the tag trustworthy -- and, once they are, there is nothing left to push
+    # but the tag itself, so the release branch is never written to from here.
+    if ! git rev-parse -q --verify "refs/remotes/${remote}/${release_branch}" >/dev/null; then
+        die "${remote}/${release_branch} was not found." \
+            "The release pull request merges into ${release_branch} on ${remote}." \
+            "Either it was never pushed there, or '${remote}' is not the remote" \
+            "the release was prepared against."
+    fi
+    local_sha="$(git rev-parse "refs/heads/${release_branch}")"
+    remote_sha="$(git rev-parse "refs/remotes/${remote}/${release_branch}")"
+    if [ "$local_sha" != "$remote_sha" ]; then
+        ahead="$(git rev-list --count "${remote}/${release_branch}..${release_branch}")"
+        behind="$(git rev-list --count "${release_branch}..${remote}/${release_branch}")"
+        die "${release_branch} does not match ${remote}/${release_branch}." \
+            "  local:  ${local_sha} (${ahead} commit(s) ${remote} does not have)" \
+            "  remote: ${remote_sha} (${behind} commit(s) missing from this checkout)" \
+            "Only what has merged on ${remote} may be tagged; a pushed tag cannot" \
+            "be recalled. If this checkout is merely behind:" \
+            "  git pull --ff-only ${remote} ${release_branch}" \
+            "Commits that exist only here do not belong in a release. Land them" \
+            "through a pull request first."
+    fi
+    echo "  ${release_branch} matches ${remote}/${release_branch} at $(git rev-parse --short "$local_sha")"
+
+    # Advisory under --dry-run: nothing else in the dry run needs a signing key,
+    # so reporting its absence beats refusing to show the rest of the plan.
     if ! git config --get user.signingkey >/dev/null 2>&1; then
-        die "no tag signing key is configured." \
+        die_unless_dry_run "no tag signing key is configured." \
             "Run: git config --global user.signingkey <your-key-id>"
     fi
 
@@ -155,8 +195,11 @@ main() {
     step "Creating the signed tag ${version}"
     run git tag -s "$version" -m "Release ${version}"
 
-    step "Pushing ${release_branch} and ${version} to ${remote}"
-    if ! run git push "$remote" "$release_branch" "$version"; then
+    # Only the tag. ${release_branch} was verified identical to its remote
+    # counterpart above, so pushing it could contribute nothing except, on a
+    # checkout that had drifted, commits the pull request never carried.
+    step "Pushing the tag ${version} to ${remote}"
+    if ! run git push "$remote" "refs/tags/${version}"; then
         cat >&2 <<EOF
 
 error: the push failed. The signed tag ${version} EXISTS LOCALLY but may not
@@ -166,8 +209,8 @@ Check with:
   git ls-remote --tags ${remote} refs/tags/${version}
 
 Then either retry:
-  git push ${remote} ${release_branch} ${version}
-  gh release edit ${version} --repo ${GH_REPO} --draft=false
+  git push ${remote} refs/tags/${version}
+  gh release edit ${version} --repo ${GH_REPO} --draft=false ${prerelease}
 
 or discard the local tag and start over:
   git tag -d ${version}
@@ -176,16 +219,15 @@ EOF
     fi
 
     step "Publishing the release"
-    if ! run gh release edit "$version" --repo "$GH_REPO" --draft=false; then
+    if ! run gh release edit "$version" --repo "$GH_REPO" --draft=false "$prerelease"; then
         cat >&2 <<EOF
 
 error: the release could not be published.
 
-${release_branch} and the signed tag ${version} ARE already on ${remote}, and
-the tag is public -- do not delete it. Only the draft release remains. Publish
-it by hand with:
+The signed tag ${version} IS already on ${remote} and is public -- do not
+delete it. Only the draft release remains. Publish it by hand with:
 
-  gh release edit ${version} --repo ${GH_REPO} --draft=false
+  gh release edit ${version} --repo ${GH_REPO} --draft=false ${prerelease}
 
 or from https://github.com/${GH_REPO}/releases/tag/${version}
 EOF

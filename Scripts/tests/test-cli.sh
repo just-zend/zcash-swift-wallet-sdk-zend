@@ -102,3 +102,12 @@ test_build_documents_skip_verify() {
     assert_succeeds "build --help documents --skip-verify" \
         sh -c "'$REPO_ROOT/Scripts/prepare-release.sh' build --help | grep -q -- --skip-verify"
 }
+
+# The overwrite path is restricted to drafts, and the help text has to say so:
+# an operator reaching for the flag is by definition about to replace an
+# artifact, and needs to know which ones are off limits before they try.
+test_artifacts_help_restricts_overwrite_to_drafts() {
+    assert_succeeds "artifacts --help says the overwrite is draft-only" \
+        sh -c "'$REPO_ROOT/Scripts/prepare-release.sh' artifacts --help |
+               grep -A1 -- --force-overwrite-existing-release | grep -q DRAFT"
+}

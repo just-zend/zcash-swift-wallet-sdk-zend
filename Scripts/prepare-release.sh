@@ -122,7 +122,8 @@ Usage: ./Scripts/prepare-release.sh artifacts [options] <version>
 
 Build the XCFramework for all five Apple architectures, zip it, and upload it
 to GitHub as a DRAFT release. Writes BuildSupport/products/release.env with the
-checksum and download URL.
+checksum and download URL. A version carrying a pre-release suffix, such as
+2.8.0-rc.1, is marked as a pre-release on GitHub.
 
 This touches no git state and no pull request, which is what lets
 .github/workflows/build-ffi.yml run it with only `contents: write`. It is also
@@ -140,7 +141,11 @@ mismatch across the FFI boundary compiles on both sides and fails only at link
 or run time, so this is the last point at which one can be caught cheaply.
 
 Options:
-  --force-overwrite-existing-release  replace the assets of an existing release
+  --force-overwrite-existing-release  replace the assets of an existing DRAFT
+                                      release. A published release is refused:
+                                      Package.swift pins its asset's checksum,
+                                      so replacing it breaks every consumer
+                                      that has already resolved the version.
   --skip-verify                       do not build and test the SDK against the
                                       new XCFramework before uploading it
   --dry-run                           print what would happen and change nothing
@@ -222,7 +227,11 @@ cmd_start() {
     step "Checking preconditions"
     require_clean_tree
     require_remote "$remote"
-    require_gh_auth
+    # Advisory under --dry-run: this is the one subcommand whose dry run reaches
+    # GitHub nowhere, so an unauthenticated rehearsal can still show the whole
+    # plan. `build` and `artifacts` read release and pull-request state even
+    # under --dry-run, and keep the check fatal.
+    require_gh_auth die_unless_dry_run
 
     GH_REPO="$(repo_for_remote "$remote")"
     export GH_REPO
@@ -422,6 +431,10 @@ produce_artifacts() {
             "from a branch where the bump has already landed."
     fi
 
+    if is_prerelease "$version"; then
+        echo "  ${version} carries a pre-release suffix; the release will be marked as a pre-release"
+    fi
+
     # Check before the ten-minute build, not after: nothing below depends on
     # the build or the checksum, so a doomed run should fail in a second, the
     # same reasoning that puts the version guard above ahead of the build.
@@ -431,7 +444,20 @@ produce_artifacts() {
             die "release ${version} already exists." \
                 "Use --force-overwrite-existing-release to replace its assets."
         fi
-        echo "  release ${version} exists; replacing its assets"
+        # Only a draft may be overwritten. Package.swift pins the checksum of
+        # whatever asset a published release carries, and SwiftPM checks it at
+        # fetch time, so replacing the bytes behind that URL breaks the build of
+        # everyone who has already resolved ${version} -- and keeps breaking it,
+        # because a published tag is immutable. The remedy is a new version.
+        if [ "$(gh release view "$version" --repo "$GH_REPO" \
+                --json isDraft --jq .isDraft)" != "true" ]; then
+            die "release ${version} is published; its assets will not be replaced." \
+                "Package.swift pins the checksum of the asset attached to it, and" \
+                "SwiftPM verifies that checksum on every fetch. Replacing the asset" \
+                "would break the build of every consumer that has resolved ${version}." \
+                "Release a new version instead."
+        fi
+        echo "  draft release ${version} exists; replacing its assets"
         exists=true
     fi
 
@@ -463,10 +489,15 @@ produce_artifacts() {
     if [ "$exists" = "true" ]; then
         gh release upload "$version" "${PRODUCTS_DIR}/${ZIP_FILE}" \
             --repo "$GH_REPO" --clobber
+        # `gh release upload` replaces assets, never release properties, so the
+        # pre-release bit has to be set on its own. A draft cut before this
+        # handling existed carries whatever it was created with.
+        gh release edit "$version" --repo "$GH_REPO" "$(prerelease_flag "$version")"
     else
         gh release create "$version" "${PRODUCTS_DIR}/${ZIP_FILE}" \
             --repo "$GH_REPO" --title "$version" \
-            --notes "Zcash Light Client SDK ${version}" --draft
+            --notes "Zcash Light Client SDK ${version}" --draft \
+            "$(prerelease_flag "$version")"
     fi
 
     # Only write this once the upload has actually succeeded: everything it

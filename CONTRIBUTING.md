@@ -147,13 +147,25 @@ Each step of phase two checks whether it has already run, so re-running it
 after a failure resumes rather than starting over.
 
 9. Merge the pull request, then run `./Scripts/release.sh <remote> X.Y.Z` from
-   `release/X.Y.Z`. It verifies the checksum in `Package.swift` against the
-   uploaded asset, signs and pushes the tag `X.Y.Z`, and publishes the release.
+   `release/X.Y.Z`. It requires that branch to be identical to its counterpart
+   on `<remote>` — only what merged there may be tagged, and a pushed tag
+   cannot be recalled — then verifies the checksum in `Package.swift` against
+   the uploaded asset, signs the tag `X.Y.Z`, pushes it, and publishes the
+   release. The tag is the only thing pushed.
+
+A version carrying a pre-release suffix, such as `2.8.0-rc.1`, is marked as a
+pre-release on GitHub, both on the draft created in step 6 and on the published
+release in step 9. That bit is what keeps a release candidate from being served
+as `latest` to everyone who asks the API for the newest release.
 
 The artifact build alone is available as
 `./Scripts/prepare-release.sh artifacts <version>`. It touches no git or
 pull-request state, which is what lets `.github/workflows/build-ffi.yml` run it
-with only `contents: write`.
+with only `contents: write`. Its
+`--force-overwrite-existing-release` replaces the assets of a *draft* release
+only: `Package.swift` pins the checksum of whatever a published release
+carries, and SwiftPM checks it on every fetch, so replacing that asset breaks
+the build of every consumer that has already resolved the version.
 
 ```
 tag X.Y.W  (previous release)
