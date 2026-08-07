@@ -28,15 +28,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     serviceable work, assuming the served step is executed and recorded, `next_height = -1` when
     nothing is height-schedulable — with the kind exported as the `ZCASHLC_STEP_KIND_*` constants,
     a verbatim mirror of upstream `state::StepKind`), `_progress`,
-    `_is_note_split_needed`, `_has_overdue_transfers`, `_has_invalid_transfers` (true iff the
+    `_is_note_split_needed`, `_has_overdue_transfers`, and `_has_invalid_transfers` (true iff the
     NON-terminal stored run holds an engine-`Invalid` or expired-unmined transaction; a cancelled
-    run answers `false`), `_has_ready_broadcast` (`1`/`0`/`-1`, true iff some transaction is
-    reported `ready` with next action `Broadcast` by the engine's public status view — a PROVED,
-    due, dependency-mined, unexpired, unmarked row; `Signed` or awaiting-proof rows never qualify.
-    ADVISORY: it agrees with the engine's broadcast queue by construction, but performs no
-    store-oracle verification of its own, so it says a broadcast session is warranted, NOT that
-    the next `_advance_step` will issue a BROADCAST instruction), and `_pending_transfer_proposal`.
-    `_advance_step`, `_has_overdue_transfers` and `_has_ready_broadcast` take an
+    run answers `false`).
+    `_advance_step` and `_has_overdue_transfers` take an
     `estimated_tip: i64` parameter (`-1` = disabled) evaluated under the upstream engine's
     `DuenessTargets` rule: the estimate may only ACCELERATE scheduled-height due-ness, expiry and
     boundary settledness stay on the SCANNED tip, and a broadcast whose expiry only the ESTIMATED
@@ -102,6 +97,25 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     observed wallet tip; the next drive call adjudicates it through sqlite's satisfiability
     oracle, while unknown and already-mined rows remain no-ops), and
     `_record_immediate_run`, which records a send-max sweep built outside the engine.
+  - Read-only reporting: the query that CANNOT drive the engine (it opens read-only connections
+    and must not mutate) — `_has_overdue_transfers` — derives its answer from upstream's public
+    per-row status view (`MigrationState::transaction_statuses`) instead of the exported
+    broadcast/prove queue
+    selectors. Only the DERIVATION moves; every answer is unchanged. The view agrees with the
+    kernel's queues by construction and renders the doomed-broadcast withhold as neither ready nor
+    actionable, so the protective withhold and the `Signed`/awaiting-signature exclusions hold
+    exactly as before; and the engine's broadcast-before-prove precedence is preserved explicitly —
+    the two-tier derivation takes the broadcast-ready `(scheduled_height, id)`-min first and reaches
+    the still-unproved rows only when that tier is empty, exactly as upstream
+    `MigrationState::next_step` consults its own two queues. What IS gone is the scratch-clone
+    VIRTUAL PROVE behind `_has_overdue_transfers` (a
+    `MigrationState` was cloned and every prove-ready row flipped `Proved` in memory, just to ask
+    what would then be broadcastable): dependency readiness is keyed on `Mined`, never `Proved`, so
+    proving can unblock nothing, and one pass per tier over the statuses gives the same answer the
+    clone did. The ordering key within each tier is re-derived rather than read off the engine —
+    the SDK's one accepted drift risk here, recorded on librustzcash #2938. It remains an
+    ADVISORY display read: no store-oracle verification happens on it, so it never promises
+    what the next delivery call will serve.
   - Recovery: `zcashlc_migration_restart_step`, and `_refresh_stale_transfers`, which rebuilds every
     expired transfer of the stored run and returns the full stored schedule, persisting
     all-or-nothing (NULL on any error).
@@ -202,11 +216,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is made ONCE: `zcashlc_migration_advance_step` cranks `advance_migration`, and the two EXECUTORS
   — `_take_broadcast_transaction` and `_prove_transactions` — discharge the instruction it
   returned (see their entries above), so what they act on was verified against the store's
-  satisfiability oracle before it was handed out. The READ-ONLY reporting queries —
-  `_has_ready_broadcast`, `_has_overdue_transfers`, `_pending_transfer_proposal` — cannot drive,
-  and read the engine's public per-row status view instead; the SDK's hand-rolled twins of
+  satisfiability oracle before it was handed out. The READ-ONLY reporting query —
+  `_has_overdue_transfers` — cannot drive,
+  and reads the engine's public per-row status view instead; the SDK's hand-rolled twins of
   upstream's readiness predicates are gone, leaving only the `(scheduled_height, id)` ordering key
-  those display reads compose over the view. The note-split ceremony's immediate-broadcast pick
+  that display read composes over the view. The note-split ceremony's immediate-broadcast pick
   reads the same view, so a resumed ceremony re-serves an already-proved, due preparation rather
   than proving another. The plan-preview numbering (`preparation_steps_from_plan`) likewise takes
   its ids, `layer`, and `index` straight from the engine's own
@@ -220,9 +234,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside the region a reorg truncation would roll back — and is the same bound the drive path
   promotes under, so a status read can no longer report `Mined` for a row `advance_migration`
   would refuse to promote.
-- The six migration read entry points (`zcashlc_migration_transaction_statuses`,
+- The five migration read entry points (`zcashlc_migration_transaction_statuses`,
   `zcashlc_migration_progress`, `zcashlc_migration_has_overdue_transfers`,
-  `zcashlc_migration_has_invalid_transfers`, `zcashlc_migration_has_ready_broadcast`,
+  `zcashlc_migration_has_invalid_transfers`,
   `zcashlc_migration_sync_wakeups`) now open the database read-only and report the persisted
   run without reconciling mined transactions first. Broadcast→Mined promotion is persisted by
   the write lanes (the advance-step engine sweep, the prove sweep, the delivery serves), which
@@ -237,6 +251,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   That testing purpose is now covered on the engine side by compressed test-network scheduling at
   commit time plus the opt-in spacing floors (`_advance_step`'s
   `overdue_tolerance_floor`/`release_spacing_floor` params, above).
+- `zcashlc_migration_pending_transfer_proposal` is removed, together with the standalone
+  `zcashlc_free_migration_transfer_proposal` destructor that freed its answer. It was a
+  KIND-FILTERED peek at the queue ("the next TRANSFER, specifically"), which the advance design
+  makes a malformed question: any answer either masks imminent work of another kind or contradicts
+  what the drive would serve. Its scheduling role belongs to `zcashlc_migration_advance_step`
+  (whose outlook names the next serviceable work of ANY kind) and its display role to
+  `zcashlc_migration_transaction_statuses` plus the schedule DTO. `FfiTransferProposal` itself
+  stays — it is the row type of `FfiMigrationSchedule::transfers` — but is no longer handed out
+  standalone.
+- `zcashlc_migration_has_ready_broadcast` is removed. It had no consumer anywhere: the 2026-08-05
+  D1 ruling deleted the sync gate's forward-looking clause, the only caller, and sync is held only
+  for past/present broadcasts (the privacy buffer and the in-flight marker), never because one is
+  expected in the future. `zcashlc_migration_has_overdue_transfers` — an honest "the delivery lane
+  has actionable work" boolean, not a kind-filtered id peek — stays.
 
 ### Fixed
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood

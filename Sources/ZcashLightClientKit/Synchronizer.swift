@@ -960,9 +960,9 @@ public protocol Synchronizer: AnyObject {
     /// broadcast — the delivery lane's "is there actionable work" query, counting an
     /// already-proved due transaction AND a due, dependency-satisfied `Signed` one the delivery
     /// call would drive through proving. Informational (re-arm background execution, launch
-    /// reconciliation): it is deliberately NOT the sync-gate predicate —
-    /// ``isMigrationSyncBlocked()`` asks the narrower ready-broadcast question instead, because a
-    /// due-but-unproved row needs MORE syncing and must never block sync.
+    /// reconciliation): it is deliberately NOT the sync-gate predicate — a due-but-unproved row
+    /// needs MORE syncing and must never block sync, so ``isMigrationSyncBlocked()`` holds only on
+    /// past/present broadcast state (the privacy buffer and the in-flight marker).
     /// - Parameters:
     ///   - accountUUID: the account to check.
     ///   - useEstimatedTip: opts the check into the wall-clock chain-tip estimate, which may only
@@ -976,17 +976,6 @@ public protocol Synchronizer: AnyObject {
     /// scheduled transfer covers it).
     /// - Parameter accountUUID: the account to check.
     func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool
-
-    /// `accountUUID`'s migration engine's next height-due pending transfer proposal, or `nil` when
-    /// nothing is pending.
-    ///
-    /// A straight delegation to the engine-backed accessor: no local time-shifting of
-    /// `nextExecutableAfterHeight`. The host re-arms its own background execution window from the
-    /// returned proposal's heights; the local decision not to broadcast before that window *is* the
-    /// reschedule. `nil` means there is nothing to re-arm (no active run, the plan is complete, or
-    /// only the note-split prep is pending).
-    /// - Parameter accountUUID: the account to check.
-    func pendingMigrationTransferProposal(accountUUID: AccountUUID) async throws -> MigrationTransferProposal?
 
     /// Re-evaluates `accountUUID`'s remaining spendable Orchard balance and returns a fresh schedule.
     ///
@@ -1419,10 +1408,6 @@ public extension Synchronizer {
     }
 
     func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
-        throw MigrationUnimplemented(member: #function)
-    }
-
-    func pendingMigrationTransferProposal(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
         throw MigrationUnimplemented(member: #function)
     }
 

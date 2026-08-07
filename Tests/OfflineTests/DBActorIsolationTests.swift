@@ -12,8 +12,8 @@
 //  Four conversion areas are pinned, one test per converted call: the migration family
 //  (blockRateSamples); the migration UI/gate reads reclassified 2026-08-05 — migrationSyncWakeups,
 //  migrationProgress, migrationTransactionStatuses, migrationHasOverdueTransfers,
-//  migrationHasReadyBroadcast, migrationHasInvalidTransfers — pinned individually so a re-add on
-//  any single one of the six fails on its own, not just as a group; the turnstile proposal
+//  migrationHasInvalidTransfers — pinned individually so a re-add on any single one of the five
+//  fails on its own, not just as a group; the turnstile proposal
 //  (proposeOrchardToIronwoodMigration, which needs the account fixture); and the wallet getters
 //  (maxScannedHeight). The DAO conversions are exercised transitively by the rest of OfflineTests.
 //
@@ -100,14 +100,6 @@ final class DBActorIsolationTests: XCTestCase {
         let accountUUID = account!
         await assertCompletesWhileDBActorIsHeld("migrationHasOverdueTransfers completed while actor held") {
             _ = try? await backend.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: nil)
-        }
-    }
-
-    func testHasReadyBroadcastReadCompletesWhileDBActorIsHeld() async throws {
-        let backend = rustBackend!
-        let accountUUID = account!
-        await assertCompletesWhileDBActorIsHeld("migrationHasReadyBroadcast completed while actor held") {
-            _ = try? await backend.migrationHasReadyBroadcast(for: accountUUID, estimatedTip: nil)
         }
     }
 

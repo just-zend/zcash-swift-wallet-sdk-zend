@@ -313,8 +313,6 @@ public enum ZcashErrorCode: String {
     case rustMigrationCreateUnsignedTransferPczts = "ZRUST0119"
     /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePczts
     case rustMigrationStoreSignedSchedulePczts = "ZRUST0120"
-    /// Error from rust layer when calling ZcashRustBackend.migrationPendingTransferProposal
-    case rustMigrationPendingTransferProposal = "ZRUST0123"
     /// Tor was requested for a migration broadcast but could not be established.
     case migrationTorUnavailable = "ZRUST0121"
     /// The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult.
@@ -365,8 +363,6 @@ public enum ZcashErrorCode: String {
     case rustMigrationBatchPcztsByActions = "ZRUST0146"
     /// No chain tip is available to estimate from: the wallet has never scanned a block.
     case migrationChainTipUnavailable = "ZRUST0147"
-    /// Error from rust layer when calling ZcashRustBackend.migrationHasReadyBroadcast
-    case rustMigrationHasReadyBroadcast = "ZRUST0148"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.

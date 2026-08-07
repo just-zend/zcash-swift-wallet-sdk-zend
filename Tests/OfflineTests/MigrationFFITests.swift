@@ -94,17 +94,6 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertFalse(hasOverdue)
     }
 
-    /// The sync-gate's work-pending predicate over the real FFI: a fresh wallet with no stored run
-    /// answers `false` (the benign `0`, not the `-1` error sentinel) — at the scanned tip and
-    /// under an estimate alike.
-    func testFreshWalletHasNoReadyBroadcast() async throws {
-        let atScannedTip = try await rustBackend.migrationHasReadyBroadcast(for: account, estimatedTip: nil)
-        XCTAssertFalse(atScannedTip)
-
-        let underEstimate = try await rustBackend.migrationHasReadyBroadcast(for: account, estimatedTip: 3_000_000)
-        XCTAssertFalse(underEstimate)
-    }
-
     func testFreshWalletHasNoInvalidTransfers() async throws {
         let hasInvalid = try await rustBackend.migrationHasInvalidTransfers(for: account)
         XCTAssertFalse(hasInvalid)
@@ -141,16 +130,6 @@ final class MigrationFFITests: XCTestCase {
 
         let empty = try await rustBackend.migrationProveTransactions(ids: [], for: account)
         XCTAssertEqual(empty, 0)
-    }
-
-    /// Unlike `isNoteSplitNeeded`/`residualAfterMigration` (which read the spendable Orchard balance
-    /// and so throw `NotSynced` on this never-synced fixture), `pendingTransferProposal` short-
-    /// circuits to `Ok(None)` as soon as it sees no active migration run -- it never reaches the
-    /// target-height read. So on a fresh db it marshals as a benign `nil` (a NULL pointer with no
-    /// recorded last-error), not a throw: the pointer-sentinel analog of `nextDueTransfer`'s nil.
-    func testFreshWalletHasNoPendingTransferProposal() async throws {
-        let pending = try await rustBackend.migrationPendingTransferProposal(for: account)
-        XCTAssertNil(pending)
     }
 
     /// `isNoteSplitNeeded` plans fresh against the live balance. On this never-synced fixture the
@@ -464,13 +443,6 @@ final class MigrationFFITests: XCTestCase {
         let first = try await rustBackend.migrationProveTransactions(ids: [0], for: account)
         let second = try await rustBackend.migrationProveTransactions(ids: [0], for: account)
         XCTAssertEqual(first, 0)
-        XCTAssertEqual(first, second)
-    }
-
-    func testMigrationPendingTransferProposalNilIsStableAcrossRepeatedCalls() async throws {
-        let first = try await rustBackend.migrationPendingTransferProposal(for: account)
-        let second = try await rustBackend.migrationPendingTransferProposal(for: account)
-        XCTAssertNil(first)
         XCTAssertEqual(first, second)
     }
 
@@ -977,10 +949,8 @@ final class MigrationFFITests: XCTestCase {
     /// `MigrationSyncGate`. On this fresh wallet the drive legitimately has no run to advance,
     /// so `executeNextPendingTransfer` must short-circuit to `.nothingDue` before ever
     /// reaching the broadcaster -- proven here with a fake that fails the assertion (via a non-zero
-    /// call count) rather than the test itself if that contract regresses. `pendingTransferProposal`
-    /// (the renamed `rescheduleOverdueTransfer`) likewise resolves `nil` (no active run), exercising
-    /// the engine-backed pending-proposal accessor over real FFI.
-    func testFreshWalletActorExecuteNextPendingTransferAndPendingTransferProposalOverRealFFI() async throws {
+    /// call count) rather than the test itself if that contract regresses.
+    func testFreshWalletActorExecuteNextPendingTransferOverRealFFI() async throws {
         let storageDirectory = try makeUniqueStorageDirectory()
         defer { try? FileManager.default.removeItem(at: storageDirectory) }
 
@@ -1008,9 +978,6 @@ final class MigrationFFITests: XCTestCase {
         )
         XCTAssertEqual(result, .nothingDue)
         XCTAssertEqual(broadcaster.receivedCalls.count, 0)
-
-        let pending = try await migration.pendingTransferProposal()
-        XCTAssertNil(pending)
     }
 
     // MARK: - Gate ticker boundary wake (field-caught 2026-08-02)
@@ -1019,7 +986,7 @@ final class MigrationFFITests: XCTestCase {
     // deadlines), yet the flat tickInterval sleep left a cleared gate unnoticed for up to a whole
     // interval — a dead half-minute of foreground between "gate expired" and "sync resumed".
     // `nextRecomputeDelay` sleeps only until the soonest FUTURE boundary (+0.25 s epsilon), capped
-    // at the interval; ready-broadcast flips carry no deadline and keep the interval cadence.
+    // at the interval; with no future boundary pending it keeps the flat interval cadence.
 
     func testNextRecomputeDelayWakesAtTheSoonestFutureBoundary() {
         let now = Date(timeIntervalSince1970: 1_000)

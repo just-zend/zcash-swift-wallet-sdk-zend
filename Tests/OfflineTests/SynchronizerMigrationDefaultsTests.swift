@@ -155,10 +155,6 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.hasInvalidMigrationTransfers(accountUUID: self.accountUUID) }
     }
 
-    func testPendingMigrationTransferProposalDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.pendingMigrationTransferProposal(accountUUID: self.accountUUID) }
-    }
-
     func testRestartCurrentMigrationStepDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented {
             _ = try await self.synchronizer.restartCurrentMigrationStep(accountUUID: self.accountUUID)

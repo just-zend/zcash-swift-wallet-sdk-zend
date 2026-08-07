@@ -955,14 +955,12 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         XCTAssertEqual(welding.migrationRecordTransferResultTransferIdResultForReceivedArguments?.transferId, prepTransfer.id)
     }
 
-    // MARK: - isSyncBlocked degrade path
+    // MARK: - isSyncBlocked gate-file state
 
-    /// When the engine's overdue query throws, `isSyncBlocked` must degrade to the persisted
-    /// gate-file (privacy-buffer) state rather than crash or propagate -- checked both with no gate
-    /// file (unblocked) and with an active buffer (blocked), so the fallback is proven to actually
-    /// read the file, not just swallow the error into a hardcoded answer.
-    func testIsSyncBlockedDegradesToGateFileStateWhenWeldingHasReadyBroadcastThrows() async throws {
-        welding.migrationHasReadyBroadcastForEstimatedTipThrowableError = StubEngineError()
+    /// `isSyncBlocked` answers from the persisted gate-file (privacy-buffer) state -- checked both
+    /// with no gate file (unblocked) and with an active buffer (blocked), so the answer is proven
+    /// to actually read the file rather than being a hardcoded constant.
+    func testIsSyncBlockedAnswersFromThePersistedGateFileState() async throws {
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         let blockedWithNoGateFile = await migration.isSyncBlocked()
@@ -974,32 +972,25 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         XCTAssertTrue(blockedWithGateFile)
     }
 
-    // MARK: - isSyncBlocked ready-broadcast policy (D1)
+    // MARK: - isSyncBlocked forward-looking policy (D1)
 
-    /// The gate's work-pending clause is the READY-broadcast predicate: a proved, due transfer
-    /// blocks sync. The very wedge D1 exists to prevent is pinned separately below.
-    /// D1 REVERSAL PIN (danny + nuttycom, 2026-08-05): a servable ready broadcast no longer
-    /// blocks sync — the forward-looking clause is deleted, and no gate path consults the
-    /// ready-broadcast probe at all (the probe answering `true` here proves the assertion is
-    /// about consultation, not about the engine's answer).
-    func testIsSyncBlockedIgnoresAWaitingReadyBroadcast() async throws {
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
+    /// D1 REVERSAL PIN (danny + nuttycom, 2026-08-05): the gate's forward-looking clause is
+    /// deleted, so a migration with no buffer and no in-flight marker never blocks sync, and no
+    /// gate path pays for the wall-clock chain-tip estimate the clause needed.
+    func testIsSyncBlockedIgnoresForwardLookingWork() async throws {
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         let blocked = await migration.isSyncBlocked()
 
         XCTAssertFalse(blocked, "sync holds only for past/present broadcasts (buffer, in-flight marker)")
-        XCTAssertFalse(welding.migrationHasReadyBroadcastForEstimatedTipCalled, "no gate path consults the probe anymore")
         XCTAssertFalse(welding.migrationBlockRateSamplesWindowCalled, "no gate path pays for the estimate anymore")
     }
 
     /// THE WEDGE (D1): a due-but-unproved row — `migrationHasOverdueTransfers` would answer `true`
-    /// for it, `migrationHasReadyBroadcast` answers `false` — must NOT block sync: its proof is
-    /// produced AT sync wake-ups, so gating sync on it would starve the very work that clears it.
-    /// The overdue query throwing loudly (rather than answering) additionally proves the gate no
-    /// longer consults it at all.
+    /// for it — must NOT block sync: its proof is produced AT sync wake-ups, so gating sync on it
+    /// would starve the very work that clears it. The overdue query throwing loudly (rather than
+    /// answering) additionally proves the gate no longer consults it at all.
     func testIsSyncBlockedDoesNotBlockForADueButUnprovedSignedRow() async throws {
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
         welding.migrationHasOverdueTransfersForEstimatedTipThrowableError = StubEngineError()
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
@@ -1011,12 +1002,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             "no gate path may consult the overdue query anymore"
         )
     }
-
-    /// U8 ordering: the gate asks the ready-broadcast question at the SCANNED tip FIRST (nil
-    /// estimate). When that answer is already `true`, the block-rate samples are never read — the
-    /// estimate could not change the answer.
-
-
 
     // MARK: - Helpers
 

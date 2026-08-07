@@ -1330,10 +1330,10 @@ fn prove_named_rows(
 
 // ----- estimated-tip due-ness (M2, upstream `DuenessTargets`) -----
 //
-// `zcashlc_migration_has_overdue_transfers` / `zcashlc_migration_advance_step` /
-// `zcashlc_migration_has_ready_broadcast` accept an OPTIONAL estimated chain tip (a wall-clock
-// projection past the scanned tip, computed by the platform from
-// `zcashlc_migration_block_rate_samples`). The estimate/scanned split is OWNED UPSTREAM now:
+// `zcashlc_migration_has_overdue_transfers` and `zcashlc_migration_advance_step` accept an
+// OPTIONAL estimated chain tip (a wall-clock projection past the scanned tip, computed by the
+// platform from `zcashlc_migration_block_rate_samples`). The estimate/scanned split is OWNED
+// UPSTREAM now:
 // `zcash_pool_migration::state::DuenessTargets` encodes the rule (the estimate may only
 // ACCELERATE schedule due-ness; expiry, boundary settledness, and every destructive decision
 // evaluate on the scanned target — plus the doomed-broadcast withhold, where an expiry the
@@ -1347,15 +1347,13 @@ fn prove_named_rows(
 // [`drive_advance`], and the two executors — [`zcashlc_migration_take_broadcast_transaction`] and
 // [`zcashlc_migration_prove_transactions`] — discharge the instruction it returned without asking
 // again (a due broadcast outranks proving exactly as the engine documents, and that precedence is
-// therefore decided once, in the advance). The READ-ONLY REPORTING queries —
-// [`zcashlc_migration_has_ready_broadcast`] and [`due_assuming_proving`], the latter behind
-// [`zcashlc_migration_has_overdue_transfers`] and
-// [`zcashlc_migration_pending_transfer_proposal`] — cannot drive anything (they open read-only
-// connections and must not mutate), so they read the engine's public PER-ROW status view,
+// therefore decided once, in the advance). The READ-ONLY REPORTING query — [`due_assuming_proving`],
+// behind [`zcashlc_migration_has_overdue_transfers`] — cannot drive anything (it opens a read-only
+// connection and must not mutate), so it reads the engine's public PER-ROW status view,
 // `MigrationState::transaction_statuses`. That view agrees with the kernel's queues by
 // construction: `ready && action == Broadcast` holds exactly when `advance_migration` would offer
 // the broadcast, and the doomed-broadcast withhold is rendered as neither ready nor actionable.
-// What those queries do compose here is the ORDER among several actionable rows — the
+// What that query does compose here is the ORDER among several actionable rows — the
 // `(scheduled_height, id)`-min re-derived in [`due_assuming_proving`] — which is the module's one
 // accepted drift risk (recorded on librustzcash #2938, 2026-08-06); and being unverified, a
 // display read can still disagree with what the drive, having consulted the store's oracle, would
@@ -1427,11 +1425,10 @@ fn dueness_targets(scanned_tip: BlockHeight, estimated_tip: i64) -> DuenessTarge
 /// re-spread) as not due yet, or be set aside entirely — and where the drive would answer `Replan`
 /// (a slot that sits BETWEEN the two tiers above, preempting proving but not a due broadcast) this
 /// query still names a row while the delivery lane has nothing to serve, a divergence by design.
-/// What this DOES separate, for the display queries built on it
-/// ([`zcashlc_migration_has_overdue_transfers`],
-/// [`zcashlc_migration_pending_transfer_proposal`]), is "nothing is due" from "due, but its proof
-/// has not been produced yet": they report due work whether or not its proof exists, because the
-/// work exists either way and proving is [`zcashlc_migration_prove_transactions`]' job, not the
+/// What this DOES separate, for the display query built on it
+/// ([`zcashlc_migration_has_overdue_transfers`]), is "nothing is due" from "due, but its proof has
+/// not been produced yet": it reports due work whether or not its proof exists, because the work
+/// exists either way and proving is [`zcashlc_migration_prove_transactions`]' job, not the
 /// reporting path's.
 ///
 /// `targets` carries the scanned/estimated due-ness pair (coincident when no estimate is in
@@ -1949,24 +1946,6 @@ pub struct FfiTransferProposal {
     pub expiry_height: i64,
 }
 
-impl FfiTransferProposal {
-    fn boxed(
-        id: MigrationTransferId,
-        amount: Zatoshis,
-        now_reference: BlockHeight,
-        next_executable_after: BlockHeight,
-        expiry: BlockHeight,
-    ) -> anyhow::Result<*mut Self> {
-        Ok(Box::into_raw(Box::new(FfiTransferProposal {
-            id: u32::from(id),
-            amount: zat_to_i64(amount),
-            anchor_height: i64::from(u32::from(now_reference)),
-            next_executable_after_height: i64::from(u32::from(next_executable_after)),
-            expiry_height: i64::from(u32::from(expiry)),
-        })))
-    }
-}
-
 /// A single note-preparation transaction in a schedule preview (element of
 /// [`FfiMigrationSchedule::preparations`]) — Android parity: the transfer rows alone do not
 /// surface the preparations that mint their funding notes (see [`FfiTransferProposal`]).
@@ -2372,19 +2351,6 @@ pub unsafe extern "C" fn zcashlc_free_migration_schedule(ptr: *mut FfiMigrationS
             free_ptr_from_vec(p.depends_on, p.depends_on_len);
         });
         drop(boxed);
-    }
-}
-
-/// Frees a standalone [`FfiTransferProposal`] (as returned by
-/// `zcashlc_migration_pending_transfer_proposal`).
-///
-/// # Safety
-/// `ptr` must be null or point to a [`FfiTransferProposal`] handed out by this module.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_free_migration_transfer_proposal(ptr: *mut FfiTransferProposal) {
-    if !ptr.is_null() {
-        // The id is a plain `u32`; dropping the box is the whole of the cleanup.
-        drop(unsafe { Box::from_raw(ptr) });
     }
 }
 
@@ -3058,8 +3024,8 @@ pub unsafe extern "C" fn zcashlc_migration_is_note_split_needed(
 /// row".
 ///
 /// NOT a sync gate: a `Signed` row it counts (due, but its proof not produced yet) must never
-/// hold sync hostage — that predicate is [`zcashlc_migration_has_ready_broadcast`], which answers
-/// for PROVED, broadcast-actionable work only.
+/// hold sync hostage — it needs MORE syncing and proving, not a broadcast session, so a gate keyed
+/// on this query would wedge.
 ///
 /// `estimated_tip` (`-1` = disabled) is the platform's wall-clock chain-tip projection (from
 /// [`zcashlc_migration_block_rate_samples`]). Its handling is upstream's
@@ -3145,71 +3111,6 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
             .is_empty())
     });
     unwrap_exc_or(res, false)
-}
-
-/// Whether any transaction of the stored, NON-TERMINAL run is reported ACTIONABLE FOR BROADCAST
-/// by upstream's public status view — `ready() && action() == Some(NextAction::Broadcast)`, the
-/// sync-gate contract `MigrationState::transaction_statuses` documents — at the
-/// [`dueness_targets`] of the scanned tip and `estimated_tip` (`-1` = disabled). That holds for a
-/// `Proved`, schedule-due, dependency-mined, unexpired, unmarked row and nothing else. Returns `1`
-/// for yes, `0` for no (including no stored run and a terminal run), `-1` on error (see
-/// `zcashlc_last_error_message`).
-///
-/// ADVISORY, not a serve guarantee. The predicate agrees with the engine's broadcast queue by
-/// construction (upstream builds the view to agree, and renders the doomed-broadcast withhold as
-/// neither ready nor actionable, precisely so a status-driven gate never wakes a session the drive
-/// would refuse), but it performs no store-oracle verification of its own, and the delivery lane
-/// it advises is DRIVEN by the engine: [`zcashlc_migration_advance_step`] additionally puts the
-/// row to sqlite's satisfiability oracle and may re-spread a slept-through backlog first, so a `1`
-/// here means "a broadcast session is warranted", not "that transaction will be handed to you".
-///
-/// Pure read of the PERSISTED run (read-only connections; no reconcile): a Broadcast row the
-/// wallet has since scanned as mined is reported Mined only after a write lane — the advance-step
-/// engine sweep, the prove sweep, or a delivery serve — persists the promotion; a platform drives
-/// one of those on its open-lane passes, sync edges, and UI-refresh passes, so a live run's reads
-/// trail a just-mined broadcast by at most one such pass.
-///
-/// This is the shape a sync gate wants: `1` means the platform should broadcast instead of
-/// starting a sync (ZIP 318's broadcast-or-sync session split). `Signed` rows — even due ones —
-/// and rows awaiting a proof or an external signature must NEVER block sync (they need MORE
-/// syncing/other work, not a broadcast session), which is why such a gate cannot be derived from
-/// [`zcashlc_migration_has_overdue_transfers`] (that query deliberately counts due-but-unproved
-/// work). Rows marked `Invalid` are excluded upstream (a dead transfer gates nothing), and so is
-/// a doomed broadcast whose expiry only the ESTIMATED target has passed (upstream's protective
-/// withhold — served again once the scanned tip proves it either way).
-///
-/// KEPT FOR NON-GATING CONSUMERS: the Swift sync gate no longer calls this (the 2026-08-05 D1
-/// ruling removed the forward-looking clause that did), so it currently has no live consumer. It
-/// stays because the question it answers — "is a broadcast session warranted right now?" — is a
-/// legitimate read for a UI or a scheduler, and is not derivable from the sibling queries.
-///
-/// # Safety
-/// See [`open`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_has_ready_broadcast(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-    estimated_tip: i64,
-) -> i32 {
-    let res = catch_panic(|| {
-        let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
-        }) else {
-            return Ok(0);
-        };
-        if state.is_terminal() {
-            return Ok(0);
-        }
-        let targets = dueness_targets(ctx.tip()?, estimated_tip);
-        Ok(i32::from(state.transaction_statuses(targets).iter().any(
-            |s| s.ready() && s.action() == Some(NextAction::Broadcast),
-        )))
-    });
-    unwrap_exc_or(res, -1)
 }
 
 /// The note-split preview for the account's live balance: the preparation output values and the
@@ -3697,65 +3598,6 @@ pub unsafe extern "C" fn zcashlc_migration_take_broadcast_transaction(
         };
         let (raw, txid) = serve_for_broadcast(&mut ctx, &state, id)?;
         FfiPreparedTransfer::from_parts(id, txid, raw)
-    });
-    unwrap_exc_or_null(res)
-}
-
-/// The next due-and-unbroadcast TRANSFER of the stored run as a proposal row (id, amount, its
-/// scheduled and expiry heights), or NULL with no error when there is none. Distinguish the two
-/// NULL meanings via `zcashlc_last_error_length`.
-///
-/// "Due-and-unbroadcast" APPROXIMATES what the delivery lane would serve:
-/// the earliest-scheduled row upstream's public status view reports actionable — an already-
-/// `Proved` due transfer, or a due, prove-ready `Signed` one whose proof the platform's sweep is
-/// expected to produce (see [`due_assuming_proving`] — this query itself never proves; it reports
-/// the row the delivery lane is being driven toward, assuming its proof succeeds). It is an
-/// approximation because a status carries no store-oracle verification, while the delivery lane
-/// is driven by [`zcashlc_migration_advance_step`], which also puts the row to that oracle and may
-/// re-spread a slept-through backlog first — this is a display read, and never a substitute for
-/// advancing. NULL when the would-be-served transaction is a preparation, when due rows still
-/// await an external signature, or when nothing is due.
-///
-/// # Safety
-/// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_transfer_proposal`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_pending_transfer_proposal(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-) -> *mut FfiTransferProposal {
-    let res = catch_panic(|| {
-        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
-            return Ok(ptr::null_mut());
-        };
-        if state.is_terminal() {
-            return Ok(ptr::null_mut());
-        }
-        // `tip` is the display-only "now" reference the DTO carries (see
-        // `FfiTransferProposal::anchor_height`'s doc); `target` (`tip + 1`) is what the engine
-        // query below is actually defined over — see `CallCtx::target`. This query takes no
-        // estimated tip, so both due-ness targets coincide (`DuenessTargets::at`).
-        let tip = ctx.tip()?;
-        let target = target_from_tip(tip);
-        let next_transfer = due_assuming_proving(&state, DuenessTargets::at(target))
-            .and_then(|id| state.transactions().iter().find(|t| t.id() == id))
-            .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }));
-        match next_transfer {
-            Some(tx) => {
-                let amount = transfer_amount(&state, tx)
-                    .ok_or_else(|| anyhow!("stored transfer has no valid net crossing amount"))?;
-                FfiTransferProposal::boxed(
-                    tx.id(),
-                    amount,
-                    tip,
-                    tx.scheduled_height(),
-                    tx.expiry_height(),
-                )
-            }
-            None => Ok(ptr::null_mut()),
-        }
     });
     unwrap_exc_or_null(res)
 }
@@ -8008,10 +7850,9 @@ mod tests {
 
     /// The head of the engine's BROADCAST QUEUE as the public status view renders it: the
     /// `(scheduled_height, id)`-min among the rows reported `ready` with
-    /// [`NextAction::Broadcast`]. Exactly the derivation
-    /// [`zcashlc_migration_has_ready_broadcast`] answers over and [`due_assuming_proving`]'s
-    /// broadcast arm contributes, so a test asserting "what is offered for broadcast" pins the
-    /// same read the production queries make rather than a second one of its own.
+    /// [`NextAction::Broadcast`]. Exactly the derivation [`due_assuming_proving`]'s broadcast arm
+    /// contributes, so a test asserting "what is offered for broadcast" pins the same read the
+    /// production queries make rather than a second one of its own.
     fn ready_broadcast_head(
         state: &MigrationState,
         targets: DuenessTargets,
@@ -10275,57 +10116,6 @@ mod tests {
         }
     }
 
-    fn has_ready_broadcast(path_bytes: &[u8], account: &[u8; 16], estimated_tip: i64) -> i32 {
-        unsafe {
-            zcashlc_migration_has_ready_broadcast(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
-                estimated_tip,
-            )
-        }
-    }
-
-    // ----- the sync-gate predicate (`zcashlc_migration_has_ready_broadcast`) -----
-
-    /// THE A2 WEDGE PIN: a `Signed`, schedule-due, prove-ready transfer is overdue DELIVERY work
-    /// (`has_overdue_transfers` answers `true` — a sweep plus a broadcast will discharge it) but
-    /// must NOT gate sync (`has_ready_broadcast` answers `0`): it needs MORE syncing/proving
-    /// before a broadcast session can do anything with it, so a gate keyed on it would wedge —
-    /// sync withheld for a broadcast that cannot be served until sync proceeds.
-    #[test]
-    fn has_ready_broadcast_signed_due_row_answers_no_while_overdue_answers_yes() {
-        let path = init_fixture_db("zcashlc_ready_broadcast_signed");
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let account = create_fixture_account(&path);
-        set_fixture_tip(path_bytes);
-        // Signed, due, boundary settled — `has_overdue_transfers_reports_a_due_signed_transfer`'s
-        // exact fixture.
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
-            3_499_000,
-            4_000_000,
-        );
-        store_fixture_state(&path, &account, &state);
-
-        assert!(
-            has_overdue(path_bytes, &account, -1),
-            "sanity: the due Signed row IS overdue delivery work"
-        );
-        assert_eq!(
-            has_ready_broadcast(path_bytes, &account, -1),
-            0,
-            "a Signed row — even a due one — must never block sync (the A2 wedge)"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The gate's yes-case and its exclusions: a `Proved`, due row answers `1`; the same row
-    /// marked `Invalid` answers `0` (a dead transfer gates nothing); no stored run answers `0`.
-
     /// A transfer scheduled past the scanned target but at/below the estimated tip is overdue
     /// WITH the estimate and not without it (`-1` disables).
     #[test]
@@ -10407,14 +10197,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The drive and the sync-gate predicate honour the same doomed-broadcast withhold: a proved,
-    /// scanned-due row whose expiry only the ESTIMATED target has passed is NOT offered by the
-    /// broadcast queue the drive plans from (and over the FFI the advance step answers `Waiting`
-    /// rather than a BROADCAST instruction the executor would then discharge) and does NOT gate
-    /// sync via [`zcashlc_migration_has_ready_broadcast`] — while without the estimate both serve
-    /// it.
+    /// The drive honours the doomed-broadcast withhold: a proved, scanned-due row whose expiry
+    /// only the ESTIMATED target has passed is NOT offered by the broadcast queue the drive plans
+    /// from, so over the FFI the advance step answers `Waiting` rather than a BROADCAST
+    /// instruction an executor would then discharge — while without the estimate it is served.
     #[test]
-    fn advance_step_and_ready_broadcast_withhold_a_doomed_broadcast() {
+    fn advance_step_withholds_a_doomed_broadcast() {
         let path = init_fixture_db("zcashlc_next_due_doomed");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
@@ -10446,21 +10234,11 @@ mod tests {
         );
 
         // The same withhold over the FFI: the conduit issues no BROADCAST instruction, so the
-        // executor is never reached, and the sync gate stops gating.
+        // executor is never reached.
         let (step, ..) = read_advance_step_at(path_bytes, &account, 3_700_000);
         assert_eq!(
             step, ZCASHLC_ADVANCE_STEP_WAITING,
             "the doomed row must yield no broadcast instruction under the estimate"
-        );
-        assert_eq!(
-            has_ready_broadcast(path_bytes, &account, -1),
-            1,
-            "without the estimate the row gates sync (a broadcast is servable right now)"
-        );
-        assert_eq!(
-            has_ready_broadcast(path_bytes, &account, 3_700_000),
-            0,
-            "the doomed row must not gate sync: serving it would only earn a rejection"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -11054,9 +10832,9 @@ mod tests {
     // ----- pure-read rewire parity (RO-T2) -----
 
     /// Parity harness for the pure-read rewire: on a freshly initialized wallet database (no
-    /// accounts, chain tip set) the four boolean/scalar read wrappers answer exactly what they
-    /// answer today. Written BEFORE the rewire (green against the reconcile-first bodies) and
-    /// kept green after it.
+    /// accounts, chain tip set) the pure read wrappers answer exactly what they answer today.
+    /// Written BEFORE the rewire (green against the reconcile-first bodies) and kept green after
+    /// it.
     #[test]
     fn pure_read_wrappers_fresh_db_answers_are_stable() {
         let path = std::env::temp_dir().join(format!(
@@ -11105,16 +10883,6 @@ mod tests {
             )
         };
         assert!(!invalid, "error path coerces to false");
-        let ready = unsafe {
-            zcashlc_migration_has_ready_broadcast(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
-                -1,
-            )
-        };
-        assert_eq!(ready, -1, "error path reports -1");
         let statuses = unsafe {
             zcashlc_migration_transaction_statuses(
                 path_bytes.as_ptr(),

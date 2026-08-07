@@ -43,7 +43,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     func testMigrationForAccountCachesPerAccountAndRoutesTheRightUUID() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .waiting, next: nil)
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
         let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
 
         let firstA = await host.migration(for: accountA)
@@ -98,7 +97,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
                 }
                 return prepared
             }
-            accountWelding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
             return OrchardMigration(
                 welding: accountWelding,
                 accountUUID: accountUUID,
@@ -177,7 +175,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
 
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA), makeAccount(accountB)]
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
         let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
 
         let blockedWhileBuffered = await host.isSyncBlocked()
@@ -199,22 +196,17 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         XCTAssertFalse(blocked, "an account-enumeration failure must degrade open, not crash")
     }
 
-    /// The wallet-scope gate consults the READY-broadcast predicate (D1): a proved, due transfer
-    /// on any enumerated account blocks sync — and per U8 the scanned tip is asked first, so a
-    /// `true` scanned answer never pays for the block-rate sample read.
-    /// D1 REVERSAL PIN at wallet scope: a servable ready broadcast no longer blocks sync, and
-    /// the wallet-scope predicate consults neither the probe nor the estimate — its whole
+    /// D1 REVERSAL PIN at wallet scope: with no gate file and no live view for either enumerated
+    /// account, the predicate holds sync for nothing — and never reaches the estimate, whose whole
     /// second pass died with the gate's forward-looking clause.
-    func testIsSyncBlockedIgnoresReadyBroadcastsAcrossAllAccounts() async throws {
+    func testIsSyncBlockedHoldsForNothingForwardLookingAcrossAllAccounts() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA), makeAccount(accountB)]
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
         let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
 
         let blocked = await host.isSyncBlocked()
 
         XCTAssertFalse(blocked, "sync holds only for past/present broadcasts (gate files, live views)")
-        XCTAssertFalse(welding.migrationHasReadyBroadcastForEstimatedTipCalled, "no gate path consults the probe anymore")
         XCTAssertFalse(welding.migrationBlockRateSamplesWindowCalled, "the estimate pass is deleted")
     }
 
@@ -226,7 +218,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     func testIsSyncBlockedConsultsTheLiveGateWhenTheFileWriteFailed() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA)]
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
         welding.migrationBlockRateSamplesWindowReturnValue = []
 
         // A factory that hands the created actor's gate back to the test, so the test can drive
@@ -307,7 +298,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     func testSyncBlockedStreamEmitsTrueAfterAHostedActorBroadcasts() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA)]
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
         welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .broadcast(id: 0), next: nil)
         welding.migrationTakeBroadcastTransactionIdForReturnValue = PreparedMigrationTransfer(
             id: 0,
@@ -364,7 +354,6 @@ final class OrchardMigrationHostTests: ZcashTestCase {
 
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountD)]
-        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
         let host = makeHost(
             welding: welding,
             broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),

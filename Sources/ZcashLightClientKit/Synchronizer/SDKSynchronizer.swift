@@ -1317,10 +1317,6 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).hasInvalidTransfers()
     }
 
-    public func pendingMigrationTransferProposal(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
-        try await migrationHost.migration(for: accountUUID).pendingTransferProposal()
-    }
-
     public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
         try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
     }

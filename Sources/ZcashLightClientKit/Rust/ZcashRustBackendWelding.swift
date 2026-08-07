@@ -501,7 +501,7 @@ protocol ZcashRustBackendWelding {
     ///
     /// NOT the sync-gate's work-pending predicate: a due-but-unproved `Signed` row this query
     /// counts needs MORE syncing (its proof is produced at sync wake-ups), so it must never hold
-    /// sync hostage — the gate asks ``migrationHasReadyBroadcast(for:estimatedTip:)`` instead.
+    /// sync hostage.
     ///
     /// `estimatedTip` (`nil` = disabled) is the platform's wall-clock chain-tip projection (see
     /// ``ChainTipEstimator``). It may only ACCELERATE scheduled-height due-ness — the effective
@@ -510,24 +510,6 @@ protocol ZcashRustBackendWelding {
     /// engine's own dual-target `DuenessTargets` rule).
     /// - Throws: `rustMigrationHasOverdueTransfers` if the rust layer returns an error.
     func migrationHasOverdueTransfers(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool
-
-    /// Whether `account`'s stored, NON-TERMINAL run has a broadcast the platform could serve
-    /// RIGHT NOW: a PROVED, schedule-due, dependency-mined, unexpired, valid transaction per the
-    /// upstream engine's transaction-status evaluation — the sync-gate's work-pending predicate
-    /// (`true` means exactly "broadcast instead of syncing", ZIP 318's broadcast-or-sync session
-    /// split). `Signed` rows — even due ones — and rows awaiting a proof or an external
-    /// signature never count (they need MORE syncing or other work, not a broadcast session),
-    /// which is why the gate cannot be derived from
-    /// ``migrationHasOverdueTransfers(for:estimatedTip:)``; rows marked invalid are excluded
-    /// upstream (a dead transfer gates nothing), and so is a broadcast whose expiry only the
-    /// ESTIMATED target has passed (upstream's protective withhold — served again once the
-    /// scanned tip proves it either way). No stored run and a terminal run answer `false`.
-    ///
-    /// `estimatedTip` (`nil` = disabled) follows the same dual-target rule as
-    /// ``migrationHasOverdueTransfers(for:estimatedTip:)``: it may only ACCELERATE
-    /// scheduled-height due-ness, never decide expiry or boundary settledness.
-    /// - Throws: `rustMigrationHasReadyBroadcast` if the rust layer returns an error.
-    func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool
 
     /// Whether `account`'s stored, NON-TERMINAL run has a transaction that cannot proceed: one
     /// marked ``MigrationTransactionStatus/State/invalid(reason:)`` in the engine state (a
@@ -678,14 +660,6 @@ protocol ZcashRustBackendWelding {
     ///   including the STALENESS refusal of a row that is no longer proved-and-servable, which a
     ///   caller discharges by advancing again rather than retrying the executor.
     func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer
-
-    /// The next height-due scheduled transfer's full proposal (amount, anchor, timing) for the
-    /// active run, or `nil` when nothing is currently pending (no active run, or only the note-split
-    /// prep is pending). The proposal-level counterpart of the delivery lane: it exposes the
-    /// heights (notably `nextExecutableAfterHeight`) so a host can re-arm its own background window
-    /// without parsing the signed PCZT.
-    /// - Throws: `rustMigrationPendingTransferProposal` if the rust layer returns an error.
-    func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal?
 
     /// Extracts the broadcast-ready consensus transaction bytes from a signed PCZT (the
     /// `PreparedMigrationTransfer.pczt` returned by `migrationStoreSignedNoteSplitPczts`, the one

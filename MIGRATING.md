@@ -96,10 +96,15 @@ ending when a pass proves nothing or the engine names some other step. Run it at
 wallet's commitment tree and takes real time, while a broadcast session must stay a pure delivery
 step.
 
-### Renamed: `rescheduleOverdueMigrationTransfer` → `pendingMigrationTransferProposal`
+### Removed: `rescheduleOverdueMigrationTransfer` / `pendingMigrationTransferProposal`
 
-Purely a rename (same signature, same behavior — a straight delegation to the engine-backed
-pending-proposal accessor). Update call sites mechanically.
+Both the pre-release name and the rename are gone, before ever shipping in a release, along with
+error code `rustMigrationPendingTransferProposal` (ZRUST0123). A kind-filtered peek at the queue
+("the next TRANSFER, specifically") is a malformed question under the advance design: any answer
+either masks imminent work of another kind or contradicts what the drive would serve. Take the
+scheduling answer from `migrationAdvanceStep`'s outlook — which names the next serviceable work of
+ANY kind — and the display answer from `migrationTransactionStatuses(accountUUID:)` plus the
+committed `MigrationSchedule` you already hold. Drop the call.
 
 ### Signing-session counts are precomputed by the engine, not derived in Swift
 
@@ -182,10 +187,10 @@ estimate — so a wallet that wakes between syncs can deliver an already-due tra
 paying for a sync, and an estimator failure silently degrades to the scanned-tip behavior rather
 than blocking or crashing the call.
 
-### The sync gate's predicate: privacy buffer, in-flight marker, READY broadcast
+### The sync gate's predicate: privacy buffer, in-flight marker
 
-`isMigrationSyncBlocked()`/`migrationSyncBlockedStream` block sync, per account, for exactly three
-reasons:
+`isMigrationSyncBlocked()`/`migrationSyncBlockedStream` block sync, per account, for exactly two
+reasons — both PAST/PRESENT-looking, never future:
 
 1. **Privacy buffer** — network-scaled after every migration broadcast: 600 s on mainnet
    (unchanged from the previous fixed value), 180 s on testnet/regtest — the full 10 minutes only
@@ -199,16 +204,21 @@ reasons:
    instant — after the Tor bootstrap — so a slow bootstrap does not burn its window, and a marker
    observed implausibly far in the future (a backwards clock step) is clamped/ignored rather than
    wedging sync.
-3. **A READY broadcast is waiting** — a PROVED, schedule-due, unexpired, valid transfer the wallet
-   should serve (`executeNextPendingMigrationTransfer`) instead of syncing (ZIP 318's
-   broadcast-or-sync session split). This clause is estimate-ACCELERATED: the wall-clock chain-tip
-   estimate may only bring due-ness forward (the scanned tip is asked first), never decide expiry.
-   It deliberately does NOT gate on `hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)`:
-   that broader query also counts due-but-unproved `Signed` rows, whose proofs are produced AT
-   sync wake-ups — gating sync on them would starve the very work that clears them, so a `Signed`
-   or awaiting-proof row never blocks sync. `hasOverdueMigrationTransfers` remains available as an
-   informational query (re-arm background execution, launch reconciliation); it is no longer
-   consulted by any gate path.
+A third clause — **a READY broadcast is waiting**, blocking sync whenever a proved, schedule-due
+transfer was servable — existed earlier in this pre-release window and is REMOVED (danny +
+nuttycom, 2026-08-05). Sync is held only when a broadcast happened recently in the PAST, never
+because one is expected in the FUTURE; the forward-looking clause was also field-implicated in a
+live wedge, where it blocked the very sync whose scanned progress the pending broadcast needed. The
+probe it consulted had no consumer left afterwards and has since been removed from the FFI and the
+welding entirely. Nothing replaces it: no gate path consults any work-pending query.
+`hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)` remains available, but purely as an
+informational one (re-arm background execution, launch reconciliation) — it deliberately counts
+due-but-unproved `Signed` rows too, whose proofs are produced AT sync wake-ups, so gating sync on
+it would starve the very work that clears it.
+
+The broadcast-or-sync session split itself is unaffected: an app open whose next step is a
+broadcast runs a no-sync delivery session, which is a statement about THAT session, not a hold on
+sync in general.
 
 ## `migrationAdvanceStep` returns `MigrationAdvance`, wrapping the step with an advisory outlook
 

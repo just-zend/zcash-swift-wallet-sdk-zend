@@ -876,50 +876,6 @@ final class MigrationLogicTests: ZcashTestCase {
         )
     }
 
-    // MARK: - Pending transfer proposal delegation
-
-    /// `pendingTransferProposal()` (the renamed `rescheduleOverdueTransfer()`) is a straight
-    /// delegation to the engine-backed welding accessor: the proposal the welding returns is
-    /// passed through untouched (no local time-shifting of `nextExecutableAfterHeight`), the bound
-    /// account is forwarded, and a `nil` answer becomes `nil` out.
-    func testPendingTransferProposalReturnsWeldingProposalUntouched() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        let proposal = Self.makeSchedule(count: 3).transfers[1]
-        welding.migrationPendingTransferProposalForReturnValue = proposal
-        let migration = makeMigration(welding: welding, account: accountA)
-
-        let pending = try await migration.pendingTransferProposal()
-
-        XCTAssertEqual(pending, proposal)
-        XCTAssertEqual(welding.migrationPendingTransferProposalForReceivedAccount, accountA)
-    }
-
-    func testPendingTransferProposalReturnsNilWhenWeldingReturnsNil() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        welding.migrationPendingTransferProposalForReturnValue = nil
-        let migration = makeMigration(welding: welding, account: accountA)
-
-        let pending = try await migration.pendingTransferProposal()
-
-        XCTAssertNil(pending)
-    }
-
-    func testPendingTransferProposalRethrowsWhenWeldingThrows() async throws {
-        let welding = ZcashRustBackendWeldingMock()
-        welding.migrationPendingTransferProposalForThrowableError =
-            ZcashError.rustMigrationPendingTransferProposal("boom")
-        let migration = makeMigration(welding: welding, account: accountA)
-
-        do {
-            _ = try await migration.pendingTransferProposal()
-            XCTFail("Expected pendingTransferProposal to rethrow the welding error")
-        } catch ZcashError.rustMigrationPendingTransferProposal {
-            // expected
-        } catch {
-            XCTFail("Expected rustMigrationPendingTransferProposal but got \(error)")
-        }
-    }
-
     // MARK: - Immediate migration (send-max lane, MOB-1513)
 
     /// `proposeImmediateMigration()` derives the account's own current address and proposes an

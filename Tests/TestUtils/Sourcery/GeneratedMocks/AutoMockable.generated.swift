@@ -3209,30 +3209,6 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
-    // MARK: - pendingMigrationTransferProposal
-
-    var pendingMigrationTransferProposalAccountUUIDThrowableError: Error?
-    var pendingMigrationTransferProposalAccountUUIDCallsCount = 0
-    var pendingMigrationTransferProposalAccountUUIDCalled: Bool {
-        return pendingMigrationTransferProposalAccountUUIDCallsCount > 0
-    }
-    var pendingMigrationTransferProposalAccountUUIDReceivedAccountUUID: AccountUUID?
-    var pendingMigrationTransferProposalAccountUUIDReturnValue: MigrationTransferProposal?
-    var pendingMigrationTransferProposalAccountUUIDClosure: ((AccountUUID) async throws -> MigrationTransferProposal?)?
-
-    func pendingMigrationTransferProposal(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
-        if let error = pendingMigrationTransferProposalAccountUUIDThrowableError {
-            throw error
-        }
-        pendingMigrationTransferProposalAccountUUIDCallsCount += 1
-        pendingMigrationTransferProposalAccountUUIDReceivedAccountUUID = accountUUID
-        if let closure = pendingMigrationTransferProposalAccountUUIDClosure {
-            return try await closure(accountUUID)
-        } else {
-            return pendingMigrationTransferProposalAccountUUIDReturnValue
-        }
-    }
-
     // MARK: - restartCurrentMigrationStep
 
     var restartCurrentMigrationStepAccountUUIDThrowableError: Error?
@@ -5215,30 +5191,6 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
-    // MARK: - migrationHasReadyBroadcast
-
-    var migrationHasReadyBroadcastForEstimatedTipThrowableError: Error?
-    var migrationHasReadyBroadcastForEstimatedTipCallsCount = 0
-    var migrationHasReadyBroadcastForEstimatedTipCalled: Bool {
-        return migrationHasReadyBroadcastForEstimatedTipCallsCount > 0
-    }
-    var migrationHasReadyBroadcastForEstimatedTipReceivedArguments: (account: AccountUUID, estimatedTip: BlockHeight?)?
-    var migrationHasReadyBroadcastForEstimatedTipReturnValue: Bool!
-    var migrationHasReadyBroadcastForEstimatedTipClosure: ((AccountUUID, BlockHeight?) async throws -> Bool)?
-
-    func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
-        if let error = migrationHasReadyBroadcastForEstimatedTipThrowableError {
-            throw error
-        }
-        migrationHasReadyBroadcastForEstimatedTipCallsCount += 1
-        migrationHasReadyBroadcastForEstimatedTipReceivedArguments = (account: account, estimatedTip: estimatedTip)
-        if let closure = migrationHasReadyBroadcastForEstimatedTipClosure {
-            return try await closure(account, estimatedTip)
-        } else {
-            return migrationHasReadyBroadcastForEstimatedTipReturnValue
-        }
-    }
-
     // MARK: - migrationHasInvalidTransfers
 
     var migrationHasInvalidTransfersForThrowableError: Error?
@@ -5519,30 +5471,6 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(id, account)
         } else {
             return migrationTakeBroadcastTransactionIdForReturnValue
-        }
-    }
-
-    // MARK: - migrationPendingTransferProposal
-
-    var migrationPendingTransferProposalForThrowableError: Error?
-    var migrationPendingTransferProposalForCallsCount = 0
-    var migrationPendingTransferProposalForCalled: Bool {
-        return migrationPendingTransferProposalForCallsCount > 0
-    }
-    var migrationPendingTransferProposalForReceivedAccount: AccountUUID?
-    var migrationPendingTransferProposalForReturnValue: MigrationTransferProposal?
-    var migrationPendingTransferProposalForClosure: ((AccountUUID) async throws -> MigrationTransferProposal?)?
-
-    func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal? {
-        if let error = migrationPendingTransferProposalForThrowableError {
-            throw error
-        }
-        migrationPendingTransferProposalForCallsCount += 1
-        migrationPendingTransferProposalForReceivedAccount = account
-        if let closure = migrationPendingTransferProposalForClosure {
-            return try await closure(account)
-        } else {
-            return migrationPendingTransferProposalForReturnValue
         }
     }
 

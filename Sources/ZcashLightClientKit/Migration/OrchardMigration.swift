@@ -363,11 +363,6 @@ actor OrchardMigration {
     // same shared `MigrationTipEstimation` composition only for its gate/delivery due-ness
     // checks below.
 
-    // (`gateReadyBroadcast` — the estimate-aware ready-broadcast probe that fed the sync gate's
-    // forward-looking clause — was deleted with that clause on 2026-08-05, danny + nuttycom's
-    // ruling; see `MigrationSyncGate`'s type doc. The `migrationHasReadyBroadcast` welding/FFI
-    // surface remains for any non-gating consumer.)
-
     // MARK: - Note splitting
 
     /// Whether the account's Orchard notes must be split before migration.
@@ -632,23 +627,6 @@ actor OrchardMigration {
     /// transfer covers it).
     func hasInvalidTransfers() async throws -> Bool {
         try await welding.migrationHasInvalidTransfers(for: accountUUID)
-    }
-
-    /// The migration engine's next height-due pending transfer proposal, or `nil` when nothing is
-    /// pending — a straight readback of the stored run's next due-and-unbroadcast transfer
-    /// (`zcashlc_migration_pending_transfer_proposal`).
-    ///
-    /// Deliberately with **no** local time-shifting of `nextExecutableAfterHeight` (the Android
-    /// implementation clamps it to `now + interval` with a known unit bug the SDK does not port).
-    /// The host re-arms its own background execution window from the returned proposal's heights;
-    /// the local decision not to broadcast before that window *is* the reschedule, and the ZIP 318
-    /// "re-spread the remainder" property is carried by the delivery machinery itself (one
-    /// broadcast per session, the privacy buffer between sessions). `nil` means there is nothing
-    /// to re-arm (no stored run, the run is terminal, or only preparation transactions are
-    /// pending).
-    /// - Throws: `rustMigrationPendingTransferProposal` if the engine returns an error.
-    func pendingTransferProposal() async throws -> MigrationTransferProposal? {
-        try await welding.migrationPendingTransferProposal(for: accountUUID)
     }
 
     // MARK: - Invalidity recovery

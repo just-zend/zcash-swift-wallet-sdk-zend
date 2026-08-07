@@ -43,7 +43,7 @@ Changes are relative to `2.8.0-rc.3`.
   transaction — so the fresh plan the restart previews sees the full balance immediately instead
   of selecting around notes the abandoned run still holds until their locks expire.
 - Migration UI/gate reads (`migrationTransactionStatuses`, `migrationProgress`,
-  `migrationHasOverdueTransfers`, `migrationHasInvalidTransfers`, `migrationHasReadyBroadcast`,
+  `migrationHasOverdueTransfers`, `migrationHasInvalidTransfers`,
   `migrationSyncWakeups`) no longer take the database write actor: the FFI now serves them from
   read-only connections without reconciling first, so they answer in milliseconds even while a
   proof is being generated. A just-mined broadcast can trail in these answers by at most one
@@ -75,7 +75,8 @@ Changes are relative to `2.8.0-rc.3`.
   re-evaluated on a flat 15-second ticker, leaving a cleared gate unnoticed for up to a whole
   interval — on a foregrounded device that read as a dead half-minute between "privacy buffer
   expired" and "sync resumed". Each ticker iteration now sleeps only until the soonest future
-  boundary (capped at the interval); ready-broadcast flips keep the interval cadence.
+  boundary (capped at the interval); with no future boundary pending it keeps the flat interval
+  cadence.
 - Proved migration transactions are recorded in the wallet's own transaction tables at proving
   time: their inputs are marked spent from the moment the proof exists, so the wallet's own sends
   can no longer
@@ -234,10 +235,6 @@ Changes are relative to `2.8.0-rc.3`.
   `refreshStaleMigrationTransfers(accountUUID:usk:)` rebuilds every expired transfer of the stored
   run, all-or-nothing, with `usk` selecting in-process signing or the external-signer lane. A funding
   note spent outside the migration throws, naming `restartCurrentMigrationStep` as the remedy.
-  `pendingMigrationTransferProposal(accountUUID:)` (renamed from the pre-release
-  `rescheduleOverdueMigrationTransfer`) returns the engine's next height-due pending transfer
-  proposal untouched, for a host that wants to re-arm its own background execution window without
-  parsing a signed PCZT.
 - Note split: `submitNoteSplit(accountUUID:proposal:usk:options:)` signs the run, serves the first
   note-split transaction back through the same atomic broadcast seam the delivery step uses, and
   submits it — so what it broadcasts is a finalized consensus transaction whose wallet-side record
@@ -282,15 +279,16 @@ Changes are relative to `2.8.0-rc.3`.
   requested but unavailable throws `ZcashError.migrationTorUnavailable`, never a silent clearnet
   fallback. `MigrationNetworkPrivacyOptions.submissionEndpoint` is required: exactly one server per
   attempt, chosen by the host, and confirmation comes from block scanning rather than txid polling.
-  `start()` throws `ZcashError.migrationSyncBlocked` while a per-account privacy gate is open: for
-  the network-scaled buffer (600 s on mainnet, 180 s on testnet/regtest) after a broadcast, while a
-  broadcast is in flight (a 120 s self-expiring marker — re-armed at the last pre-submit instant,
-  after the Tor bootstrap — guards the submit-to-record window so the reconciliation probe above
-  never treats a just-broadcast transfer as a submit crash), or while a READY broadcast is waiting
-  (a proved, schedule-due, unexpired, valid transfer the wallet should serve instead of syncing;
-  estimate-accelerated, and never a `Signed`/awaiting-proof row — those need MORE syncing, so the
-  broader `hasOverdueMigrationTransfers` answer deliberately does not gate sync) — see
-  `isMigrationSyncBlocked()`, `migrationSyncBlockedStream`, `migrationPrivacySyncBufferDuration`. The broadcasting members throw
+  `start()` throws `ZcashError.migrationSyncBlocked` while a per-account privacy gate is open, and
+  only ever for a broadcast that already happened: for the network-scaled buffer (600 s on mainnet,
+  180 s on testnet/regtest) after a broadcast, or while a broadcast is in flight (a 120 s
+  self-expiring marker — re-armed at the last pre-submit instant, after the Tor bootstrap — guards
+  the submit-to-record window so the reconciliation probe above never treats a just-broadcast
+  transfer as a submit crash). Sync is never held because a broadcast is merely EXPECTED: a proved,
+  schedule-due, servable transfer does not gate sync, and neither does the broader
+  `hasOverdueMigrationTransfers` answer, whose due-but-unproved `Signed` rows need MORE syncing —
+  see `isMigrationSyncBlocked()`, `migrationSyncBlockedStream`,
+  `migrationPrivacySyncBufferDuration`. The broadcasting members throw
   `ZcashError.migrationBroadcastDuringSync` while a sync runs. A record failure after a successful
   broadcast throws the distinguishable `ZcashError.migrationRecordFailedAfterBroadcast`, which a
   later execution window heals.
@@ -300,11 +298,16 @@ Changes are relative to `2.8.0-rc.3`.
   from a copy persisted before the field existed. Its `encode(to:)` omits `proposalHandle` (a
   process-lifetime plan-cache key no persisted copy could honor), so every decoded copy carries
   handle `0` — re-propose instead of committing a persisted schedule.
-- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0138`, and
-  `ZRUST0140`–`ZRUST0148` (`ZRUST0098`, `rustMigrationState`, was retired pre-release with the
-  SDK-side migration state machine it served — the code is not reused; `ZRUST0139`,
-  `rustMigrationDebugRescheduleTransfers`, was likewise retired pre-release with the
-  debug-reschedule FFI it served — the code is not reused).
+- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0113`,
+  `ZRUST0115`–`ZRUST0122`, `ZRUST0124`–`ZRUST0138`, and `ZRUST0140`–`ZRUST0147`. Five codes were
+  retired pre-release with the members they served — which is every gap in those ranges — and none
+  is reused: `ZRUST0098`
+  (`rustMigrationState`, with the SDK-side migration state machine), `ZRUST0114`
+  (`rustMigrationIsSyncRequired`, with the always-false `zcashlc_migration_is_sync_required`, which
+  never threw), `ZRUST0123`
+  (`rustMigrationPendingTransferProposal`, with the kind-filtered queue peek), `ZRUST0139`
+  (`rustMigrationDebugRescheduleTransfers`, with the debug-reschedule FFI), and `ZRUST0148`
+  (`rustMigrationHasReadyBroadcast`, with the consumer-less ready-broadcast probe).
 
 ### Slipstream sync engine
 

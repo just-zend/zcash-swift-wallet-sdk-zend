@@ -1498,7 +1498,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
 
         // NULL with no recorded error is the benign "no migration run is stored" answer (the
-        // pointer analog of `migrationPendingTransferProposal`'s NULL sentinel).
+        // pointer analog of the bool/`-1` sentinel reads above).
         guard let stepPtr else {
             if zcashlc_last_error_length() > 0 {
                 throw ZcashError.rustMigrationAdvanceStep(
@@ -1737,32 +1737,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
 
         return hasOverdue
-    }
-
-    // DB-READ (audited 2026-08-05): zcashlc_migration_has_ready_broadcast — opens through the
-    // FFI's `open_read` (both connections SQLITE_OPEN_READ_ONLY; no reconcile, no preamble
-    // writes), so read-only-ness is machine-enforced: a write anywhere down this path fails
-    // SQLITE_READONLY rather than silently reclassifying the call. Mined promotion is persisted
-    // by the write lanes (advance-step sweep, prove sweep, delivery serves).
-    func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
-        let outcome = zcashlc_migration_has_ready_broadcast(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId,
-            // `-1` disables the estimate on the rust side.
-            estimatedTip.map(Int64.init) ?? -1
-        )
-
-        // A dedicated `-1` error sentinel (unlike the bool-returning sentinel reads above), so no
-        // last-error disambiguation dance is needed.
-        guard outcome >= 0 else {
-            throw ZcashError.rustMigrationHasReadyBroadcast(
-                lastErrorMessage(fallback: "`migrationHasReadyBroadcast` failed with unknown error")
-            )
-        }
-
-        return outcome == 1
     }
 
     // DB-READ (audited 2026-08-05): zcashlc_migration_has_invalid_transfers — opens through the
@@ -2129,39 +2103,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
 
         return prepared
-    }
-
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
-    @DBActor
-    func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal? {
-        // Clear any stale, unconsumed last-error before this sentinel read (see
-        // `migrationIsNoteSplitNeeded` above). Added alongside the pointer-sentinel accessor itself,
-        // which follows the same ambiguous-sentinel pattern as the five bool/`-1` wrappers.
-        zcashlc_clear_last_error()
-
-        let proposalPtr = zcashlc_migration_pending_transfer_proposal(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId
-        )
-
-        // A NULL pointer overloads "legitimately nothing pending" and "error"; check last-error to
-        // disambiguate (the pointer analog of `migrationResidualAfterMigration`'s `-1` sentinel).
-        guard let proposalPtr else {
-            if zcashlc_last_error_length() > 0 {
-                throw ZcashError.rustMigrationPendingTransferProposal(
-                    lastErrorMessage(fallback: "`migrationPendingTransferProposal` failed with unknown error")
-                )
-            }
-
-            return nil
-        }
-
-        defer { zcashlc_free_migration_transfer_proposal(proposalPtr) }
-
-        return proposalPtr.pointee.unsafeToMigrationTransferProposal()
     }
 
     // DB-AUDIT (2026-08-03): SELECT-only in steady state, but routes through the shared

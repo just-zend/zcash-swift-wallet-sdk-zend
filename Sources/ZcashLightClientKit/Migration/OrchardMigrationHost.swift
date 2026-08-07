@@ -171,11 +171,10 @@ actor OrchardMigrationHost {
     /// Whether ordinary wallet sync should currently be paused for *any* migrating account.
     ///
     /// Enumerates every wallet account via the welding (not the lazy actor cache, so a dormant
-    /// account with a persisted gate file or a ready broadcast still counts after a fresh launch)
-    /// and blocks if any account has a ready broadcast waiting or is still inside its privacy
-    /// buffer / in-flight window. Non-throwing: an account enumeration failure logs and degrades
-    /// to "unblocked" (sync allowed), and a per-account ready-broadcast-query failure contributes
-    /// "no ready broadcast" — matching ``OrchardMigration/isSyncBlocked()``.
+    /// account with a persisted gate file still counts after a fresh launch) and blocks if any
+    /// account is still inside its privacy buffer / in-flight window. Non-throwing: an account
+    /// enumeration failure logs and degrades to "unblocked" (sync allowed) — matching
+    /// ``OrchardMigration/isSyncBlocked()``.
     func isSyncBlocked() async -> Bool {
         await Self.computeSyncBlocked(
             welding: welding,
