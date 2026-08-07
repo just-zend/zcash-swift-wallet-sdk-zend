@@ -574,3 +574,27 @@ Unmerged upstream branches (not carried):
 - `rust-build-plugin`: 2 commits ahead and 1114 behind `upstream/main`; stale draft build-plugin work covered by upstream PR `#1443`.
 - `shielded-vote-2.4.10`: 1 commit ahead and 110 behind `upstream/main`; specialized voting branch with unclear Zend product priority.
 - `testing/note_spendability_improvements`: 6 commits ahead and 223 behind `upstream/main`; draft test-only branch covered by upstream PR `#1700`.
+
+## Bleeding-edge refresh (2026-08-06)
+
+- Default branches remain `origin/main` at `4497fe9e` and `upstream/main` at `468d1e9f`.
+  The default-branch range remains `174 111`; Zend draft PR `#34`
+  (`codex/zcash-upstream-sync-2026-08-01`) already contains `upstream/main`, so it remains the
+  only full-parity vehicle. Do not open a duplicate sync branch.
+- Upstream PR `#1955` is clean and approved, but its one-file Keystone batch-signing redaction test
+  changes `rust/src/migration_keystone.rs`, which Zend's provenance-locked migration engine does
+  not carry. It is not independently applicable; wait for the coherent upstream migration stack
+  and artifact reconciliation.
+- Upstream PR `#1956` adds Rust unit-test gating in `swift.yml` and `Makefile`, but is blocked and
+  review-required on the `maint/v2.7.x` line. It needs upstream approval plus a Zend-specific CI
+  and private-engine test-cost review before any adaptation; retain Zend's SHA-pinned actions,
+  read-only permissions, and disabled persisted credentials if it is later carried.
+- Upstream PR `#1957` and active `feature/ironwood-slipstream` descendants remain a blocked,
+  review-required migration/librustzcash stack. The current PR spans Swift migration APIs, FFI
+  welding, generated mocks, Rust migration logic, and locked dependencies, so it cannot be
+  cherry-picked ahead of upstream. Upstream PR `#1942` deletes Darkside coverage and has no Zend
+  testing benefit.
+
+No newly active upstream PR or branch is simultaneously ready, useful, and low-risk for an early
+Zend carry. Continue to route the focused decrypt sentinel fix through Zend PR `#35`, and retain
+funded-device migration evidence as a prerequisite for the full-parity PR `#34`.
