@@ -49,6 +49,13 @@
 //  security boundary. `MigrationFFITests` covers the other half — the rust seam refusing a forged
 //  id over the real FFI, which is the actual safety backstop.
 //
+//  ONE deliberate escape hatch exists, and it is not reachable from this file's plain import:
+//  both initializers are `@_spi(Testing) public`, so a TEST target that writes
+//  `@_spi(Testing) import ZcashLightClientKit` may construct instructions (downstream apps'
+//  suites need genuine instructions to exercise their drivers). The SPI name is the ceremony —
+//  greppable, deliberate, and never present in a production import. This file intentionally
+//  keeps the plain import so the claims above stay verified against the surface an app ships on.
+//
 
 import Foundation
 import XCTest

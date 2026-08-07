@@ -25,7 +25,7 @@
 import XCTest
 import libzcashlc
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZcashLightClientKit
 
 final class MigrationFFITests: XCTestCase {
     var dbData: URL!

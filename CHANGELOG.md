@@ -226,9 +226,13 @@ Changes are relative to `2.8.0-rc.3`.
   proving CPU and cranks again next time; `performMigrationBroadcast` returns the recorded
   `MigrationTransferResult` directly, there being no empty outcome to distinguish it from.
 - Instructions are OPAQUE: `MigrationBroadcastInstruction` (the `.broadcast` step's payload, in
-  place of a bare id) and `MigrationProveTarget` have no public initializers, so the advance
-  marshaling is their only producer and holding one is the proof that the caller cranked.
-  Un-instructed proving or broadcasting does not compile. Quoting the ruling: *"And as such it
+  place of a bare id) and `MigrationProveTarget` have no plainly-importable initializers, so the
+  advance marshaling is their only producer and holding one is the proof that the caller cranked.
+  Un-instructed proving or broadcasting does not compile. The one deliberate exception is for
+  TEST targets: both initializers are `@_spi(Testing) public`, so a suite that writes
+  `@_spi(Testing) import ZcashLightClientKit` can construct genuine instructions to exercise its
+  driver — the SPI name is the opt-in ceremony, greppable and never present in production
+  imports. Quoting the ruling: *"And as such it
   should be provided with no capabilities for such semantic goals."* This is a Swift-surface
   property and NOT a security boundary — at the C ABI everything is forgeable, and the Rust
   executors' per-row state gating (a non-`Proved` row is refused; a row not awaiting its proof is

@@ -117,16 +117,18 @@ public struct MigrationBroadcastInstruction: Equatable, Sendable {
     /// ``MigrationTransactionStatus/id`` and for logging.
     public let id: UInt32
 
-    /// Creates an instruction. INTERNAL by design: instructions are produced only by the advance
-    /// marshaling (`FfiMigrationAdvanceStep.unsafeToMigrationAdvance()`); SDK tests reach it
-    /// through `@testable`.
+    /// Creates an instruction. SPI(Testing) by design: instructions are produced only by the
+    /// advance marshaling (`FfiMigrationAdvanceStep.unsafeToMigrationAdvance()`), and a plain
+    /// `import ZcashLightClientKit` cannot name this initializer — possession of an instruction
+    /// proves the caller cranked. TEST targets (the SDK's own, and downstream apps') opt in with
+    /// `@_spi(Testing) import ZcashLightClientKit`: the SPI name is the ceremony that keeps the
+    /// capability boundary greppable and deliberate rather than ambient, and it must never
+    /// appear in a production import.
     ///
-    /// Written out rather than left to synthesis even though the two are identical today: the
-    /// internal access level is the whole capability discipline, and this declaration is where it
-    /// is stated and documented. Deleting it would leave the same behavior with the reasoning
-    /// nowhere, one `public` away from silently becoming forgeable.
-    // swiftlint:disable:next unneeded_synthesized_initializer
-    init(id: UInt32) {
+    /// Written out rather than left to synthesis: the access level IS the capability discipline,
+    /// and this declaration is where it is stated and documented. Widening it without the SPI
+    /// attribute would silently make instructions forgeable.
+    @_spi(Testing) public init(id: UInt32) {
         self.id = id
     }
 }
@@ -164,10 +166,12 @@ public struct MigrationProveTarget: Equatable, Sendable {
     /// reading of the row against the same dueness targets the advance judged with.
     public let isScheduleDue: Bool
 
-    /// Creates a `MigrationProveTarget`. INTERNAL by design: prove targets are produced only by
-    /// the advance marshaling (`FfiMigrationAdvanceStep.unsafeToMigrationAdvance()`); SDK tests
-    /// reach it through `@testable`.
-    init(id: UInt32, kind: MigrationTransactionStatus.Kind, isScheduleDue: Bool = false) {
+    /// Creates a `MigrationProveTarget`. SPI(Testing) by design: prove targets are produced only
+    /// by the advance marshaling (`FfiMigrationAdvanceStep.unsafeToMigrationAdvance()`), and a
+    /// plain import cannot name this initializer. Test targets opt in with
+    /// `@_spi(Testing) import ZcashLightClientKit` — the ceremony import that must never appear
+    /// in production code; see ``MigrationBroadcastInstruction/init(id:)`` for the full rationale.
+    @_spi(Testing) public init(id: UInt32, kind: MigrationTransactionStatus.Kind, isScheduleDue: Bool = false) {
         self.id = id
         self.kind = kind
         self.isScheduleDue = isScheduleDue
