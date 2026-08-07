@@ -74,7 +74,7 @@ use std::slice;
 
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
-use orchard::keys::SpendAuthorizingKey;
+use orchard::keys::SpendingKey;
 use rand::rngs::OsRng;
 use rusqlite::{Connection, OptionalExtension};
 use zcash_client_backend::data_api::wallet::{
@@ -1044,15 +1044,17 @@ fn encode_schedule_from_state(
 /// what guarantees a commit can only sign the exact plan the user reviewed). On the resume path
 /// the handle is not consulted: the commitment already happened — with a handle-verified plan —
 /// and is durable, so there is nothing left the handle could protect. `unsigned_out` picks the
-/// `build_preparation_unsigned` / `commit_preparation` variant; `ask` is the account's Orchard
-/// spend authority, required by (and live only for) the second. A terminal stored run (a
-/// completed or cancelled previous migration) is REPLACED — that is the sequential-runs path.
-/// When the cached preview came through the immediate lane, the committed transfers' scheduled
-/// heights are rewritten to the commit tip (everything due at once; preparation mining order
-/// still gates transfers via their dependencies).
+/// `build_preparation_unsigned` / `commit_preparation` variant; `sk` is the account's Orchard
+/// spending key, required by (and live only for) the second — the engine derives its full viewing
+/// key and checks it against the account's before building anything, so a foreign key is refused
+/// as [`engine::CommitError::WrongSpendAuthority`] rather than silently signing nothing. A
+/// terminal stored run (a completed or cancelled previous migration) is REPLACED — that is the
+/// sequential-runs path. When the cached preview came through the immediate lane, the committed
+/// transfers' scheduled heights are rewritten to the commit tip (everything due at once;
+/// preparation mining order still gates transfers via their dependencies).
 fn commit_or_resume(
     ctx: &mut CallCtx,
-    ask: Option<&SpendAuthorizingKey>,
+    sk: Option<&SpendingKey>,
     unsigned_out: bool,
     plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<(MigrationState, Vec<(MigrationTransferId, Vec<u8>, u32)>)> {
@@ -1104,12 +1106,12 @@ fn commit_or_resume(
             .collect::<anyhow::Result<Vec<_>>>()?;
         (state, unsigned)
     } else {
-        let ask = ask.ok_or_else(|| anyhow!("signing requires the account's spending key"))?;
+        let sk = sk.ok_or_else(|| anyhow!("signing requires the account's spending key"))?;
         let state = engine::commit_preparation(
             &ctx.network,
             target,
             &mut backend,
-            ask,
+            sk,
             &cached.plan,
             &mut rng,
             ReplanThreshold::DEFAULT,
@@ -1123,7 +1125,10 @@ fn commit_or_resume(
 }
 
 /// Map a commit error, routing `StalePlan` through the stable plan-stale prefix (the actionable
-/// "re-propose" signal).
+/// "re-propose" signal). `WrongSpendAuthority` — the spending key passed in does not derive to the
+/// account's stored viewing key — is a caller-contract violation, not a wallet-state condition the
+/// platform recovers from by retrying the same call, so it gets no dedicated prefix: the generic
+/// arm's message (from the engine's own `Display`) already names the mismatch plainly.
 fn map_commit_err(e: engine::CommitError<AdapterError>) -> anyhow::Error {
     match e {
         engine::CommitError::StalePlan => {
@@ -1136,8 +1141,9 @@ fn map_commit_err(e: engine::CommitError<AdapterError>) -> anyhow::Error {
 /// Map a rebuild-on-expiry error. `FundingNoteUnavailable` gets the actionable message: the
 /// expired transfer's EXACT funding note (matched by nullifier identity — the engine deliberately
 /// never substitutes an equal-value note, which could be a sibling transfer's) was spent outside
-/// the migration, so the remaining balance must be re-planned via the restart lane. Everything
-/// else is a hard error carrying the engine's detail.
+/// the migration, so the remaining balance must be re-planned via the restart lane.
+/// `WrongSpendAuthority` — as with [`map_commit_err`] — is a caller-contract violation and gets no
+/// dedicated prefix. Everything else is a hard error carrying the engine's detail.
 fn map_rebuild_err(e: engine::RebuildError<AdapterError>) -> anyhow::Error {
     match e {
         engine::RebuildError::FundingNoteUnavailable(value) => anyhow!(
@@ -3215,13 +3221,14 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
 ) -> *mut FfiPreparedTransfer {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        // The decoded spending key is projected straight to the Orchard spend authority the
-        // engine's signing entry point takes, and never reaches the adapter: no migration type
-        // holds spend authority, so the key is live only for this call.
-        let ask =
-            SpendAuthorizingKey::from(unsafe { crate::decode_usk(usk_ptr, usk_len)? }.orchard());
+        // The decoded spending key is handed straight to the engine's signing entry point, which
+        // derives its own full viewing key and checks it against the account's before building
+        // anything. It never reaches the adapter: no migration type holds spend authority, so the
+        // key is live only for this call.
+        let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
 
-        let (mut state, _) = commit_or_resume(&mut ctx, Some(&ask), false, proposal_handle)?;
+        let (mut state, _) =
+            commit_or_resume(&mut ctx, Some(usk.orchard()), false, proposal_handle)?;
 
         // The preparation transaction to prove now and return for immediate broadcast (see
         // [`ceremony_preparation_pick`] for which row and why). Proven now, against the wallet's
@@ -3520,9 +3527,8 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let ask =
-            SpendAuthorizingKey::from(unsafe { crate::decode_usk(usk_ptr, usk_len)? }.orchard());
-        commit_or_resume(&mut ctx, Some(&ask), false, proposal_handle)?;
+        let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
+        commit_or_resume(&mut ctx, Some(usk.orchard()), false, proposal_handle)?;
         Ok(true)
     });
     unwrap_exc_or(res, false)
@@ -3890,17 +3896,15 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
 ) -> *mut FfiMigrationSchedule {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        // As on the commit lane: the decoded key becomes an Orchard spend authority here and
-        // nowhere else, and `None` is the external-signer lane that never had one.
-        let ask = if usk_ptr.is_null() {
+        // As on the commit lane: the decoded key is handed to the engine's signing entry point
+        // here and nowhere else, and `None` is the external-signer lane that never had one.
+        let usk = if usk_ptr.is_null() {
             if usk_len != 0 {
                 return Err(anyhow!("usk_len must be 0 when usk_ptr is null"));
             }
             None
         } else {
-            Some(SpendAuthorizingKey::from(
-                unsafe { crate::decode_usk(usk_ptr, usk_len)? }.orchard(),
-            ))
+            Some(unsafe { crate::decode_usk(usk_ptr, usk_len)? })
         };
 
         // Reconcile before judging expiry: a Broadcast transfer the wallet has since observed
@@ -3924,11 +3928,11 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
         let mut rng = OsRng;
         let mut backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
         for id in &expired {
-            if let Some(ask) = ask.as_ref() {
+            if let Some(sk) = usk.as_ref().map(|usk| usk.orchard()) {
                 engine::rebuild_expired_transfer(
                     &ctx.network,
                     &backend,
-                    ask,
+                    sk,
                     &mut state,
                     *id,
                     &mut rng,
@@ -5958,12 +5962,9 @@ mod tests {
             "a funded account's plan must schedule at least one transfer"
         );
 
-        let ask = SpendAuthorizingKey::from(
-            unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
-                .expect("the fixture usk decodes")
-                .orchard(),
-        );
-        let (state, unsigned) = commit_or_resume(&mut ctx, Some(&ask), false, handle)
+        let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
+            .expect("the fixture usk decodes");
+        let (state, unsigned) = commit_or_resume(&mut ctx, Some(usk.orchard()), false, handle)
             .expect("commit with the plan's own handle must succeed");
         assert!(
             unsigned.is_empty(),
@@ -6036,12 +6037,9 @@ mod tests {
             "each cached plan draws a fresh, distinct handle"
         );
 
-        let ask = SpendAuthorizingKey::from(
-            unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
-                .expect("the fixture usk decodes")
-                .orchard(),
-        );
-        let err = commit_or_resume(&mut ctx, Some(&ask), false, handle1)
+        let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
+            .expect("the fixture usk decodes");
+        let err = commit_or_resume(&mut ctx, Some(usk.orchard()), false, handle1)
             .expect_err("committing with the SUPERSEDED first handle must fail");
         let message = err.to_string();
         assert!(
@@ -6052,6 +6050,80 @@ mod tests {
             message.contains("superseded"),
             "the detail must be the Superseded arm's message, not Missing's: {message}"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A spending key that does not belong to the committing account is refused before anything
+    /// is built or persisted: the engine derives the key's own full viewing key and checks it
+    /// against the account's stored one ([`engine::CommitError::WrongSpendAuthority`], mirroring
+    /// upstream librustzcash PR #2951's signing-boundary fix). Constructing the foreign key is a
+    /// bare ZIP 32 derivation from an unrelated seed — no second wallet account, and nothing this
+    /// test does ever reaches storage.
+    #[test]
+    fn commit_or_resume_rejects_a_spending_key_that_is_not_the_accounts() {
+        let path = init_fixture_db("zcashlc_migration_commit_rejects_foreign_key");
+        let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_note(&path, &usk_bytes, 1_234_567_890);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+
+        let (plan, _reference_height, handle) = plan_and_cache(&mut ctx, false)
+            .expect("planning must succeed")
+            .expect("the funded account has a real migration plan");
+        assert_ne!(handle, 0, "a real cached plan must mint a non-zero handle");
+        assert!(
+            !plan.schedule().is_empty(),
+            "a funded account's plan must schedule at least one transfer"
+        );
+
+        // A spending key for a wholly unrelated seed — never registered as any account in this
+        // wallet, so its full viewing key cannot match the one the committing account stores.
+        let foreign_usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &zcash_protocol::consensus::MAIN_NETWORK,
+            &[9u8; 32],
+            zip32::AccountId::ZERO,
+        )
+        .expect("the foreign usk must derive");
+
+        let err = commit_or_resume(&mut ctx, Some(foreign_usk.orchard()), false, handle)
+            .expect_err("committing with a foreign spending key must fail");
+        let message = err.to_string();
+        assert!(
+            !message.starts_with(PLAN_STALE_PREFIX),
+            "a wrong key is a caller-contract violation, not a stale-plan condition: {message}"
+        );
+        assert!(
+            message.contains("spending key is not the account's"),
+            "the error must name the spend-authority mismatch: {message}"
+        );
+
+        // The plan handle survives: `commit_or_resume` never reached `migration_plan_cache::clear`,
+        // so the SAME handle can still commit with the account's own key.
+        assert!(matches!(
+            migration_plan_cache::get(&ctx.db_path, ctx.account_bytes, handle),
+            Ok(_)
+        ));
 
         let _ = std::fs::remove_file(&path);
     }

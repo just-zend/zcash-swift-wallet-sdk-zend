@@ -185,11 +185,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deleted. Three consequences reach behaviour rather than just code:
   - No migration type holds spend authority any more, and none can be given it. The adapter is
     built from the account's VIEWING key alone, and the engine's two signing entry points
-    (`commit_preparation`, `rebuild_expired_transfer`) take an `orchard::keys::SpendAuthorizingKey`
-    per call — so the FFI functions that sign derive one from the spending key they just decoded
-    and drop it with the call, instead of parking a `UnifiedSpendingKey` inside an adapter that
-    mostly does not need one. The external-signer lanes are unchanged: they call the unsigned
-    entry points, which take no authority at all.
+    (`commit_preparation`, `rebuild_expired_transfer`) take an `orchard::keys::SpendingKey` per
+    call — deriving its full viewing key and checking it against the account's stored one BEFORE
+    building anything, refusing a foreign key with `CommitError::WrongSpendAuthority` /
+    `RebuildError::WrongSpendAuthority` rather than silently signing nothing — so the FFI functions
+    that sign pass the spending key they just decoded straight through and drop it with the call,
+    instead of parking a `UnifiedSpendingKey` inside an adapter that mostly does not need one. The
+    external-signer lanes are unchanged: they call the unsigned entry points, which take no
+    authority at all.
   - The spendable-note snapshot that keeps a commit linear in the wallet's note count is
     upstream's own (librustzcash #2946) rather than an SDK mirror of it.
   - `PoolMigrationRead::mined_height` is answered by the adapter from the wallet's FULLY-SCANNED

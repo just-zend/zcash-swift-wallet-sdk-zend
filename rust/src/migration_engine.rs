@@ -25,8 +25,10 @@
 //!
 //! There is no spending key in this module, and no way to give the adapter one — [`WalletMigration`]
 //! holds viewing authority and offers no constructor that takes more. The engine's two signing
-//! entry points take an `orchard::keys::SpendAuthorizingKey` per call, so the FFI functions that
-//! sign derive one from the spending key they just decoded and drop it with the call.
+//! entry points take an `orchard::keys::SpendingKey` per call — deriving its full viewing key and
+//! refusing eagerly if it does not match the account's, before building anything — so the FFI
+//! functions that sign pass the spending key they just decoded straight through and drop it with
+//! the call.
 //!
 //! Proving (`engine::MigrationProver`) is upstream's `wallet::WalletMigrationProver` over a
 //! separate MUTABLE wallet borrow: resolving witnesses needs the note commitment tree, which the
