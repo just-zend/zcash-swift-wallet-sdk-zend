@@ -163,33 +163,26 @@ lto = true
 slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "ab89ada45f2ef893a05fcefa0ead99f87d848a4e" }
 
 ## Update the `rev` value in the following lines to use a hash-pinned version of the librustzcash crates.
-# INTERIM PIN (MOB-1466): the michal/tmp-next-due-plus-exact-funding-note-count branch head —
-# the previous pin's rebased public next-due selection (#2927's scanned-chain-tip overdue
-# re-spread and MigrationState's public read-only next-due selection,
-# next_due_broadcast/next_provable — a caller reads the engine's own delivery-lane choice
-# instead of recomputing it client-side) merged with the #2949 exact-funding-note-count
-# follow-up. Main itself now also carries #2909 (migration transactions classified against ZIP
-# 318 at store time — what the app's Activity labels key on), #2907 (engine next_* selection
-# ordered by height), #2910 (a missed broadcast schedule is re-spread on resume), #2936
-# (advance_migration returns satisfiability::Advance: the verified step plus the next-wake
-# outlook), #2939 (the Prove step serves the whole provable set, gated on a reorg-stable anchor
-# depth), #2946 (the upstream wallet adapter snapshots spendable notes — commit-time signing
-# linear, not quadratic), #2943 (first-fit-decreasing preparation strategy), #2945/#2947
-# (denomination follow-ups: exact funding notes preserved, quantize-once/truncation,
-# shape-bounded floors), and #2916/#2915/#2911 (ZIP 318 classification written at store time;
-# idempotent sent-transaction stores).
-# Remove the pin (recomment the block) at the first published rc that contains all of it.
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "4d654982c4cc3d243ba0ee8f595890a19656c15a" }
+# INTERIM PIN (MOB-1466): the kris/tmp-respread-on-main branch head — librustzcash main as of
+# 2026-08-06 (post-#2949) merged with PR #2927's head (the scanned-chain-tip overdue re-spread:
+# the released overdue step lands on scanned chain data, re-spread only when more of the
+# schedule is due). This pin deliberately EXCLUDES #2938's read-only next-due selectors
+# (next_due_broadcast/next_provable): every SDK lane now drives through
+# `satisfiability::advance_migration` (the verified step + outlook) and takes its read-only
+# views from `MigrationState::transaction_statuses` — see the observations recorded on #2938,
+# which is expected to be withdrawn.
+# Remove the pin (recomment the block) at the first published rc that contains #2927.
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
 
 # Reinstate together with the voting dependencies above:
 # zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "e53e74487d31ad0f5713580fb2f0222b53ae9db8" }
