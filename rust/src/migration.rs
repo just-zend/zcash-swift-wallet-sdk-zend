@@ -95,7 +95,7 @@ use zcash_pool_migration::engine::{
     MigrationTransferId, MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
 use zcash_pool_migration::satisfiability::{
-    AdvanceConfig, DuenessTargets, ReorgSettleDepth, ReplanThreshold, UnsatisfiableKind,
+    Advance, AdvanceConfig, DuenessTargets, ReorgSettleDepth, ReplanThreshold, UnsatisfiableKind,
     advance_migration,
 };
 use zcash_pool_migration::scheduling::{WakeupParams, WakeupScheduleError};
@@ -2388,6 +2388,29 @@ fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
         .ok_or_else(|| anyhow!("spendable Orchard balance overflows"))
 }
 
+/// One verified crank of the engine's drive: builds the store adapter, judges dueness at the
+/// scanned target plus the FFI's optional `estimated_tip` (`-1` = none), and returns the
+/// engine's `Advance` with every determination it made already persisted.
+fn drive_advance(
+    ctx: &mut CallCtx,
+    state: &mut MigrationState,
+    estimated_tip: i64,
+) -> anyhow::Result<Advance> {
+    let targets = dueness_targets(ctx.tip()?, estimated_tip);
+    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+    advance_migration(
+        &mut backend,
+        state,
+        targets,
+        &AdvanceConfig::new(ReorgSettleDepth::new(
+            zcash_pool_migration::scheduling::PROVABLE_ANCHOR_DEPTH,
+        )),
+        // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
+        // inter-broadcast gaps, so advancing needs entropy.
+        &mut OsRng,
+    )
+}
+
 /// Advances the stored run with upstream's public satisfiability API, using scanned and estimated
 /// targets plus the provable-anchor reorg-settle depth. Reevaluate and Replan are projected onto
 /// the existing Attend DTO case so the Swift public enum remains source-compatible.
@@ -2440,21 +2463,10 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
             ));
         }
         let targets = dueness_targets(ctx.tip()?, estimated_tip);
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
         // librustzcash #2936: the advance returns the verified step plus a next-wake OUTLOOK
         // (`Advance::next`) — this conduit marshals both, the step via the borrow `.step()`
         // returns and the outlook via `.next()`, onto every arm below.
-        let advance = advance_migration(
-            &mut backend,
-            &mut state,
-            targets,
-            &AdvanceConfig::new(ReorgSettleDepth::new(
-                zcash_pool_migration::scheduling::PROVABLE_ANCHOR_DEPTH,
-            )),
-            // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
-            // inter-broadcast gaps, so advancing needs entropy.
-            &mut OsRng,
-        )?;
+        let advance = drive_advance(&mut ctx, &mut state, estimated_tip)?;
         let next = advance.next();
         Ok(match advance.step() {
             AdvanceStep::Reevaluate | AdvanceStep::Replan => {
