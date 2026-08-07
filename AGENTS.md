@@ -207,7 +207,7 @@ hand-written `swift` command:
 
 | Workflow | Trigger | Local equivalent |
 |---|---|---|
-| `swift.yml` | any PR outside its `paths-ignore` list | `make check` (`make build` then `make test-offline`) |
+| `swift.yml` | any PR outside its `paths-ignore` list | `make check` (`make build`, `make test-offline`, `make test-rust`) |
 | `swiftlint.yml` | any PR touching `**/*.swift` or `.swiftlint.yml` | `make lint` |
 | `proto-sync.yml` | any PR outside its `paths-ignore` list | `./Scripts/update-proposal-proto.sh --check` |
 | `zizmor.yml` | every PR | matters when you change a workflow file |
@@ -233,8 +233,12 @@ macOS slice alone is enough to build and test the Swift package:
 ```bash
 make ffi-macos           # once per branch, and after each Rust edit
 make configure-local-ffi # point Package.swift at the local build
-make check               # build, then the offline suite
+make check               # build, the offline suite, then the Rust tests
 ```
+
+`make test-rust` runs `cargo test`. The Rust unit tests sit below the Swift
+package, so no `swift test` filter reaches them and `make test-offline` passing
+says nothing about them; `swift.yml` runs both.
 
 ### When to run which
 
@@ -244,7 +248,7 @@ make check               # build, then the offline suite
 | Any other doc, including this one | `make check` — the build runs regardless |
 | Swift style or rename | `make lint` |
 | Swift logic or refactor | `make check`, then `make lint` |
-| Rust internals | `make ffi-macos`, then `make check` |
+| Rust internals | `make ffi-macos`, then `make check` (which runs `make test-rust`) |
 | Any change to an FFI signature or a new FFI function | `make ffi-all` (all five architectures) before PRing |
 | Bumping the pinned `zcash_client_backend` | `./Scripts/update-proposal-proto.sh --check` |
 
