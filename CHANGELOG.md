@@ -162,7 +162,7 @@ Changes are relative to `2.8.0-rc.3`.
 
 ### Orchard → Ironwood migration
 
-- A 38-member migration group on the `Synchronizer` protocol, account-scoped by `AccountUUID`. Two
+- A 39-member migration group on the `Synchronizer` protocol, account-scoped by `AccountUUID`. Two
   accounts (for example one software and one hardware-wallet account) can migrate concurrently. Its
   members work without `prepare()`, so a background session can deliver a transfer without starting
   sync, and on custom networks without a prior `Initializer`. `ClosureSynchronizer` and
@@ -195,6 +195,16 @@ Changes are relative to `2.8.0-rc.3`.
   `isScheduleDue`: `true` means the schedule has already reached that transaction's broadcast
   window, so its missing proof is what blocks delivery right now, rather than the opportunistic
   proving a batch ordinarily represents.
+- New: `nextMigrationWake(accountUUID:)` — the drive's own retained outlook, from the most recent
+  `migrationAdvanceStep(accountUUID:)` crank by ANY caller (the sweep, the delivery lane, or a
+  direct call), so a host can ask "when is the next migration wake, per the drive's own plan"
+  without re-cranking the engine. Same advisory-FLOOR contract as `MigrationAdvance.next`: a
+  height, not an appointment, unconditionally superseded by the very next crank's outlook —
+  including to `nil`, so a stale outlook never outlives the crank that replaced it. Complements,
+  never replaces, `migrationSyncWakeups(accountUUID:)`: this is one height, the schedule is many —
+  a host arming OS wake-ups min-folds this outlook's height in alongside the schedule's own
+  heights, as zodl-ios already does. `nil` also means no crank has run yet this session, or the
+  last step's own outcome (not a height) decides what follows.
 - Planning and delivery: a randomized-cadence schedule proposal committed by
   `signAndStoreMigrationSchedule`, proved opportunistically during sync by the new
   `finalizeReadyMigrationTransfers(accountUUID:)` — a LOOP over `migrationAdvanceStep`, proving

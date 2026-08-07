@@ -175,6 +175,14 @@ actor OrchardMigration {
     /// Callers waiting for the in-flight broadcast flow to finish, resumed in bulk when it does.
     private var broadcastFlowWaiters: [CheckedContinuation<Void, Never>] = []
 
+    /// The outlook (``MigrationAdvance/next``) most recently returned by
+    /// ``advanceStep(useEstimatedTip:)`` -- from ANY caller (the sweep, the delivery lane, or a
+    /// direct host call, all of which fold through that one method). Replaced on every crank,
+    /// including with `nil` when that crank's step carried none: the outlook holds only as of the
+    /// state its call returned, so a stale value must never outlive the crank that superseded it.
+    /// Read side for hosts is ``nextMigrationWake``.
+    private var lastOutlook: MigrationNextWork?
+
     /// Creates an `OrchardMigration` from `config`, building its own Rust backend, a dedicated
     /// ``MigrationBroadcaster``, and sync gate. Standalone construction: use
     /// ``init(config:sharedBroadcaster:)`` instead when several accounts must share one broadcaster
@@ -284,7 +292,36 @@ actor OrchardMigration {
         let estimatedTip = useEstimatedTip
             ? await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now())
             : nil
-        return try await welding.migrationAdvanceStep(for: accountUUID, estimatedTip: estimatedTip)
+        let advance = try await welding.migrationAdvanceStep(for: accountUUID, estimatedTip: estimatedTip)
+        // Every crank -- regardless of which caller drove it -- replaces the retained outlook,
+        // including with `nil`: a stale outlook must not outlive the crank that superseded it (see
+        // `lastOutlook`'s doc). A throw above leaves the previous value in place, since it means no
+        // new state was actually observed.
+        lastOutlook = advance?.next
+        return advance
+    }
+
+    /// The engine's OUTLOOK retained from the most recent ``advanceStep(useEstimatedTip:)`` crank —
+    /// by ANY caller (the sweep, the delivery lane, or a direct host call) — so a host can ask
+    /// "when is the next migration wake, per the drive's own plan" without re-cranking the engine
+    /// itself.
+    ///
+    /// ADVISORY and a FLOOR, exactly as ``MigrationAdvance/next`` documents: the height is the
+    /// earliest the outlook's work becomes serviceable, never an appointment — dependencies still
+    /// have to mine, and this value holds only as of the crank that produced it. The VERY NEXT
+    /// crank's outlook supersedes it unconditionally, including to `nil`: a stale outlook must
+    /// never outlive the crank that superseded it.
+    ///
+    /// It complements, never replaces, ``syncWakeups()``: this is ONE height (the very next thing
+    /// to plan for), while the sync-wakeup schedule is MANY (the run's whole proving calendar) — a
+    /// host registering OS wake-ups should min-fold this outlook's height in alongside the
+    /// schedule's own heights, as zodl-ios already does, never treat it as a replacement source.
+    ///
+    /// `nil` means either no crank has run yet this session (``advanceStep(useEstimatedTip:)`` has
+    /// never completed), or the last step's own outcome decides what follows — a chain condition
+    /// (a mining confirmation) or a user/spend-authority action, not a height.
+    var nextMigrationWake: MigrationNextWork? {
+        lastOutlook
     }
 
     /// Live migration progress, or `nil` when no snapshot is reportable: present only while an

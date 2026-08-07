@@ -1223,6 +1223,10 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).syncWakeups()
     }
 
+    public func nextMigrationWake(accountUUID: AccountUUID) async -> MigrationNextWork? {
+        await migrationHost.migration(for: accountUUID).nextMigrationWake
+    }
+
     public func estimatedMigrationChainTip() async throws -> BlockHeight {
         // Wallet-scoped (the samples come from the shared blocks table), so this lives on the
         // host, not on a per-account actor.

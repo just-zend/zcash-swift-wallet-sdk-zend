@@ -50,6 +50,10 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationSyncWakeups(accountUUID: self.accountUUID) }
     }
 
+    // `nextMigrationWake(accountUUID:)` is one of the non-throwing members: its default is the
+    // inert `nil` (`testNextMigrationWakeDefaultReturnsNil` below, alongside the other inert
+    // defaults), not a `MigrationUnimplemented` throw.
+
     func testEstimatedMigrationChainTipDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.estimatedMigrationChainTip() }
     }
@@ -234,6 +238,13 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
     }
 
     // MARK: - Inert defaults
+
+    /// `nil` is the correct session-start answer for the inert default too: no host-level
+    /// conformer means no crank has ever run.
+    func testNextMigrationWakeDefaultReturnsNil() async {
+        let outlook = await synchronizer.nextMigrationWake(accountUUID: accountUUID)
+        XCTAssertNil(outlook, "the inert default must report no retained outlook")
+    }
 
     func testIsMigrationSyncBlockedDefaultReturnsFalse() async {
         let blocked = await synchronizer.isMigrationSyncBlocked()

@@ -1003,6 +1003,49 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         )
     }
 
+    // MARK: - nextMigrationWake retention
+
+    /// Session start: before any crank runs, the retained outlook is `nil` -- the actor's own
+    /// initial state, not a value read off an un-run engine call.
+    func testNextMigrationWakeIsNilBeforeAnyCrank() async throws {
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        let outlook = await migration.nextMigrationWake
+
+        XCTAssertNil(outlook, "no crank has run yet this session")
+    }
+
+    /// A crank's outlook is retained past the call that produced it, so a host can read it later
+    /// without re-cranking the engine.
+    func testNextMigrationWakeRetainsTheMostRecentCranksOutlook() async throws {
+        let outlook = MigrationNextWork(height: 3_000_100, kind: .broadcast)
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .waiting, next: outlook)
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        _ = try await migration.advanceStep()
+
+        let retained = await migration.nextMigrationWake
+        XCTAssertEqual(retained, outlook)
+    }
+
+    /// The NEXT crank's outlook supersedes the previous one unconditionally -- including replacing
+    /// a previously retained outlook with `nil` when the new crank's step carries none, so a stale
+    /// outlook never outlives the crank that superseded it.
+    func testNextMigrationWakeIsReplacedIncludingToNilOnTheNextCrank() async throws {
+        let firstOutlook = MigrationNextWork(height: 3_000_100, kind: .broadcast)
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .waiting, next: firstOutlook)
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+        _ = try await migration.advanceStep()
+        let retainedAfterFirst = await migration.nextMigrationWake
+        XCTAssertEqual(retainedAfterFirst, firstOutlook, "sanity: the first crank's outlook must be retained before it is superseded")
+
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .complete, next: nil)
+        _ = try await migration.advanceStep()
+
+        let retainedAfterSecond = await migration.nextMigrationWake
+        XCTAssertNil(retainedAfterSecond, "a crank with no outlook must clear the previous one, not preserve it")
+    }
+
     // MARK: - Helpers
 
     private func makeMigration(broadcaster: any MigrationBroadcasting) -> OrchardMigration {

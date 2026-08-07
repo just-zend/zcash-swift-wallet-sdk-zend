@@ -699,6 +699,23 @@ public protocol Synchronizer: AnyObject {
     ///   valid wake-up height (an inconsistent stored schedule; rebuild or restart the run).
     func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup]
 
+    /// The drive's retained OUTLOOK for `accountUUID`: the most recent
+    /// ``migrationAdvanceStep(accountUUID:)`` crank's advisory ``MigrationAdvance/next``, from ANY
+    /// caller (the sweep, the delivery lane, or a direct call for this account) — so a host can ask
+    /// "when is the next migration wake, per the drive's own plan" without re-cranking the engine.
+    ///
+    /// ADVISORY and a FLOOR: the height is the earliest the outlook's work becomes serviceable,
+    /// never an appointment, and it holds only as of the crank that produced it — the VERY NEXT
+    /// crank's outlook (even to `nil`) supersedes it unconditionally. It complements, never
+    /// replaces, ``migrationSyncWakeups(accountUUID:)``: this is ONE height, the schedule is
+    /// MANY — a host arming OS wake-ups should min-fold this outlook's height in alongside the
+    /// schedule's own heights, as zodl-ios already does, never treat it as a replacement source.
+    ///
+    /// `nil` means no crank has run this session, or the last step's own outcome (a chain
+    /// condition or user/spend-authority action, not a height) decides what follows.
+    /// - Parameter accountUUID: the account whose retained outlook is of interest.
+    func nextMigrationWake(accountUUID: AccountUUID) async -> MigrationNextWork?
+
     /// The wall-clock ESTIMATED chain tip, projected from the most recently scanned blocks'
     /// header times (the measured-block-rate estimator behind `useEstimatedTip`). Falls back to
     /// the wallet's max SCANNED height when no samples exist. WALLET-scoped, like the batching
@@ -1282,7 +1299,7 @@ public extension Synchronizer {
     // source-breaking change for downstream/stacked conformers (in particular the
     // `SlipstreamSynchronizer` stack, until it carries its own implementations). Conformers with
     // migration support (`SDKSynchronizer`) override every one of these; conformers that don't fall
-    // through here. The throwing members all throw `MigrationUnimplemented`; the three non-throwing
+    // through here. The throwing members all throw `MigrationUnimplemented`; the four non-throwing
     // members get inert defaults instead, documented below — conformers must override them to offer
     // real migration behavior.
 
@@ -1301,6 +1318,12 @@ public extension Synchronizer {
 
     func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
         throw MigrationUnimplemented(member: #function)
+    }
+
+    /// Inert default: conformers must override to provide the retained-outlook accessor. `nil` is
+    /// the correct "no crank has run" answer either way, so this default needs no throwing variant.
+    func nextMigrationWake(accountUUID: AccountUUID) async -> MigrationNextWork? {
+        nil
     }
 
     func estimatedMigrationChainTip() async throws -> BlockHeight {

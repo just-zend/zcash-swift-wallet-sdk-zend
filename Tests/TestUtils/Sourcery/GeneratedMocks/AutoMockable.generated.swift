@@ -2797,6 +2797,26 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - nextMigrationWake
+
+    var nextMigrationWakeAccountUUIDCallsCount = 0
+    var nextMigrationWakeAccountUUIDCalled: Bool {
+        return nextMigrationWakeAccountUUIDCallsCount > 0
+    }
+    var nextMigrationWakeAccountUUIDReceivedAccountUUID: AccountUUID?
+    var nextMigrationWakeAccountUUIDReturnValue: MigrationNextWork?
+    var nextMigrationWakeAccountUUIDClosure: ((AccountUUID) async -> MigrationNextWork?)?
+
+    func nextMigrationWake(accountUUID: AccountUUID) async -> MigrationNextWork? {
+        nextMigrationWakeAccountUUIDCallsCount += 1
+        nextMigrationWakeAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = nextMigrationWakeAccountUUIDClosure {
+            return await closure(accountUUID)
+        } else {
+            return nextMigrationWakeAccountUUIDReturnValue
+        }
+    }
+
     // MARK: - estimatedMigrationChainTip
 
     var estimatedMigrationChainTipThrowableError: Error?
