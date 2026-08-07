@@ -90,7 +90,7 @@ build-release: ## Build the Swift package in release mode
 	$(SWIFT) build -c release $(SWIFT_BUILD_FLAGS)
 
 .PHONY: test
-test: test-offline ## Run the offline test suite
+test: test-scripts test-offline ## Run the script and offline test suites
 
 .PHONY: check
 check: build test ## Build and run the offline tests
@@ -132,6 +132,10 @@ resolve: ## Resolve the SwiftPM dependencies
 .PHONY: test-offline
 test-offline: ## Run the offline tests (no network, no lightwalletd)
 	$(SWIFT) test --filter $(OFFLINE_TEST_FILTER)
+
+.PHONY: test-scripts
+test-scripts: ## Run the release-script unit tests
+	./$(SCRIPTS)/tests/run-tests.sh
 
 .PHONY: test-all
 test-all: ## Run the whole test suite, including networked tests
@@ -232,3 +236,8 @@ rebuild-ffi: ## Rebuild the local FFI (REBUILD_TARGET=ios-sim by default)
 .PHONY: reset-ffi
 reset-ffi: ## Reset the local FFI development environment
 	./$(SCRIPTS)/reset-local-ffi.sh
+
+.PHONY: ffi-artifacts
+ffi-artifacts: require-macos ## Build and upload the release XCFramework (VERSION=X.Y.Z)
+	@[ -n "$(VERSION)" ] || { echo "Set VERSION, e.g. make ffi-artifacts VERSION=2.7.1"; exit 1; }
+	./$(SCRIPTS)/prepare-release.sh artifacts $(VERSION)

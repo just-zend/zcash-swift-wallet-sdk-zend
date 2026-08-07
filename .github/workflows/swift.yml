@@ -29,6 +29,9 @@ jobs:
     - name: Select Xcode version
       run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
+    - name: Run release-script tests
+      run: make test-scripts
+
     # Generate a hash of all Rust source files for cache key
     - name: Generate FFI source hash
       id: ffi-hash
