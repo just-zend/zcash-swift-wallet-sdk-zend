@@ -1150,7 +1150,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // -- an advisory point-in-time check, not a hard mutual-exclusion lock: sync and migration
     // broadcasts must never share a session, and hosts still sequence sessions themselves.
     // `proveMigrationTransactions` is deliberately NOT guarded: proving is what a SYNC session is
-    // for.
+    // for. Neither is `takeMigrationPreparation`, which only RETRIEVES -- a proved preparation's
+    // submission is the app's own ordinary path, not a delivery session of the engine's.
+    // `recordMigrationPreparationBroadcast` is likewise unguarded: it RECORDS an outcome the app
+    // already produced -- refusing the record because a sync is open would only delay the
+    // engine's knowledge of a broadcast that already happened.
 
     public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
         try await migrationHost.migration(for: accountUUID).advanceStep()
@@ -1164,8 +1168,20 @@ public actor SlipstreamSynchronizer: Synchronizer {
         accountUUID: AccountUUID,
         _ instruction: [MigrationProveTarget],
         maxProofs: Int
-    ) async throws -> Int {
+    ) async throws -> MigrationProveOutcome {
         try await migrationHost.migration(for: accountUUID).proveTransactions(instruction, maxProofs: maxProofs)
+    }
+
+    public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
+        try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+    }
+
+    public func recordMigrationPreparationBroadcast(
+        accountUUID: AccountUUID,
+        _ prepared: PreparedMigrationTransfer,
+        result: MigrationTransferResult
+    ) async throws {
+        try await migrationHost.migration(for: accountUUID).recordPreparationBroadcast(prepared, result: result)
     }
 
     public func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {

@@ -724,6 +724,99 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(recorder.callCount, 1, "the host must be consulted when the synchronizer is not syncing")
     }
 
+    // MARK: - The preparation accessor (the txid seam)
+
+    /// `takeMigrationPreparation` forwards to the per-account actor and is NOT sync-guarded: it
+    /// only RETRIEVES, and the pass that produces its txids is a proving pass, which by design
+    /// runs inside a sync session. Guarding it would make the whole seam unreachable where the
+    /// engine intends it to be used.
+    ///
+    /// Proved by stubbing the actor's one engine call to throw a distinctive, non-`ZcashError`
+    /// failure and watching it propagate untouched WHILE THE SYNCHRONIZER IS SYNCING -- had a
+    /// broadcast guard been wired in front, `migrationBroadcastDuringSync` would surface instead.
+    func testTakeMigrationPreparationForwardsEvenWhileSyncing() async throws {
+        struct StubTakePreparationFailure: Error, Equatable {}
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationTakePreparationTxidForThrowableError = StubTakePreparationFailure()
+        let recorder = FactoryInvocationRecorder()
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
+        await synchronizer.updateStatus(.syncing(0.5, false))
+
+        do {
+            _ = try await synchronizer.takeMigrationPreparation(
+                accountUUID: accountUUID,
+                byTxid: Data(repeating: 7, count: 32)
+            )
+            XCTFail("expected the stubbed take-preparation failure to propagate")
+        } catch let error as StubTakePreparationFailure {
+            XCTAssertEqual(error, StubTakePreparationFailure())
+        } catch {
+            XCTFail("expected StubTakePreparationFailure, got \(error)")
+        }
+
+        // See the note in `testSubmitNoteSplitForwardsWhenNotSyncing()`: `...ThrowableError` bypasses
+        // the mock's `...CallsCount` bump, so the recorder + exact stub type are the proof here.
+        XCTAssertEqual(recorder.callCount, 1, "a retrieval must reach the host even mid-sync")
+    }
+
+    /// The txid reaches the engine verbatim, and the DTO comes back whole -- engine transfer id
+    /// included, which is what lets a host record the submission's outcome with no identity of
+    /// its own.
+    func testTakeMigrationPreparationPassesTheTxidThroughAndReturnsTheEngineId() async throws {
+        let txid = Data(repeating: 0x5A, count: 32)
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationTakePreparationTxidForReturnValue = PreparedMigrationTransfer(
+            id: 11,
+            txid: txid,
+            pczt: Data([0xDE, 0xAD, 0xBE, 0xEF])
+        )
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+
+        let prepared = try await synchronizer.takeMigrationPreparation(accountUUID: accountUUID, byTxid: txid)
+
+        XCTAssertEqual(prepared.id, 11, "the engine transfer id crosses the surface")
+        XCTAssertEqual(prepared.txid, txid)
+        XCTAssertEqual(prepared.pczt, Data([0xDE, 0xAD, 0xBE, 0xEF]), "the finalized transaction is submittable as-is")
+        XCTAssertEqual(welding.migrationTakePreparationTxidForReceivedArguments?.txid, txid)
+        XCTAssertEqual(welding.migrationTakePreparationTxidForReceivedArguments?.account, accountUUID)
+    }
+
+    /// The seam's closing member forwards to the per-account actor, and — like the accessor — is
+    /// NOT sync-guarded: the pass that submits a preparation is a proving pass, which runs inside
+    /// a sync session. The engine's mark reaches the standard record path with the retrieval DTO's
+    /// own id.
+    func testRecordMigrationPreparationBroadcastForwardsEvenWhileSyncing() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationTransactionStatusesForReturnValue = [
+            MigrationTransactionStatus(
+                id: 5,
+                kind: .preparation(layer: 0, index: 0),
+                state: .proved,
+                scheduledHeight: 3_000_000,
+                expiryHeight: 3_000_100,
+                isReady: true,
+                nextAction: .broadcast,
+                blockedOn: nil,
+                dependsOn: [],
+                anchorBoundaryHeight: nil
+            )
+        ]
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+        await synchronizer.updateStatus(.syncing(0.5, false))
+
+        let prepared = PreparedMigrationTransfer(id: 5, txid: Data(repeating: 0x5A, count: 32), pczt: Data([0x01]))
+        try await synchronizer.recordMigrationPreparationBroadcast(
+            accountUUID: accountUUID,
+            prepared,
+            result: .success(txId: prepared.txid.toHexStringTxId())
+        )
+
+        let received = try XCTUnwrap(welding.migrationRecordTransferResultTransferIdResultForReceivedArguments)
+        XCTAssertEqual(received.transferId, 5, "the engine mark is keyed by the retrieval DTO's id")
+        XCTAssertEqual(received.account, accountUUID)
+    }
+
     // MARK: - Resource lifecycle: migration-host registration must not retain the Initializer
 
     /// Regression test: `SDKSynchronizer.init` registers a factory closure for `OrchardMigrationHost`

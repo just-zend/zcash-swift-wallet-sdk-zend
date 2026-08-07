@@ -2023,8 +2023,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationProveTransactions(ids: [UInt32], maxProofs: Int, for account: AccountUUID) async throws -> Int {
-        guard !ids.isEmpty, maxProofs > 0 else { return 0 }
+    func migrationProveTransactions(
+        ids: [UInt32],
+        maxProofs: Int,
+        for account: AccountUUID
+    ) async throws -> MigrationProveOutcome {
+        guard !ids.isEmpty, maxProofs > 0 else {
+            return MigrationProveOutcome(totalProved: 0, preparationTxids: [])
+        }
 
         // The batch is CHUNKED: one proof per FFI call, with a suspension between calls. Each
         // proof is seconds of CPU. Since the read/write split, every read-only call runs OFF
@@ -2043,14 +2049,17 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         // caller's `maxProofs` budget is spent. Because each chunk is capped at 1 and a skip never
         // counts against the rust cap, the budget is honoured EXACTLY: this returns at most
         // `maxProofs`, all of them real proofs.
+        //
+        // The chunks' PREPARATION TXIDS accumulate across the whole pass, in prove order, so the
+        // caller sees one handoff list for the pass rather than one per chunk.
         var totalProved = 0
+        var preparationTxids: [Data] = []
         while totalProved < maxProofs {
-            // `-1` is never a legitimate count, so the return value alone decides success.
             // The last-error is cleared first so the message read on failure cannot be a
             // leftover from an earlier call on this thread.
             zcashlc_clear_last_error()
 
-            let proved = ids.withUnsafeBufferPointer { buffer in
+            let outcomePtr = ids.withUnsafeBufferPointer { buffer in
                 zcashlc_migration_prove_transactions(
                     dbData.0,
                     dbData.1,
@@ -2062,16 +2071,21 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
                 )
             }
 
-            guard proved >= 0 else {
+            guard let outcomePtr else {
                 throw migrationRoutedError(
                     lastErrorMessage(fallback: "`migrationProveTransactions` failed with unknown error"),
                     fallback: ZcashError.rustMigrationProveTransactions
                 )
             }
-            guard proved > 0 else {
-                return totalProved
+
+            let chunk = outcomePtr.pointee.unsafeToMigrationProveOutcome()
+            zcashlc_free_migration_prove_outcome(outcomePtr)
+
+            guard chunk.totalProved > 0 else {
+                return MigrationProveOutcome(totalProved: totalProved, preparationTxids: preparationTxids)
             }
-            totalProved += Int(proved)
+            totalProved += chunk.totalProved
+            preparationTxids.append(contentsOf: chunk.preparationTxids)
 
             // Let queued `DBActor` writers run before the next proof.
             await Task.yield()
@@ -2079,7 +2093,50 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         // The budget is spent, with the batch possibly still holding provable rows: the caller
         // advances again and re-passes whatever the next crank offers.
-        return totalProved
+        return MigrationProveOutcome(totalProved: totalProved, preparationTxids: preparationTxids)
+    }
+
+    // DB-AUDIT (2026-08-07): WRITE — the accessor IS the store's atomic broadcast seam: it records
+    // the transaction in the wallet's own tables in the same database transaction that hands the
+    // bytes back. Stays serialized.
+    @DBActor
+    func migrationTakePreparation(txid: Data, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
+        guard txid.count == 32 else {
+            throw ZcashError.rustMigrationTakePreparation(
+                "`migrationTakePreparation` was given a \(txid.count)-byte txid; it must be 32 bytes"
+            )
+        }
+
+        let preparedPtr: UnsafeMutablePointer<FfiPreparedTransfer>? = txid.withUnsafeBytes { buffer in
+            guard let bufferPtr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return nil
+            }
+
+            return zcashlc_migration_take_preparation_by_txid(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                bufferPtr
+            )
+        }
+
+        guard let preparedPtr else {
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationTakePreparation` failed with unknown error"),
+                fallback: ZcashError.rustMigrationTakePreparation
+            )
+        }
+
+        defer { zcashlc_free_migration_prepared_transfer(preparedPtr) }
+
+        guard let prepared = preparedPtr.pointee.unsafeToPreparedMigrationTransfer() else {
+            throw ZcashError.rustMigrationTakePreparation(
+                lastErrorMessage(fallback: "`migrationTakePreparation` returned a malformed transaction")
+            )
+        }
+
+        return prepared
     }
 
     // DB-AUDIT (2026-08-03): WRITE — the broadcast seam records the transaction in the wallet's
@@ -3102,6 +3159,26 @@ extension FfiPreparedTransfer {
             txid: Data(FfiTxId(tuple: txid).array),
             pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
         )
+    }
+}
+
+extension FfiMigrationProveOutcome {
+    /// Converts an [`FfiMigrationProveOutcome`] into a [`MigrationProveOutcome`], copying the
+    /// preparation txids out of the rust-owned buffer (the caller still frees the DTO).
+    ///
+    /// Total-only is a valid shape: a pass that proved transfers alone reports its count with no
+    /// txids, because only preparations are retrievable.
+    func unsafeToMigrationProveOutcome() -> MigrationProveOutcome {
+        var txids: [Data] = []
+        txids.reserveCapacity(Int(preparation_txids_len))
+
+        if let txidsPtr = preparation_txids {
+            for index in 0 ..< Int(preparation_txids_len) {
+                txids.append(Data(FfiTxId(tuple: txidsPtr.advanced(by: index).pointee).array))
+            }
+        }
+
+        return MigrationProveOutcome(totalProved: Int(total_proved), preparationTxids: txids)
     }
 }
 

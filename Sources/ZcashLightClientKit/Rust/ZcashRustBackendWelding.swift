@@ -623,8 +623,13 @@ protocol ZcashRustBackendWelding {
 
     /// Proves the NAMED migration transactions — the batch a prior
     /// ``migrationAdvanceStep(for:estimatedTip:)`` call returned as its
-    /// ``MigrationAdvanceStep/prove(transactions:)`` step — persisting each proof, and returns how
-    /// many were proved (`0` is the ordinary "nothing left to prove right now" answer).
+    /// ``MigrationAdvanceStep/prove(transactions:)`` step — persisting each proof, and returns a
+    /// ``MigrationProveOutcome``: how many were proved (`0` is the ordinary "nothing left to prove
+    /// right now" answer) and THE TXIDS OF THE PREPARATIONS it proved.
+    ///
+    /// The txids are the handoff to ``migrationTakePreparation(txid:for:)``: a proved preparation
+    /// is submitted through the caller's ordinary raw-transaction machinery. Transfers are never
+    /// named — they are delivered by the drive's broadcast instruction alone.
     ///
     /// This NEVER asks the engine what to prove: `migrationAdvanceStep` is the top-level call and
     /// every executor is subservient to it, so there is no proving to do without having first been
@@ -644,7 +649,43 @@ protocol ZcashRustBackendWelding {
     /// caller bug rather than silently no-op'ing.
     /// - Throws: `migrationProvingUnavailable` when proving fails for a non-transient reason;
     ///   `rustMigrationProveTransactions` for other rust-layer errors.
-    func migrationProveTransactions(ids: [UInt32], maxProofs: Int, for account: AccountUUID) async throws -> Int
+    func migrationProveTransactions(
+        ids: [UInt32],
+        maxProofs: Int,
+        for account: AccountUUID
+    ) async throws -> MigrationProveOutcome
+
+    /// Serves the PROVED PREPARATION with `txid` for submission — the retrieval half of the
+    /// handoff ``migrationProveTransactions(ids:maxProofs:for:)`` opens by returning the
+    /// preparations' txids.
+    ///
+    /// A proved preparation is a complete PCZT, so its submission is the caller's ORDINARY path,
+    /// not the engine's delivery ceremony: preparations are ZIP 318-exempt and the engine's own
+    /// contract is that a preparation is broadcast as soon as it is proved. Submit the returned
+    /// ``PreparedMigrationTransfer/pczt`` — a FINALIZED CONSENSUS TRANSACTION, submittable as-is —
+    /// through whatever machinery already submits raw transactions, then close the loop with
+    /// ``migrationRecordTransferResult(transferId:result:for:)`` under the returned
+    /// ``PreparedMigrationTransfer/id`` — the ENGINE TRANSFER ID, so the caller keeps no identity
+    /// of its own. (The `Synchronizer` surface wraps that last step as
+    /// `recordMigrationPreparationBroadcast(accountUUID:_:result:)`, which gates it on the id
+    /// naming a preparation.) The WALLET's own record needs no separate call: it bound at
+    /// retrieval, below.
+    ///
+    /// THIS IS THE TAKE SEAM, NOT A BYTE READ: the retrieval goes through the store's atomic
+    /// broadcast seam, so the wallet's own record of the transaction binds AT RETRIEVAL, in the
+    /// same database transaction that hands the bytes back. It is idempotent — a consumer that
+    /// crashed between retrieving and submitting re-retrieves the same bytes over the same record.
+    /// Retrieved-but-never-submitted is therefore a bounded, engine-modelled state: the record is
+    /// idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces
+    /// through the ordinary attention path once it expires.
+    /// - Parameter txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
+    ///   raw/internal byte order.
+    /// - Throws: `migrationProvingUnavailable` when the stored artifact cannot be turned into
+    ///   servable bytes; `rustMigrationTakePreparation` otherwise — for a txid naming a TRANSFER
+    ///   (transfers are served by the drive's broadcast instruction alone), for a txid the stored
+    ///   run does not carry, and for the readiness refusal of a preparation that is not proved,
+    ///   which a caller discharges by proving again rather than retrying this.
+    func migrationTakePreparation(txid: Data, for account: AccountUUID) async throws -> PreparedMigrationTransfer
 
     /// Serves the transaction `id` for broadcast — the instruction a prior
     /// ``migrationAdvanceStep(for:estimatedTip:)`` call returned as its

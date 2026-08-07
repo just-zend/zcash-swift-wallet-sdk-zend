@@ -174,13 +174,13 @@ Changes are relative to `2.8.0-rc.3`.
 
 ### Orchard → Ironwood migration
 
-- A 35-member migration group on the `Synchronizer` protocol, account-scoped by `AccountUUID`. Two
+- A 37-member migration group on the `Synchronizer` protocol, account-scoped by `AccountUUID`. Two
   accounts (for example one software and one hardware-wallet account) can migrate concurrently. Its
   members work without `prepare()`, so a background session can deliver a transfer without starting
   sync, and on custom networks without a prior `Initializer`. `ClosureSynchronizer` and
   `CombineSynchronizer` do not mirror the group.
 - Value types: `MigrationAdvanceStep`, `MigrationBroadcastInstruction`, `MigrationProveTarget`,
-  `MigrationProgress`, `MigrationSchedule`,
+  `MigrationProveOutcome`, `MigrationProgress`, `MigrationSchedule`,
   `MigrationTransferProposal`, `MigrationTransferResult`,
   `MigrationRunEstimate` (with `MigrationRunEstimate.Run`), `MigrationSyncWakeup`,
   `MigrationPreparationStep`, `MigrationSigningBudget`, `NoteSplitProposal`,
@@ -225,6 +225,35 @@ Changes are relative to `2.8.0-rc.3`.
   (`maxProofs`, at least `1`; skips do not spend it), so a background session bounds seconds of
   proving CPU and cranks again next time; `performMigrationBroadcast` returns the recorded
   `MigrationTransferResult` directly, there being no empty outcome to distinguish it from.
+- A PROVED PREPARATION IS SUBMITTED BY THE APP, THE ORDINARY WAY. Quoting the ruling: a proved
+  preparation is a complete PCZT (signatures and proofs), it is ZIP 318-exempt, and the engine's
+  own contract is that *"a preparation is broadcast as soon as it is proved"* — so its submission
+  is the app's ordinary path, not the engine's delivery ceremony. Accordingly
+  `proveMigrationTransactions(accountUUID:_:maxProofs:)` returns `MigrationProveOutcome` — the
+  total proved plus THE TXIDS OF THE PREPARATIONS IT PROVED, and only those — and the new
+  `takeMigrationPreparation(accountUUID:byTxid:)` hands each one back as a
+  `PreparedMigrationTransfer`. THE ACCESSOR IS THE SEAM: `txid -> row -> the store's atomic
+  broadcast seam`, in one database transaction, so the wallet's record binds AT RETRIEVAL and a
+  consumer that crashed before submitting re-retrieves the same bytes over the same record. It is
+  PREPARATION-GATED — a transfer's txid is refused, because transfers are served by the drive's
+  broadcast instruction alone — so a driver needs no kind judgment of its own: the return and the
+  gate carry it. The DRIVER SHAPE is: crank, prove the batch, then for each returned preparation
+  txid retrieve it AT SUBMISSION TIME, submit the bytes through the app's ordinary raw-transaction
+  machinery, and record the outcome through its standard record path (the DTO carries the ENGINE
+  TRANSFER ID alongside the bytes and txid, so the app keeps no identity of its own) — and CLOSE
+  THE LOOP with `recordMigrationPreparationBroadcast(accountUUID:_:result:)`, which takes that
+  same DTO back and makes the engine's own `Proved -> Broadcast` mark: the one
+  `performMigrationBroadcast` makes on its success arm, made here by the app in place of the
+  ceremony it skipped. It is preparation-gated in the same register as the accessor (a transfer's
+  id is refused; that lane records its own outcome), and it is for acceptances — a non-acceptance
+  needs no call, since the engine's network-error outcome records nothing by design.
+  Retrieved-but-never-submitted is a bounded, engine-modelled state, not a leak: the record is
+  idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces through
+  the ordinary attention path once it expires. Submitted-but-never-marked is bounded too, and is
+  now the ACCIDENT rather than the ordinary path: an app that crashed between submitting and
+  marking still converges, because the engine promotes any in-flight transaction its scan sees
+  mine (by the id it stored when it BUILT the transaction) and a later re-serve draws a duplicate
+  rejection recorded as success.
 - Instructions are OPAQUE: `MigrationBroadcastInstruction` (the `.broadcast` step's payload, in
   place of a bare id) and `MigrationProveTarget` have no plainly-importable initializers, so the
   advance marshaling is their only producer and holding one is the proof that the caller cranked.
@@ -351,7 +380,8 @@ Changes are relative to `2.8.0-rc.3`.
   process-lifetime plan-cache key no persisted copy could honor), so every decoded copy carries
   handle `0` — re-propose instead of committing a persisted schedule.
 - New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0113`,
-  `ZRUST0115`–`ZRUST0122`, `ZRUST0124`–`ZRUST0138`, and `ZRUST0140`–`ZRUST0147`. Five codes were
+  `ZRUST0115`–`ZRUST0122`, `ZRUST0124`–`ZRUST0138`, `ZRUST0140`–`ZRUST0147`, and `ZRUST0149`
+  (`rustMigrationTakePreparation`, the preparation accessor). Five codes were
   retired pre-release with the members they served — which is every gap in those ranges — and none
   is reused: `ZRUST0098`
   (`rustMigrationState`, with the SDK-side migration state machine), `ZRUST0114`

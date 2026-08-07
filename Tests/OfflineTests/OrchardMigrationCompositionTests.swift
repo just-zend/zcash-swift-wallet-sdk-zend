@@ -606,9 +606,12 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// The prove executor MARSHALS AND NOTHING ELSE: it names exactly the ids of the instruction
     /// it was handed, in order, forwards the caller's budget, and — the load-bearing half — never
     /// cranks the drive. The removed sweep's loop is gone with it: one call, one prove batch, and
-    /// the count the engine reports.
+    /// the OUTCOME the engine reports — count and preparation txids alike, passed through
+    /// untouched (no kind judgment of its own: the engine's return already carries it).
     func testProveTransactionsNamesTheInstructionsIdsWithoutCrankingTheDrive() async throws {
-        welding.migrationProveTransactionsIdsMaxProofsForReturnValue = 2
+        let preparationTxid = Data(repeating: 8, count: 32)
+        welding.migrationProveTransactionsIdsMaxProofsForReturnValue =
+            MigrationProveOutcome(totalProved: 2, preparationTxids: [preparationTxid])
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
         let instruction = [
             MigrationProveTarget(id: 7, kind: .transfer(crossing: 0), isScheduleDue: false),
@@ -617,7 +620,11 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
         let proved = try await migration.proveTransactions(instruction, maxProofs: 4)
 
-        XCTAssertEqual(proved, 2)
+        XCTAssertEqual(
+            proved,
+            MigrationProveOutcome(totalProved: 2, preparationTxids: [preparationTxid]),
+            "the outcome reaches the caller verbatim: the total counts both kinds, the txids name only the preparation"
+        )
         let received = try XCTUnwrap(welding.migrationProveTransactionsIdsMaxProofsForReceivedArguments)
         XCTAssertEqual(received.ids, [7, 8], "the instruction's ids, in its own order")
         XCTAssertEqual(received.maxProofs, 4, "the caller's session budget reaches the engine unmodified")
@@ -653,18 +660,106 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         XCTAssertFalse(welding.migrationProveTransactionsIdsMaxProofsForCalled)
     }
 
-    /// An EMPTY instruction is the benign `0` (the engine never issues one, but a caller that
-    /// filters its batch down to nothing must not fault): still one forwarded call, still no
-    /// crank.
+    /// An EMPTY instruction is the benign EMPTY OUTCOME (the engine never issues one, but a caller
+    /// that filters its batch down to nothing must not fault): still one forwarded call, still no
+    /// crank, and no preparation txid to hand off.
     func testProveTransactionsWithAnEmptyInstructionProvesNothing() async throws {
-        welding.migrationProveTransactionsIdsMaxProofsForReturnValue = 0
+        welding.migrationProveTransactionsIdsMaxProofsForReturnValue =
+            MigrationProveOutcome(totalProved: 0, preparationTxids: [])
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         let proved = try await migration.proveTransactions([], maxProofs: 1)
 
-        XCTAssertEqual(proved, 0)
+        XCTAssertEqual(proved, MigrationProveOutcome(totalProved: 0, preparationTxids: []))
         XCTAssertEqual(welding.migrationProveTransactionsIdsMaxProofsForReceivedArguments?.ids, [])
         XCTAssertFalse(welding.migrationAdvanceStepForEstimatedTipCalled)
+    }
+
+    // MARK: - Closing the txid seam: the engine-side mark for an app-submitted preparation
+
+    /// A preparation row for the gate to read. Only `id` and `kind` matter here — the gate asks
+    /// the engine's public status view "is this id a preparation", nothing more.
+    private func makeStatusRow(id: UInt32, kind: MigrationTransactionStatus.Kind) -> MigrationTransactionStatus {
+        MigrationTransactionStatus(
+            id: id,
+            kind: kind,
+            state: .proved,
+            scheduledHeight: 3_000_000,
+            expiryHeight: 3_000_100,
+            isReady: true,
+            nextAction: .broadcast,
+            blockedOn: nil,
+            dependsOn: [],
+            anchorBoundaryHeight: nil
+        )
+    }
+
+    /// THE LOOP CLOSES ON THE ENGINE. A preparation the host retrieved and submitted itself gets
+    /// the same `Proved -> Broadcast` mark `performBroadcast`'s success arm makes — forwarded to
+    /// the SAME welding record member, keyed by the id the retrieval DTO carried, with the host's
+    /// outcome passed through verbatim.
+    func testRecordPreparationBroadcastMarksThroughTheStandardRecordPath() async throws {
+        let prepared = makePreparedTransfer(id: 5)
+        welding.migrationTransactionStatusesForReturnValue = [
+            makeStatusRow(id: 5, kind: .preparation(layer: 0, index: 0))
+        ]
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+        let landed = MigrationTransferResult.success(txId: prepared.txid.toHexStringTxId())
+
+        try await migration.recordPreparationBroadcast(prepared, result: landed)
+
+        let received = try XCTUnwrap(welding.migrationRecordTransferResultTransferIdResultForReceivedArguments)
+        XCTAssertEqual(received.transferId, 5, "the mark is keyed by the retrieval DTO's engine transfer id")
+        XCTAssertEqual(received.result, landed, "the host's outcome reaches the engine unmodified")
+        XCTAssertEqual(received.account, accountA)
+    }
+
+    /// PREPARATION-GATED, in the accessor's own register. A transfer's id is refused and NOTHING is
+    /// recorded: a transfer is served by the drive's broadcast instruction alone, and that
+    /// broadcast records its own outcome — a second mark from here would be an app-side claim
+    /// about a lane the app does not drive.
+    func testRecordPreparationBroadcastRefusesATransferId() async throws {
+        let prepared = makePreparedTransfer(id: 7)
+        welding.migrationTransactionStatusesForReturnValue = [
+            makeStatusRow(id: 7, kind: .transfer(crossing: 0))
+        ]
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        do {
+            try await migration.recordPreparationBroadcast(prepared, result: .success(txId: "landed"))
+            XCTFail("a transfer's id must be refused")
+        } catch let ZcashError.rustMigrationRecordTransferResult(message) {
+            XCTAssertTrue(
+                message.contains("transfers are served by the drive's broadcast instruction alone"),
+                "the gate must speak the seam's own register, got: \(message)"
+            )
+        }
+
+        XCTAssertFalse(
+            welding.migrationRecordTransferResultTransferIdResultForCalled,
+            "a gated id must never reach the record path"
+        )
+    }
+
+    /// An id the stored run does not carry is refused the same way, and likewise records nothing.
+    /// The DTO is a plain value type, so its `id` is an assertion the gate checks rather than a
+    /// capability it trusts.
+    func testRecordPreparationBroadcastRefusesAnUnknownId() async throws {
+        let prepared = makePreparedTransfer(id: 99)
+        welding.migrationTransactionStatusesForReturnValue = [
+            makeStatusRow(id: 5, kind: .preparation(layer: 0, index: 0))
+        ]
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        do {
+            try await migration.recordPreparationBroadcast(prepared, result: .success(txId: "landed"))
+            XCTFail("an id the run does not carry must be refused")
+        } catch let ZcashError.rustMigrationRecordTransferResult(message) {
+            XCTAssertTrue(message.contains("no migration transaction with id 99"), "got: \(message)")
+        }
+
+        XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
     }
 
     // MARK: - Broadcast single-flight

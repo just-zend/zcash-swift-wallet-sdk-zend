@@ -323,8 +323,14 @@ actor OrchardMigration {
 
     // MARK: - Instruction executors
 
-    /// Proves up to `maxProofs` of the transactions `instruction` NAMES, and returns how many were
-    /// proved (`0` is the ordinary "nothing in this batch is provable right now" answer).
+    /// Proves up to `maxProofs` of the transactions `instruction` NAMES, and returns a
+    /// ``MigrationProveOutcome``: how many were proved (`0` is the ordinary "nothing in this batch
+    /// is provable right now" answer) and the txids of the PREPARATIONS it proved.
+    ///
+    /// THE TXIDS ARE THE HANDOFF. A proved preparation is a complete PCZT whose submission is the
+    /// host's ORDINARY path — retrieve each txid with ``takePreparation(byTxid:)``, submit the
+    /// bytes through the host's own raw-transaction machinery, record the outcome the standard way.
+    /// Transfers are never named: they are delivered by a ``MigrationBroadcastInstruction`` alone.
     ///
     /// THE INSTRUCTION IS THE AUTHORITY: this never asks the engine what to prove.
     /// ``advanceStep()`` is the top-level call, and `instruction` is a
@@ -353,7 +359,10 @@ actor OrchardMigration {
     ///   a caller bug, named rather than silently treated as "prove nothing";
     ///   ``ZcashError/migrationProvingUnavailable(_:)`` when proving fails for a non-transient
     ///   reason.
-    func proveTransactions(_ instruction: [MigrationProveTarget], maxProofs: Int) async throws -> Int {
+    func proveTransactions(
+        _ instruction: [MigrationProveTarget],
+        maxProofs: Int
+    ) async throws -> MigrationProveOutcome {
         guard maxProofs >= 1 else {
             throw ZcashError.rustMigrationProveTransactions(
                 "`proveTransactions` was given a proof budget of \(maxProofs); it must be at least 1"
@@ -365,6 +374,108 @@ actor OrchardMigration {
             maxProofs: maxProofs,
             for: accountUUID
         )
+    }
+
+    /// Serves the PROVED PREPARATION with `txid` for submission — the retrieval half of the
+    /// handoff ``proveTransactions(_:maxProofs:)`` opens by returning the preparations' txids.
+    ///
+    /// THE RULING (kris, 2026-08-07). A proved preparation is a complete PCZT (signatures and
+    /// proofs); its submission is the ORDINARY path, not the engine's delivery ceremony —
+    /// preparations are ZIP 318-exempt, and the engine's own contract is that a preparation is
+    /// broadcast as soon as it is proved. So this hands the finalized transaction back, the host
+    /// submits it through whatever machinery it already uses for raw transactions, and then closes
+    /// the loop with ``recordPreparationBroadcast(_:result:)`` — which takes the very value this
+    /// returned, so the host needs no identity of its own. The WALLET's record needs no separate
+    /// call: it bound at retrieval, below.
+    ///
+    /// THIS ACCESSOR IS THE TAKE SEAM, NOT A BYTE READ. `txid -> row -> the store's atomic
+    /// broadcast seam` in one database transaction: the wallet's record of the transaction binds
+    /// AT RETRIEVAL, so a host can never hold submittable bytes the wallet knows nothing about,
+    /// and a consumer that crashed between retrieving and submitting re-retrieves exactly the same
+    /// bytes over the same record.
+    ///
+    /// PREPARATION-GATED: a txid naming a TRANSFER is refused — transfers are served by the
+    /// drive's broadcast instruction alone (``performBroadcast(_:options:)``).
+    ///
+    /// Retrieved-but-never-submitted is a bounded, engine-modelled state, not a leak: the record
+    /// is idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces
+    /// through the ordinary attention path once it expires.
+    ///
+    /// Unlike ``performBroadcast(_:options:)`` this does NOT broadcast, so it is not serialized
+    /// against the broadcast flows and carries no privacy options of its own: what the host does
+    /// with the bytes, and over what transport, is the host's ordinary submission policy.
+    /// - Parameter txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
+    ///   raw/internal byte order.
+    /// - Throws: ``ZcashError/migrationProvingUnavailable(_:)`` when the stored artifact cannot be
+    ///   turned into servable bytes; ``ZcashError/rustMigrationTakePreparation(_:)`` for a
+    ///   transfer's txid, for a txid the stored run does not carry, and for the readiness refusal
+    ///   of a preparation that is not proved — which a host discharges by proving again rather
+    ///   than retrying this.
+    func takePreparation(byTxid txid: Data) async throws -> PreparedMigrationTransfer {
+        try await welding.migrationTakePreparation(txid: txid, for: accountUUID)
+    }
+
+    /// Records the engine-side outcome of a preparation the host retrieved and submitted ITSELF —
+    /// the closing half of the txid seam.
+    ///
+    /// ``takePreparation(byTxid:)`` binds the WALLET's record at retrieval, but the ENGINE's own
+    /// per-row mark (`Proved -> Broadcast`) is what ``performBroadcast(_:options:)`` does on its
+    /// success arm, and a host-submitted preparation never travels that path. This is the same
+    /// mark, made by the host at the same moment: after its submit landed, in place of the
+    /// ceremony it deliberately skipped. Without it the run leans on the self-healing fallback
+    /// below for every ordinary preparation rather than only for the accidents it exists to cover.
+    ///
+    /// KEYED ON THE RETRIEVAL RESULT. It takes the `PreparedMigrationTransfer` itself, not a bare
+    /// id: possession of what the accessor returned is what says this host actually holds the
+    /// submission it is reporting on, and the DTO's ``PreparedMigrationTransfer/id`` is already
+    /// the engine transfer id the record path keys on.
+    ///
+    /// PREPARATION-GATED, in the same register as the accessor: an id naming a TRANSFER is refused
+    /// — transfers are served by the drive's broadcast instruction alone, and
+    /// ``performBroadcast(_:options:)`` records their outcome itself — as is an id the stored run
+    /// does not carry.
+    ///
+    /// REPORT ONLY WHAT LANDED. Pass a `.success`; a non-acceptance needs no call at all, because
+    /// the engine's "network error" outcome records nothing by design and leaves the row exactly
+    /// as re-servable as not calling would. A `.networkError` is accepted and forwarded verbatim
+    /// for hosts that would rather report every attempt, but it is not the intended use.
+    ///
+    /// THE SELF-HEALING FALLBACK REMAINS, now covering the accident rather than the ordinary path:
+    /// a host that crashed between submitting and marking, or whose mark failed, still converges —
+    /// the engine promotes any in-flight transaction its scan sees mine (identified by the id it
+    /// stored when it BUILT the transaction), and a later re-serve of the same bytes draws a
+    /// duplicate rejection the SDK records as success.
+    /// - Parameters:
+    ///   - prepared: the value ``takePreparation(byTxid:)`` returned for this submission.
+    ///   - result: the submission's outcome, in the engine's own vocabulary.
+    /// - Throws: ``ZcashError/rustMigrationRecordTransferResult(_:)`` when `prepared` names a
+    ///   transfer or a transaction the stored run does not carry, and for rust-layer failures of
+    ///   the record itself.
+    func recordPreparationBroadcast(
+        _ prepared: PreparedMigrationTransfer,
+        result: MigrationTransferResult
+    ) async throws {
+        // The gate reads the engine's own public status view rather than trusting the caller's
+        // DTO: `PreparedMigrationTransfer` is a plain value type, so its `id` is an assertion, not
+        // a capability. This is the same question the accessor's gate asks of a txid, asked of an
+        // id.
+        let statuses = try await welding.migrationTransactionStatuses(for: accountUUID)
+        guard let row = statuses.first(where: { $0.id == prepared.id }) else {
+            throw ZcashError.rustMigrationRecordTransferResult(
+                "no migration transaction with id \(prepared.id) is stored, so its broadcast cannot be recorded"
+            )
+        }
+        guard case MigrationTransactionStatus.Kind.preparation = row.kind else {
+            throw ZcashError.rustMigrationRecordTransferResult(
+                """
+                migration transaction \(prepared.id) is a transfer, not a preparation: transfers \
+                are served by the drive's broadcast instruction alone, and their outcome is \
+                recorded by that broadcast
+                """
+            )
+        }
+
+        try await welding.migrationRecordTransferResult(transferId: prepared.id, result: result, for: accountUUID)
     }
 
     /// Broadcasts the transaction `instruction` names and returns the recorded outcome.

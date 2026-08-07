@@ -50,11 +50,10 @@ Discharging each step:
   payload — submit and end the session (a broadcast session must not sync).
 - `.prove(transactions:)` → the WHOLE provable batch is ready, and the batch IS the instruction:
   `proveMigrationTransactions(accountUUID:_:maxProofs:)` at a sync wake-up (see
-  `migrationSyncWakeups(accountUUID:)`).
-  Each entry's `kind` says what follows for THAT transaction: a `.transfer(crossing:)` entry's
-  broadcast follows in its own LATER session (proving has no deadline of its own — a missed
-  wake-up defers the proof, never invalidates it), while a `.preparation(layer:index:)` entry is
-  due by construction and may broadcast at the SAME wake-up.
+  `migrationSyncWakeups(accountUUID:)`). Its return names the PREPARATIONS it proved; submit each
+  one yourself (see "A proved preparation is yours to submit" below). A `.transfer(crossing:)`
+  entry's broadcast follows in its own LATER session (proving has no deadline of its own — a
+  missed wake-up defers the proof, never invalidates it).
 
   ```swift
   // Before
@@ -87,7 +86,8 @@ more precisely, since `.nothingDue` collapsed six distinct situations into one w
 The migration ACTION surface is now exactly three things: the CONDUIT
 (`migrationAdvanceStep(accountUUID:)`), the INSTRUCTION EXECUTORS
 (`proveMigrationTransactions`, `performMigrationBroadcast`, `refreshStaleMigrationTransfers`), and
-READS.
+READS — plus `takeMigrationPreparation(accountUUID:byTxid:)`, which is not a fourth executor but
+the retrieval half of the prove executor's own return (see below).
 
 ### The replacement: drive it yourself
 
@@ -107,7 +107,21 @@ case .executed(let result):  handle(result)
 // After — crank, then perform the crank's dictate with the crank's own payload
 switch try await synchronizer.migrationAdvanceStep(accountUUID: account)?.step {
 case .prove(let instruction):
-    _ = try await synchronizer.proveMigrationTransactions(accountUUID: account, instruction, maxProofs: 4)
+    let outcome = try await synchronizer.proveMigrationTransactions(accountUUID: account, instruction, maxProofs: 4)
+    for txid in outcome.preparationTxids {
+        let prepared = try await synchronizer.takeMigrationPreparation(accountUUID: account, byTxid: txid)
+        // Ordinary raw-transaction submission — whatever the app already uses — then the app's own
+        // record path, then the engine's mark, which takes the retrieval result straight back.
+        let submission = await submitRawTransaction(prepared.pczt)
+        record(submission, for: prepared.id)
+        if case let .accepted(txId) = submission {
+            try await synchronizer.recordMigrationPreparationBroadcast(
+                accountUUID: account,
+                prepared,
+                result: .success(txId: txId)
+            )
+        }
+    }
 case .broadcast(let instruction):
     let result = try await synchronizer.performMigrationBroadcast(accountUUID: account, instruction, options: options)
     handle(result)
@@ -134,6 +148,60 @@ never offered: each proof is seconds of CPU, so a background session bounds what
 cranks again next time. It must be at least `1`; a lower value throws
 `rustMigrationProveTransactions` rather than silently proving nothing. Skips (a row already proved,
 or one whose anchor the wallet cannot resolve yet) do not spend the budget.
+
+### A proved preparation is yours to submit, the ordinary way
+
+`proveMigrationTransactions(accountUUID:_:maxProofs:)` no longer returns a bare `Int`. It returns
+`MigrationProveOutcome` — `totalProved` plus `preparationTxids`. **Breaking, with no deprecation
+period** (nothing here has shipped in a release): a caller that used the count reads
+`outcome.totalProved`.
+
+The ruling behind the new shape, verbatim in substance:
+
+> A proved preparation is a complete PCZT (signatures + proofs); its submission is the ORDINARY
+> path, not the engine's delivery ceremony — preparations are ZIP 318-exempt, and the engine's own
+> contract is that a preparation is broadcast as soon as it is proved.
+
+Four clauses follow from it, and the surface implements exactly them:
+
+1. **The prove return lists the preparations it proved, and only those.** A transfer's txid is
+   never returned, because appearing in that list means "retrievable" — and a transfer is served
+   by the drive's `.broadcast` instruction alone. A driver therefore makes **no kind judgment of
+   its own**: the return carries it.
+2. **The accessor IS the take seam.** `takeMigrationPreparation(accountUUID:byTxid:)` resolves
+   `txid -> row -> the store's atomic broadcast seam` in ONE database transaction: the wallet's
+   own record of the transaction binds AT RETRIEVAL, not after submission. It is not a byte read.
+   It is idempotent — a consumer that crashed between retrieving and submitting re-retrieves
+   exactly the same bytes over the same record — so retrieve **at submission time**, not eagerly.
+3. **It is preparation-gated.** A transfer's txid is refused with
+   `rustMigrationTakePreparation`, whose message states that transfers are served by the drive's
+   broadcast instruction alone. An unknown txid, and a preparation whose proof is not persisted,
+   are refused the same way; the latter is the readiness gate, discharged by proving again.
+4. **The DTO carries the engine transfer id**, alongside the finalized transaction bytes and the
+   row's stored txid, so the app records the submission's outcome through its standard record path
+   with no identity of its own to keep.
+
+Then **close the loop** with `recordMigrationPreparationBroadcast(accountUUID:_:result:)`. The
+accessor bound the WALLET's record at retrieval, but the ENGINE's own per-row `Proved -> Broadcast`
+mark is what `performMigrationBroadcast(accountUUID:_:options:)` makes on its success arm — and a
+preparation the app submitted never travels that path. This member is that same mark, made by the
+app at the same moment. It takes the `PreparedMigrationTransfer` the accessor returned (possession
+of the retrieval result is what says you hold the submission you are reporting on), is
+preparation-gated in the same register (a transfer's id is refused; that lane records itself), and
+is for **acceptances** — a non-acceptance needs no call, because the engine's network-error outcome
+records nothing by design and leaves the row exactly as re-servable as silence would.
+
+Retrieved-but-never-submitted is a bounded, engine-modelled state, not a leak: the record is
+idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces through the
+ordinary attention path once it expires. Submitted-but-never-marked is bounded too — and with the
+mark in place it is now the ACCIDENT, not the ordinary path: an app that crashed between submitting
+and marking still converges, because the engine promotes any in-flight transaction its scan sees
+mine (by the id it stored when it BUILT the transaction) and a later re-serve of the same bytes
+draws a duplicate rejection the SDK records as success.
+
+The bytes are a FINALIZED CONSENSUS TRANSACTION, submittable as-is — no
+`migrationExtractBroadcastTx` step, no `MigrationNetworkPrivacyOptions`, no broadcast session. Do
+not build a parallel submit path for them: use the raw-transaction machinery the app already has.
 
 `performMigrationBroadcast(accountUUID:_:options:)` has **no `useEstimatedTip`**. That parameter
 existed because the delivery lane advanced internally; the conduit always projects the wall-clock

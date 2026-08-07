@@ -8,7 +8,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Pool-migration (Orchard→Ironwood) FFI: 32 `zcashlc_migration_*` entry points with their
+- Pool-migration (Orchard→Ironwood) FFI: 33 `zcashlc_migration_*` entry points with their
   `#[repr(C)]` return types and `zcashlc_free_migration_*` destructors, plus
   `zcashlc_ironwood_activation_height`. Each call takes the wallet-db path, a 16-byte account uuid
   and a network id, opens the wallet database and the account-keyed migration store, and reports
@@ -64,7 +64,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     selection per adapter (librustzcash #2946), and the FFI builds one adapter per call.
   - Proving: `zcashlc_migration_prove_transactions(ids, ids_len, max_proofs)` proves the
     transactions the caller NAMES — the batch a prior `_advance_step` returned as its PROVE step —
-    and returns the count proved (`-1` = error). Like the delivery executor it never cranks the
+    and returns `FfiMigrationProveOutcome` (freed by `zcashlc_free_migration_prove_outcome`,
+    `NULL` = error): `total_proved` plus `preparation_txids`/`preparation_txids_len`, a heap array
+    of raw 32-byte txids naming THE PREPARATIONS IT PROVED and nothing else. A transfer's txid is
+    never returned, because appearing in that array means "retrievable through
+    `_take_preparation_by_txid`", and a transfer is delivered by the drive's BROADCAST instruction
+    alone. Like the delivery executor it never cranks the
     engine: `advance_migration` is the top-level call, and there is no proving to do without an
     instruction saying what to prove. Per row, a transaction that is no longer `Signed` is a SKIP
     rather than an error (a stale instruction is safe — the engine re-offers un-recorded work on
@@ -72,6 +77,27 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     persists through the store seam. `max_proofs <= 0` means unlimited, and a platform that
     serializes database access behind one actor can pass `1` and loop, chunking a sweep without
     re-cranking between chunks. Call it from the sync path.
+  - Preparation retrieval: `zcashlc_migration_take_preparation_by_txid(txid_ptr)` serves the
+    proved PREPARATION with that 32-byte raw txid, returning the same `FfiPreparedTransfer` the
+    delivery executor does (freed by `zcashlc_free_migration_prepared_transfer`) — finalized
+    consensus transaction bytes, the row's stored txid, and the ENGINE TRANSFER ID, so the caller
+    closes the loop through the existing `_record_transfer_result` — the same `Proved -> Broadcast`
+    mark the delivery executor's success path makes — with no identity of its own. A proved
+    preparation is a complete PCZT and its submission is the platform's ORDINARY path, not the engine's delivery ceremony: preparations are ZIP 318-exempt, and the engine's
+    contract is that a preparation is broadcast as soon as it is proved. The accessor IS the take
+    seam, not a byte read — `txid -> row -> PoolMigrations::take_transaction_for_broadcast` in one
+    database transaction, so the wallet's record binds AT RETRIEVAL and a crashed consumer
+    re-retrieves the same bytes over the same record. It is PREPARATION-GATED: a transfer's txid
+    is refused ("transfers are served by the drive's broadcast instruction alone"), bare, before
+    the seam is reached, as an unknown txid is — both are questions about WHICH row was named, not
+    about whether an artifact can be made servable, so neither carries
+    `MIGRATION_PROVING_UNAVAILABLE`. The seam's own refusal of a non-`Proved` row remains the
+    readiness gate. Retrieved-but-never-submitted is a bounded, engine-modelled state: the record
+    is idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces
+    through the ordinary attention path once it expires. Submitted-but-never-marked is bounded
+    too, and is the ACCIDENT rather than the ordinary path now that the caller marks: the engine
+    promotes any in-flight transaction its scan sees mine, by the id it stored when it BUILT the
+    transaction.
   - Delivery: `zcashlc_migration_take_broadcast_transaction` serves the transaction the caller
     NAMES — the instruction a prior `_advance_step` returned as its BROADCAST step. It never
     proves and never cranks the engine: `advance_migration` is the top-level call and every
@@ -247,7 +273,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is made ONCE: `zcashlc_migration_advance_step` cranks `advance_migration`, and the two EXECUTORS
   — `_take_broadcast_transaction` and `_prove_transactions` — discharge the instruction it
   returned (see their entries above), so what they act on was verified against the store's
-  satisfiability oracle before it was handed out. The READ-ONLY reporting query —
+  satisfiability oracle before it was handed out. `_take_preparation_by_txid` is not a third
+  executor but the retrieval half of the prove executor's own return: it acts only on a txid that
+  return just named, and its gate refuses everything else. The READ-ONLY reporting query —
   `_has_overdue_transfers` — cannot drive,
   and reads the engine's public per-row status view instead; the SDK's hand-rolled twins of
   upstream's readiness predicates are gone, leaving only the `(scheduled_height, id)` ordering key

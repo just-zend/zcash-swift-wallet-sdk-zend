@@ -734,8 +734,18 @@ public protocol Synchronizer: AnyObject {
     func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress?
 
     /// THE PROVE EXECUTOR: proves up to `maxProofs` of the transactions `instruction` names,
-    /// persisting each proof, and returns how many were proved (`0` is the ordinary "nothing in
-    /// this batch is provable right now" answer).
+    /// persisting each proof, and returns a ``MigrationProveOutcome`` — how many were proved (`0`
+    /// is the ordinary "nothing in this batch is provable right now" answer) and the txids of the
+    /// PREPARATIONS it proved.
+    ///
+    /// THE TXIDS ARE THE HANDOFF (kris, 2026-08-07). A proved preparation is a complete PCZT
+    /// (signatures and proofs); it is ZIP 318-exempt and the engine's own contract is that a
+    /// preparation is broadcast as soon as it is proved, so its submission is the app's ORDINARY
+    /// path rather than the engine's delivery ceremony: for each returned txid call
+    /// ``takeMigrationPreparation(accountUUID:byTxid:)``, submit the bytes it hands back through
+    /// the app's ordinary raw-transaction machinery, and record the outcome the standard way. A
+    /// TRANSFER's txid is never returned — transfers are served by the drive's broadcast
+    /// instruction alone — so the app needs no kind judgment of its own on this path.
     ///
     /// The instruction is a ``MigrationAdvanceStep/prove(transactions:)`` batch that a
     /// ``migrationAdvanceStep(accountUUID:)`` crank handed out — and the only way to hold one,
@@ -768,7 +778,86 @@ public protocol Synchronizer: AnyObject {
         accountUUID: AccountUUID,
         _ instruction: [MigrationProveTarget],
         maxProofs: Int
-    ) async throws -> Int
+    ) async throws -> MigrationProveOutcome
+
+    /// THE PREPARATION ACCESSOR: serves the proved preparation with `txid` for submission — the
+    /// retrieval half of the handoff ``proveMigrationTransactions(accountUUID:_:maxProofs:)`` opens
+    /// by returning the preparations' txids.
+    ///
+    /// THE ACCESSOR IS THE SEAM, not a byte read of a stored artifact: `txid -> row -> the store's
+    /// atomic broadcast seam`, in ONE database transaction. The wallet's own record of the
+    /// transaction binds AT RETRIEVAL, so an app can never hold submittable bytes the wallet knows
+    /// nothing about, and it is idempotent — a consumer that crashed between retrieving and
+    /// submitting re-retrieves exactly the same bytes over the same record.
+    ///
+    /// Submit ``PreparedMigrationTransfer/pczt`` — a FINALIZED CONSENSUS TRANSACTION, submittable
+    /// as-is, with no ``migrationExtractBroadcastTx`` step — through the app's ORDINARY
+    /// raw-transaction machinery, then record the outcome the standard way: the returned
+    /// ``PreparedMigrationTransfer/id`` is the ENGINE TRANSFER ID that path keys on, so the app
+    /// carries no identity of its own.
+    ///
+    /// PREPARATION-GATED: a txid naming a TRANSFER is refused. Transfers cross the turnstile on
+    /// the drive's own ZIP 318 schedule and are served by
+    /// ``performMigrationBroadcast(accountUUID:_:options:)`` alone.
+    ///
+    /// Retrieved-but-never-submitted is a bounded, engine-modelled state, not a leak: the record
+    /// is idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces
+    /// through the ordinary attention path once it expires.
+    ///
+    /// Unlike ``performMigrationBroadcast(accountUUID:_:options:)`` this does not broadcast, so it
+    /// carries no privacy options and is not guarded against sync: what the bytes travel over is
+    /// the app's ordinary submission policy.
+    /// - Parameters:
+    ///   - accountUUID: the account whose preparation is being retrieved.
+    ///   - txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
+    ///     raw/internal byte order.
+    /// - Throws: ``ZcashError/migrationProvingUnavailable(_:)`` when the stored artifact cannot be
+    ///   turned into servable bytes; ``ZcashError/rustMigrationTakePreparation(_:)`` for a
+    ///   transfer's txid, for a txid the stored run does not carry, and for the readiness refusal
+    ///   of a preparation that is not proved — which an app discharges by proving again rather
+    ///   than retrying this.
+    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer
+
+    /// CLOSES THE SEAM: records the engine-side outcome of a preparation the app retrieved with
+    /// ``takeMigrationPreparation(accountUUID:byTxid:)`` and submitted ITSELF.
+    ///
+    /// The accessor binds the WALLET's record at retrieval, but the ENGINE's own per-row mark
+    /// (`Proved -> Broadcast`) is what ``performMigrationBroadcast(accountUUID:_:options:)`` makes
+    /// on its success arm — and a host-submitted preparation never travels that path. This is that
+    /// same mark, made by the app at the same moment, in place of the ceremony it deliberately
+    /// skipped. It is the ORDINARY close of the loop, not a repair.
+    ///
+    /// KEYED ON THE RETRIEVAL RESULT: it takes the ``PreparedMigrationTransfer`` the accessor
+    /// returned, whose ``PreparedMigrationTransfer/id`` is already the engine transfer id the
+    /// record path keys on — so an app that submitted a preparation carries no identity of its own
+    /// from retrieval to record.
+    ///
+    /// PREPARATION-GATED, in the same register as the accessor: an id naming a TRANSFER is refused
+    /// — transfers are served by the drive's broadcast instruction alone, and that broadcast
+    /// records their outcome itself — as is an id the stored run does not carry.
+    ///
+    /// REPORT ONLY WHAT LANDED. Call this on an acceptance. A non-acceptance needs no call: the
+    /// engine's network-error outcome records nothing by design, so reporting one and reporting
+    /// nothing leave the row equally re-servable.
+    ///
+    /// THE SELF-HEALING FALLBACK REMAINS, now covering the accident rather than the ordinary path:
+    /// an app that crashed between submitting and marking, or whose mark failed, still converges —
+    /// the engine promotes any in-flight transaction its scan sees mine (by the id it stored when
+    /// it BUILT the transaction), and a later re-serve of the same bytes draws a duplicate
+    /// rejection the SDK records as success.
+    /// - Parameters:
+    ///   - accountUUID: the account the preparation belongs to.
+    ///   - prepared: the value ``takeMigrationPreparation(accountUUID:byTxid:)`` returned for this
+    ///     submission.
+    ///   - result: the submission's outcome, in the engine's own vocabulary.
+    /// - Throws: ``ZcashError/rustMigrationRecordTransferResult(_:)`` when `prepared` names a
+    ///   transfer or a transaction the stored run does not carry, and for rust-layer failures of
+    ///   the record itself.
+    func recordMigrationPreparationBroadcast(
+        accountUUID: AccountUUID,
+        _ prepared: PreparedMigrationTransfer,
+        result: MigrationTransferResult
+    ) async throws
 
     /// The stored run's minimal sync/proving wake-up schedule for `accountUUID`, as of the
     /// SCANNED chain tip: each row is a height at which to wake, sync, crank
@@ -1427,7 +1516,19 @@ public extension Synchronizer {
         accountUUID: AccountUUID,
         _ instruction: [MigrationProveTarget],
         maxProofs: Int
-    ) async throws -> Int {
+    ) async throws -> MigrationProveOutcome {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func recordMigrationPreparationBroadcast(
+        accountUUID: AccountUUID,
+        _ prepared: PreparedMigrationTransfer,
+        result: MigrationTransferResult
+    ) async throws {
         throw MigrationUnimplemented(member: #function)
     }
 

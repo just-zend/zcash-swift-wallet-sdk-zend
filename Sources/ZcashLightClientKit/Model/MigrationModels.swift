@@ -848,6 +848,35 @@ public struct PreparedMigrationTransfer: Equatable, Sendable {
     }
 }
 
+/// What one prove pass accomplished: how many transactions it proved, and the txids of the
+/// PREPARATIONS among them.
+///
+/// THE TXIDS ARE THE HANDOFF, and they name preparations only. A proved preparation is a complete
+/// PCZT (signatures and proofs); it is ZIP 318-exempt, and the engine's own contract is that a
+/// preparation is broadcast as soon as it is proved — so its submission is the host's ORDINARY
+/// path: take each txid to `takeMigrationPreparation(accountUUID:byTxid:)`, submit the bytes it
+/// hands back through whatever machinery the host already uses for raw transactions, and record
+/// the outcome through the standard record path. A transfer crosses the turnstile on the drive's
+/// own schedule and is delivered by a `MigrationAdvanceStep/broadcast(_:)` instruction alone, so
+/// its txid never appears here: appearing here MEANS retrievable.
+///
+/// ``totalProved`` counts both kinds, so it is the honest measure of a pass's progress —
+/// `0` with no txids is the ordinary "nothing in this batch is provable right now" answer.
+public struct MigrationProveOutcome: Equatable, Sendable {
+    /// How many transactions this pass proved — preparations AND transfers.
+    public let totalProved: Int
+    /// The proved preparations' txids, in the order they were proved, in the SDK's raw/internal
+    /// byte order (matching ``PreparedMigrationTransfer/txid``, not the reversed display-hex order
+    /// produced by `Data.toHexStringTxId()`). Empty when the pass proved no preparation.
+    public let preparationTxids: [Data]
+
+    /// Creates a `MigrationProveOutcome`.
+    public init(totalProved: Int, preparationTxids: [Data]) {
+        self.totalProved = totalProved
+        self.preparationTxids = preparationTxids
+    }
+}
+
 /// The platform's outcome of broadcasting (or attempting to broadcast) a prepared migration
 /// transfer, reported back to the migration engine via
 /// `ZcashRustBackendWelding.migrationRecordTransferResult(transferId:result:for:)`.

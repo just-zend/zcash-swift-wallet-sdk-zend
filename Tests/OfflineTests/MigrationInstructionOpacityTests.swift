@@ -121,17 +121,39 @@ final class MigrationInstructionOpacityTests: XCTestCase {
 /// COMPILE-TIME FIXTURE, never invoked (see this file's header, claim 1): the reference driver
 /// dispatch exactly as the `migrationAdvanceStep(accountUUID:)` documentation prescribes it,
 /// written against the public surface alone. Its value is that it type-checks: each actionable arm
-/// hands the step's OWN payload straight to an executor, with nothing in between.
+/// hands the step's OWN payload straight to an executor, with nothing in between — including the
+/// prove arm's full handoff (prove -> take-by-txid -> submit -> mark), so a change to any link in
+/// that chain has to come back through this fixture.
+///
+/// `submitRawTransaction` stands in for whatever raw-transaction machinery the host already has;
+/// the SDK deliberately supplies none, since a proved preparation's submission is the host's
+/// ordinary path.
 private func performDictate(
     of advance: MigrationAdvance?,
     for accountUUID: AccountUUID,
     on synchronizer: Synchronizer,
     options: MigrationNetworkPrivacyOptions,
-    maxProofs: Int
+    maxProofs: Int,
+    submitRawTransaction: (Data) async -> String?
 ) async throws {
     switch advance?.step {
     case .prove(let instruction):
-        _ = try await synchronizer.proveMigrationTransactions(accountUUID: accountUUID, instruction, maxProofs: maxProofs)
+        let outcome = try await synchronizer.proveMigrationTransactions(
+            accountUUID: accountUUID,
+            instruction,
+            maxProofs: maxProofs
+        )
+        // The preparations this pass proved are the host's to submit. No kind judgement here: the
+        // return names preparations only, and the accessor refuses anything else.
+        for txid in outcome.preparationTxids {
+            let prepared = try await synchronizer.takeMigrationPreparation(accountUUID: accountUUID, byTxid: txid)
+            guard let landedTxId = await submitRawTransaction(prepared.pczt) else { continue }
+            try await synchronizer.recordMigrationPreparationBroadcast(
+                accountUUID: accountUUID,
+                prepared,
+                result: .success(txId: landedTxId)
+            )
+        }
     case .broadcast(let instruction):
         _ = try await synchronizer.performMigrationBroadcast(accountUUID: accountUUID, instruction, options: options)
     case .rebuild:

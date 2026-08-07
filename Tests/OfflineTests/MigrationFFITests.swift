@@ -120,16 +120,44 @@ final class MigrationFFITests: XCTestCase {
     }
 
     /// The prove executor is safe to run against a wallet with no migration run at all: there is
-    /// nothing to prove, which is the benign `0` — not a throw. This is what lets a host call it
-    /// unconditionally from its sync path without first asking whether a migration exists. An
-    /// EMPTY instruction is likewise `0`: naming no transactions asks for no work, so a host need
-    /// not special-case a batch it has already exhausted.
+    /// nothing to prove, which is the benign EMPTY OUTCOME — not a throw. This is what lets a host
+    /// call it unconditionally from its sync path without first asking whether a migration exists.
+    /// An EMPTY instruction is likewise empty: naming no transactions asks for no work, so a host
+    /// need not special-case a batch it has already exhausted. Neither answer offers a preparation
+    /// txid, so the handoff to `migrationTakePreparation` never fires.
     func testFreshWalletProveTransactionsProvesNothing() async throws {
         let named = try await rustBackend.migrationProveTransactions(ids: [0, 1], maxProofs: 8, for: account)
-        XCTAssertEqual(named, 0)
+        XCTAssertEqual(named, MigrationProveOutcome(totalProved: 0, preparationTxids: []))
 
         let empty = try await rustBackend.migrationProveTransactions(ids: [], maxProofs: 8, for: account)
-        XCTAssertEqual(empty, 0)
+        XCTAssertEqual(empty, MigrationProveOutcome(totalProved: 0, preparationTxids: []))
+    }
+
+    /// The preparation accessor has no benign empty answer either: with no stored run there is no
+    /// row a txid could name, so it throws rather than reporting "nothing to retrieve". A host
+    /// only ever reaches it holding a txid `migrationProveTransactions` just handed out.
+    func testFreshWalletTakePreparationThrows() async throws {
+        do {
+            _ = try await rustBackend.migrationTakePreparation(txid: Data(repeating: 0, count: 32), for: account)
+            XCTFail("a wallet with no stored run has no preparation to serve")
+        } catch let error as ZcashError {
+            XCTAssertEqual(error.code.rawValue, "ZRUST0149")
+        }
+    }
+
+    /// A txid that is not 32 bytes is a CALLER BUG, named as such before the FFI is entered — the
+    /// accessor's parameter is a raw internal-order txid, never a display-hex string.
+    func testTakePreparationRejectsAMalformedTxid() async throws {
+        do {
+            _ = try await rustBackend.migrationTakePreparation(txid: Data(repeating: 0, count: 31), for: account)
+            XCTFail("a 31-byte txid must be refused")
+        } catch let error as ZcashError {
+            XCTAssertEqual(error.code.rawValue, "ZRUST0149")
+            XCTAssertTrue(
+                "\(error)".contains("31-byte txid"),
+                "the refusal must name the offending length, got: \(error)"
+            )
+        }
     }
 
     /// `isNoteSplitNeeded` plans fresh against the live balance. On this never-synced fixture the
@@ -442,7 +470,7 @@ final class MigrationFFITests: XCTestCase {
     func testMigrationProveTransactionsIsStableAcrossRepeatedCalls() async throws {
         let first = try await rustBackend.migrationProveTransactions(ids: [0], maxProofs: 8, for: account)
         let second = try await rustBackend.migrationProveTransactions(ids: [0], maxProofs: 8, for: account)
-        XCTAssertEqual(first, 0)
+        XCTAssertEqual(first, MigrationProveOutcome(totalProved: 0, preparationTxids: []))
         XCTAssertEqual(first, second)
     }
 
@@ -815,6 +843,84 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertNil(
             empty.unsafeToMigrationAdvance(),
             "an empty Prove batch is malformed (upstream never serves one empty), not a valid step"
+        )
+    }
+
+    // MARK: - Prove outcome decode mapping (the txid seam)
+    //
+    // `FfiMigrationProveOutcome`'s marshal into `MigrationProveOutcome`, constructed directly like
+    // the rows above. The txid buffer is a heap array of raw `[u8; 32]` values, so what needs
+    // pinning is that the decode walks it by ELEMENT (32 bytes each, in order) rather than
+    // flattening it, and that a total-only outcome is a valid shape.
+
+    /// The C side's `uint8_t[32]` element type as Swift imports it -- a 32-byte tuple, spelled out
+    /// once here so the fixture below can name it.
+    private typealias ImportedTxId = (
+        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+    )
+
+    /// Builds an `FfiMigrationProveOutcome` over a heap txid buffer the caller must free with
+    /// `freeProveOutcome`.
+    ///
+    /// An empty `txids` leaves the pointer `nil`. That is NOT what rust hands back — `ptr_from_vec`
+    /// on an empty `Vec` yields a DANGLING NON-NULL pointer with `len == 0` — so this arm exercises
+    /// the decode's defensive `if let` rather than the production shape. Both must decode to the
+    /// same empty result, which is the point: the length is what the decode may trust, and the
+    /// pointer is never dereferenced at length 0 either way.
+    private func makeProveOutcome(totalProved: UInt32, txids: [[UInt8]]) -> FfiMigrationProveOutcome {
+        guard !txids.isEmpty else {
+            return FfiMigrationProveOutcome(total_proved: totalProved, preparation_txids: nil, preparation_txids_len: 0)
+        }
+        let buffer = UnsafeMutableRawPointer.allocate(
+            byteCount: txids.count * 32,
+            alignment: MemoryLayout<ImportedTxId>.alignment
+        )
+        for (index, txid) in txids.enumerated() {
+            precondition(txid.count == 32, "a fixture txid must be 32 bytes")
+            txid.withUnsafeBufferPointer { bytes in
+                buffer.advanced(by: index * 32).copyMemory(from: bytes.baseAddress!, byteCount: 32)
+            }
+        }
+        return FfiMigrationProveOutcome(
+            total_proved: totalProved,
+            preparation_txids: buffer.bindMemory(to: ImportedTxId.self, capacity: txids.count),
+            preparation_txids_len: UInt(txids.count)
+        )
+    }
+
+    private func freeProveOutcome(_ outcome: FfiMigrationProveOutcome) {
+        outcome.preparation_txids?.deallocate()
+    }
+
+    /// Every txid crosses whole and in order, keyed to its own 32-byte element -- the handoff list
+    /// a host walks to retrieve each proved preparation.
+    func testProveOutcomeDecodeMapsEveryPreparationTxidInOrder() {
+        let first = [UInt8](repeating: 0xAB, count: 32)
+        let second = [UInt8]((0 ..< 32).map { UInt8($0) })
+        let outcome = makeProveOutcome(totalProved: 3, txids: [first, second])
+        defer { freeProveOutcome(outcome) }
+
+        XCTAssertEqual(
+            outcome.unsafeToMigrationProveOutcome(),
+            MigrationProveOutcome(totalProved: 3, preparationTxids: [Data(first), Data(second)]),
+            "the total counts every kind; the txids marshal element-by-element, in buffer order"
+        )
+    }
+
+    /// A pass that proved TRANSFERS ONLY reports its count with no txids: only preparations are
+    /// retrievable, so a non-zero total with an empty handoff list is the correct shape, not a
+    /// marshal that lost data.
+    func testProveOutcomeDecodeMapsATotalWithNoPreparationTxids() {
+        let outcome = makeProveOutcome(totalProved: 2, txids: [])
+        defer { freeProveOutcome(outcome) }
+
+        XCTAssertEqual(
+            outcome.unsafeToMigrationProveOutcome(),
+            MigrationProveOutcome(totalProved: 2, preparationTxids: []),
+            "a transfers-only pass offers nothing for retrieval"
         )
     }
 

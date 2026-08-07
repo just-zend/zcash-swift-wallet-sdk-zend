@@ -1275,7 +1275,24 @@ fn prove_one(
     }
 }
 
-/// Proves the NAMED rows, persisting each, and returns how many were proved.
+/// What one prove sweep accomplished: how many rows it proved, and the txids of the PREPARATIONS
+/// among them.
+///
+/// ONLY PREPARATIONS ARE LISTED. A proved preparation is a complete PCZT (signatures and proofs),
+/// it is ZIP 318-exempt, and the engine's own contract is that a preparation is broadcast as soon
+/// as it is proved — so its submission is the platform's ORDINARY path: retrieve it by txid
+/// through [`zcashlc_migration_take_preparation_by_txid`] and submit it like any other raw
+/// transaction. A transfer is delivered by the drive's BROADCAST instruction alone, so naming one
+/// here would imply a retrievability it deliberately does not have.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProveOutcome {
+    /// How many of the named rows this call proved — preparations AND transfers.
+    total_proved: u32,
+    /// The proved preparations' stored txids, in the order they were proved.
+    preparation_txids: Vec<[u8; 32]>,
+}
+
+/// Proves the NAMED rows, persisting each, and returns what was proved (see [`ProveOutcome`]).
 ///
 /// The ids are an instruction, not a query: they are the batch a prior
 /// [`zcashlc_migration_advance_step`] returned as its `Prove` step, already verified against the
@@ -1314,15 +1331,15 @@ fn prove_named_rows(
         &mut MigrationState,
         MigrationTransferId,
     ) -> anyhow::Result<bool>,
-) -> anyhow::Result<u32> {
-    let mut proved = 0;
+) -> anyhow::Result<ProveOutcome> {
+    let mut outcome = ProveOutcome::default();
     for &id in ids {
         // `max_proofs` caps SUCCESSFUL proofs per call so an FFI caller can chunk a sweep:
         // each proof is seconds of CPU, and a platform serializing DB access behind one
         // actor needs a seam between proofs for interactive reads to interleave. A skip
         // below doesn't count against the cap — it costs no proving time, which is what lets a
         // cap-1 caller re-pass the WHOLE batch each chunk and still make progress.
-        if max_proofs.is_some_and(|max| proved >= max) {
+        if max_proofs.is_some_and(|max| outcome.total_proved >= max) {
             break;
         }
         // The staleness skip. Only a `Signed` row is proving work; anything else the instruction
@@ -1338,23 +1355,29 @@ fn prove_named_rows(
             // Guarded above as `Signed`, so a successful prove must have advanced this one; were
             // that ever untrue a cap-1 caller's loop would re-select it forever, which as an FFI
             // call means a hung app. Fail loudly instead.
-            let advanced = state
-                .transactions()
-                .iter()
-                .find(|t| t.id() == id)
-                .is_none_or(|t| !matches!(t.state(), MigrationTxState::Signed));
+            let row = state.transactions().iter().find(|t| t.id() == id);
+            let advanced = row.is_none_or(|t| !matches!(t.state(), MigrationTxState::Signed));
             if !advanced {
                 return Err(anyhow!(
                     "migration transaction {} reported a successful prove but is still Signed",
                     u32::from(id)
                 ));
             }
-            proved += 1;
+            // Preparations only — see [`ProveOutcome`]. The txid is the row's STORED one, the
+            // identity [`serve_for_broadcast`] serves under and the engine keys `mark_broadcast`
+            // on, so what the platform retrieves by is exactly what it submits and records under.
+            if let Some(txid) = row
+                .filter(|t| matches!(t.kind(), MigrationTxKind::Preparation { .. }))
+                .map(|t| <[u8; 32]>::from(t.txid()))
+            {
+                outcome.preparation_txids.push(txid);
+            }
+            outcome.total_proved += 1;
         }
         // A `false` (transient) result — the anchor not yet witnessable — moves on without
         // marking anything: the next crank re-offers this row among the still-unproved remainder.
     }
-    Ok(proved)
+    Ok(outcome)
 }
 
 // ----- estimated-tip due-ness (M2, upstream `DuenessTargets`) -----
@@ -1958,6 +1981,39 @@ impl FfiPreparedTransfer {
     }
 }
 
+/// What one [`zcashlc_migration_prove_transactions`] call proved: the total count, and the txids
+/// of the PREPARATIONS among them. Always populated; a NULL return signals an error.
+///
+/// `total_proved == 0` with an empty `preparation_txids` is the ordinary "nothing in this batch is
+/// provable right now" answer (also: no stored run, or a terminal one).
+///
+/// THE TXIDS ARE PREPARATIONS' AND NOTHING ELSE. A proved preparation is a complete PCZT whose
+/// submission is the platform's ORDINARY path — retrieve it with
+/// [`zcashlc_migration_take_preparation_by_txid`] and submit it like any other raw transaction —
+/// whereas a transfer crosses the turnstile on the drive's own schedule and is served by a
+/// BROADCAST instruction alone. A transfer's txid therefore never appears here, because appearing
+/// here means "retrievable".
+#[repr(C)]
+pub struct FfiMigrationProveOutcome {
+    /// How many of the named transactions this call proved — preparations AND transfers.
+    pub total_proved: u32,
+    /// Heap array of `preparation_txids_len` raw (internal-order) 32-byte txids: the preparations
+    /// this call proved, in the order it proved them.
+    pub preparation_txids: *mut [u8; 32],
+    pub preparation_txids_len: usize,
+}
+
+impl FfiMigrationProveOutcome {
+    fn from_outcome(outcome: ProveOutcome) -> *mut Self {
+        let (preparation_txids, preparation_txids_len) = ptr_from_vec(outcome.preparation_txids);
+        Box::into_raw(Box::new(FfiMigrationProveOutcome {
+            total_proved: outcome.total_proved,
+            preparation_txids,
+            preparation_txids_len,
+        }))
+    }
+}
+
 /// A single scheduled Orchard→Ironwood transfer (element of [`FfiMigrationSchedule`]).
 #[repr(C)]
 pub struct FfiTransferProposal {
@@ -2361,6 +2417,19 @@ pub unsafe extern "C" fn zcashlc_free_migration_prepared_transfer(ptr: *mut FfiP
     if !ptr.is_null() {
         let boxed = unsafe { Box::from_raw(ptr) };
         free_ptr_from_vec(boxed.pczt, boxed.pczt_len);
+        drop(boxed);
+    }
+}
+
+/// Frees a [`FfiMigrationProveOutcome`], including its preparation-txid array.
+///
+/// # Safety
+/// `ptr` must be null or point to a [`FfiMigrationProveOutcome`] handed out by this module.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_migration_prove_outcome(ptr: *mut FfiMigrationProveOutcome) {
+    if !ptr.is_null() {
+        let boxed = unsafe { Box::from_raw(ptr) };
+        free_ptr_from_vec(boxed.preparation_txids, boxed.preparation_txids_len);
         drop(boxed);
     }
 }
@@ -3536,8 +3605,15 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
 
 /// Proves the NAMED migration transactions — the instruction a prior
 /// [`zcashlc_migration_advance_step`] call returned as its PROVE step — persisting each proof, and
-/// returns HOW MANY were proved (`0` is the ordinary "nothing left to prove NOW" answer; `-1`
-/// signals an error — see `zcashlc_last_error_message`).
+/// returns a [`FfiMigrationProveOutcome`]: how many were proved, and THE TXIDS OF THE PREPARATIONS
+/// IT PROVED. A `total_proved` of `0` with no txids is the ordinary "nothing left to prove NOW"
+/// answer; NULL signals an error (see `zcashlc_last_error_message`).
+///
+/// THE TXIDS ARE THE HANDOFF. A proved preparation is a complete PCZT and the engine's contract is
+/// that it is broadcast as soon as it is proved, so the platform takes each returned txid to
+/// [`zcashlc_migration_take_preparation_by_txid`] and submits the bytes through its ordinary
+/// raw-transaction machinery. Transfers are NEVER named: they are delivered by the drive's
+/// BROADCAST instruction alone.
 ///
 /// THIS EXECUTOR NEVER ASKS THE ENGINE WHAT TO PROVE. `advance_migration` is the top-level call
 /// and every invocation is subservient to it: there is no proving to do without first having been
@@ -3561,7 +3637,8 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
 /// and takes real time, while the broadcast executor must only broadcast.
 ///
 /// # Safety
-/// See [`open`]; `ids` must be valid for reads of `ids_len` `u32` values.
+/// See [`open`]; `ids` must be valid for reads of `ids_len` `u32` values. Free the returned
+/// pointer with [`zcashlc_free_migration_prove_outcome`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_prove_transactions(
     db_data: *const u8,
@@ -3571,7 +3648,7 @@ pub unsafe extern "C" fn zcashlc_migration_prove_transactions(
     ids: *const u32,
     ids_len: usize,
     max_proofs: i64,
-) -> i64 {
+) -> *mut FfiMigrationProveOutcome {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let ids: Vec<MigrationTransferId> = unsafe { slice_or_empty(ids, ids_len) }
@@ -3588,18 +3665,22 @@ pub unsafe extern "C" fn zcashlc_migration_prove_transactions(
                 .latest_migration()
                 .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
-            return Ok(0);
+            return Ok(FfiMigrationProveOutcome::from_outcome(
+                ProveOutcome::default(),
+            ));
         };
         if state.is_terminal() {
-            return Ok(0);
+            return Ok(FfiMigrationProveOutcome::from_outcome(
+                ProveOutcome::default(),
+            ));
         }
         let cap = u32::try_from(max_proofs).ok().filter(|&n| n > 0);
-        let proved = prove_named_rows(&mut ctx, &mut state, &ids, cap, |ctx, state, id| {
+        let outcome = prove_named_rows(&mut ctx, &mut state, &ids, cap, |ctx, state, id| {
             prove_one(ctx, state, id)
         })?;
-        Ok(i64::from(proved))
+        Ok(FfiMigrationProveOutcome::from_outcome(outcome))
     });
-    unwrap_exc_or(res, -1)
+    unwrap_exc_or_null(res)
 }
 
 /// Serves the named transaction for broadcast — the instruction a prior
@@ -3654,6 +3735,106 @@ pub unsafe extern "C" fn zcashlc_migration_take_broadcast_transaction(
         };
         let (raw, txid) = serve_for_broadcast(&mut ctx, &state, id)?;
         FfiPreparedTransfer::from_parts(id, txid, raw)
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Serves the PROVED PREPARATION with the given txid for submission — the retrieval half of the
+/// handoff [`zcashlc_migration_prove_transactions`] opens by returning the preparations' txids.
+///
+/// THE RULING THIS IMPLEMENTS. A proved preparation is a complete PCZT (signatures and proofs);
+/// its submission is the ORDINARY path, not the engine's delivery ceremony — preparations are
+/// ZIP 318-exempt, and the engine's own contract is that a preparation is broadcast as soon as it
+/// is proved. So the platform submits it through whatever machinery it already uses for raw
+/// transactions, and records the outcome through the standard
+/// [`zcashlc_migration_record_transfer_result`] path.
+///
+/// THIS ACCESSOR IS THE TAKE SEAM, NOT A BYTE READ. `txid -> row -> take_transaction_for_broadcast`
+/// (via [`serve_for_broadcast`]) in ONE database transaction: the wallet's own record of the
+/// transaction binds AT RETRIEVAL, so a platform can never hold submittable bytes the wallet knows
+/// nothing about. It is idempotent — a consumer that crashed between retrieving and submitting
+/// re-retrieves exactly the same bytes over the same record.
+///
+/// PREPARATION-GATED. A txid naming a TRANSFER is refused: transfers are served by the drive's
+/// broadcast instruction alone. The refusal is bare, as an unknown txid is, because both are
+/// questions about WHICH row was named rather than about whether an artifact can be made servable
+/// — the distinction [`broadcast_seam_error`] draws, and the one the
+/// `MIGRATION_PROVING_UNAVAILABLE` prefix is reserved for. The seam's own refusal of a
+/// non-`Proved` row is what remains as the READINESS gate: a preparation whose proof this process
+/// has not persisted is not servable, and the caller proves again rather than retrying here.
+///
+/// TAKEN BUT NEVER SUBMITTED is a bounded, engine-modelled state, not a leak: the record is
+/// idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces through
+/// the ordinary attention path once it expires. SUBMITTED BUT NEVER MARKED is likewise bounded:
+/// the platform reports the landed submission through
+/// [`zcashlc_migration_record_transfer_result`] as the ordinary close of the loop, and a platform
+/// that crashed before doing so still converges — the engine promotes any in-flight transaction
+/// its scan sees mine, by the id it stored when it BUILT the transaction.
+///
+/// The returned DTO carries the ENGINE TRANSFER ID alongside the finalized transaction bytes and
+/// the row's stored txid, so the platform records the submission's outcome through the standard
+/// record path with no identity of its own to keep.
+///
+/// # Safety
+/// See [`open`]; `txid_ptr` must be non-null and valid for reads of 32 bytes (a null pointer is
+/// refused rather than read). Free the returned pointer with
+/// [`zcashlc_free_migration_prepared_transfer`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_take_preparation_by_txid(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+    txid_ptr: *const u8,
+) -> *mut FfiPreparedTransfer {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        // Checked, not coerced: `slice_or_empty` only tolerates NULL at length 0, and reading 32
+        // bytes from a null pointer is undefined behaviour — which a public C ABI symbol must
+        // refuse rather than risk. Mirrors `zcashlc_migration_record_transfer_result`'s own
+        // null-check on the txid it takes.
+        if txid_ptr.is_null() {
+            return Err(anyhow!(
+                "txid_ptr is null; a preparation txid must be 32 bytes"
+            ));
+        }
+        let txid: [u8; 32] = unsafe { slice::from_raw_parts(txid_ptr, 32) }
+            .try_into()
+            .expect("length 32 by construction");
+        // A plain load, NOT `reconcile_mined`: this is a retrieval against the run as the last
+        // advance left it, and a row promoted since is simply no longer `Proved`, which the seam's
+        // own refusal handles.
+        let Some(state) = ({
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
+        }) else {
+            return Err(anyhow!(
+                "no migration run is stored, so no preparation with txid {} can be served",
+                TxId::from_bytes(txid)
+            ));
+        };
+        let row = state
+            .transactions()
+            .iter()
+            .find(|t| <[u8; 32]>::from(t.txid()) == txid)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no migration transaction with txid {}",
+                    TxId::from_bytes(txid)
+                )
+            })?;
+        let id = row.id();
+        if !matches!(row.kind(), MigrationTxKind::Preparation { .. }) {
+            return Err(anyhow!(
+                "migration transaction {} is a transfer, not a preparation: transfers are served \
+                 by the drive's broadcast instruction alone",
+                u32::from(id)
+            ));
+        }
+        let (raw, served_txid) = serve_for_broadcast(&mut ctx, &state, id)?;
+        FfiPreparedTransfer::from_parts(id, served_txid, raw)
     });
     unwrap_exc_or_null(res)
 }
@@ -8175,7 +8356,10 @@ mod tests {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("a capped sweep must not fail");
-        assert_eq!(first, 1, "the cap must stop the sweep after one proof");
+        assert_eq!(
+            first.total_proved, 1,
+            "the cap must stop the sweep after one proof"
+        );
         assert_eq!(
             prover.calls.len(),
             1,
@@ -8195,7 +8379,10 @@ mod tests {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("the follow-up sweep must not fail");
-        assert_eq!(second, 1, "the uncapped follow-up must prove the remainder");
+        assert_eq!(
+            second.total_proved, 1,
+            "the uncapped follow-up must prove the remainder"
+        );
         assert_eq!(prover.calls.len(), 2, "two proofs total across the chunks");
         let _ = std::fs::remove_file(&path);
     }
@@ -8215,7 +8402,10 @@ mod tests {
         })
         .expect("sweeping a provable transfer must not fail");
 
-        assert_eq!(proved, 1, "the sweep must prove the one provable row");
+        assert_eq!(
+            proved.total_proved, 1,
+            "the sweep must prove the one provable row"
+        );
         assert_eq!(
             prover.calls,
             vec![ProveCall::Transfer(h(1440))],
@@ -8301,7 +8491,7 @@ mod tests {
         .expect("a transient prove outcome must not be an error");
 
         assert_eq!(
-            proved, 1,
+            proved.total_proved, 1,
             "the sweep must prove the row behind the skipped one"
         );
         assert!(
@@ -8350,7 +8540,10 @@ mod tests {
         })
         .expect("the sweep must not fail");
 
-        assert_eq!(proved, 1, "the undue but provable row must be proved");
+        assert_eq!(
+            proved.total_proved, 1,
+            "the undue but provable row must be proved"
+        );
         let stored = read_fixture_state(&path, &account);
         let tx = stored
             .transactions()
@@ -8431,7 +8624,7 @@ mod tests {
             |_ctx, state, id| Ok(prove_due_for_test(&mut prover, state, id, Some(tip))?.is_some()),
         )
         .expect("the boundary sweep must not fail");
-        assert_eq!(proved, 1, "the named preparation is proved");
+        assert_eq!(proved.total_proved, 1, "the named preparation is proved");
         assert_eq!(
             prover.calls,
             vec![ProveCall::Preparation(tip)],
@@ -8557,7 +8750,10 @@ mod tests {
         })
         .expect("a stale instruction must not be an error");
 
-        assert_eq!(proved, 0, "an already-proved row is a skip, not a re-prove");
+        assert_eq!(
+            proved.total_proved, 0,
+            "an already-proved row is a skip, not a re-prove"
+        );
         assert!(
             prover.calls.is_empty(),
             "the prover must never be consulted for a row that is not Signed"
@@ -8891,7 +9087,7 @@ mod tests {
         .expect("the recording prove closure must not fail");
 
         assert_eq!(
-            proved, 1,
+            proved.total_proved, 1,
             "max_proofs = Some(1) caps the sweep at one proof"
         );
         assert_eq!(
@@ -11010,6 +11206,376 @@ mod tests {
             stored_scheduled_height(&stored, 2) - stored_scheduled_height(&stored, 1),
             200,
             "the drawn inter-broadcast gap survives the wallet's absence unchanged"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- the txid seam (the prove return + `zcashlc_migration_take_preparation_by_txid`) -----
+    //
+    // A proved preparation is a complete PCZT whose submission is the platform's ORDINARY path
+    // (preparations are ZIP 318-exempt, and the engine's contract is that a preparation is
+    // broadcast as soon as it is proved), so the prove executor NAMES the preparations it proved
+    // and the accessor hands each one back by txid. The accessor is the take seam itself — the
+    // wallet's record binds at retrieval — so these fixtures inherit the delivery lane's limits
+    // exactly: what is reachable here is that the seam is REACHED and that every refusal is
+    // all-or-nothing.
+
+    /// One retrieval over the FFI, with the DTO copied out and freed: the engine transfer id, the
+    /// served txid, and the served (finalized transaction) bytes. Asserts success — a NULL is an
+    /// error to be read with [`take_preparation_error`] instead.
+    fn take_preparation_by_txid(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+        txid: [u8; 32],
+    ) -> (u32, [u8; 32], Vec<u8>) {
+        let ptr = unsafe {
+            zcashlc_migration_take_preparation_by_txid(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                txid.as_ptr(),
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "the preparation accessor must not error: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        let prepared = unsafe { &*ptr };
+        let out = (
+            prepared.id,
+            prepared.txid,
+            unsafe { slice_or_empty(prepared.pczt, prepared.pczt_len) }.to_vec(),
+        );
+        unsafe { zcashlc_free_migration_prepared_transfer(ptr) };
+        out
+    }
+
+    /// The preparation accessor's refusal message: asserts the NULL return and takes the last
+    /// error.
+    fn take_preparation_error(path_bytes: &[u8], account: &[u8; 16], txid: [u8; 32]) -> String {
+        let ptr = unsafe {
+            zcashlc_migration_take_preparation_by_txid(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                txid.as_ptr(),
+            )
+        };
+        assert!(
+            ptr.is_null(),
+            "the accessor was expected to refuse txid {}",
+            TxId::from_bytes(txid)
+        );
+        ffi_helpers::error_handling::take_last_error()
+            .expect("the refusal must record a last-error")
+            .to_string()
+    }
+
+    /// The fixture txid [`test_transaction_from_parts`] stamps on row `id`.
+    fn fixture_txid(id: u32) -> [u8; 32] {
+        [id as u8; 32]
+    }
+
+    /// THE PROVE RETURN NAMES PREPARATIONS ONLY. A mixed batch proves both kinds and the total
+    /// counts both, but only the preparations' txids come back: appearing in that list MEANS
+    /// "retrievable through the accessor", and a transfer never is — it is delivered by the
+    /// drive's broadcast instruction alone.
+    #[test]
+    fn prove_outcome_names_the_proved_preparations_and_no_transfer() {
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_prove_outcome_mixed", 5_000);
+        let anchor = h(4_000);
+        let mut state = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                provable_tx_row(
+                    0,
+                    MigrationTxKind::Preparation { layer: 0, index: 0 },
+                    4_000,
+                    10_000,
+                    None,
+                    MigrationTxState::Signed,
+                ),
+                provable_tx_row(
+                    1,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    4_000,
+                    10_000,
+                    Some(1_440),
+                    MigrationTxState::Signed,
+                ),
+            ],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let ids = prove_instruction(&state);
+        assert_eq!(ids.len(), 2, "both rows are named by the instruction");
+        // The production dispatch ([`prove_one`]): a preparation proves against the resolved
+        // anchor, a transfer against its persisted boundary.
+        let outcome = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
+            let is_preparation = state
+                .transactions()
+                .iter()
+                .find(|t| t.id() == id)
+                .is_some_and(|t| matches!(t.kind(), MigrationTxKind::Preparation { .. }));
+            let preparation_anchor = is_preparation.then_some(anchor);
+            Ok(prove_due_for_test(&mut prover, state, id, preparation_anchor)?.is_some())
+        })
+        .expect("the mixed sweep must not fail");
+
+        assert_eq!(
+            prover.calls,
+            vec![
+                ProveCall::Preparation(anchor),
+                ProveCall::Transfer(h(1_440))
+            ],
+            "both kinds must actually have been proved"
+        );
+        assert_eq!(
+            outcome,
+            ProveOutcome {
+                total_proved: 2,
+                preparation_txids: vec![fixture_txid(0)],
+            },
+            "the total counts both kinds; the txids name the preparation alone"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The prove return's MARSHALING: the outcome crosses as a DTO whose txid array is a heap
+    /// `[u8; 32]` buffer the caller frees, and the empty outcome is a valid (non-NULL) DTO rather
+    /// than a sentinel — "nothing was provable right now" is an ordinary answer.
+    #[test]
+    fn prove_outcome_marshals_its_txid_buffer_and_frees() {
+        let round_trip = |outcome: ProveOutcome| {
+            let ptr = FfiMigrationProveOutcome::from_outcome(outcome);
+            assert!(!ptr.is_null(), "the outcome DTO is always populated");
+            let dto = unsafe { &*ptr };
+            let read = (
+                dto.total_proved,
+                unsafe { slice_or_empty(dto.preparation_txids, dto.preparation_txids_len) }
+                    .to_vec(),
+            );
+            unsafe { zcashlc_free_migration_prove_outcome(ptr) };
+            read
+        };
+
+        assert_eq!(
+            round_trip(ProveOutcome::default()),
+            (0, Vec::new()),
+            "the empty outcome marshals as a real DTO, not an error sentinel"
+        );
+        assert_eq!(
+            round_trip(ProveOutcome {
+                total_proved: 3,
+                preparation_txids: vec![fixture_txid(1), fixture_txid(2)],
+            }),
+            (3, vec![fixture_txid(1), fixture_txid(2)]),
+            "the total and every txid survive the crossing, in order"
+        );
+        // Freeing a null pointer is a no-op, as every free function in this module allows.
+        unsafe { zcashlc_free_migration_prove_outcome(std::ptr::null_mut()) };
+    }
+
+    /// With no stored run there is nothing to prove, and the executor says so with an EMPTY
+    /// outcome rather than an error: the benign answer is a DTO, and NULL now means only failure.
+    #[test]
+    fn prove_transactions_without_a_stored_run_returns_an_empty_outcome() {
+        let path = init_fixture_db("zcashlc_prove_outcome_no_run");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+
+        let ids = [0u32];
+        let ptr = unsafe {
+            zcashlc_migration_prove_transactions(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                ids.as_ptr(),
+                ids.len(),
+                1,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "nothing to prove is not an error: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        let dto = unsafe { &*ptr };
+        assert_eq!(dto.total_proved, 0, "no run means nothing was proved");
+        assert_eq!(
+            dto.preparation_txids_len, 0,
+            "and nothing is offered for retrieval"
+        );
+        unsafe { zcashlc_free_migration_prove_outcome(ptr) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE ACCESSOR IS THE TAKE SEAM. Retrieving a preparation is not a byte read of the stored
+    /// artifact: it resolves txid -> row and goes straight through
+    /// `PoolMigrations::take_transaction_for_broadcast` ([`serve_for_broadcast`]), which finalizes,
+    /// extracts and records the transaction in the WALLET's own tables in one database transaction
+    /// with handing the bytes out — so the record binds at retrieval and a crashed consumer
+    /// re-retrieves the same bytes over the same record.
+    ///
+    /// As with the delivery lane, a SUCCESSFUL serve needs a genuinely proven artifact (extraction
+    /// re-verifies the proofs), which no hand-built fixture can stand in for; what is reachable
+    /// here is that the accessor REACHES the seam — the message is the STORE's — and that the
+    /// refusal leaves the wallet exactly as it found it.
+    #[test]
+    fn take_preparation_by_txid_serves_through_the_broadcast_seam() {
+        let (path, account) = init_delivery_fixture("zcashlc_take_prep_seam");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                0,
+                MigrationTxKind::Preparation { layer: 0, index: 0 },
+                3_600_000,
+                4_000_000,
+                None,
+                MigrationTxState::Proved,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "no transaction is recorded before the accessor runs"
+        );
+
+        let err = take_preparation_error(path_bytes, &account, fixture_txid(0));
+        assert!(
+            err.contains("taking migration transaction 0 for broadcast failed")
+                && err.contains("pool-migration store"),
+            "the accessor must fail THROUGH the store's seam, got: {err}"
+        );
+        assert!(
+            err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "an unfinalizable artifact keeps the proving-unavailable route here too, got: {err}"
+        );
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "a refused finalization must record nothing: the seam is all-or-nothing"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE PREPARATION GATE. A transfer's txid is refused even when the row is `Proved` and would
+    /// serve perfectly well through the same seam: transfers are served by the drive's broadcast
+    /// instruction alone, and this accessor exists only for the preparations the prove return
+    /// names. The refusal is BARE — it is a question about WHICH row was named, not about whether
+    /// an artifact can be made servable — and it is decided before the seam, so nothing is
+    /// recorded.
+    #[test]
+    fn take_preparation_by_txid_refuses_a_transfer_txid() {
+        let (path, account) = init_delivery_fixture("zcashlc_take_prep_gate");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                0,
+                MigrationTxKind::Transfer { crossing: 0 },
+                3_600_000,
+                4_000_000,
+                Some(3_500_000),
+                MigrationTxState::Proved,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let err = take_preparation_error(path_bytes, &account, fixture_txid(0));
+        assert!(
+            err.contains("transfers are served by the drive's broadcast instruction alone"),
+            "the gate must state the ruling, got: {err}"
+        );
+        assert!(
+            !err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "the gate is not a claim about the artifact, got: {err}"
+        );
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "the gated row must never reach the seam, so nothing is recorded"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE READINESS GATE, THE UNKNOWN TXID, AND THE NULL POINTER. A preparation that is not
+    /// `Proved` is refused by the seam itself — the same staleness guard the delivery executor
+    /// relies on, bare and recording nothing — a txid the stored run does not carry is refused,
+    /// bare, before the seam is reached, and a null `txid_ptr` is refused before anything is read.
+    #[test]
+    fn take_preparation_by_txid_refuses_an_unproved_unknown_or_null_txid() {
+        let (path, account) = init_delivery_fixture("zcashlc_take_prep_unready");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                0,
+                MigrationTxKind::Preparation { layer: 0, index: 0 },
+                3_600_000,
+                4_000_000,
+                None,
+                MigrationTxState::Signed,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let err = take_preparation_error(path_bytes, &account, fixture_txid(0));
+        assert!(
+            err.contains("is not proved"),
+            "the seam must name the lifecycle problem, got: {err}"
+        );
+        assert!(
+            !err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "a lifecycle refusal must not claim proving is unavailable, got: {err}"
+        );
+
+        // A NULL txid pointer is refused, not read: `slice_or_empty` tolerates NULL only at
+        // length 0, so reading 32 bytes from one would be undefined behaviour at a public C ABI
+        // symbol.
+        let ptr = unsafe {
+            zcashlc_migration_take_preparation_by_txid(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                std::ptr::null(),
+            )
+        };
+        assert!(ptr.is_null(), "a null txid pointer must be refused");
+        let err = ffi_helpers::error_handling::take_last_error()
+            .expect("the refusal must record a last-error")
+            .to_string();
+        assert!(
+            err.contains("txid_ptr is null"),
+            "the null refusal must name the pointer, got: {err}"
+        );
+
+        let unknown = fixture_txid(99);
+        let err = take_preparation_error(path_bytes, &account, unknown);
+        assert!(
+            err.contains(&format!(
+                "no migration transaction with txid {}",
+                TxId::from_bytes(unknown)
+            )),
+            "an unknown txid must be named, got: {err}"
+        );
+        assert!(
+            !err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "an unknown txid says nothing about any artifact, got: {err}"
+        );
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "neither refusal leaves a wallet record behind"
         );
         let _ = std::fs::remove_file(&path);
     }

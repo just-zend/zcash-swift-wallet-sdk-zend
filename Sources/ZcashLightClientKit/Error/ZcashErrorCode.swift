@@ -297,6 +297,8 @@ public enum ZcashErrorCode: String {
     case rustMigrationSignAndStoreSchedule = "ZRUST0108"
     /// Error from rust layer when calling ZcashRustBackend.migrationTakeBroadcastTransaction
     case rustMigrationTakeBroadcastTransaction = "ZRUST0111"
+    /// Error from rust layer when calling ZcashRustBackend.migrationTakePreparation
+    case rustMigrationTakePreparation = "ZRUST0149"
     /// Error from rust layer when calling ZcashRustBackend.migrationExtractBroadcastTx
     case rustMigrationExtractBroadcastTx = "ZRUST0112"
     /// Error from rust layer when calling ZcashRustBackend.migrationRecordTransferResult
