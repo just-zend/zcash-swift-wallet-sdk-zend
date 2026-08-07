@@ -29,8 +29,8 @@
 //! necessarily so, since [`build_sign_batch_qr_parts`]'s redaction clears the wire `spend_fvk` —
 //! and the migration ENGINE has already stamped it by the time a PCZT reaches this module:
 //! `zcash_pool_migration::engine::Committer::start` resolves the account's derivation through
-//! `MigrationBackend::account_derivation` (implemented for this SDK in
-//! [`crate::migration_engine`]) and passes it to both the preparation and transfer builders,
+//! `MigrationBackend::account_derivation` (upstream's `wallet::WalletMigration`, constructed for
+//! this SDK by [`crate::migration_engine`]) and passes it to both the preparation and transfer builders,
 //! whose shared `zcash_pool_migration::build::finalize_pczt` runs an `Updater` pass after IO
 //! finalization stamping every action whose spend has no `spend_auth_sig`. That predicate leaves
 //! the protocol padding dummies alone — `IoFinalizer` self-signed those with a throwaway key, so

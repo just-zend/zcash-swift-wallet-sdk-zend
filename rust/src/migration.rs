@@ -1,8 +1,11 @@
 //! FFI over the final Orchard→Ironwood pool-migration engine
 //! ([`zcash_pool_migration`] + the `zcash_client_sqlite::pool_migration` store).
 //!
-//! The engine is a set of free functions over traits — [`crate::migration_engine::Backend`] wires
-//! this SDK's wallet database (and the account-keyed migration store living inside it) into them;
+//! The engine is a set of free functions over traits — upstream's own `wallet::WalletMigration`
+//! adapter and `zcash_client_sqlite`'s account-scoped store implement them, wired to this SDK's
+//! wallet database by [`crate::migration_engine`]'s two constructors
+//! ([`account_migration`] for the calls that need a backend and viewing key,
+//! [`account_store`] for the ones that are purely store operations);
 //! [`crate::migration_finalize`] proves transactions as soon as they become provable (ZIP 374
 //! deferred anchors/witnesses, resolved through the upstream prover — transfers against their
 //! drawn ZIP 318 boundary anchor, preparations against the wallet's scanned tip; see its module
@@ -71,6 +74,7 @@ use std::slice;
 
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
+use orchard::keys::SpendAuthorizingKey;
 use rand::rngs::OsRng;
 use rusqlite::{Connection, OptionalExtension};
 use zcash_client_backend::data_api::wallet::{
@@ -108,7 +112,9 @@ use zcash_pool_migration::state::{
 };
 use zcash_pool_migration::wallet::WalletMigrationProver;
 
-use crate::migration_engine::{Backend, MigrationWallet};
+use crate::migration_engine::{
+    AdapterError, MigrationWallet, account_migration, account_store, stored_orchard_fvk,
+};
 use crate::migration_finalize;
 use crate::migration_plan_cache;
 use crate::{
@@ -138,8 +144,8 @@ pub(crate) fn proving_unavailable(detail: impl std::fmt::Display) -> anyhow::Err
 }
 
 /// Classifies a failure of the store's broadcast seam
-/// ([`Backend::take_transaction_for_broadcast`], reached from [`serve_for_broadcast`]) onto the
-/// delivery lane's error channel.
+/// (`PoolMigrations::take_transaction_for_broadcast`, reached from [`serve_for_broadcast`]) onto
+/// the delivery lane's error channel.
 ///
 /// The split is the one the pre-drive serve path established, and the Swift layer still routes on
 /// it: a stored artifact that cannot be turned into servable bytes right now carries
@@ -619,7 +625,7 @@ fn resolve_immediate_run(
 
 // ----- reconciliation, planning, committing -----
 
-/// Loads the stored run — TERMINAL RUNS INCLUDED, via [`Backend::latest_migration`], since
+/// Loads the stored run — TERMINAL RUNS INCLUDED, via the store's own `latest_migration`, since
 /// upstream's `get_migration` went pending-only and the reads built on this must keep serving a
 /// completed, failed, or cancelled run (progress, statuses, history) — with its `Broadcast`
 /// transactions promoted to `Mined` wherever the wallet's scan has since seen them, persisting
@@ -632,8 +638,11 @@ fn resolve_immediate_run(
 /// read-only entry points (progress, statuses, the delivery queries) run it so a standalone read
 /// is not answered from a state the wallet's own scan has already moved past.
 fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> {
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-    let Some(mut state) = backend.latest_migration()? else {
+    let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+    let Some(mut state) = store
+        .latest_migration()
+        .map_err(|e| anyhow!("migration store read failed: {e}"))?
+    else {
         return Ok(None);
     };
     if state.is_terminal() {
@@ -649,13 +658,18 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
         .collect();
     let mut changed = false;
     for (id, txid) in broadcast {
-        if let Some(height) = backend.mined_height(txid)? {
+        if let Some(height) = store
+            .mined_height(txid)
+            .map_err(|e| anyhow!("mined-height lookup failed: {e}"))?
+        {
             state.mark_mined(id, height);
             changed = true;
         }
     }
     if changed {
-        backend.replace_migration(&state)?;
+        store
+            .replace_migration(&state)
+            .map_err(|e| anyhow!("migration store write failed: {e}"))?;
     }
     Ok(Some(state))
 }
@@ -695,7 +709,7 @@ fn plan_and_cache(
 /// replacing the cached plan would invalidate the handle of a proposal the user is currently
 /// reviewing, failing its later commit with `MIGRATION_PLAN_STALE` for no user-visible reason.
 fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, BlockHeight)>> {
-    let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+    let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
     let mut rng = OsRng;
     match engine::plan_migration(&ctx.network, &backend, &mut rng) {
         Ok(plan) => {
@@ -1027,21 +1041,25 @@ fn encode_schedule_from_state(
 /// superseded the plan the platform displayed (see `migration_plan_cache`: the handle gate is
 /// what guarantees a commit can only sign the exact plan the user reviewed). On the resume path
 /// the handle is not consulted: the commitment already happened — with a handle-verified plan —
-/// and is durable, so there is nothing left the handle could protect. `sign` picks the
-/// `commit_preparation` / `build_preparation_unsigned` variant. A terminal stored run (a
+/// and is durable, so there is nothing left the handle could protect. `unsigned_out` picks the
+/// `build_preparation_unsigned` / `commit_preparation` variant; `ask` is the account's Orchard
+/// spend authority, required by (and live only for) the second. A terminal stored run (a
 /// completed or cancelled previous migration) is REPLACED — that is the sequential-runs path.
 /// When the cached preview came through the immediate lane, the committed transfers' scheduled
 /// heights are rewritten to the commit tip (everything due at once; preparation mining order
 /// still gates transfers via their dependencies).
 fn commit_or_resume(
     ctx: &mut CallCtx,
-    usk: Option<zcash_keys::keys::UnifiedSpendingKey>,
+    ask: Option<&SpendAuthorizingKey>,
     unsigned_out: bool,
     plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<(MigrationState, Vec<(MigrationTransferId, Vec<u8>, u32)>)> {
     {
-        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        if let Some(state) = backend.get_migration()? {
+        let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+        if let Some(state) = store
+            .get_migration()
+            .map_err(|e| anyhow!("migration store read failed: {e}"))?
+        {
             if !state.is_terminal() {
                 // Re-serve path: the row's own kind carries its action weight (the same weight
                 // the plan's now-consumed signing-rounds preview used), never re-derived from the
@@ -1062,7 +1080,7 @@ fn commit_or_resume(
 
     let target = ctx.target()?;
     let mut rng = OsRng;
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, usk, &mut ctx.store_conn)?;
+    let mut backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
     let (state, unsigned) = if unsigned_out {
         let (state, unsigned) = engine::build_preparation_unsigned(
             &ctx.network,
@@ -1084,10 +1102,12 @@ fn commit_or_resume(
             .collect::<anyhow::Result<Vec<_>>>()?;
         (state, unsigned)
     } else {
+        let ask = ask.ok_or_else(|| anyhow!("signing requires the account's spending key"))?;
         let state = engine::commit_preparation(
             &ctx.network,
             target,
             &mut backend,
+            ask,
             &cached.plan,
             &mut rng,
             ReplanThreshold::DEFAULT,
@@ -1102,7 +1122,7 @@ fn commit_or_resume(
 
 /// Map a commit error, routing `StalePlan` through the stable plan-stale prefix (the actionable
 /// "re-propose" signal).
-fn map_commit_err(e: engine::CommitError<anyhow::Error>) -> anyhow::Error {
+fn map_commit_err(e: engine::CommitError<AdapterError>) -> anyhow::Error {
     match e {
         engine::CommitError::StalePlan => {
             plan_stale("the previewed plan no longer matches the wallet or the build height")
@@ -1116,7 +1136,7 @@ fn map_commit_err(e: engine::CommitError<anyhow::Error>) -> anyhow::Error {
 /// never substitutes an equal-value note, which could be a sibling transfer's) was spent outside
 /// the migration, so the remaining balance must be re-planned via the restart lane. Everything
 /// else is a hard error carrying the engine's detail.
-fn map_rebuild_err(e: engine::RebuildError<anyhow::Error>) -> anyhow::Error {
+fn map_rebuild_err(e: engine::RebuildError<AdapterError>) -> anyhow::Error {
     match e {
         engine::RebuildError::FundingNoteUnavailable(value) => anyhow!(
             "the expired transfer's funding note ({} zatoshi) is gone — it was spent outside the \
@@ -1131,7 +1151,7 @@ fn map_rebuild_err(e: engine::RebuildError<anyhow::Error>) -> anyhow::Error {
 /// Serves the stored `Proved` transaction `id` through the store's atomic broadcast seam, as
 /// `(finalized transaction bytes, the row's stored txid)`.
 ///
-/// The seam ([`Backend::take_transaction_for_broadcast`]) finalizes, extracts and records the
+/// The seam (`PoolMigrations::take_transaction_for_broadcast`) finalizes, extracts and records the
 /// transaction in the wallet's own tables in one database transaction with handing the bytes back,
 /// so the wallet's record binds at the broadcast ATTEMPT. It is idempotent: a retry after a failed
 /// submission re-serves exactly the same transaction over the same record.
@@ -1154,8 +1174,8 @@ fn serve_for_broadcast(
         .find(|t| t.id() == id)
         .map(|t| <[u8; 32]>::from(t.txid()))
         .ok_or_else(|| anyhow!("no migration transaction with id {}", u32::from(id)))?;
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-    let tx = backend
+    let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+    let tx = store
         .take_transaction_for_broadcast(state, id)
         .map_err(|e| broadcast_seam_error(id, e))?;
     let mut raw = Vec::new();
@@ -1212,8 +1232,7 @@ fn prove_one(
                 .map(|meta| meta.block_height())
                 .map_or_else(|| ctx.tip(), Ok)?;
             let network = ctx.network;
-            let fvk = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?
-                .stored_orchard_fvk()?;
+            let fvk = stored_orchard_fvk(&ctx.wallet, ctx.account)?;
             let mut prover = WalletMigrationProver::new(&mut ctx.wallet, ctx.account, fvk);
             let Some(proved) = migration_finalize::prove_due_transaction(
                 &network,
@@ -1234,8 +1253,10 @@ fn prove_one(
             // the wallet's own spends could double-spend a migration input. It persists the
             // whole state, so the proving-time boundary re-draw's mutation rides along — the
             // separate `replace_migration` this replaces is no longer needed here.
-            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.store_proved_transaction(state, proved)?;
+            let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .store_proved_transaction(state, proved)
+                .map_err(|e| anyhow!("migration store proved-transaction write failed: {e}"))?;
             Ok(true)
         }
         other => Err(anyhow!(
@@ -2455,9 +2476,11 @@ pub unsafe extern "C" fn zcashlc_free_migration_keystone_batch_decode_result(
 
 /// The account's live spendable Orchard balance (what is still in the old pool).
 fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
-    let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+    let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
     use zcash_pool_migration::engine::MigrationBackend;
-    let values = backend.spendable_orchard_note_values()?;
+    let values = backend
+        .spendable_orchard_note_values()
+        .map_err(|e| anyhow!("reading the account's spendable Orchard notes failed: {e}"))?;
     values
         .into_iter()
         .try_fold(Zatoshis::ZERO, |acc, v| acc + v)
@@ -2489,9 +2512,9 @@ fn drive_advance(
     estimated_tip: i64,
 ) -> anyhow::Result<Advance> {
     let targets = dueness_targets(ctx.tip()?, estimated_tip);
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+    let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
     advance_migration(
-        &mut backend,
+        &mut store,
         state,
         targets,
         &AdvanceConfig::new(ReorgSettleDepth::new(
@@ -2501,6 +2524,7 @@ fn drive_advance(
         // inter-broadcast gaps, so advancing needs entropy.
         &mut OsRng,
     )
+    .map_err(|e| anyhow!("advancing the migration failed: {e}"))
 }
 
 /// Advances the stored run with upstream's public satisfiability API, using scanned and estimated
@@ -2533,11 +2557,13 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
         // transaction and promotes the ones the wallet's scan has seen mine, so reconciling first
         // would only ask the same question twice.
         let Some(mut state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
             // `latest_migration`, not the trait's `get_migration`: upstream made the latter
             // PENDING-ONLY, and this conduit's contract still reports `Complete` (below) for a
             // terminal stored run rather than "no run".
-            backend.latest_migration()?
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             // No stored run: NULL with NO error (see the function doc). Returned before any
             // chain-tip lookup, so it holds even before the wallet ever saw a chain tip.
@@ -2627,8 +2653,10 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let engine_state = {
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         };
         if let Some(state) = engine_state.as_ref().filter(|state| !state.is_terminal()) {
             let (completed, total, next_ready) = active_run_progress(state);
@@ -2705,8 +2733,10 @@ pub unsafe extern "C" fn zcashlc_migration_sync_wakeups(
         };
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Ok(empty());
         };
@@ -2953,11 +2983,13 @@ pub unsafe extern "C" fn zcashlc_migration_transaction_statuses(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
             // `latest_migration`, not the pending-only `get_migration`: unlike the sibling reads
             // (whose terminal answer equals their no-run answer), this view keeps rendering a
             // TERMINAL run's rows — a completed migration's mined transfers stay listed.
-            backend.latest_migration()?
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Ok(encode_empty_transaction_statuses());
         };
@@ -3046,8 +3078,10 @@ pub unsafe extern "C" fn zcashlc_migration_has_overdue_transfers(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Ok(false);
         };
@@ -3080,8 +3114,10 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Ok(false);
         };
@@ -3177,9 +3213,13 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
 ) -> *mut FfiPreparedTransfer {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
+        // The decoded spending key is projected straight to the Orchard spend authority the
+        // engine's signing entry point takes, and never reaches the adapter: no migration type
+        // holds spend authority, so the key is live only for this call.
+        let ask =
+            SpendAuthorizingKey::from(unsafe { crate::decode_usk(usk_ptr, usk_len)? }.orchard());
 
-        let (mut state, _) = commit_or_resume(&mut ctx, Some(usk), false, proposal_handle)?;
+        let (mut state, _) = commit_or_resume(&mut ctx, Some(&ask), false, proposal_handle)?;
 
         // The preparation transaction to prove now and return for immediate broadcast (see
         // [`ceremony_preparation_pick`] for which row and why). Proven now, against the wallet's
@@ -3228,8 +3268,11 @@ pub unsafe extern "C" fn zcashlc_migration_residual_after_migration(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         {
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            if let Some(state) = backend.get_migration()? {
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            if let Some(state) = store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
+            {
                 if !state.is_terminal() {
                     return Ok(state.denominations().change().map_or(-1, zat_to_i64));
                 }
@@ -3272,7 +3315,7 @@ pub unsafe extern "C" fn zcashlc_migration_lock_residual(
 ) -> i64 {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        // Selection targets the next block, mirroring `Backend::selection_target`.
+        // Selection targets the next block, mirroring the adapter's own selection target.
         let target = TargetHeight::from(u32::from(ctx.tip()?) + 1);
         let received = ctx
             .wallet
@@ -3379,7 +3422,7 @@ pub unsafe extern "C" fn zcashlc_migration_estimate_runs(
 ) -> *mut FfiMigrationRunEstimate {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+        let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
         let mut rng = OsRng;
         let estimate = match engine::estimate_migration_runs(&ctx.network, &backend, &mut rng) {
             Ok(estimate) => Some(estimate),
@@ -3475,8 +3518,9 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
-        commit_or_resume(&mut ctx, Some(usk), false, proposal_handle)?;
+        let ask =
+            SpendAuthorizingKey::from(unsafe { crate::decode_usk(usk_ptr, usk_len)? }.orchard());
+        commit_or_resume(&mut ctx, Some(&ask), false, proposal_handle)?;
         Ok(true)
     });
     unwrap_exc_or(res, false)
@@ -3531,8 +3575,10 @@ pub unsafe extern "C" fn zcashlc_migration_prove_transactions(
         // reconciling here would ask the same `mined_height` question twice. A row promoted since
         // is simply no longer `Signed`, which the per-row skip handles.
         let Some(mut state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.latest_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Ok(0);
         };
@@ -3558,7 +3604,7 @@ pub unsafe extern "C" fn zcashlc_migration_prove_transactions(
 /// dueness judgement all happened in the advance that issued the instruction.
 ///
 /// The serve goes through the store's atomic broadcast seam
-/// ([`Backend::take_transaction_for_broadcast`] via [`serve_for_broadcast`]): finalize, extract,
+/// (`PoolMigrations::take_transaction_for_broadcast` via [`serve_for_broadcast`]): finalize, extract,
 /// and record the transaction in the wallet's own tables, in one database transaction with handing
 /// the bytes back — so the wallet's record of a transaction the platform is about to submit binds
 /// at the attempt rather than after it. Retrying a failed submission re-serves the same
@@ -3588,8 +3634,10 @@ pub unsafe extern "C" fn zcashlc_migration_take_broadcast_transaction(
         // swept in-flight transactions and promoted the ones the wallet's scan had seen mine, so
         // reconciling here would ask the same `mined_height` question twice.
         let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.latest_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Err(anyhow!(
                 "no migration run is stored, so transaction {} cannot be served for broadcast",
@@ -3660,10 +3708,10 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
                 let txid: [u8; 32] = unsafe { slice::from_raw_parts(txid_bytes, 32) }
                     .try_into()
                     .expect("length 32 by construction");
-                let mut backend =
-                    Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-                let mut state = backend
-                    .get_migration()?
+                let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+                let mut state = store
+                    .get_migration()
+                    .map_err(|e| anyhow!("migration store read failed: {e}"))?
                     .ok_or_else(|| anyhow!("no migration is stored"))?;
                 // The engine records the broadcast under the id it derived when it BUILT the
                 // transaction, so the reported one is no longer an input. It is still checked:
@@ -3679,24 +3727,33 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
                     ));
                 }
                 state.mark_broadcast(id);
-                backend.replace_migration(&state)?;
+                store
+                    .replace_migration(&state)
+                    .map_err(|e| anyhow!("migration store write failed: {e}"))?;
                 Ok(true)
             }
             1 => Ok(true),
             2 | 3 => {
-                let mut backend =
-                    Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+                // The adapter, not the bare store: this arm dates its testimony against the
+                // ENGINE's chain tip (`MigrationBackend::chain_tip_height`), which is the
+                // backend's question, not the store's.
+                let mut backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
                 let mut state = backend
-                    .get_migration()?
+                    .get_migration()
+                    .map_err(|e| anyhow!("migration store read failed: {e}"))?
                     .ok_or_else(|| anyhow!("no migration is stored"))?;
                 if state
                     .transactions()
                     .iter()
                     .any(|tx| tx.id() == id && matches!(tx.state(), MigrationTxState::Proved))
                 {
-                    let observed_tip = backend.chain_tip_height()?;
+                    let observed_tip = backend
+                        .chain_tip_height()
+                        .map_err(|e| anyhow!("chain height lookup failed: {e}"))?;
                     state.report_broadcast_failure(id, observed_tip);
-                    backend.replace_migration(&state)?;
+                    backend
+                        .replace_migration(&state)
+                        .map_err(|e| anyhow!("migration store write failed: {e}"))?;
                 }
                 Ok(true)
             }
@@ -3763,13 +3820,16 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         {
-            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
             // The engine's own cancel: releases every note reservation the pending run's
             // never-broadcast transactions hold and records the terminal `Cancelled` status, in
             // one store transaction. Hand-writing `Failed` (the pre-locking behavior) would
             // leave those reservations standing, and the fresh plan below would select around
             // notes the abandoned run still holds.
-            backend.cancel_migration()?;
+            store
+                .cancel_migration()
+                .map(|_outcome| ())
+                .map_err(|e| anyhow!("cancelling the migration failed: {e}"))?;
         }
         match plan_and_cache(&mut ctx, false)? {
             Some((plan, reference_height, handle)) => {
@@ -3828,13 +3888,17 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
 ) -> *mut FfiMigrationSchedule {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let usk = if usk_ptr.is_null() {
+        // As on the commit lane: the decoded key becomes an Orchard spend authority here and
+        // nowhere else, and `None` is the external-signer lane that never had one.
+        let ask = if usk_ptr.is_null() {
             if usk_len != 0 {
                 return Err(anyhow!("usk_len must be 0 when usk_ptr is null"));
             }
             None
         } else {
-            Some(unsafe { crate::decode_usk(usk_ptr, usk_len)? })
+            Some(SpendAuthorizingKey::from(
+                unsafe { crate::decode_usk(usk_ptr, usk_len)? }.orchard(),
+            ))
         };
 
         // Reconcile before judging expiry: a Broadcast transfer the wallet has since observed
@@ -3855,13 +3919,19 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
             return encode_schedule_from_state(&state, tip);
         }
 
-        let sign_in_process = usk.is_some();
         let mut rng = OsRng;
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, usk, &mut ctx.store_conn)?;
+        let mut backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
         for id in &expired {
-            if sign_in_process {
-                engine::rebuild_expired_transfer(&ctx.network, &backend, &mut state, *id, &mut rng)
-                    .map_err(map_rebuild_err)?;
+            if let Some(ask) = ask.as_ref() {
+                engine::rebuild_expired_transfer(
+                    &ctx.network,
+                    &backend,
+                    ask,
+                    &mut state,
+                    *id,
+                    &mut rng,
+                )
+                .map_err(map_rebuild_err)?;
             } else {
                 // The returned UnsignedMigrationTx is deliberately dropped: the rebuilt transfer
                 // is persisted `AwaitingSignature` below, and the ceremony re-serves those bytes
@@ -3876,7 +3946,9 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
                 .map_err(map_rebuild_err)?;
             }
         }
-        backend.replace_migration(&state)?;
+        backend
+            .replace_migration(&state)
+            .map_err(|e| anyhow!("migration store write failed: {e}"))?;
         encode_schedule_from_state(&state, tip)
     });
     unwrap_exc_or_null(res)
@@ -3950,9 +4022,10 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        let mut state = backend
-            .get_migration()?
+        let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+        let mut state = store
+            .get_migration()
+            .map_err(|e| anyhow!("migration store read failed: {e}"))?
             .ok_or_else(|| anyhow!("no migration is committed yet"))?;
         let mut first: Option<(MigrationTransferId, Vec<u8>)> = None;
         for (id, bytes) in signed {
@@ -3969,7 +4042,9 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
         }
         let (first_id, first_bytes) =
             first.ok_or_else(|| anyhow!("no signed note-split PCZTs were provided"))?;
-        backend.replace_migration(&state)?;
+        store
+            .replace_migration(&state)
+            .map_err(|e| anyhow!("migration store write failed: {e}"))?;
         FfiPreparedTransfer::from_parts(first_id, [0u8; 32], first_bytes)
     });
     unwrap_exc_or_null(res)
@@ -4067,9 +4142,15 @@ pub unsafe extern "C" fn zcashlc_migration_batch_pczts_by_actions(
                          ({PREPARATION_ACTIONS}) nor a transfer ({TRANSFER_ACTIONS}) weight"
                     ));
                 };
-                // `layer`/`index`/`crossing` are dummies (see the doc above): the packer never
-                // reads them, only each entry's action weight.
-                Ok(PlannedTx::new(MigrationTransferId::new(i as u32), kind))
+                // `layer`/`index`/`crossing`, and likewise the empty dependency set and absent
+                // scheduled height, are dummies (see the doc above): the packer never reads
+                // them, only each entry's action weight.
+                Ok(PlannedTx::new(
+                    MigrationTransferId::new(i as u32),
+                    kind,
+                    Vec::new(),
+                    None,
+                ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let sizes = NextFit
@@ -4103,9 +4184,10 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        let mut state = backend
-            .get_migration()?
+        let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+        let mut state = store
+            .get_migration()
+            .map_err(|e| anyhow!("migration store read failed: {e}"))?
             .ok_or_else(|| anyhow!("no migration is committed yet"))?;
         for (id, bytes) in signed {
             if !state.apply_signature(id, bytes) {
@@ -4116,7 +4198,9 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
                 ));
             }
         }
-        backend.replace_migration(&state)?;
+        store
+            .replace_migration(&state)
+            .map_err(|e| anyhow!("migration store write failed: {e}"))?;
         Ok(true)
     });
     unwrap_exc_or(res, false)
@@ -5658,26 +5742,26 @@ mod tests {
         );
     }
 
-    /// #1806 / MOB-1466 (librustzcash #2946 parity): `Backend::spendable_orchard_notes` must
-    /// serve every read through ONE adapter from a snapshot taken on first use, never re-running
-    /// the wallet's full note selection per call — the quadratic-in-note-count behavior #2946
-    /// fixed upstream in `zcash_pool_migration::wallet::WalletMigration`, which this SDK's own
-    /// `Backend` cannot use (it requires an unconditional spending key; this adapter exists
-    /// precisely to also serve imported hardware-wallet accounts whose `usk` is `None`).
+    /// #1806 / MOB-1466 (librustzcash #2946): the migration adapter must serve every read from a
+    /// snapshot taken on first use, never re-running the wallet's full note selection per call.
+    /// The snapshot is upstream's own now — this SDK's fork of the adapter is gone — so what is
+    /// pinned here is the SDK's side of that contract: [`account_migration`] hands out an adapter
+    /// whose index space is fixed for its lifetime over THIS wallet handle, and a fresh one sees
+    /// the wallet as it now is.
     ///
     /// The mutation locks both funded notes through a SECOND wallet connection
     /// (`zcashlc_migration_lock_residual`, the same kind of reservation a real migration commit
     /// takes over the notes it is about to spend) — exactly the sort of wallet change a per-call
     /// re-selection is unsafe against: a plan's `PrepInput::Wallet { index }` names a position in
     /// the FIRST read's selection, so a later read observing a different set would resolve the
-    /// wrong note (or none) for an index the plan already committed to. The backend under test
-    /// must not observe the lock: a second read through the SAME backend stays identical to the
-    /// first. A FRESH backend, constructed after the lock, must observe it.
+    /// wrong note (or none) for an index the plan already committed to. The adapter under test
+    /// must not observe the lock: a second read through the SAME adapter stays identical to the
+    /// first. A FRESH adapter, constructed after the lock, must observe it.
     #[test]
     fn spendable_orchard_notes_snapshots_per_backend_not_per_call() {
-        use incrementalmerkletree::Position;
+        use crate::migration_engine::AccountMigration;
         use orchard::note::ExtractedNoteCommitment;
-        use zcash_pool_migration::engine::MigrationCrypto;
+        use zcash_pool_migration::engine::{MigrationBackend, MigrationCrypto};
 
         let path = init_fixture_db("zcashlc_migration_spendable_snapshot");
         let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
@@ -5705,38 +5789,44 @@ mod tests {
         }
         .expect("the fixture context opens");
 
-        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)
-            .expect("backend construction must succeed");
-
-        let first_snapshot: Vec<(Position, u64)> = {
-            let first = backend
-                .spendable_orchard_notes()
+        // The adapter's index space as the ENGINE addresses it: one entry per selected note, in
+        // selection order, each read through BOTH public accessors — the value from
+        // `spendable_orchard_note_values` and the note itself from `resolve_wallet_note(i)`,
+        // asserted to agree. That agreement is the index-space stability the engine's
+        // `PrepInput::Wallet { index }` depends on.
+        let snapshot = |backend: &AccountMigration<'_>| -> Vec<(u64, [u8; 32])> {
+            let values = backend
+                .spendable_orchard_note_values()
                 .expect("selection must succeed");
-            assert_eq!(
-                first.len(),
-                2,
-                "the fixture funds exactly two spendable notes"
-            );
-            // Index-space stability: `resolve_wallet_note(i)` must name the SAME note
-            // `spendable_orchard_notes()[i]` does, through the SAME backend — the property the
-            // engine's `PrepInput::Wallet { index }` depends on.
-            for (i, &(note, _, value)) in first.iter().enumerate() {
-                let resolved = backend
-                    .resolve_wallet_note(i)
-                    .unwrap_or_else(|e| panic!("resolve_wallet_note({i}) must succeed: {e}"));
-                assert_eq!(
-                    ExtractedNoteCommitment::from(resolved.commitment()).to_bytes(),
-                    ExtractedNoteCommitment::from(note.commitment()).to_bytes(),
-                    "resolve_wallet_note({i}) must name the same note spendable_orchard_notes()[{i}] does"
-                );
-                assert_eq!(
-                    resolved.value().inner(),
-                    value,
-                    "resolve_wallet_note({i})'s value must match the selection's own"
-                );
-            }
-            first.iter().map(|&(_, pos, value)| (pos, value)).collect()
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, value)| {
+                    let note = backend
+                        .resolve_wallet_note(i)
+                        .unwrap_or_else(|e| panic!("resolve_wallet_note({i}) must succeed: {e}"));
+                    assert_eq!(
+                        note.value().inner(),
+                        u64::from(*value),
+                        "resolve_wallet_note({i})'s value must match the selection's own"
+                    );
+                    (
+                        u64::from(*value),
+                        ExtractedNoteCommitment::from(note.commitment()).to_bytes(),
+                    )
+                })
+                .collect()
         };
+
+        let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)
+            .expect("adapter construction must succeed");
+
+        let first_snapshot = snapshot(&backend);
+        assert_eq!(
+            first_snapshot.len(),
+            2,
+            "the fixture funds exactly two spendable notes"
+        );
 
         // Mutate the wallet through a SECOND connection: lock every currently-spendable note,
         // exactly what a real migration commit does when it reserves the notes it is about to
@@ -5754,30 +5844,23 @@ mod tests {
             "locking must report both notes' total value"
         );
 
-        // SAME backend: a second read must be served from the snapshot, unaffected by the lock
+        // SAME adapter: a second read must be served from the snapshot, unaffected by the lock
         // the second connection just took.
-        let second_snapshot: Vec<(Position, u64)> = {
-            let second = backend
-                .spendable_orchard_notes()
-                .expect("the cached selection must still succeed");
-            second.iter().map(|&(_, pos, value)| (pos, value)).collect()
-        };
+        let second_snapshot = snapshot(&backend);
         assert_eq!(
             first_snapshot, second_snapshot,
-            "a second read through the SAME backend must be unchanged by the second \
+            "a second read through the SAME adapter must be unchanged by the second \
              connection's note lock"
         );
 
-        // A FRESH backend (same wallet connection, new instance) must observe the mutation.
+        // A FRESH adapter (same wallet connection, new instance) must observe the mutation.
         drop(backend);
-        let fresh = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)
-            .expect("backend construction must succeed");
-        let third = fresh
-            .spendable_orchard_notes()
-            .expect("the fresh selection must succeed");
+        let fresh = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)
+            .expect("adapter construction must succeed");
+        let third = snapshot(&fresh);
         assert!(
             third.is_empty(),
-            "a fresh backend must see every note the second connection locked, got {} notes",
+            "a fresh adapter must see every note the second connection locked, got {} notes",
             third.len()
         );
 
@@ -5827,9 +5910,12 @@ mod tests {
             "a funded account's plan must schedule at least one transfer"
         );
 
-        let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
-            .expect("the fixture usk decodes");
-        let (state, unsigned) = commit_or_resume(&mut ctx, Some(usk), false, handle)
+        let ask = SpendAuthorizingKey::from(
+            unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
+                .expect("the fixture usk decodes")
+                .orchard(),
+        );
+        let (state, unsigned) = commit_or_resume(&mut ctx, Some(&ask), false, handle)
             .expect("commit with the plan's own handle must succeed");
         assert!(
             unsigned.is_empty(),
@@ -5902,9 +5988,12 @@ mod tests {
             "each cached plan draws a fresh, distinct handle"
         );
 
-        let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
-            .expect("the fixture usk decodes");
-        let err = commit_or_resume(&mut ctx, Some(usk), false, handle1)
+        let ask = SpendAuthorizingKey::from(
+            unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
+                .expect("the fixture usk decodes")
+                .orchard(),
+        );
+        let err = commit_or_resume(&mut ctx, Some(&ask), false, handle1)
             .expect_err("committing with the SUPERSEDED first handle must fail");
         let message = err.to_string();
         assert!(
@@ -6150,8 +6239,8 @@ mod tests {
 
     /// The ENGINE, not this SDK, stamps the ZIP 32 spend derivation an external signer (Keystone)
     /// needs in order to recognize a migration spend as the account's. `Committer::start` resolves
-    /// it once from `MigrationBackend::account_derivation` (this crate's impl lives in
-    /// `migration_engine.rs`) and hands it to both builders; their shared `build::finalize_pczt`
+    /// it once from `MigrationBackend::account_derivation` (upstream's `WalletMigration` answers
+    /// it from the account record) and hands it to both builders; their shared `build::finalize_pczt`
     /// runs an `Updater` pass AFTER IO finalization that stamps every action whose spend carries
     /// no `spend_auth_sig`, across the Orchard and Ironwood bundles alike.
     ///
@@ -10499,7 +10588,7 @@ mod tests {
             .unwrap_or_else(|| panic!("row {id} remains stored"))
     }
 
-    /// [`Backend::take_transaction_for_broadcast`] over the fixture wallet, surfacing the store's
+    /// `PoolMigrations::take_transaction_for_broadcast` over the fixture wallet, surfacing the store's
     /// TYPED error — what the delivery lane's broadcast arm delegates to, and what
     /// [`broadcast_seam_error`] classifies. The store error type is `#[non_exhaustive]`, so a real
     /// call is the only way a test can hold one of its variants.
@@ -10519,9 +10608,9 @@ mod tests {
             )
         }
         .expect("the fixture call context opens");
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)
-            .expect("the fixture backend opens");
-        backend
+        let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)
+            .expect("the fixture store opens");
+        store
             .take_transaction_for_broadcast(state, MigrationTransferId::new(id))
             .map(|_| ())
     }
@@ -10591,7 +10680,7 @@ mod tests {
 
     /// THE ATOMIC BROADCAST SEAM. The delivery executor does not re-parse the stored PCZT and
     /// extract it just to recover a txid, throwing the transaction away: it calls the store's
-    /// [`Backend::take_transaction_for_broadcast`], which finalizes, extracts, and records the
+    /// `PoolMigrations::take_transaction_for_broadcast`, which finalizes, extracts, and records the
     /// transaction in the WALLET's own tables in one database transaction with handing the bytes
     /// out — so the wallet's record binds at the broadcast ATTEMPT and a platform can never hold
     /// broadcastable bytes the wallet knows nothing about.

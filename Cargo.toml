@@ -163,26 +163,41 @@ lto = true
 slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "ab89ada45f2ef893a05fcefa0ead99f87d848a4e" }
 
 ## Update the `rev` value in the following lines to use a hash-pinned version of the librustzcash crates.
-# INTERIM PIN (MOB-1466): the kris/tmp-respread-on-main branch head — librustzcash main as of
-# 2026-08-06 (post-#2949) merged with PR #2927's head (the scanned-chain-tip overdue re-spread:
-# the released overdue step lands on scanned chain data, re-spread only when more of the
-# schedule is due). This pin deliberately EXCLUDES #2938's read-only next-due selectors
+# INTERIM PIN (MOB-1466): the kris/tmp-respread-plus-adapter branch head — librustzcash main
+# merged with two PRs this SDK consumes together:
+#
+# - #2927, the scanned-chain-tip overdue re-spread: the released overdue step lands on scanned
+#   chain data, re-spread only when more of the schedule is due.
+# - #2951's adapter and planned-transaction-graph work: `wallet::WalletMigration` takes the
+#   account's viewing key as a constructor parameter and holds no spend authority (the engine's
+#   two signing entry points take an `orchard::keys::SpendAuthorizingKey` per call), and
+#   `MigrationPlan::planned_transactions` publishes the run's execution shape — each row's
+#   `depends_on` and `scheduled_height` — as the same enumeration the commit builds from. Together
+#   these retire this SDK's fork of the adapter and its own re-derivation of the plan preview;
+#   see `rust/src/migration_engine.rs` and `preparation_steps_from_plan`.
+#
+# The pin deliberately tracks the DRAFT #2951 rather than waiting for it to merge, so that PR
+# #1957 shows this SDK in its FINAL shape against that API rather than a shape that would have to
+# be revised once it lands (kris, 2026-08-07).
+#
+# This pin deliberately EXCLUDES #2938's read-only next-due selectors
 # (next_due_broadcast/next_provable): every SDK lane now drives through
 # `satisfiability::advance_migration` (the verified step + outlook) and takes its read-only
 # views from `MigrationState::transaction_statuses` — see the observations recorded on #2938,
 # which is expected to be withdrawn.
-# Remove the pin (recomment the block) at the first published rc that contains #2927.
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "2dc5347f4456dec5b87a02538b5d9229e42eb0a1" }
+# Remove the pin (recomment the block) at the first published rc that contains BOTH #2927 and
+# #2951.
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "4f316136090c67f558db6d077c46fd394511b941" }
 
 # Reinstate together with the voting dependencies above:
 # zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "e53e74487d31ad0f5713580fb2f0222b53ae9db8" }

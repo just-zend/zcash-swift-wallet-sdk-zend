@@ -59,9 +59,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     goes through the same atomic broadcast seam as the delivery executor, so its artifact is
     likewise the finalized consensus transaction rather than a PCZT.
   - Proposal and commit: `zcashlc_migration_residual_after_migration`, `_propose_transfers`,
-    `_sign_and_store_schedule`. Committing a plan is linear in the wallet's note count: the FFI's
-    wallet adapter snapshots its spendable-note selection per call (the pattern librustzcash #2946
-    set for the upstream adapter).
+    `_sign_and_store_schedule`. Committing a plan is linear in the wallet's note count: the
+    upstream `wallet::WalletMigration` adapter these calls run over snapshots its spendable-note
+    selection per adapter (librustzcash #2946), and the FFI builds one adapter per call.
   - Proving: `zcashlc_migration_prove_transactions(ids, ids_len, max_proofs)` proves the
     transactions the caller NAMES — the batch a prior `_advance_step` returned as its PROVE step —
     and returns the count proved (`-1` = error). Like the delivery executor it never cranks the
@@ -180,6 +180,29 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Migrated to `zcash_protocol 0.10.4`, `zcash_client_backend 0.24.0-rc.7`,
   `zcash_client_sqlite 0.22.0-rc.7`, `pczt 0.9.2`.
+- The migration engine's wallet adapter is UPSTREAM's (`zcash_pool_migration::wallet::WalletMigration`
+  plus `zcash_client_sqlite`'s account-scoped `PoolMigrations` store); the SDK's own fork of it is
+  deleted. Three consequences reach behaviour rather than just code:
+  - No migration type holds spend authority any more, and none can be given it. The adapter is
+    built from the account's VIEWING key alone, and the engine's two signing entry points
+    (`commit_preparation`, `rebuild_expired_transfer`) take an `orchard::keys::SpendAuthorizingKey`
+    per call — so the FFI functions that sign derive one from the spending key they just decoded
+    and drop it with the call, instead of parking a `UnifiedSpendingKey` inside an adapter that
+    mostly does not need one. The external-signer lanes are unchanged: they call the unsigned
+    entry points, which take no authority at all.
+  - The spendable-note snapshot that keeps a commit linear in the wallet's note count is
+    upstream's own (librustzcash #2946) rather than an SDK mirror of it.
+  - `PoolMigrationRead::mined_height` is answered by the adapter from the wallet's FULLY-SCANNED
+    bound instead of being delegated to the store. The two agree on every value — the store
+    applies the same rule at its own layer — so no answer changes; the store still answers
+    directly on the paths that use it without an adapter.
+
+  What remains SDK-side is the account's stored unified full viewing key: upstream's constructor
+  takes the key from its CALLER (a wallet may hold several keys that view one account), and this
+  SDK always supplies the one the account record holds, which is what lets an imported
+  hardware-wallet account — whose spending key never exists on this device — plan, build and prove.
+  A migration call against an account whose record holds no unified full viewing key now fails at
+  the point the adapter is built rather than at the first key-dependent operation.
 - `zcashlc_set_transaction_status` now returns `bool` (`true` on success) instead of `void`, so
   callers can detect a failed status write (previously any error — including an unknown chain
   height — was silently discarded). No `repr(C)` struct layout changes.
