@@ -63,7 +63,8 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
             MigrationAdvance(step: .rebuild(id: 6), next: nil),
             MigrationAdvance(step: .waiting, next: MigrationNextWork(height: 850_000, kind: .broadcast)),
             MigrationAdvance(step: .complete, next: nil),
-            MigrationAdvance(step: .requiresAttention(id: 7), next: nil)
+            MigrationAdvance(step: .replan, next: nil),
+            MigrationAdvance(step: .reevaluate, next: nil)
         ]
 
         for expectedAdvance in cases {

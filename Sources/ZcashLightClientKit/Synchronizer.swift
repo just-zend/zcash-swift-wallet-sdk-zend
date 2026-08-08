@@ -646,16 +646,18 @@ public protocol Synchronizer: AnyObject {
     ///     _ = try await synchronizer.performMigrationBroadcast(accountUUID: account, instruction, options: options)
     /// case .rebuild:
     ///     _ = try await synchronizer.refreshStaleMigrationTransfers(accountUUID: account, usk: usk)
-    /// case .requiresAttention, .waiting, .complete, nil:
+    /// case .replan, .reevaluate, .waiting, .complete, nil:
     ///     break // nothing to perform; see the per-step notes below
     /// }
     /// ```
     ///
     /// Discharging each step (see ``MigrationAdvanceStep`` for the full contract):
-    /// - `.requiresAttention` — surfaced first, before any actionable step, when a transaction of
-    ///   the run is ``MigrationTransactionStatus/State/invalid(reason:)`` → sync and call this
-    ///   again so the engine can adjudicate against the newly scanned data; only if attention
-    ///   persists, surface the attention UX and then
+    /// - `.reevaluate` — surfaced first, before any actionable step, while a broadcast-rejection
+    ///   report is open → sync and call this again so the engine can adjudicate against the newly
+    ///   scanned data; it keeps answering this until the scan reaches the rejecting node's tip.
+    /// - `.replan` — the run's plan was undercut past the committed threshold and the verdict is
+    ///   already persisted (no sync changes it) → surface the re-plan UX over the
+    ///   ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
     ///   ``restartCurrentMigrationStep(accountUUID:)``. Invalid rows are excluded from delivery
     ///   and from the sync gate.
     /// - `.broadcast` → ``performMigrationBroadcast(accountUUID:_:options:)`` with the step's own

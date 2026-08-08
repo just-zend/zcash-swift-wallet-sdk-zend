@@ -9,17 +9,16 @@ import Foundation
 /// by `Synchronizer.migrationAdvanceStep(accountUUID:)` /
 /// `ZcashRustBackendWelding.migrationAdvanceStep(for:)`.
 ///
-/// A conduit of the upstream engine's public `advance_migration` API. The SDK preserves this
-/// enum's source-compatible shape by projecting upstream `Reevaluate` and `Replan` decisions onto
-/// ``requiresAttention(id:)``; the broadcast/prove/rebuild/waiting/complete cases marshal directly
-/// (upstream PR #2871).
+/// A conduit of the upstream engine's public `advance_migration` API: every upstream case
+/// marshals onto its own case here — ``replan`` and ``reevaluate`` included, bare, exactly as
+/// upstream carries them. (The interim `requiresAttention(id:)` collapse, which folded both
+/// behind one synthesised transaction id, is retired — 2026-08-08.)
 /// `nil` at the API level (the call returns an optional) means no migration run is stored at all —
 /// none was ever committed for the account — so there is nothing to advance and nothing to poll.
-/// The engine's priority order is attend > broadcast > prove > rebuild:
-/// ``requiresAttention(id:)`` outranks every actionable step (a run holding an invalid
-/// transaction is not driven further until resolved), and a proven, due transaction broadcasts
-/// ahead of any new proving work (its broadcast window is the scarcer resource; proving can
-/// happen on any later wake-up).
+/// The engine's priority order: ``reevaluate`` outranks everything (an open rejection report
+/// freezes adjudication until the scan catches up), ``replan`` ends the drive until the user
+/// re-plans, and a proven, due transaction broadcasts ahead of any new proving work (its
+/// broadcast window is the scarcer resource; proving can happen on any later wake-up).
 ///
 /// Evaluated with both the wallet's fully-scanned target and its wall-clock tip estimate. Upstream
 /// uses the estimate only for reversible scheduling/withholding; persisted or destructive
@@ -29,12 +28,14 @@ import Foundation
 /// belongs to the caller and the sync gate, not to this value.
 ///
 /// Discharging each step:
-/// - ``requiresAttention(id:)`` → SYNC, then call `migrationAdvanceStep(accountUUID:)` again: the
-///   engine adjudicates against the newly scanned data and, where the obstruction was transient,
-///   re-offers the work in that same call. Only if attention persists does the run need the
-///   out-of-band resolution — surface the attention UX over the
-///   ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
-///   `restartCurrentMigrationStep(accountUUID:)` to cancel and re-plan.
+/// - ``reevaluate`` → SYNC (to at least the tip the rejecting node reported), then call
+///   `migrationAdvanceStep(accountUUID:)` again: the engine adjudicates against the newly scanned
+///   data and, where the rejection was transient, re-offers the work in that same call. Not a
+///   user-facing state — the run is alive and nothing is asked of anyone but the syncer.
+/// - ``replan`` → the run is finished deciding and is not driven further: surface the re-plan UX
+///   over the ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
+///   `restartCurrentMigrationStep(accountUUID:)` to cancel and re-plan. No sync first — the
+///   verdict is already persisted and cannot be scanned away.
 /// - ``broadcast(_:)`` → `performMigrationBroadcast(accountUUID:_:options:)`: hand the case's
 ///   opaque ``MigrationBroadcastInstruction`` straight to the executor and end the session — a
 ///   broadcast session must not sync.
@@ -86,12 +87,17 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     case waiting
     /// The stored run is terminal (fully mined, or cancelled): stop polling it.
     case complete
-    /// The transaction identified by `id` either has an open node-rejection report that requires
-    /// more sync (`Reevaluate`) or was determined unsatisfiable and requires a new plan (`Replan`).
-    /// Discharge: sync and call `migrationAdvanceStep` again for reevaluation; if attention
-    /// remains, show the status and use `restartCurrentMigrationStep` (see the type doc's
-    /// mapping).
-    case requiresAttention(id: UInt32)
+    /// The PLAN needs replacing: the run's unsatisfiable share passed the engine's committed
+    /// replan threshold, or dead value would otherwise be stranded — an ORDINARY outcome (most
+    /// often an ordinary wallet spend consuming notes the plan had allocated), and a verdict the
+    /// engine has ALREADY persisted, so more scanning cannot change it. Names no transaction: the
+    /// verdict is about the run. See the type doc's discharge mapping.
+    case replan
+    /// A broadcast this wallet made was REJECTED by a node whose chain view is ahead of this
+    /// wallet's scan, and the engine will not adjudicate on stale data. Names no transaction and
+    /// asks for nothing but a sync; the engine keeps answering this until the scan reaches the
+    /// tip the rejecting node reported. See the type doc's discharge mapping.
+    case reevaluate
 }
 
 /// The drive's instruction to broadcast one transaction — the payload of
@@ -417,7 +423,7 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         /// projection of that upstream condition. Chain inclusion OUTRANKS it: a
         /// row the wallet's scan has observed mined reports `.mined`, never `.invalid` — a stale
         /// verdict cannot shadow a landed transaction. Resolved out-of-band via the
-        /// ``MigrationAdvanceStep/requiresAttention(id:)`` discharge mapping (typically
+        /// ``MigrationAdvanceStep/replan`` discharge mapping (typically
         /// `restartCurrentMigrationStep`).
         case invalid(reason: MigrationInvalidReason)
     }
@@ -446,7 +452,7 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         /// Marked dead by an observed event (its state is
         /// ``MigrationTransactionStatus/State/invalid(reason:)``): no chain condition makes it
         /// actionable again — resolution is out-of-band, via the
-        /// ``MigrationAdvanceStep/requiresAttention(id:)`` discharge mapping.
+        /// ``MigrationAdvanceStep/replan`` discharge mapping.
         case invalid
     }
 
