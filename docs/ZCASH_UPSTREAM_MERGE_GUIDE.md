@@ -2,13 +2,37 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-04
+Last reviewed: 2026-08-07
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-07)
+
+- Fresh fetches leave the default-branch refs unchanged: `origin/main=4497fe9e` and
+  `upstream/main=468d1e9f`, with divergence `174 111`. `upstream/main` is not yet an ancestor of
+  `origin/main`, but Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  (`codex/zcash-upstream-sync-2026-08-01`) already contains that exact tip (`177 0` against
+  `upstream/main`). Reuse #34 as the only full-parity vehicle; do not open a duplicate sync branch.
+- Upstream [#1953](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1953) is clean and its
+  checks are green, but it is still a draft against `feature/ironwood-slipstream`. Its 21-file
+  migration/FFI change advances the private `librustzcash` pin, changes batch proving and migration
+  outlook APIs, and rewrites the wallet adapter. It is coupled to the same artifact provenance and
+  funded-device migration gates as the broader Slipstream line, so it is not a safe standalone Zend
+  carry. Draft [#1957](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1957) and blocked
+  [#1954](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1954) confirm that the stack is still
+  in integration rather than release-ready state; #1954's build is currently failing.
+- The newly merged upstream maintenance-only work remains wait-for-upstream: #1956 adds Rust test
+  gating only to `maint/v2.7.x`, and #1925 unifies release scripts on that same line. Keep Zend's
+  SHA-pinned actions, read-only permissions, and private-engine verification policy until a
+  Zend-compatible mainline or release artifact exists. The narrow XCFramework packaging fix #1944,
+  stale-sync-state fix #1900, and Tor-off submission change #1898 are respectively
+  maintenance-line-only, draft/dirty, or draft/dirty; none clears the ready, useful, low-risk gate.
+- This is a documentation-only monitoring record. No SDK source or FFI artifact changed, so local
+  `swift build` and `swift test --filter OfflineTests` were intentionally not rerun.
 
 ## Parity and bleeding-edge refresh (2026-08-05)
 
