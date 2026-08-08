@@ -435,10 +435,14 @@ actor OrchardMigration {
     /// ``performBroadcast(_:options:)`` records their outcome itself — as is an id the stored run
     /// does not carry.
     ///
-    /// REPORT ONLY WHAT LANDED. Pass a `.success`; a non-acceptance needs no call at all, because
-    /// the engine's "network error" outcome records nothing by design and leaves the row exactly
-    /// as re-servable as not calling would. A `.networkError` is accepted and forwarded verbatim
-    /// for hosts that would rather report every attempt, but it is not the intended use.
+    /// REPORT THE REAL OUTCOME. Pass a `.success` on an acceptance, and a `.invalidNote` /
+    /// `.expired` on a PERMANENT server rejection — the engine's record path dates the verdict
+    /// against the observed tip on the still-`Proved` row, and the next crank re-adjudicates, so
+    /// a doomed row can raise attention instead of being re-served until expiry. A network-level
+    /// non-acceptance needs no call at all, because the engine's "network error" outcome records
+    /// nothing by design and leaves the row exactly as re-servable as not calling would (a
+    /// `.networkError` is accepted and forwarded verbatim for hosts that would rather report
+    /// every attempt).
     ///
     /// THE SELF-HEALING FALLBACK REMAINS, now covering the accident rather than the ordinary path:
     /// a host that crashed between submitting and marking, or whose mark failed, still converges —

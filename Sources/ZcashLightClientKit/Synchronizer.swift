@@ -766,9 +766,12 @@ public protocol Synchronizer: AnyObject {
     /// a transfer is refused — the drive's own broadcast records transfer outcomes itself — as is
     /// an id the stored run does not carry.
     ///
-    /// Report only what landed: call this on an acceptance. A network-level non-acceptance needs
-    /// no call — the engine's network-error outcome records nothing by design, so reporting one
-    /// and reporting nothing leave the row equally re-servable. An app that crashed between
+    /// Report the submission's real outcome. An acceptance makes the mark; a permanent server
+    /// rejection (`.invalidNote` / `.expired`) should be reported too — the engine dates the
+    /// verdict against the observed tip and the next crank re-adjudicates, so a doomed row can
+    /// raise attention instead of being re-served until expiry. A network-level non-acceptance
+    /// needs no call — the engine's network-error outcome records nothing by design, so reporting
+    /// one and reporting nothing leave the row equally re-servable. An app that crashed between
     /// submitting and marking still converges: the engine promotes any in-flight transaction its
     /// scan sees mine, and a later re-serve of the same bytes draws a duplicate rejection the SDK
     /// records as success.
