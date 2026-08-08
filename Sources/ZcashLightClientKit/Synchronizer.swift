@@ -598,78 +598,45 @@ public protocol Synchronizer: AnyObject {
 
     // MARK: - Migration (Orchard -> Ironwood)
     //
-    // Exposes the host's per-account `OrchardMigration` machinery and its wallet-scope privacy gate
-    // to the app: note-split preparation and submission, transfer scheduling, the drive and its
-    // instruction executors, the gate that pauses ordinary sync while a submission is in flight,
-    // on-launch reconciliation/recovery, and external (PCZT) signing. None of these methods require
-    // `prepare()` to have been called — a host may broadcast a migration transfer from a background
-    // session without ever starting sync.
+    // Exposes the host's per-account `OrchardMigration` machinery and its wallet-scope sync gate
+    // to the app: note-split preparation and submission, transfer scheduling, the advance drive
+    // and its instruction executors, on-launch reconciliation/recovery, and external (PCZT)
+    // signing. None of these methods require `prepare()` to have been called — a host may
+    // broadcast a migration transfer from a background session without ever starting sync.
     //
-    // THE ACTION SURFACE IS EXACTLY THREE THINGS: the CONDUIT
-    // (`migrationAdvanceStep(accountUUID:)`), the INSTRUCTION EXECUTORS
-    // (`proveMigrationTransactions`, `performMigrationBroadcast`, `refreshStaleMigrationTransfers`),
-    // and READS. There is no member that decides for itself what the migration needs; kris'
-    // ruling, verbatim:
-    //
-    //   "`executeNextPendingTransfer` is *also* wrong, yes. The app should have no semantic goal
-    //    except to advance the migration and perform the advancement's dictates."
-    //
-    // The deleted `finalizeReadyMigrationTransfers` and `executeNextPendingMigrationTransfer` were
-    // both kind-filtered drives wearing semantic names — the first looped the advance and executed
-    // only `.prove`, the second cranked once and executed only `.broadcast`, re-interpreting every
-    // other step as an outcome of its own. A driver that cranks the conduit and switches over the
-    // step sees all of that directly, with nothing lost in the re-interpretation.
-    //
-    // CAPABILITY DISCIPLINE. The executors do not merely prefer to be driven — they cannot be
-    // called without a crank. Continuing the ruling:
-    //
-    //   "And as such it should be provided with no *capabilities* for such semantic goals."
-    //
-    // `MigrationBroadcastInstruction` and `MigrationProveTarget` have no public initializers: the
-    // advance marshaling is their only producer, so an instruction value in an app's hands IS the
-    // proof that the app cranked, and un-instructed proving or broadcasting does not compile.
-    // This is a SWIFT-SURFACE property and not a security boundary — at the C ABI everything is
-    // forgeable, and the Rust executors' per-row state gating (a non-`Proved` row is refused, a
-    // row not awaiting its proof is skipped) remains the safety backstop, not the authority model.
+    // The action surface is exactly three things: the conduit (`migrationAdvanceStep(accountUUID:)`),
+    // the instruction executors (`proveMigrationTransactions`, `performMigrationBroadcast`,
+    // `refreshStaleMigrationTransfers`), and reads. The app has no semantic goal except to advance
+    // the migration and perform the advancement's dictates, and no member decides for itself what
+    // the migration needs: `MigrationBroadcastInstruction` and `MigrationProveTarget` have no
+    // public initializers, so the advance marshaling is their only producer and un-instructed
+    // proving or broadcasting does not compile. This is a Swift-surface property, not a security
+    // boundary — the Rust executors' per-row state gating remains the safety backstop.
     //
     // The ceremony/consent lane is deliberately untouched by this: `prepareNoteSplit` /
-    // `submitNoteSplit` and the propose/sign/store family are PRE-drive consent flows — a user
+    // `submitNoteSplit` and the propose/sign/store family are pre-drive consent flows — a user
     // approving a plan that does not exist yet — so there is no instruction for them to carry.
 
     /// The migration engine's next step to advance `accountUUID`'s stored run, paired with its
-    /// advisory OUTLOOK (upstream #2936) — the replacement for the removed SDK-side migration
-    /// state machine, and a VERBATIM conduit of the upstream engine's own `advance_migration`: no
-    /// SDK ordering shims, no carve-outs — the attention step, the broadcast-first ordering, and
-    /// the prove batch's per-entry kinds are all the engine's own answer, marshaled field-for-field.
-    /// Call it on launch and after every migration operation.
+    /// advisory outlook — a verbatim conduit of the engine's own `advance_migration`: the
+    /// attention step, the broadcast-first ordering, and the prove batch's per-entry kinds are
+    /// all the engine's own answer, marshaled field-for-field. Call it on launch and after every
+    /// migration operation.
     ///
-    /// `nil` means NO run is stored (none was ever committed) — nothing to advance, nothing to
-    /// poll. A non-`nil` answer is a ``MigrationAdvance``: `.step` is the step to perform NOW
-    /// (judged under the engine's `DuenessTargets` rule — the wall-clock chain-tip estimate, which
-    /// this member always projects and passes, may only ACCELERATE scheduled-height due-ness,
-    /// while expiry, boundary settledness and every destructive determination evaluate on the
-    /// SCANNED tip, and an estimator failure degrades to scanned-tip behavior rather than failing
-    /// the call — with the
-    /// engine's attend > broadcast > prove > rebuild priority, and memoryless about sessions: it
-    /// reports what the run needs next, while session policy — one broadcast per session, no sync
-    /// in a broadcast session — stays with the caller and the sync gate); `.next` is the advisory
-    /// outlook (``MigrationNextWork``) — what session to plan for once `.step` is executed, or
-    /// `nil` when nothing is height-schedulable.
+    /// `nil` means no run is stored — nothing to advance, nothing to poll. A non-`nil` answer is
+    /// a ``MigrationAdvance``: `.step` is the step to perform now, judged with the engine's
+    /// attend > broadcast > prove > rebuild priority under its dueness rule — the wall-clock
+    /// chain-tip estimate, which this member always projects and passes, may only ACCELERATE
+    /// scheduled-height due-ness, while expiry, boundary settledness, and every destructive
+    /// determination evaluate on the SCANNED tip, and an estimator failure degrades to
+    /// scanned-tip behavior rather than failing the call. The answer is memoryless about
+    /// sessions: session policy (one broadcast per session, no sync in a broadcast session)
+    /// stays with the caller and the sync gate. `.next` is the advisory outlook
+    /// (``MigrationNextWork``) — what session to plan for once `.step` is executed, or `nil`
+    /// when nothing is height-schedulable.
     ///
-    /// THE PROVING PATH NOW JUDGES AT THE ESTIMATE, where the removed proving sweep pinned the
-    /// scanned tip. That pin's argument was lane DESYNCHRONIZATION: it required two crank sites
-    /// with different tip rules, so inside the estimate's lead window the estimate-advanced sweep
-    /// saw `.broadcast` and proved nothing while the scanned-tip delivery lane saw nothing due, and
-    /// neither progressed until the scan caught up. There is one crank site now, and it can
-    /// dispatch every step kind, so there is no second lane to fall out of step with — a crank that
-    /// turns to `.broadcast` inside the lead window is delivered, not stalled on. The residual
-    /// effect is an earlier PERSISTED ZIP 318 re-spread, which librustzcash #2927 already bounds:
-    /// the step a re-spread releases lands on scanned chain data, so an estimate-advanced re-spread
-    /// cannot re-pin the schedule past the scan.
-    ///
-    /// This is the CONDUIT, and the app's only semantic goal: crank it, then switch over `.step`
-    /// and perform that step's dictate. The dispatch is mechanical, and every actionable arm hands
-    /// the step's own payload straight to an executor:
+    /// This is the conduit: crank it, then switch over `.step` and perform that step's dictate.
+    /// Every actionable arm hands the step's own payload straight to an executor:
     ///
     /// ```swift
     /// switch try await synchronizer.migrationAdvanceStep(accountUUID: account)?.step {
@@ -685,45 +652,30 @@ public protocol Synchronizer: AnyObject {
     /// ```
     ///
     /// Discharging each step (see ``MigrationAdvanceStep`` for the full contract):
-    /// - `.requiresAttention` — surfaced FIRST, before any actionable step, when a transaction of
-    ///   the run is ``MigrationTransactionStatus/State/invalid(reason:)`` (funding note spent
-    ///   outside the migration, or a network-rejected broadcast) → SYNC and call this again, so
-    ///   the engine can adjudicate against the newly scanned data and re-offer the work where the
-    ///   obstruction was transient; only if attention persists, surface the attention UX over the
-    ///   invalid status row(s) and then ``restartCurrentMigrationStep(accountUUID:)``. Invalid rows
-    ///   are excluded from delivery (never named by a `.broadcast` step) and from
-    ///   the sync gate (a dead transfer gates nothing).
+    /// - `.requiresAttention` — surfaced first, before any actionable step, when a transaction of
+    ///   the run is ``MigrationTransactionStatus/State/invalid(reason:)`` → sync and call this
+    ///   again so the engine can adjudicate against the newly scanned data; only if attention
+    ///   persists, surface the attention UX and then
+    ///   ``restartCurrentMigrationStep(accountUUID:)``. Invalid rows are excluded from delivery
+    ///   and from the sync gate.
     /// - `.broadcast` → ``performMigrationBroadcast(accountUUID:_:options:)`` with the step's own
-    ///   ``MigrationBroadcastInstruction`` — submit and END the session (no sync).
-    /// - `.prove` → the batch IS the instruction:
-    ///   ``proveMigrationTransactions(accountUUID:_:maxProofs:)`` at a sync wake-up, which proves
-    ///   up to the caller's budget from it. Proving can unblock rows the batch did not name, so a
-    ///   host draining the run cranks again afterwards and discharges the NEXT instruction — the
-    ///   drive, never the executor, decides whether more proving (or a now-due broadcast) follows.
-    ///   Each entry's `kind` decides
-    ///   what follows for THAT transaction: a `.preparation` entry is due by construction and may
-    ///   be proved AND broadcast at the SAME wake-up (it anchors near-tip, not against a drawn
-    ///   boundary), while a `.transfer` entry's broadcast follows in its own LATER session —
-    ///   proving has no deadline of its own, since its boundary anchor checkpoint is durably
-    ///   retained, so a missed wake-up only defers it.
+    ///   ``MigrationBroadcastInstruction`` — submit and end the session (no sync).
+    /// - `.prove` → ``proveMigrationTransactions(accountUUID:_:maxProofs:)`` at a sync wake-up.
+    ///   Proving can unblock rows the batch did not name, so a host draining the run cranks again
+    ///   afterwards and discharges the next instruction. Each entry's `kind` decides what follows
+    ///   for that transaction: a `.preparation` entry may be proved and broadcast at the same
+    ///   wake-up, while a `.transfer` entry's broadcast follows in its own later session.
     /// - `.rebuild` → ``refreshStaleMigrationTransfers(accountUUID:usk:)`` (needs spend
     ///   authority).
     /// - `.waiting` → register OS wake-ups from ``migrationSyncWakeups(accountUUID:)`` plus each
     ///   ``migrationTransactionStatuses(accountUUID:)`` row's `scheduledHeight`; the outlook's
-    ///   `.next`, when present, sharpens which of those wake-ups to arm FIRST — its `kind` says
-    ///   what session to plan (a `.broadcast` outlook needs no sync, a `.prove` one is sync-bound)
-    ///   — but ``migrationSyncWakeups(accountUUID:)`` remains the proving-schedule authority: the
-    ///   outlook is one call's lookahead, superseded by the next.
-    ///
-    /// `.complete` is terminal for the STORED run — including a CANCELLED one — and means "stop
-    /// polling" (its outlook is always `nil`). It is PER-RUN, never "nothing left to migrate":
-    /// whether a migratable balance remains is answered by
-    /// ``proposeMigrationTransfers(accountUUID:)`` (an empty schedule means no). For the other
-    /// signals the removed state machine used to carry: "preparations still confirming" is
-    /// `isPreparationPhaseComplete` over ``migrationTransactionStatuses(accountUUID:)``, live
-    /// progress is ``migrationProgress(accountUUID:)``, and invalid/expired transfers surface
-    /// through ``hasInvalidMigrationTransfers(accountUUID:)`` and per-row `state`/`blockedOn`
-    /// values.
+    ///   `.next`, when present, sharpens which wake-up to arm first (a `.broadcast` outlook needs
+    ///   no sync, a `.prove` one is sync-bound), but the wake-up schedule remains the authority —
+    ///   the outlook is one call's lookahead, superseded by the next.
+    /// - `.complete` is terminal for the stored run — including a cancelled one — and means
+    ///   "stop polling" (its outlook is always `nil`). It is per-run, never "nothing left to
+    ///   migrate": whether a migratable balance remains is answered by
+    ///   ``proposeMigrationTransfers(accountUUID:)`` (an empty schedule means no).
     /// - Parameter accountUUID: the account whose next step is of interest.
     func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance?
 
@@ -733,39 +685,29 @@ public protocol Synchronizer: AnyObject {
     /// - Parameter accountUUID: the account whose migration progress is of interest.
     func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress?
 
-    /// THE PROVE EXECUTOR: proves up to `maxProofs` of the transactions `instruction` names,
+    /// The prove executor: proves up to `maxProofs` of the transactions `instruction` names,
     /// persisting each proof, and returns a ``MigrationProveOutcome`` — how many were proved (`0`
     /// is the ordinary "nothing in this batch is provable right now" answer) and the txids of the
     /// PREPARATIONS it proved.
     ///
-    /// THE TXIDS ARE THE HANDOFF (kris, 2026-08-07). A proved preparation is a complete PCZT
-    /// (signatures and proofs); it is ZIP 318-exempt and the engine's own contract is that a
-    /// preparation is broadcast as soon as it is proved, so its submission is the app's ORDINARY
-    /// path rather than the engine's delivery ceremony: for each returned txid call
-    /// ``takeMigrationPreparation(accountUUID:byTxid:)``, submit the bytes it hands back through
-    /// the app's ordinary raw-transaction machinery, and record the outcome the standard way. A
-    /// TRANSFER's txid is never returned — transfers are served by the drive's broadcast
-    /// instruction alone — so the app needs no kind judgment of its own on this path.
+    /// The txids are the handoff: a proved preparation is a complete transaction, ZIP 318-exempt
+    /// and meant to be broadcast as soon as it is proved, so its submission is the app's ordinary
+    /// path — for each returned txid call ``takeMigrationPreparation(accountUUID:byTxid:)``,
+    /// submit the bytes it hands back through the app's ordinary raw-transaction machinery, and
+    /// record the outcome the standard way. A transfer's txid is never returned — transfers are
+    /// served by the drive's broadcast instruction alone.
     ///
-    /// The instruction is a ``MigrationAdvanceStep/prove(transactions:)`` batch that a
-    /// ``migrationAdvanceStep(accountUUID:)`` crank handed out — and the only way to hold one,
-    /// since ``MigrationProveTarget`` has no public initializer. This executor never asks the
-    /// engine what to prove: which candidates are worth proving, their order, and whether a due
-    /// broadcast outranks proving this session were all settled by the advance that issued the
-    /// batch.
-    ///
-    /// There is no loop here. Proving a batch can unblock rows it did not name, so a host draining
-    /// the run cranks ``migrationAdvanceStep(accountUUID:)`` again and discharges the next
-    /// instruction; a pass that proves `0` means the batch's remainder is transiently unprovable
-    /// and a later wake-up will retry it.
+    /// The instruction is a batch a ``migrationAdvanceStep(accountUUID:)`` crank handed out — the
+    /// only way to hold one, since ``MigrationProveTarget`` has no public initializer. There is
+    /// no loop here: proving can unblock rows the batch did not name, so a host draining the run
+    /// cranks the conduit again and discharges the next instruction; a pass that proves `0` means
+    /// the batch's remainder is transiently unprovable and a later wake-up will retry it.
     ///
     /// Run this at the sync wake-ups ``migrationSyncWakeups(accountUUID:)`` schedules — after the
-    /// wake-up's sync has caught the wallet up — and NEVER in a broadcast session: proving needs
-    /// the wallet's commitment tree and takes real time, while
-    /// ``performMigrationBroadcast(accountUUID:_:options:)`` stays a pure delivery step. A
-    /// transaction that cannot be proved yet (anchor not scanned/retained) is skipped and retried
-    /// by a later call, as is one no longer awaiting its proof — so acting on a stale instruction
-    /// is safe, and neither skip spends the budget.
+    /// wake-up's sync has caught the wallet up — and never in a broadcast session. A transaction
+    /// that cannot be proved yet (anchor not scanned/retained) is skipped and retried by a later
+    /// call, as is one no longer awaiting its proof — so acting on a stale instruction is safe,
+    /// and neither skip spends the budget.
     /// - Parameters:
     ///   - accountUUID: the account whose proofs should be produced.
     ///   - instruction: the prove batch the crank returned.
@@ -780,32 +722,27 @@ public protocol Synchronizer: AnyObject {
         maxProofs: Int
     ) async throws -> MigrationProveOutcome
 
-    /// THE PREPARATION ACCESSOR: serves the proved preparation with `txid` for submission — the
-    /// retrieval half of the handoff ``proveMigrationTransactions(accountUUID:_:maxProofs:)`` opens
-    /// by returning the preparations' txids.
+    /// Serves the proved preparation with `txid` for submission — the retrieval half of the
+    /// handoff ``proveMigrationTransactions(accountUUID:_:maxProofs:)`` opens by returning the
+    /// preparations' txids.
     ///
-    /// THE ACCESSOR IS THE SEAM, not a byte read of a stored artifact: `txid -> row -> the store's
-    /// atomic broadcast seam`, in ONE database transaction. The wallet's own record of the
-    /// transaction binds AT RETRIEVAL, so an app can never hold submittable bytes the wallet knows
-    /// nothing about, and it is idempotent — a consumer that crashed between retrieving and
+    /// The accessor is the seam, not a byte read of a stored artifact: `txid -> row -> the
+    /// store's atomic broadcast seam`, in one database transaction. The wallet's own record of
+    /// the transaction binds at retrieval, so an app can never hold submittable bytes the wallet
+    /// knows nothing about, and it is idempotent — a consumer that crashed between retrieving and
     /// submitting re-retrieves exactly the same bytes over the same record.
     ///
-    /// Submit ``PreparedMigrationTransfer/pczt`` — a FINALIZED CONSENSUS TRANSACTION, submittable
-    /// as-is — through the app's ORDINARY raw-transaction machinery, then record the outcome the
-    /// standard way: the returned ``PreparedMigrationTransfer/id`` is the ENGINE TRANSFER ID that
-    /// path keys on, so the app carries no identity of its own.
+    /// Submit ``PreparedMigrationTransfer/pczt`` — a finalized consensus transaction, submittable
+    /// as-is — through the app's ordinary raw-transaction machinery, then record the outcome the
+    /// standard way: the returned ``PreparedMigrationTransfer/id`` is the engine transfer id that
+    /// path keys on. Retrieved-but-never-submitted is a bounded state, not a leak: the
+    /// preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces through the
+    /// ordinary attention path once it expires.
     ///
-    /// PREPARATION-GATED: a txid naming a TRANSFER is refused. Transfers cross the turnstile on
-    /// the drive's own ZIP 318 schedule and are served by
-    /// ``performMigrationBroadcast(accountUUID:_:options:)`` alone.
-    ///
-    /// Retrieved-but-never-submitted is a bounded, engine-modelled state, not a leak: the record
-    /// is idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces
-    /// through the ordinary attention path once it expires.
-    ///
-    /// Unlike ``performMigrationBroadcast(accountUUID:_:options:)`` this does not broadcast, so it
-    /// carries no privacy options and is not guarded against sync: what the bytes travel over is
-    /// the app's ordinary submission policy.
+    /// Preparation-gated: a txid naming a transfer is refused. Transfers cross on the drive's own
+    /// ZIP 318 schedule and are served by ``performMigrationBroadcast(accountUUID:_:options:)``
+    /// alone. This call does not broadcast, so it carries no privacy options and is not guarded
+    /// against sync.
     /// - Parameters:
     ///   - accountUUID: the account whose preparation is being retrieved.
     ///   - txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
@@ -817,33 +754,24 @@ public protocol Synchronizer: AnyObject {
     ///   than retrying this.
     func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer
 
-    /// CLOSES THE SEAM: records the engine-side outcome of a preparation the app retrieved with
-    /// ``takeMigrationPreparation(accountUUID:byTxid:)`` and submitted ITSELF.
+    /// Closes the seam: records the engine-side outcome of a preparation the app retrieved with
+    /// ``takeMigrationPreparation(accountUUID:byTxid:)`` and submitted itself — the same per-row
+    /// mark (`Proved -> Broadcast`) ``performMigrationBroadcast(accountUUID:_:options:)`` makes
+    /// on its own success arm, made here by the app in place of the ceremony it deliberately
+    /// skipped. It is the ordinary close of the loop, not a repair.
     ///
-    /// The accessor binds the WALLET's record at retrieval, but the ENGINE's own per-row mark
-    /// (`Proved -> Broadcast`) is what ``performMigrationBroadcast(accountUUID:_:options:)`` makes
-    /// on its success arm — and a host-submitted preparation never travels that path. This is that
-    /// same mark, made by the app at the same moment, in place of the ceremony it deliberately
-    /// skipped. It is the ORDINARY close of the loop, not a repair.
-    ///
-    /// KEYED ON THE RETRIEVAL RESULT: it takes the ``PreparedMigrationTransfer`` the accessor
+    /// Keyed on the retrieval result: it takes the ``PreparedMigrationTransfer`` the accessor
     /// returned, whose ``PreparedMigrationTransfer/id`` is already the engine transfer id the
-    /// record path keys on — so an app that submitted a preparation carries no identity of its own
-    /// from retrieval to record.
+    /// record path keys on. Preparation-gated in the same register as the accessor: an id naming
+    /// a transfer is refused — the drive's own broadcast records transfer outcomes itself — as is
+    /// an id the stored run does not carry.
     ///
-    /// PREPARATION-GATED, in the same register as the accessor: an id naming a TRANSFER is refused
-    /// — transfers are served by the drive's broadcast instruction alone, and that broadcast
-    /// records their outcome itself — as is an id the stored run does not carry.
-    ///
-    /// REPORT ONLY WHAT LANDED. Call this on an acceptance. A non-acceptance needs no call: the
-    /// engine's network-error outcome records nothing by design, so reporting one and reporting
-    /// nothing leave the row equally re-servable.
-    ///
-    /// THE SELF-HEALING FALLBACK REMAINS, now covering the accident rather than the ordinary path:
-    /// an app that crashed between submitting and marking, or whose mark failed, still converges —
-    /// the engine promotes any in-flight transaction its scan sees mine (by the id it stored when
-    /// it BUILT the transaction), and a later re-serve of the same bytes draws a duplicate
-    /// rejection the SDK records as success.
+    /// Report only what landed: call this on an acceptance. A network-level non-acceptance needs
+    /// no call — the engine's network-error outcome records nothing by design, so reporting one
+    /// and reporting nothing leave the row equally re-servable. An app that crashed between
+    /// submitting and marking still converges: the engine promotes any in-flight transaction its
+    /// scan sees mine, and a later re-serve of the same bytes draws a duplicate rejection the SDK
+    /// records as success.
     /// - Parameters:
     ///   - accountUUID: the account the preparation belongs to.
     ///   - prepared: the value ``takeMigrationPreparation(accountUUID:byTxid:)`` returned for this
@@ -877,12 +805,12 @@ public protocol Synchronizer: AnyObject {
     /// caller (the app's driver, or any other call for this account) — so a host can ask
     /// "when is the next migration wake, per the drive's own plan" without re-cranking the engine.
     ///
-    /// ADVISORY and a FLOOR: the height is the earliest the outlook's work becomes serviceable,
-    /// never an appointment, and it holds only as of the crank that produced it — the VERY NEXT
+    /// Advisory and a floor: the height is the earliest the outlook's work becomes serviceable,
+    /// never an appointment, and it holds only as of the crank that produced it — the very next
     /// crank's outlook (even to `nil`) supersedes it unconditionally. It complements, never
-    /// replaces, ``migrationSyncWakeups(accountUUID:)``: this is ONE height, the schedule is
-    /// MANY — a host arming OS wake-ups should min-fold this outlook's height in alongside the
-    /// schedule's own heights, as zodl-ios already does, never treat it as a replacement source.
+    /// replaces, ``migrationSyncWakeups(accountUUID:)``: this is one height, the schedule is
+    /// many — a host arming OS wake-ups should min-fold this outlook's height in alongside the
+    /// schedule's own heights, never treat it as a replacement source.
     ///
     /// `nil` means no crank has run this session, or the last step's own outcome (a chain
     /// condition or user/spend-authority action, not a height) decides what follows.
@@ -1077,30 +1005,23 @@ public protocol Synchronizer: AnyObject {
     ///   propose/prepare call — re-propose and re-display; rust-layer errors otherwise.
     func signAndStoreMigrationSchedule(accountUUID: AccountUUID, _ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws
 
-    /// THE BROADCAST EXECUTOR: submits the ALREADY-PROVEN migration transaction `instruction`
+    /// The broadcast executor: submits the already-proven migration transaction `instruction`
     /// names for `accountUUID`, records the outcome, and returns it.
     ///
     /// The instruction is the payload of a ``MigrationAdvanceStep/broadcast(_:)`` step that a
     /// ``migrationAdvanceStep(accountUUID:)`` crank handed out — and the only way to hold one,
     /// since ``MigrationBroadcastInstruction`` has no public initializer. This executor never
     /// advances the drive and never chooses a transaction: the ZIP 318 re-spread, the
-    /// satisfiability verification and the dueness judgement (including any wall-clock chain-tip
-    /// acceleration — the conduit always projects the estimate, which is why there is no
-    /// `useEstimatedTip` here) all happened in the crank that issued it. There is
-    /// consequently no "nothing due" and no "awaiting proof" outcome to report: the driver saw the
-    /// step itself.
+    /// satisfiability verification, and the dueness judgement all happened in the crank that
+    /// issued it, so there is no "nothing due" and no "awaiting proof" outcome to report. It
+    /// never proves, either: a due row still awaiting its proof is never named by a `.broadcast`
+    /// step; the crank reports it inside the `.prove` batch.
     ///
     /// It wraps exactly what an app cannot do for itself: serving the transaction's finalized
     /// bytes through the store's atomic broadcast seam, submitting them under the given privacy
     /// options — always over the dedicated migration Tor runtime when `options.useTor` is set,
-    /// independent of the global `tor(enabled:)` toggle and fail-closed — bracketing the submit in
-    /// the sync gate's in-flight marker, and recording the result; see the throws/notes below for
-    /// the order those happen in and what each failure means.
-    ///
-    /// BROADCAST-ONLY: it never proves. A due row still awaiting its proof is never named by a
-    /// `.broadcast` step in the first place; the crank reports it inside the `.prove` batch (with
-    /// ``MigrationProveTarget/isScheduleDue`` set), and
-    /// ``proveMigrationTransactions(accountUUID:_:maxProofs:)`` at a sync wake-up clears it.
+    /// independent of the global `tor(enabled:)` toggle and fail-closed — bracketing the submit
+    /// in the sync gate's in-flight marker, and recording the result.
     ///
     /// - Parameters:
     ///   - accountUUID: the account the instruction belongs to.
@@ -1138,24 +1059,16 @@ public protocol Synchronizer: AnyObject {
     /// in flight for any account in the wallet — including an account with no live activity this
     /// session (a gate file a crashed launch left a marker in still counts).
     ///
-    /// The gate is BEHAVIOR-BASED, and the predicate is now a single PRESENT-TENSE condition: a
-    /// migration submit is between reaching the network and having its outcome recorded. That
-    /// lasts seconds. Nothing else holds sync:
-    ///
-    /// - No elapsed-time condition. The post-broadcast privacy buffer was deleted on 2026-08-07:
-    ///   a fixed delay between a broadcast and the next sync is itself an identifiable pattern —
-    ///   a correlation signature rather than a defense against one — so spacing sync from
-    ///   broadcasts by the clock was the wrong abstraction, not merely an insufficient dose of the
-    ///   right one. What replaces it is behavioral and lives in the host: a wake serves the
-    ///   drive's instruction and does not auto-append a sync, so sync sessions start for a reason
-    ///   (the outlook naming sync-bound work, an organic scheduled sync, or the user).
-    /// - No user intent is ever held. A manual balance refresh or an attempt to create a
-    ///   transaction requires sync, and this gate does not stand in its way — the in-flight marker
-    ///   is the only wait, and only while a submission is genuinely mid-flight.
-    /// - No work-pending query (the forward-looking ready-broadcast clause was removed
-    ///   2026-08-05): a due row that still needs its proof needs MORE syncing, so
-    ///   ``hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)``'s broader answer
-    ///   deliberately does not gate sync either.
+    /// The gate is behavior-based: the single present-tense condition is that a migration submit
+    /// is between reaching the network and having its outcome recorded, which lasts seconds.
+    /// Nothing else holds sync: there is no elapsed-time condition (a fixed post-broadcast delay
+    /// is itself an identifiable pattern — a correlation signature rather than a defense against
+    /// one; instead, a wake serves the drive's instruction without auto-appending a sync, so sync
+    /// sessions start for a reason), no hold on user intent (a manual refresh or an attempt to
+    /// create a transaction is never made to wait beyond an in-flight submit), and no
+    /// work-pending query (a due row that still needs its proof needs MORE syncing, so
+    /// ``hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)`` deliberately does not gate
+    /// sync either).
     ///
     /// Non-throwing: degrades open (returns `false`, i.e. sync allowed) if the check itself fails
     /// rather than blocking sync on an internal error. ``start(retry:)`` consults this and throws

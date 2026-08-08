@@ -34,7 +34,7 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertFalse(MigrationSyncGate.isBlocked(now: inFlightUntil, inFlightUntil: inFlightUntil))
     }
 
-    /// D1 (danny + nuttycom, 2026-08-05): the forward-looking ready-broadcast clause is GONE — no
+    /// D1 (2026-08-05): the forward-looking ready-broadcast clause is GONE — no
     /// pending work of any kind can block sync. This is the anti-regression pin for the clause's
     /// removal (it froze an awake session for 50+ min by blocking the very sync its pending
     /// broadcast needed — FIND-5).
@@ -47,7 +47,7 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertFalse(MigrationSyncGate.isBlocked(now: referenceDate, inFlightUntil: nil))
     }
 
-    // MARK: - Gate math: no time component (2026-08-07, kris' behavior-gate ruling)
+    // MARK: - Gate math: no time component (the behavior-based gate)
 
     /// THE PIN FOR THE DELETED POST-BROADCAST BUFFER: a completed broadcast leaves NO timed hold.
     /// The moment the in-flight marker clears, the gate is open — a query at the very same instant
@@ -522,7 +522,7 @@ final class MigrationLogicTests: ZcashTestCase {
 
 
     // (The "overdue flips on" tick test was deleted 2026-08-05 with the gate's forward-looking
-    // ready-broadcast clause — D1, danny + nuttycom's ruling; see `MigrationSyncGate`'s type doc.
+    // ready-broadcast clause — D1; see `MigrationSyncGate`'s type doc.
     // The ticker's remaining job is the in-flight marker's own self-expiry, pinned below; the
     // post-broadcast buffer that used to be the other half went on 2026-08-07.)
 

@@ -101,8 +101,8 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
 /// OPAQUE BY CONSTRUCTION: it has no public initializer, so an app cannot manufacture one. The
 /// only way to hold an instruction is to have called `migrationAdvanceStep(accountUUID:)` and been
 /// handed it, which is what makes "broadcast a migration transaction the drive did not ask for"
-/// unrepresentable at the Swift surface. Quoting the ruling this shape implements: *"And as such it
-/// should be provided with no capabilities for such semantic goals."*
+/// unrepresentable at the Swift surface: the app is provided with no capability for semantic
+/// migration goals of its own.
 ///
 /// The ``id`` is readable — a host correlates it with a
 /// ``MigrationTransactionStatus`` row for display and logging — but reading an id is not a

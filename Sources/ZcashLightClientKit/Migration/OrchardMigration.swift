@@ -379,7 +379,7 @@ actor OrchardMigration {
     /// Serves the PROVED PREPARATION with `txid` for submission — the retrieval half of the
     /// handoff ``proveTransactions(_:maxProofs:)`` opens by returning the preparations' txids.
     ///
-    /// THE RULING (kris, 2026-08-07). A proved preparation is a complete PCZT (signatures and
+    /// A proved preparation is a complete PCZT (signatures and
     /// proofs); its submission is the ORDINARY path, not the engine's delivery ceremony —
     /// preparations are ZIP 318-exempt, and the engine's own contract is that a preparation is
     /// broadcast as soon as it is proved. So this hands the finalized transaction back, the host
@@ -663,11 +663,9 @@ actor OrchardMigration {
     /// Whether ordinary wallet sync should currently be paused for this migration.
     ///
     /// `true` only while a submission is IN FLIGHT — the seconds between a migration submit
-    /// reaching the network and its outcome being recorded. Nothing timed remains: the
-    /// post-broadcast privacy buffer was deleted on 2026-08-07 (kris' ruling — a fixed delay is an
-    /// identifiable pattern, so the gate is behavior-based; see `MigrationSyncGate`'s type doc),
-    /// as the forward-looking ready-broadcast clause had been on 2026-08-05. A user action that
-    /// requires sync is never held here.
+    /// reaching the network and its outcome being recorded. Nothing timed remains: a fixed
+    /// post-broadcast delay is an identifiable pattern, so the gate is behavior-based (see
+    /// `MigrationSyncGate`'s type doc). A user action that requires sync is never held here.
     ///
     /// - Note: The gate is per-account (by file name). An app running several migrating accounts must
     ///   consult each account's `OrchardMigration`; this instance answers only for its bound account.
@@ -860,7 +858,7 @@ actor OrchardMigration {
     /// recorded — or immediately when the broadcaster throws before submitting anything (its
     /// fail-closed contract: a throw means nothing reached the network). Once cleared, sync is
     /// open again immediately; no timed spacing follows a broadcast (see
-    /// ``MigrationSyncGate``'s type doc for the ruling). A crash — or a record throw the rules
+    /// ``MigrationSyncGate``'s type doc for the rationale). A crash — or a record throw the rules
     /// above retain it for — between submit and record leaves the marker behind, and it
     /// self-expires at ``MigrationSyncGate/broadcastInFlightGuardDuration`` (120 s), a
     /// crash-recovery ceiling rather than a privacy interval; while it lives, sync (and with it

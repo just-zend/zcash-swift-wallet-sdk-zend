@@ -944,7 +944,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
     // MARK: - isSyncBlocked forward-looking policy (D1)
 
-    /// D1 REVERSAL PIN (danny + nuttycom, 2026-08-05): the gate's forward-looking clause is
+    /// D1 REVERSAL PIN (2026-08-05): the gate's forward-looking clause is
     /// deleted, so a migration with no in-flight marker never blocks sync, and no gate path pays
     /// for the wall-clock chain-tip estimate the clause needed.
     func testIsSyncBlockedIgnoresForwardLookingWork() async throws {

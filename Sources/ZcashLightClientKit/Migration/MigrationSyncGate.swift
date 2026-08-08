@@ -9,24 +9,14 @@ import Foundation
 /// The persisted, per-account gate that decides whether ordinary wallet sync must pause for the
 /// benefit of an in-flight migration.
 ///
-/// The gate is BEHAVIOR-BASED, never time-based. kris' ruling, verbatim:
-///
-/// > "On wake, we get an instruction: if that is `Broadcast { id }`, then we broadcast that
-/// > transaction. If the user continues interacting with their wallet — particularly if they take
-/// > actions that express a desire that _requires_ sync (a manual trigger to refresh balance, or
-/// > they attempt to manually create a transaction) then sync should be unlocked for the remainder
-/// > of the session. This lock being strictly time-bound *doesn't fix anything* because any short
-/// > fixed delay (like the current 10 minutes) is an identifiable pattern. So what we want isn't a
-/// > fixed time-based gate, but instead a behavior-based gate. The primary intent is that, while a
-/// > wallet is in the process of running a migration, we don't automatically trigger sync on every
-/// > wake."
-///
-/// What that rules out is spacing sync away from a broadcast by the clock. A fixed post-broadcast
-/// delay is not merely a weak defense — it is itself a correlation SIGNATURE: broadcast at T,
-/// sync reliably at T + delay, repeated across every broadcast of a migration that runs for days.
-/// Time-based spacing was the wrong abstraction, not an insufficient amount of the right one, so
-/// the persisted `resumeAt` buffer that used to live here is GONE rather than lengthened or
-/// randomized.
+/// The gate is BEHAVIOR-BASED, never time-based. A strictly time-bound lock fixes nothing,
+/// because any short fixed delay between a broadcast and the next sync is itself an identifiable
+/// pattern — a correlation SIGNATURE, not a defense against one: broadcast at T, sync reliably at
+/// T + delay, repeated across every broadcast of a migration that runs for days. Time-based
+/// spacing was the wrong abstraction, not an insufficient amount of the right one, so the
+/// persisted `resumeAt` buffer that used to live here is GONE rather than lengthened or
+/// randomized. The primary intent is that, while a wallet is in the process of running a
+/// migration, sync is not automatically triggered on every wake.
 ///
 /// The behavior that replaces it is not this type's to enforce: wakes serve the drive's
 /// instruction and do not auto-append a sync, and a sync session starts for a REASON — the
@@ -45,11 +35,10 @@ import Foundation
 /// gate's answer is meant to be a function of elapsed time since a broadcast.
 ///
 /// Two conditions that used to block sync are gone. A forward-looking "ready broadcast" clause —
-/// block whenever a proved, schedule-due transfer was servable — was removed on 2026-08-05
-/// (danny + nuttycom's ruling, relayed by Lukas); it was field-implicated in a live wedge, since
-/// it blocked the very sync whose scanned progress the pending broadcast needed, freezing an
-/// awake session for 50+ minutes (FIND-5, campaign 7/8a receipts). The post-broadcast privacy
-/// buffer followed it on 2026-08-07, on the ruling quoted above.
+/// block whenever a proved, schedule-due transfer was servable — was removed first: it was
+/// field-implicated in a live wedge, since it blocked the very sync whose scanned progress the
+/// pending broadcast needed, freezing an awake session for 50+ minutes (FIND-5, campaign 7/8a
+/// receipts). The post-broadcast privacy buffer followed it, on the rationale above.
 ///
 /// State is durably persisted to an atomically written JSON file, but every read in this process is
 /// served from an in-memory cache (see `cachedInFlightUntil`) -- the file exists for durability
