@@ -87,10 +87,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             "the seam's finalized bytes are submitted verbatim, with no extract step"
         )
         XCTAssertEqual(broadcaster.receivedCalls.first?.endpoint, defaultEndpoint)
-        XCTAssertFalse(
-            welding.migrationExtractBroadcastTxPcztForCalled,
-            "the broadcast path must not extract: its bytes are already a consensus transaction"
-        )
         XCTAssertNil(gate.currentInFlightUntil(), "the recorded outcome closes the submit-to-record window")
         XCTAssertFalse(gate.currentlyBlocked(), "a completed broadcast leaves no timed hold behind")
     }
@@ -900,10 +896,6 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             next: nil
         )
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepTransfer
-        welding.migrationExtractBroadcastTxPcztForClosure = { pczt, _ in
-            XCTAssertEqual(pczt, prepTransfer.pczt)
-            return Data([0x0A])
-        }
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)

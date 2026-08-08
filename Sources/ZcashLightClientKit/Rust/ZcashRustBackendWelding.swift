@@ -700,19 +700,13 @@ protocol ZcashRustBackendWelding {
     /// extracted, and recorded in the wallet's own tables in the same database transaction that
     /// hands the bytes back, so the wallet's record binds at the broadcast ATTEMPT. The returned
     /// ``PreparedMigrationTransfer/pczt`` is therefore the FINALIZED CONSENSUS TRANSACTION,
-    /// submittable as-is with no `migrationExtractBroadcastTx` step. Retrying a failed submission
-    /// re-serves the same transaction over the same record.
+    /// submittable as-is. Retrying a failed submission re-serves the same transaction over the
+    /// same record.
     /// - Throws: `migrationProvingUnavailable` when the stored artifact cannot be turned into
     ///   servable bytes; `rustMigrationTakeBroadcastTransaction` for other rust-layer errors —
     ///   including the STALENESS refusal of a row that is no longer proved-and-servable, which a
     ///   caller discharges by advancing again rather than retrying the executor.
     func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer
-
-    /// Extracts the broadcast-ready consensus transaction bytes from a signed PCZT (the
-    /// `PreparedMigrationTransfer.pczt` returned by `migrationStoreSignedNoteSplitPczts`, the one
-    /// producer whose artifact is still a PCZT).
-    /// - Throws: `rustMigrationExtractBroadcastTx` if the rust layer returns an error.
-    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data
 
     /// Records the platform's broadcast outcome for `transferId`, advancing the engine's state.
     /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error;

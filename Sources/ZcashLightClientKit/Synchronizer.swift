@@ -791,10 +791,9 @@ public protocol Synchronizer: AnyObject {
     /// submitting re-retrieves exactly the same bytes over the same record.
     ///
     /// Submit ``PreparedMigrationTransfer/pczt`` — a FINALIZED CONSENSUS TRANSACTION, submittable
-    /// as-is, with no ``migrationExtractBroadcastTx`` step — through the app's ORDINARY
-    /// raw-transaction machinery, then record the outcome the standard way: the returned
-    /// ``PreparedMigrationTransfer/id`` is the ENGINE TRANSFER ID that path keys on, so the app
-    /// carries no identity of its own.
+    /// as-is — through the app's ORDINARY raw-transaction machinery, then record the outcome the
+    /// standard way: the returned ``PreparedMigrationTransfer/id`` is the ENGINE TRANSFER ID that
+    /// path keys on, so the app carries no identity of its own.
     ///
     /// PREPARATION-GATED: a txid naming a TRANSFER is refused. Transfers cross the turnstile on
     /// the drive's own ZIP 318 schedule and are served by

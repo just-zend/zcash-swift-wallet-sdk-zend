@@ -5557,30 +5557,6 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
-    // MARK: - migrationExtractBroadcastTx
-
-    var migrationExtractBroadcastTxPcztForThrowableError: Error?
-    var migrationExtractBroadcastTxPcztForCallsCount = 0
-    var migrationExtractBroadcastTxPcztForCalled: Bool {
-        return migrationExtractBroadcastTxPcztForCallsCount > 0
-    }
-    var migrationExtractBroadcastTxPcztForReceivedArguments: (pczt: Data, account: AccountUUID)?
-    var migrationExtractBroadcastTxPcztForReturnValue: Data!
-    var migrationExtractBroadcastTxPcztForClosure: ((Data, AccountUUID) async throws -> Data)?
-
-    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data {
-        if let error = migrationExtractBroadcastTxPcztForThrowableError {
-            throw error
-        }
-        migrationExtractBroadcastTxPcztForCallsCount += 1
-        migrationExtractBroadcastTxPcztForReceivedArguments = (pczt: pczt, account: account)
-        if let closure = migrationExtractBroadcastTxPcztForClosure {
-            return try await closure(pczt, account)
-        } else {
-            return migrationExtractBroadcastTxPcztForReturnValue
-        }
-    }
-
     // MARK: - migrationRecordTransferResult
 
     var migrationRecordTransferResultTransferIdResultForThrowableError: Error?

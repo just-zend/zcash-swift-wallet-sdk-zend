@@ -297,20 +297,6 @@ final class MigrationFFITests: XCTestCase {
         )
     }
 
-    /// Ported from the prototype's `testExtractBroadcastTxWithInvalidPcztThrows`: garbage PCZT bytes
-    /// fail the crate's deserialization before any wallet-state check, so this is deterministic
-    /// regardless of sync state.
-    func testExtractBroadcastTxWithInvalidPcztThrows() async throws {
-        do {
-            _ = try await rustBackend.migrationExtractBroadcastTx(pczt: Data([0, 1, 2, 3]), for: account)
-            XCTFail("Expected extracting a tx from invalid PCZT bytes to throw")
-        } catch ZcashError.rustMigrationExtractBroadcastTx {
-            // expected
-        } catch {
-            XCTFail("Expected rustMigrationExtractBroadcastTx but got \(error)")
-        }
-    }
-
     // MARK: - Immediate migration (send-max lane)
 
     /// MOB-1513: `migrationRecordImmediateRun` validates `txid.count == 32` in Swift before making

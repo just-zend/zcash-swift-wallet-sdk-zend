@@ -60,9 +60,9 @@
 //! functions yield NULL on error, `bool`-returning functions `false`, and the `i64` sentinels are
 //! documented per function.
 //!
-//! Heap ownership: every function that returns a `*mut Ffi*` (or a [`ffi::BoxedSlice`]) transfers
-//! ownership to the caller, who must free it with the matching `zcashlc_free_migration_*` (or
-//! `zcashlc_free_boxed_slice`) function.
+//! Heap ownership: every function that returns a `*mut Ffi*` (or a [`crate::ffi::BoxedSlice`])
+//! transfers ownership to the caller, who must free it with the matching
+//! `zcashlc_free_migration_*` (or `zcashlc_free_boxed_slice`) function.
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr};
@@ -118,7 +118,7 @@ use crate::migration_engine::{
 use crate::migration_finalize;
 use crate::migration_plan_cache;
 use crate::{
-    NETWORK_ID_MAINNET, NETWORK_ID_TESTNET, NetworkParams, account_uuid_from_bytes, ffi,
+    NETWORK_ID_MAINNET, NETWORK_ID_TESTNET, NetworkParams, account_uuid_from_bytes,
     free_ptr_from_vec, free_ptr_from_vec_with, parse_network, ptr_from_vec, unwrap_exc_or,
     unwrap_exc_or_null, zcashlc_string_free,
 };
@@ -1947,9 +1947,11 @@ pub struct FfiNoteSplitProposal {
 /// - `zcashlc_migration_take_broadcast_transaction` (the drive's BROADCAST instruction) and
 ///   `zcashlc_migration_sign_note_split` (the ceremony handback) both serve through the store's
 ///   atomic broadcast seam, so their artifact is the FINALIZED CONSENSUS TRANSACTION — submit it
-///   as-is, with no `zcashlc_migration_extract_broadcast_tx` step.
+///   as-is.
 /// - The storage receipt `zcashlc_migration_store_signed_note_split_pczts` returns is a serialized
-///   PCZT, which is not submittable until extracted.
+///   PCZT, not submittable until the engine has proved it and a later
+///   `zcashlc_migration_take_broadcast_transaction` serves the broadcastable, proven value once a
+///   crank names it.
 #[repr(C)]
 pub struct FfiPreparedTransfer {
     /// The transaction's id (the engine's raw id).
@@ -2264,7 +2266,7 @@ pub struct FfiMigrationTransactionStatuses {
 ///
 /// This crate's first string-array FFI output type: kept intentionally minimal (unlike
 /// [`FfiUnsignedTransferPczts`], there is no paired per-element id or byte blob here, just
-/// strings), rather than generalizing [`ffi::BoxedSlice`] (a single binary blob, not an array) or
+/// strings), rather than generalizing [`crate::ffi::BoxedSlice`] (a single binary blob, not an array) or
 /// inventing a shared generic array wrapper for a need that has arisen exactly once so far.
 #[repr(C)]
 pub struct FfiKeystoneQrParts {
@@ -3835,31 +3837,6 @@ pub unsafe extern "C" fn zcashlc_migration_take_preparation_by_txid(
         }
         let (raw, served_txid) = serve_for_broadcast(&mut ctx, &state, id)?;
         FfiPreparedTransfer::from_parts(id, served_txid, raw)
-    });
-    unwrap_exc_or_null(res)
-}
-
-/// Extracts the consensus transaction bytes from a proven, finalized migration PCZT.
-///
-/// # Safety
-/// See [`open`]; `pczt_ptr` must be valid for reads of `pczt_len` bytes. Free the returned
-/// pointer with `zcashlc_free_boxed_slice`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_extract_broadcast_tx(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-    pczt_ptr: *const u8,
-    pczt_len: usize,
-) -> *mut ffi::BoxedSlice {
-    let res = catch_panic(|| {
-        let _ = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let pczt_bytes = unsafe { slice_or_empty(pczt_ptr, pczt_len) };
-        let pczt =
-            pczt::Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Error parsing PCZT: {e:?}"))?;
-        let (raw, _) = migration_finalize::extract_tx(pczt)?;
-        Ok(ffi::BoxedSlice::some(raw))
     });
     unwrap_exc_or_null(res)
 }

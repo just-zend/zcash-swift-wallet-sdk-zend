@@ -208,16 +208,3 @@ where
         Err(e) => Err(proving_unavailable(e)),
     }
 }
-
-/// Extracts the consensus transaction bytes and txid (raw internal order) from a fully proven and
-/// finalized PCZT.
-pub(crate) fn extract_tx(pczt: pczt::Pczt) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
-    let tx = pczt::roles::tx_extractor::TransactionExtractor::new(pczt)
-        .extract()
-        .map_err(|e| anyhow!("finalize: extract tx: {e:?}"))?;
-    let txid: [u8; 32] = *tx.txid().as_ref();
-    let mut raw = Vec::new();
-    tx.write(&mut raw)
-        .map_err(|e| anyhow!("finalize: encode tx: {e}"))?;
-    Ok((raw, txid))
-}

@@ -108,21 +108,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     transaction and records it in the wallet's own tables — raw bytes, sent outputs, input-spend
     marks, status-queue entry — in the same database transaction that hands the bytes back, so the
     wallet record binds at the broadcast attempt rather than after it. `FfiPreparedTransfer`'s
-    `pczt`/`pczt_len` therefore carry the FINALIZED CONSENSUS TRANSACTION bytes, submittable as-is
-    with no `_extract_broadcast_tx` step (which is unchanged and remains for callers holding a PCZT
-    of their own, including the `_store_signed_note_split_pczts` storage receipt). The seam's own
-    refusal of a row that is not `Proved` is the STALENESS GUARD — an instruction that went stale
-    between the advance and the serve fails here rather than being acted on, and the caller
-    discharges it by advancing again. `FfiPreparedTransfer` accordingly loses its `status` field
-    and `FfiPreparedTransferStatus` is gone: an executor either serves or errors, so there is no
-    "nothing due"/"awaiting proof" shape left to carry. WHETHER a missing proof is what blocks
-    delivery is now reported on the advance step itself — each `FfiProveTarget` row gains a
+    `pczt`/`pczt_len` therefore carry the FINALIZED CONSENSUS TRANSACTION bytes, submittable as-is.
+    The seam's own refusal of a row that is not `Proved` is the STALENESS GUARD — an instruction
+    that went stale between the advance and the serve fails here rather than being acted on, and
+    the caller discharges it by advancing again. `FfiPreparedTransfer` accordingly loses its
+    `status` field and `FfiPreparedTransferStatus` is gone: an executor either serves or errors, so
+    there is no "nothing due"/"awaiting proof" shape left to carry. WHETHER a missing proof is what
+    blocks delivery is now reported on the advance step itself — each `FfiProveTarget` row gains a
     trailing `schedule_due` bool, true when the effective dueness target has already reached that
-    transaction's scheduled height. Then `_extract_broadcast_tx`, `_record_transfer_result` (whose terminal
-    tags — 2 invalid, 3 expired — record `report_broadcast_failure` testimony stamped at the
-    observed wallet tip; the next drive call adjudicates it through sqlite's satisfiability
-    oracle, while unknown and already-mined rows remain no-ops), and
-    `_record_immediate_run`, which records a send-max sweep built outside the engine.
+    transaction's scheduled height. Then `_record_transfer_result` (whose terminal tags — 2
+    invalid, 3 expired — record `report_broadcast_failure` testimony stamped at the observed
+    wallet tip; the next drive call adjudicates it through sqlite's satisfiability oracle, while
+    unknown and already-mined rows remain no-ops), and `_record_immediate_run`, which records a
+    send-max sweep built outside the engine.
   - Read-only reporting: the query that CANNOT drive the engine (it opens read-only connections
     and must not mutate) — `_has_overdue_transfers` — derives its answer from upstream's public
     per-row status view (`MigrationState::transaction_statuses`) instead of the exported
@@ -328,6 +326,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   future, and never for a fixed interval after one happened.
   `zcashlc_migration_has_overdue_transfers` — an honest "the delivery lane has actionable work"
   boolean, not a kind-filtered id peek — stays.
+- `zcashlc_migration_extract_broadcast_tx` is removed. It had zero consumers, in the SDK or the
+  app: every live flow receives already-finalized consensus transaction bytes from the store's
+  atomic broadcast seam, never a PCZT that needs extracting. Its private helper,
+  `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood

@@ -199,9 +199,9 @@ and marking still converges, because the engine promotes any in-flight transacti
 mine (by the id it stored when it BUILT the transaction) and a later re-serve of the same bytes
 draws a duplicate rejection the SDK records as success.
 
-The bytes are a FINALIZED CONSENSUS TRANSACTION, submittable as-is — no
-`migrationExtractBroadcastTx` step, no `MigrationNetworkPrivacyOptions`, no broadcast session. Do
-not build a parallel submit path for them: use the raw-transaction machinery the app already has.
+The bytes are a FINALIZED CONSENSUS TRANSACTION, submittable as-is — no extraction step, no
+`MigrationNetworkPrivacyOptions`, no broadcast session. Do not build a parallel submit path for
+them: use the raw-transaction machinery the app already has.
 
 `performMigrationBroadcast(accountUUID:_:options:)` has **no `useEstimatedTip`**. That parameter
 existed because the delivery lane advanced internally; the conduit always projects the wall-clock

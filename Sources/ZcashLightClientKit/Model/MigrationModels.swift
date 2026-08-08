@@ -826,8 +826,9 @@ public struct ImmediateMigrationProposal: Equatable {
 /// (`migrationTakeBroadcastTransaction(id:for:)`) and the note-split ceremony
 /// (`migrationSignNoteSplit`) both serve through the store's atomic broadcast seam, so theirs is
 /// the FINALIZED CONSENSUS TRANSACTION — submittable as-is. The storage receipt
-/// `migrationStoreSignedNoteSplitPczts` returns is a serialized PCZT, not submittable until run
-/// through `ZcashRustBackendWelding.migrationExtractBroadcastTx(pczt:for:)`.
+/// `migrationStoreSignedNoteSplitPczts` returns is a serialized PCZT, not submittable until the
+/// engine has proved it and a later `migrationTakeBroadcastTransaction(id:for:)` serves the
+/// broadcastable, proven value once a crank names it.
 public struct PreparedMigrationTransfer: Equatable, Sendable {
     /// The transfer's engine-issued id.
     public let id: UInt32

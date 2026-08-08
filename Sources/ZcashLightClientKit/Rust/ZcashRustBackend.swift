@@ -2169,37 +2169,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return prepared
     }
 
-    // DB-AUDIT (2026-08-03): SELECT-only in steady state, but routes through the shared
-    // open() preamble (CREATE TABLE IF NOT EXISTS + first-call legacy-marks migration can
-    // write). Stays serialized.
-    @DBActor
-    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data {
-        let txPtr: UnsafeMutablePointer<FfiBoxedSlice>? = pczt.withUnsafeBytes { buffer in
-            guard let bufferPtr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return nil
-            }
-
-            return zcashlc_migration_extract_broadcast_tx(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                bufferPtr,
-                UInt(pczt.count)
-            )
-        }
-
-        guard let txPtr else {
-            throw ZcashError.rustMigrationExtractBroadcastTx(
-                lastErrorMessage(fallback: "`migrationExtractBroadcastTx` failed with unknown error")
-            )
-        }
-
-        defer { zcashlc_free_boxed_slice(txPtr) }
-
-        return Data(bytes: txPtr.pointee.ptr, count: Int(txPtr.pointee.len))
-    }
-
     @DBActor
     func migrationRecordTransferResult(
         transferId: UInt32,
