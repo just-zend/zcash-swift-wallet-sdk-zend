@@ -622,3 +622,28 @@ Unmerged upstream branches (not carried):
 No newly active upstream PR or branch is simultaneously ready, useful, and low-risk for an early
 Zend carry. Continue to route the focused decrypt sentinel fix through Zend PR `#35`, and retain
 funded-device migration evidence as a prerequisite for the full-parity PR `#34`.
+
+## Bleeding-edge refresh (2026-08-08)
+
+- Default branches remain `origin/main` at `4497fe9e` and `upstream/main` at `468d1e9f` after a
+  fresh fetch. Their divergence remains `174 111`; Zend draft PR `#34`
+  (`codex/zcash-upstream-sync-2026-08-01`) contains the upstream tip (`177 0` against
+  `upstream/main`) and remains the sole parity vehicle.
+- Upstream PR `#1953` is draft, even though it is clean and approved. It repins `librustzcash` and
+  changes batch-prove/outlook and adapter behavior on top of `feature/ironwood-slipstream`; Zend's
+  provenance-locked migration engine and artifact do not make it independently applicable.
+- Upstream PR `#1954` remains blocked and review-required while proposing the full
+  `feature/ironwood-slipstream` merge to `main`. Upstream PR `#1957` is also blocked and
+  review-required, and advances the same migration lanes and dependency graph. Do not carry either
+  ahead of upstream.
+- Newly advertised `fable/f1-span-rate-estimator`, `fable/gardening-test`, and force-updated
+  `kris/advance-driven-migration` all contain the large Ironwood/Slipstream migration, FFI,
+  generated-code, and `librustzcash` graph. They are neither narrow nor independently verifiable
+  against Zend's committed private-engine artifact; wait for upstream integration, provenance
+  reconciliation, and funded-device migration evidence.
+- Upstream PR `#1956` is now approved but targets the `maint/v2.7.x` maintenance line. Its Rust
+  test-gate workflow change is not a Zend early-carry candidate; any later adaptation must retain
+  Zend's SHA-pinned actions, read-only permissions, and disabled persisted credentials.
+
+No new upstream-main commit or carry-worthy bleeding-edge work was found. Do not create another
+parity branch or run Swift validation for this documentation-only tracker update.
