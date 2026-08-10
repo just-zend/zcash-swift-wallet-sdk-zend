@@ -1,0 +1,39 @@
+name: Proto Sync
+
+# Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf/proto/proposal.proto
+# is vendored from librustzcash. libzcashlc encodes proposals with the schema of
+# the pinned zcash_client_backend, so a stale copy silently drops fields on the
+# Swift side. Re-derive it from the pinned version and fail if the committed
+# copy differs.
+
+on:
+  pull_request:
+    paths-ignore:
+      - '.github/ISSUE_TEMPLATE/*'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - 'LICENSE'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'responsible_disclosure.md'
+      - 'SWIFTLINT.md'
+      - 'docs/**'
+
+permissions: {}
+
+jobs:
+  check_proposal_proto:
+    permissions:
+      contents: read
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+      timeout-minutes: 1
+
+    - name: Check proposal.proto matches the pinned zcash_client_backend
+      timeout-minutes: 5
+      run: ./Scripts/update-proposal-proto.sh --check

@@ -112,7 +112,7 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         let path = makeTempDbPath()
 
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
         backend.close()
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: path))
@@ -122,12 +122,25 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         let path = makeTempDbPath()
 
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
         defer { backend.close() }
 
-        XCTAssertThrowsError(try backend.open(path: path)) { error in
+        XCTAssertThrowsError(try backend.open(path: path, networkId: roundTripNetworkId)) { error in
             guard case VotingRustBackendError.databaseAlreadyOpen = error else {
                 XCTFail("expected .databaseAlreadyOpen, got \(error.localizedDescription)")
+                return
+            }
+        }
+    }
+
+    func test_open_rejectsUnknownNetworkId() throws {
+        // The network is fixed when the handle is opened, so an unknown id is
+        // rejected once, here, rather than by each database-bound call.
+        let backend = VotingRustBackend()
+
+        XCTAssertThrowsError(try backend.open(path: makeTempDbPath(), networkId: 99)) { error in
+            guard case VotingRustBackendError.rustError = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
                 return
             }
         }
@@ -137,19 +150,19 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         let path = makeTempDbPath()
 
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
         backend.close()
         backend.close() // second close must not crash
 
         // Re-opening after close must succeed.
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
         backend.close()
     }
 
     func test_close_waitsForInFlightDatabaseOperationBeforeFreeingHandle() throws {
         let backend = VotingRustBackend()
         let path = makeTempDbPath()
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
 
         let operationStarted = XCTestExpectation(description: "operation started")
         let operationFinished = XCTestExpectation(description: "operation finished")
@@ -464,7 +477,6 @@ final class VotingRustBackendTests: XCTestCase {
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
             roundId: hexRoundId(0x21),
-            networkId: roundTripNetworkId,
             snapshotHeight: 1234,
             eaPublicKey: valid,
             ncRoot: valid,
@@ -490,32 +502,10 @@ final class VotingRustBackendTests: XCTestCase {
         XCTAssertThrowsError(
             try backend.initRound(
                 roundId: hexRoundId(0x41),
-                networkId: roundTripNetworkId,
                 snapshotHeight: 1,
                 eaPublicKey: short,
                 ncRoot: valid,
                 nullifierImtRoot: valid
-            )
-        ) { error in
-            guard case VotingRustBackendError.rustError = error else {
-                XCTFail("expected .rustError, got \(error.localizedDescription)")
-                return
-            }
-        }
-    }
-
-    func test_initRound_rejectsUnknownNetworkId() throws {
-        let backend = try makeReadyBackend()
-        defer { backend.close() }
-
-        XCTAssertThrowsError(
-            try backend.initRound(
-                roundId: hexRoundId(0x42),
-                networkId: 99,
-                snapshotHeight: 1,
-                eaPublicKey: roundTripRoundParameter,
-                ncRoot: roundTripRoundParameter,
-                nullifierImtRoot: roundTripRoundParameter
             )
         ) { error in
             guard case VotingRustBackendError.rustError = error else {
@@ -540,7 +530,6 @@ final class VotingRustBackendTests: XCTestCase {
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
             roundId: hexRoundId(0x21),
-            networkId: roundTripNetworkId,
             snapshotHeight: 42,
             eaPublicKey: valid,
             ncRoot: valid,
@@ -548,7 +537,6 @@ final class VotingRustBackendTests: XCTestCase {
         )
         try backend.initRound(
             roundId: hexRoundId(0x22),
-            networkId: roundTripNetworkId,
             snapshotHeight: 43,
             eaPublicKey: valid,
             ncRoot: valid,
@@ -567,7 +555,6 @@ final class VotingRustBackendTests: XCTestCase {
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
             roundId: roundTripRoundId,
-            networkId: roundTripNetworkId,
             snapshotHeight: 1,
             eaPublicKey: valid,
             ncRoot: valid,
@@ -768,7 +755,6 @@ final class VotingRustBackendTests: XCTestCase {
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
             roundId: roundTripRoundId,
-            networkId: roundTripNetworkId,
             snapshotHeight: 1,
             eaPublicKey: valid,
             ncRoot: valid,
@@ -912,7 +898,6 @@ final class VotingRustBackendTests: XCTestCase {
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
             roundId: roundTripRoundId,
-            networkId: roundTripNetworkId,
             snapshotHeight: 1,
             eaPublicKey: valid,
             ncRoot: valid,
@@ -938,7 +923,6 @@ final class VotingRustBackendTests: XCTestCase {
             bundleIndex: 0,
             notes: [],
             keys: VotingDelegationKeyInputs(
-                networkId: roundTripNetworkId,
                 fvk: [UInt8](repeating: 0, count: votingOrchardFvkByteCount),
                 hotkeyStoredSecret: hotkey.storedSecret,
                 seedFingerprint: [UInt8](repeating: 0, count: votingSeedFingerprintByteCount - 1),
@@ -995,7 +979,6 @@ final class VotingRustBackendTests: XCTestCase {
         XCTAssertThrowsError(
             try backend.initRound(
                 roundId: hexRoundId(0x31),
-                networkId: roundTripNetworkId,
                 snapshotHeight: 0,
                 eaPublicKey: valid,
                 ncRoot: valid,
@@ -1072,7 +1055,6 @@ final class VotingRustBackendTests: XCTestCase {
                 notes: [],
                 pirEndpoints: ["https://stub"],
                 expectedSnapshotHeight: 0,
-                networkId: roundTripNetworkId,
                 pirResolver: PirSnapshotResolver(probe: FailingProbe())
             )
             XCTFail("expected .databaseNotOpen")
@@ -1200,7 +1182,6 @@ final class VotingRustBackendTests: XCTestCase {
                 roundId: hexRoundId(0x11),
                 bundleIndex: 0,
                 hotkeyStoredSecret: hotkey.storedSecret,
-                networkId: roundTripNetworkId,
                 proposalId: 0,
                 choice: 0,
                 numOptions: 2,
@@ -1232,7 +1213,6 @@ final class VotingRustBackendTests: XCTestCase {
                 roundId: hexRoundId(0x11),
                 bundleIndex: 0,
                 hotkeyStoredSecret: [UInt8](repeating: 1, count: votingFieldElementByteCount),
-                networkId: roundTripNetworkId,
                 proposalId: 0,
                 choice: 0,
                 numOptions: 2,
@@ -1256,35 +1236,6 @@ final class VotingRustBackendTests: XCTestCase {
         }
 
         await fulfillment(of: [progressReported], timeout: 0.1)
-    }
-
-    func test_commitVote_afterOpen_rejectsUnknownNetworkId() async throws {
-        let backend = try makeOpenBackend()
-        defer { backend.close() }
-        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
-
-        do {
-            _ = try await backend.commitVote(
-                roundId: hexRoundId(0x11),
-                bundleIndex: 0,
-                hotkeyStoredSecret: hotkey.storedSecret,
-                networkId: 99,
-                proposalId: 0,
-                choice: 0,
-                numOptions: 2,
-                voteCommitmentTreePosition: 0,
-                vanWitness: makeVanWitness(),
-                singleShare: false
-            )
-            XCTFail("expected .rustError")
-        } catch let error as VotingRustBackendError {
-            guard case .rustError = error else {
-                XCTFail("expected .rustError, got \(error.localizedDescription)")
-                return
-            }
-        } catch {
-            XCTFail("unexpected error: \(error.localizedDescription)")
-        }
     }
 
     // MARK: - markVoteSubmitted
@@ -1333,7 +1284,7 @@ final class VotingRustBackendTests: XCTestCase {
 
     func test_setWalletId_succeedsAfterOpen() throws {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         defer { backend.close() }
 
         XCTAssertNoThrow(try backend.setWalletId("wallet-id-1"))
@@ -1345,7 +1296,7 @@ final class VotingRustBackendTests: XCTestCase {
 
     func test_resetTreeClient_succeedsAfterOpen_withEmptyRoundId() throws {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         defer { backend.close() }
 
         // Empty round ID resets all in-memory tree clients; safe to call on a
@@ -1357,7 +1308,7 @@ final class VotingRustBackendTests: XCTestCase {
 
     func test_precomputeDelegationPir_emptyEndpoints_throwsResolverError() async throws {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         defer { backend.close() }
 
         do {
@@ -1366,8 +1317,7 @@ final class VotingRustBackendTests: XCTestCase {
                 bundleIndex: 0,
                 notes: [],
                 pirEndpoints: [],
-                expectedSnapshotHeight: 0,
-                networkId: roundTripNetworkId
+                expectedSnapshotHeight: 0
             )
             XCTFail("expected PirSnapshotResolverError.noEndpointsConfigured")
         } catch PirSnapshotResolverError.noEndpointsConfigured {
@@ -1388,7 +1338,7 @@ final class VotingRustBackendTests: XCTestCase {
 
     private func makeReadyBackend(walletId: String = roundTripWalletId) throws -> VotingRustBackend {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         try backend.setWalletId(walletId)
         return backend
     }
@@ -1410,7 +1360,6 @@ final class VotingRustBackendTests: XCTestCase {
             bundleIndex: roundTripBundleIndex,
             notes: [],
             keys: VotingDelegationKeyInputs(
-                networkId: roundTripNetworkId,
                 fvk: [UInt8](repeating: 0x03, count: votingOrchardFvkByteCount),
                 hotkeyStoredSecret: hotkey.storedSecret,
                 seedFingerprint: seedFingerprint,
@@ -1426,7 +1375,6 @@ final class VotingRustBackendTests: XCTestCase {
     ) throws {
         try backend.initRound(
             roundId: roundId,
-            networkId: roundTripNetworkId,
             snapshotHeight: roundTripSnapshotHeight,
             eaPublicKey: roundTripRoundParameter,
             ncRoot: roundTripRoundParameter,
@@ -1562,7 +1510,7 @@ final class VotingRustBackendTests: XCTestCase {
 
     private func makeOpenBackend() throws -> VotingRustBackend {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         try backend.setWalletId("wallet")
         return backend
     }

@@ -12,12 +12,15 @@ use super::db::VotingDatabaseHandle;
 use super::ffi_types::{
     FfiRoundState, FfiRoundSummaries, FfiRoundSummary, FfiVoteRecord, FfiVoteRecords,
 };
-use super::helpers::{bytes_from_ptr, round_phase_to_u32, str_from_ptr, voting_network};
+use super::helpers::{bytes_from_ptr, round_phase_to_u32, str_from_ptr};
 
 /// Initialize a voting round.
 ///
-/// `network_id` is persisted with the round so that governance PCZT consensus
-/// branch identifiers can later be validated against the round's snapshot.
+/// The round is persisted with the database handle's network, so that governance
+/// PCZT consensus branch identifiers can later be validated against the round's
+/// snapshot. The network is fixed when the handle is opened
+/// (`zcashlc_voting_db_open`) rather than passed here, so a round cannot be
+/// initialized against a network the handle disagrees with.
 ///
 /// Returns 0 on success, -1 on error.
 ///
@@ -28,7 +31,6 @@ use super::helpers::{bytes_from_ptr, round_phase_to_u32, str_from_ptr, voting_ne
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_init_round(
     db: *mut VotingDatabaseHandle,
-    network_id: u32,
     round_id: *const u8,
     round_id_len: usize,
     snapshot_height: u64,
@@ -70,7 +72,7 @@ pub unsafe extern "C" fn zcashlc_voting_init_round(
 
         handle
             .db
-            .init_round(voting_network(network_id)?, &params, session.as_deref())
+            .init_round(handle.network, &params, session.as_deref())
             .map_err(|e| anyhow!("init_round failed: {}", e))?;
         Ok(0)
     });
@@ -334,7 +336,6 @@ mod tests {
         unsafe {
             zcashlc_voting_init_round(
                 db,
-                crate::NETWORK_ID_MAINNET,
                 round_id.as_ptr(),
                 round_id.len(),
                 123,

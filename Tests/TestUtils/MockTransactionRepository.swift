@@ -155,7 +155,11 @@ extension MockTransactionRepository: TransactionRepository {
             value: Zatoshi(-Int64.random(in: 1 ... Zatoshi.Constants.oneZecInZatoshi)),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
     }
 
@@ -177,7 +181,11 @@ extension MockTransactionRepository: TransactionRepository {
             value: Zatoshi(Int64.random(in: 1 ... Zatoshi.Constants.oneZecInZatoshi)),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
     }
 

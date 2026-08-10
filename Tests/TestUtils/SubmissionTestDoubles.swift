@@ -230,6 +230,11 @@ final class StubTransactionEncoder: TransactionEncoder {
     private(set) var receivedFetchTxIds: [Data]?
     private(set) var submittedTransactions: [EncodedTransaction] = []
 
+    /// When set, `submit(transaction:)` records the transaction and then throws this error.
+    var submitError: Error?
+    /// `isTransactionKnownToServer(txId:)` returns `true` for txids in this set.
+    var knownToServerTxIds: Set<Data> = []
+
     init(createdTransactions: [ZcashTransaction.Overview]) {
         self.createdTransactions = createdTransactions
     }
@@ -273,10 +278,13 @@ final class StubTransactionEncoder: TransactionEncoder {
 
     func submit(transaction: EncodedTransaction) async throws {
         submittedTransactions.append(transaction)
+        if let submitError {
+            throw submitError
+        }
     }
 
     func isTransactionKnownToServer(txId: Data) async -> Bool {
-        false
+        knownToServerTxIds.contains(txId)
     }
 
     func fetchTransactionsForTxIds(_ txIds: [Data]) async throws -> [ZcashTransaction.Overview] {

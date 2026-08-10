@@ -175,7 +175,6 @@ pub unsafe extern "C" fn zcashlc_voting_get_bundle_count(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_build_pczt(
     db: *mut VotingDatabaseHandle,
-    network_id: u32,
     round_id: *const u8,
     round_id_len: usize,
     bundle_index: u32,
@@ -213,9 +212,8 @@ pub unsafe extern "C" fn zcashlc_voting_build_pczt(
         })?;
         let round_name_str = unsafe { str_from_ptr(round_name, round_name_len) }?;
 
-        let hotkey =
-            voting::VotingHotkey::from_stored_secret(hotkey_secret, voting_network(network_id)?)
-                .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
+        let hotkey = voting::VotingHotkey::from_stored_secret(hotkey_secret, handle.network)
+            .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
         let keys = voting::delegate::DelegationKeys::with_voting_hotkey(
             fvk.to_vec(),
             &hotkey,
@@ -435,7 +433,6 @@ fn connect_pir_client(pir_url: &str) -> anyhow::Result<voting::PirClientBlocking
 ///   if `len > 0` then `ptr` must be non-null and valid for reads for `len` bytes; if
 ///   `len == 0`, `ptr` is ignored. An empty `notes_json` is treated as the empty notes
 ///   list (JSON is not parsed).
-/// - `network_id` must be `0` (testnet) or `1` (mainnet), matching other `zcashlc_*` FFI.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
     db: *mut VotingDatabaseHandle,
@@ -446,13 +443,12 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
     notes_json_len: usize,
     pir_server_url: *const u8,
     pir_server_url_len: usize,
-    network_id: u32,
 ) -> *mut crate::ffi::BoxedSlice {
     let db = AssertUnwindSafe(db);
     let res = catch_panic(|| {
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        crate::parse_network(network_id)?;
+        crate::parse_network(handle.network_id)?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
         let notes_bytes = unsafe { bytes_from_ptr(notes_json, notes_json_len) }?;
         let json_notes: Vec<JsonNoteInfo> = if notes_bytes.is_empty() {
@@ -471,7 +467,7 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
                 bundle_index,
                 &core_notes,
                 &pir_client,
-                voting_network(network_id)?,
+                handle.network,
             )
             .map_err(|e| anyhow!("precompute_delegation_pir failed: {}", e))?;
 
@@ -517,7 +513,6 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
     round_name_len: usize,
     pir_server_url: *const u8,
     pir_server_url_len: usize,
-    network_id: u32,
     progress_callback: Option<unsafe extern "C" fn(f64, *mut std::ffi::c_void)>,
     progress_context: *mut std::ffi::c_void,
 ) -> *mut crate::ffi::BoxedSlice {
@@ -526,7 +521,7 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
     let res = catch_panic(|| {
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        crate::parse_network(network_id)?;
+        crate::parse_network(handle.network_id)?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
         let notes_bytes = unsafe { bytes_from_ptr(notes_json, notes_json_len) }?;
         let json_notes: Vec<JsonNoteInfo> = serde_json::from_slice(notes_bytes)?;
@@ -546,9 +541,8 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
         let pir_url = unsafe { str_from_ptr(pir_server_url, pir_server_url_len) }?;
         let pir_client = connect_pir_client(&pir_url)?;
 
-        let hotkey =
-            voting::VotingHotkey::from_stored_secret(hotkey_secret, voting_network(network_id)?)
-                .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
+        let hotkey = voting::VotingHotkey::from_stored_secret(hotkey_secret, handle.network)
+            .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
         let keys = voting::delegate::DelegationKeys::with_voting_hotkey(
             fvk.to_vec(),
             &hotkey,
@@ -871,7 +865,8 @@ mod tests {
 
     fn open_memory_voting_db() -> *mut VotingDatabaseHandle {
         let path = b":memory:";
-        let db = unsafe { zcashlc_voting_db_open(path.as_ptr(), path.len()) };
+        let db =
+            unsafe { zcashlc_voting_db_open(path.as_ptr(), path.len(), crate::NETWORK_ID_MAINNET) };
         assert!(!db.is_null(), "open in-memory voting db");
 
         let wallet = TEST_WALLET_ID.as_bytes();
@@ -1172,7 +1167,6 @@ mod tests {
             unsafe {
                 zcashlc_voting_build_pczt(
                     std::ptr::null_mut(),
-                    crate::NETWORK_ID_TESTNET,
                     round.as_ptr(),
                     round.len(),
                     0,
@@ -1224,7 +1218,6 @@ mod tests {
                     round.len(),
                     round.as_ptr(),
                     round.len(),
-                    crate::NETWORK_ID_TESTNET,
                     None,
                     std::ptr::null_mut(),
                 )
@@ -1386,47 +1379,6 @@ mod tests {
         unsafe { zcashlc_voting_db_free(db) };
     }
 
-    // Only the proving call still takes a network id: the submission call now
-    // reconstructs the payload from a caller-supplied signature and no longer
-    // accepts a network, so there is no invalid network id left to reject there.
-    #[test]
-    fn proof_calls_reject_invalid_network_id_before_remote_work() {
-        let db = open_memory_voting_db();
-        let round = TEST_ROUND_ID.as_bytes();
-        let notes_json = b"[]";
-        let bytes = [0u8; 32];
-
-        assert!(
-            unsafe {
-                zcashlc_voting_build_and_prove_delegation(
-                    db,
-                    round.as_ptr(),
-                    round.len(),
-                    0,
-                    notes_json.as_ptr(),
-                    notes_json.len(),
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    0,
-                    round.as_ptr(),
-                    round.len(),
-                    b"https://example.com/".as_ptr(),
-                    20,
-                    99,
-                    None,
-                    std::ptr::null_mut(),
-                )
-            }
-            .is_null()
-        );
-
-        unsafe { zcashlc_voting_db_free(db) };
-    }
-
     #[test]
     fn cached_tree_state_validation_accepts_matching_round() {
         let root = [7; 32];
@@ -1559,31 +1511,10 @@ mod tests {
                 0,
                 std::ptr::null(),
                 0,
-                0,
             )
         };
 
         assert!(result.is_null());
-    }
-
-    #[test]
-    fn precompute_delegation_pir_rejects_invalid_network_id() {
-        let db = open_memory_voting_db();
-        let result = unsafe {
-            zcashlc_voting_precompute_delegation_pir(
-                db,
-                b"round1".as_ptr(),
-                6,
-                0,
-                b"[]".as_ptr(),
-                2,
-                b"https://example.com/".as_ptr(),
-                20,
-                99,
-            )
-        };
-        assert!(result.is_null());
-        unsafe { zcashlc_voting_db_free(db) };
     }
 
     #[test]

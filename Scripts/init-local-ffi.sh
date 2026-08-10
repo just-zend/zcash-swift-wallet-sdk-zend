@@ -136,6 +136,14 @@ build_arm_xcframework() {
     rm -rf "$XCFRAMEWORK_DIR"
     mv "$temp_xcfw" "$XCFRAMEWORK_DIR"
     rm -rf "$temp_dir"
+
+    # The slices above are assembled shallow (iOS layout). macOS embedded
+    # frameworks require the VERSIONED bundle layout, else the app build fails
+    # ("expected Versions/Current/Resources/Info.plist"). Same fix as the full
+    # make path below and rebuild-local-ffi.sh; guarded for iOS-only subsets.
+    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework" ]]; then
+        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    fi
 }
 
 # Parse the single optional flag.
@@ -174,14 +182,23 @@ if [[ "$BUILD_MODE" == "arm" ]]; then
     build_arm_xcframework "${ARM_TARGETS[@]}"
 elif [[ "$BUILD_MODE" == "cached" ]]; then
     echo "Downloading pre-built xcframework..."
-    REPO="zcash/zcash-swift-wallet-sdk"
 
-    # Extract the version from the download URL in Package.swift
-    SDK_VERSION=$(grep -oE 'releases/download/[0-9]+\.[0-9]+\.[0-9]+' Package.swift | head -1 | sed 's|releases/download/||')
-    if [[ -z "$SDK_VERSION" ]]; then
-        echo "Error: Could not determine SDK version from Package.swift"
+    # Derive BOTH the repo (owner/name — releases may live on a fork) and the full
+    # release tag (including any pre-release suffix like 2.6.0-alpha.6) from the
+    # binary-target download URL in Package.swift, so --cached always fetches the
+    # exact release the manifest pins.
+    DOWNLOAD_URL=$(grep -oE 'https://github.com/[^"]+/releases/download/[^"]+/libzcashlc\.xcframework\.zip' Package.swift | head -1)
+    if [[ -z "$DOWNLOAD_URL" ]]; then
+        echo "Error: Could not find the libzcashlc.xcframework.zip download URL in Package.swift"
         exit 1
     fi
+    REPO=$(echo "$DOWNLOAD_URL" | sed -E 's|https://github.com/([^/]+/[^/]+)/releases/download/.*|\1|')
+    SDK_VERSION=$(echo "$DOWNLOAD_URL" | sed -E 's|.*/releases/download/([^/]+)/.*|\1|')
+    if [[ -z "$REPO" || -z "$SDK_VERSION" ]]; then
+        echo "Error: Could not parse repo/version from download URL: $DOWNLOAD_URL"
+        exit 1
+    fi
+    echo "  release $SDK_VERSION from $REPO"
 
     # Extract the expected checksum from Package.swift
     EXPECTED_CHECKSUM=$(grep -A1 'libzcashlc.xcframework.zip' Package.swift | grep 'checksum:' | sed -E 's/.*checksum: "([a-f0-9]+)".*/\1/')
@@ -208,8 +225,19 @@ elif [[ "$BUILD_MODE" == "cached" ]]; then
     fi
     echo "Checksum verified."
 
+    # Remove any existing framework first: extracting/copying onto an existing
+    # directory leaves stale files (or, for cp -R, nests the new framework inside
+    # the old one), so installs must always start from a clean target.
+    rm -rf "$XCFRAMEWORK_DIR"
     unzip -o LocalPackages/libzcashlc.xcframework.zip -d LocalPackages/
     rm LocalPackages/libzcashlc.xcframework.zip
+
+    # Release zips ship every slice shallow (iOS layout); macOS embedding requires
+    # the versioned bundle layout, same as the build paths above. Idempotent — a
+    # future zip that ships versioned is left untouched.
+    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework" ]]; then
+        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    fi
     echo ""
     echo "Note: Downloaded pre-built xcframework may not match your local source."
     echo "      Run './Scripts/rebuild-local-ffi.sh' to rebuild for your target platform."
@@ -219,7 +247,15 @@ else
     make xcframework
     cd ..
     mkdir -p LocalPackages
+    # cp -R into an EXISTING directory copies the source INSIDE it (nested
+    # libzcashlc.xcframework/libzcashlc.xcframework with stale slices at the top
+    # level — device builds silently run old code). Always replace, never merge.
+    rm -rf "$XCFRAMEWORK_DIR"
     cp -R BuildSupport/products/libzcashlc.xcframework "$XCFRAMEWORK_DIR"
+    # The Makefile assembles every slice shallow (iOS layout). macOS embedded
+    # frameworks require the versioned bundle layout, else Xcode rejects the app
+    # ("expected Versions/Current/Resources/Info.plist"). Fix the macOS slice.
+    ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
 fi
 
 # Create local SPM package wrapper
