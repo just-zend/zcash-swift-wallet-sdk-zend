@@ -39,31 +39,45 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Changed
 
-- The librustzcash family rides an interim git pin (the michal/pool-migration-public-next-due
-  branch head, rebased onto librustzcash main) so a wallet's own scheduled migration transactions
-  carry their ZIP 318 classification (`Overview.zip318Kind`) from the moment they are STORED at
-  proving time, instead of only after they mine and are scanned. This is what lets a wallet
-  present its stored-but-unmined migration transactions as labeled in-flight activity. The rev
-  also carries librustzcash #2907 — the engine's advance-path selection (prove/broadcast steps)
-  picks transfers by scheduled height instead of internal id — librustzcash #2910: a broadcast
-  schedule whose slots were missed (for example when the app was closed past several scheduled
-  sends) is re-spread on resume instead of coming due all at once — librustzcash #2927: the step
-  that re-spread releases lands on scanned chain data (and the re-spread fires only when more of
-  the schedule is due behind it), so a wallet driven in short foreground sessions can actually
-  prove and broadcast the released step instead of livelocking with its schedule re-pinned past
-  the scan on every open — librustzcash #2936: `advance_migration` returns the verified step
-  together with a next-wake outlook (this FFI marshals the step alone for now) — and the engine's
-  note-locking generation: a proved migration transaction's spent notes are reserved in the
-  wallet database, so an ordinary payment proposed mid-migration can no longer spend a note a
-  stored, proved transfer is already committed to. It also carries `MigrationState`'s public
-  read-only next-due selection (`next_due_broadcast`/`next_provable`): the engine's own
-  delivery-lane choice, now exposed for a caller to read directly instead of recomputing it
-  client-side — pinned so this SDK's FFI can delegate to it instead of reimplementing the
-  selection. (This branch replaces that delivery-lane selection with the engine's exported reads,
-  so the drive and read lanes now agree by construction.) The compressed-schedule spacing floors
-  (`AdvanceConfig::with_compressed_schedule_floors`) left the pinned lineage, and this SDK no
-  longer derives or passes them. The pin reverts to published crates at the first rc containing
-  all of it.
+- The migration sync gate is now BEHAVIOR-BASED, and its post-broadcast privacy buffer is gone
+  along with `Synchronizer.migrationPrivacySyncBufferDuration` (the protocol requirement and its
+  protocol-extension default): any reference stops compiling, and there is nothing to replace it
+  with, because no duration remains to report. `isMigrationSyncBlocked()` /
+  `migrationSyncBlockedStream` / `start(retry:)` now hold sync only while a migration submission is
+  in flight — the seconds between the transaction reaching the network and its outcome being
+  recorded. A host that scheduled work around the buffer (deferring a refresh for 600 s after a
+  broadcast, say) should stop: a fixed post-broadcast delay is itself a correlation signature —
+  broadcast at T, sync reliably at T + delay, across every broadcast of a migration that runs for
+  days — so spacing sync from broadcasts by the clock was the wrong mechanism, not too short a one.
+  The privacy property it was reaching for is behavioral and belongs to the host: serve the drive's
+  instruction on a wake without auto-appending a sync, and start sync sessions for a reason (the
+  advance's outlook naming sync-bound work, an organic scheduled sync, or the user). User intent
+  that requires sync — a manual balance refresh, an attempted send — must never be deferred for
+  this; the in-flight marker is the only wait the SDK imposes. Gate files persisted by an earlier
+  build load unchanged: the buffer field is read and ignored, and an in-flight marker beside it
+  still counts.
+
+- The librustzcash family rides an interim git pin — the `kris/tmp-respread-plus-adapter-2` branch
+  head (rev `fa3e1de5`), librustzcash main merged with two PRs this SDK consumes together:
+  librustzcash #2927, the scanned-chain-tip overdue re-spread (the released overdue step lands on
+  scanned chain data, and the re-spread fires only when more of the schedule is due behind it, so a
+  wallet driven in short foreground sessions can actually prove and broadcast the released step
+  instead of livelocking with its schedule re-pinned past the scan on every open), and #2951, the
+  adapter and planned-transaction-graph work: `wallet::WalletMigration` takes the account's viewing
+  key as a constructor parameter and holds no spend authority (the engine's two signing entry
+  points take an `orchard::keys::SpendingKey` per call, deriving its full viewing key and checking
+  it against the account's before building anything — a foreign key is refused eagerly, as
+  `CommitError::WrongSpendAuthority` / `RebuildError::WrongSpendAuthority`, rather than silently
+  signing nothing), and `MigrationPlan::planned_transactions` publishes the run's execution shape —
+  each row's `depends_on` and `scheduled_height` — as the same enumeration the commit builds from,
+  retiring this SDK's own fork of the adapter and its re-derivation of the plan preview. The pin
+  deliberately EXCLUDES #2938's read-only next-due selectors (`next_due_broadcast`/
+  `next_provable`): every SDK lane instead drives through the engine's public `advance_migration`
+  (the verified step plus its advisory outlook) and takes its read-only views from
+  `MigrationState::transaction_statuses`, rather than delegating to those selectors. The
+  compressed-schedule spacing floors (`AdvanceConfig::with_compressed_schedule_floors`) left the
+  pinned lineage, and this SDK no longer derives or passes them. The pin reverts to published
+  crates at the first rc containing both #2927 and #2951.
 - Restarting a migration (`restartCurrentMigrationStep`) now cancels the stored run through the
   engine's own cancel: the run is recorded with the terminal `Cancelled` status (previously
   `Failed`, which left a deliberate abandonment indistinguishable from a broken run) and every
@@ -71,7 +85,7 @@ Changes are relative to `2.8.0-rc.3`.
   transaction — so the fresh plan the restart previews sees the full balance immediately instead
   of selecting around notes the abandoned run still holds until their locks expire.
 - Migration UI/gate reads (`migrationTransactionStatuses`, `migrationProgress`,
-  `migrationHasOverdueTransfers`, `migrationHasInvalidTransfers`, `migrationHasReadyBroadcast`,
+  `migrationHasOverdueTransfers`, `migrationHasInvalidTransfers`,
   `migrationSyncWakeups`) no longer take the database write actor: the FFI now serves them from
   read-only connections without reconciling first, so they answer in milliseconds even while a
   proof is being generated. A just-mined broadcast can trail in these answers by at most one
@@ -98,12 +112,12 @@ Changes are relative to `2.8.0-rc.3`.
   minutes the engine was stopped behind the migration gate), tripping the loud hung-engine log
   at the exact moment recovery was working. The evaluated span is now clamped to the current
   handle's own lifetime.
-- The migration sync gate's blocked stream now wakes AT its own known boundaries: `resumeAt` and
-  `inFlightUntil` are wall-clock deadlines the gate itself persists, yet the stream only
+- The migration sync gate's blocked stream now wakes AT its own known boundary: the in-flight
+  marker's expiry is a wall-clock deadline the gate itself persists, yet the stream only
   re-evaluated on a flat 15-second ticker, leaving a cleared gate unnoticed for up to a whole
-  interval — on a foregrounded device that read as a dead half-minute between "privacy buffer
-  expired" and "sync resumed". Each ticker iteration now sleeps only until the soonest future
-  boundary (capped at the interval); ready-broadcast flips keep the interval cadence.
+  interval — on a foregrounded device that read as a dead half-minute between "gate expired" and
+  "sync resumed". Each ticker iteration now sleeps only until that boundary (capped at the
+  interval); with no future boundary pending it keeps the flat interval cadence.
 - Proved migration transactions are recorded in the wallet's own transaction tables at proving
   time: their inputs are marked spent from the moment the proof exists, so the wallet's own sends
   can no longer
@@ -189,47 +203,137 @@ Changes are relative to `2.8.0-rc.3`.
 
 ### Orchard → Ironwood migration
 
-- A 38-member migration group on the `Synchronizer` protocol, account-scoped by `AccountUUID`. Two
+- A 37-member migration group on the `Synchronizer` protocol, account-scoped by `AccountUUID`. Two
   accounts (for example one software and one hardware-wallet account) can migrate concurrently. Its
   members work without `prepare()`, so a background session can deliver a transfer without starting
   sync, and on custom networks without a prior `Initializer`. `ClosureSynchronizer` and
   `CombineSynchronizer` do not mirror the group.
-- Value types: `MigrationAdvanceStep`, `MigrationProgress`, `MigrationSchedule`,
-  `MigrationTransferProposal`, `MigrationTransferResult`, `MigrationTransferAttempt`,
+- Value types: `MigrationAdvanceStep`, `MigrationBroadcastInstruction`, `MigrationProveTarget`,
+  `MigrationProveOutcome`, `MigrationProgress`, `MigrationSchedule`,
+  `MigrationTransferProposal`, `MigrationTransferResult`,
   `MigrationRunEstimate` (with `MigrationRunEstimate.Run`), `MigrationSyncWakeup`,
   `MigrationPreparationStep`, `MigrationSigningBudget`, `NoteSplitProposal`,
   `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`,
-  `MigrationTransactionStatus`, `DueMigrationTransfer`, `KeystoneBatchDecodeResult`, and
+  `MigrationTransactionStatus`, `KeystoneBatchDecodeResult`, and
   `KeystoneFirmwareVersion`. Migration transaction ids are `UInt32`.
 - State: `migrationAdvanceStep(accountUUID:)` drives the migration engine's public
-  `advance_migration` decision at the scanned chain tip — `nil` when no run is stored, otherwise
-  `.requiresAttention(id:)` (the engine returned `Reevaluate` after a node rejection or `Replan`
-  after determining a transaction unsatisfiable), `.prove(id:kind:)`, `.broadcast(id:)`, `.rebuild(id:)`,
-  `.waiting`, or the terminal `.complete` (per-run, including a cancelled run — never "nothing
-  left to migrate"; ask `proposeMigrationTransfers` for that). The SDK adds no state machine, no
-  ordering shims, and no carve-outs of its own on top of the engine's answer — the attention step
-  and the broadcast-first ordering are native to the pinned librustzcash revision (upstream PR
-  #2871).
+  `advance_migration` decision, ALWAYS projecting the wall-clock chain-tip estimate alongside the
+  scanned target (it takes no parameter for it; the estimate may only ACCELERATE scheduled-height
+  due-ness, expiry and every destructive determination stay on the scanned tip, and an estimator
+  failure degrades to scanned-tip behavior) — `nil` when no run is stored, otherwise a
+  `MigrationAdvance` whose `.step` is `.requiresAttention(id:)` (the engine returned `Reevaluate`
+  after a node rejection or `Replan` after determining a transaction unsatisfiable),
+  `.prove(transactions:)`, `.broadcast(_:)`, `.rebuild(id:)`, `.waiting`, or the terminal
+  `.complete` (per-run, including a cancelled run — never "nothing left to migrate"; ask
+  `proposeMigrationTransfers` for that). The SDK adds no state machine, no ordering shims, and no
+  carve-outs of its own on top of the engine's answer — the attention step and the broadcast-first
+  ordering are native to the pinned librustzcash revision (upstream PR #2871).
+  The answer wraps the step with the engine's advisory OUTLOOK (`MigrationAdvance.next`,
+  librustzcash #2936): the kind of the migration's next serviceable work and the earliest target
+  height it becomes serviceable at, assuming the returned step is executed (`nil` = nothing
+  height-schedulable) — a `.broadcast` outlook needs no sync session, a `.prove` one is
+  sync-bound, and `migrationSyncWakeups` remains the proving-schedule authority. A `.prove` step
+  carries the WHOLE provable set (`[MigrationProveTarget]`, earliest-ready first, never empty;
+  librustzcash #2939: proving emits nothing on-chain, so a synced session proves everything
+  provable at once while broadcast stays one-at-a-time on the privacy schedule) — and that batch
+  IS the instruction the prove executor takes. Each `MigrationProveTarget` carries
+  `isScheduleDue`: `true` means the schedule has already reached that transaction's broadcast
+  window, so its missing proof is what blocks delivery right now, rather than the opportunistic
+  proving a batch ordinarily represents.
+- The migration ACTION surface is the CONDUIT, the INSTRUCTION EXECUTORS, and READS — nothing on
+  it decides for itself what the migration needs. Quoting the ruling: *"The app should have no
+  semantic goal except to advance the migration and perform the advancement's dictates."* A driver
+  cranks `migrationAdvanceStep(accountUUID:)` and switches over `.step`, handing each actionable
+  arm's own payload to an executor: `.prove(let instruction)` to
+  `proveMigrationTransactions(accountUUID:_:maxProofs:)`, `.broadcast(let instruction)` to
+  `performMigrationBroadcast(accountUUID:_:options:)`, `.rebuild` to
+  `refreshStaleMigrationTransfers(accountUUID:usk:)`. The executors never crank the drive
+  themselves: which transactions are worth proving, their order, the ZIP 318 re-spread, the
+  satisfiability verification and the dueness judgement all happened in the crank that issued the
+  instruction. `proveMigrationTransactions` additionally takes a per-session PROOF BUDGET
+  (`maxProofs`, at least `1`; skips do not spend it), so a background session bounds seconds of
+  proving CPU and cranks again next time; `performMigrationBroadcast` returns the recorded
+  `MigrationTransferResult` directly, there being no empty outcome to distinguish it from.
+- A PROVED PREPARATION IS SUBMITTED BY THE APP, THE ORDINARY WAY. Quoting the ruling: a proved
+  preparation is a complete PCZT (signatures and proofs), it is ZIP 318-exempt, and the engine's
+  own contract is that *"a preparation is broadcast as soon as it is proved"* — so its submission
+  is the app's ordinary path, not the engine's delivery ceremony. Accordingly
+  `proveMigrationTransactions(accountUUID:_:maxProofs:)` returns `MigrationProveOutcome` — the
+  total proved plus THE TXIDS OF THE PREPARATIONS IT PROVED, and only those — and the new
+  `takeMigrationPreparation(accountUUID:byTxid:)` hands each one back as a
+  `PreparedMigrationTransfer`. THE ACCESSOR IS THE SEAM: `txid -> row -> the store's atomic
+  broadcast seam`, in one database transaction, so the wallet's record binds AT RETRIEVAL and a
+  consumer that crashed before submitting re-retrieves the same bytes over the same record. It is
+  PREPARATION-GATED — a transfer's txid is refused, because transfers are served by the drive's
+  broadcast instruction alone — so a driver needs no kind judgment of its own: the return and the
+  gate carry it. The DRIVER SHAPE is: crank, prove the batch, then for each returned preparation
+  txid retrieve it AT SUBMISSION TIME, submit the bytes through the app's ordinary raw-transaction
+  machinery, and record the outcome through its standard record path (the DTO carries the ENGINE
+  TRANSFER ID alongside the bytes and txid, so the app keeps no identity of its own) — and CLOSE
+  THE LOOP with `recordMigrationPreparationBroadcast(accountUUID:_:result:)`, which takes that
+  same DTO back and makes the engine's own `Proved -> Broadcast` mark: the one
+  `performMigrationBroadcast` makes on its success arm, made here by the app in place of the
+  ceremony it skipped. It is preparation-gated in the same register as the accessor (a transfer's
+  id is refused; that lane records its own outcome), and it is for acceptances — a non-acceptance
+  needs no call, since the engine's network-error outcome records nothing by design.
+  Retrieved-but-never-submitted is a bounded, engine-modelled state, not a leak: the record is
+  idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces through
+  the ordinary attention path once it expires. Submitted-but-never-marked is bounded too, and is
+  now the ACCIDENT rather than the ordinary path: an app that crashed between submitting and
+  marking still converges, because the engine promotes any in-flight transaction its scan sees
+  mine (by the id it stored when it BUILT the transaction) and a later re-serve draws a duplicate
+  rejection recorded as success.
+- Instructions are OPAQUE: `MigrationBroadcastInstruction` (the `.broadcast` step's payload, in
+  place of a bare id) and `MigrationProveTarget` have no plainly-importable initializers, so the
+  advance marshaling is their only producer and holding one is the proof that the caller cranked.
+  Un-instructed proving or broadcasting does not compile. The one deliberate exception is for
+  TEST targets: both initializers are `@_spi(Testing) public`, so a suite that writes
+  `@_spi(Testing) import ZcashLightClientKit` can construct genuine instructions to exercise its
+  driver — the SPI name is the opt-in ceremony, greppable and never present in production
+  imports. Quoting the ruling: *"And as such it
+  should be provided with no capabilities for such semantic goals."* This is a Swift-surface
+  property and NOT a security boundary — at the C ABI everything is forgeable, and the Rust
+  executors' per-row state gating (a non-`Proved` row is refused; a row not awaiting its proof is
+  skipped) remains the safety backstop, not the authority model. One consequence to plan for: a
+  stale instruction now throws `rustMigrationTakeBroadcastTransaction` from the broadcast seam
+  where the previous delivery lane's internal re-advance would have reported "nothing due" —
+  discharge it by cranking again, not by retrying the executor. Broadcast single-flight per
+  account, the privacy-gate marking, and the record-after-submit ordering are unchanged.
+- New: `nextMigrationWake(accountUUID:)` — the drive's own retained outlook, from the most recent
+  `migrationAdvanceStep(accountUUID:)` crank by ANY caller (the app's driver, or any other call
+  for the account), so a host can ask "when is the next migration wake, per the drive's own plan"
+  without re-cranking the engine. Same advisory-FLOOR contract as `MigrationAdvance.next`: a
+  height, not an appointment, unconditionally superseded by the very next crank's outlook —
+  including to `nil`, so a stale outlook never outlives the crank that replaced it. Complements,
+  never replaces, `migrationSyncWakeups(accountUUID:)`: this is one height, the schedule is many —
+  a host arming OS wake-ups min-folds this outlook's height in alongside the schedule's own
+  heights, as zodl-ios already does. `nil` also means no crank has run yet this session, or the
+  last step's own outcome (not a height) decides what follows.
 - Planning and delivery: a randomized-cadence schedule proposal committed by
-  `signAndStoreMigrationSchedule`, proved opportunistically during sync by the new
-  `finalizeReadyMigrationTransfers(accountUUID:)`, then delivered by
-  `executeNextPendingMigrationTransfer`, which is BROADCAST-ONLY (it never proves) and answers
-  `MigrationTransferAttempt.nothingDue`, `.awaitingProof(id:)` (due but not proved yet — run
-  `finalizeReadyMigrationTransfers` and retry in a later session), or
-  `.executed(MigrationTransferResult)`. A submit rejection identifying the transaction as already
-  known is recorded as success, so a retried broadcast whose first attempt landed completes the
-  transfer.
+  `signAndStoreMigrationSchedule`, proved opportunistically during sync by
+  `proveMigrationTransactions(accountUUID:_:maxProofs:)` at the wake-ups
+  `migrationSyncWakeups(accountUUID:)` schedules, then delivered by
+  `performMigrationBroadcast(accountUUID:_:options:)` in a session that does not sync. Proving a
+  batch can unblock rows it did not name, so a driver draining a run cranks again after each pass —
+  and, unlike a fixed proving sweep, a driver that sees the crank turn to `.broadcast` can deliver
+  instead of merely stopping. Broadcast remains BROADCAST-ONLY (it never proves); a due row still
+  awaiting its proof appears in the `.prove` batch with `isScheduleDue` set rather than as a
+  delivery outcome. A submit rejection identifying the transaction as already known is recorded as
+  success, so a retried broadcast whose first attempt landed completes the transfer.
 - New: `migrationSyncWakeups(accountUUID:)` — the stored run's minimal sync/proving wake-up
-  schedule (heights at which to wake, sync, and call `finalizeReadyMigrationTransfers`, plus the
+  schedule (heights at which to wake, sync, crank the conduit and discharge the prove instruction
+  it returns, plus the
   transfer ids each wake-up covers) — and `estimatedMigrationChainTip()` /
   `estimatedMigrationSecondsPerBlock()`, a measured-block-rate wall-clock chain-tip
   projection (Android-SDK-parity constants: a window of the last 100 scanned blocks, a 5–150 s
   per-delta/result clamp, a 75 s fallback with fewer than two samples; wallet-scoped — the
-  projection reads the shared blocks table, so the pair takes no account). `executeNextPendingMigrationTransfer`
-  and `hasOverdueMigrationTransfers(accountUUID:)` gain a `useEstimatedTip: Bool` parameter
-  (one/two-argument convenience overloads default it to `false`) that lets the estimated tip only
+  projection reads the shared blocks table, so the pair takes no account).
+  `hasOverdueMigrationTransfers(accountUUID:)` gains a `useEstimatedTip: Bool` parameter
+  (a one-argument convenience overload defaults it to `false`) that lets the estimated tip only
   ACCELERATE scheduled-height due-ness; expiry always evaluates against the scanned tip, and an
-  estimator failure silently degrades to the scanned-tip behavior. There is no repair member: every
+  estimator failure silently degrades to the scanned-tip behavior. `migrationAdvanceStep` applies
+  the same rule with no parameter at all: the conduit always projects the estimate, and it is now
+  the only place the acceleration enters — the executors judge nothing, so they take no tip. There is no repair member: every
   repair happens inside `migrationAdvanceStep(accountUUID:)`. A funding note spent outside the
   migration is discovered by the sqlite satisfiability oracle from scanned wallet data; a recorded
   broadcast is promoted to mined; and a transaction this process submitted whose broadcast was
@@ -241,10 +345,10 @@ Changes are relative to `2.8.0-rc.3`.
   `refreshStaleMigrationTransfers(accountUUID:usk:)` rebuilds every expired transfer of the stored
   run, all-or-nothing, with `usk` selecting in-process signing or the external-signer lane. A funding
   note spent outside the migration throws, naming `restartCurrentMigrationStep` as the remedy.
-  `pendingMigrationTransferProposal(accountUUID:)` (renamed from the pre-release
-  `rescheduleOverdueMigrationTransfer`) returns the engine's next height-due pending transfer
-  proposal untouched, for a host that wants to re-arm its own background execution window without
-  parsing a signed PCZT.
+- Note split: `submitNoteSplit(accountUUID:proposal:usk:options:)` signs the run, serves the first
+  note-split transaction back through the same atomic broadcast seam the delivery step uses, and
+  submits it — so what it broadcasts is a finalized consensus transaction whose wallet-side record
+  was written in the database transaction that produced it, with no extract step in between.
 - External signer: `createUnsignedNoteSplitPCZTs` / `storeSignedNoteSplitPCZTs` and
   `createUnsignedMigrationTransferPCZTs` / `storeSignedMigrationSchedulePCZTs`. All are plural: a run
   has N preparation transactions, and one signing ceremony covers them together.
@@ -285,15 +389,16 @@ Changes are relative to `2.8.0-rc.3`.
   requested but unavailable throws `ZcashError.migrationTorUnavailable`, never a silent clearnet
   fallback. `MigrationNetworkPrivacyOptions.submissionEndpoint` is required: exactly one server per
   attempt, chosen by the host, and confirmation comes from block scanning rather than txid polling.
-  `start()` throws `ZcashError.migrationSyncBlocked` while a per-account privacy gate is open: for
-  the network-scaled buffer (600 s on mainnet, 180 s on testnet/regtest) after a broadcast, while a
-  broadcast is in flight (a 120 s self-expiring marker — re-armed at the last pre-submit instant,
-  after the Tor bootstrap — guards the submit-to-record window so the reconciliation probe above
-  never treats a just-broadcast transfer as a submit crash), or while a READY broadcast is waiting
-  (a proved, schedule-due, unexpired, valid transfer the wallet should serve instead of syncing;
-  estimate-accelerated, and never a `Signed`/awaiting-proof row — those need MORE syncing, so the
-  broader `hasOverdueMigrationTransfers` answer deliberately does not gate sync) — see
-  `isMigrationSyncBlocked()`, `migrationSyncBlockedStream`, `migrationPrivacySyncBufferDuration`. The broadcasting members throw
+  The migration sync gate is BEHAVIOR-BASED and imposes exactly one hold: `start()` throws
+  `ZcashError.migrationSyncBlocked` while a submission is IN FLIGHT — the transaction has reached
+  the network but its outcome is not recorded yet, ordinarily a matter of seconds (a 120 s
+  self-expiring marker, re-armed at the last pre-submit instant after the Tor bootstrap, guards the
+  submit-to-record window so the reconciliation probe above never treats a just-broadcast transfer
+  as a submit crash; that deadline is a crash-recovery ceiling, not a privacy interval). Nothing
+  else holds sync — not elapsed time since a broadcast, and not pending work: a proved,
+  schedule-due, servable transfer does not gate sync, and neither does the broader
+  `hasOverdueMigrationTransfers` answer, whose due-but-unproved `Signed` rows need MORE syncing.
+  See `isMigrationSyncBlocked()` and `migrationSyncBlockedStream`. The broadcasting members throw
   `ZcashError.migrationBroadcastDuringSync` while a sync runs. A record failure after a successful
   broadcast throws the distinguishable `ZcashError.migrationRecordFailedAfterBroadcast`, which a
   later execution window heals.
@@ -303,11 +408,17 @@ Changes are relative to `2.8.0-rc.3`.
   from a copy persisted before the field existed. Its `encode(to:)` omits `proposalHandle` (a
   process-lifetime plan-cache key no persisted copy could honor), so every decoded copy carries
   handle `0` — re-propose instead of committing a persisted schedule.
-- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0138`, and
-  `ZRUST0140`–`ZRUST0148` (`ZRUST0098`, `rustMigrationState`, was retired pre-release with the
-  SDK-side migration state machine it served — the code is not reused; `ZRUST0139`,
-  `rustMigrationDebugRescheduleTransfers`, was likewise retired pre-release with the
-  debug-reschedule FFI it served — the code is not reused).
+- New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0113`,
+  `ZRUST0115`–`ZRUST0122`, `ZRUST0124`–`ZRUST0138`, `ZRUST0140`–`ZRUST0147`, and `ZRUST0149`
+  (`rustMigrationTakePreparation`, the preparation accessor). Five codes were
+  retired pre-release with the members they served — which is every gap in those ranges — and none
+  is reused: `ZRUST0098`
+  (`rustMigrationState`, with the SDK-side migration state machine), `ZRUST0114`
+  (`rustMigrationIsSyncRequired`, with the always-false `zcashlc_migration_is_sync_required`, which
+  never threw), `ZRUST0123`
+  (`rustMigrationPendingTransferProposal`, with the kind-filtered queue peek), `ZRUST0139`
+  (`rustMigrationDebugRescheduleTransfers`, with the debug-reschedule FFI), and `ZRUST0148`
+  (`rustMigrationHasReadyBroadcast`, with the consumer-less ready-broadcast probe).
 
 ### Slipstream sync engine
 
