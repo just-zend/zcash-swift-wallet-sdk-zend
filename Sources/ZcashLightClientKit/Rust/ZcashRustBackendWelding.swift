@@ -418,7 +418,8 @@ protocol ZcashRustBackendWelding {
     /// The engine's next step to advance `account`'s stored migration run, wrapped with its
     /// advisory OUTLOOK (upstream #2936; see ``MigrationAdvance``). This compatibility overload
     /// drives at the scanned target; migration hosts use the estimate-aware overload. Upstream
-    /// `Reevaluate` and `Replan` project to ``MigrationAdvanceStep/requiresAttention(id:)``.
+    /// `Reevaluate` and `Replan` arrive as their own bare cases
+    /// (``MigrationAdvanceStep/reevaluate`` / ``MigrationAdvanceStep/replan``).
     /// Mined
     /// transactions reconciled first like every other read. `nil` means NO run is stored at all
     /// (nothing to advance); a stored TERMINAL run — complete or cancelled — reports

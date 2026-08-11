@@ -1698,7 +1698,12 @@ pub const ZCASHLC_ADVANCE_STEP_BROADCAST: u32 = 1;
 pub const ZCASHLC_ADVANCE_STEP_REBUILD: u32 = 2;
 pub const ZCASHLC_ADVANCE_STEP_WAITING: u32 = 3;
 pub const ZCASHLC_ADVANCE_STEP_COMPLETE: u32 = 4;
-pub const ZCASHLC_ADVANCE_STEP_ATTEND: u32 = 5;
+// 5 was ZCASHLC_ADVANCE_STEP_ATTEND — the collapsed Reevaluate/Replan projection (with a
+// synthesised transaction id neither upstream step carries), retired 2026-08-08 when the two
+// steps gained their own bare discriminants below. The value stays a HOLE on purpose: reusing
+// it would let a stale header decode one vocabulary as the other.
+pub const ZCASHLC_ADVANCE_STEP_REPLAN: u32 = 6;
+pub const ZCASHLC_ADVANCE_STEP_REEVALUATE: u32 = 7;
 
 /// The step-kind discriminants of [`FfiMigrationAdvanceStep::next_kind`], a verbatim export of
 /// upstream `state::StepKind` (the outlook's kind — WHICH transaction a wake-up serves is decided
@@ -2606,8 +2611,9 @@ fn drive_advance(
 }
 
 /// Advances the stored run with upstream's public satisfiability API, using scanned and estimated
-/// targets plus the provable-anchor reorg-settle depth. Reevaluate and Replan are projected onto
-/// the existing Attend DTO case so the Swift public enum remains source-compatible.
+/// targets plus the provable-anchor reorg-settle depth. Every upstream step marshals onto its own
+/// discriminant — Reevaluate and Replan included (bare, as upstream carries them; the collapsed
+/// Attend projection is retired).
 ///
 /// Returns NULL **with no error recorded** when `get_migration()` returns `None` — no run is
 /// stored, so there is nothing to advance and no step to report. Distinguish that benign NULL
@@ -2665,23 +2671,14 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
         let advance = drive_advance(&mut ctx, &mut state, estimated_tip)?;
         let next = advance.next();
         Ok(match advance.step() {
-            AdvanceStep::Reevaluate | AdvanceStep::Replan => {
-                let id = state
-                    .transaction_statuses(targets)
-                    .into_iter()
-                    .find(|status| {
-                        matches!(
-                            status.blocked_on(),
-                            Some(
-                                Blocker::AwaitingReevaluation
-                                    | Blocker::Unsatisfiable
-                                    | Blocker::Expired
-                            )
-                        )
-                    })
-                    .map(|status| status.id())
-                    .unwrap_or_else(|| MigrationTransferId::new(0));
-                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_ATTEND, id, next)
+            // Both are BARE: neither upstream step names a transaction — Replan is a verdict
+            // about the RUN (its unsatisfiable share passed the committed threshold), Reevaluate
+            // asks for a sync and nothing else — and the retired Attend collapse synthesised an
+            // id at least one of them never had. The platform's per-row detail, when it wants
+            // one, is `transaction_statuses`' own blockers, not this step.
+            AdvanceStep::Replan => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_REPLAN, next),
+            AdvanceStep::Reevaluate => {
+                FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_REEVALUATE, next)
             }
             AdvanceStep::Prove { transactions } => {
                 FfiMigrationAdvanceStep::prove(&state, transactions, targets, next)
@@ -3844,8 +3841,8 @@ pub unsafe extern "C" fn zcashlc_migration_take_preparation_by_txid(
 /// `txid_bytes`, 32 raw bytes) — the transaction is marked broadcast, to be reconciled to mined
 /// as the wallet scans; 1 = network error (retryable — nothing is recorded, the transaction stays
 /// offered); 2 = invalid note, 3 = expired — each rejection is reported to the engine at the
-/// wallet's observed chain tip. The next advance reevaluates satisfiability and projects any
-/// resulting Reevaluate/Replan step onto the existing Attend DTO case.
+/// wallet's observed chain tip. The next advance reevaluates satisfiability and surfaces any
+/// resulting Reevaluate/Replan step on its own discriminant.
 ///
 /// An unknown id or already-mined transaction is left untouched; both still answer `true`, since
 /// the reported outcome was consumed.

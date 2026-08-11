@@ -760,9 +760,9 @@ final class MigrationFFITests: XCTestCase {
     // a renumbering on either side surfaces here. Assertions unwrap `.step`; the outlook
     // (`.next`) has its own dedicated section below.
 
-    /// Every step discriminant decodes to its case; `requiresAttention` (ATTEND) carries the id
-    /// like the other id-bearing steps.
-    func testAdvanceStepDecodeMapsEveryStepIncludingAttend() throws {
+    /// Every step discriminant decodes to its case; `replan`/`reevaluate` decode BARE — upstream
+    /// carries no transaction id on either step, and the marshal must not invent one.
+    func testAdvanceStepDecodeMapsEveryStepIncludingReplanAndReevaluate() throws {
         let prove = makeProveAdvanceStep([
             FfiProveTarget(id: 4, kind_is_preparation: false, kind_layer: 0, kind_index: 0, kind_crossing: 2, schedule_due: false)
         ])
@@ -794,16 +794,26 @@ final class MigrationFFITests: XCTestCase {
         let complete = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_COMPLETE), id: 0)
         XCTAssertEqual(complete.unsafeToMigrationAdvance()?.step, .complete)
 
-        let attend = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_ATTEND), id: 9)
+        let replan = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_REPLAN), id: 9)
         XCTAssertEqual(
-            attend.unsafeToMigrationAdvance()?.step,
-            .requiresAttention(id: 9),
-            "the engine's Attend step must pass through verbatim, carrying the invalid transaction's id"
+            replan.unsafeToMigrationAdvance()?.step,
+            .replan,
+            "Replan decodes bare — an id on the DTO is ignored, never surfaced"
+        )
+
+        let reevaluate = makeAdvanceStep(step: UInt32(ZCASHLC_ADVANCE_STEP_REEVALUATE), id: 9)
+        XCTAssertEqual(
+            reevaluate.unsafeToMigrationAdvance()?.step,
+            .reevaluate,
+            "Reevaluate decodes bare — an id on the DTO is ignored, never surfaced"
         )
     }
 
     func testAdvanceStepDecodeReturnsNilForAnOutOfRangeStep() {
         XCTAssertNil(makeAdvanceStep(step: 99, id: 1).unsafeToMigrationAdvance())
+        // 5 is the retired Attend discriminant — a HOLE, never reused: a stale header speaking
+        // the old vocabulary must decode to nil, not to some other step.
+        XCTAssertNil(makeAdvanceStep(step: 5, id: 1).unsafeToMigrationAdvance())
     }
 
     /// A multi-entry Prove batch marshals every row, ordered and typed, mixing preparation and

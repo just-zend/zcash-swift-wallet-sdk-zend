@@ -3059,8 +3059,12 @@ extension FfiMigrationAdvanceStep {
             step = .waiting
         case ZCASHLC_ADVANCE_STEP_COMPLETE:
             step = .complete
-        case ZCASHLC_ADVANCE_STEP_ATTEND:
-            step = .requiresAttention(id: self.id)
+        case ZCASHLC_ADVANCE_STEP_REPLAN:
+            // Bare on both sides of the FFI: upstream's Replan/Reevaluate name no transaction,
+            // so there is no id to carry (the retired Attend collapse synthesised one).
+            step = .replan
+        case ZCASHLC_ADVANCE_STEP_REEVALUATE:
+            step = .reevaluate
         default:
             return nil
         }

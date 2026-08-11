@@ -75,7 +75,8 @@ final class MigrationInstructionOpacityTests: XCTestCase {
             .waiting,
             .complete,
             .rebuild(id: 6),
-            .requiresAttention(id: 7)
+            .replan,
+            .reevaluate
         ]
 
         for step in instructionFree {
@@ -112,7 +113,7 @@ final class MigrationInstructionOpacityTests: XCTestCase {
             return "proveMigrationTransactions"
         case .broadcast:
             return "performMigrationBroadcast"
-        case .rebuild, .requiresAttention, .waiting, .complete:
+        case .rebuild, .replan, .reevaluate, .waiting, .complete:
             return nil
         }
     }
@@ -159,7 +160,7 @@ private func performDictate(
     case .rebuild:
         // The third executor, unchanged by this task: it already discharged the `.rebuild` dictate.
         _ = try await synchronizer.refreshStaleMigrationTransfers(accountUUID: accountUUID, usk: nil)
-    case .requiresAttention, .waiting, .complete, .none:
+    case .replan, .reevaluate, .waiting, .complete, .none:
         break
     }
 }
