@@ -66,6 +66,53 @@ class ZcashRustBackendTests: XCTestCase {
         } catch { }
     }
 
+    func testDecryptAndStoreTransactionThrowsOnMalformedTransaction() async throws {
+        let dbInit = try await rustBackend.initDataDb(seed: nil)
+
+        guard case .success = dbInit else {
+            XCTFail("Failed to initDataDb. Expected `.success` got: \(String(describing: dbInit))")
+            return
+        }
+
+        // Bytes that cannot parse as a Zcash transaction make the FFI report an error
+        // by returning its -1 sentinel and leaving the txid out-buffer untouched.
+        let malformedTxBytes: [UInt8] = [0xde, 0xad, 0xbe, 0xef]
+
+        do {
+            let txid = try await rustBackend.decryptAndStoreTransaction(txBytes: malformedTxBytes, minedHeight: nil)
+            XCTFail("decryptAndStoreTransaction must throw when the FFI reports an error, got txid: \(Array(txid))")
+        } catch let error as ZcashError {
+            guard case .rustDecryptAndStoreTransaction = error else {
+                XCTFail("Expected ZcashError.rustDecryptAndStoreTransaction, got: \(error)")
+                return
+            }
+        }
+    }
+
+    func testDecryptAndStoreTransactionReturnsTxidOnSuccess() async throws {
+        let dbInit = try await rustBackend.initDataDb(seed: nil)
+
+        guard case .success = dbInit else {
+            XCTFail("Failed to initDataDb. Expected `.success` got: \(String(describing: dbInit))")
+            return
+        }
+
+        let txBase64String = try XCTUnwrap(
+            String(bytes: TestCoordinator.loadResource(name: "txBase64String", extension: "txt"), encoding: .utf8)
+        )
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawTx = try XCTUnwrap(Data(base64Encoded: txBase64String))
+
+        // The FFI refuses to store a transaction while the wallet database has no
+        // known chain tip, so record one; the fixture is treated as mined nearby.
+        try await rustBackend.updateChainTip(height: 663_250)
+
+        let txid = try await rustBackend.decryptAndStoreTransaction(txBytes: rawTx.bytes, minedHeight: 663_200)
+
+        XCTAssertEqual(txid.count, 32)
+        XCTAssertFalse(txid.allSatisfy { $0 == 0 }, "txid must be the transaction's real txid, not the zeroed placeholder")
+    }
+
     // TODO: [#1518] Fix the test, https://github.com/Electric-Coin-Company/zcash-swift-wallet-sdk/issues/1518
     func _testListTransparentReceivers() async throws {
         let testVector = [TestVector](TestVector.testVectors![0 ... 2])

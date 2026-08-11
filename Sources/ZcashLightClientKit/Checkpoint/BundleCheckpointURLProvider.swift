@@ -28,6 +28,8 @@ extension BundleCheckpointURLProvider {
             return Checkpoint.mainnetCheckpointDirectory
         case .testnet:
             return Checkpoint.testnetCheckpointDirectory
+        case .regtest:
+            return Checkpoint.regtestCheckpointDirectory
         }
     })
 
@@ -54,6 +56,8 @@ extension BundleCheckpointURLProvider {
                 localization: nil
             )?
             .deletingLastPathComponent() ?? Checkpoint.testnetCheckpointDirectory
+        case .regtest:
+            return Checkpoint.regtestCheckpointDirectory
         }
     })
 }

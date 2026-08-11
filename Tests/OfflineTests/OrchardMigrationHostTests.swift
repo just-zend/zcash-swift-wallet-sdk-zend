@@ -1,0 +1,576 @@
+//
+//  OrchardMigrationHostTests.swift
+//  OfflineTests
+//
+//  Tests for `OrchardMigrationHost`: the per-synchronizer owner of the migration machinery. Driven
+//  through the host's injecting initializer against `ZcashRustBackendWeldingMock`, the shared
+//  `MigrationBroadcasting` seam, and real temp-file-backed `MigrationSyncGate`s (as established by
+//  the other migration test files). No network, no real FFI. Covers per-account actor identity and
+//  caching, the single shared Tor bootstrap across accounts, the wallet-scope `isSyncBlocked()`
+//  predicate (including dormant-account enumeration and degrade-open), and the wallet-scope
+//  `syncBlockedStream`.
+//
+
+import Combine
+import XCTest
+@testable import TestUtils
+@testable import ZcashLightClientKit
+
+final class OrchardMigrationHostTests: ZcashTestCase {
+    private let accountA = AccountUUID(id: [UInt8](repeating: 0x0A, count: 16))
+    private let accountB = AccountUUID(id: [UInt8](repeating: 0x0B, count: 16))
+    private let accountD = AccountUUID(id: [UInt8](repeating: 0x0D, count: 16))
+    private let referenceDate = Date(timeIntervalSince1970: 1_700_000_000)
+    private let buffer: TimeInterval = 600
+    private let submissionEndpoint = LightWalletEndpoint(address: "submit.example", port: 9067)
+
+    private var clock: TestClock!
+
+    override func setUp() {
+        super.setUp()
+        clock = TestClock(referenceDate)
+    }
+
+    override func tearDown() {
+        clock = nil
+        super.tearDown()
+    }
+
+    // MARK: - Per-account identity and caching
+
+    /// Same account resolves to the same cached actor; distinct accounts get distinct actors; and
+    /// driving each actor reaches the welding with that actor's own account UUID.
+    func testMigrationForAccountCachesPerAccountAndRoutesTheRightUUID() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = .waiting
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        let firstA = await host.migration(for: accountA)
+        let secondA = await host.migration(for: accountA)
+        let firstB = await host.migration(for: accountB)
+
+        XCTAssertTrue(firstA === secondA, "the same account must resolve to the same cached actor")
+        XCTAssertFalse(firstA === firstB, "distinct accounts must get distinct actors")
+
+        // Driving each actor (sequentially) reaches the welding with that actor's own account UUID.
+        _ = try await firstA.advanceStep()
+        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountA)
+        _ = try await firstB.advanceStep()
+        XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountB)
+    }
+
+    // MARK: - Shared broadcaster (single Tor bootstrap across accounts)
+
+    /// Shared-broadcaster canary: two accounts each broadcasting (over Tor) through their own actor go
+    /// through the host's ONE `MigrationBroadcaster`, so exactly ONE Tor bootstrap happens — counted
+    /// via the broadcaster's injectable `torClientFactory`. If each actor built its own broadcaster
+    /// (the latent multi-account hazard this host closes), the count would be two. Held gated and
+    /// resolved with a failure so no real Arti runtime/connection is ever driven (offline).
+    func testTwoAccountsBroadcastingShareASingleTorBootstrap() async throws {
+        let factory = GatedTorClientFactory()
+        let sharedBroadcaster = MigrationBroadcaster(
+            torDirURL: testGeneralStorageDirectory,
+            logger: logger,
+            torClientFactory: factory.make
+        )
+
+        let prepared = PreparedMigrationTransfer(
+            id: 0,
+            txid: Data(repeating: 0xAB, count: 32),
+            pczt: Data([0x01, 0x02])
+        )
+        // Fulfilled from account B's own actor, right before it hands off to the shared broadcaster
+        // (its next step, `syncGate.markBroadcastInFlight()`, is synchronous, so this fires at most
+        // one actor-hop before B's `dedicatedTorClient()` cache check) -- a much tighter, and
+        // therefore far less flaky, synchronization point than counting `Task.yield()`s from B's
+        // Task start, which has to cross B's own mocked `migrationNextDueTransfer` call first too.
+        let accountBReachedTheBroadcaster = expectation(description: "account B's actor reached the point just before calling the shared broadcaster")
+        // A fresh mock per account keeps the two concurrent broadcast flows off a shared mutable mock.
+        let perAccountFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { [testGeneralStorageDirectory, buffer, clock, accountB] accountUUID, broadcaster in
+            let accountWelding = ZcashRustBackendWeldingMock()
+            accountWelding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(prepared)
+            // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+            accountWelding.migrationTransactionStatusesForReturnValue = []
+            accountWelding.migrationExtractBroadcastTxPcztForClosure = { _, _ in
+                if accountUUID == accountB {
+                    accountBReachedTheBroadcaster.fulfill()
+                }
+                return Data([0x07])
+            }
+            accountWelding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
+            return OrchardMigration(
+                welding: accountWelding,
+                accountUUID: accountUUID,
+                broadcaster: broadcaster,
+                syncGate: MigrationSyncGate(
+                    directory: testGeneralStorageDirectory!,
+                    accountUUID: accountUUID,
+                    bufferDuration: buffer,
+                    tickInterval: 3600,
+                    now: { clock!.now },
+                    logger: logger
+                ),
+                logger: logger
+            )
+        }
+
+        let clockValue = clock!
+        let host = OrchardMigrationHost(
+            welding: ZcashRustBackendWeldingMock(),
+            sharedBroadcaster: sharedBroadcaster,
+            generalStorageURL: testGeneralStorageDirectory,
+            tickInterval: 3600,
+            now: { clockValue.now },
+            logger: logger,
+            actorFactory: perAccountFactory
+        )
+
+        let migrationA = await host.migration(for: accountA)
+        let migrationB = await host.migration(for: accountB)
+        let options = MigrationNetworkPrivacyOptions(useTor: true, submissionEndpoint: submissionEndpoint)
+
+        let taskA = Task { try await migrationA.executeNextPendingTransfer(options: options, useEstimatedTip: false) }
+        // Wait for account A's broadcast to have started the (single) bootstrap.
+        await factory.awaitCallsStarted(1)
+        let taskB = Task { try await migrationB.executeNextPendingTransfer(options: options, useEstimatedTip: false) }
+        // Deterministic: B has reached its own extract step, one short hop from the shared
+        // broadcaster's cache check.
+        await fulfillment(of: [accountBReachedTheBroadcaster], timeout: 5)
+        // The one remaining hop is NOT purely cooperative: `MigrationSyncGate.markBroadcastInFlight()`
+        // -- B's very next step -- does a real synchronous, atomic file write (finding 14's
+        // durability requirement), which can genuinely block its worker thread on I/O rather than
+        // merely being an unscheduled `Task`; `Task.yield()` only reorders cooperatively-ready work
+        // and cannot wait out that write. A short real sleep is the honest bridge for that non-
+        // cooperative gap (the test's own correctness comes from `countWhileInFlight`/`finalCount`
+        // below, not from this duration).
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        let countWhileInFlight = await factory.callCount
+        XCTAssertEqual(countWhileInFlight, 1, "two accounts must share ONE Tor bootstrap through the host's shared broadcaster")
+
+        await factory.resolve(throwing: StubTorBootstrapError())
+        await assertThrowsMigrationTorUnavailable(taskA)
+        await assertThrowsMigrationTorUnavailable(taskB)
+
+        let finalCount = await factory.callCount
+        XCTAssertEqual(finalCount, 1, "the failing bootstrap was shared by both accounts, not driven twice")
+    }
+
+    // MARK: - Wallet-scope isSyncBlocked (dormant enumeration + degrade-open)
+
+    /// Dormant-account enumeration: a persisted gate file for an account whose actor is never created
+    /// still blocks sync. Account B's privacy buffer is written by a throwaway gate; a FRESH host that
+    /// never instantiates B's actor enumerates [A, B] via the welding, reads B's gate file directly,
+    /// and reports blocked while the buffer is live — then unblocked once the injected clock passes it.
+    func testIsSyncBlockedEnumeratesDormantAccountsFromTheirPersistedGateFiles() async throws {
+        // Persist a live privacy buffer for B (resumeAt = referenceDate + buffer), then discard the gate.
+        let dormantGateB = MigrationSyncGate(
+            directory: testGeneralStorageDirectory,
+            accountUUID: accountB,
+            bufferDuration: buffer,
+            tickInterval: 3600,
+            now: { [clock] in clock!.now },
+            logger: logger
+        )
+        dormantGateB.markBroadcast()
+
+        let welding = ZcashRustBackendWeldingMock()
+        welding.listAccountsReturnValue = [makeAccount(accountA), makeAccount(accountB)]
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        let blockedWhileBuffered = await host.isSyncBlocked()
+        XCTAssertTrue(blockedWhileBuffered, "a dormant account's live gate file must block sync after a fresh launch")
+
+        clock.now = referenceDate.addingTimeInterval(buffer + 1)
+        let blockedAfterExpiry = await host.isSyncBlocked()
+        XCTAssertFalse(blockedAfterExpiry, "once the buffer elapses and nothing is overdue, sync is no longer blocked")
+    }
+
+    /// Degrade-open: if the welding's account enumeration throws, `isSyncBlocked()` returns `false`
+    /// (sync allowed) and never crashes — matching `OrchardMigration.isSyncBlocked()`'s behavior.
+    func testIsSyncBlockedDegradesOpenWhenAccountEnumerationThrows() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.listAccountsThrowableError = StubHostWeldingError()
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        let blocked = await host.isSyncBlocked()
+        XCTAssertFalse(blocked, "an account-enumeration failure must degrade open, not crash")
+    }
+
+    /// The wallet-scope gate consults the READY-broadcast predicate (D1): a proved, due transfer
+    /// on any enumerated account blocks sync — and per U8 the scanned tip is asked first, so a
+    /// `true` scanned answer never pays for the block-rate sample read.
+    /// D1 REVERSAL PIN at wallet scope: a servable ready broadcast no longer blocks sync, and
+    /// the wallet-scope predicate consults neither the probe nor the estimate — its whole
+    /// second pass died with the gate's forward-looking clause.
+    func testIsSyncBlockedIgnoresReadyBroadcastsAcrossAllAccounts() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.listAccountsReturnValue = [makeAccount(accountA), makeAccount(accountB)]
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = true
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        let blocked = await host.isSyncBlocked()
+
+        XCTAssertFalse(blocked, "sync holds only for past/present broadcasts (gate files, live views)")
+        XCTAssertFalse(welding.migrationHasReadyBroadcastForEstimatedTipCalled, "no gate path consults the probe anymore")
+        XCTAssertFalse(welding.migrationBlockRateSamplesWindowCalled, "the estimate pass is deleted")
+    }
+
+
+    /// A8: a mark whose gate-FILE write failed (the gate directory is made read-only, so
+    /// `markBroadcast()`'s persist fails while its in-memory cache updates) must still block the
+    /// WALLET-scope predicate: the host consults the hosted actor's live gate view alongside the
+    /// file, and blocked wins.
+    func testIsSyncBlockedConsultsTheLiveGateWhenTheFileWriteFailed() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.listAccountsReturnValue = [makeAccount(accountA)]
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
+        welding.migrationBlockRateSamplesWindowReturnValue = []
+
+        // A factory that hands the created actor's gate back to the test, so the test can drive
+        // `markBroadcast()` directly against a broken filesystem.
+        let directory = testGeneralStorageDirectory!
+        let clockValue = clock!
+        let bufferDuration = buffer
+        var capturedGates: [MigrationSyncGate] = []
+        let capturingFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { accountUUID, broadcaster in
+            let gate = MigrationSyncGate(
+                directory: directory,
+                accountUUID: accountUUID,
+                bufferDuration: bufferDuration,
+                tickInterval: 3600,
+                now: { clockValue.now },
+                logger: logger
+            )
+            capturedGates.append(gate)
+            return OrchardMigration(
+                welding: welding,
+                accountUUID: accountUUID,
+                broadcaster: broadcaster,
+                syncGate: gate,
+                logger: logger,
+                now: { clockValue.now }
+            )
+        }
+        let host = OrchardMigrationHost(
+            welding: welding,
+            sharedBroadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),
+            generalStorageURL: directory,
+            tickInterval: 3600,
+            now: { clockValue.now },
+            logger: logger,
+            actorFactory: capturingFactory
+        )
+
+        // Creating the actor registers its live gate with the host; its gate file does not exist
+        // yet (nothing marked).
+        _ = await host.migration(for: accountA)
+        let gate = try XCTUnwrap(capturedGates.first)
+
+        // Break persistence AFTER the gate exists: chmod the storage directory read-only so the
+        // atomic write inside `markBroadcast()` fails, leaving only the in-memory cache updated.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path) }
+
+        gate.markBroadcast()
+
+        let fileInputs = MigrationSyncGate.persistedGateInputs(directory: directory, accountUUID: accountA, logger: logger)
+        XCTAssertNil(fileInputs.resumeAt, "precondition: the gate-file write must have failed for this test to prove anything")
+        XCTAssertNotNil(gate.currentResumeAt(), "precondition: the in-memory cache carries the mark the file lost")
+
+        let blocked = await host.isSyncBlocked()
+        XCTAssertTrue(blocked, "A8: the live gate cache must win when the file write failed — blocked wins")
+    }
+
+    // MARK: - Wallet-scope syncBlockedStream
+
+    /// Subscribe-time seed: a fresh host with nothing blocked seeds `false` on the very first
+    /// (synchronous) emission, before the subscription-started ticker can schedule its first recompute.
+    func testSyncBlockedStreamSeedsFalseOnSubscribe() {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.listAccountsReturnValue = []
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        var received: [Bool] = []
+        let cancellable = host.syncBlockedStream.sink { received.append($0) }
+        defer { cancellable.cancel() }
+
+        XCTAssertEqual(received, [false])
+    }
+
+    /// Emission after a hosted actor broadcasts: with a subscriber already attached and the account's
+    /// actor created, a successful broadcast through that actor marks its gate, which the host observes
+    /// through the account's per-account stream and re-evaluates the wallet predicate — publishing
+    /// `true` without waiting for the (long) periodic ticker.
+    func testSyncBlockedStreamEmitsTrueAfterAHostedActorBroadcasts() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.listAccountsReturnValue = [makeAccount(accountA)]
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
+        welding.migrationNextDueTransferForEstimatedTipReturnValue = .ready(PreparedMigrationTransfer(
+            id: 0,
+            txid: Data(repeating: 0xAB, count: 32),
+            pczt: Data([0x01, 0x02])
+        ))
+        // D2: broadcastAndRecord now reads statuses for the prep buffer exemption; empty = transfer treatment (buffer arms), the old semantics.
+        welding.migrationTransactionStatusesForReturnValue = []
+        welding.migrationExtractBroadcastTxPcztForReturnValue = Data([0x07])
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+
+        // A tick far longer than the timeout, so only the broadcast (not a coincidental tick) can
+        // deliver the `true`.
+        let host = makeHost(
+            welding: welding,
+            broadcaster: ScriptedBroadcaster(script: .outcome(.submitted)),
+            tickInterval: 3600,
+            gateTickInterval: 3600
+        )
+
+        var received: [Bool] = []
+        let blockedEmitted = expectation(description: "wallet stream emitted true after a hosted broadcast")
+        let cancellable = host.syncBlockedStream.sink { value in
+            received.append(value)
+            if value {
+                blockedEmitted.fulfill()
+            }
+        }
+        defer { cancellable.cancel() }
+
+        let migration = await host.migration(for: accountA)
+        _ = try await migration.executeNextPendingTransfer(
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint),
+            useEstimatedTip: false
+        )
+
+        await fulfillment(of: [blockedEmitted], timeout: 5)
+        XCTAssertEqual(received.first, false, "precondition: the fresh host seeds false")
+        XCTAssertEqual(received.last, true)
+    }
+
+    /// Ticker re-evaluation catching a dormant account's expiry: with only the periodic ticker (no
+    /// actor ever created for the account), the stream reports `true` while the dormant account's
+    /// buffer is live and re-evaluates to `false` once the injected clock passes it.
+    func testSyncBlockedStreamTickerCatchesADormantAccountExpiry() async throws {
+        let dormantGateD = MigrationSyncGate(
+            directory: testGeneralStorageDirectory,
+            accountUUID: accountD,
+            bufferDuration: buffer,
+            tickInterval: 3600,
+            now: { [clock] in clock!.now },
+            logger: logger
+        )
+        dormantGateD.markBroadcast()
+
+        let welding = ZcashRustBackendWeldingMock()
+        welding.listAccountsReturnValue = [makeAccount(accountD)]
+        welding.migrationHasReadyBroadcastForEstimatedTipReturnValue = false
+        let host = makeHost(
+            welding: welding,
+            broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),
+            tickInterval: 0.02
+        )
+
+        var received: [Bool] = []
+        var sawBlocked = false
+        let blockedByTick = expectation(description: "a tick observed the dormant account's live buffer")
+        let unblockedByTick = expectation(description: "a tick observed the dormant account's buffer expire")
+        let cancellable = host.syncBlockedStream.sink { value in
+            received.append(value)
+            if value {
+                sawBlocked = true
+                blockedByTick.fulfill()
+            } else if sawBlocked {
+                unblockedByTick.fulfill()
+            }
+        }
+        defer { cancellable.cancel() }
+
+        await fulfillment(of: [blockedByTick], timeout: 5)
+
+        clock.now = referenceDate.addingTimeInterval(buffer + 1)
+        await fulfillment(of: [unblockedByTick], timeout: 5)
+        XCTAssertEqual(received.last, false)
+    }
+
+    /// Duplicate collapse: several ticks that all agree with the already-published value produce no
+    /// extra emissions — pins `.removeDuplicates()` in the wallet stream's pipeline. A counting
+    /// welding proves multiple recomputes actually ran.
+    func testSyncBlockedStreamCollapsesConsecutiveIdenticalTicks() async throws {
+        let counter = CallCounter()
+        let tickedThreeTimes = expectation(description: "the ticker re-evaluated at least three times")
+        let welding = ZcashRustBackendWeldingMock()
+        welding.listAccountsClosure = {
+            let count = await counter.increment()
+            if count == 3 {
+                tickedThreeTimes.fulfill()
+            }
+            // No accounts: every recompute agrees with the fresh-host `false` seed.
+            return []
+        }
+        let host = makeHost(
+            welding: welding,
+            broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),
+            tickInterval: 0.02
+        )
+
+        var received: [Bool] = []
+        let cancellable = host.syncBlockedStream.sink { received.append($0) }
+        defer { cancellable.cancel() }
+        XCTAssertEqual(received, [false], "precondition: fresh host seeds false")
+
+        await fulfillment(of: [tickedThreeTimes], timeout: 5)
+        XCTAssertEqual(received, [false], "three ticks agreeing with the seed must not add emissions")
+    }
+
+    // MARK: - Wallet-scope chain-tip estimation (U12 hosting, U7 clock injection)
+
+    /// `estimatedChainTip()` is wallet-scoped and lives on the host: projected from the shared
+    /// blocks table's samples at the host's INJECTED clock — the deterministic arithmetic only
+    /// holds if the shared tip-estimation helper received the fake `now`.
+    func testEstimatedChainTipProjectsFromSamplesAtTheInjectedClock() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        // One sample 150 s (two 75 s fallback-spacing blocks) before the frozen clock.
+        let sampleTime = referenceDate.addingTimeInterval(-150)
+        welding.migrationBlockRateSamplesWindowReturnValue = [
+            MigrationBlockRateSample(height: 3_000_000, unixTime: Int64(sampleTime.timeIntervalSince1970))
+        ]
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        let estimated = try await host.estimatedChainTip()
+
+        XCTAssertEqual(estimated, 3_000_002, "height + floor(150 / 75) at the injected clock")
+    }
+
+    /// With no samples at all, `estimatedChainTip()` falls back to the max SCANNED height, and
+    /// throws `migrationChainTipUnavailable` when even that is unknown.
+    func testEstimatedChainTipFallsBackToScannedHeightThenThrows() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationBlockRateSamplesWindowReturnValue = []
+        welding.maxScannedHeightReturnValue = 2_900_000
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        let fallback = try await host.estimatedChainTip()
+        XCTAssertEqual(fallback, 2_900_000)
+
+        welding.maxScannedHeightClosure = { nil }
+        do {
+            _ = try await host.estimatedChainTip()
+            XCTFail("expected migrationChainTipUnavailable")
+        } catch ZcashError.migrationChainTipUnavailable {
+            // expected
+        } catch {
+            XCTFail("expected migrationChainTipUnavailable, got \(error)")
+        }
+    }
+
+    /// `estimatedSecondsPerBlock()` is the same shared projection's other half: the measured mean
+    /// over the samples, with the 75 s fallback under two samples.
+    func testEstimatedSecondsPerBlockMeasuresTheSamplesAndFallsBack() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let base = Int64(referenceDate.timeIntervalSince1970)
+        welding.migrationBlockRateSamplesWindowReturnValue = [
+            MigrationBlockRateSample(height: 3_000_000, unixTime: base),
+            MigrationBlockRateSample(height: 3_000_001, unixTime: base + 60),
+            MigrationBlockRateSample(height: 3_000_002, unixTime: base + 120)
+        ]
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        let measured = try await host.estimatedSecondsPerBlock()
+        XCTAssertEqual(measured, 60, accuracy: 0.0001)
+
+        welding.migrationBlockRateSamplesWindowClosure = { _ in [] }
+        let fallback = try await host.estimatedSecondsPerBlock()
+        XCTAssertEqual(fallback, ChainTipEstimator.fallbackSecondsPerBlock)
+    }
+
+    // MARK: - Helpers
+
+    private func makeHost(
+        welding: ZcashRustBackendWeldingMock,
+        broadcaster: any MigrationBroadcasting,
+        tickInterval: TimeInterval = 3600,
+        gateTickInterval: TimeInterval = 3600
+    ) -> OrchardMigrationHost {
+        // `isSyncBlocked()`/`syncBlockedStream` unconditionally read `migrationBlockRateSamples`
+        // (`ChainTipEstimator`'s raw input) while computing the wallet-scope predicate; default it
+        // to "no samples" so a test that never cares about the estimate does not crash on the
+        // mock's un-stubbed, implicitly-unwrapped `ReturnValue` -- a test that DOES care sets it
+        // itself before calling this helper, which this guard leaves untouched.
+        if welding.migrationBlockRateSamplesWindowReturnValue == nil {
+            welding.migrationBlockRateSamplesWindowReturnValue = []
+        }
+        let clockValue = clock!
+        return OrchardMigrationHost(
+            welding: welding,
+            sharedBroadcaster: broadcaster,
+            generalStorageURL: testGeneralStorageDirectory,
+            tickInterval: tickInterval,
+            now: { clockValue.now },
+            logger: logger,
+            actorFactory: makeActorFactory(welding: welding, gateTickInterval: gateTickInterval)
+        )
+    }
+
+    private func makeActorFactory(
+        welding: ZcashRustBackendWeldingMock,
+        gateTickInterval: TimeInterval
+    ) -> (AccountUUID, any MigrationBroadcasting) -> OrchardMigration {
+        let storage = testGeneralStorageDirectory!
+        let clockValue = clock!
+        let bufferDuration = buffer
+        return { accountUUID, broadcaster in
+            OrchardMigration(
+                welding: welding,
+                accountUUID: accountUUID,
+                broadcaster: broadcaster,
+                syncGate: MigrationSyncGate(
+                    directory: storage,
+                    accountUUID: accountUUID,
+                    bufferDuration: bufferDuration,
+                    tickInterval: gateTickInterval,
+                    now: { clockValue.now },
+                    logger: logger
+                ),
+                logger: logger
+            )
+        }
+    }
+
+    private func makeAccount(_ uuid: AccountUUID) -> Account {
+        Account(
+            id: uuid,
+            name: nil,
+            keySource: nil,
+            seedFingerprint: nil,
+            hdAccountIndex: nil,
+            ufvk: nil,
+            uivk: nil
+        )
+    }
+
+    private func assertThrowsMigrationTorUnavailable(_ task: Task<MigrationTransferAttempt, Error>) async {
+        do {
+            _ = try await task.value
+            XCTFail("Expected migrationTorUnavailable to be thrown")
+        } catch ZcashError.migrationTorUnavailable {
+            // expected
+        } catch {
+            XCTFail("Expected migrationTorUnavailable but got \(error)")
+        }
+    }
+}
+
+/// A generic, non-`ZcashError` failure for stubbing a welding enumeration error in the host's
+/// degrade-open path.
+private struct StubHostWeldingError: Error {}
+
+/// A minimal thread-safe call counter for pinning "the ticker actually re-evaluated N times".
+private actor CallCounter {
+    private var count = 0
+
+    func increment() -> Int {
+        count += 1
+        return count
+    }
+}

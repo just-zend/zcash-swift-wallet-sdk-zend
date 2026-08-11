@@ -2,7 +2,6 @@ use anyhow::anyhow;
 use serde::Serialize;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_protocol::consensus::Network;
 use zcash_voting as voting;
 use zip32::AccountId;
 
@@ -57,11 +56,20 @@ pub(super) fn json_to_boxed_slice<T: Serialize>(
 }
 
 /// Open the wallet database.
+///
+/// The store is parameterized by `NetworkParams` rather than `Network` so that a
+/// custom (modified-mainnet or regtest) chain resolves its consensus parameters
+/// the same way every other `zcashlc_*` entry point does.
 pub(super) fn open_wallet_db(
     wallet_db_path: &str,
     network_id: u32,
 ) -> anyhow::Result<
-    zcash_client_sqlite::WalletDb<rusqlite::Connection, Network, SystemClock, rand::rngs::OsRng>,
+    zcash_client_sqlite::WalletDb<
+        rusqlite::Connection,
+        crate::NetworkParams,
+        SystemClock,
+        rand::rngs::OsRng,
+    >,
 > {
     let network = crate::parse_network(network_id)?;
     zcash_client_sqlite::WalletDb::for_path(wallet_db_path, network, SystemClock, rand::rngs::OsRng)
