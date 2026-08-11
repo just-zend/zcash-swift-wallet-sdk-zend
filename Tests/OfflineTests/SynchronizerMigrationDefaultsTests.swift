@@ -16,7 +16,7 @@ import Combine
 import Foundation
 @testable import TestUtils
 import XCTest
-@testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZcashLightClientKit
 
 final class SynchronizerMigrationDefaultsTests: XCTestCase {
     private let accountUUID = AccountUUID(id: [UInt8](repeating: 0x01, count: 16))
@@ -42,13 +42,23 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationProgress(accountUUID: self.accountUUID) }
     }
 
-    func testFinalizeReadyMigrationTransfersDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.finalizeReadyMigrationTransfers(accountUUID: self.accountUUID) }
+    func testProveMigrationTransactionsDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented {
+            _ = try await self.synchronizer.proveMigrationTransactions(
+                accountUUID: self.accountUUID,
+                [MigrationProveTarget(id: 1, kind: .transfer(crossing: 0), isScheduleDue: false)],
+                maxProofs: 1
+            )
+        }
     }
 
     func testMigrationSyncWakeupsDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationSyncWakeups(accountUUID: self.accountUUID) }
     }
+
+    // `nextMigrationWake(accountUUID:)` is one of the non-throwing members: its default is the
+    // inert `nil` (`testNextMigrationWakeDefaultReturnsNil` below, alongside the other inert
+    // defaults), not a `MigrationUnimplemented` throw.
 
     func testEstimatedMigrationChainTipDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.estimatedMigrationChainTip() }
@@ -119,22 +129,13 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         }
     }
 
-    /// The two-argument convenience overload (`useEstimatedTip` defaulted to `false`) must reach
-    /// the same protocol-extension default as the three-argument requirement it forwards to.
-    func testExecuteNextPendingMigrationTransferTwoArgOverloadDefaultThrowsUnimplemented() async {
+    func testPerformMigrationBroadcastDefaultThrowsUnimplemented() async {
         let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067))
         await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.executeNextPendingMigrationTransfer(accountUUID: self.accountUUID, options: options)
-        }
-    }
-
-    func testExecuteNextPendingMigrationTransferDefaultThrowsUnimplemented() async {
-        let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: LightWalletEndpoint(address: "submit.example", port: 9067))
-        await assertThrowsMigrationUnimplemented {
-            _ = try await self.synchronizer.executeNextPendingMigrationTransfer(
+            _ = try await self.synchronizer.performMigrationBroadcast(
                 accountUUID: self.accountUUID,
-                options: options,
-                useEstimatedTip: true
+                MigrationBroadcastInstruction(id: 1),
+                options: options
             )
         }
     }
@@ -153,10 +154,6 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
 
     func testHasInvalidMigrationTransfersDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.hasInvalidMigrationTransfers(accountUUID: self.accountUUID) }
-    }
-
-    func testPendingMigrationTransferProposalDefaultThrowsUnimplemented() async {
-        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.pendingMigrationTransferProposal(accountUUID: self.accountUUID) }
     }
 
     func testRestartCurrentMigrationStepDefaultThrowsUnimplemented() async {
@@ -239,6 +236,13 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
 
     // MARK: - Inert defaults
 
+    /// `nil` is the correct session-start answer for the inert default too: no host-level
+    /// conformer means no crank has ever run.
+    func testNextMigrationWakeDefaultReturnsNil() async {
+        let outlook = await synchronizer.nextMigrationWake(accountUUID: accountUUID)
+        XCTAssertNil(outlook, "the inert default must report no retained outlook")
+    }
+
     func testIsMigrationSyncBlockedDefaultReturnsFalse() async {
         let blocked = await synchronizer.isMigrationSyncBlocked()
         XCTAssertFalse(blocked, "the inert default must report unblocked (sync allowed)")
@@ -250,14 +254,6 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         defer { cancellable.cancel() }
 
         XCTAssertEqual(received, [false], "the inert default stream must seed (and only ever emit) false")
-    }
-
-    func testMigrationPrivacySyncBufferDurationDefaultForwardsTheRealConstant() {
-        XCTAssertEqual(
-            synchronizer.migrationPrivacySyncBufferDuration,
-            OrchardMigration.privacySyncBufferDuration,
-            "the constant default must forward OrchardMigration's real privacy-buffer duration, not a placeholder"
-        )
     }
 
     /// Infallible by protocol contract (see `Synchronizer.resetKeystoneSignBatchDecoder()`'s doc):

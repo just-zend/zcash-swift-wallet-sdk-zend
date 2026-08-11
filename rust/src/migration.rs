@@ -1,12 +1,15 @@
 //! FFI over the final Orchard→Ironwood pool-migration engine
 //! ([`zcash_pool_migration`] + the `zcash_client_sqlite::pool_migration` store).
 //!
-//! The engine is a set of free functions over traits — [`crate::migration_engine::Backend`] wires
-//! this SDK's wallet database (and the account-keyed migration store living inside it) into them;
+//! The engine is a set of free functions over traits — upstream's own `wallet::WalletMigration`
+//! adapter and `zcash_client_sqlite`'s account-scoped store implement them, wired to this SDK's
+//! wallet database by [`crate::migration_engine`]'s two constructors
+//! ([`account_migration`] for the calls that need a backend and viewing key,
+//! [`account_store`] for the ones that are purely store operations);
 //! [`crate::migration_finalize`] proves transactions as soon as they become provable (ZIP 374
 //! deferred anchors/witnesses, resolved through the upstream prover — transfers against their
 //! drawn ZIP 318 boundary anchor, preparations against the wallet's scanned tip; see its module
-//! doc), driven by [`zcashlc_migration_prove_pending`] rather than by the broadcast path;
+//! doc), driven by [`zcashlc_migration_prove_transactions`] rather than by the broadcast path;
 //! [`crate::migration_plan_cache`] carries the previewed plan from propose to commit.
 //! This module keeps the platform-facing C ABI of the v1 integration: the same entry points, the
 //! same `#[repr(C)]` DTOs, the same sentinels — the engine swap is absorbed here, with two
@@ -57,9 +60,9 @@
 //! functions yield NULL on error, `bool`-returning functions `false`, and the `i64` sentinels are
 //! documented per function.
 //!
-//! Heap ownership: every function that returns a `*mut Ffi*` (or a [`ffi::BoxedSlice`]) transfers
-//! ownership to the caller, who must free it with the matching `zcashlc_free_migration_*` (or
-//! `zcashlc_free_boxed_slice`) function.
+//! Heap ownership: every function that returns a `*mut Ffi*` (or a [`crate::ffi::BoxedSlice`])
+//! transfers ownership to the caller, who must free it with the matching
+//! `zcashlc_free_migration_*` (or `zcashlc_free_boxed_slice`) function.
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr};
@@ -71,6 +74,7 @@ use std::slice;
 
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
+use orchard::keys::SpendingKey;
 use rand::rngs::OsRng;
 use rusqlite::{Connection, OptionalExtension};
 use zcash_client_backend::data_api::wallet::{
@@ -85,7 +89,7 @@ use zcash_client_sqlite::pool_migration::orchard_ironwood::{
 };
 use zcash_client_sqlite::util::SystemClock;
 use zcash_protocol::consensus::{
-    BLOCKS_PER_HOUR, BlockHeight, Network, NetworkConstants, NetworkUpgrade, Parameters,
+    BLOCKS_PER_HOUR, BlockHeight, Network, NetworkUpgrade, Parameters,
 };
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
@@ -95,7 +99,7 @@ use zcash_pool_migration::engine::{
     MigrationTransferId, MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
 use zcash_pool_migration::satisfiability::{
-    AdvanceConfig, DuenessTargets, ReorgSettleDepth, ReplanThreshold, UnsatisfiableKind,
+    Advance, AdvanceConfig, DuenessTargets, ReorgSettleDepth, ReplanThreshold, UnsatisfiableKind,
     advance_migration,
 };
 use zcash_pool_migration::scheduling::{WakeupParams, WakeupScheduleError};
@@ -103,14 +107,18 @@ use zcash_pool_migration::signing_rounds::{
     NextFit, PREPARATION_ACTIONS, PlannedTx, SigningRoundBudget, SigningRoundStrategy,
     TRANSFER_ACTIONS, action_weight,
 };
-use zcash_pool_migration::state::{AdvanceStep, Blocker, NextAction, TransactionStatus};
+use zcash_pool_migration::state::{
+    AdvanceStep, Blocker, NextAction, ProveTarget, StepKind, TransactionStatus,
+};
 use zcash_pool_migration::wallet::WalletMigrationProver;
 
-use crate::migration_engine::{Backend, MigrationWallet};
+use crate::migration_engine::{
+    AdapterError, MigrationWallet, account_migration, account_store, stored_orchard_fvk,
+};
 use crate::migration_finalize;
 use crate::migration_plan_cache;
 use crate::{
-    NETWORK_ID_MAINNET, NETWORK_ID_TESTNET, NetworkParams, account_uuid_from_bytes, ffi,
+    NETWORK_ID_MAINNET, NETWORK_ID_TESTNET, NetworkParams, account_uuid_from_bytes,
     free_ptr_from_vec, free_ptr_from_vec_with, parse_network, ptr_from_vec, unwrap_exc_or,
     unwrap_exc_or_null, zcashlc_string_free,
 };
@@ -133,6 +141,34 @@ fn plan_stale(detail: &str) -> anyhow::Error {
 /// the prove dispatch classifies prover failures onto the two lanes.
 pub(crate) fn proving_unavailable(detail: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("{PROVING_UNAVAILABLE_PREFIX}: {detail}")
+}
+
+/// Classifies a failure of the store's broadcast seam
+/// (`PoolMigrations::take_transaction_for_broadcast`, reached from [`serve_for_broadcast`]) onto
+/// the delivery lane's error channel.
+///
+/// The split is the one the pre-drive serve path established, and the Swift layer still routes on
+/// it: a stored artifact that cannot be turned into servable bytes right now carries
+/// [`PROVING_UNAVAILABLE_PREFIX`] (there, a PCZT that failed to re-parse or to extract), while a
+/// question about WHICH row was named — an unknown id, or a row that is not `Proved` — stays bare
+/// and reaches the platform as the lane's generic failure. That failure class did not disappear
+/// when the seam replaced the hand-rolled parse-and-extract; it simply arrives as
+/// `Error::Finalize` now, which additionally covers the spend-finalization and fee stages the
+/// seam performs and the old path did not.
+///
+/// Every other store failure — the database itself, the wallet-side write, a missing account or
+/// viewing key, corrupt or unrepresentable stored data — is bare: none of them says anything
+/// about whether this transaction's proofs exist.
+fn broadcast_seam_error(id: MigrationTransferId, e: PoolMigrationStoreError) -> anyhow::Error {
+    let detail = format!(
+        "taking migration transaction {} for broadcast failed: {e}",
+        u32::from(id)
+    );
+    if matches!(e, PoolMigrationStoreError::Finalize(_)) {
+        proving_unavailable(detail)
+    } else {
+        anyhow!(detail)
+    }
 }
 
 /// The stable prefix the Swift layer maps to a typed "sync wake-up schedule infeasible" error
@@ -180,11 +216,11 @@ unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
 }
 
 /// The engine's target height for a given chain tip: `tip + 1`, the height of the next block.
-/// Every [`MigrationState`] query (`next_provable`, `next_broadcastable`, `expired_transactions`)
-/// is defined over this height, never the raw tip — see [`CallCtx::target`], the primary way
-/// callers reach this from a live wallet handle. Exposed as a pure function too for the callers
-/// (like the estimated-tip due-ness split) that already hold a `tip` value rather than a
-/// [`CallCtx`].
+/// Every [`MigrationState`] query (`transaction_statuses`, `expired_transactions`, and the
+/// drive's own `advance_migration`) is defined over this height, never the raw tip — see
+/// [`CallCtx::target`], the primary way callers reach this from a live wallet handle. Exposed as
+/// a pure function too for the callers (like the estimated-tip due-ness split) that already hold
+/// a `tip` value rather than a [`CallCtx`].
 fn target_from_tip(tip: BlockHeight) -> BlockHeight {
     BlockHeight::from(u32::from(tip) + 1)
 }
@@ -347,8 +383,9 @@ impl CallCtx {
     /// mined only in a block at or below its expiry (ZIP 203), so it first becomes un-mineable in
     /// the NEXT block once the tip reaches its expiry height, and a scheduled transaction first
     /// becomes due once the NEXT block reaches its scheduled height. Every call that feeds a
-    /// [`MigrationState`] query (`next_provable`, `next_broadcastable`, `expired_transactions`,
-    /// `commit_preparation`, `build_preparation_unsigned`) must use this, never `tip()` directly.
+    /// [`MigrationState`] query (`transaction_statuses`, `expired_transactions`,
+    /// `commit_preparation`, `build_preparation_unsigned`, and the drive's own
+    /// `advance_migration`) must use this, never `tip()` directly.
     /// SDK-owned, tip-based policy (the immediate lane's fallback expiry bound, display-only "now"
     /// references) keeps using `tip()`.
     fn target(&self) -> anyhow::Result<BlockHeight> {
@@ -588,7 +625,7 @@ fn resolve_immediate_run(
 
 // ----- reconciliation, planning, committing -----
 
-/// Loads the stored run — TERMINAL RUNS INCLUDED, via [`Backend::latest_migration`], since
+/// Loads the stored run — TERMINAL RUNS INCLUDED, via the store's own `latest_migration`, since
 /// upstream's `get_migration` went pending-only and the reads built on this must keep serving a
 /// completed, failed, or cancelled run (progress, statuses, history) — with its `Broadcast`
 /// transactions promoted to `Mined` wherever the wallet's scan has since seen them, persisting
@@ -601,8 +638,11 @@ fn resolve_immediate_run(
 /// read-only entry points (progress, statuses, the delivery queries) run it so a standalone read
 /// is not answered from a state the wallet's own scan has already moved past.
 fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> {
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-    let Some(mut state) = backend.latest_migration()? else {
+    let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+    let Some(mut state) = store
+        .latest_migration()
+        .map_err(|e| anyhow!("migration store read failed: {e}"))?
+    else {
         return Ok(None);
     };
     if state.is_terminal() {
@@ -618,13 +658,18 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
         .collect();
     let mut changed = false;
     for (id, txid) in broadcast {
-        if let Some(height) = backend.mined_height(txid)? {
+        if let Some(height) = store
+            .mined_height(txid)
+            .map_err(|e| anyhow!("mined-height lookup failed: {e}"))?
+        {
             state.mark_mined(id, height);
             changed = true;
         }
     }
     if changed {
-        backend.replace_migration(&state)?;
+        store
+            .replace_migration(&state)
+            .map_err(|e| anyhow!("migration store write failed: {e}"))?;
     }
     Ok(Some(state))
 }
@@ -664,7 +709,7 @@ fn plan_and_cache(
 /// replacing the cached plan would invalidate the handle of a proposal the user is currently
 /// reviewing, failing its later commit with `MIGRATION_PLAN_STALE` for no user-visible reason.
 fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, BlockHeight)>> {
-    let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+    let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
     let mut rng = OsRng;
     match engine::plan_migration(&ctx.network, &backend, &mut rng) {
         Ok(plan) => {
@@ -682,19 +727,30 @@ fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bloc
 /// The row set the platform sees for a plan's transfer schedule: `(engine tx id, crossing amount,
 /// broadcast height, expiry height)`, sorted chronologically by broadcast height.
 ///
-/// - Amounts are what each transfer CROSSES, straight from the engine's `crossing_values()`:
-///   index-aligned with `funding_notes()` and with `schedule()`, and already net of the fee buffer
-///   that pays each transfer's own fee. Serving the funding note instead would overstate every row
-///   by one transfer fee and show a value that is not a round denomination the user approved.
-/// - The engine numbers every preparation transaction first, then transfers in `schedule()`
-///   order (see [`MigrationPlan::planned_transactions`], the authority for this), so transfer
-///   `i`'s real committed id is `prep_tx_count + i`.
+/// `planned` is the engine's own enumeration of the run
+/// ([`MigrationPlan::planned_transactions`]) — the very rows `commit_preparation` builds from — so
+/// each transfer's id and broadcast height are READ off it rather than worked out again here. The
+/// id is the ordinal the built transaction will carry (the engine numbers every preparation
+/// transaction first, then transfers in crossing order), and `scheduled_height` is the height the
+/// commit will stamp on the row, so a previewed timeline and the committed one cannot disagree.
+///
+/// - Amounts are what each transfer CROSSES, straight from the engine's `crossing_values()`
+///   indexed by the row's OWN crossing: index-aligned with `funding_notes()` and with
+///   `schedule()`, and already net of the fee buffer that pays each transfer's own fee. Serving
+///   the funding note instead would overstate every row by one transfer fee and show a value that
+///   is not a round denomination the user approved.
+/// - The expiry comes from `schedule()`: it is the one field of a transfer's timeline the
+///   enumeration does not publish.
+/// - A row carrying no scheduled height (the malformed-plan case the enumeration reports as
+///   `None`, which `commit_preparation` likewise refuses to build), or a crossing with no
+///   schedule entry or crossing value, is the same invariant-violation error style used elsewhere
+///   in this module.
 /// - The sort makes the platform's row order chronological: ZIP 318 SHUFFLE deliberately makes
 ///   funding-note order differ from broadcast order.
 fn schedule_rows(
+    planned: &[PlannedTx],
     crossing_values: &[Zatoshis],
     schedule: &[zcash_pool_migration::scheduling::Schedule],
-    prep_tx_count: u32,
 ) -> anyhow::Result<Vec<(MigrationTransferId, Zatoshis, BlockHeight, BlockHeight)>> {
     if crossing_values.len() != schedule.len() {
         return Err(anyhow!(
@@ -703,19 +759,29 @@ fn schedule_rows(
             schedule.len()
         ));
     }
-    let mut rows: Vec<_> = crossing_values
-        .iter()
-        .zip(schedule.iter())
-        .enumerate()
-        .map(|(i, (crossing, entry))| {
-            (
-                MigrationTransferId::new(prep_tx_count + i as u32),
-                *crossing,
-                entry.broadcast_height(),
-                entry.expiry_height(),
+    let mut rows = Vec::new();
+    for tx in planned {
+        let MigrationTxKind::Transfer { crossing } = tx.kind() else {
+            continue;
+        };
+        let amount = *crossing_values.get(crossing).ok_or_else(|| {
+            anyhow!("migration plan invariant violated: no crossing value for transfer {crossing}")
+        })?;
+        let expiry = schedule
+            .get(crossing)
+            .ok_or_else(|| {
+                anyhow!(
+                    "migration plan invariant violated: no schedule entry for transfer {crossing}"
+                )
+            })?
+            .expiry_height();
+        let broadcast = tx.scheduled_height().ok_or_else(|| {
+            anyhow!(
+                "migration plan invariant violated: no scheduled height for transfer {crossing}"
             )
-        })
-        .collect();
+        })?;
+        rows.push((tx.id(), amount, broadcast, expiry));
+    }
     rows.sort_by_key(|(_, _, broadcast, _)| *broadcast);
     Ok(rows)
 }
@@ -736,71 +802,52 @@ fn estimated_duration_hours(
         .map_or(0, |max| max.saturating_sub(now) / BLOCKS_PER_HOUR)
 }
 
-/// The number of preparation transactions a plan commits (across all layers) — the id offset of
-/// the first transfer. Delegates to the engine's own
-/// [`MigrationPlan::preparation_tx_count`], the source of truth this count must agree with.
+/// The number of preparation transactions a plan commits (across all layers). Delegates to the
+/// engine's own [`MigrationPlan::preparation_tx_count`], the source of truth the preview's own
+/// row count is cross-checked against.
 fn prep_tx_count(plan: &MigrationPlan) -> anyhow::Result<u32> {
     count_to_u32(plan.preparation_tx_count(), "preparation transaction count")
 }
 
 /// The plan's preparation transactions as schedule-preview rows — the PROPOSE-path derivation,
-/// read-only over a not-yet-committed [`MigrationPlan`]. Ids, `layer`, and `index` come straight
-/// from [`MigrationPlan::planned_transactions`] — the engine's own enumeration of the STABLE
-/// ordinals `zcash_pool_migration::engine::commit_preparation`'s `Committer::build_preparation_layers`
-/// will assign once committed, so a preview id already equals the id the built transaction will
-/// carry. `depends_on` is the WHOLE preceding layer's ids (layer 0 depends on nothing — the
-/// commit path does not narrow this to the specific producer(s) a layer's inputs spend), tracked
-/// as a watermark over the layer-major enumeration (layer transitions only ever increment, so the
-/// watermark never needs to look back further than the layer immediately before).
-/// `broadcast_height` is `plan.prep_schedule()[layer][index]`, index-aligned with
-/// `plan.preparation().layers()`; a missing entry there, or an emitted count disagreeing with
-/// [`prep_tx_count`], is the same invariant-violation error style used elsewhere in this module.
-/// Do NOT invent a finer-grained dependency from `PrepInput`; the commit path itself does not.
+/// read-only over a not-yet-committed [`MigrationPlan`]. Every field is read off
+/// [`MigrationPlan::planned_transactions`], the engine's own enumeration of the run: the STABLE
+/// ordinals `zcash_pool_migration::engine::commit_preparation` will assign, each row's
+/// `depends_on`, and each row's `scheduled_height`. Nothing here re-derives any of them, which is
+/// the point — the enumeration is what the commit itself builds from, so a previewed row and the
+/// committed transaction it becomes cannot describe different things. (The dependency rule is
+/// therefore the engine's: a layer waits on the WHOLE layer before it, never narrowed to the
+/// specific producer(s) its inputs spend.)
+///
+/// The two invariant violations this can report are the ones the enumeration itself surfaces as
+/// absences: a row holding no scheduled height (`None`, unconstructible through the engine's
+/// public API and refused by `commit_preparation`), and an emitted count disagreeing with
+/// [`prep_tx_count`].
 fn preparation_steps_from_plan(
     plan: &MigrationPlan,
 ) -> anyhow::Result<Vec<FfiMigrationPreparationStep>> {
     // Phase 1: derive every step's plain-data fields, including everything fallible (the
-    // broadcast-height lookup, the final count cross-check below) — no `Vec` is leaked into a
+    // scheduled-height read, the final count cross-check below) — no `Vec` is leaked into a
     // raw pointer yet, so an early `?` return here cannot leak one (A15; see
     // `encode_schedule_from_plan`'s caller-side comment for the same discipline one level up).
     let mut rows: Vec<(u32, u32, u32, i64, Vec<u32>)> = Vec::new();
-    let mut prev_layer_ids: Vec<u32> = Vec::new();
-    let mut this_layer_ids: Vec<u32> = Vec::new();
-    let mut current_layer: Option<usize> = None;
     for tx in plan.planned_transactions() {
         let (layer, index) = match tx.kind() {
             MigrationTxKind::Preparation { layer, index } => (layer, index),
             MigrationTxKind::Transfer { .. } => continue,
         };
-        if current_layer != Some(layer) {
-            // A new preparation layer starts: the layer just finished (if any) becomes the
-            // `depends_on` source for every step of this new layer.
-            prev_layer_ids = std::mem::take(&mut this_layer_ids);
-            current_layer = Some(layer);
-        }
-        let broadcast_height = plan
-            .prep_schedule()
-            .get(layer)
-            .and_then(|heights| heights.get(index))
-            .ok_or_else(|| {
-                anyhow!(
-                    "migration plan invariant violated: no scheduled height for preparation \
-                     layer {layer} index {index}"
-                )
-            })?;
-        let id = u32::from(tx.id());
-        this_layer_ids.push(id);
-        let depends_on = if layer == 0 {
-            Vec::new()
-        } else {
-            prev_layer_ids.clone()
-        };
+        let broadcast_height = tx.scheduled_height().ok_or_else(|| {
+            anyhow!(
+                "migration plan invariant violated: no scheduled height for preparation \
+                 layer {layer} index {index}"
+            )
+        })?;
         rows.push((
-            id,
+            u32::from(tx.id()),
             layer as u32,
             index as u32,
-            i64::from(u32::from(*broadcast_height)),
-            depends_on,
+            i64::from(u32::from(broadcast_height)),
+            tx.depends_on().iter().map(|id| u32::from(*id)).collect(),
         ));
     }
 
@@ -866,9 +913,9 @@ fn encode_schedule_from_plan(
     plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
     let rows = schedule_rows(
+        &plan.planned_transactions(),
         plan.crossing_values(),
         plan.schedule(),
-        prep_tx_count(plan)?,
     )?;
     let transfers = rows
         .into_iter()
@@ -996,21 +1043,27 @@ fn encode_schedule_from_state(
 /// superseded the plan the platform displayed (see `migration_plan_cache`: the handle gate is
 /// what guarantees a commit can only sign the exact plan the user reviewed). On the resume path
 /// the handle is not consulted: the commitment already happened — with a handle-verified plan —
-/// and is durable, so there is nothing left the handle could protect. `sign` picks the
-/// `commit_preparation` / `build_preparation_unsigned` variant. A terminal stored run (a
-/// completed or cancelled previous migration) is REPLACED — that is the sequential-runs path.
-/// When the cached preview came through the immediate lane, the committed transfers' scheduled
-/// heights are rewritten to the commit tip (everything due at once; preparation mining order
-/// still gates transfers via their dependencies).
+/// and is durable, so there is nothing left the handle could protect. `unsigned_out` picks the
+/// `build_preparation_unsigned` / `commit_preparation` variant; `sk` is the account's Orchard
+/// spending key, required by (and live only for) the second — the engine derives its full viewing
+/// key and checks it against the account's before building anything, so a foreign key is refused
+/// as [`engine::CommitError::WrongSpendAuthority`] rather than silently signing nothing. A
+/// terminal stored run (a completed or cancelled previous migration) is REPLACED — that is the
+/// sequential-runs path. When the cached preview came through the immediate lane, the committed
+/// transfers' scheduled heights are rewritten to the commit tip (everything due at once;
+/// preparation mining order still gates transfers via their dependencies).
 fn commit_or_resume(
     ctx: &mut CallCtx,
-    usk: Option<zcash_keys::keys::UnifiedSpendingKey>,
+    sk: Option<&SpendingKey>,
     unsigned_out: bool,
     plan_handle: migration_plan_cache::PlanHandle,
 ) -> anyhow::Result<(MigrationState, Vec<(MigrationTransferId, Vec<u8>, u32)>)> {
     {
-        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        if let Some(state) = backend.get_migration()? {
+        let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+        if let Some(state) = store
+            .get_migration()
+            .map_err(|e| anyhow!("migration store read failed: {e}"))?
+        {
             if !state.is_terminal() {
                 // Re-serve path: the row's own kind carries its action weight (the same weight
                 // the plan's now-consumed signing-rounds preview used), never re-derived from the
@@ -1031,7 +1084,7 @@ fn commit_or_resume(
 
     let target = ctx.target()?;
     let mut rng = OsRng;
-    let mut backend = Backend::new(&ctx.wallet, ctx.account, usk, &mut ctx.store_conn)?;
+    let mut backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
     let (state, unsigned) = if unsigned_out {
         let (state, unsigned) = engine::build_preparation_unsigned(
             &ctx.network,
@@ -1053,10 +1106,12 @@ fn commit_or_resume(
             .collect::<anyhow::Result<Vec<_>>>()?;
         (state, unsigned)
     } else {
+        let sk = sk.ok_or_else(|| anyhow!("signing requires the account's spending key"))?;
         let state = engine::commit_preparation(
             &ctx.network,
             target,
             &mut backend,
+            sk,
             &cached.plan,
             &mut rng,
             ReplanThreshold::DEFAULT,
@@ -1070,8 +1125,11 @@ fn commit_or_resume(
 }
 
 /// Map a commit error, routing `StalePlan` through the stable plan-stale prefix (the actionable
-/// "re-propose" signal).
-fn map_commit_err(e: engine::CommitError<anyhow::Error>) -> anyhow::Error {
+/// "re-propose" signal). `WrongSpendAuthority` — the spending key passed in does not derive to the
+/// account's stored viewing key — is a caller-contract violation, not a wallet-state condition the
+/// platform recovers from by retrying the same call, so it gets no dedicated prefix: the generic
+/// arm's message (from the engine's own `Display`) already names the mismatch plainly.
+fn map_commit_err(e: engine::CommitError<AdapterError>) -> anyhow::Error {
     match e {
         engine::CommitError::StalePlan => {
             plan_stale("the previewed plan no longer matches the wallet or the build height")
@@ -1083,9 +1141,10 @@ fn map_commit_err(e: engine::CommitError<anyhow::Error>) -> anyhow::Error {
 /// Map a rebuild-on-expiry error. `FundingNoteUnavailable` gets the actionable message: the
 /// expired transfer's EXACT funding note (matched by nullifier identity — the engine deliberately
 /// never substitutes an equal-value note, which could be a sibling transfer's) was spent outside
-/// the migration, so the remaining balance must be re-planned via the restart lane. Everything
-/// else is a hard error carrying the engine's detail.
-fn map_rebuild_err(e: engine::RebuildError<anyhow::Error>) -> anyhow::Error {
+/// the migration, so the remaining balance must be re-planned via the restart lane.
+/// `WrongSpendAuthority` — as with [`map_commit_err`] — is a caller-contract violation and gets no
+/// dedicated prefix. Everything else is a hard error carrying the engine's detail.
+fn map_rebuild_err(e: engine::RebuildError<AdapterError>) -> anyhow::Error {
     match e {
         engine::RebuildError::FundingNoteUnavailable(value) => anyhow!(
             "the expired transfer's funding note ({} zatoshi) is gone — it was spent outside the \
@@ -1097,30 +1156,40 @@ fn map_rebuild_err(e: engine::RebuildError<anyhow::Error>) -> anyhow::Error {
     }
 }
 
-/// Serves an already-`Proved` row's stored artifact as `(proven pczt bytes, txid)`. A pure read:
-/// the bytes were persisted when the row was proved, so a retry after a failed broadcast attempt
-/// re-serves exactly the same transaction (same anchor, same txid) rather than re-proving.
-fn serve_proved(
+/// Serves the stored `Proved` transaction `id` through the store's atomic broadcast seam, as
+/// `(finalized transaction bytes, the row's stored txid)`.
+///
+/// The seam (`PoolMigrations::take_transaction_for_broadcast`) finalizes, extracts and records the
+/// transaction in the wallet's own tables in one database transaction with handing the bytes back,
+/// so the wallet's record binds at the broadcast ATTEMPT. It is idempotent: a retry after a failed
+/// submission re-serves exactly the same transaction over the same record.
+///
+/// The txid is the row's STORED one — fixed when the transaction was built, before its authorizing
+/// data — because that is the identity the engine keys `mark_broadcast` and mining promotion on,
+/// so it is what the platform must submit-and-record under.
+///
+/// The seam's own refusal of a non-`Proved` row is the STALENESS GUARD for both callers: neither
+/// re-asks the engine what to serve, so an instruction that has gone stale between the advance
+/// that issued it and the serve that discharges it is refused here rather than acted on.
+fn serve_for_broadcast(
+    ctx: &mut CallCtx,
     state: &MigrationState,
     id: MigrationTransferId,
 ) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
-    let tx = state
+    let txid = state
         .transactions()
         .iter()
         .find(|t| t.id() == id)
+        .map(|t| <[u8; 32]>::from(t.txid()))
         .ok_or_else(|| anyhow!("no migration transaction with id {}", u32::from(id)))?;
-    if !matches!(tx.state(), MigrationTxState::Proved) {
-        return Err(anyhow!(
-            "migration transaction {} is not broadcastable (state {})",
-            u32::from(id),
-            tx.state().as_ref()
-        ));
-    }
-    let bytes = tx.pczt().clone();
-    let pczt = pczt::Pczt::parse(&bytes)
-        .map_err(|e| proving_unavailable(format!("re-parse proven pczt: {e:?}")))?;
-    let (_, txid) = migration_finalize::extract_tx(pczt).map_err(proving_unavailable)?;
-    Ok((bytes, txid))
+    let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+    let tx = store
+        .take_transaction_for_broadcast(state, id)
+        .map_err(|e| broadcast_seam_error(id, e))?;
+    let mut raw = Vec::new();
+    tx.write(&mut raw)
+        .map_err(|e| anyhow!("encoding the broadcastable transaction failed: {e}"))?;
+    Ok((raw, txid))
 }
 
 /// Proves ONE `Signed` row through the upstream engine prover
@@ -1171,8 +1240,7 @@ fn prove_one(
                 .map(|meta| meta.block_height())
                 .map_or_else(|| ctx.tip(), Ok)?;
             let network = ctx.network;
-            let fvk = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?
-                .stored_orchard_fvk()?;
+            let fvk = stored_orchard_fvk(&ctx.wallet, ctx.account)?;
             let mut prover = WalletMigrationProver::new(&mut ctx.wallet, ctx.account, fvk);
             let Some(proved) = migration_finalize::prove_due_transaction(
                 &network,
@@ -1193,8 +1261,10 @@ fn prove_one(
             // the wallet's own spends could double-spend a migration input. It persists the
             // whole state, so the proving-time boundary re-draw's mutation rides along — the
             // separate `replace_migration` this replaces is no longer needed here.
-            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.store_proved_transaction(state, proved)?;
+            let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .store_proved_transaction(state, proved)
+                .map_err(|e| anyhow!("migration store proved-transaction write failed: {e}"))?;
             Ok(true)
         }
         other => Err(anyhow!(
@@ -1205,80 +1275,117 @@ fn prove_one(
     }
 }
 
-/// Proves every row that can be proved right now, persisting each, and returns how many were
-/// proved.
+/// What one prove sweep accomplished: how many rows it proved, and the txids of the PREPARATIONS
+/// among them.
+///
+/// ONLY PREPARATIONS ARE LISTED. A proved preparation is a complete PCZT (signatures and proofs),
+/// it is ZIP 318-exempt, and the engine's own contract is that a preparation is broadcast as soon
+/// as it is proved — so its submission is the platform's ORDINARY path: retrieve it by txid
+/// through [`zcashlc_migration_take_preparation_by_txid`] and submit it like any other raw
+/// transaction. A transfer is delivered by the drive's BROADCAST instruction alone, so naming one
+/// here would imply a retrievability it deliberately does not have.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProveOutcome {
+    /// How many of the named rows this call proved — preparations AND transfers.
+    total_proved: u32,
+    /// The proved preparations' stored txids, in the order they were proved.
+    preparation_txids: Vec<[u8; 32]>,
+}
+
+/// Proves the NAMED rows, persisting each, and returns what was proved (see [`ProveOutcome`]).
+///
+/// The ids are an instruction, not a query: they are the batch a prior
+/// [`zcashlc_migration_advance_step`] returned as its `Prove` step, already verified against the
+/// store's satisfiability oracle and ordered oldest-anchor-first by the drive that produced them.
+/// THIS FUNCTION NEVER CRANKS THE DRIVE — see [`drive_advance`]'s invariant. Which rows are worth
+/// proving, and whether a due broadcast outranks proving at all, are the advance's decisions; the
+/// sweep only executes what it was told.
 ///
 /// This is the opportunistic seam: a transaction's anchor becomes witnessable long before its
 /// broadcast schedule arrives, so proofs are produced as the wallet scans rather than on the
-/// delivery path — by broadcast time there is nothing left to do but broadcast. A row the wallet
-/// cannot prove yet (its anchor not scanned/retained) is SKIPPED, not fatal and not a reason to
-/// stop: the rows behind it still prove, and the skipped row is retried by the next sweep.
+/// delivery path — by broadcast time there is nothing left to do but broadcast.
 ///
-/// The next candidate is upstream's own read, [`MigrationState::next_provable`] — the drive's
-/// `(anchor_boundary | scheduled_height, id)`-min, oldest-anchor-first — with `deferred` passed
-/// straight through as its `skip`: exactly the call-local `set_aside` exclusion the drive loop
-/// itself uses, so a row this sweep already found transiently unprovable is not re-offered within
-/// the same call.
+/// TWO KINDS OF SKIP, neither fatal and neither a reason to stop — the rows behind still prove:
+///
+/// - A row that is no longer `Signed` (already `Proved` by an earlier chunk, broadcast, mined, or
+///   awaiting a signature) is passed over. A STALE INSTRUCTION IS THEREFORE SAFE: the engine
+///   re-offers work it has not recorded on the next crank, so acting on an out-of-date batch can
+///   at worst do nothing.
+/// - A row the wallet cannot prove YET (its anchor witness not scanned/retained) is left `Signed`
+///   for a later call, which the next crank re-offers among the still-unproved remainder.
+///
+/// A row that only becomes provable BECAUSE an earlier member proved is NOT picked up here: the
+/// ids are a snapshot, not re-derived mid-call. The caller advances again to collect it.
 ///
 /// `prove` is [`prove_one`] in production; tests substitute the generic
 /// [`migration_finalize::prove_due_transaction`] seam with a recording/failing test prover plus a
-/// fixture-store persist.
-fn prove_pending_rows(
+/// fixture-store persist. It takes `ctx` as a parameter rather than capturing it, so the caller
+/// keeps the sole borrow.
+fn prove_named_rows(
+    ctx: &mut CallCtx,
     state: &mut MigrationState,
-    target: BlockHeight,
+    ids: &[MigrationTransferId],
     max_proofs: Option<u32>,
-    mut prove: impl FnMut(&mut MigrationState, MigrationTransferId) -> anyhow::Result<bool>,
-) -> anyhow::Result<u32> {
-    let mut deferred: Vec<MigrationTransferId> = Vec::new();
-    let mut proved = 0;
-    while let Some(id) = state.next_provable(DuenessTargets::at(target), &deferred) {
+    mut prove: impl FnMut(
+        &mut CallCtx,
+        &mut MigrationState,
+        MigrationTransferId,
+    ) -> anyhow::Result<bool>,
+) -> anyhow::Result<ProveOutcome> {
+    let mut outcome = ProveOutcome::default();
+    for &id in ids {
         // `max_proofs` caps SUCCESSFUL proofs per call so an FFI caller can chunk a sweep:
         // each proof is seconds of CPU, and a platform serializing DB access behind one
-        // actor needs a seam between proofs for interactive reads to interleave. Deferred
-        // (transient) rows don't count against the cap — they cost no proving time.
-        if max_proofs.is_some_and(|max| proved >= max) {
+        // actor needs a seam between proofs for interactive reads to interleave. A skip
+        // below doesn't count against the cap — it costs no proving time, which is what lets a
+        // cap-1 caller re-pass the WHOLE batch each chunk and still make progress.
+        if max_proofs.is_some_and(|max| outcome.total_proved >= max) {
             break;
         }
-        if prove(state, id)? {
-            // `next_provable` only offers `Signed` rows, so a successful prove must have advanced
-            // this one; were that ever untrue the loop would re-select it forever, which as an FFI
+        // The staleness skip. Only a `Signed` row is proving work; anything else the instruction
+        // still names has been overtaken, and re-proving it would be wasted CPU at best.
+        let still_signed = state
+            .transactions()
+            .iter()
+            .any(|t| t.id() == id && matches!(t.state(), MigrationTxState::Signed));
+        if !still_signed {
+            continue;
+        }
+        if prove(ctx, state, id)? {
+            // Guarded above as `Signed`, so a successful prove must have advanced this one; were
+            // that ever untrue a cap-1 caller's loop would re-select it forever, which as an FFI
             // call means a hung app. Fail loudly instead.
-            let advanced = state
-                .transactions()
-                .iter()
-                .find(|t| t.id() == id)
-                .is_none_or(|t| !matches!(t.state(), MigrationTxState::Signed));
+            let row = state.transactions().iter().find(|t| t.id() == id);
+            let advanced = row.is_none_or(|t| !matches!(t.state(), MigrationTxState::Signed));
             if !advanced {
                 return Err(anyhow!(
                     "migration transaction {} reported a successful prove but is still Signed",
                     u32::from(id)
                 ));
             }
-            proved += 1;
-        } else {
-            deferred.push(id);
+            // Preparations only — see [`ProveOutcome`]. The txid is the row's STORED one, the
+            // identity [`serve_for_broadcast`] serves under and the engine keys `mark_broadcast`
+            // on, so what the platform retrieves by is exactly what it submits and records under.
+            if let Some(txid) = row
+                .filter(|t| matches!(t.kind(), MigrationTxKind::Preparation { .. }))
+                .map(|t| <[u8; 32]>::from(t.txid()))
+            {
+                outcome.preparation_txids.push(txid);
+            }
+            outcome.total_proved += 1;
         }
+        // A `false` (transient) result — the anchor not yet witnessable — moves on without
+        // marking anything: the next crank re-offers this row among the still-unproved remainder.
     }
-    Ok(proved)
-}
-
-/// What the delivery lane has for the platform at the evaluated [`DuenessTargets`].
-#[derive(Debug, PartialEq, Eq)]
-enum DueOutcome {
-    /// Nothing is due.
-    Nothing,
-    /// This row is proved and due: its stored artifact is what gets broadcast.
-    Ready { id: MigrationTransferId },
-    /// A transaction is due but still awaits its proof (see [`prove_pending_rows`]).
-    AwaitingProof { id: MigrationTransferId },
+    Ok(outcome)
 }
 
 // ----- estimated-tip due-ness (M2, upstream `DuenessTargets`) -----
 //
-// `zcashlc_migration_has_overdue_transfers` / `zcashlc_migration_next_due_transfer` /
-// `zcashlc_migration_has_ready_broadcast` accept an OPTIONAL estimated chain tip (a wall-clock
-// projection past the scanned tip, computed by the platform from
-// `zcashlc_migration_block_rate_samples`). The estimate/scanned split is OWNED UPSTREAM now:
+// `zcashlc_migration_has_overdue_transfers` and `zcashlc_migration_advance_step` accept an
+// OPTIONAL estimated chain tip (a wall-clock projection past the scanned tip, computed by the
+// platform from `zcashlc_migration_block_rate_samples`). The estimate/scanned split is OWNED
+// UPSTREAM now:
 // `zcash_pool_migration::state::DuenessTargets` encodes the rule (the estimate may only
 // ACCELERATE schedule due-ness; expiry, boundary settledness, and every destructive decision
 // evaluate on the scanned target — plus the doomed-broadcast withhold, where an expiry the
@@ -1287,15 +1394,22 @@ enum DueOutcome {
 // converts the FFI's `estimated_tip: i64` into the estimated-target side of
 // [`DuenessTargets::new`] — see [`dueness_targets`].
 //
-// WHICH ROW is next is upstream's call too, not just the heights it is judged against:
-// [`next_due`] and [`due_assuming_proving`] delegate straight to
-// [`MigrationState::next_due_broadcast`] / [`MigrationState::next_provable`] — the same exported
-// reads [`prove_pending_rows`] and [`zcashlc_migration_has_ready_broadcast`] use — so this module
-// no longer re-derives an ordering over `transaction_statuses`, and cannot drift from the drive's
-// own `(scheduled_height, id)` / `(anchor_boundary | scheduled_height, id)`-min. The one thing
-// still composed HERE, over that public API, is the virtual-prove scratch clone
-// [`due_assuming_proving`] drives to answer "what would be due once every outstanding proof
-// existed" without a prover or a persisted write.
+// WHICH ROW is next is upstream's call too, not just the heights it is judged against, and among
+// the ACTION lanes it is the CONDUIT's alone to ask: [`zcashlc_migration_advance_step`] cranks
+// [`drive_advance`], and the two executors — [`zcashlc_migration_take_broadcast_transaction`] and
+// [`zcashlc_migration_prove_transactions`] — discharge the instruction it returned without asking
+// again (a due broadcast outranks proving exactly as the engine documents, and that precedence is
+// therefore decided once, in the advance). The READ-ONLY REPORTING query — [`due_assuming_proving`],
+// behind [`zcashlc_migration_has_overdue_transfers`] — cannot drive anything (it opens a read-only
+// connection and must not mutate), so it reads the engine's public PER-ROW status view,
+// `MigrationState::transaction_statuses`. That view agrees with the kernel's queues by
+// construction: `ready && action == Broadcast` holds exactly when `advance_migration` would offer
+// the broadcast, and the doomed-broadcast withhold is rendered as neither ready nor actionable.
+// What that query does compose here is the ORDER among several actionable rows — the
+// `(scheduled_height, id)`-min re-derived in [`due_assuming_proving`] — which is the module's one
+// accepted drift risk (recorded on librustzcash #2938, 2026-08-06); and being unverified, a
+// display read can still disagree with what the drive, having consulted the store's oracle, would
+// actually serve.
 
 /// The estimated TARGET height (`estimated tip + 1`) for an FFI-supplied `estimated_tip`
 /// (`-1`, or any negative, = no estimate) — the `estimated_target` input of
@@ -1325,54 +1439,49 @@ fn dueness_targets(scanned_tip: BlockHeight, estimated_tip: i64) -> DuenessTarge
     )
 }
 
-/// The delivery lane's decision, as a pure function of stored state: which row (if any) the
-/// platform should broadcast now. NEVER proves.
+/// The id the delivery lane WOULD be driven toward once every outstanding proof exists, derived
+/// over upstream's public status view ([`MigrationState::transaction_statuses`]). `None` when the
+/// delivery lane has nothing actionable: nothing schedule-due yet, dependencies unmined, rows
+/// awaiting an external signature (the signing ceremony, not the delivery lane, advances those),
+/// or everything already broadcast/mined.
 ///
-/// Proving is decoupled from broadcasting (upstream's `next_provable` / `next_broadcastable`
-/// split): by the time a row comes due its proof should already exist, produced by
-/// [`prove_pending_rows`] as the wallet scanned. A due row that is still `Signed` is reported as
-/// [`DueOutcome::AwaitingProof`] rather than proved here — the broadcast path stays free of
-/// proving latency, and a platform that is not sweeping learns that it must, instead of seeing an
-/// indefinite "nothing due". The chosen row's artifact is read by [`serve_proved`].
+/// TWO TIERS, mirroring the drive's own precedence (upstream `MigrationState::next_step` consults
+/// its broadcast queue FIRST and reaches its prove queue only when that queue is empty — a due
+/// broadcast outranks all proving, whatever the two rows' relative schedules):
 ///
-/// The candidate itself is [`MigrationState::next_due_broadcast`], upstream's own exported
-/// broadcast-queue read — the drive's `(scheduled_height, id)`-min among due, `Proved`,
-/// dependency-mined rows — so this answers exactly what `advance_migration` would broadcast next,
-/// by construction rather than by a parallel re-derivation over `transaction_statuses`.
+/// 1. The broadcast-queue min: the `(scheduled_height, id)`-min among rows reported `ready` with
+///    [`NextAction::Broadcast`].
+/// 2. Only if that tier is empty, the earliest-scheduled row still awaiting its proof: the
+///    `(scheduled_height, id)`-min among rows reported `ready` with [`NextAction::Prove`] whose
+///    schedule the effective target has already reached. Prove-readiness arrives long before the
+///    broadcast window — that head start is the whole point of the prove/broadcast split — so an
+///    undue prove-ready row is not delivery work and is excluded.
 ///
-/// `targets` carries the scanned/estimated due-ness pair (coincident when no estimate is in
-/// play) — see the section comment above [`estimated_target_from_tip`].
-fn next_due(state: &MigrationState, targets: DuenessTargets) -> DueOutcome {
-    if let Some(id) = state.next_due_broadcast(targets) {
-        return DueOutcome::Ready { id };
-    }
-    match due_assuming_proving(state, targets) {
-        Some(id) => DueOutcome::AwaitingProof { id },
-        None => DueOutcome::Nothing,
-    }
-}
-
-/// The id [`zcashlc_migration_next_due_transfer`] WOULD serve once every outstanding
-/// proof exists: the next broadcastable row after virtually proving every prove-ready `Signed` row
-/// over a scratch copy — no prover runs and nothing persists (`set_transaction_proved` with the
-/// row's own bytes and no lock owner only flips the lifecycle state). `None` when the delivery
-/// lane has nothing
-/// actionable: nothing schedule-due yet, dependencies unmined, rows awaiting an external signature
-/// (the signing ceremony, not the delivery lane, advances those), or everything already
-/// broadcast/mined.
+/// ONE PASS PER TIER suffices, with no virtual-prove closure to drive and no scratch clone to
+/// drive it over: dependency readiness is keyed on `Mined`, never `Proved`, so proving a row
+/// cannot make any OTHER row actionable. The transitive "once every proof exists" answer is
+/// therefore exactly these two filters over the statuses as they already stand.
 ///
-/// This is what separates "nothing is due" from "due, but its proof has not been produced yet"
-/// ([`DueOutcome::AwaitingProof`]), and the queries built on it
-/// ([`zcashlc_migration_has_overdue_transfers`], [`zcashlc_migration_pending_transfer_proposal`])
-/// report due work whether or not its proof exists: the work exists either way, and proving is
-/// [`prove_pending_rows`]' job, not the reporting path's.
+/// The per-row predicates are upstream's by construction: a row is `ready` with
+/// [`NextAction::Broadcast`] exactly when the drive would offer its broadcast, and a
+/// doomed-broadcast withhold ([`Blocker::ExpiryImminent`]) is reported as neither `ready` nor
+/// carrying an action, so this query honours the withhold without restating it. What is RE-DERIVED
+/// here, the queues themselves not being exported, is the ORDER within each tier — the
+/// `(scheduled_height, id)`-min — which is this module's accepted drift risk, recorded on
+/// librustzcash #2938 (2026-08-06).
 ///
-/// Every candidate read here — the broadcast checks and the scratch loop's own prove queue — is
-/// [`MigrationState::next_due_broadcast`] / [`MigrationState::next_provable`], upstream's exported
-/// reads: this function's only remaining composition is driving the scratch clone to EXHAUSTION
-/// (every prove-ready row gets virtually proved, in whatever order the engine offers them, since
-/// none of them can unblock another — dependency readiness is keyed on `Mined`, never `Proved`)
-/// before asking, once more, what the drive would broadcast from the result.
+/// ADVISORY, exactly as the exported queue reads it replaces were: a status carries no
+/// store-oracle verification. [`zcashlc_migration_advance_step`] is the verified drive, which puts
+/// each candidate to the store's satisfiability oracle and may re-spread a slept-through backlog
+/// before answering, so a row named here can still come back as a `Prove` step, or (once
+/// re-spread) as not due yet, or be set aside entirely — and where the drive would answer `Replan`
+/// (a slot that sits BETWEEN the two tiers above, preempting proving but not a due broadcast) this
+/// query still names a row while the delivery lane has nothing to serve, a divergence by design.
+/// What this DOES separate, for the display query built on it
+/// ([`zcashlc_migration_has_overdue_transfers`]), is "nothing is due" from "due, but its proof has
+/// not been produced yet": it reports due work whether or not its proof exists, because the work
+/// exists either way and proving is [`zcashlc_migration_prove_transactions`]' job, not the
+/// reporting path's.
 ///
 /// `targets` carries the scanned/estimated due-ness pair (coincident when no estimate is in
 /// play) — see the section comment above [`estimated_target_from_tip`].
@@ -1380,21 +1489,73 @@ fn due_assuming_proving(
     state: &MigrationState,
     targets: DuenessTargets,
 ) -> Option<MigrationTransferId> {
-    if let Some(id) = state.next_due_broadcast(targets) {
-        return Some(id);
-    }
-    state.next_provable(targets, &[])?;
-    let mut scratch = state.clone();
-    while let Some(id) = scratch.next_provable(targets, &[]) {
-        let bytes = scratch
+    let statuses = state.transaction_statuses(targets);
+    statuses
+        .iter()
+        .filter(|s| s.ready() && s.action() == Some(NextAction::Broadcast))
+        .min_by_key(|s| (s.scheduled_height(), s.id()))
+        .or_else(|| {
+            statuses
+                .iter()
+                .filter(|s| {
+                    s.ready()
+                        && s.action() == Some(NextAction::Prove)
+                        && s.scheduled_height() <= targets.effective()
+                })
+                .min_by_key(|s| (s.scheduled_height(), s.id()))
+        })
+        .map(|s| s.id())
+}
+
+/// The PREPARATION [`zcashlc_migration_sign_note_split`] proves now and hands back for the
+/// platform's immediate broadcast, as a pure function of stored state. `None` only when the run
+/// holds no unbroadcast preparation at all, which the caller reports as an error.
+///
+/// RESUME FIRST. A resumed ceremony must re-serve a preparation that is already `Proved` and due
+/// rather than prove another one: the artifact exists, re-proving it is seconds of wasted CPU,
+/// and it is the row the engine's own broadcast queue is holding right now. Those rows are
+/// exactly the ones upstream's status view reports `ready` with [`NextAction::Broadcast`]
+/// (`Proved`, schedule-due, dependency-mined, unexpired, unmarked), and the
+/// `(scheduled_height, id)`-min among them mirrors that queue's order.
+///
+/// FRESH COMMIT otherwise, which is also the ordinary path: nothing is broadcast-ready yet,
+/// because the first preparation's drawn window opens a few blocks ahead — the engine will not
+/// offer it until then, and this lane must still hand it back NOW, which is the whole reason the
+/// ceremony does not simply defer to the delivery lane. The `(scheduled_height, id)`-min over the
+/// run's own unbroadcast preparation rows is what the engine itself picks once that window opens:
+/// preparation layers are serialized in schedule order (a later layer starts past the previous
+/// layer's last scheduled height), so the earliest-scheduled row is also the one whose
+/// dependencies mine first.
+fn ceremony_preparation_pick(
+    state: &MigrationState,
+    targets: DuenessTargets,
+) -> Option<MigrationTransferId> {
+    let resume_pick = state
+        .transaction_statuses(targets)
+        .iter()
+        .filter(|s| {
+            s.ready()
+                && s.action() == Some(NextAction::Broadcast)
+                && matches!(s.kind(), MigrationTxKind::Preparation { .. })
+        })
+        .min_by_key(|s| (s.scheduled_height(), s.id()))
+        .map(|s| s.id());
+    resume_pick.or_else(|| {
+        state
             .transactions()
             .iter()
-            .find(|t| t.id() == id)
-            .map(|t| t.pczt().clone())
-            .unwrap_or_default();
-        scratch.set_transaction_proved(id, bytes, None);
-    }
-    scratch.next_due_broadcast(targets)
+            .filter(|t| {
+                matches!(t.kind(), MigrationTxKind::Preparation { .. })
+                    && matches!(
+                        t.state(),
+                        MigrationTxState::Signed | MigrationTxState::Proved
+                    )
+            })
+            // Ties (equal `scheduled_height`) break by `id`, mirroring the engine's own ordering
+            // key: deterministic on equal heights.
+            .min_by_key(|t| (t.scheduled_height(), t.id()))
+            .map(|t| t.id())
+    })
 }
 
 // ----- progress derivation (pure; unit-tested) -----
@@ -1537,72 +1698,190 @@ pub const ZCASHLC_ADVANCE_STEP_BROADCAST: u32 = 1;
 pub const ZCASHLC_ADVANCE_STEP_REBUILD: u32 = 2;
 pub const ZCASHLC_ADVANCE_STEP_WAITING: u32 = 3;
 pub const ZCASHLC_ADVANCE_STEP_COMPLETE: u32 = 4;
-pub const ZCASHLC_ADVANCE_STEP_ATTEND: u32 = 5;
+// 5 was ZCASHLC_ADVANCE_STEP_ATTEND — the collapsed Reevaluate/Replan projection (with a
+// synthesised transaction id neither upstream step carries), retired 2026-08-08 when the two
+// steps gained their own bare discriminants below. The value stays a HOLE on purpose: reusing
+// it would let a stale header decode one vocabulary as the other.
+pub const ZCASHLC_ADVANCE_STEP_REPLAN: u32 = 6;
+pub const ZCASHLC_ADVANCE_STEP_REEVALUATE: u32 = 7;
+
+/// The step-kind discriminants of [`FfiMigrationAdvanceStep::next_kind`], a verbatim export of
+/// upstream `state::StepKind` (the outlook's kind — WHICH transaction a wake-up serves is decided
+/// by the `advance_migration` call that serves it). Only Prove, Broadcast, Rebuild and Replan are
+/// constructible outlooks today (upstream's `upcoming_step` maps the rest to "no outlook"), but
+/// the export mirrors the full enum so the marshal never invents a projection.
+pub const ZCASHLC_STEP_KIND_PROVE: u32 = 0;
+pub const ZCASHLC_STEP_KIND_BROADCAST: u32 = 1;
+pub const ZCASHLC_STEP_KIND_REBUILD: u32 = 2;
+pub const ZCASHLC_STEP_KIND_REPLAN: u32 = 3;
+pub const ZCASHLC_STEP_KIND_REEVALUATE: u32 = 4;
+pub const ZCASHLC_STEP_KIND_WAITING: u32 = 5;
+pub const ZCASHLC_STEP_KIND_COMPLETE: u32 = 6;
+
+/// Marshals upstream `state::StepKind` into the [`ZCASHLC_STEP_KIND_*`] discriminants — the
+/// [`FfiMigrationAdvanceStep::next_kind`] counterpart of the step discriminants above. Exhaustive
+/// (no wildcard arm): a new upstream variant must be assigned an explicit number here rather than
+/// silently falling into whatever the last arm was.
+fn step_kind_to_ffi(kind: StepKind) -> u32 {
+    match kind {
+        StepKind::Prove => ZCASHLC_STEP_KIND_PROVE,
+        StepKind::Broadcast => ZCASHLC_STEP_KIND_BROADCAST,
+        StepKind::Rebuild => ZCASHLC_STEP_KIND_REBUILD,
+        StepKind::Replan => ZCASHLC_STEP_KIND_REPLAN,
+        StepKind::Reevaluate => ZCASHLC_STEP_KIND_REEVALUATE,
+        StepKind::Waiting => ZCASHLC_STEP_KIND_WAITING,
+        StepKind::Complete => ZCASHLC_STEP_KIND_COMPLETE,
+    }
+}
+
+/// The outlook pair as the FFI carries it: `(-1, 0)` for "no outlook", else the target height
+/// widened to `i64` beside the kind discriminant — one encoding, shared by every constructor.
+fn outlook_to_ffi(next: Option<(BlockHeight, StepKind)>) -> (i64, u32) {
+    (
+        next.map_or(-1, |(h, _)| i64::from(u32::from(h))),
+        next.map_or(0, |(_, k)| step_kind_to_ffi(k)),
+    )
+}
+
+/// One transaction of a Prove batch (element of [`FfiMigrationAdvanceStep::prove_targets`]): the
+/// transaction to prove, with the kind that routes it (a preparation proves against the tip anchor
+/// and may broadcast at the same wake-up; a transfer proves against its drawn boundary and
+/// broadcasts in its own later session), plus whether its broadcast window has already opened.
+///
+/// The kind fields are a verbatim marshal of upstream `state::ProveTarget`; `schedule_due` is not
+/// an upstream field but this conduit's own reading of the row against the very
+/// [`DuenessTargets`] the drive that produced the batch judged with — see
+/// [`FfiMigrationAdvanceStep::prove`].
+#[repr(C)]
+pub struct FfiProveTarget {
+    /// The engine's raw transaction id.
+    pub id: u32,
+    /// Whether the transaction is a preparation (`true`) or a transfer (`false`).
+    pub kind_is_preparation: bool,
+    /// The preparation's layer, when `kind_is_preparation`; `0` otherwise.
+    pub kind_layer: u32,
+    /// The preparation's index within its layer, when `kind_is_preparation`; `0` otherwise.
+    pub kind_index: u32,
+    /// The transfer's crossing index, when `!kind_is_preparation`; `0` otherwise.
+    pub kind_crossing: u32,
+    /// Whether the effective dueness target has already reached this transaction's scheduled
+    /// height — i.e. whether its missing proof is what stands between the run and a broadcast the
+    /// platform could otherwise make right now.
+    ///
+    /// A transaction becomes provable long BEFORE it comes due — that head start is the whole
+    /// point of the prove/broadcast split — so most of a batch is ordinarily `false`, meaning
+    /// "proving is opportunistic work for the next sync wake-up". A `true` entry means the
+    /// delivery lane is blocked on this proof, so a platform that skipped its sweep should sweep
+    /// and re-advance instead of sleeping until the next scheduled wake.
+    pub schedule_due: bool,
+}
 
 /// The engine's next-step decision for the stored run (returned by
 /// [`zcashlc_migration_advance_step`]) — a verbatim marshal of upstream
 /// the public satisfiability advance API's [`AdvanceStep`].
 #[repr(C)]
 pub struct FfiMigrationAdvanceStep {
-    /// The step discriminant (see the `ZCASHLC_ADVANCE_STEP_*` constants): `0` = Prove,
-    /// `1` = Broadcast, `2` = Rebuild, `3` = Waiting, `4` = Complete, `5` = Attend (a
-    /// transaction is marked invalid and no automatic step can advance the run — resolve
-    /// out-of-band, typically by cancelling and re-planning).
+    /// The step discriminant (see the `ZCASHLC_ADVANCE_STEP_*` constants).
     pub step: u32,
-    /// The engine's raw transaction id for Prove/Broadcast/Rebuild/Attend; `0` for
-    /// Waiting/Complete.
+    /// The engine's raw transaction id for Broadcast/Rebuild/Attend; `0` for Prove (the batch
+    /// entries carry their own ids) and for Waiting/Complete.
     pub id: u32,
-    /// Whether the Prove step's transaction is a preparation (`true`) or a transfer (`false`).
-    /// Meaningful only for `step == 0`; `false` otherwise.
-    pub kind_is_preparation: bool,
-    /// The preparation's layer, when `step == 0` and `kind_is_preparation`; `0` otherwise.
-    pub kind_layer: u32,
-    /// The preparation's index within its layer, when `step == 0` and `kind_is_preparation`; `0`
-    /// otherwise.
-    pub kind_index: u32,
-    /// The transfer's crossing index, when `step == 0` and `!kind_is_preparation`; `0` otherwise.
-    pub kind_crossing: u32,
+    /// Heap array of `prove_targets_len` batch entries when `step == 0` (Prove) — the WHOLE
+    /// provable set, earliest-ready first, never empty for a served Prove; null/0 otherwise.
+    pub prove_targets: *mut FfiProveTarget,
+    /// Length of `prove_targets`.
+    pub prove_targets_len: usize,
+    /// The OUTLOOK (upstream #2936, `Advance::next`): the earliest target height (`tip + 1`
+    /// convention, directly comparable with the drive's own targets) at which the migration next
+    /// has serviceable work, assuming this step is executed and recorded; `-1` when nothing is
+    /// height-schedulable (chain- or user-driven followers, terminal runs — upstream documents
+    /// the cases). ADVISORY: a floor, not an appointment; the serving call re-verifies.
+    pub next_height: i64,
+    /// The kind of that upcoming work (see the `ZCASHLC_STEP_KIND_*` constants); meaningful only
+    /// when `next_height >= 0`.
+    pub next_kind: u32,
 }
 
 impl FfiMigrationAdvanceStep {
-    /// A step that names a transaction but carries no kind payload (Broadcast/Rebuild/Attend).
-    fn with_id(step: u32, id: MigrationTransferId) -> *mut Self {
+    /// A step that names a transaction but carries no batch payload (Broadcast/Rebuild/Attend).
+    fn with_id(
+        step: u32,
+        id: MigrationTransferId,
+        next: Option<(BlockHeight, StepKind)>,
+    ) -> *mut Self {
+        let (next_height, next_kind) = outlook_to_ffi(next);
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step,
             id: u32::from(id),
-            kind_is_preparation: false,
-            kind_layer: 0,
-            kind_index: 0,
-            kind_crossing: 0,
+            prove_targets: ptr::null_mut(),
+            prove_targets_len: 0,
+            next_height,
+            next_kind,
         }))
     }
 
     /// A payload-free step (Waiting/Complete).
-    fn bare(step: u32) -> *mut Self {
+    fn bare(step: u32, next: Option<(BlockHeight, StepKind)>) -> *mut Self {
+        let (next_height, next_kind) = outlook_to_ffi(next);
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step,
             id: 0,
-            kind_is_preparation: false,
-            kind_layer: 0,
-            kind_index: 0,
-            kind_crossing: 0,
+            prove_targets: ptr::null_mut(),
+            prove_targets_len: 0,
+            next_height,
+            next_kind,
         }))
     }
 
-    /// The Prove step, carrying the transaction's kind so the platform can route it (preparations
-    /// prove against the tip anchor, transfers against their drawn boundary).
-    fn prove(id: MigrationTransferId, kind: MigrationTxKind) -> *mut Self {
-        let (kind_is_preparation, kind_layer, kind_index, kind_crossing) = match kind {
-            MigrationTxKind::Preparation { layer, index } => (true, layer as u32, index as u32, 0),
-            MigrationTxKind::Transfer { crossing } => (false, 0, 0, crossing as u32),
-        };
+    /// The Prove step, carrying the whole provable set (upstream #2939): each entry's kind lets the
+    /// platform route it without a lookup, and its `schedule_due` says whether the delivery lane is
+    /// blocked on that proof.
+    ///
+    /// `schedule_due` is read off the stored row's scheduled height against
+    /// [`DuenessTargets::effective`] — schedule dueness is the wall-clock estimate's to accelerate
+    /// (see the section comment above [`estimated_target_from_tip`]) — using the SAME `targets` the
+    /// [`drive_advance`] call that produced `transactions` judged with, so the flag can never
+    /// disagree with the batch it annotates. A row the batch names but the stored run does not
+    /// contain cannot happen (the engine draws the batch from that run); it reads as not due, which
+    /// is the answer that asks the platform for nothing.
+    fn prove(
+        state: &MigrationState,
+        transactions: &[ProveTarget],
+        targets: DuenessTargets,
+        next: Option<(BlockHeight, StepKind)>,
+    ) -> *mut Self {
+        let targets_ffi: Vec<FfiProveTarget> = transactions
+            .iter()
+            .map(|t| {
+                let (kind_is_preparation, kind_layer, kind_index, kind_crossing) = match t.kind() {
+                    MigrationTxKind::Preparation { layer, index } => {
+                        (true, layer as u32, index as u32, 0)
+                    }
+                    MigrationTxKind::Transfer { crossing } => (false, 0, 0, crossing as u32),
+                };
+                let schedule_due = state
+                    .transactions()
+                    .iter()
+                    .any(|row| row.id() == t.id() && row.scheduled_height() <= targets.effective());
+                FfiProveTarget {
+                    id: u32::from(t.id()),
+                    kind_is_preparation,
+                    kind_layer,
+                    kind_index,
+                    kind_crossing,
+                    schedule_due,
+                }
+            })
+            .collect();
+        let (prove_targets, prove_targets_len) = ptr_from_vec(targets_ffi);
+        let (next_height, next_kind) = outlook_to_ffi(next);
         Box::into_raw(Box::new(FfiMigrationAdvanceStep {
             step: ZCASHLC_ADVANCE_STEP_PROVE,
-            id: u32::from(id),
-            kind_is_preparation,
-            kind_layer,
-            kind_index,
-            kind_crossing,
+            id: 0,
+            prove_targets,
+            prove_targets_len,
+            next_height,
+            next_kind,
         }))
     }
 }
@@ -1661,44 +1940,35 @@ pub struct FfiNoteSplitProposal {
     pub proposal_handle: u64,
 }
 
-/// What a [`FfiPreparedTransfer`] carries, so the delivery lane's three outcomes stay distinct
-/// instead of collapsing into one all-null sentinel.
+/// One transaction handed to the platform, always populated; a NULL return signals an error.
 ///
-/// The variants carry a `Migration` prefix of their own: cbindgen emits C enum variants
-/// unqualified unless two enums collide, and these names land in the global namespace of a header
-/// that ships to consuming apps.
-#[repr(C)]
-pub enum FfiPreparedTransferStatus {
-    /// Nothing is due: nothing scheduled yet, dependencies unmined, rows awaiting an external
-    /// signature, or everything already broadcast. `id` and `pczt` are null.
-    MigrationNothingDue,
-    /// A proven transaction is ready to broadcast: `id`, `txid` and `pczt` are all populated.
-    MigrationReady,
-    /// A transaction is DUE but not yet proved, so this call has nothing to broadcast: `id` names
-    /// the row waiting on a proof, `pczt` is null and `txid` zeroed. The delivery lane never
-    /// proves; the platform clears this by running `zcashlc_migration_prove_pending` (which it
-    /// should be running as blocks are scanned anyway) and calling again.
-    MigrationAwaitingProof,
-}
-
-/// A fully proven, signed transaction persisted as a PCZT, ready for the platform to broadcast.
-/// When returned by `zcashlc_migration_next_due_transfer`, `status` distinguishes a broadcastable
-/// transaction from the two empty outcomes (see [`FfiPreparedTransferStatus`]); a NULL return
-/// signals an error.
+/// There is no "nothing due" or "awaiting proof" shape here any more. Those were the answers of a
+/// lane that ASKED the engine what to deliver; the executors that replaced it are told what to
+/// deliver by a prior [`zcashlc_migration_advance_step`], so a call that reaches this type has an
+/// instruction to serve and either serves it or fails.
+///
+/// WHAT THE ARTIFACT IS depends on which entry point produced the value, because the producers
+/// hand back different stages of the same transaction:
+/// - `zcashlc_migration_take_broadcast_transaction` (the drive's BROADCAST instruction) and
+///   `zcashlc_migration_sign_note_split` (the ceremony handback) both serve through the store's
+///   atomic broadcast seam, so their artifact is the FINALIZED CONSENSUS TRANSACTION — submit it
+///   as-is.
+/// - The storage receipt `zcashlc_migration_store_signed_note_split_pczts` returns is a serialized
+///   PCZT, not submittable until the engine has proved it and a later
+///   `zcashlc_migration_take_broadcast_transaction` serves the broadcastable, proven value once a
+///   crank names it.
 #[repr(C)]
 pub struct FfiPreparedTransfer {
-    /// The transaction's id (the engine's raw id). Meaningful only when `pczt` is non-null; the
-    /// "nothing due" sentinel leaves it `0`.
+    /// The transaction's id (the engine's raw id).
     pub id: u32,
     /// The finalized transaction's id, as raw (internal-order) 32-byte value (zeroed when the
     /// value is a storage receipt whose transaction has not been proven yet).
     pub txid: [u8; 32],
-    /// Heap `pczt_len`-byte serialized PCZT (null unless `status` is
-    /// [`FfiPreparedTransferStatus::MigrationReady`]).
+    /// The heap `pczt_len`-byte artifact — a finalized transaction or a serialized PCZT per the
+    /// producer, as the type doc above spells out. The field keeps its historical name for ABI
+    /// compatibility.
     pub pczt: *mut u8,
     pub pczt_len: usize,
-    /// Which of the three delivery outcomes this value is.
-    pub status: FfiPreparedTransferStatus,
 }
 
 impl FfiPreparedTransfer {
@@ -1714,28 +1984,39 @@ impl FfiPreparedTransfer {
             txid,
             pczt,
             pczt_len,
-            status: FfiPreparedTransferStatus::MigrationReady,
         })))
     }
+}
 
-    /// The "due, but its proof has not been produced yet" outcome: the row's id with no artifact.
-    fn awaiting_proof(id: MigrationTransferId) -> anyhow::Result<*mut Self> {
-        Ok(Box::into_raw(Box::new(FfiPreparedTransfer {
-            id: u32::from(id),
-            txid: [0u8; 32],
-            pczt: ptr::null_mut(),
-            pczt_len: 0,
-            status: FfiPreparedTransferStatus::MigrationAwaitingProof,
-        })))
-    }
+/// What one [`zcashlc_migration_prove_transactions`] call proved: the total count, and the txids
+/// of the PREPARATIONS among them. Always populated; a NULL return signals an error.
+///
+/// `total_proved == 0` with an empty `preparation_txids` is the ordinary "nothing in this batch is
+/// provable right now" answer (also: no stored run, or a terminal one).
+///
+/// THE TXIDS ARE PREPARATIONS' AND NOTHING ELSE. A proved preparation is a complete PCZT whose
+/// submission is the platform's ORDINARY path — retrieve it with
+/// [`zcashlc_migration_take_preparation_by_txid`] and submit it like any other raw transaction —
+/// whereas a transfer crosses the turnstile on the drive's own schedule and is served by a
+/// BROADCAST instruction alone. A transfer's txid therefore never appears here, because appearing
+/// here means "retrievable".
+#[repr(C)]
+pub struct FfiMigrationProveOutcome {
+    /// How many of the named transactions this call proved — preparations AND transfers.
+    pub total_proved: u32,
+    /// Heap array of `preparation_txids_len` raw (internal-order) 32-byte txids: the preparations
+    /// this call proved, in the order it proved them.
+    pub preparation_txids: *mut [u8; 32],
+    pub preparation_txids_len: usize,
+}
 
-    fn none() -> *mut Self {
-        Box::into_raw(Box::new(FfiPreparedTransfer {
-            id: 0,
-            txid: [0u8; 32],
-            pczt: ptr::null_mut(),
-            pczt_len: 0,
-            status: FfiPreparedTransferStatus::MigrationNothingDue,
+impl FfiMigrationProveOutcome {
+    fn from_outcome(outcome: ProveOutcome) -> *mut Self {
+        let (preparation_txids, preparation_txids_len) = ptr_from_vec(outcome.preparation_txids);
+        Box::into_raw(Box::new(FfiMigrationProveOutcome {
+            total_proved: outcome.total_proved,
+            preparation_txids,
+            preparation_txids_len,
         }))
     }
 }
@@ -1755,24 +2036,6 @@ pub struct FfiTransferProposal {
     pub next_executable_after_height: i64,
     /// The height after which this transfer is no longer valid.
     pub expiry_height: i64,
-}
-
-impl FfiTransferProposal {
-    fn boxed(
-        id: MigrationTransferId,
-        amount: Zatoshis,
-        now_reference: BlockHeight,
-        next_executable_after: BlockHeight,
-        expiry: BlockHeight,
-    ) -> anyhow::Result<*mut Self> {
-        Ok(Box::into_raw(Box::new(FfiTransferProposal {
-            id: u32::from(id),
-            amount: zat_to_i64(amount),
-            anchor_height: i64::from(u32::from(now_reference)),
-            next_executable_after_height: i64::from(u32::from(next_executable_after)),
-            expiry_height: i64::from(u32::from(expiry)),
-        })))
-    }
 }
 
 /// A single note-preparation transaction in a schedule preview (element of
@@ -2008,7 +2271,7 @@ pub struct FfiMigrationTransactionStatuses {
 ///
 /// This crate's first string-array FFI output type: kept intentionally minimal (unlike
 /// [`FfiUnsignedTransferPczts`], there is no paired per-element id or byte blob here, just
-/// strings), rather than generalizing [`ffi::BoxedSlice`] (a single binary blob, not an array) or
+/// strings), rather than generalizing [`crate::ffi::BoxedSlice`] (a single binary blob, not an array) or
 /// inventing a shared generic array wrapper for a need that has arisen exactly once so far.
 #[repr(C)]
 pub struct FfiKeystoneQrParts {
@@ -2085,15 +2348,16 @@ fn cstring_raw(s: &str, what: &str) -> anyhow::Result<*mut c_char> {
 
 // ----- free functions -----
 
-/// Frees a [`FfiMigrationAdvanceStep`].
+/// Frees a [`FfiMigrationAdvanceStep`], including its `prove_targets` batch array (if any).
 ///
 /// # Safety
 /// `ptr` must be null or point to a [`FfiMigrationAdvanceStep`] handed out by this module.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_free_migration_advance_step(ptr: *mut FfiMigrationAdvanceStep) {
     if !ptr.is_null() {
-        // Every field is plain data, so dropping the box is the whole of the cleanup.
-        drop(unsafe { Box::from_raw(ptr) });
+        let boxed = unsafe { Box::from_raw(ptr) };
+        free_ptr_from_vec(boxed.prove_targets, boxed.prove_targets_len);
+        drop(boxed);
     }
 }
 
@@ -2164,6 +2428,19 @@ pub unsafe extern "C" fn zcashlc_free_migration_prepared_transfer(ptr: *mut FfiP
     }
 }
 
+/// Frees a [`FfiMigrationProveOutcome`], including its preparation-txid array.
+///
+/// # Safety
+/// `ptr` must be null or point to a [`FfiMigrationProveOutcome`] handed out by this module.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_migration_prove_outcome(ptr: *mut FfiMigrationProveOutcome) {
+    if !ptr.is_null() {
+        let boxed = unsafe { Box::from_raw(ptr) };
+        free_ptr_from_vec(boxed.preparation_txids, boxed.preparation_txids_len);
+        drop(boxed);
+    }
+}
+
 /// Frees a [`FfiMigrationSchedule`], its transfer rows, and its preparation rows (including each
 /// preparation's own `depends_on` array).
 ///
@@ -2179,19 +2456,6 @@ pub unsafe extern "C" fn zcashlc_free_migration_schedule(ptr: *mut FfiMigrationS
             free_ptr_from_vec(p.depends_on, p.depends_on_len);
         });
         drop(boxed);
-    }
-}
-
-/// Frees a standalone [`FfiTransferProposal`] (as returned by
-/// `zcashlc_migration_pending_transfer_proposal`).
-///
-/// # Safety
-/// `ptr` must be null or point to a [`FfiTransferProposal`] handed out by this module.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_free_migration_transfer_proposal(ptr: *mut FfiTransferProposal) {
-    if !ptr.is_null() {
-        // The id is a plain `u32`; dropping the box is the whole of the cleanup.
-        drop(unsafe { Box::from_raw(ptr) });
     }
 }
 
@@ -2296,24 +2560,67 @@ pub unsafe extern "C" fn zcashlc_free_migration_keystone_batch_decode_result(
 
 /// The account's live spendable Orchard balance (what is still in the old pool).
 fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
-    let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+    let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
     use zcash_pool_migration::engine::MigrationBackend;
-    let values = backend.spendable_orchard_note_values()?;
+    let values = backend
+        .spendable_orchard_note_values()
+        .map_err(|e| anyhow!("reading the account's spendable Orchard notes failed: {e}"))?;
     values
         .into_iter()
         .try_fold(Zatoshis::ZERO, |acc, v| acc + v)
         .ok_or_else(|| anyhow!("spendable Orchard balance overflows"))
 }
 
+/// One verified crank of the engine's drive: builds the store adapter, judges dueness at the
+/// scanned target plus the FFI's optional `estimated_tip` (`-1` = none), and returns the
+/// engine's `Advance` with every determination it made already persisted.
+///
+/// # Invariant: this is the CONDUIT's crank, and nothing else's
+///
+/// [`zcashlc_migration_advance_step`] is its only caller, and must stay so. By design,
+/// `advance_migration` is the top-level call and every invocation is subservient to it: there is
+/// no invocation to prove without *first* having called `advance_migration` — which gives the
+/// caller the instruction of what must be proved — and `advance_migration` is never used as an
+/// internal call of a more specialized operation.
+///
+/// So the specialized operations — [`zcashlc_migration_prove_transactions`] and
+/// [`zcashlc_migration_take_broadcast_transaction`] — take the instruction the platform already
+/// holds and execute it. Cranking from inside one of them would both invert that relationship and
+/// double-crank whenever the platform had already advanced to learn what to do: each crank
+/// persists the engine's determinations, including the ZIP 318 overdue re-spread, so a hidden
+/// second one is not free.
+fn drive_advance(
+    ctx: &mut CallCtx,
+    state: &mut MigrationState,
+    estimated_tip: i64,
+) -> anyhow::Result<Advance> {
+    let targets = dueness_targets(ctx.tip()?, estimated_tip);
+    let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+    advance_migration(
+        &mut store,
+        state,
+        targets,
+        &AdvanceConfig::new(ReorgSettleDepth::new(
+            zcash_pool_migration::scheduling::PROVABLE_ANCHOR_DEPTH,
+        )),
+        // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
+        // inter-broadcast gaps, so advancing needs entropy.
+        &mut OsRng,
+    )
+    .map_err(|e| anyhow!("advancing the migration failed: {e}"))
+}
+
 /// Advances the stored run with upstream's public satisfiability API, using scanned and estimated
-/// targets plus a ten-block reorg-settle depth. Reevaluate and Replan are projected onto the
-/// existing Attend DTO case so the Swift public enum remains source-compatible.
+/// targets plus the provable-anchor reorg-settle depth. Every upstream step marshals onto its own
+/// discriminant — Reevaluate and Replan included (bare, as upstream carries them; the collapsed
+/// Attend projection is retired).
 ///
 /// Returns NULL **with no error recorded** when `get_migration()` returns `None` — no run is
 /// stored, so there is nothing to advance and no step to report. Distinguish that benign NULL
 /// from an error NULL via `zcashlc_last_error_length`. A stored TERMINAL run (Complete, or
 /// Failed/cancelled) reports the `Complete` step VERBATIM, exactly as upstream's `next_step`
-/// does — a cancelled run is never driven further, and is NEVER remapped to any other step.
+/// does — a cancelled run is never driven further, and is NEVER remapped to any other step; it
+/// also carries no outlook (`next_height = -1`), same as every other terminal answer below.
 /// (The terminal check here is upstream's own first check, hoisted only so the answer needs no
 /// chain-tip lookup — the same answer `next_step` would give, available on a wallet that never
 /// saw a chain tip.)
@@ -2334,11 +2641,13 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
         // transaction and promotes the ones the wallet's scan has seen mine, so reconciling first
         // would only ask the same question twice.
         let Some(mut state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
             // `latest_migration`, not the trait's `get_migration`: upstream made the latter
             // PENDING-ONLY, and this conduit's contract still reports `Complete` (below) for a
             // terminal stored run rather than "no run".
-            backend.latest_migration()?
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             // No stored run: NULL with NO error (see the function doc). Returned before any
             // chain-tip lookup, so it holds even before the wallet ever saw a chain tip.
@@ -2346,52 +2655,46 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
         };
         // Upstream `next_step`'s own first check, hoisted ahead of the target lookup (not a
         // carve-out — identical answers): a cancelled or failed run reports Complete even on a
-        // wallet with no chain tip, and is never driven further.
+        // wallet with no chain tip, and is never driven further. No outlook is knowable either
+        // (no targets were even looked up), so this hoisted answer carries `None`, same as every
+        // other Complete below.
         if state.is_terminal() {
-            return Ok(FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE));
+            return Ok(FfiMigrationAdvanceStep::bare(
+                ZCASHLC_ADVANCE_STEP_COMPLETE,
+                None,
+            ));
         }
         let targets = dueness_targets(ctx.tip()?, estimated_tip);
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        let step = advance_migration(
-            &mut backend,
-            &mut state,
-            targets,
-            &AdvanceConfig::new(ReorgSettleDepth::new(10)),
-            // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
-            // inter-broadcast gaps, so advancing needs entropy.
-            &mut OsRng,
-        )?
-        // librustzcash #2936: the advance returns the verified step plus a next-wake outlook;
-        // this conduit marshals the step alone (no FFI field carries the outlook yet).
-        .step();
-        Ok(match step {
-            AdvanceStep::Reevaluate | AdvanceStep::Replan => {
-                let id = state
-                    .transaction_statuses(targets)
-                    .into_iter()
-                    .find(|status| {
-                        matches!(
-                            status.blocked_on(),
-                            Some(
-                                Blocker::AwaitingReevaluation
-                                    | Blocker::Unsatisfiable
-                                    | Blocker::Expired
-                            )
-                        )
-                    })
-                    .map(|status| status.id())
-                    .unwrap_or_else(|| MigrationTransferId::new(0));
-                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_ATTEND, id)
+        // librustzcash #2936: the advance returns the verified step plus a next-wake OUTLOOK
+        // (`Advance::next`) — this conduit marshals both, the step via the borrow `.step()`
+        // returns and the outlook via `.next()`, onto every arm below.
+        let advance = drive_advance(&mut ctx, &mut state, estimated_tip)?;
+        let next = advance.next();
+        Ok(match advance.step() {
+            // Both are BARE: neither upstream step names a transaction — Replan is a verdict
+            // about the RUN (its unsatisfiable share passed the committed threshold), Reevaluate
+            // asks for a sync and nothing else — and the retired Attend collapse synthesised an
+            // id at least one of them never had. The platform's per-row detail, when it wants
+            // one, is `transaction_statuses`' own blockers, not this step.
+            AdvanceStep::Replan => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_REPLAN, next),
+            AdvanceStep::Reevaluate => {
+                FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_REEVALUATE, next)
             }
-            AdvanceStep::Prove { id, kind } => FfiMigrationAdvanceStep::prove(id, kind),
+            AdvanceStep::Prove { transactions } => {
+                FfiMigrationAdvanceStep::prove(&state, transactions, targets, next)
+            }
             AdvanceStep::Broadcast { id } => {
-                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_BROADCAST, id)
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_BROADCAST, *id, next)
             }
             AdvanceStep::Rebuild { id } => {
-                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_REBUILD, id)
+                FfiMigrationAdvanceStep::with_id(ZCASHLC_ADVANCE_STEP_REBUILD, *id, next)
             }
-            AdvanceStep::Waiting => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_WAITING),
-            AdvanceStep::Complete => FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE),
+            AdvanceStep::Waiting => {
+                FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_WAITING, next)
+            }
+            AdvanceStep::Complete => {
+                FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_COMPLETE, next)
+            }
         })
     });
     unwrap_exc_or_null(res)
@@ -2425,8 +2728,10 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let engine_state = {
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         };
         if let Some(state) = engine_state.as_ref().filter(|state| !state.is_terminal()) {
             let (completed, total, next_ready) = active_run_progress(state);
@@ -2503,8 +2808,10 @@ pub unsafe extern "C" fn zcashlc_migration_sync_wakeups(
         };
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Ok(empty());
         };
@@ -2544,7 +2851,7 @@ pub unsafe extern "C" fn zcashlc_migration_sync_wakeups(
 /// The most recently scanned blocks' `(height, header time)` samples from the wallet database's
 /// `blocks` table, at most `window` rows, returned ASCENDING by height — the raw inputs the
 /// platform's measured-block-rate estimator projects an ESTIMATED chain tip from (fed back into
-/// [`zcashlc_migration_has_overdue_transfers`] / [`zcashlc_migration_next_due_transfer`] as
+/// [`zcashlc_migration_has_overdue_transfers`] / [`zcashlc_migration_advance_step`] as
 /// `estimated_tip`). A read-only, best-effort read of scanned-block metadata, mirroring the
 /// Android SDK's `blockRateSamplesNative`: a wallet with no scanned blocks yet — no readable
 /// `blocks` table, or no wallet-database file at all (the read-only open cannot create one) —
@@ -2735,9 +3042,9 @@ fn encode_transaction_status(
 /// such pass. No stored run, or a stored run with no transactions, returns an EMPTY container
 /// (`len == 0`) — not an error, the same convention as [`encode_empty_schedule`].
 ///
-/// This is a pure read: unlike [`zcashlc_migration_next_due_transfer`] it never drives a
-/// prove-ready `Signed` row through proving — a `Signed` row ready to prove is reported via
-/// `ready`/`action` (`action == 1`), not silently advanced to `Proved`.
+/// This is a pure read: unlike [`zcashlc_migration_advance_step`] it never drives anything — a
+/// `Signed` row ready to prove is reported via `ready`/`action` (`action == 1`), not silently
+/// advanced to `Proved`.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_transaction_statuses`].
@@ -2751,11 +3058,13 @@ pub unsafe extern "C" fn zcashlc_migration_transaction_statuses(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
             // `latest_migration`, not the pending-only `get_migration`: unlike the sibling reads
             // (whose terminal answer equals their no-run answer), this view keeps rendering a
             // TERMINAL run's rows — a completed migration's mined transfers stay listed.
-            backend.latest_migration()?
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Ok(encode_empty_transaction_statuses());
         };
@@ -2809,16 +3118,21 @@ pub unsafe extern "C" fn zcashlc_migration_is_note_split_needed(
 
 /// Whether any transaction of the stored run is due-and-unbroadcast — that is, whether the
 /// delivery lane has actionable work: an already-`Proved` transaction due for broadcast, or a
-/// due, dependency-satisfied, prove-ready `Signed` one that
-/// [`zcashlc_migration_next_due_transfer`] would drive through proving and serve (proofs are
-/// assumed to succeed — a transiently unwitnessable anchor defers the delivery, not this
-/// report; see [`due_assuming_proving`]). A row awaiting an EXTERNAL signature is not delivery
-/// work (the signing ceremony advances it). Returns `false` on error (see
-/// `zcashlc_last_error_message`).
+/// due, dependency-satisfied, prove-ready `Signed` one whose proof the platform's sweep
+/// ([`zcashlc_migration_prove_transactions`]) is expected to produce. Proofs are assumed to
+/// succeed: a transiently unwitnessable anchor defers the delivery, not this report. A row
+/// awaiting an EXTERNAL signature is not delivery work (the signing ceremony advances it). Returns
+/// `false` on error (see `zcashlc_last_error_message`).
 ///
-/// NOT the sync-gate's work-pending predicate: a `Signed` row it counts (due, but its proof not
-/// produced yet) must never hold sync hostage — that predicate is
-/// [`zcashlc_migration_has_ready_broadcast`], which answers for PROVED, servable work only.
+/// A display read over upstream's public status view (see [`due_assuming_proving`]), not a
+/// prediction of the lane: [`zcashlc_migration_advance_step`] is the verified drive, which
+/// additionally consults the store's oracle and may re-spread a slept-through backlog, so `true`
+/// here means "the run has work the platform owes it", not "the next advance will name that
+/// row".
+///
+/// NOT a sync gate: a `Signed` row it counts (due, but its proof not produced yet) must never
+/// hold sync hostage — it needs MORE syncing and proving, not a broadcast session, so a gate keyed
+/// on this query would wedge.
 ///
 /// `estimated_tip` (`-1` = disabled) is the platform's wall-clock chain-tip projection (from
 /// [`zcashlc_migration_block_rate_samples`]). Its handling is upstream's
@@ -2839,8 +3153,10 @@ pub unsafe extern "C" fn zcashlc_migration_has_overdue_transfers(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Ok(false);
         };
@@ -2873,8 +3189,10 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
         }) else {
             return Ok(false);
         };
@@ -2904,54 +3222,6 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
             .is_empty())
     });
     unwrap_exc_or(res, false)
-}
-
-/// Whether the stored, NON-TERMINAL run has a broadcast the platform could serve RIGHT NOW: a
-/// `Proved`, schedule-due, dependency-mined, unexpired transaction, per upstream's own
-/// broadcast-queue read (`next_due_broadcast`) at the [`dueness_targets`] of the scanned tip and
-/// `estimated_tip` (`-1` = disabled). Pure read of the PERSISTED run (read-only connections; no
-/// reconcile): a Broadcast row the wallet has since scanned as mined is reported Mined only after
-/// a write lane — the advance-step engine sweep, the prove sweep, or a delivery serve — persists
-/// the promotion; a platform drives one of those on its open-lane passes, sync edges, and
-/// UI-refresh passes, so a live run's reads trail a just-mined broadcast by at most one such pass.
-/// Returns `1` for yes, `0` for no (including no stored run and a terminal run), `-1` on error (see
-/// `zcashlc_last_error_message`).
-///
-/// This is the sync-gate's work-pending predicate: `1` means exactly "a PROVED, due, unexpired,
-/// valid transfer is waiting", the one situation where the platform should broadcast instead of
-/// starting a sync (ZIP 318's broadcast-or-sync session split). `Signed` rows — even due ones —
-/// and rows awaiting a proof or an external signature must NEVER block sync (they need MORE
-/// syncing/other work, not a broadcast session), which is why the gate cannot be derived from
-/// [`zcashlc_migration_has_overdue_transfers`] (that query deliberately counts due-but-unproved
-/// work). Rows marked `Invalid` are excluded upstream (a dead transfer gates nothing), and so is
-/// a doomed broadcast whose expiry only the ESTIMATED target has passed (upstream's protective
-/// withhold — served again once the scanned tip proves it either way).
-///
-/// # Safety
-/// See [`open`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_has_ready_broadcast(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-    estimated_tip: i64,
-) -> i32 {
-    let res = catch_panic(|| {
-        let mut ctx = unsafe { open_read(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = ({
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            backend.get_migration()?
-        }) else {
-            return Ok(0);
-        };
-        if state.is_terminal() {
-            return Ok(0);
-        }
-        let targets = dueness_targets(ctx.tip()?, estimated_tip);
-        Ok(i32::from(state.next_due_broadcast(targets).is_some()))
-    });
-    unwrap_exc_or(res, -1)
 }
 
 /// The note-split preview for the account's live balance: the preparation output values and the
@@ -3018,54 +3288,25 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
 ) -> *mut FfiPreparedTransfer {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        // The decoded spending key is handed straight to the engine's signing entry point, which
+        // derives its own full viewing key and checks it against the account's before building
+        // anything. It never reaches the adapter: no migration type holds spend authority, so the
+        // key is live only for this call.
         let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
 
-        let (mut state, _) = commit_or_resume(&mut ctx, Some(usk), false, proposal_handle)?;
+        let (mut state, _) =
+            commit_or_resume(&mut ctx, Some(usk.orchard()), false, proposal_handle)?;
 
-        // The preparation transaction to prove now and return for immediate broadcast: upstream's
-        // own broadcast queue first, falling to its prove queue — a RESUMED ceremony must re-serve
-        // an earlier preparation that is already `Proved` and due before proving a later `Signed`
-        // sibling, something `next_provable` alone cannot see (it only ever names `Signed` rows); a
-        // fresh commit has no `Proved` row yet, so the order changes nothing there. Restricted to
-        // preparation rows, so this agrees with what `next_due`/`prove_pending_rows` will pick once
-        // the row is due — falling back (see the ceremony fallback below) only when neither read
-        // names a preparation, the same trigger as before this ordering. Proven now, against the
-        // wallet's scanned-tip anchor, and returned for the platform's immediate broadcast — this
-        // lane exists to hand back something to broadcast, so its proof cannot wait for a sweep.
-        // Remaining preparation transactions are proved by `zcashlc_migration_prove_pending` and
+        // The preparation transaction to prove now and return for immediate broadcast (see
+        // [`ceremony_preparation_pick`] for which row and why). Proven now, against the wallet's
+        // scanned-tip anchor, and returned for the platform's immediate broadcast — this lane
+        // exists to hand back something to broadcast, so its proof cannot wait for a sweep.
+        // Remaining preparation transactions are proved by
+        // `zcashlc_migration_prove_transactions` and
         // ride the normal delivery lane as they come due.
         let target = ctx.target()?;
-        let targets = DuenessTargets::at(target);
-        let engine_pick = state
-            .next_due_broadcast(targets)
-            .or_else(|| state.next_provable(targets, &[]))
-            .filter(|id| {
-                state.transactions().iter().any(|t| {
-                    t.id() == *id && matches!(t.kind(), MigrationTxKind::Preparation { .. })
-                })
-            });
-        // Ceremony fallback: the engine's queues answer None here — its drawn window opens a few
-        // blocks ahead, or a due TRANSFER short-circuits `next_due_broadcast` before
-        // `next_provable` is even consulted, and the kind filter above drops it. Either way, this
-        // hands back the same preparation the pre-change scan (and the engine, once due) would have.
-        let first_prep = engine_pick
-            .or_else(|| {
-                state
-                    .transactions()
-                    .iter()
-                    .filter(|t| {
-                        matches!(t.kind(), MigrationTxKind::Preparation { .. })
-                            && matches!(
-                                t.state(),
-                                MigrationTxState::Signed | MigrationTxState::Proved
-                            )
-                    })
-                    // Ties (equal `scheduled_height`) break by `id`, mirroring the engine's own
-                    // ordering key: deterministic on equal heights.
-                    .min_by_key(|t| (t.scheduled_height(), t.id()))
-                    .map(|t| t.id())
-            })
-            .ok_or_else(|| {
+        let first_prep =
+            ceremony_preparation_pick(&state, DuenessTargets::at(target)).ok_or_else(|| {
                 anyhow!("the committed migration has no broadcastable preparation transaction")
             })?;
         if !prove_one(&mut ctx, &mut state, first_prep)? {
@@ -3073,8 +3314,15 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
                 "the note split is not yet finalizable — its funding note is not witnessable; sync first"
             ));
         }
-        let (proven, txid) = serve_proved(&state, first_prep)?;
-        FfiPreparedTransfer::from_parts(first_prep, txid, proven)
+        // Through the SAME broadcast seam the delivery executor uses, so the ceremony's handback is
+        // a finalized consensus transaction the platform submits as-is and the wallet's own record
+        // of it binds here rather than after the submit. This lane is deliberately pre-schedule —
+        // the commit persists the run, the prove above stores the wallet record of the proof, and
+        // the platform records the broadcast — which is why it hands a transaction back at all
+        // instead of deferring to the drive, whose window for this preparation opens a few blocks
+        // ahead.
+        let (raw, txid) = serve_for_broadcast(&mut ctx, &state, first_prep)?;
+        FfiPreparedTransfer::from_parts(first_prep, txid, raw)
     });
     unwrap_exc_or_null(res)
 }
@@ -3096,8 +3344,11 @@ pub unsafe extern "C" fn zcashlc_migration_residual_after_migration(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         {
-            let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-            if let Some(state) = backend.get_migration()? {
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            if let Some(state) = store
+                .get_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
+            {
                 if !state.is_terminal() {
                     return Ok(state.denominations().change().map_or(-1, zat_to_i64));
                 }
@@ -3140,7 +3391,7 @@ pub unsafe extern "C" fn zcashlc_migration_lock_residual(
 ) -> i64 {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        // Selection targets the next block, mirroring `Backend::selection_target`.
+        // Selection targets the next block, mirroring the adapter's own selection target.
         let target = TargetHeight::from(u32::from(ctx.tip()?) + 1);
         let received = ctx
             .wallet
@@ -3247,7 +3498,7 @@ pub unsafe extern "C" fn zcashlc_migration_estimate_runs(
 ) -> *mut FfiMigrationRunEstimate {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+        let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
         let mut rng = OsRng;
         let estimate = match engine::estimate_migration_runs(&ctx.network, &backend, &mut rng) {
             Ok(estimate) => Some(estimate),
@@ -3344,177 +3595,244 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
-        commit_or_resume(&mut ctx, Some(usk), false, proposal_handle)?;
+        commit_or_resume(&mut ctx, Some(usk.orchard()), false, proposal_handle)?;
         Ok(true)
     });
     unwrap_exc_or(res, false)
 }
 
-/// Proves every migration transaction of the stored run whose anchor the wallet can resolve right
-/// now, persisting each proof, and returns HOW MANY were proved (`0` is the ordinary "nothing left
-/// to prove" answer; `-1` signals an error — see `zcashlc_last_error_message`).
+/// Proves the NAMED migration transactions — the instruction a prior
+/// [`zcashlc_migration_advance_step`] call returned as its PROVE step — persisting each proof, and
+/// returns a [`FfiMigrationProveOutcome`]: how many were proved, and THE TXIDS OF THE PREPARATIONS
+/// IT PROVED. A `total_proved` of `0` with no txids is the ordinary "nothing left to prove NOW"
+/// answer; NULL signals an error (see `zcashlc_last_error_message`).
+///
+/// THE TXIDS ARE THE HANDOFF. A proved preparation is a complete PCZT and the engine's contract is
+/// that it is broadcast as soon as it is proved, so the platform takes each returned txid to
+/// [`zcashlc_migration_take_preparation_by_txid`] and submits the bytes through its ordinary
+/// raw-transaction machinery. Transfers are NEVER named: they are delivered by the drive's
+/// BROADCAST instruction alone.
+///
+/// THIS EXECUTOR NEVER ASKS THE ENGINE WHAT TO PROVE. `advance_migration` is the top-level call
+/// and every invocation is subservient to it: there is no proving to do without first having been
+/// instructed what to prove, so this takes the ids it was told and does not crank the drive to
+/// second-guess them (see [`drive_advance`]). Whether a candidate is worth proving at all — the
+/// store's satisfiability verification — and whether a due broadcast outranks proving this session
+/// are the advance's decisions, made before the batch was handed out.
+///
+/// PER ROW (see [`prove_named_rows`]): a transaction that is no longer `Signed` is a SKIP, so a
+/// stale instruction is safe (the engine re-offers un-recorded work on the next crank); a
+/// transaction whose anchor is not scanned/retained yet is likewise skipped and retried later; and
+/// a successful proof persists through the store seam before this returns.
+///
+/// `max_proofs <= 0` means unlimited. A platform whose database access serializes behind one actor
+/// should pass `1` and loop with a yield between calls, re-passing the SAME ids: the rows it
+/// already proved skip for free, so the chunking works without re-cranking the drive between
+/// chunks.
 ///
 /// Call this opportunistically as the wallet scans (proofs are wanted long before their
 /// transactions come due), not on the broadcast path: proving needs the wallet's commitment tree
-/// and takes real time, while `zcashlc_migration_next_due_transfer` must only broadcast. A
-/// transaction whose anchor is not scanned/retained yet is skipped and retried by a later call, so
-/// this is safe to run on any schedule, including mid-sync.
+/// and takes real time, while the broadcast executor must only broadcast.
 ///
 /// # Safety
-/// See [`open`].
+/// See [`open`]; `ids` must be valid for reads of `ids_len` `u32` values. Free the returned
+/// pointer with [`zcashlc_free_migration_prove_outcome`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_prove_pending(
+pub unsafe extern "C" fn zcashlc_migration_prove_transactions(
     db_data: *const u8,
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
+    ids: *const u32,
+    ids_len: usize,
     max_proofs: i64,
-) -> i64 {
+) -> *mut FfiMigrationProveOutcome {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(mut state) = reconcile_mined(&mut ctx)? else {
-            return Ok(0);
+        let ids: Vec<MigrationTransferId> = unsafe { slice_or_empty(ids, ids_len) }
+            .iter()
+            .map(|id| MigrationTransferId::new(*id))
+            .collect();
+        // A plain load, NOT `reconcile_mined`: the advance that issued this instruction already
+        // swept in-flight transactions and promoted the ones the wallet's scan had seen mine, so
+        // reconciling here would ask the same `mined_height` question twice. A row promoted since
+        // is simply no longer `Signed`, which the per-row skip handles.
+        let Some(mut state) = ({
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
+        }) else {
+            return Ok(FfiMigrationProveOutcome::from_outcome(
+                ProveOutcome::default(),
+            ));
         };
         if state.is_terminal() {
-            return Ok(0);
+            return Ok(FfiMigrationProveOutcome::from_outcome(
+                ProveOutcome::default(),
+            ));
         }
-        // `target = tip + 1`, the height every `MigrationState` query is defined over (see
-        // `CallCtx::target`; A1 — this sweep briefly fed the raw tip, which left a preparation
-        // scheduled exactly at the target un-proved for one extra block).
-        let target = ctx.target()?;
-        // `max_proofs <= 0` means unlimited. A platform whose DB access serializes behind one
-        // actor should pass 1 and loop with a yield between calls, so interactive reads
-        // interleave between proofs instead of waiting out the whole sweep.
         let cap = u32::try_from(max_proofs).ok().filter(|&n| n > 0);
-        let proved = prove_pending_rows(&mut state, target, cap, |state, id| {
-            prove_one(&mut ctx, state, id)
+        let outcome = prove_named_rows(&mut ctx, &mut state, &ids, cap, |ctx, state, id| {
+            prove_one(ctx, state, id)
         })?;
-        Ok(i64::from(proved))
+        Ok(FfiMigrationProveOutcome::from_outcome(outcome))
     });
-    unwrap_exc_or(res, -1)
+    unwrap_exc_or_null(res)
 }
 
-/// The next due transaction of the stored run, already proven and ready to broadcast — or, per
-/// `status`, "nothing is due" or "due, but its proof has not been produced yet" (see
-/// [`FfiPreparedTransferStatus`]). Reconciles mined transactions first. Serves preparation
-/// transactions and transfers alike, in scheduled order.
+/// Serves the named transaction for broadcast — the instruction a prior
+/// [`zcashlc_migration_advance_step`] call returned as its BROADCAST step.
 ///
-/// This call NEVER proves: proofs are produced by `zcashlc_migration_prove_pending` as the wallet
-/// scans, so broadcasting stays a pure delivery step. A platform that has not swept sees
-/// `AwaitingProof` and can sweep then retry, rather than paying proving latency here.
+/// THIS EXECUTOR NEVER ASKS THE ENGINE WHAT TO SERVE. `advance_migration` is the top-level call
+/// and every invocation is subservient to it: there is no broadcast to make without first having
+/// been instructed to make it, so this takes the id it was told and does not crank the drive to
+/// second-guess it (see [`drive_advance`]). The re-spread, the satisfiability verification and the
+/// dueness judgement all happened in the advance that issued the instruction.
 ///
-/// `estimated_tip` (`-1` = disabled) follows upstream's [`DuenessTargets`] rule: it may only
-/// ACCELERATE scheduled-height due-ness; expiry is always evaluated against the SCANNED tip
-/// (with the doomed-broadcast withhold when only the estimate has passed an expiry) — the same
-/// rule as [`zcashlc_migration_has_overdue_transfers`].
+/// The serve goes through the store's atomic broadcast seam
+/// (`PoolMigrations::take_transaction_for_broadcast` via [`serve_for_broadcast`]): finalize, extract,
+/// and record the transaction in the wallet's own tables, in one database transaction with handing
+/// the bytes back — so the wallet's record of a transaction the platform is about to submit binds
+/// at the attempt rather than after it. Retrying a failed submission re-serves the same
+/// transaction over the same record.
+///
+/// STALENESS is the seam's own refusal of a non-`Proved` row: an instruction that has gone stale
+/// between the advance and this call fails here rather than being acted on, with the
+/// `MIGRATION_PROVING_UNAVAILABLE` prefix reserved for "the stored artifact cannot be turned into
+/// servable bytes" and lifecycle refusals left bare (see [`broadcast_seam_error`]). The returned
+/// artifact is the FINALIZED CONSENSUS TRANSACTION, submittable as-is, paired with the row's
+/// stored txid to submit-and-record under.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_prepared_transfer`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_next_due_transfer(
+pub unsafe extern "C" fn zcashlc_migration_take_broadcast_transaction(
     db_data: *const u8,
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-    estimated_tip: i64,
+    id: u32,
 ) -> *mut FfiPreparedTransfer {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
-            return Ok(FfiPreparedTransfer::none());
+        let id = MigrationTransferId::new(id);
+        // A plain load, NOT `reconcile_mined`: the advance that issued this instruction already
+        // swept in-flight transactions and promoted the ones the wallet's scan had seen mine, so
+        // reconciling here would ask the same `mined_height` question twice.
+        let Some(state) = ({
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
+        }) else {
+            return Err(anyhow!(
+                "no migration run is stored, so transaction {} cannot be served for broadcast",
+                u32::from(id)
+            ));
         };
-        if state.is_terminal() {
-            return Ok(FfiPreparedTransfer::none());
-        }
-        let targets = dueness_targets(ctx.tip()?, estimated_tip);
-        match next_due(&state, targets) {
-            DueOutcome::Ready { id } => {
-                let (pczt, txid) = serve_proved(&state, id)?;
-                FfiPreparedTransfer::from_parts(id, txid, pczt)
-            }
-            DueOutcome::AwaitingProof { id } => FfiPreparedTransfer::awaiting_proof(id),
-            DueOutcome::Nothing => Ok(FfiPreparedTransfer::none()),
-        }
+        let (raw, txid) = serve_for_broadcast(&mut ctx, &state, id)?;
+        FfiPreparedTransfer::from_parts(id, txid, raw)
     });
     unwrap_exc_or_null(res)
 }
 
-/// The next due-and-unbroadcast TRANSFER of the stored run as a proposal row (id, amount, its
-/// scheduled and expiry heights), or NULL with no error when there is none. Distinguish the two
-/// NULL meanings via `zcashlc_last_error_length`.
+/// Serves the PROVED PREPARATION with the given txid for submission — the retrieval half of the
+/// handoff [`zcashlc_migration_prove_transactions`] opens by returning the preparations' txids.
 ///
-/// "Due-and-unbroadcast" matches what [`zcashlc_migration_next_due_transfer`] would serve: an
-/// already-`Proved` due transfer, or a due, prove-ready `Signed` one the delivery call would
-/// first drive through proving (see [`due_assuming_proving`] — this query itself never proves;
-/// it reports the row the delivery lane is being driven toward, assuming its proof succeeds).
-/// NULL when the would-be-served transaction is a preparation, when due rows still await an
-/// external signature, or when nothing is due.
+/// THE RULING THIS IMPLEMENTS. A proved preparation is a complete PCZT (signatures and proofs);
+/// its submission is the ORDINARY path, not the engine's delivery ceremony — preparations are
+/// ZIP 318-exempt, and the engine's own contract is that a preparation is broadcast as soon as it
+/// is proved. So the platform submits it through whatever machinery it already uses for raw
+/// transactions, and records the outcome through the standard
+/// [`zcashlc_migration_record_transfer_result`] path.
+///
+/// THIS ACCESSOR IS THE TAKE SEAM, NOT A BYTE READ. `txid -> row -> take_transaction_for_broadcast`
+/// (via [`serve_for_broadcast`]) in ONE database transaction: the wallet's own record of the
+/// transaction binds AT RETRIEVAL, so a platform can never hold submittable bytes the wallet knows
+/// nothing about. It is idempotent — a consumer that crashed between retrieving and submitting
+/// re-retrieves exactly the same bytes over the same record.
+///
+/// PREPARATION-GATED. A txid naming a TRANSFER is refused: transfers are served by the drive's
+/// broadcast instruction alone. The refusal is bare, as an unknown txid is, because both are
+/// questions about WHICH row was named rather than about whether an artifact can be made servable
+/// — the distinction [`broadcast_seam_error`] draws, and the one the
+/// `MIGRATION_PROVING_UNAVAILABLE` prefix is reserved for. The seam's own refusal of a
+/// non-`Proved` row is what remains as the READINESS gate: a preparation whose proof this process
+/// has not persisted is not servable, and the caller proves again rather than retrying here.
+///
+/// TAKEN BUT NEVER SUBMITTED is a bounded, engine-modelled state, not a leak: the record is
+/// idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces through
+/// the ordinary attention path once it expires. SUBMITTED BUT NEVER MARKED is likewise bounded:
+/// the platform reports the landed submission through
+/// [`zcashlc_migration_record_transfer_result`] as the ordinary close of the loop, and a platform
+/// that crashed before doing so still converges — the engine promotes any in-flight transaction
+/// its scan sees mine, by the id it stored when it BUILT the transaction.
+///
+/// The returned DTO carries the ENGINE TRANSFER ID alongside the finalized transaction bytes and
+/// the row's stored txid, so the platform records the submission's outcome through the standard
+/// record path with no identity of its own to keep.
 ///
 /// # Safety
-/// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_transfer_proposal`].
+/// See [`open`]; `txid_ptr` must be non-null and valid for reads of 32 bytes (a null pointer is
+/// refused rather than read). Free the returned pointer with
+/// [`zcashlc_free_migration_prepared_transfer`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_pending_transfer_proposal(
+pub unsafe extern "C" fn zcashlc_migration_take_preparation_by_txid(
     db_data: *const u8,
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-) -> *mut FfiTransferProposal {
+    txid_ptr: *const u8,
+) -> *mut FfiPreparedTransfer {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let Some(state) = reconcile_mined(&mut ctx)? else {
-            return Ok(ptr::null_mut());
+        // Checked, not coerced: `slice_or_empty` only tolerates NULL at length 0, and reading 32
+        // bytes from a null pointer is undefined behaviour — which a public C ABI symbol must
+        // refuse rather than risk. Mirrors `zcashlc_migration_record_transfer_result`'s own
+        // null-check on the txid it takes.
+        if txid_ptr.is_null() {
+            return Err(anyhow!(
+                "txid_ptr is null; a preparation txid must be 32 bytes"
+            ));
+        }
+        let txid: [u8; 32] = unsafe { slice::from_raw_parts(txid_ptr, 32) }
+            .try_into()
+            .expect("length 32 by construction");
+        // A plain load, NOT `reconcile_mined`: this is a retrieval against the run as the last
+        // advance left it, and a row promoted since is simply no longer `Proved`, which the seam's
+        // own refusal handles.
+        let Some(state) = ({
+            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .latest_migration()
+                .map_err(|e| anyhow!("migration store read failed: {e}"))?
+        }) else {
+            return Err(anyhow!(
+                "no migration run is stored, so no preparation with txid {} can be served",
+                TxId::from_bytes(txid)
+            ));
         };
-        if state.is_terminal() {
-            return Ok(ptr::null_mut());
-        }
-        // `tip` is the display-only "now" reference the DTO carries (see
-        // `FfiTransferProposal::anchor_height`'s doc); `target` (`tip + 1`) is what the engine
-        // query below is actually defined over — see `CallCtx::target`. This query takes no
-        // estimated tip, so both due-ness targets coincide (`DuenessTargets::at`).
-        let tip = ctx.tip()?;
-        let target = target_from_tip(tip);
-        let next_transfer = due_assuming_proving(&state, DuenessTargets::at(target))
-            .and_then(|id| state.transactions().iter().find(|t| t.id() == id))
-            .filter(|t| matches!(t.kind(), MigrationTxKind::Transfer { .. }));
-        match next_transfer {
-            Some(tx) => {
-                let amount = transfer_amount(&state, tx)
-                    .ok_or_else(|| anyhow!("stored transfer has no valid net crossing amount"))?;
-                FfiTransferProposal::boxed(
-                    tx.id(),
-                    amount,
-                    tip,
-                    tx.scheduled_height(),
-                    tx.expiry_height(),
+        let row = state
+            .transactions()
+            .iter()
+            .find(|t| <[u8; 32]>::from(t.txid()) == txid)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no migration transaction with txid {}",
+                    TxId::from_bytes(txid)
                 )
-            }
-            None => Ok(ptr::null_mut()),
+            })?;
+        let id = row.id();
+        if !matches!(row.kind(), MigrationTxKind::Preparation { .. }) {
+            return Err(anyhow!(
+                "migration transaction {} is a transfer, not a preparation: transfers are served \
+                 by the drive's broadcast instruction alone",
+                u32::from(id)
+            ));
         }
-    });
-    unwrap_exc_or_null(res)
-}
-
-/// Extracts the consensus transaction bytes from a proven, finalized migration PCZT.
-///
-/// # Safety
-/// See [`open`]; `pczt_ptr` must be valid for reads of `pczt_len` bytes. Free the returned
-/// pointer with `zcashlc_free_boxed_slice`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_migration_extract_broadcast_tx(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-    pczt_ptr: *const u8,
-    pczt_len: usize,
-) -> *mut ffi::BoxedSlice {
-    let res = catch_panic(|| {
-        let _ = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let pczt_bytes = unsafe { slice_or_empty(pczt_ptr, pczt_len) };
-        let pczt =
-            pczt::Pczt::parse(pczt_bytes).map_err(|e| anyhow!("Error parsing PCZT: {e:?}"))?;
-        let (raw, _) = migration_finalize::extract_tx(pczt)?;
-        Ok(ffi::BoxedSlice::some(raw))
+        let (raw, served_txid) = serve_for_broadcast(&mut ctx, &state, id)?;
+        FfiPreparedTransfer::from_parts(id, served_txid, raw)
     });
     unwrap_exc_or_null(res)
 }
@@ -3523,8 +3841,8 @@ pub unsafe extern "C" fn zcashlc_migration_extract_broadcast_tx(
 /// `txid_bytes`, 32 raw bytes) — the transaction is marked broadcast, to be reconciled to mined
 /// as the wallet scans; 1 = network error (retryable — nothing is recorded, the transaction stays
 /// offered); 2 = invalid note, 3 = expired — each rejection is reported to the engine at the
-/// wallet's observed chain tip. The next advance reevaluates satisfiability and projects any
-/// resulting Reevaluate/Replan step onto the existing Attend DTO case.
+/// wallet's observed chain tip. The next advance reevaluates satisfiability and surfaces any
+/// resulting Reevaluate/Replan step on its own discriminant.
 ///
 /// An unknown id or already-mined transaction is left untouched; both still answer `true`, since
 /// the reported outcome was consumed.
@@ -3552,10 +3870,10 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
                 let txid: [u8; 32] = unsafe { slice::from_raw_parts(txid_bytes, 32) }
                     .try_into()
                     .expect("length 32 by construction");
-                let mut backend =
-                    Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-                let mut state = backend
-                    .get_migration()?
+                let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+                let mut state = store
+                    .get_migration()
+                    .map_err(|e| anyhow!("migration store read failed: {e}"))?
                     .ok_or_else(|| anyhow!("no migration is stored"))?;
                 // The engine records the broadcast under the id it derived when it BUILT the
                 // transaction, so the reported one is no longer an input. It is still checked:
@@ -3571,24 +3889,33 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
                     ));
                 }
                 state.mark_broadcast(id);
-                backend.replace_migration(&state)?;
+                store
+                    .replace_migration(&state)
+                    .map_err(|e| anyhow!("migration store write failed: {e}"))?;
                 Ok(true)
             }
             1 => Ok(true),
             2 | 3 => {
-                let mut backend =
-                    Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+                // The adapter, not the bare store: this arm dates its testimony against the
+                // ENGINE's chain tip (`MigrationBackend::chain_tip_height`), which is the
+                // backend's question, not the store's.
+                let mut backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
                 let mut state = backend
-                    .get_migration()?
+                    .get_migration()
+                    .map_err(|e| anyhow!("migration store read failed: {e}"))?
                     .ok_or_else(|| anyhow!("no migration is stored"))?;
                 if state
                     .transactions()
                     .iter()
                     .any(|tx| tx.id() == id && matches!(tx.state(), MigrationTxState::Proved))
                 {
-                    let observed_tip = backend.chain_tip_height()?;
+                    let observed_tip = backend
+                        .chain_tip_height()
+                        .map_err(|e| anyhow!("chain height lookup failed: {e}"))?;
                     state.report_broadcast_failure(id, observed_tip);
-                    backend.replace_migration(&state)?;
+                    backend
+                        .replace_migration(&state)
+                        .map_err(|e| anyhow!("migration store write failed: {e}"))?;
                 }
                 Ok(true)
             }
@@ -3655,13 +3982,16 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         {
-            let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
+            let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
             // The engine's own cancel: releases every note reservation the pending run's
             // never-broadcast transactions hold and records the terminal `Cancelled` status, in
             // one store transaction. Hand-writing `Failed` (the pre-locking behavior) would
             // leave those reservations standing, and the fresh plan below would select around
             // notes the abandoned run still holds.
-            backend.cancel_migration()?;
+            store
+                .cancel_migration()
+                .map(|_outcome| ())
+                .map_err(|e| anyhow!("cancelling the migration failed: {e}"))?;
         }
         match plan_and_cache(&mut ctx, false)? {
             Some((plan, reference_height, handle)) => {
@@ -3720,6 +4050,8 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
 ) -> *mut FfiMigrationSchedule {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        // As on the commit lane: the decoded key is handed to the engine's signing entry point
+        // here and nowhere else, and `None` is the external-signer lane that never had one.
         let usk = if usk_ptr.is_null() {
             if usk_len != 0 {
                 return Err(anyhow!("usk_len must be 0 when usk_ptr is null"));
@@ -3747,13 +4079,19 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
             return encode_schedule_from_state(&state, tip);
         }
 
-        let sign_in_process = usk.is_some();
         let mut rng = OsRng;
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, usk, &mut ctx.store_conn)?;
+        let mut backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
         for id in &expired {
-            if sign_in_process {
-                engine::rebuild_expired_transfer(&ctx.network, &backend, &mut state, *id, &mut rng)
-                    .map_err(map_rebuild_err)?;
+            if let Some(sk) = usk.as_ref().map(|usk| usk.orchard()) {
+                engine::rebuild_expired_transfer(
+                    &ctx.network,
+                    &backend,
+                    sk,
+                    &mut state,
+                    *id,
+                    &mut rng,
+                )
+                .map_err(map_rebuild_err)?;
             } else {
                 // The returned UnsignedMigrationTx is deliberately dropped: the rebuilt transfer
                 // is persisted `AwaitingSignature` below, and the ceremony re-serves those bytes
@@ -3768,42 +4106,12 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
                 .map_err(map_rebuild_err)?;
             }
         }
-        backend.replace_migration(&state)?;
+        backend
+            .replace_migration(&state)
+            .map_err(|e| anyhow!("migration store write failed: {e}"))?;
         encode_schedule_from_state(&state, tip)
     });
     unwrap_exc_or_null(res)
-}
-
-/// Fetches the account's ZIP 32 seed fingerprint and account index, required to annotate
-/// external-signer (Keystone) migration PCZTs with `spend_zip32_derivation` — see
-/// [`crate::migration_keystone::annotate_spend_zip32_derivation`]'s doc comment for why this is
-/// needed.
-///
-/// Applied as a post-processing step on whatever unsigned PCZT bytes `commit_or_resume` returns
-/// (freshly built, or resumed from an already-committed migration) rather than inside the engine
-/// build call itself: `commit_or_resume` only calls the engine builder on first commit, so
-/// annotating only there would silently skip already-committed migrations (e.g. ones committed
-/// before this annotation existed) on every later re-entry into the Keystone sign screen.
-fn account_zip32_derivation(
-    wallet: &MigrationWallet,
-    account: AccountUuid,
-) -> anyhow::Result<([u8; 32], zip32::AccountId)> {
-    use zcash_client_backend::data_api::Account;
-
-    let account_info = wallet
-        .get_account(account)
-        .map_err(|e| anyhow!("account lookup failed: {}", e))?
-        .ok_or_else(|| anyhow!("Account not found"))?;
-    let derivation = account_info.source().key_derivation().ok_or_else(|| {
-        anyhow!(
-            "Account has no known ZIP 32 seed fingerprint/account index — cannot annotate \
-             migration PCZTs for external-signer batch signing"
-        )
-    })?;
-    Ok((
-        derivation.seed_fingerprint().to_bytes(),
-        derivation.account_index(),
-    ))
 }
 
 /// Builds the whole migration UNSIGNED (external-signer lane): every transaction is persisted
@@ -3816,10 +4124,10 @@ fn account_zip32_derivation(
 /// the platform displayed. A fresh build fails with `MIGRATION_PLAN_STALE` when that plan is
 /// missing or superseded; the resume path does not consult the handle (see [`commit_or_resume`]).
 ///
-/// Every returned PCZT is annotated with the account's ZIP 32 spend derivation (see
-/// [`account_zip32_derivation`]) so an external signer (Keystone) can identify which of its
-/// accounts each spend belongs to — annotation happens here, after `commit_or_resume`, so it
-/// covers both a freshly built and a resumed (already-committed) run alike.
+/// Every returned PCZT already carries the account's ZIP 32 spend derivation, so an external
+/// signer (Keystone) can identify which of its accounts each spend belongs to: the engine stamps
+/// it during the build (see [`crate::migration_keystone`]'s module doc), on the freshly built and
+/// the resumed (already-committed) run alike.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with
@@ -3845,20 +4153,6 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczts(
             .into_iter()
             .filter(|(id, _, _)| prep_ids.contains(id))
             .collect();
-        let (seed_fingerprint, account_index) = account_zip32_derivation(&ctx.wallet, ctx.account)?;
-        let preps = preps
-            .into_iter()
-            .map(|(id, pczt_bytes, actions)| {
-                let pczt_bytes = crate::migration_keystone::annotate_spend_zip32_derivation(
-                    &pczt_bytes,
-                    seed_fingerprint,
-                    ctx.network.coin_type(),
-                    account_index,
-                )
-                .map_err(|e| anyhow!("Error annotating note-split PCZT derivation: {:?}", e))?;
-                Ok::<_, anyhow::Error>((id, pczt_bytes, actions))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
         FfiUnsignedTransferPczts::from_pairs(preps)
     });
     unwrap_exc_or_null(res)
@@ -3888,9 +4182,10 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        let mut state = backend
-            .get_migration()?
+        let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+        let mut state = store
+            .get_migration()
+            .map_err(|e| anyhow!("migration store read failed: {e}"))?
             .ok_or_else(|| anyhow!("no migration is committed yet"))?;
         let mut first: Option<(MigrationTransferId, Vec<u8>)> = None;
         for (id, bytes) in signed {
@@ -3907,7 +4202,9 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
         }
         let (first_id, first_bytes) =
             first.ok_or_else(|| anyhow!("no signed note-split PCZTs were provided"))?;
-        backend.replace_migration(&state)?;
+        store
+            .replace_migration(&state)
+            .map_err(|e| anyhow!("migration store write failed: {e}"))?;
         FfiPreparedTransfer::from_parts(first_id, [0u8; 32], first_bytes)
     });
     unwrap_exc_or_null(res)
@@ -3919,11 +4216,8 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
 /// gates the fresh-build case where this call is the one creating the run — see
 /// [`commit_or_resume`]).
 ///
-/// Every returned PCZT is annotated with the account's ZIP 32 spend derivation — see
-/// [`account_zip32_derivation`] and `zcashlc_migration_create_unsigned_note_split_pczts`'s doc.
-///
-/// Every returned PCZT is annotated with the account's ZIP 32 spend derivation — see
-/// [`account_zip32_derivation`] and `zcashlc_migration_create_unsigned_note_split_pczts`'s doc.
+/// Every returned PCZT already carries the account's ZIP 32 spend derivation, stamped by the
+/// engine during the build — see `zcashlc_migration_create_unsigned_note_split_pczts`'s doc.
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with
@@ -3949,20 +4243,6 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_transfer_pczts(
             .into_iter()
             .filter(|(id, _, _)| transfer_ids.contains(id))
             .collect();
-        let (seed_fingerprint, account_index) = account_zip32_derivation(&ctx.wallet, ctx.account)?;
-        let transfers: Vec<_> = transfers
-            .into_iter()
-            .map(|(id, pczt_bytes, actions)| {
-                let pczt_bytes = crate::migration_keystone::annotate_spend_zip32_derivation(
-                    &pczt_bytes,
-                    seed_fingerprint,
-                    ctx.network.coin_type(),
-                    account_index,
-                )
-                .map_err(|e| anyhow!("Error annotating transfer PCZT derivation: {:?}", e))?;
-                Ok::<_, anyhow::Error>((id, pczt_bytes, actions))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
         FfiUnsignedTransferPczts::from_pairs(transfers)
     });
     unwrap_exc_or_null(res)
@@ -4022,9 +4302,15 @@ pub unsafe extern "C" fn zcashlc_migration_batch_pczts_by_actions(
                          ({PREPARATION_ACTIONS}) nor a transfer ({TRANSFER_ACTIONS}) weight"
                     ));
                 };
-                // `layer`/`index`/`crossing` are dummies (see the doc above): the packer never
-                // reads them, only each entry's action weight.
-                Ok(PlannedTx::new(MigrationTransferId::new(i as u32), kind))
+                // `layer`/`index`/`crossing`, and likewise the empty dependency set and absent
+                // scheduled height, are dummies (see the doc above): the packer never reads
+                // them, only each entry's action weight.
+                Ok(PlannedTx::new(
+                    MigrationTransferId::new(i as u32),
+                    kind,
+                    Vec::new(),
+                    None,
+                ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let sizes = NextFit
@@ -4058,9 +4344,10 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
-        let mut backend = Backend::new(&ctx.wallet, ctx.account, None, &mut ctx.store_conn)?;
-        let mut state = backend
-            .get_migration()?
+        let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+        let mut state = store
+            .get_migration()
+            .map_err(|e| anyhow!("migration store read failed: {e}"))?
             .ok_or_else(|| anyhow!("no migration is committed yet"))?;
         for (id, bytes) in signed {
             if !state.apply_signature(id, bytes) {
@@ -4071,7 +4358,9 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
                 ));
             }
         }
-        backend.replace_migration(&state)?;
+        store
+            .replace_migration(&state)
+            .map_err(|e| anyhow!("migration store write failed: {e}"))?;
         Ok(true)
     });
     unwrap_exc_or(res, false)
@@ -4554,75 +4843,41 @@ mod tests {
         .expect("the scanned range inserts");
     }
 
-    /// A view-only account imported by UFVK (no seed) — the negative-path counterpart to
-    /// [`create_fixture_account_with_usk`], which only ever produces seed-derived accounts.
-    /// Returns the wallet handle itself (not just the uuid bytes), since the caller exercises
-    /// [`account_zip32_derivation`] directly, off the FFI boundary.
-    fn create_fixture_view_only_account(path: &std::path::Path) -> (MigrationWallet, AccountUuid) {
-        use zcash_client_backend::data_api::{Account, AccountBirthday, AccountPurpose};
-        use zcash_client_backend::proto::service::TreeState;
-        use zcash_keys::keys::UnifiedSpendingKey;
-        use zcash_protocol::consensus::MAIN_NETWORK;
-
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let mut wallet = unsafe {
-            crate::wallet_db(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                parse_network(NETWORK_ID_MAINNET).expect("mainnet parses"),
-            )
-        }
-        .expect("the wallet database must open");
-
-        // A throwaway seed, only to derive SOME validly-shaped UFVK to import — the wallet is
-        // never given this seed (that is the entire point of `import_account_ufvk`), so it has
-        // no ZIP 32 path to recover from it later.
-        let usk = UnifiedSpendingKey::from_seed(&MAIN_NETWORK, &[9u8; 32], zip32::AccountId::ZERO)
-            .expect("valid ZIP 32 seed derivation");
-        let ufvk = usk.to_unified_full_viewing_key();
-        let treestate = TreeState {
-            hash: "00".repeat(32),
-            ..TreeState::default()
-        };
-        let birthday = match AccountBirthday::from_treestate(treestate, None) {
-            Ok(birthday) => birthday,
-            Err(_) => panic!("the fixture treestate must convert to a birthday"),
-        };
-        let account = wallet
-            .import_account_ufvk(
-                "fixture-view-only",
-                &ufvk,
-                &birthday,
-                AccountPurpose::ViewOnly,
-                None,
-            )
-            .expect("ufvk import must succeed");
-        let account_id = account.id();
-        (wallet, account_id)
-    }
-
-    /// `account_zip32_derivation` is this SDK's own addition (annotating Keystone migration
-    /// PCZTs with the spend derivation path — see its doc comment), so it has no Android
-    /// original to mirror. A UFVK-imported (view-only) account is exactly the case its error
-    /// branch guards: the wallet was never given a seed for it, so there is no ZIP 32 path to
-    /// annotate with, and Keystone has no way to recognize which of its accounts a spend belongs
-    /// to.
-    #[test]
-    fn account_zip32_derivation_errors_for_a_view_only_account() {
-        let path = init_fixture_db("zcashlc_migration_account_zip32_derivation_view_only");
-        let (wallet, account) = create_fixture_view_only_account(&path);
-
-        let result = account_zip32_derivation(&wallet, account);
-        let err = match result {
-            Ok(_) => panic!("a view-only account must have no known ZIP 32 derivation"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string()
-                .contains("Account has no known ZIP 32 seed fingerprint/account index"),
-            "unexpected error message: {err}"
-        );
-        let _ = std::fs::remove_file(&path);
+    /// Seeds a synthetic RECEIVED Orchard note whose nullifier is `nf`, so the satisfiability
+    /// oracle's per-nullifier input observation resolves a fixture migration transaction's
+    /// `spend_nullifiers` to "known, unspent" rather than `Unknown` — an unknown nullifier defers
+    /// the candidate silently (`Waiting`) rather than ever offering it as `Prove`.
+    /// [`test_transaction_from_parts`] gives every non-`Mined` fixture transaction the SAME
+    /// placeholder nullifier (`[0u8; 32]`), so one seeded row here covers every `Signed` row a
+    /// fixture adds. The note's other fields are meaningless placeholders — the oracle's
+    /// observation query joins only on `nf`/`account_id` and whether a MINED spend exists (there
+    /// is none here), never touching diversifier/rho/rseed.
+    fn seed_placeholder_received_note(path: &std::path::Path, nf: [u8; 32]) {
+        let conn = Connection::open(path).expect("the wallet connection opens");
+        let account_id: i64 = conn
+            .query_row("SELECT id FROM accounts", [], |row| row.get(0))
+            .expect("the fixture account exists");
+        conn.execute(
+            "INSERT INTO transactions (txid, min_observed_height) VALUES (?1, ?2)",
+            rusqlite::params![&[0xABu8; 32][..], 0],
+        )
+        .expect("the placeholder receiving-transaction row inserts");
+        let transaction_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO orchard_received_notes \
+             (transaction_id, action_index, account_id, diversifier, value, rho, rseed, nf, is_change) \
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            rusqlite::params![
+                transaction_id,
+                account_id,
+                &[0u8; 11][..],
+                100_000_000i64,
+                &[0u8; 32][..],
+                &[0u8; 32][..],
+                &nf[..],
+            ],
+        )
+        .expect("the placeholder received-note row inserts");
     }
 
     /// A minimal stored migration: `n_preps` preparation transactions then `n_transfers`
@@ -4897,6 +5152,29 @@ mod tests {
         assert_eq!(transfer_amount(&state, tx), Some(zat(100_000_000)));
     }
 
+    /// The TRANSFER rows of a plan's enumeration as [`MigrationPlan::planned_transactions`]
+    /// emits them for `schedule`: `prep_tx_count` preparation transactions are numbered first, so
+    /// crossing `i` carries id `prep_tx_count + i` and the broadcast height its schedule entry
+    /// drew. `schedule_rows` reads exactly these two fields off the row, so this is what a real
+    /// plan hands it.
+    fn planned_transfers(
+        prep_tx_count: u32,
+        schedule: &[zcash_pool_migration::scheduling::Schedule],
+    ) -> Vec<PlannedTx> {
+        schedule
+            .iter()
+            .enumerate()
+            .map(|(crossing, entry)| {
+                PlannedTx::new(
+                    MigrationTransferId::new(prep_tx_count + crossing as u32),
+                    MigrationTxKind::Transfer { crossing },
+                    Vec::new(),
+                    Some(entry.broadcast_height()),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn schedule_rows_sort_chronologically_with_prep_offset() {
         let mut rng = StdRng::seed_from_u64(7);
@@ -4904,7 +5182,12 @@ mod tests {
         // The engine hands the crossing values straight over; they are already net of the fee
         // buffer that pays each transfer's own fee.
         let crossing_values: Vec<Zatoshis> = (1..=5).map(|i| zat(i * 100_000_000)).collect();
-        let rows = schedule_rows(&crossing_values, &schedule, 3).unwrap();
+        let rows = schedule_rows(
+            &planned_transfers(3, &schedule),
+            &crossing_values,
+            &schedule,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 5);
         // Chronological by broadcast height.
         for pair in rows.windows(2) {
@@ -4932,11 +5215,21 @@ mod tests {
 
         let mut rng_a = StdRng::seed_from_u64(1);
         let schedule_a = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng_a);
-        let rows_a = schedule_rows(&crossing_values, &schedule_a, 0).unwrap();
+        let rows_a = schedule_rows(
+            &planned_transfers(0, &schedule_a),
+            &crossing_values,
+            &schedule_a,
+        )
+        .unwrap();
 
         let mut rng_b = StdRng::seed_from_u64(99);
         let schedule_b = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng_b);
-        let rows_b = schedule_rows(&crossing_values, &schedule_b, 0).unwrap();
+        let rows_b = schedule_rows(
+            &planned_transfers(0, &schedule_b),
+            &crossing_values,
+            &schedule_b,
+        )
+        .unwrap();
 
         let total_a: u64 = rows_a
             .iter()
@@ -4967,7 +5260,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 3, &mut rng);
         let crossing_values = vec![zat(100)];
-        assert!(schedule_rows(&crossing_values, &schedule, 0).is_err());
+        assert!(
+            schedule_rows(
+                &planned_transfers(0, &schedule),
+                &crossing_values,
+                &schedule
+            )
+            .is_err()
+        );
     }
 
     /// F3 pin: `schedule_rows`' amount is BOTH the engine's authoritative
@@ -4994,7 +5294,12 @@ mod tests {
             crossing_values.len(),
             &mut rng,
         );
-        let rows = schedule_rows(note_split.crossing_values(), &schedule, 0).unwrap();
+        let rows = schedule_rows(
+            &planned_transfers(0, &schedule),
+            note_split.crossing_values(),
+            &schedule,
+        )
+        .unwrap();
         assert_eq!(rows.len(), crossing_values.len());
         for (id, amount, _, _) in &rows {
             let crossing = u32::from(*id) as usize;
@@ -5273,12 +5578,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Safety net for #1806 (audit item 2): pins that this module's hand-rolled plan-preview
-    /// numbering ALREADY agrees with the engine's own [`MigrationPlan::planned_transactions`]
-    /// enumeration, before [`preparation_steps_from_plan`] and [`schedule_rows`]'s id input are
-    /// rewritten to read from it directly instead of re-deriving it. Refactor-under-green: this
-    /// is expected to pass against today's code unmodified (there is no new behavior to drive
-    /// out, only a new source of truth for numbers that must already match).
+    /// Safety net for #1806 (audit item 2): pins that this module's plan preview reports the
+    /// engine's own [`MigrationPlan::planned_transactions`] enumeration. It was written while
+    /// [`preparation_steps_from_plan`] and [`schedule_rows`] still RE-DERIVED those numbers, to
+    /// catch the rewrite that made them read the enumeration directly changing any answer; it
+    /// passed unmodified across that rewrite, and now guards the marshalling on top — that no id
+    /// is renumbered, dropped or reordered between the enumeration and the DTO rows.
     ///
     /// (a) `preparation_steps_from_plan`'s `(id, layer, index)` triples, in order, against the
     /// same triples read off `planned_transactions()`'s preparation-kind entries.
@@ -5363,12 +5668,8 @@ mod tests {
             .filter(|t| t.is_transfer())
             .map(|t| t.id())
             .collect();
-        let rows = schedule_rows(
-            plan.crossing_values(),
-            plan.schedule(),
-            prep_tx_count(&plan).expect("preparation count must compute"),
-        )
-        .expect("schedule rows must compute");
+        let rows = schedule_rows(&planned, plan.crossing_values(), plan.schedule())
+            .expect("schedule rows must compute");
         let actual_transfer_ids: HashSet<MigrationTransferId> =
             rows.iter().map(|(id, _, _, _)| *id).collect();
         assert_eq!(
@@ -5474,9 +5775,13 @@ mod tests {
     /// behind the `test-dependencies` feature this crate does not enable) using only the
     /// non-test-gated `orchard`/`zcash_note_encryption` APIs that helper itself is built from —
     /// the same relationship [`fixture_transfer_pczt_bytes`] already has to a hand-built PCZT.
+    /// `seed_offset` displaces the deterministic RNG seed, so [`fund_fixture_account_with_orchard_notes`]
+    /// can fund several distinct notes (distinct nullifier/rho/rseed) in one call; `0` reproduces
+    /// the single-note fixture's original, byte-for-byte fixed output.
     fn fixture_orchard_compact_action(
         usk: &zcash_keys::keys::UnifiedSpendingKey,
         value_zat: u64,
+        seed_offset: u64,
     ) -> zcash_client_backend::proto::compact_formats::CompactOrchardAction {
         use orchard::keys::{FullViewingKey, Scope};
         use orchard::note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho};
@@ -5489,7 +5794,7 @@ mod tests {
         let fvk = FullViewingKey::from(usk.orchard());
         let recipient = fvk.address_at(0u32, Scope::External);
 
-        let mut rng = StdRng::seed_from_u64(0x1806_0002);
+        let mut rng = StdRng::seed_from_u64(0x1806_0002 + seed_offset);
         // The wire `nullifier` field IS the spend half of this same action: by construction the
         // new note's `rho` always equals the nullifier revealed by the action's spend
         // (`Rho::from_nf_old(nf) == Rho(nf.inner())` -- same underlying field element, just
@@ -5537,20 +5842,35 @@ mod tests {
         }
     }
 
-    /// Funds the account whose spending key is `usk_bytes` ([`Era::Orchard`]-encoded exactly as
-    /// [`create_fixture_account_with_usk`] returns it) with one real, spendable Orchard note of
-    /// `value_zat`, by scanning ONE synthetic compact block at height 1 — right after the empty
-    /// birthday frontier every [`create_fixture_account_with_usk`] fixture starts from — through
-    /// the production [`scan_cached_blocks`] entry point: the same trial-decryption and
-    /// commitment-tree insert the real sync pipeline runs, just fed an in-memory block instead of
-    /// the filesystem cache `zcashlc_scan_blocks` reads from (so no FS block-metadata-db setup is
-    /// needed for one block). `value_zat` should be an amount that is not itself a single
+    /// [`fund_fixture_account_with_orchard_notes`] for exactly one note — the common case nearly
+    /// every fixture wallet wants. `value_zat` should be an amount that is not itself a single
     /// canonical ZIP 318 denomination (e.g. not an exact `{1,2,5}·10^k` ZEC amount), so the note
     /// actually needs splitting — exercising preparation transactions, not just a transfer.
     fn fund_fixture_account_with_orchard_note(
         path: &std::path::Path,
         usk_bytes: &[u8],
         value_zat: u64,
+    ) {
+        fund_fixture_account_with_orchard_notes(path, usk_bytes, &[value_zat]);
+    }
+
+    /// Funds the account whose spending key is `usk_bytes` ([`Era::Orchard`]-encoded exactly as
+    /// [`create_fixture_account_with_usk`] returns it) with one real, spendable Orchard note per
+    /// entry of `values_zat`, by scanning ONE synthetic compact block at height 1 — right after
+    /// the empty birthday frontier every [`create_fixture_account_with_usk`] fixture starts from
+    /// — through the production [`scan_cached_blocks`] entry point: the same trial-decryption and
+    /// commitment-tree insert the real sync pipeline runs, just fed an in-memory block instead of
+    /// the filesystem cache `zcashlc_scan_blocks` reads from (so no FS block-metadata-db setup is
+    /// needed for one block). Each note is its own transaction (txid tag byte `0xAC` plus a
+    /// little-endian `u16` index at bytes 1-2 over a zero background, disjoint from
+    /// `seed_placeholder_received_note`'s `[0xAB; 32]`, and distinct nullifier/rho/rseed via
+    /// [`fixture_orchard_compact_action`]'s `seed_offset = i`), so the wallet ends up with
+    /// `values_zat.len()` independently addressable spendable notes after the one scan — needed to
+    /// exercise ordering/snapshot behavior a single note cannot.
+    fn fund_fixture_account_with_orchard_notes(
+        path: &std::path::Path,
+        usk_bytes: &[u8],
+        values_zat: &[u64],
     ) {
         use zcash_client_backend::data_api::chain::scan_cached_blocks;
         use zcash_client_backend::proto::compact_formats::{
@@ -5563,22 +5883,37 @@ mod tests {
 
         let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
             .expect("the fixture usk decodes");
-        let action = fixture_orchard_compact_action(&usk, value_zat);
 
-        let ctx = CompactTx {
-            index: 1,
-            txid: vec![0xABu8; 32],
-            actions: vec![action],
-            ..Default::default()
-        };
+        let vtx: Vec<CompactTx> = values_zat
+            .iter()
+            .enumerate()
+            .map(|(i, &value_zat)| {
+                let action = fixture_orchard_compact_action(&usk, value_zat, i as u64);
+                CompactTx {
+                    index: (i + 1) as u64,
+                    txid: {
+                        // Disjoint from `seed_placeholder_received_note`'s [0xAB; 32] by the tag
+                        // byte, and unique for arbitrary i via the two-byte index — the old
+                        // `0xAB + i` scheme overflowed u8 at i = 85 and collided with the
+                        // placeholder at i = 0.
+                        let mut txid = vec![0u8; 32];
+                        txid[0] = 0xAC;
+                        txid[1..3].copy_from_slice(&(i as u16).to_le_bytes());
+                        txid
+                    },
+                    actions: vec![action],
+                    ..Default::default()
+                }
+            })
+            .collect();
         let block = CompactBlock {
             height: 1,
             hash: vec![0x11u8; 32],
             prev_hash: vec![0x00u8; 32],
-            vtx: vec![ctx],
+            vtx,
             chain_metadata: Some(ChainMetadata {
                 sapling_commitment_tree_size: 0,
-                orchard_commitment_tree_size: 1,
+                orchard_commitment_tree_size: values_zat.len() as u32,
                 ironwood_commitment_tree_size: 0,
             }),
             ..Default::default()
@@ -5608,9 +5943,134 @@ mod tests {
         .expect("scanning the one fixture block must succeed");
         assert_eq!(
             summary.received_orchard_note_count(),
-            1,
-            "the fixture block's one action must be detected as belonging to this wallet"
+            values_zat.len(),
+            "every funded action must be detected as belonging to this wallet"
         );
+    }
+
+    /// #1806 / MOB-1466 (librustzcash #2946): the migration adapter must serve every read from a
+    /// snapshot taken on first use, never re-running the wallet's full note selection per call.
+    /// The snapshot is upstream's own now — this SDK's fork of the adapter is gone — so what is
+    /// pinned here is the SDK's side of that contract: [`account_migration`] hands out an adapter
+    /// whose index space is fixed for its lifetime over THIS wallet handle, and a fresh one sees
+    /// the wallet as it now is.
+    ///
+    /// The mutation locks both funded notes through a SECOND wallet connection
+    /// (`zcashlc_migration_lock_residual`, the same kind of reservation a real migration commit
+    /// takes over the notes it is about to spend) — exactly the sort of wallet change a per-call
+    /// re-selection is unsafe against: a plan's `PrepInput::Wallet { index }` names a position in
+    /// the FIRST read's selection, so a later read observing a different set would resolve the
+    /// wrong note (or none) for an index the plan already committed to. The adapter under test
+    /// must not observe the lock: a second read through the SAME adapter stays identical to the
+    /// first. A FRESH adapter, constructed after the lock, must observe it.
+    #[test]
+    fn spendable_orchard_notes_snapshots_per_backend_not_per_call() {
+        use crate::migration_engine::AccountMigration;
+        use orchard::note::ExtractedNoteCommitment;
+        use zcash_pool_migration::engine::{MigrationBackend, MigrationCrypto};
+
+        let path = init_fixture_db("zcashlc_migration_spendable_snapshot");
+        let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_notes(&path, &usk_bytes, &[1_000_000_000, 2_000_000_000]);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+
+        // The adapter's index space as the ENGINE addresses it: one entry per selected note, in
+        // selection order, each read through BOTH public accessors — the value from
+        // `spendable_orchard_note_values` and the note itself from `resolve_wallet_note(i)`,
+        // asserted to agree. That agreement is the index-space stability the engine's
+        // `PrepInput::Wallet { index }` depends on.
+        let snapshot = |backend: &AccountMigration<'_>| -> Vec<(u64, [u8; 32])> {
+            let values = backend
+                .spendable_orchard_note_values()
+                .expect("selection must succeed");
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, value)| {
+                    let note = backend
+                        .resolve_wallet_note(i)
+                        .unwrap_or_else(|e| panic!("resolve_wallet_note({i}) must succeed: {e}"));
+                    assert_eq!(
+                        note.value().inner(),
+                        u64::from(*value),
+                        "resolve_wallet_note({i})'s value must match the selection's own"
+                    );
+                    (
+                        u64::from(*value),
+                        ExtractedNoteCommitment::from(note.commitment()).to_bytes(),
+                    )
+                })
+                .collect()
+        };
+
+        let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)
+            .expect("adapter construction must succeed");
+
+        let first_snapshot = snapshot(&backend);
+        assert_eq!(
+            first_snapshot.len(),
+            2,
+            "the fixture funds exactly two spendable notes"
+        );
+
+        // Mutate the wallet through a SECOND connection: lock every currently-spendable note,
+        // exactly what a real migration commit does when it reserves the notes it is about to
+        // spend.
+        let locked = unsafe {
+            zcashlc_migration_lock_residual(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(
+            locked, 3_000_000_000,
+            "locking must report both notes' total value"
+        );
+
+        // SAME adapter: a second read must be served from the snapshot, unaffected by the lock
+        // the second connection just took.
+        let second_snapshot = snapshot(&backend);
+        assert_eq!(
+            first_snapshot, second_snapshot,
+            "a second read through the SAME adapter must be unchanged by the second \
+             connection's note lock"
+        );
+
+        // A FRESH adapter (same wallet connection, new instance) must observe the mutation.
+        drop(backend);
+        let fresh = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)
+            .expect("adapter construction must succeed");
+        let third = snapshot(&fresh);
+        assert!(
+            third.is_empty(),
+            "a fresh adapter must see every note the second connection locked, got {} notes",
+            third.len()
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Item 1 of the plan-cache supersession contract: `plan_and_cache` → `commit_or_resume`
@@ -5658,7 +6118,7 @@ mod tests {
 
         let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
             .expect("the fixture usk decodes");
-        let (state, unsigned) = commit_or_resume(&mut ctx, Some(usk), false, handle)
+        let (state, unsigned) = commit_or_resume(&mut ctx, Some(usk.orchard()), false, handle)
             .expect("commit with the plan's own handle must succeed");
         assert!(
             unsigned.is_empty(),
@@ -5733,7 +6193,7 @@ mod tests {
 
         let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
             .expect("the fixture usk decodes");
-        let err = commit_or_resume(&mut ctx, Some(usk), false, handle1)
+        let err = commit_or_resume(&mut ctx, Some(usk.orchard()), false, handle1)
             .expect_err("committing with the SUPERSEDED first handle must fail");
         let message = err.to_string();
         assert!(
@@ -5744,6 +6204,80 @@ mod tests {
             message.contains("superseded"),
             "the detail must be the Superseded arm's message, not Missing's: {message}"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A spending key that does not belong to the committing account is refused before anything
+    /// is built or persisted: the engine derives the key's own full viewing key and checks it
+    /// against the account's stored one ([`engine::CommitError::WrongSpendAuthority`], mirroring
+    /// upstream librustzcash PR #2951's signing-boundary fix). Constructing the foreign key is a
+    /// bare ZIP 32 derivation from an unrelated seed — no second wallet account, and nothing this
+    /// test does ever reaches storage.
+    #[test]
+    fn commit_or_resume_rejects_a_spending_key_that_is_not_the_accounts() {
+        let path = init_fixture_db("zcashlc_migration_commit_rejects_foreign_key");
+        let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_note(&path, &usk_bytes, 1_234_567_890);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+
+        let (plan, _reference_height, handle) = plan_and_cache(&mut ctx, false)
+            .expect("planning must succeed")
+            .expect("the funded account has a real migration plan");
+        assert_ne!(handle, 0, "a real cached plan must mint a non-zero handle");
+        assert!(
+            !plan.schedule().is_empty(),
+            "a funded account's plan must schedule at least one transfer"
+        );
+
+        // A spending key for a wholly unrelated seed — never registered as any account in this
+        // wallet, so its full viewing key cannot match the one the committing account stores.
+        let foreign_usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &zcash_protocol::consensus::MAIN_NETWORK,
+            &[9u8; 32],
+            zip32::AccountId::ZERO,
+        )
+        .expect("the foreign usk must derive");
+
+        let err = commit_or_resume(&mut ctx, Some(foreign_usk.orchard()), false, handle)
+            .expect_err("committing with a foreign spending key must fail");
+        let message = err.to_string();
+        assert!(
+            !message.starts_with(PLAN_STALE_PREFIX),
+            "a wrong key is a caller-contract violation, not a stale-plan condition: {message}"
+        );
+        assert!(
+            message.contains("spending key is not the account's"),
+            "the error must name the spend-authority mismatch: {message}"
+        );
+
+        // The plan handle survives: `commit_or_resume` never reached `migration_plan_cache::clear`,
+        // so the SAME handle can still commit with the account's own key.
+        assert!(matches!(
+            migration_plan_cache::get(&ctx.db_path, ctx.account_bytes, handle),
+            Ok(_)
+        ));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -5973,6 +6507,176 @@ mod tests {
             );
         }
         unsafe { zcashlc_free_migration_unsigned_transfer_pczts(transfers_ptr) };
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The ENGINE, not this SDK, stamps the ZIP 32 spend derivation an external signer (Keystone)
+    /// needs in order to recognize a migration spend as the account's. `Committer::start` resolves
+    /// it once from `MigrationBackend::account_derivation` (upstream's `WalletMigration` answers
+    /// it from the account record) and hands it to both builders; their shared `build::finalize_pczt`
+    /// runs an `Updater` pass AFTER IO finalization that stamps every action whose spend carries
+    /// no `spend_auth_sig`, across the Orchard and Ironwood bundles alike.
+    ///
+    /// This asserts that on the engine's OWN output — `commit_or_resume`'s return value, which is
+    /// what `zcashlc_migration_create_unsigned_note_split_pczts` and `_transfer_pczts` marshal —
+    /// every spend still awaiting a signature already resolves to this account's
+    /// `m/32'/coin_type'/account'` path. `Zip32Derivation::extract_account_index` checks the seed
+    /// fingerprint and the path shape together against values derived from the fixture's own seed,
+    /// so a derivation naming a different seed, coin type, or account fails here rather than
+    /// passing as merely "present".
+    ///
+    /// Regression guard for a re-stamp this SDK used to apply on top: an
+    /// `annotate_spend_zip32_derivation` pass over each PCZT the two create-unsigned entry points
+    /// returned, which recomputed the identical path under the identical predicate with the
+    /// identical setter. Should the engine ever stop stamping, that duplication is gone, so this
+    /// test is what fails — instead of the failure surfacing only on-device, as Keystone's "None
+    /// of inputs belongs to the provided account".
+    #[test]
+    fn the_engine_stamps_the_spend_zip32_derivation_on_every_unsigned_pczt() {
+        use zcash_protocol::consensus::NetworkConstants;
+
+        /// Checks one bundle's still-unsigned spends, adding each to `checked`. Shared by the
+        /// Orchard and Ironwood arms, which the engine stamps identically.
+        fn check_bundle(
+            bundle: &orchard::pczt::Bundle,
+            seed_fingerprint: &zip32::fingerprint::SeedFingerprint,
+            coin_type: zip32::ChildIndex,
+            account_index: zip32::AccountId,
+            label: &str,
+            seen: &mut usize,
+            checked: &mut usize,
+        ) {
+            *seen += bundle.actions().len();
+            for (index, action) in bundle.actions().iter().enumerate() {
+                // An already-signed action is a protocol padding dummy the IO Finalizer signed
+                // with its own throwaway key: it needs no derivation, and the engine's predicate
+                // deliberately skips it.
+                if action.spend().spend_auth_sig().is_some() {
+                    continue;
+                }
+                let derivation = action
+                    .spend()
+                    .zip32_derivation()
+                    .as_ref()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{label} action {index} awaits a signature but carries no ZIP 32 \
+                         derivation, so no external signer can identify it as the account's",
+                        )
+                    });
+                assert_eq!(
+                    derivation.extract_account_index(seed_fingerprint, coin_type),
+                    Some(account_index),
+                    "{label} action {index} must be stamped with this account's own \
+                     m/32'/coin_type'/account' path",
+                );
+                *checked += 1;
+            }
+        }
+
+        let path = init_fixture_db("zcashlc_migration_engine_stamps_spend_zip32_derivation");
+        let (account_bytes, usk_bytes) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_note(&path, &usk_bytes, 1_234_567_890);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+        let (_plan, _reference_height, handle) = plan_and_cache(&mut ctx, false)
+            .expect("planning must succeed")
+            .expect("the funded account has a real migration plan");
+
+        // The EXTERNAL-SIGNER lane, exactly as the two create-unsigned entry points drive it: no
+        // spending key, `unsigned_out` set. The returned PCZTs are the engine's own bytes, with no
+        // SDK post-processing between the builder and this assertion.
+        let (_state, unsigned) = commit_or_resume(&mut ctx, None, true, handle)
+            .expect("the unsigned external-signer commit must succeed");
+        assert!(
+            !unsigned.is_empty(),
+            "a funded account's unsigned run must serve at least one PCZT"
+        );
+
+        // Derived from the fixture's own seed rather than read back out of the wallet record the
+        // engine itself consulted, so this pins the VALUE, not just the round-trip.
+        let expected_seed_fingerprint = zip32::fingerprint::SeedFingerprint::from_seed(&[7u8; 32])
+            .expect("the fixture seed has a valid ZIP 32 fingerprint");
+        let expected_coin_type = zip32::ChildIndex::hardened(ctx.network.coin_type());
+        let expected_account_index = zip32::AccountId::ZERO;
+
+        let (mut orchard_seen, mut orchard_checked) = (0usize, 0usize);
+        let (mut ironwood_seen, mut ironwood_checked) = (0usize, 0usize);
+        for (id, pczt_bytes, _actions) in &unsigned {
+            let label = format!("transaction {}", u32::from(*id));
+            let pczt = pczt::parse(pczt_bytes)
+                .unwrap_or_else(|e| panic!("{label} must parse as a PCZT: {e:?}"));
+            pczt::roles::verifier::Verifier::new(pczt)
+                .with_orchard::<core::convert::Infallible, _>(|bundle| {
+                    check_bundle(
+                        bundle,
+                        &expected_seed_fingerprint,
+                        expected_coin_type,
+                        expected_account_index,
+                        &format!("{label} Orchard"),
+                        &mut orchard_seen,
+                        &mut orchard_checked,
+                    );
+                    Ok(())
+                })
+                .expect("the Orchard bundle parses")
+                .with_ironwood::<core::convert::Infallible, _>(|bundle| {
+                    check_bundle(
+                        bundle,
+                        &expected_seed_fingerprint,
+                        expected_coin_type,
+                        expected_account_index,
+                        &format!("{label} Ironwood"),
+                        &mut ironwood_seen,
+                        &mut ironwood_checked,
+                    );
+                    Ok(())
+                })
+                .expect("the Ironwood bundle parses");
+        }
+
+        // Guards against a vacuous pass: a run of nothing but pre-signed padding dummies would
+        // satisfy every assertion above while exercising the stamping not at all. The funded
+        // fixture builds one preparation transaction plus six transfers, whose Orchard spends are
+        // what the signer has to authorize.
+        assert!(
+            orchard_checked > 0,
+            "the run must contain Orchard spends awaiting a signature \
+             (Orchard actions seen: {orchard_seen})"
+        );
+        // The Ironwood arm is walked over real actions, not skipped over an absent bundle: each
+        // transfer carries one, holding the Ironwood output it crosses value into. That action's
+        // spend half is a padding dummy the IO Finalizer already signed, so a migration run has no
+        // Ironwood spend awaiting a signature — it is Orchard notes a migration spends, and the
+        // account owns no Ironwood note to spend until one of these transfers is mined. So
+        // `ironwood_checked` is legitimately 0 today; it is deliberately not asserted to stay 0,
+        // because the per-action assertion above is what must hold if that ever changes.
+        assert!(
+            ironwood_seen > 0,
+            "each transfer must carry an Ironwood action, so the Ironwood arm is not vacuous \
+             (Ironwood spends awaiting a signature: {ironwood_checked})"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -6471,7 +7175,7 @@ mod tests {
 
     /// The accepted semantic shift, pinned: a pure statuses read reports what is PERSISTED — a
     /// `Broadcast` row stays `Broadcast` in its answer until a write lane (`advance_step`'s
-    /// engine sweep, `prove_pending`, `next_due_transfer`) persists the Mined promotion. Display
+    /// engine sweep, the prove executor, the delivery executor) persists the Mined promotion. Display
     /// green is unaffected (the app derives it from the wallet's own mined-txid set).
     #[test]
     fn pure_statuses_report_broadcast_until_a_write_lane_promotes() {
@@ -7475,7 +8179,7 @@ mod tests {
         )
     }
 
-    /// The test-side counterpart of [`prove_one`] for [`prove_pending_rows`]: proves through the
+    /// The test-side counterpart of [`prove_one`] for [`prove_named_rows`]: proves through the
     /// same generic [`migration_finalize::prove_due_transaction`] seam with the given test prover
     /// instead of the production `WalletMigrationProver`, and persists through the same
     /// account-keyed store. The preparation anchor is never resolved (these fixtures sweep
@@ -7527,26 +8231,108 @@ mod tests {
             .expect("a migration is stored")
     }
 
+    /// The ids a `Prove` INSTRUCTION over `state` would name: every `Signed` row, in stored order.
+    /// The sweep is an executor now — it is told what to prove rather than deriving it — so this
+    /// stands in for the [`zcashlc_migration_advance_step`] call a platform makes first. (The real
+    /// drive additionally verifies each candidate against the store's oracle and orders the batch
+    /// oldest-anchor-first; neither bears on what [`prove_named_rows`] then does with the ids,
+    /// which is what these tests are about. The drive's own batch is pinned by
+    /// `advance_step_prove_carries_the_whole_batch`.)
+    fn prove_instruction(state: &MigrationState) -> Vec<MigrationTransferId> {
+        state
+            .transactions()
+            .iter()
+            .filter(|t| matches!(t.state(), MigrationTxState::Signed))
+            .map(|t| t.id())
+            .collect()
+    }
+
+    /// The head of the engine's BROADCAST QUEUE as the public status view renders it: the
+    /// `(scheduled_height, id)`-min among the rows reported `ready` with
+    /// [`NextAction::Broadcast`]. Exactly the derivation [`due_assuming_proving`]'s broadcast arm
+    /// contributes, so a test asserting "what is offered for broadcast" pins the same read the
+    /// production queries make rather than a second one of its own.
+    fn ready_broadcast_head(
+        state: &MigrationState,
+        targets: DuenessTargets,
+    ) -> Option<MigrationTransferId> {
+        state
+            .transaction_statuses(targets)
+            .iter()
+            .filter(|s| s.ready() && s.action() == Some(NextAction::Broadcast))
+            .min_by_key(|s| (s.scheduled_height(), s.id()))
+            .map(|s| s.id())
+    }
+
+    /// Opens a fixture [`CallCtx`] with the chain tip set so `target_from_tip` yields `target`,
+    /// plus the two prerequisites the sweep's now-verified drive needs that the pre-drive
+    /// prove-queue selector never touched: the wallet scanned through `target`, and the
+    /// placeholder spend nullifier every non-`Mined` fixture row carries
+    /// ([`test_transaction_from_parts`]) seeded as a known, unspent note. Without both, the
+    /// store's satisfiability oracle can vouch for nothing and every candidate degrades silently
+    /// to `Waiting` — the safe answer, but not the one under test. `target` is the sweep tests'
+    /// own convention (what the pre-drive sweep took as a raw `BlockHeight`), kept so their
+    /// existing schedule/boundary/expiry fixture numbers stay valid under a real wallet tip.
+    fn sweep_fixture_ctx(prefix: &str, target: u32) -> (PathBuf, [u8; 16], CallCtx) {
+        let path = init_fixture_db(prefix);
+        let account = create_fixture_account(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let tip = target - 1;
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    tip as i32,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        mark_fixture_scanned_through(&path, tip);
+        seed_placeholder_received_note(&path, [0u8; 32]);
+        let ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture call context opens");
+        (path, account, ctx)
+    }
+
     /// `max_proofs` chunks a sweep: the first call proves exactly the cap and leaves the rest
     /// `Signed`; the next (uncapped) call finishes the remainder. This is the seam platforms use
     /// to interleave interactive DB reads between seconds-long proofs.
+    ///
+    /// The two transfers are scheduled ABOVE the target (unlike [`provable_state`]'s uniform
+    /// default): schedule plays no part in prove-readiness (only the anchor boundary does), and
+    /// keeping both comfortably undue sidesteps the drive's ZIP 318 overdue re-spread, which
+    /// (unlike the pre-drive selector) a `Prove` batch can also trigger when two or more live
+    /// candidates sit far enough behind the target — a concern this test has nothing to do with.
     #[test]
     fn sweep_cap_proves_at_most_max_and_the_next_call_finishes() {
-        let path = init_fixture_db("zcashlc_sweep_cap_chunks");
-        let account = create_fixture_account(&path);
-        let mut state = provable_state(
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_cap_chunks", 5_000);
+        let mut state = scheduled_state(
             &[MINED],
-            &[MigrationTxState::Signed, MigrationTxState::Signed],
-            Some(h(1440)),
+            &[
+                (MigrationTxState::Signed, 6_000, Some(h(1440))),
+                (MigrationTxState::Signed, 6_000, Some(h(1440))),
+            ],
         );
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let first = prove_pending_rows(&mut state, h(5_000), Some(1), |state, id| {
+        let ids = prove_instruction(&state);
+        let first = prove_named_rows(&mut ctx, &mut state, &ids, Some(1), |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("a capped sweep must not fail");
-        assert_eq!(first, 1, "the cap must stop the sweep after one proof");
+        assert_eq!(
+            first.total_proved, 1,
+            "the cap must stop the sweep after one proof"
+        );
         assert_eq!(
             prover.calls.len(),
             1,
@@ -7562,12 +8348,16 @@ mod tests {
             "one transfer must remain Signed for the next chunk"
         );
 
-        let second = prove_pending_rows(&mut state, h(5_000), None, |state, id| {
+        let second = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("the follow-up sweep must not fail");
-        assert_eq!(second, 1, "the uncapped follow-up must prove the remainder");
+        assert_eq!(
+            second.total_proved, 1,
+            "the uncapped follow-up must prove the remainder"
+        );
         assert_eq!(prover.calls.len(), 2, "two proofs total across the chunks");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The sweep proves a provable `Signed` transfer — `Signed -> Proved`, PERSISTED — against the
@@ -7575,18 +8365,20 @@ mod tests {
     /// consulting a prover: proving and broadcasting are separate steps.
     #[test]
     fn sweep_proves_a_signed_transfer_that_delivery_then_serves_without_proving() {
-        let path = init_fixture_db("zcashlc_sweep_then_serve");
-        let account = create_fixture_account(&path);
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_then_serve", 5_000);
         let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let proved = prove_pending_rows(&mut state, h(5_000), None, |state, id| {
+        let ids = prove_instruction(&state);
+        let proved = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("sweeping a provable transfer must not fail");
 
-        assert_eq!(proved, 1, "the sweep must prove the one provable row");
+        assert_eq!(
+            proved.total_proved, 1,
+            "the sweep must prove the one provable row"
+        );
         assert_eq!(
             prover.calls,
             vec![ProveCall::Transfer(h(1440))],
@@ -7603,14 +8395,16 @@ mod tests {
             "the sweep must persist Signed -> Proved"
         );
 
-        // Delivery picks up the swept row, with the prover untouched.
+        // The swept row is now what the broadcast queue offers, with the prover untouched. The
+        // delivery executor serves it once the drive instructs it to (see
+        // `take_broadcast_transaction_serves_a_proved_row_through_the_broadcast_seam`); this
+        // asserts the queue the drive's broadcast arm draws from, which is what the sweep was
+        // for.
         let calls_before = prover.calls.len();
         assert_eq!(
-            next_due(&stored, DuenessTargets::at(h(5_000))),
-            DueOutcome::Ready {
-                id: MigrationTransferId::new(1)
-            },
-            "the proved, due row must be the one served"
+            ready_broadcast_head(&stored, DuenessTargets::at(h(5_000))),
+            Some(MigrationTransferId::new(1)),
+            "the proved, due row must be the one offered for broadcast"
         );
         assert_eq!(
             prover.calls.len(),
@@ -7620,27 +8414,26 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A due row that has not been proved yet is reported as `AwaitingProof` — NOT as "nothing
-    /// due": the delivery lane refuses to prove, so the platform must be told that a sweep is what
-    /// unblocks the broadcast, instead of polling an indefinitely empty lane.
+    /// A due row that has not been proved yet is delivery work no executor can serve — NOT
+    /// "nothing due": the drive offers it for PROVING, and the platform must be told that a sweep
+    /// is what unblocks the broadcast rather than left polling an indefinitely empty lane. (The
+    /// flag that carries this over the FFI is pinned by
+    /// `advance_step_estimated_tip_marks_a_prove_target_schedule_due`, and the executor's refusal
+    /// to serve such a row by
+    /// `take_broadcast_transaction_refuses_a_row_that_is_not_proved`.)
     #[test]
-    fn delivery_reports_a_due_unproven_row_as_awaiting_proof() {
+    fn a_due_unproven_row_is_delivery_work_no_executor_can_serve() {
         let state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
 
         assert_eq!(
-            next_due(&state, DuenessTargets::at(h(5_000))),
-            DueOutcome::AwaitingProof {
-                id: MigrationTransferId::new(1)
-            },
-            "a due Signed row must report AwaitingProof, naming the row that needs the proof"
+            ready_broadcast_head(&state, DuenessTargets::at(h(5_000))),
+            None,
+            "an unproved row is not broadcastable, whatever its schedule says"
         );
-
-        // And the artifact read refuses that row outright: an unproven row has nothing to serve.
-        let err = serve_proved(&state, MigrationTransferId::new(1))
-            .expect_err("an unproven row must not yield a broadcastable artifact");
-        assert!(
-            err.to_string().contains("not broadcastable"),
-            "the refusal must name the lifecycle problem, got: {err}"
+        assert_eq!(
+            due_assuming_proving(&state, DuenessTargets::at(h(5_000))),
+            Some(MigrationTransferId::new(1)),
+            "a due Signed row is due delivery work, naming the row that needs the proof"
         );
     }
 
@@ -7649,8 +8442,7 @@ mod tests {
     /// BEHIND the transiently-unprovable one are still proved on the same pass.
     #[test]
     fn sweep_skips_a_transiently_unprovable_row_and_proves_the_rest() {
-        let path = init_fixture_db("zcashlc_sweep_transient");
-        let account = create_fixture_account(&path);
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_transient", 100);
         // Both transfers are provable and due; the prover fails the FIRST one transiently and
         // proves the second.
         let mut state = scheduled_state(
@@ -7660,19 +8452,19 @@ mod tests {
                 (MigrationTxState::Signed, 90, Some(h(40))),
             ],
         );
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = FirstFailsProver {
             error: Some(WalletProveError::AnchorNotFound(h(40))),
             calls: Vec::new(),
         };
-        let proved = prove_pending_rows(&mut state, h(100), None, |state, id| {
+        let ids = prove_instruction(&state);
+        let proved = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("a transient prove outcome must not be an error");
 
         assert_eq!(
-            proved, 1,
+            proved.total_proved, 1,
             "the sweep must prove the row behind the skipped one"
         );
         assert!(
@@ -7709,20 +8501,22 @@ mod tests {
     /// time the artifact already exists.
     #[test]
     fn sweep_proves_a_provable_but_undue_transfer_ahead_of_its_schedule() {
-        let path = init_fixture_db("zcashlc_sweep_undue");
-        let account = create_fixture_account(&path);
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_undue", 100);
         // Provable (boundary settled) but scheduled far ABOVE the tip.
         let mut state =
             scheduled_state(&[MINED], &[(MigrationTxState::Signed, 9_000, Some(h(40)))]);
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let proved = prove_pending_rows(&mut state, h(100), None, |state, id| {
+        let ids = prove_instruction(&state);
+        let proved = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect("the sweep must not fail");
 
-        assert_eq!(proved, 1, "the undue but provable row must be proved");
+        assert_eq!(
+            proved.total_proved, 1,
+            "the undue but provable row must be proved"
+        );
         let stored = read_fixture_state(&path, &account);
         let tx = stored
             .transactions()
@@ -7733,85 +8527,97 @@ mod tests {
             matches!(tx.state(), MigrationTxState::Proved),
             "the sweep must persist the ahead-of-schedule proof"
         );
-        // Still nothing to broadcast: proving does not make a row due.
+        // Still nothing to broadcast: proving does not make a row due. `due_assuming_proving`
+        // subsumes the broadcast-queue read, so `None` here is the whole "nothing due" answer.
         assert_eq!(
-            next_due(&stored, DuenessTargets::at(h(100))),
-            DueOutcome::Nothing,
+            due_assuming_proving(&stored, DuenessTargets::at(h(100))),
+            None,
             "a proved but unscheduled row must not be served"
         );
         let _ = std::fs::remove_file(&path);
     }
 
-    /// THE A1 BOUNDARY PIN: the sweep is driven at `target = tip + 1` (the height every
-    /// `MigrationState` query is defined over — `zcashlc_migration_prove_pending` reads
-    /// `ctx.target()`, not the raw tip), so a PREPARATION scheduled EXACTLY at the target is
-    /// proved now rather than one block late. A preparation is the kind whose prove-readiness
-    /// IS schedule due-ness, which is why the raw-tip regression only ever bit preparations; the
-    /// raw-tip counterfactual is pinned alongside.
+    /// THE A1 BOUNDARY PIN: the drive's target is always `tip + 1` (never the raw tip —
+    /// [`target_from_tip`], baked into [`dueness_targets`] and applied uniformly by
+    /// [`drive_advance`]), so a PREPARATION scheduled EXACTLY at the target is OFFERED for proving
+    /// now rather than one block late. A preparation is the kind whose prove-readiness IS schedule
+    /// due-ness, which is why the raw-tip regression A1 fixed only ever bit preparations.
+    ///
+    /// The pin is read off the CONDUIT, because that is now the only thing that decides which rows
+    /// a sweep is told to prove; the executor below then proves the row it was handed, against the
+    /// caller-resolved preparation anchor. The raw-tip COUNTERFACTUAL the pre-drive version of
+    /// this test also pinned (feeding the sweep the bare tip and asserting it wrongly swept
+    /// nothing) is gone: no entry point accepts a raw height at all any more — the wallet's chain
+    /// tip is the only knob a caller has, and `drive_advance` converts it to `tip + 1` the same
+    /// uniform way every time — so the off-by-one class A1 fixed is structurally unrepresentable
+    /// rather than merely untested.
     #[test]
     fn sweep_proves_a_preparation_scheduled_exactly_at_target() {
         let tip = h(100);
-        let build_state = || {
-            custom_state(
-                MigrationStatus::InProgress,
-                vec![test_transaction_from_parts(
-                    MigrationTransferId::new(0),
-                    MigrationTxKind::Preparation { layer: 0, index: 0 },
-                    minimal_pczt_bytes(),
-                    Vec::new(),
-                    h(101), // scheduled exactly at target = tip + 1
-                    h(10_000),
-                    None,
-                    MigrationTxState::Signed,
-                    None,
-                )],
-            )
-        };
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_prep_at_target", 101);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let mut state = custom_state(
+            MigrationStatus::InProgress,
+            vec![test_transaction_from_parts(
+                MigrationTransferId::new(0),
+                MigrationTxKind::Preparation { layer: 0, index: 0 },
+                minimal_pczt_bytes(),
+                Vec::new(),
+                h(101), // scheduled exactly at target = tip + 1
+                h(10_000),
+                None,
+                MigrationTxState::Signed,
+                None,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, _id, batch, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_PROVE,
+            "a preparation scheduled exactly at tip + 1 is due for proving NOW, not one block \
+             later"
+        );
+        let instruction: Vec<MigrationTransferId> = batch
+            .iter()
+            .map(|t| MigrationTransferId::new(t.0))
+            .collect();
+        assert_eq!(
+            instruction,
+            vec![MigrationTransferId::new(0)],
+            "the boundary row must be the one named, got {batch:?}"
+        );
 
         let mut prover = RecordingProver { calls: Vec::new() };
-        let mut state = build_state();
-        let proved = prove_pending_rows(&mut state, target_from_tip(tip), None, |state, id| {
-            Ok(prove_due_for_test(&mut prover, state, id, Some(tip))?.is_some())
-        })
+        let proved = prove_named_rows(
+            &mut ctx,
+            &mut state,
+            &instruction,
+            None,
+            |_ctx, state, id| Ok(prove_due_for_test(&mut prover, state, id, Some(tip))?.is_some()),
+        )
         .expect("the boundary sweep must not fail");
-        assert_eq!(
-            proved, 1,
-            "a preparation scheduled exactly at tip + 1 is due the sweep NOW"
-        );
+        assert_eq!(proved.total_proved, 1, "the named preparation is proved");
         assert_eq!(
             prover.calls,
             vec![ProveCall::Preparation(tip)],
             "the preparation proves against the caller-resolved anchor"
         );
-
-        // The raw-tip counterfactual (the exact off-by-one A1 fixed): fed the tip instead of the
-        // target, the same state sweeps nothing.
-        let mut prover = RecordingProver { calls: Vec::new() };
-        let mut state = build_state();
-        let proved = prove_pending_rows(&mut state, tip, None, |state, id| {
-            Ok(prove_due_for_test(&mut prover, state, id, Some(tip))?.is_some())
-        })
-        .expect("the counterfactual sweep must not fail");
-        assert_eq!(
-            proved, 0,
-            "at the raw tip the target-scheduled preparation is (wrongly) not yet due — the \
-             convention the FFI must therefore never feed the sweep"
-        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A HARD prover failure aborts the sweep and propagates: an unprovable-for-real row is not
     /// something a later sweep fixes, and swallowing it would hide a corrupt store.
     #[test]
     fn sweep_propagates_a_hard_prover_failure() {
-        let path = init_fixture_db("zcashlc_sweep_hard_failure");
-        let account = create_fixture_account(&path);
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_hard_failure", 5_000);
         let mut state = provable_state(&[MINED], &[MigrationTxState::Signed], Some(h(1440)));
-        store_fixture_state(&path, &account, &state);
 
         let mut prover = FailingProver {
             error: Some(WalletProveError::Prove("proof backend failure".into())),
         };
-        let err = prove_pending_rows(&mut state, h(5_000), None, |state, id| {
+        let ids = prove_instruction(&state);
+        let err = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
             prove_with_test_prover(&path, &account, &mut prover, state, id)
         })
         .expect_err("a hard prover failure must not be swallowed");
@@ -7819,6 +8625,123 @@ mod tests {
         assert!(
             err.to_string().starts_with(PROVING_UNAVAILABLE_PREFIX),
             "the hard failure must carry the proving-unavailable prefix, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE DUE-BROADCAST PRECEDENCE (RED against the pre-drive selector this arc replaced): a
+    /// Proved, schedule-due, dependency-satisfied row is delivery work the drive names as
+    /// `AdvanceStep::Broadcast`, which OUTRANKS proving in the engine's own precedence — a due
+    /// broadcast is what lets a woken session submit and end without ever proving. The pre-drive
+    /// prove-queue selector had no notion of that precedence and offered an
+    /// independently-provable Signed row regardless of the due broadcast sitting right beside it.
+    ///
+    /// The pin now sits on the CONDUIT, which is where the precedence is decided: the sweep is an
+    /// executor and proves whatever it is handed, so "prove nothing this session" can only be an
+    /// instruction the advance declined to issue. What the executor does with an instruction that
+    /// names a row it must not touch is
+    /// [`prove_transactions_skips_a_row_that_is_no_longer_signed`].
+    #[test]
+    fn advance_defers_to_a_due_broadcast_and_offers_no_prove_batch() {
+        let (path, account, _ctx) = sweep_fixture_ctx("zcashlc_sweep_due_broadcast", 100);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let transactions = vec![
+            // Proved, scheduled well under the target, no dependencies: ready to broadcast.
+            test_transaction_from_parts(
+                MigrationTransferId::new(1),
+                MigrationTxKind::Transfer { crossing: 0 },
+                minimal_pczt_bytes(),
+                Vec::new(),
+                h(50),
+                h(10_000),
+                Some(h(40)),
+                MigrationTxState::Proved,
+                None,
+            ),
+            // Signed, boundary settled: independently provable, but must not be offered while a
+            // broadcast is due.
+            test_transaction_from_parts(
+                MigrationTransferId::new(2),
+                MigrationTxKind::Transfer { crossing: 1 },
+                minimal_pczt_bytes(),
+                Vec::new(),
+                h(9_000),
+                h(10_000),
+                Some(h(40)),
+                MigrationTxState::Signed,
+                None,
+            ),
+        ];
+        let state = test_state_from_parts(
+            MigrationStatus::InProgress,
+            DenominationPlan::from_stored_parts(
+                vec![zat(100_000_000), zat(100_000_000)],
+                zat(10_000),
+                None,
+                zat(20_000),
+                zat(1_000_000_000),
+                zat(999_000_000),
+            )
+            .unwrap(),
+            PreparationPlan::from_parts(Vec::new(), Vec::new()),
+            transactions,
+            AnchorBucketInterval::ZIP_318,
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, id, targets, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_BROADCAST,
+            "a due broadcast outranks proving: the drive must instruct a broadcast, not a sweep"
+        );
+        assert_eq!(id, 1, "the due, proved row is the one named");
+        assert!(
+            targets.is_empty(),
+            "a Broadcast step carries no prove batch, so a sweeping platform is told to prove \
+             nothing this session, got {targets:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE EXECUTOR'S STALENESS SKIP. `prove_named_rows` never re-asks the engine what to prove,
+    /// so the one thing standing between a stale instruction and wasted (or wrong) work is the
+    /// per-row check that the named transaction is still `Signed`. A row that has been proved
+    /// since the instruction was issued is skipped — the prover is never consulted, the count is
+    /// 0, and nothing is persisted — which is what makes acting on an out-of-date batch safe: the
+    /// engine re-offers whatever it has not recorded on the next crank.
+    #[test]
+    fn prove_transactions_skips_a_row_that_is_no_longer_signed() {
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_sweep_stale_instruction", 5_000);
+        let mut state = provable_state(&[MINED], &[MigrationTxState::Proved], Some(h(1440)));
+        let stale = MigrationTransferId::new(1);
+
+        let mut prover = RecordingProver { calls: Vec::new() };
+        // The instruction names the row anyway — exactly the shape a batch that has gone stale
+        // between the advance and this call arrives in.
+        let proved = prove_named_rows(&mut ctx, &mut state, &[stale], None, |_ctx, state, id| {
+            prove_with_test_prover(&path, &account, &mut prover, state, id)
+        })
+        .expect("a stale instruction must not be an error");
+
+        assert_eq!(
+            proved.total_proved, 0,
+            "an already-proved row is a skip, not a re-prove"
+        );
+        assert!(
+            prover.calls.is_empty(),
+            "the prover must never be consulted for a row that is not Signed"
+        );
+        assert!(
+            matches!(
+                state
+                    .transactions()
+                    .iter()
+                    .find(|t| t.id() == stale)
+                    .expect("the row remains")
+                    .state(),
+                MigrationTxState::Proved
+            ),
+            "the skipped row must be left exactly as it was"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -7874,13 +8797,131 @@ mod tests {
         );
     }
 
-    // ----- selection order is delegated to the engine's exported reads, not commit order -----
+    /// THE DUE-BROADCAST PRECEDENCE, as [`due_assuming_proving`] must mirror it. The engine's own
+    /// `MigrationState::next_step` consults its broadcast queue UNCONDITIONALLY first and reaches
+    /// its prove queue only when that queue is empty: a row that can be broadcast right now
+    /// outranks all proving, whatever the two rows' relative schedules. So with a `Proved`, due
+    /// transfer (id 1, scheduled 1000) beside a prove-ready `Signed` one scheduled EARLIER (id 2,
+    /// scheduled 900), the answer is id 1 — the drive would broadcast it this crank and only reach
+    /// id 2's proof on a later one.
+    ///
+    /// This is what makes the two-tier shape load-bearing rather than cosmetic: a FLAT
+    /// `(scheduled_height, id)`-min over both actions answers id 2 and fails here.
+    #[test]
+    fn due_assuming_proving_serves_the_broadcastable_row_before_an_earlier_scheduled_unproved_one()
+    {
+        let state = scheduled_state(
+            &[MINED],
+            &[
+                (MigrationTxState::Proved, 1_000, Some(h(40))),
+                (MigrationTxState::Signed, 900, Some(h(40))),
+            ],
+        );
+        assert_eq!(
+            due_assuming_proving(&state, DuenessTargets::at(h(1_100))),
+            Some(MigrationTransferId::new(1)),
+            "a due broadcast outranks proving in the engine's own precedence: the schedule-earlier \
+             row still awaiting its proof must not preempt it"
+        );
+    }
 
-    /// `next_due` must serve the drive's own `(scheduled_height, id)`-min among ready-to-broadcast
-    /// candidates, never merely the first match in commit/dependency order. Id 3 is committed
-    /// (appears in the transactions list) before id 4, but id 4 is scheduled EARLIER (3900 vs
-    /// 4000): a first-match scan over commit order would answer id 3; the engine's
-    /// `next_due_broadcast` answers id 4, the earliest-scheduled row.
+    /// THE NOTE-SPLIT CEREMONY'S RESUME ORDERING ([`ceremony_preparation_pick`]). A RESUMED
+    /// ceremony walks into a run that already holds a `Proved`, due preparation, and must hand
+    /// that artifact back rather than prove another row: re-proving what exists is seconds of
+    /// wasted CPU, and the proved row is the one the engine's broadcast queue is offering right
+    /// now. The fixture makes both wrong answers reachable — a still-`Signed` sibling scheduled
+    /// EARLIER (which wins the fresh-commit fallback's `(scheduled_height, id)`-min), and a due
+    /// `Proved` TRANSFER scheduled earlier still (which wins the broadcast queue outright, and
+    /// which this lane must never hand back: the ceremony exists to serve a preparation).
+    #[test]
+    fn ceremony_pick_prefers_a_proved_due_preparation() {
+        let prep = |id: u32, scheduled: u32, state: MigrationTxState| {
+            tx_row(
+                id,
+                MigrationTxKind::Preparation {
+                    layer: 0,
+                    index: id as usize,
+                },
+                &[],
+                scheduled,
+                10_000,
+                None,
+                state,
+            )
+        };
+        let transfer = |id: u32, deps: &[u32], scheduled: u32, state: MigrationTxState| {
+            tx_row(
+                id,
+                MigrationTxKind::Transfer { crossing: 0 },
+                deps,
+                scheduled,
+                10_000,
+                None,
+                state,
+            )
+        };
+
+        let resumed = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                prep(0, 100, MigrationTxState::Signed),
+                prep(1, 110, MigrationTxState::Proved),
+                transfer(2, &[], 90, MigrationTxState::Proved),
+            ],
+        );
+        assert_eq!(
+            ceremony_preparation_pick(&resumed, DuenessTargets::at(h(200))),
+            Some(MigrationTransferId::new(1)),
+            "a resume must re-serve the proved, due PREPARATION — not re-prove the \
+             earlier-scheduled Signed sibling, and not hand back the transfer that outranks \
+             both in the broadcast queue"
+        );
+
+        // A fresh commit holds no `Proved` row, so the fallback answers: the earliest-scheduled
+        // preparation, and it answers even BEFORE the drawn window opens — the engine's queues
+        // offer nothing there, and handing back that first preparation now is the whole reason
+        // this lane does not simply defer to the delivery drive.
+        let fresh = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                prep(0, 100, MigrationTxState::Signed),
+                prep(1, 110, MigrationTxState::Signed),
+                transfer(2, &[0], 90, MigrationTxState::Signed),
+            ],
+        );
+        for target in [h(50), h(200)] {
+            assert_eq!(
+                ceremony_preparation_pick(&fresh, DuenessTargets::at(target)),
+                Some(MigrationTransferId::new(0)),
+                "a fresh commit serves its earliest-scheduled preparation, due or not"
+            );
+        }
+
+        // Every preparation is already out the door: nothing to serve, which the FFI reports as
+        // an error rather than an empty answer.
+        let spent = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                prep(0, 100, MINED),
+                transfer(1, &[0], 90, MigrationTxState::Signed),
+            ],
+        );
+        assert_eq!(
+            ceremony_preparation_pick(&spent, DuenessTargets::at(h(200))),
+            None,
+            "a run whose preparations have all been broadcast has no ceremony row left"
+        );
+    }
+
+    // ----- selection order follows the engine's ordering keys, not commit order -----
+
+    /// The broadcast queue every delivery decision rests on — the `(scheduled_height, id)`-min
+    /// among ready-to-broadcast candidates, the drive's own order — never answers merely the
+    /// first match in commit/dependency order. Id 3 is committed (appears in the transactions
+    /// list) before id 4, but id 4 is scheduled EARLIER (3900 vs 4000): a first-match scan over
+    /// commit order would answer id 3; the ordering key answers id 4, the earliest-scheduled row.
+    /// Pinned through [`due_assuming_proving`], which composes that key over the public status
+    /// view — the one place this module still re-derives the queue's order.
     #[test]
     fn next_due_prefers_the_schedule_earliest_row_like_the_drive() {
         let transactions = vec![
@@ -7926,22 +8967,24 @@ mod tests {
         );
 
         assert_eq!(
-            next_due(&state, DuenessTargets::at(h(4_100))),
-            DueOutcome::Ready {
-                id: MigrationTransferId::new(4)
-            },
+            due_assuming_proving(&state, DuenessTargets::at(h(4_100))),
+            Some(MigrationTransferId::new(4)),
             "the drive's (scheduled_height, id)-min must win: id 4 (scheduled 3900) over id 3 \
              (scheduled 4000), even though id 3 was committed first"
         );
     }
 
-    /// `prove_pending_rows` must serve the drive's own `(anchor_boundary, id)`-min among
-    /// prove-ready candidates — oldest-anchor-first — never merely the first match in commit
-    /// order. Id 7 is committed before id 8, but id 8's boundary SETTLED EARLIER (3990 vs 4020): a
-    /// first-match scan over commit order would prove id 7 first; the engine's `next_provable`
-    /// proves id 8 first.
+    /// OLDEST-ANCHOR-FIRST, pinned on both sides of the instruction. The DRIVE orders the batch
+    /// by its own `(anchor_boundary, id)` key, never commit order: id 7 is committed before id 8,
+    /// but id 8's boundary SETTLED EARLIER (3990 vs 4020), so the batch must name 8 first — a
+    /// first-match scan over commit order would name id 7. The EXECUTOR then honours that order
+    /// verbatim — with `max_proofs = 1` it proves the batch's head — because it has no ordering of
+    /// its own to impose and must not reintroduce one.
     #[test]
     fn prove_sweep_serves_the_oldest_anchor_first() {
+        let (path, account, mut ctx) =
+            sweep_fixture_ctx("zcashlc_sweep_oldest_anchor_first", 4_100);
+        let path_bytes = path.to_str().unwrap().as_bytes();
         let transactions = vec![
             // Committed FIRST (id 7), but its boundary settled LATER — must lose.
             test_transaction_from_parts(
@@ -7983,28 +9026,49 @@ mod tests {
             transactions,
             AnchorBucketInterval::ZIP_318,
         );
+        store_fixture_state(&path, &account, &state);
+
+        // The drive's own instruction, read over the conduit the platform actually calls.
+        let (step, _id, batch, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(step, ZCASHLC_ADVANCE_STEP_PROVE, "both rows are provable");
+        let instruction: Vec<MigrationTransferId> = batch
+            .iter()
+            .map(|t| MigrationTransferId::new(t.0))
+            .collect();
+        assert_eq!(
+            instruction,
+            vec![MigrationTransferId::new(8), MigrationTransferId::new(7)],
+            "the drive's (anchor_boundary, id)-min — oldest anchor first — must name id 8 \
+             (boundary 3990) before id 7 (boundary 4020), even though id 7 was committed first"
+        );
 
         // A recording prove closure: records which id it was asked to prove, flips that row
-        // `Signed -> Proved` (as a real prove would, so `prove_pending_rows`' own
+        // `Signed -> Proved` (as a real prove would, so `prove_named_rows`' own
         // still-Signed-after-a-successful-prove guard does not trip), and always succeeds.
         let mut proved_ids: Vec<MigrationTransferId> = Vec::new();
-        let proved = prove_pending_rows(&mut state, h(4_100), Some(1), |state, id| {
-            proved_ids.push(id);
-            state.set_transaction_proved(id, Vec::new(), None);
-            Ok(true)
-        })
+        let proved = prove_named_rows(
+            &mut ctx,
+            &mut state,
+            &instruction,
+            Some(1),
+            |_ctx, state, id| {
+                proved_ids.push(id);
+                state.set_transaction_proved(id, Vec::new(), None);
+                Ok(true)
+            },
+        )
         .expect("the recording prove closure must not fail");
 
         assert_eq!(
-            proved, 1,
+            proved.total_proved, 1,
             "max_proofs = Some(1) caps the sweep at one proof"
         );
         assert_eq!(
             proved_ids,
             vec![MigrationTransferId::new(8)],
-            "the drive's (anchor_boundary, id)-min — oldest anchor first — must prove id 8 \
-             (boundary 3990) before id 7 (boundary 4020), even though id 7 was committed first"
+            "the executor must take the instruction's head, imposing no order of its own"
         );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A stored run whose next transaction is `Signed`, schedule-due, dependency-satisfied, and
@@ -8054,10 +9118,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ----- engine target-height boundary (F2): `next_broadcastable`/`next_provable`/
-    // `expired_transactions` are all defined over `target = tip + 1`, never the raw tip -----
+    // ----- engine target-height boundary (F2): `transaction_statuses`, `expired_transactions`
+    // and the drive are all defined over `target = tip + 1`, never the raw tip -----
 
-    /// Engine semantics: `next_broadcastable` is defined over `target = tip + 1` (the height of
+    /// Engine semantics: the broadcast queue is defined over `target = tip + 1` (the height of
     /// the NEXT block), with schedule test `scheduled_height <= target` — so a `Proved` transfer
     /// scheduled at EXACTLY `tip + 1` is due for broadcast right now, one block earlier than a
     /// raw-tip check (`scheduled_height <= tip`) would have admitted it.
@@ -8648,16 +9712,35 @@ mod tests {
         );
     }
 
-    /// Reads one advance step over the FFI, asserting success, and frees the DTO after copying it
-    /// out (every field is plain data).
-    fn read_advance_step(path_bytes: &[u8], account: &[u8; 16]) -> (u32, u32, bool, u32, u32, u32) {
+    /// One copied-out `FfiProveTarget` row, as `(id, kind_is_preparation, kind_layer, kind_index,
+    /// kind_crossing, schedule_due)` — the tuple shape [`read_advance_step`] collects
+    /// `prove_targets` into.
+    type ProveTargetTuple = (u32, bool, u32, u32, u32, bool);
+
+    /// [`read_advance_step_at`] with no wall-clock estimate (`-1`), the ordinary reading.
+    fn read_advance_step(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+    ) -> (u32, u32, Vec<ProveTargetTuple>, i64, u32) {
+        read_advance_step_at(path_bytes, account, -1)
+    }
+
+    /// Reads one advance step over the FFI at `estimated_tip`, asserting success, and frees the
+    /// DTO (and its `prove_targets` batch array, if any) after copying everything out. The
+    /// trailing pair is the OUTLOOK (upstream #2936): `next_height` (`-1` = no outlook) and
+    /// `next_kind`.
+    fn read_advance_step_at(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+        estimated_tip: i64,
+    ) -> (u32, u32, Vec<ProveTargetTuple>, i64, u32) {
         let ptr = unsafe {
             zcashlc_migration_advance_step(
                 path_bytes.as_ptr(),
                 path_bytes.len(),
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
-                -1,
+                estimated_tip,
             )
         };
         assert!(
@@ -8666,13 +9749,25 @@ mod tests {
             ffi_helpers::error_handling::error_message()
         );
         let step = unsafe { &*ptr };
+        let targets = unsafe { slice_or_empty(step.prove_targets, step.prove_targets_len) }
+            .iter()
+            .map(|t| {
+                (
+                    t.id,
+                    t.kind_is_preparation,
+                    t.kind_layer,
+                    t.kind_index,
+                    t.kind_crossing,
+                    t.schedule_due,
+                )
+            })
+            .collect();
         let out = (
             step.step,
             step.id,
-            step.kind_is_preparation,
-            step.kind_layer,
-            step.kind_index,
-            step.kind_crossing,
+            targets,
+            step.next_height,
+            step.next_kind,
         );
         unsafe { zcashlc_free_migration_advance_step(ptr) };
         out
@@ -8729,11 +9824,11 @@ mod tests {
     /// run is terminal, so the conduit answers `Complete` and the attention queries answer
     /// `false`, with no separate clearing machinery involved.
 
-    /// A provable PREPARATION reports `Prove` with `kind_is_preparation` and its layer/index —
-    /// carried natively by upstream's `AdvanceStep::Prove { id, kind }`, no stored-row lookup
-    /// involved.
+    /// A provable PREPARATION reports `Prove` with a batch entry whose `kind_is_preparation` and
+    /// layer/index are set — carried natively by upstream's `AdvanceStep::Prove { transactions }`,
+    /// no stored-row lookup involved.
 
-    /// A provable TRANSFER reports `Prove` with its crossing index populated.
+    /// A provable TRANSFER reports `Prove` with a batch entry whose crossing index is populated.
 
     /// Every transaction mined -> the `Complete` step (upstream's own all-mined arm).
     #[test]
@@ -8798,6 +9893,199 @@ mod tests {
         let (step, id, ..) = read_advance_step(path_bytes, &account);
         assert_eq!(step, 3, "nothing actionable must report Waiting");
         assert_eq!(id, 0, "the Waiting step names no transaction");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two-provable-transfers state both the batch pin and the outlook pin drive: two
+    /// Signed transfers, both settled below the tip — row 0 is earliest-ready, its boundary
+    /// settling before row 1's.
+    fn store_two_provable_transfers(db_name: &str) -> (std::path::PathBuf, [u8; 16]) {
+        let path = init_fixture_db(db_name);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        // The satisfiability oracle verifies a transfer's boundary checkpoint against SCANNED
+        // data, not just the stored schedule — an unscanned wallet cannot vouch for either
+        // boundary however far below the tip they sit.
+        mark_fixture_scanned_through(&path, 3_600_000);
+        // Both rows below share the fixture's placeholder spend nullifier; the oracle must find
+        // it as a known, unspent input before either row is satisfiable.
+        seed_placeholder_received_note(&path, [0u8; 32]);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                tx_row(
+                    0,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    &[],
+                    3_700_000,
+                    4_000_000,
+                    Some(3_500_000), // settled well below the tip: provable now
+                    MigrationTxState::Signed,
+                ),
+                tx_row(
+                    1,
+                    MigrationTxKind::Transfer { crossing: 1 },
+                    &[],
+                    3_750_000,
+                    4_000_000,
+                    Some(3_550_000), // also settled, but later than row 0's boundary
+                    MigrationTxState::Signed,
+                ),
+            ],
+        );
+        store_fixture_state(&path, &account, &state);
+        (path, account)
+    }
+
+    /// The batch marshal pin (librustzcash #2939): with MULTIPLE provable rows outstanding, the
+    /// Prove step carries the WHOLE provable set in one call rather than one candidate at a time
+    /// — each entry keeping its own id and kind, ordered earliest-ready-first (a transfer by its
+    /// settled anchor boundary) with distinct ids — and the step's own `id` is `0` (the batch
+    /// entries carry their own).
+    #[test]
+    fn advance_step_prove_carries_the_whole_batch() {
+        let (path, account) = store_two_provable_transfers("zcashlc_advance_step_prove_batch");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        let (step, id, targets, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(step, 0, "multiple provable rows must report Prove");
+        assert_eq!(id, 0, "the step itself names no single transaction");
+        assert!(
+            targets.len() >= 2,
+            "the batch must carry every provable row, got {targets:?}"
+        );
+        let ids: Vec<u32> = targets.iter().map(|t| t.0).collect();
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "entries must be earliest-ready-first (row 0's boundary settled first) with distinct ids"
+        );
+        assert!(
+            targets.iter().all(|t| !t.1),
+            "both rows are transfers, so kind_is_preparation must be false throughout"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The preparation arm of the batch marshal: `kind_is_preparation`, `kind_layer`, and
+    /// `kind_index` survive the crossing into the FFI row with layer and index NOT transposed
+    /// (both cast to `u32`, so a swap would compile silently).
+    #[test]
+    fn advance_step_prove_marshals_a_preparation_target() {
+        let path = init_fixture_db("zcashlc_advance_step_prove_preparation");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        mark_fixture_scanned_through(&path, 3_600_000);
+        seed_placeholder_received_note(&path, [0u8; 32]);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![tx_row(
+                0,
+                MigrationTxKind::Preparation { layer: 2, index: 5 },
+                &[],
+                3_500_000, // due: at or below the scanned target, so the schedule offers it
+                4_000_000,
+                None, // a preparation draws no anchor boundary
+                MigrationTxState::Signed,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, id, targets, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_PROVE,
+            "a due preparation is provable"
+        );
+        assert_eq!(id, 0, "the step itself names no single transaction");
+        assert_eq!(
+            targets.len(),
+            1,
+            "exactly the one preparation, got {targets:?}"
+        );
+        let (target_id, is_preparation, layer, index, crossing, schedule_due) = targets[0];
+        assert_eq!(target_id, 0);
+        assert!(is_preparation, "the kind must marshal as a preparation");
+        assert_eq!(layer, 2, "layer must not be transposed with index");
+        assert_eq!(index, 5, "index must not be transposed with layer");
+        assert_eq!(crossing, 0, "a preparation carries no crossing");
+        assert!(
+            schedule_due,
+            "the preparation is scheduled at or below the target, so its proof blocks delivery"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The OUTLOOK (upstream #2936, `Advance::next`): the earliest height at which the migration
+    /// next has serviceable work, assuming the served step is executed — mirrors upstream's own
+    /// `outlook_after_a_prove_is_the_broadcast_that_follows` (satisfiability.rs ~3089): a served
+    /// Prove batch's own entries become `Proved` in the hypothetical, so their own (still-future)
+    /// broadcast schedule is what the outlook reports next.
+    #[test]
+    fn advance_step_outlook_reports_next_work() {
+        let (path, account) = store_two_provable_transfers("zcashlc_advance_step_outlook_prove");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        let (step, _id, targets, next_height, next_kind) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_PROVE,
+            "the whole provable batch is served now"
+        );
+        assert_eq!(targets.len(), 2, "both rows are provable now");
+        assert!(
+            next_height > 0,
+            "once proved, row 0's own (still-future) broadcast schedule is a real height: {next_height}"
+        );
+        assert_eq!(
+            next_height, 3_700_000,
+            "the earliest of the two proved-and-scheduled followers wins"
+        );
+        assert_eq!(
+            next_kind, ZCASHLC_STEP_KIND_BROADCAST,
+            "once proved, a transfer's own later broadcast is the outlook"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // Nothing height-schedulable: the sole transaction is already in flight (Broadcast,
+        // unmined) -- mining is chain-derived, so upstream's `step_floor` reports no floor for
+        // it, and the Waiting step's outlook is `None` (mirrors upstream's own
+        // `outlook_is_none_when_nothing_is_height_schedulable`, satisfiability.rs, second case).
+        // No anchor boundary: an in-flight row's boundary would otherwise route the drive's own
+        // reorg-displacement check through the stored PCZT, which this fixture's placeholder
+        // bytes cannot satisfy -- orthogonal to what this scenario exercises (`step_floor`
+        // reports no floor for a `Broadcast`-state row regardless of its boundary).
+        let path = init_fixture_db("zcashlc_advance_step_outlook_none");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        mark_fixture_scanned_through(&path, 3_600_000);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![tx_row(
+                0,
+                MigrationTxKind::Transfer { crossing: 0 },
+                &[],
+                3_100_000,
+                4_000_000,
+                None,
+                MigrationTxState::Broadcast {
+                    txid: TxId::from_bytes([9u8; 32]),
+                },
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, _id, _targets, next_height, _next_kind) =
+            read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_WAITING,
+            "an in-flight-only run must report Waiting"
+        );
+        assert_eq!(
+            next_height, -1,
+            "mining is chain-derived: nothing is height-schedulable"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -9242,57 +10530,6 @@ mod tests {
         }
     }
 
-    fn has_ready_broadcast(path_bytes: &[u8], account: &[u8; 16], estimated_tip: i64) -> i32 {
-        unsafe {
-            zcashlc_migration_has_ready_broadcast(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
-                estimated_tip,
-            )
-        }
-    }
-
-    // ----- the sync-gate predicate (`zcashlc_migration_has_ready_broadcast`) -----
-
-    /// THE A2 WEDGE PIN: a `Signed`, schedule-due, prove-ready transfer is overdue DELIVERY work
-    /// (`has_overdue_transfers` answers `true` — a sweep plus a broadcast will discharge it) but
-    /// must NOT gate sync (`has_ready_broadcast` answers `0`): it needs MORE syncing/proving
-    /// before a broadcast session can do anything with it, so a gate keyed on it would wedge —
-    /// sync withheld for a broadcast that cannot be served until sync proceeds.
-    #[test]
-    fn has_ready_broadcast_signed_due_row_answers_no_while_overdue_answers_yes() {
-        let path = init_fixture_db("zcashlc_ready_broadcast_signed");
-        let path_bytes = path.to_str().unwrap().as_bytes();
-        let account = create_fixture_account(&path);
-        set_fixture_tip(path_bytes);
-        // Signed, due, boundary settled — `has_overdue_transfers_reports_a_due_signed_transfer`'s
-        // exact fixture.
-        let state = test_state(
-            MigrationStatus::InProgress,
-            &[],
-            &[MigrationTxState::Signed],
-            3_499_000,
-            4_000_000,
-        );
-        store_fixture_state(&path, &account, &state);
-
-        assert!(
-            has_overdue(path_bytes, &account, -1),
-            "sanity: the due Signed row IS overdue delivery work"
-        );
-        assert_eq!(
-            has_ready_broadcast(path_bytes, &account, -1),
-            0,
-            "a Signed row — even a due one — must never block sync (the A2 wedge)"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The gate's yes-case and its exclusions: a `Proved`, due row answers `1`; the same row
-    /// marked `Invalid` answers `0` (a dead transfer gates nothing); no stored run answers `0`.
-
     /// A transfer scheduled past the scanned target but at/below the estimated tip is overdue
     /// WITH the estimate and not without it (`-1` disables).
     #[test]
@@ -9374,17 +10611,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The delivery lane and the sync-gate predicate honour the same doomed-broadcast withhold: a
-    /// proved, scanned-due row whose expiry only the ESTIMATED target has passed is NOT served by
-    /// the delivery decision ([`next_due`], and over the FFI
-    /// [`zcashlc_migration_next_due_transfer`] answers `NothingDue`) and does NOT gate sync via
-    /// [`zcashlc_migration_has_ready_broadcast`] — while without the estimate both serve it.
+    /// The drive honours the doomed-broadcast withhold: a proved, scanned-due row whose expiry
+    /// only the ESTIMATED target has passed is NOT offered by the broadcast queue the drive plans
+    /// from, so over the FFI the advance step answers `Waiting` rather than a BROADCAST
+    /// instruction an executor would then discharge — while without the estimate it is served.
     #[test]
-    fn next_due_transfer_and_ready_broadcast_withhold_a_doomed_broadcast() {
+    fn advance_step_withholds_a_doomed_broadcast() {
         let path = init_fixture_db("zcashlc_next_due_doomed");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
         set_fixture_tip(path_bytes);
+        mark_fixture_scanned_through(&path, 3_600_000);
+        seed_placeholder_received_note(&path, [0u8; 32]);
         let scanned_tip = h(3_600_000);
         // Proved; due at the SCANNED target; expiry between the scanned and estimated targets.
         let state = test_state(
@@ -9396,52 +10634,25 @@ mod tests {
         );
         store_fixture_state(&path, &account, &state);
 
-        // The pure delivery decision: served on the scanned view, withheld under the estimate.
+        // The pure queue read the drive plans from: offered on the scanned view, withheld under
+        // the estimate.
         assert_eq!(
-            next_due(&state, dueness_targets(scanned_tip, -1)),
-            DueOutcome::Ready {
-                id: MigrationTransferId::new(0)
-            },
-            "without the estimate the proved, due, unexpired row is served"
+            ready_broadcast_head(&state, dueness_targets(scanned_tip, -1)),
+            Some(MigrationTransferId::new(0)),
+            "without the estimate the proved, due, unexpired row is offered"
         );
         assert_eq!(
-            next_due(&state, dueness_targets(scanned_tip, 3_700_000)),
-            DueOutcome::Nothing,
+            due_assuming_proving(&state, dueness_targets(scanned_tip, 3_700_000)),
+            None,
             "under the estimate the doomed broadcast is withheld from the delivery lane"
         );
 
-        // The same withhold over the FFI: the delivery call answers the benign NothingDue (it
-        // never reaches the artifact read), and the sync gate stops gating.
-        let ptr = unsafe {
-            zcashlc_migration_next_due_transfer(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
-                3_700_000,
-            )
-        };
-        assert!(
-            !ptr.is_null(),
-            "the withheld delivery answer is not an error"
-        );
-        assert!(
-            matches!(
-                unsafe { &*ptr }.status,
-                FfiPreparedTransferStatus::MigrationNothingDue
-            ),
-            "the doomed row must read as NothingDue under the estimate"
-        );
-        unsafe { zcashlc_free_migration_prepared_transfer(ptr) };
+        // The same withhold over the FFI: the conduit issues no BROADCAST instruction, so the
+        // executor is never reached.
+        let (step, ..) = read_advance_step_at(path_bytes, &account, 3_700_000);
         assert_eq!(
-            has_ready_broadcast(path_bytes, &account, -1),
-            1,
-            "without the estimate the row gates sync (a broadcast is servable right now)"
-        );
-        assert_eq!(
-            has_ready_broadcast(path_bytes, &account, 3_700_000),
-            0,
-            "the doomed row must not gate sync: serving it would only earn a rejection"
+            step, ZCASHLC_ADVANCE_STEP_WAITING,
+            "the doomed row must yield no broadcast instruction under the estimate"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -9484,15 +10695,26 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The delivery lane mirrors the same acceleration: a `Signed`, provable transfer scheduled
-    /// past the scanned target is `NothingDue` without the estimate and `AwaitingProof` with it
-    /// (the boundary-settle check stays scanned-side — the fixture's boundary IS settled).
+    /// The PROVE step's `schedule_due` flag mirrors the same acceleration: a `Signed`, provable
+    /// transfer scheduled past the scanned target is NOT schedule-due without the estimate and IS
+    /// with it (the boundary-settle check stays scanned-side — the fixture's boundary IS settled).
+    ///
+    /// This is what lets a platform's delivery session distinguish "the batch is opportunistic
+    /// proving work" from "the delivery lane is blocked on this proof" without asking the engine a
+    /// second question of its own.
+    ///
+    /// The fixture owes the store's satisfiability oracle a scanned range and a known, unspent
+    /// input, because the batch is drawn by the VERIFIED drive: an oracle with nothing to vouch
+    /// with sets the candidate aside and the step degrades to `Waiting`, which is the safe answer
+    /// but not the acceleration under test.
     #[test]
-    fn next_due_transfer_estimated_tip_reports_awaiting_proof() {
+    fn advance_step_estimated_tip_marks_a_prove_target_schedule_due() {
         let path = init_fixture_db("zcashlc_next_due_estimate");
         let path_bytes = path.to_str().unwrap().as_bytes();
         let account = create_fixture_account(&path);
         set_fixture_tip(path_bytes);
+        mark_fixture_scanned_through(&path, 3_600_000);
+        seed_placeholder_received_note(&path, [0u8; 32]);
         let state = custom_state(
             MigrationStatus::InProgress,
             vec![tx_row(
@@ -9507,44 +10729,827 @@ mod tests {
         );
         store_fixture_state(&path, &account, &state);
 
-        let read_status = |estimated_tip: i64| {
-            let ptr = unsafe {
-                zcashlc_migration_next_due_transfer(
-                    path_bytes.as_ptr(),
-                    path_bytes.len(),
-                    account.as_ptr(),
-                    NETWORK_ID_MAINNET,
-                    estimated_tip,
-                )
-            };
-            assert!(!ptr.is_null(), "next_due_transfer must not error");
-            let transfer = unsafe { &*ptr };
-            let out = (
-                matches!(
-                    transfer.status,
-                    FfiPreparedTransferStatus::MigrationNothingDue
-                ),
-                matches!(
-                    transfer.status,
-                    FfiPreparedTransferStatus::MigrationAwaitingProof
-                ),
-                transfer.id,
+        let read_due = |estimated_tip: i64| {
+            let (step, _id, targets, ..) =
+                read_advance_step_at(path_bytes, &account, estimated_tip);
+            assert_eq!(
+                step, ZCASHLC_ADVANCE_STEP_PROVE,
+                "the provable row is offered for proving either way"
             );
-            unsafe { zcashlc_free_migration_prepared_transfer(ptr) };
-            out
+            assert_eq!(targets.len(), 1, "exactly the one row, got {targets:?}");
+            (targets[0].0, targets[0].5)
         };
 
-        let (nothing, awaiting, _) = read_status(-1);
+        let (id, schedule_due) = read_due(-1);
+        assert_eq!(id, 0, "the batch names the provable row");
         assert!(
-            nothing && !awaiting,
-            "without an estimate the future-scheduled row is not due"
+            !schedule_due,
+            "without an estimate the future-scheduled row's proof blocks no delivery"
         );
-        let (nothing, awaiting, id) = read_status(3_600_010);
+        let (id, schedule_due) = read_due(3_600_010);
+        assert_eq!(id, 0, "the batch still names the same row");
         assert!(
-            !nothing && awaiting,
-            "under the estimate the due-but-unproved row must report AwaitingProof"
+            schedule_due,
+            "under the estimate the row is due, so its missing proof IS what blocks delivery"
         );
-        assert_eq!(id, 0, "the awaiting row must be named");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- the delivery executor (`zcashlc_migration_take_broadcast_transaction`) -----
+    //
+    // The instruction the executor discharges comes from the engine's VERIFIED drive, so these
+    // fixtures owe the store's satisfiability oracle what a real wallet would have: a scanned
+    // range (`mark_fixture_scanned_through`) and a known, unspent input for the rows' placeholder
+    // nullifier (`seed_placeholder_received_note`). Without both the oracle can vouch for nothing
+    // and every step degrades to `Waiting` — the safe answer, but not the one under test. The
+    // rows also carry PARSEABLE artifacts ([`provable_tx_row`]): the broadcast seam finalizes and
+    // extracts the stored PCZT, which the `vec![0u8]` placeholder cannot survive.
+
+    /// [`tx_row`] carrying parseable PCZT bytes ([`minimal_pczt_bytes`]) — what the delivery
+    /// executor's broadcast seam needs, and what the heterogeneous-row fixtures otherwise lack.
+    fn provable_tx_row(
+        id: u32,
+        kind: MigrationTxKind,
+        scheduled: u32,
+        expiry: u32,
+        anchor_boundary: Option<u32>,
+        state: MigrationTxState,
+    ) -> MigrationTransaction {
+        test_transaction_from_parts(
+            MigrationTransferId::new(id),
+            kind,
+            minimal_pczt_bytes(),
+            Vec::new(),
+            h(scheduled),
+            h(expiry),
+            anchor_boundary.map(h),
+            state,
+            None,
+        )
+    }
+
+    /// A fixture wallet whose oracle can vouch for [`provable_tx_row`] rows: tip and scanned
+    /// range at the file's usual 3,600,000, with the placeholder spend nullifier seeded as a
+    /// known, unspent note.
+    fn init_delivery_fixture(prefix: &str) -> (PathBuf, [u8; 16]) {
+        let path = init_fixture_db(prefix);
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path.to_str().unwrap().as_bytes());
+        mark_fixture_scanned_through(&path, 3_600_000);
+        seed_placeholder_received_note(&path, [0u8; 32]);
+        (path, account)
+    }
+
+    /// One run of the delivery executor over the FFI, with the DTO copied out and freed: the
+    /// named id, the served txid, and the served (finalized transaction) bytes. Asserts success —
+    /// the executor has no benign empty answer, so a NULL here is an error to be read with
+    /// [`take_broadcast_error`] instead.
+    fn take_broadcast_transaction(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+        id: u32,
+    ) -> (u32, [u8; 32], Vec<u8>) {
+        let ptr = unsafe {
+            zcashlc_migration_take_broadcast_transaction(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                id,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "the delivery executor must not error: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        let prepared = unsafe { &*ptr };
+        let out = (
+            prepared.id,
+            prepared.txid,
+            unsafe { slice_or_empty(prepared.pczt, prepared.pczt_len) }.to_vec(),
+        );
+        unsafe { zcashlc_free_migration_prepared_transfer(ptr) };
+        out
+    }
+
+    /// The delivery executor's refusal message: asserts the NULL return and takes the last error.
+    fn take_broadcast_error(path_bytes: &[u8], account: &[u8; 16], id: u32) -> String {
+        let ptr = unsafe {
+            zcashlc_migration_take_broadcast_transaction(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                id,
+            )
+        };
+        assert!(
+            ptr.is_null(),
+            "the executor was expected to refuse row {id}"
+        );
+        ffi_helpers::error_handling::take_last_error()
+            .expect("the refusal must record a last-error")
+            .to_string()
+    }
+
+    /// The number of rows the wallet's OWN `transactions` table holds with raw bytes recorded —
+    /// the record the broadcast seam writes in the same database transaction as it hands the
+    /// transaction out. (The fixtures' own hand-inserted rows carry no `raw`, so this counts
+    /// exactly what the seam wrote.)
+    fn wallet_transaction_records(path: &std::path::Path) -> i64 {
+        let conn = Connection::open(path).expect("the verification connection opens");
+        conn.query_row(
+            "SELECT COUNT(*) FROM transactions WHERE raw IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the wallet transactions table is queryable")
+    }
+
+    /// The stored scheduled height of `id`, for asserting what a drive persisted.
+    fn stored_scheduled_height(state: &MigrationState, id: u32) -> u32 {
+        state
+            .transactions()
+            .iter()
+            .find(|t| t.id() == MigrationTransferId::new(id))
+            .map(|t| u32::from(t.scheduled_height()))
+            .unwrap_or_else(|| panic!("row {id} remains stored"))
+    }
+
+    /// `PoolMigrations::take_transaction_for_broadcast` over the fixture wallet, surfacing the store's
+    /// TYPED error — what the delivery lane's broadcast arm delegates to, and what
+    /// [`broadcast_seam_error`] classifies. The store error type is `#[non_exhaustive]`, so a real
+    /// call is the only way a test can hold one of its variants.
+    fn take_for_broadcast(
+        path: &std::path::Path,
+        account: &[u8; 16],
+        state: &MigrationState,
+        id: u32,
+    ) -> Result<(), PoolMigrationStoreError> {
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture call context opens");
+        let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)
+            .expect("the fixture store opens");
+        store
+            .take_transaction_for_broadcast(state, MigrationTransferId::new(id))
+            .map(|_| ())
+    }
+
+    /// THE DELIVERY LANE'S ERROR CLASSIFICATION. `MIGRATION_PROVING_UNAVAILABLE` is a STABLE FFI
+    /// prefix — the Swift layer routes it to `ZcashError.migrationProvingUnavailable` and shows a
+    /// different, actionable message for it — so which broadcast-seam failures carry it is part of
+    /// the contract, not a detail of the message text.
+    ///
+    /// The pre-drive serve path prefixed exactly the two failures that meant "this stored artifact
+    /// cannot be turned into servable bytes right now" (the PCZT would not re-parse; it would not
+    /// extract) and left the "which row did you name" failures bare (unknown id, not `Proved`).
+    /// Routing the lane through the store's seam must not silently reclassify either class: the
+    /// same failures now arrive as `Error::Finalize` and `Error::NotProved` respectively, and must
+    /// come out the same way. Both variants here are REAL ones from the store, since the error
+    /// type is `#[non_exhaustive]` and cannot be constructed.
+    #[test]
+    fn broadcast_seam_error_keeps_the_proving_unavailable_prefix_contract() {
+        let (path, account) = init_delivery_fixture("zcashlc_seam_error_class");
+        let id = MigrationTransferId::new(0);
+        let row = |state: MigrationTxState| {
+            custom_state(
+                MigrationStatus::InProgress,
+                vec![provable_tx_row(
+                    0,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    3_600_000,
+                    4_000_000,
+                    Some(3_500_000),
+                    state,
+                )],
+            )
+        };
+
+        // A `Proved` row whose artifact will not finalize: the class the old path prefixed.
+        let unfinalizable = take_for_broadcast(&path, &account, &row(MigrationTxState::Proved), 0)
+            .expect_err("the fixture artifact carries no proofs, so it cannot be finalized");
+        assert!(
+            matches!(unfinalizable, PoolMigrationStoreError::Finalize(_)),
+            "the fixture must produce the finalize class, got: {unfinalizable:?}"
+        );
+        let classified = broadcast_seam_error(id, unfinalizable).to_string();
+        assert!(
+            classified.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "an unfinalizable artifact must stay on the proving-unavailable route, got: \
+             {classified}"
+        );
+
+        // A row that is not `Proved`: the class the old path left bare.
+        let not_proved = take_for_broadcast(&path, &account, &row(MigrationTxState::Signed), 0)
+            .expect_err("an unproved row must not be finalizable");
+        assert!(
+            matches!(not_proved, PoolMigrationStoreError::NotProved(_)),
+            "the fixture must produce the lifecycle class, got: {not_proved:?}"
+        );
+        let classified = broadcast_seam_error(id, not_proved).to_string();
+        assert!(
+            !classified.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "a lifecycle refusal must NOT claim proving is unavailable, got: {classified}"
+        );
+        assert!(
+            classified.contains("is not proved"),
+            "the bare error must still carry the store's detail, got: {classified}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE ATOMIC BROADCAST SEAM. The delivery executor does not re-parse the stored PCZT and
+    /// extract it just to recover a txid, throwing the transaction away: it calls the store's
+    /// `PoolMigrations::take_transaction_for_broadcast`, which finalizes, extracts, and records the
+    /// transaction in the WALLET's own tables in one database transaction with handing the bytes
+    /// out — so the wallet's record binds at the broadcast ATTEMPT and a platform can never hold
+    /// broadcastable bytes the wallet knows nothing about.
+    ///
+    /// What this fixture can pin is that the executor REACHES that seam and that the seam is
+    /// all-or-nothing. Extraction re-verifies the proofs and signatures it assembles, so a
+    /// SUCCESSFUL serve needs a genuinely proven artifact — real Orchard proving over a real
+    /// commitment tree, which upstream covers in its `expensive-tests` chain simulation and no
+    /// hand-built state here can stand in for. The refusal path is the same seam, and it must
+    /// leave the wallet exactly as it found it.
+    #[test]
+    fn take_broadcast_transaction_serves_a_proved_row_through_the_broadcast_seam() {
+        let (path, account) = init_delivery_fixture("zcashlc_next_due_seam");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                0,
+                MigrationTxKind::Transfer { crossing: 0 },
+                3_600_000,
+                4_000_000,
+                Some(3_500_000),
+                MigrationTxState::Proved,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "no transaction is recorded before the executor runs"
+        );
+
+        // The executor delegates to the seam, whose verification refuses this fixture's unproven
+        // artifact. The message is the STORE's, which is how this pins the delegation: a
+        // hand-rolled extract failure could not name the store at all.
+        let err = take_broadcast_error(path_bytes, &account, 0);
+        assert!(
+            err.contains("taking migration transaction 0 for broadcast failed")
+                && err.contains("pool-migration store"),
+            "the executor must fail THROUGH the store's seam, got: {err}"
+        );
+        // ...and over the FFI it keeps the stable prefix the pre-drive serve path put on exactly
+        // this failure class, so the Swift layer still routes it to its own error rather than the
+        // lane's generic one (the classification itself is pinned by
+        // `broadcast_seam_error_keeps_the_proving_unavailable_prefix_contract`).
+        assert!(
+            err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "the executor must keep classifying an unfinalizable artifact as \
+             proving-unavailable, got: {err}"
+        );
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "a refused finalization must record nothing: the seam is all-or-nothing"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE STALENESS GUARD. The executor takes the id it was given and never re-asks the engine
+    /// whether that id is still the right one — so what protects it from acting on an instruction
+    /// that has gone stale is the seam's own refusal of a row that is not `Proved`. Serving an
+    /// unproved row is refused, BARE (no proving-unavailable prefix: this is a question about
+    /// WHICH row was named, not about the artifact), and leaves the wallet untouched.
+    ///
+    /// The same refusal is what makes a stale BROADCAST instruction safe: the engine re-offers
+    /// un-discharged work on the next crank, so a caller that lost the race simply advances again.
+    #[test]
+    fn take_broadcast_transaction_refuses_a_row_that_is_not_proved() {
+        let (path, account) = init_delivery_fixture("zcashlc_take_broadcast_stale");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let unproved = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                0,
+                MigrationTxKind::Transfer { crossing: 0 },
+                3_600_000,
+                4_000_000,
+                Some(3_500_000),
+                MigrationTxState::Signed,
+            )],
+        );
+        store_fixture_state(&path, &account, &unproved);
+
+        let err = take_broadcast_error(path_bytes, &account, 0);
+        assert!(
+            err.contains("is not proved"),
+            "the seam must name the lifecycle problem, got: {err}"
+        );
+        assert!(
+            !err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "a lifecycle refusal must not claim proving is unavailable, got: {err}"
+        );
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "the refused row leaves no wallet record behind"
+        );
+
+        // An id the stored run does not contain at all is refused before the seam is even reached.
+        let err = take_broadcast_error(path_bytes, &account, 99);
+        assert!(
+            err.contains("no migration transaction with id 99"),
+            "an unknown id must be named, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE RE-SPREAD REGRESSION. A wallet that slept through several scheduled broadcasts and
+    /// wakes to deliver must have its backlog RE-SPREAD before anything is served: ZIP 318
+    /// releases at most one overdue transfer immediately and defers the rest by the lag, drawn
+    /// inter-broadcast gaps intact. That re-spread fires ONLY inside `advance_migration` — which
+    /// is exactly why the delivery session's FIRST call is the advance, and the executor that
+    /// follows is told what to serve rather than choosing for itself.
+    ///
+    /// One advance over a three-transfer backlog: the released row lands at the SCANNED target
+    /// (release means executable — a proof rests on scanned chain data), and it is the only row
+    /// servable there afterwards; the other two moved later by the same lag, so the gap between
+    /// them survives unchanged.
+    ///
+    /// The backlog is `Signed`, so the released row comes back as a schedule-due `Prove` target
+    /// rather than a BROADCAST instruction. The trigger, the release and the deferral are the
+    /// drive's and are identical for its `Prove` and `Broadcast` steps; what this pins is that the
+    /// SESSION-OPENING ADVANCE is what fires them, and a `Proved` backlog would need a genuinely
+    /// proven artifact to get past the broadcast seam's verification (see
+    /// [`take_broadcast_transaction_serves_a_proved_row_through_the_broadcast_seam`]).
+    #[test]
+    fn advance_step_re_spreads_a_slept_through_backlog_before_serving() {
+        let (path, account) = init_delivery_fixture("zcashlc_next_due_respread");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        // Three transfers, all scheduled far below the scanned target (3,600,001) — the wallet
+        // slept through the whole window. Their drawn gaps are 100 and 200 blocks.
+        let transfer = |id: u32, scheduled: u32| {
+            provable_tx_row(
+                id,
+                MigrationTxKind::Transfer {
+                    crossing: id as usize,
+                },
+                scheduled,
+                4_000_000,
+                Some(3_400_000),
+                MigrationTxState::Signed,
+            )
+        };
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                transfer(0, 3_500_000),
+                transfer(1, 3_500_100),
+                transfer(2, 3_500_300),
+            ],
+        );
+        // The counterfactual the drive fixes: every row of the backlog starts due at the scanned
+        // target, so a selector-served lane would hand them out back-to-back.
+        assert_eq!(
+            state
+                .transactions()
+                .iter()
+                .filter(|t| u32::from(t.scheduled_height()) <= 3_600_001)
+                .count(),
+            3,
+            "the fixture backlog must start fully due"
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let (step, _id, targets, ..) = read_advance_step(path_bytes, &account);
+        assert_eq!(
+            step, ZCASHLC_ADVANCE_STEP_PROVE,
+            "the released row is offered for proving"
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|t| t.5)
+                .map(|t| t.0)
+                .collect::<Vec<_>>(),
+            vec![0],
+            "exactly the most overdue row is released as schedule-due, got {targets:?}"
+        );
+
+        let stored = read_fixture_state(&path, &account);
+        assert_eq!(
+            stored
+                .transactions()
+                .iter()
+                .filter(|t| u32::from(t.scheduled_height()) <= 3_600_001)
+                .count(),
+            1,
+            "exactly one row may be servable at the scanned target after the re-spread"
+        );
+        assert_eq!(
+            stored_scheduled_height(&stored, 0),
+            3_600_001,
+            "the release lands at the scanned target, where the wallet can execute it"
+        );
+        // The lag is 3,600,001 - 3,500,000 = 100,001 blocks; every deferred row moves by it.
+        assert_eq!(
+            stored_scheduled_height(&stored, 1),
+            3_600_101,
+            "the first deferred row moves later by the full lag"
+        );
+        assert_eq!(
+            stored_scheduled_height(&stored, 2),
+            3_600_301,
+            "the second deferred row moves later by the same lag"
+        );
+        assert_eq!(
+            stored_scheduled_height(&stored, 2) - stored_scheduled_height(&stored, 1),
+            200,
+            "the drawn inter-broadcast gap survives the wallet's absence unchanged"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- the txid seam (the prove return + `zcashlc_migration_take_preparation_by_txid`) -----
+    //
+    // A proved preparation is a complete PCZT whose submission is the platform's ORDINARY path
+    // (preparations are ZIP 318-exempt, and the engine's contract is that a preparation is
+    // broadcast as soon as it is proved), so the prove executor NAMES the preparations it proved
+    // and the accessor hands each one back by txid. The accessor is the take seam itself — the
+    // wallet's record binds at retrieval — so these fixtures inherit the delivery lane's limits
+    // exactly: what is reachable here is that the seam is REACHED and that every refusal is
+    // all-or-nothing.
+
+    /// One retrieval over the FFI, with the DTO copied out and freed: the engine transfer id, the
+    /// served txid, and the served (finalized transaction) bytes. Asserts success — a NULL is an
+    /// error to be read with [`take_preparation_error`] instead.
+    fn take_preparation_by_txid(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+        txid: [u8; 32],
+    ) -> (u32, [u8; 32], Vec<u8>) {
+        let ptr = unsafe {
+            zcashlc_migration_take_preparation_by_txid(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                txid.as_ptr(),
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "the preparation accessor must not error: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        let prepared = unsafe { &*ptr };
+        let out = (
+            prepared.id,
+            prepared.txid,
+            unsafe { slice_or_empty(prepared.pczt, prepared.pczt_len) }.to_vec(),
+        );
+        unsafe { zcashlc_free_migration_prepared_transfer(ptr) };
+        out
+    }
+
+    /// The preparation accessor's refusal message: asserts the NULL return and takes the last
+    /// error.
+    fn take_preparation_error(path_bytes: &[u8], account: &[u8; 16], txid: [u8; 32]) -> String {
+        let ptr = unsafe {
+            zcashlc_migration_take_preparation_by_txid(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                txid.as_ptr(),
+            )
+        };
+        assert!(
+            ptr.is_null(),
+            "the accessor was expected to refuse txid {}",
+            TxId::from_bytes(txid)
+        );
+        ffi_helpers::error_handling::take_last_error()
+            .expect("the refusal must record a last-error")
+            .to_string()
+    }
+
+    /// The fixture txid [`test_transaction_from_parts`] stamps on row `id`.
+    fn fixture_txid(id: u32) -> [u8; 32] {
+        [id as u8; 32]
+    }
+
+    /// THE PROVE RETURN NAMES PREPARATIONS ONLY. A mixed batch proves both kinds and the total
+    /// counts both, but only the preparations' txids come back: appearing in that list MEANS
+    /// "retrievable through the accessor", and a transfer never is — it is delivered by the
+    /// drive's broadcast instruction alone.
+    #[test]
+    fn prove_outcome_names_the_proved_preparations_and_no_transfer() {
+        let (path, account, mut ctx) = sweep_fixture_ctx("zcashlc_prove_outcome_mixed", 5_000);
+        let anchor = h(4_000);
+        let mut state = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                provable_tx_row(
+                    0,
+                    MigrationTxKind::Preparation { layer: 0, index: 0 },
+                    4_000,
+                    10_000,
+                    None,
+                    MigrationTxState::Signed,
+                ),
+                provable_tx_row(
+                    1,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    4_000,
+                    10_000,
+                    Some(1_440),
+                    MigrationTxState::Signed,
+                ),
+            ],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let mut prover = RecordingProver { calls: Vec::new() };
+        let ids = prove_instruction(&state);
+        assert_eq!(ids.len(), 2, "both rows are named by the instruction");
+        // The production dispatch ([`prove_one`]): a preparation proves against the resolved
+        // anchor, a transfer against its persisted boundary.
+        let outcome = prove_named_rows(&mut ctx, &mut state, &ids, None, |_ctx, state, id| {
+            let is_preparation = state
+                .transactions()
+                .iter()
+                .find(|t| t.id() == id)
+                .is_some_and(|t| matches!(t.kind(), MigrationTxKind::Preparation { .. }));
+            let preparation_anchor = is_preparation.then_some(anchor);
+            Ok(prove_due_for_test(&mut prover, state, id, preparation_anchor)?.is_some())
+        })
+        .expect("the mixed sweep must not fail");
+
+        assert_eq!(
+            prover.calls,
+            vec![
+                ProveCall::Preparation(anchor),
+                ProveCall::Transfer(h(1_440))
+            ],
+            "both kinds must actually have been proved"
+        );
+        assert_eq!(
+            outcome,
+            ProveOutcome {
+                total_proved: 2,
+                preparation_txids: vec![fixture_txid(0)],
+            },
+            "the total counts both kinds; the txids name the preparation alone"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The prove return's MARSHALING: the outcome crosses as a DTO whose txid array is a heap
+    /// `[u8; 32]` buffer the caller frees, and the empty outcome is a valid (non-NULL) DTO rather
+    /// than a sentinel — "nothing was provable right now" is an ordinary answer.
+    #[test]
+    fn prove_outcome_marshals_its_txid_buffer_and_frees() {
+        let round_trip = |outcome: ProveOutcome| {
+            let ptr = FfiMigrationProveOutcome::from_outcome(outcome);
+            assert!(!ptr.is_null(), "the outcome DTO is always populated");
+            let dto = unsafe { &*ptr };
+            let read = (
+                dto.total_proved,
+                unsafe { slice_or_empty(dto.preparation_txids, dto.preparation_txids_len) }
+                    .to_vec(),
+            );
+            unsafe { zcashlc_free_migration_prove_outcome(ptr) };
+            read
+        };
+
+        assert_eq!(
+            round_trip(ProveOutcome::default()),
+            (0, Vec::new()),
+            "the empty outcome marshals as a real DTO, not an error sentinel"
+        );
+        assert_eq!(
+            round_trip(ProveOutcome {
+                total_proved: 3,
+                preparation_txids: vec![fixture_txid(1), fixture_txid(2)],
+            }),
+            (3, vec![fixture_txid(1), fixture_txid(2)]),
+            "the total and every txid survive the crossing, in order"
+        );
+        // Freeing a null pointer is a no-op, as every free function in this module allows.
+        unsafe { zcashlc_free_migration_prove_outcome(std::ptr::null_mut()) };
+    }
+
+    /// With no stored run there is nothing to prove, and the executor says so with an EMPTY
+    /// outcome rather than an error: the benign answer is a DTO, and NULL now means only failure.
+    #[test]
+    fn prove_transactions_without_a_stored_run_returns_an_empty_outcome() {
+        let path = init_fixture_db("zcashlc_prove_outcome_no_run");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+
+        let ids = [0u32];
+        let ptr = unsafe {
+            zcashlc_migration_prove_transactions(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                ids.as_ptr(),
+                ids.len(),
+                1,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "nothing to prove is not an error: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        let dto = unsafe { &*ptr };
+        assert_eq!(dto.total_proved, 0, "no run means nothing was proved");
+        assert_eq!(
+            dto.preparation_txids_len, 0,
+            "and nothing is offered for retrieval"
+        );
+        unsafe { zcashlc_free_migration_prove_outcome(ptr) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE ACCESSOR IS THE TAKE SEAM. Retrieving a preparation is not a byte read of the stored
+    /// artifact: it resolves txid -> row and goes straight through
+    /// `PoolMigrations::take_transaction_for_broadcast` ([`serve_for_broadcast`]), which finalizes,
+    /// extracts and records the transaction in the WALLET's own tables in one database transaction
+    /// with handing the bytes out — so the record binds at retrieval and a crashed consumer
+    /// re-retrieves the same bytes over the same record.
+    ///
+    /// As with the delivery lane, a SUCCESSFUL serve needs a genuinely proven artifact (extraction
+    /// re-verifies the proofs), which no hand-built fixture can stand in for; what is reachable
+    /// here is that the accessor REACHES the seam — the message is the STORE's — and that the
+    /// refusal leaves the wallet exactly as it found it.
+    #[test]
+    fn take_preparation_by_txid_serves_through_the_broadcast_seam() {
+        let (path, account) = init_delivery_fixture("zcashlc_take_prep_seam");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                0,
+                MigrationTxKind::Preparation { layer: 0, index: 0 },
+                3_600_000,
+                4_000_000,
+                None,
+                MigrationTxState::Proved,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "no transaction is recorded before the accessor runs"
+        );
+
+        let err = take_preparation_error(path_bytes, &account, fixture_txid(0));
+        assert!(
+            err.contains("taking migration transaction 0 for broadcast failed")
+                && err.contains("pool-migration store"),
+            "the accessor must fail THROUGH the store's seam, got: {err}"
+        );
+        assert!(
+            err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "an unfinalizable artifact keeps the proving-unavailable route here too, got: {err}"
+        );
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "a refused finalization must record nothing: the seam is all-or-nothing"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE PREPARATION GATE. A transfer's txid is refused even when the row is `Proved` and would
+    /// serve perfectly well through the same seam: transfers are served by the drive's broadcast
+    /// instruction alone, and this accessor exists only for the preparations the prove return
+    /// names. The refusal is BARE — it is a question about WHICH row was named, not about whether
+    /// an artifact can be made servable — and it is decided before the seam, so nothing is
+    /// recorded.
+    #[test]
+    fn take_preparation_by_txid_refuses_a_transfer_txid() {
+        let (path, account) = init_delivery_fixture("zcashlc_take_prep_gate");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                0,
+                MigrationTxKind::Transfer { crossing: 0 },
+                3_600_000,
+                4_000_000,
+                Some(3_500_000),
+                MigrationTxState::Proved,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let err = take_preparation_error(path_bytes, &account, fixture_txid(0));
+        assert!(
+            err.contains("transfers are served by the drive's broadcast instruction alone"),
+            "the gate must state the ruling, got: {err}"
+        );
+        assert!(
+            !err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "the gate is not a claim about the artifact, got: {err}"
+        );
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "the gated row must never reach the seam, so nothing is recorded"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE READINESS GATE, THE UNKNOWN TXID, AND THE NULL POINTER. A preparation that is not
+    /// `Proved` is refused by the seam itself — the same staleness guard the delivery executor
+    /// relies on, bare and recording nothing — a txid the stored run does not carry is refused,
+    /// bare, before the seam is reached, and a null `txid_ptr` is refused before anything is read.
+    #[test]
+    fn take_preparation_by_txid_refuses_an_unproved_unknown_or_null_txid() {
+        let (path, account) = init_delivery_fixture("zcashlc_take_prep_unready");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                0,
+                MigrationTxKind::Preparation { layer: 0, index: 0 },
+                3_600_000,
+                4_000_000,
+                None,
+                MigrationTxState::Signed,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let err = take_preparation_error(path_bytes, &account, fixture_txid(0));
+        assert!(
+            err.contains("is not proved"),
+            "the seam must name the lifecycle problem, got: {err}"
+        );
+        assert!(
+            !err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "a lifecycle refusal must not claim proving is unavailable, got: {err}"
+        );
+
+        // A NULL txid pointer is refused, not read: `slice_or_empty` tolerates NULL only at
+        // length 0, so reading 32 bytes from one would be undefined behaviour at a public C ABI
+        // symbol.
+        let ptr = unsafe {
+            zcashlc_migration_take_preparation_by_txid(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                std::ptr::null(),
+            )
+        };
+        assert!(ptr.is_null(), "a null txid pointer must be refused");
+        let err = ffi_helpers::error_handling::take_last_error()
+            .expect("the refusal must record a last-error")
+            .to_string();
+        assert!(
+            err.contains("txid_ptr is null"),
+            "the null refusal must name the pointer, got: {err}"
+        );
+
+        let unknown = fixture_txid(99);
+        let err = take_preparation_error(path_bytes, &account, unknown);
+        assert!(
+            err.contains(&format!(
+                "no migration transaction with txid {}",
+                TxId::from_bytes(unknown)
+            )),
+            "an unknown txid must be named, got: {err}"
+        );
+        assert!(
+            !err.starts_with(PROVING_UNAVAILABLE_PREFIX),
+            "an unknown txid says nothing about any artifact, got: {err}"
+        );
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "neither refusal leaves a wallet record behind"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -9611,9 +11616,9 @@ mod tests {
     // ----- pure-read rewire parity (RO-T2) -----
 
     /// Parity harness for the pure-read rewire: on a freshly initialized wallet database (no
-    /// accounts, chain tip set) the four boolean/scalar read wrappers answer exactly what they
-    /// answer today. Written BEFORE the rewire (green against the reconcile-first bodies) and
-    /// kept green after it.
+    /// accounts, chain tip set) the pure read wrappers answer exactly what they answer today.
+    /// Written BEFORE the rewire (green against the reconcile-first bodies) and kept green after
+    /// it.
     #[test]
     fn pure_read_wrappers_fresh_db_answers_are_stable() {
         let path = std::env::temp_dir().join(format!(
@@ -9662,16 +11667,6 @@ mod tests {
             )
         };
         assert!(!invalid, "error path coerces to false");
-        let ready = unsafe {
-            zcashlc_migration_has_ready_broadcast(
-                path_bytes.as_ptr(),
-                path_bytes.len(),
-                account.as_ptr(),
-                NETWORK_ID_MAINNET,
-                -1,
-            )
-        };
-        assert_eq!(ready, -1, "error path reports -1");
         let statuses = unsafe {
             zcashlc_migration_transaction_statuses(
                 path_bytes.as_ptr(),
