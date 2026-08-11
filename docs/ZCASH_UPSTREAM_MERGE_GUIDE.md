@@ -436,6 +436,16 @@ When conflicts occur:
 
 Zend parity branch note:
 
+- On 2026-08-10, upstream `main` advanced from `468d1e9f` to `a1234039` by merging the
+  Ironwood/Slipstream stack (upstream PR `#1954`) and its migration, FFI, generated-code, and
+  CI dependencies. Zend draft PR `#34` reuses `codex/zcash-upstream-sync-2026-08-01` and merges
+  this range cleanly at `93b4a858`; do not create a competing parity branch. The source requires
+  the corresponding Ironwood/Slipstream `libzcashlc` header and XCFramework. Zend's current
+  released binary lacks the new migration and Slipstream declarations, so `swift build` fails on
+  symbols including `FfiMigrationProgress` and `zcashlc_slipstream_open`. Keep PR `#34` draft
+  until the exact `librustzcash` / `slipstream-internal` provenance is reconciled with Zend's
+  private-engine policy, all required arm64 artifacts are rebuilt and verified, and funded-device
+  migration evidence is available.
 - `codex/zcash-upstream-sync-2026-06-17` merged upstream `main` through `dd7329eb`.
 - The original June 17 merge conflict was `CHANGELOG.md`; resolve by keeping Zend's `2.6.3` release section and placing the upstream `Unreleased` diagnostics/resubmission notes above it.
 - The June 19 refresh merged `#1765` without conflicts and required no Zend-specific code adaptation.
