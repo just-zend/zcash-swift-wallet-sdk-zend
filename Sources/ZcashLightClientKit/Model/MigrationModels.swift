@@ -25,8 +25,8 @@ import Foundation
 /// uses the estimate only for reversible scheduling/withholding; persisted or destructive
 /// judgments remain anchored to scanned data. It is also memoryless about sessions: it reports
 /// what the run needs next, not whether doing it now would pair a broadcast
-/// with a sync — session policy (one broadcast per session, no sync in a broadcast session, the
-/// post-broadcast privacy buffer) belongs to the caller and the sync gate, not to this value.
+/// with a sync — session policy (one broadcast per session, no sync in a broadcast session)
+/// belongs to the caller and the sync gate, not to this value.
 ///
 /// Discharging each step:
 /// - ``requiresAttention(id:)`` → SYNC, then call `migrationAdvanceStep(accountUUID:)` again: the
@@ -35,18 +35,21 @@ import Foundation
 ///   out-of-band resolution — surface the attention UX over the
 ///   ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
 ///   `restartCurrentMigrationStep(accountUUID:)` to cancel and re-plan.
-/// - ``broadcast(id:)`` → `executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`:
-///   submit the served transaction and end the session — a broadcast session must not sync.
-/// - ``prove(id:kind:)`` with a ``MigrationTransactionStatus/Kind/transfer(crossing:)`` kind →
-///   `finalizeReadyMigrationTransfers(accountUUID:)` at a sync wake-up (see
-///   `migrationSyncWakeups(accountUUID:)`); the broadcast then follows in its own LATER session.
-///   Proving has no deadline of its own — a transfer's boundary anchor checkpoint is durably
-///   retained, so a missed wake-up defers the proof, never invalidates it.
-/// - ``prove(id:kind:)`` with a ``MigrationTransactionStatus/Kind/preparation(layer:index:)`` kind
-///   → the preparation is due by construction (the engine only reports a preparation prove once
-///   its broadcast height has arrived and its dependencies are mined), and a preparation proves
-///   against a near-tip witnessable anchor rather than a drawn boundary — so it may be proved
-///   (`finalizeReadyMigrationTransfers`) and broadcast at the SAME wake-up.
+/// - ``broadcast(_:)`` → `performMigrationBroadcast(accountUUID:_:options:)`: hand the case's
+///   opaque ``MigrationBroadcastInstruction`` straight to the executor and end the session — a
+///   broadcast session must not sync.
+/// - ``prove(transactions:)`` → the WHOLE batch is ready, and the batch IS the instruction: hand
+///   it to `proveMigrationTransactions(accountUUID:_:maxProofs:)` at a sync wake-up (see
+///   `migrationSyncWakeups(accountUUID:)`), which proves up to the caller's budget from that pass. Each
+///   entry's ``MigrationProveTarget/kind`` distinguishes what follows for THAT transaction: a
+///   ``MigrationTransactionStatus/Kind/transfer(crossing:)`` entry's broadcast follows in its own
+///   LATER session — proving has no deadline of its own, a transfer's boundary anchor checkpoint
+///   is durably retained, so a missed wake-up defers the proof, never invalidates it — while a
+///   ``MigrationTransactionStatus/Kind/preparation(layer:index:)`` entry is due by construction
+///   (the engine only reports a preparation prove once its broadcast height has arrived and its
+///   dependencies are mined) and proves against a near-tip witnessable anchor rather than a drawn
+///   boundary, so it may broadcast at the SAME wake-up. Broadcast itself remains a separate later
+///   step, served one transaction at a time.
 /// - ``rebuild(id:)`` → `refreshStaleMigrationTransfers(accountUUID:usk:)` — needs spend
 ///   authority (a spending key in-process, or the external-signer re-serve ceremony).
 /// - ``waiting`` → nothing is actionable now: register OS wake-ups at the heights
@@ -59,12 +62,24 @@ import Foundation
 /// funds received later) is answered by `proposeMigrationTransfers(accountUUID:)` — an empty
 /// schedule means no.
 public enum MigrationAdvanceStep: Equatable, Sendable {
-    /// The transaction identified by `id` is ready to be proved; `kind` tells a preparation (may
-    /// prove and broadcast at the same wake-up) from a transfer (prove now, broadcast in its own
-    /// later session) — see the type doc's discharge mapping.
-    case prove(id: UInt32, kind: MigrationTransactionStatus.Kind)
-    /// The transaction identified by `id` is proved and due: broadcast it (and end the session).
-    case broadcast(id: UInt32)
+    /// The WHOLE provable set is ready to be proved in one synced session (upstream #2939):
+    /// earliest-ready first, never empty, preparations and transfers possibly mixed. Proving
+    /// emits nothing on-chain, so nothing is gained by leaving provable work on the table while
+    /// a synced session is open — hand the entire batch to
+    /// `proveMigrationTransactions(accountUUID:_:maxProofs:)`, which proves as much of it as the
+    /// caller's budget allows. Broadcast remains a separate later step, served one transaction at
+    /// a time.
+    ///
+    /// The batch is also the INSTRUCTION: ``MigrationProveTarget`` has no public initializer, so
+    /// the only way to hold one is to have cranked `migrationAdvanceStep(accountUUID:)` and been
+    /// handed this step.
+    case prove(transactions: [MigrationProveTarget])
+    /// A proved, due transaction is ready to broadcast: hand the payload to
+    /// `performMigrationBroadcast(accountUUID:_:options:)` (and end the session).
+    ///
+    /// The payload is the opaque ``MigrationBroadcastInstruction`` rather than a bare id: holding
+    /// one is the proof that this crank issued the instruction (see that type's doc).
+    case broadcast(MigrationBroadcastInstruction)
     /// The transfer identified by `id` expired unmined and must be rebuilt in place.
     case rebuild(id: UInt32)
     /// Nothing is actionable right now: wake again at the sync-wakeup/scheduled heights.
@@ -79,23 +94,152 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     case requiresAttention(id: UInt32)
 }
 
-/// The outcome of one broadcast-lane delivery attempt
-/// (`Synchronizer.executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)`).
+/// The drive's instruction to broadcast one transaction — the payload of
+/// ``MigrationAdvanceStep/broadcast(_:)``, and the only thing
+/// `performMigrationBroadcast(accountUUID:_:options:)` accepts.
 ///
-/// Distinguishes the two empty outcomes from an actual broadcast: ``nothingDue`` ends the session
-/// with nothing to do, ``awaitingProof(id:)`` means the due transaction's proof has not been
-/// produced yet (run `finalizeReadyMigrationTransfers` at a sync wake-up, then retry in a later
-/// broadcast session), and ``executed(_:)`` carries the broadcast's recorded
-/// ``MigrationTransferResult``.
-public enum MigrationTransferAttempt: Equatable, Sendable {
-    /// Nothing is due: nothing scheduled yet, dependencies unmined, rows awaiting an external
-    /// signature, or everything already broadcast.
-    case nothingDue
-    /// The transaction identified by `id` is due but has not been proved yet; nothing was
-    /// broadcast. Proofs are produced by `finalizeReadyMigrationTransfers` as the wallet syncs.
-    case awaitingProof(id: UInt32)
-    /// A broadcast was attempted and its outcome recorded.
-    case executed(MigrationTransferResult)
+/// OPAQUE BY CONSTRUCTION: it has no public initializer, so an app cannot manufacture one. The
+/// only way to hold an instruction is to have called `migrationAdvanceStep(accountUUID:)` and been
+/// handed it, which is what makes "broadcast a migration transaction the drive did not ask for"
+/// unrepresentable at the Swift surface: the app is provided with no capability for semantic
+/// migration goals of its own.
+///
+/// The ``id`` is readable — a host correlates it with a
+/// ``MigrationTransactionStatus`` row for display and logging — but reading an id is not a
+/// capability: nothing consumes a bare `UInt32`.
+///
+/// - Important: This is a SWIFT-SURFACE property, not a security boundary. At the C ABI everything
+///   is forgeable, and the Rust executors' per-row state gating (a non-`Proved` row is refused)
+///   remains the actual safety backstop. The instruction type makes the correct call shape the
+///   only one that compiles; it does not make the incorrect one impossible.
+public struct MigrationBroadcastInstruction: Equatable, Sendable {
+    /// The engine's stable transaction id for the transaction to broadcast — for correlating with
+    /// ``MigrationTransactionStatus/id`` and for logging.
+    public let id: UInt32
+
+    /// Creates an instruction. SPI(Testing) by design: instructions are produced only by the
+    /// advance marshaling (`FfiMigrationAdvanceStep.unsafeToMigrationAdvance()`), and a plain
+    /// `import ZcashLightClientKit` cannot name this initializer — possession of an instruction
+    /// proves the caller cranked. TEST targets (the SDK's own, and downstream apps') opt in with
+    /// `@_spi(Testing) import ZcashLightClientKit`: the SPI name is the ceremony that keeps the
+    /// capability boundary greppable and deliberate rather than ambient, and it must never
+    /// appear in a production import.
+    ///
+    /// Written out rather than left to synthesis: the access level IS the capability discipline,
+    /// and this declaration is where it is stated and documented. Widening it without the SPI
+    /// attribute would silently make instructions forgeable.
+    @_spi(Testing) public init(id: UInt32) {
+        self.id = id
+    }
+}
+
+/// One transaction of a ``MigrationAdvanceStep/prove(transactions:)`` batch: the transaction to
+/// prove, with the kind that routes it, plus whether its broadcast window has already opened. A
+/// preparation may prove and broadcast at the same wake-up; a transfer proves now and broadcasts
+/// in its own later session (see the type doc's discharge mapping).
+///
+/// ``id`` and ``kind`` are a verbatim marshal of the upstream engine's `ProveTarget`;
+/// ``isScheduleDue`` is NOT an upstream field but the SDK's own reading of the row against the
+/// same dueness targets the advance that produced the batch judged with.
+///
+/// OPAQUE BY CONSTRUCTION, exactly as ``MigrationBroadcastInstruction`` is: the initializer is
+/// internal, so the batch an app holds can only be one the drive handed it. A `[MigrationProveTarget]`
+/// IS the prove instruction — see `proveMigrationTransactions(accountUUID:_:maxProofs:)`.
+public struct MigrationProveTarget: Equatable, Sendable {
+    /// The engine's stable transaction id.
+    public let id: UInt32
+    /// The preparation/transfer distinction, with its payload.
+    public let kind: MigrationTransactionStatus.Kind
+    /// Whether the schedule has already reached this transaction's broadcast window — i.e. whether
+    /// its missing proof is what stands between the run and a broadcast that could otherwise be
+    /// made right now.
+    ///
+    /// A transaction becomes provable long BEFORE it comes due — that head start is the whole
+    /// point of the prove/broadcast split — so most of a batch is ordinarily `false`, meaning
+    /// "proving is opportunistic work for the next sync wake-up". A `true` entry means the
+    /// schedule has already reached that row: its missing proof is what stands between the run and
+    /// a broadcast, so a host with a proof budget to spend has a reason to spend it NOW and crank
+    /// again rather than wait for the next wake-up. Informational either way — the batch is
+    /// discharged whole, and the engine, not the host, decides what a later crank offers.
+    ///
+    /// Unlike ``id`` and ``kind`` this is not an upstream `ProveTarget` field but the SDK's
+    /// reading of the row against the same dueness targets the advance judged with.
+    public let isScheduleDue: Bool
+
+    /// Creates a `MigrationProveTarget`. SPI(Testing) by design: prove targets are produced only
+    /// by the advance marshaling (`FfiMigrationAdvanceStep.unsafeToMigrationAdvance()`), and a
+    /// plain import cannot name this initializer. Test targets opt in with
+    /// `@_spi(Testing) import ZcashLightClientKit` — the ceremony import that must never appear
+    /// in production code; see ``MigrationBroadcastInstruction/init(id:)`` for the full rationale.
+    @_spi(Testing) public init(id: UInt32, kind: MigrationTransactionStatus.Kind, isScheduleDue: Bool = false) {
+        self.id = id
+        self.kind = kind
+        self.isScheduleDue = isScheduleDue
+    }
+}
+
+/// The kind of upcoming work named by a ``MigrationAdvance/next`` outlook — a verbatim marshal of
+/// the upstream engine's `state::StepKind` (the outlook's kind ALONE: WHICH transaction a wake-up
+/// serves is decided by the `migrationAdvanceStep` call that serves it, not by this value).
+///
+/// ``prove``, ``broadcast``, ``rebuild`` and ``replan`` are the only outlooks the engine
+/// constructs today (upstream's own outlook derivation maps every other case to no outlook); the
+/// SDK still mirrors the full upstream enum — ``reevaluate``, ``waiting``, ``complete`` included —
+/// so this marshal never invents a projection of its own.
+public enum MigrationStepKind: Equatable, Sendable {
+    case prove
+    case broadcast
+    case rebuild
+    case replan
+    case reevaluate
+    case waiting
+    case complete
+}
+
+/// The engine's OUTLOOK (upstream #2936, `Advance::next`): what session to plan for next,
+/// assuming the step it rode in on (``MigrationAdvance/step``) is executed and recorded.
+public struct MigrationNextWork: Equatable, Sendable {
+    /// The earliest height at which the outlook's work becomes serviceable — upstream's `tip + 1`
+    /// target convention, directly comparable with a caller's own scanned/estimated targets. A
+    /// FLOOR, not an appointment: dependencies still have to mine, and the wake-up's own
+    /// `migrationAdvanceStep` call re-verifies (and may displace) it — this value holds only as of
+    /// the call that returned it, and the NEXT call's outlook supersedes it.
+    public let height: BlockHeight
+    /// What session to plan for the upcoming work: a ``MigrationStepKind/broadcast`` outlook needs
+    /// no sync, a ``MigrationStepKind/prove`` one is sync-bound (the ZIP 318 session separation
+    /// `migrationAdvanceStep`'s own doc describes), and ``MigrationStepKind/replan``/
+    /// ``MigrationStepKind/rebuild`` need user or spend-authority action.
+    /// ``MigrationStepKind/reevaluate``/``MigrationStepKind/waiting``/``MigrationStepKind/complete``
+    /// are not constructible outlooks upstream (see ``MigrationStepKind``'s doc) but are mirrored
+    /// so the marshal never projects one case onto another.
+    public let kind: MigrationStepKind
+
+    /// Creates a `MigrationNextWork`.
+    public init(height: BlockHeight, kind: MigrationStepKind) {
+        self.height = height
+        self.kind = kind
+    }
+}
+
+/// The engine's answer to `Synchronizer.migrationAdvanceStep(accountUUID:)` /
+/// `ZcashRustBackendWelding.migrationAdvanceStep(for:)`: the step to perform NOW
+/// (``MigrationAdvanceStep``, unchanged) plus the advisory OUTLOOK (upstream #2936) — what the
+/// migration will next need, assuming this step is executed. `next == nil` means nothing is
+/// height-schedulable: what follows is chain-driven (an in-flight transaction mining), user-driven
+/// (a signature, a replan), or the migration is terminal — see ``MigrationNextWork`` for the full
+/// contract.
+public struct MigrationAdvance: Equatable, Sendable {
+    /// The step to perform now — see ``MigrationAdvanceStep`` for the full discharge contract.
+    public let step: MigrationAdvanceStep
+    /// The advisory outlook: what session to plan for next, or `nil` when nothing is
+    /// height-schedulable.
+    public let next: MigrationNextWork?
+
+    /// Creates a `MigrationAdvance`.
+    public init(step: MigrationAdvanceStep, next: MigrationNextWork?) {
+        self.step = step
+        self.next = next
+    }
 }
 
 /// One sync/proving wake-up of the stored run's schedule, as returned by
@@ -676,8 +820,15 @@ public struct ImmediateMigrationProposal: Equatable {
     }
 }
 
-/// A fully proven, signed migration transaction persisted by the engine, ready for the platform
-/// to broadcast (see `ZcashRustBackendWelding.migrationExtractBroadcastTx(pczt:for:)`).
+/// A migration transaction handed to the platform.
+///
+/// WHAT ``pczt`` CARRIES depends on the producer: the delivery executor
+/// (`migrationTakeBroadcastTransaction(id:for:)`) and the note-split ceremony
+/// (`migrationSignNoteSplit`) both serve through the store's atomic broadcast seam, so theirs is
+/// the FINALIZED CONSENSUS TRANSACTION — submittable as-is. The storage receipt
+/// `migrationStoreSignedNoteSplitPczts` returns is a serialized PCZT, not submittable until the
+/// engine has proved it and a later `migrationTakeBroadcastTransaction(id:for:)` serves the
+/// broadcastable, proven value once a crank names it.
 public struct PreparedMigrationTransfer: Equatable, Sendable {
     /// The transfer's engine-issued id.
     public let id: UInt32
@@ -686,7 +837,8 @@ public struct PreparedMigrationTransfer: Equatable, Sendable {
     /// value is a STORAGE RECEIPT (`migrationStoreSignedNoteSplitPczts`) whose transaction has not
     /// been proven yet — the broadcastable value is served by the delivery lane.
     public let txid: Data
-    /// The serialized, signed PCZT backing this transfer.
+    /// The artifact: a finalized consensus transaction or a serialized PCZT per the producer, as
+    /// the type doc above spells out. The property keeps its historical name.
     public let pczt: Data
 
     /// Creates a `PreparedMigrationTransfer`.
@@ -697,21 +849,33 @@ public struct PreparedMigrationTransfer: Equatable, Sendable {
     }
 }
 
-/// What the migration delivery lane has to offer right now.
+/// What one prove pass accomplished: how many transactions it proved, and the txids of the
+/// PREPARATIONS among them.
 ///
-/// The delivery lane never proves: proofs are produced opportunistically by
-/// `ZcashRustBackendWelding.migrationProvePending(for:)` while the wallet scans, so broadcasting is
-/// a pure delivery step. That makes "a transaction is due but its proof does not exist yet" a
-/// distinct outcome from "nothing is due" — the former is cleared by running the proving sweep.
-public enum DueMigrationTransfer: Equatable, Sendable {
-    /// Nothing is due: nothing scheduled yet, dependencies unmined, rows awaiting an external
-    /// signature, or everything already broadcast.
-    case nothingDue
-    /// A proven transaction, ready for the platform to broadcast.
-    case ready(PreparedMigrationTransfer)
-    /// The transaction identified by `id` is due but has not been proved yet. Run
-    /// `migrationProvePending(for:)` and ask again.
-    case awaitingProof(id: UInt32)
+/// THE TXIDS ARE THE HANDOFF, and they name preparations only. A proved preparation is a complete
+/// PCZT (signatures and proofs); it is ZIP 318-exempt, and the engine's own contract is that a
+/// preparation is broadcast as soon as it is proved — so its submission is the host's ORDINARY
+/// path: take each txid to `takeMigrationPreparation(accountUUID:byTxid:)`, submit the bytes it
+/// hands back through whatever machinery the host already uses for raw transactions, and record
+/// the outcome through the standard record path. A transfer crosses the turnstile on the drive's
+/// own schedule and is delivered by a `MigrationAdvanceStep/broadcast(_:)` instruction alone, so
+/// its txid never appears here: appearing here MEANS retrievable.
+///
+/// ``totalProved`` counts both kinds, so it is the honest measure of a pass's progress —
+/// `0` with no txids is the ordinary "nothing in this batch is provable right now" answer.
+public struct MigrationProveOutcome: Equatable, Sendable {
+    /// How many transactions this pass proved — preparations AND transfers.
+    public let totalProved: Int
+    /// The proved preparations' txids, in the order they were proved, in the SDK's raw/internal
+    /// byte order (matching ``PreparedMigrationTransfer/txid``, not the reversed display-hex order
+    /// produced by `Data.toHexStringTxId()`). Empty when the pass proved no preparation.
+    public let preparationTxids: [Data]
+
+    /// Creates a `MigrationProveOutcome`.
+    public init(totalProved: Int, preparationTxids: [Data]) {
+        self.totalProved = totalProved
+        self.preparationTxids = preparationTxids
+    }
 }
 
 /// The platform's outcome of broadcasting (or attempting to broadcast) a prepared migration

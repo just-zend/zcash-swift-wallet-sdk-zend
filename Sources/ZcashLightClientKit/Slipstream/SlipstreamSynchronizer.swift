@@ -293,8 +293,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
             throw ZcashError.synchronizerNotPrepared
         }
         // Migration privacy gate — parity with SDKSynchronizer.start's `.stopped, .synced,
-        // .disconnected, .error` branch: a migration broadcast's post-broadcast privacy buffer must
-        // not be immediately followed by a sync session. Only blocks a NEW start(); an already-running
+        // .disconnected, .error` branch: a sync session must not start while a migration
+        // submission is still in flight. Only blocks a NEW start(); an already-running
         // engine is unaffected (this synchronizer has no separate "already syncing" branch to skip
         // into, unlike SDKSynchronizer's status switch), and stop() is untouched.
         if await migrationHost.isSyncBlocked() {
@@ -1146,11 +1146,17 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // Thin forwards to `migrationHost.migration(for:)`'s per-account `OrchardMigration` actor (or,
     // for the three wallet-scope gate members, to the host itself) -- mirrors `SDKSynchronizer`'s
     // "MARK: Migration" section exactly. The two members that can broadcast (`submitNoteSplit`,
-    // `executeNextPendingMigrationTransfer`) are guarded here by `throwIfSyncingForMigrationBroadcast()`
+    // `performMigrationBroadcast`) are guarded here by `throwIfSyncingForMigrationBroadcast()`
     // -- an advisory point-in-time check, not a hard mutual-exclusion lock: sync and migration
     // broadcasts must never share a session, and hosts still sequence sessions themselves.
+    // `proveMigrationTransactions` is deliberately NOT guarded: proving is what a SYNC session is
+    // for. Neither is `takeMigrationPreparation`, which only RETRIEVES -- a proved preparation's
+    // submission is the app's own ordinary path, not a delivery session of the engine's.
+    // `recordMigrationPreparationBroadcast` is likewise unguarded: it RECORDS an outcome the app
+    // already produced -- refusing the record because a sync is open would only delay the
+    // engine's knowledge of a broadcast that already happened.
 
-    public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvanceStep? {
+    public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
         try await migrationHost.migration(for: accountUUID).advanceStep()
     }
 
@@ -1158,10 +1164,25 @@ public actor SlipstreamSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).migrationProgress()
     }
 
-    public func finalizeReadyMigrationTransfers(accountUUID: AccountUUID) async throws -> Int {
-        try await migrationHost.migration(for: accountUUID).finalizeReadyTransfers()
+    public func proveMigrationTransactions(
+        accountUUID: AccountUUID,
+        _ instruction: [MigrationProveTarget],
+        maxProofs: Int
+    ) async throws -> MigrationProveOutcome {
+        try await migrationHost.migration(for: accountUUID).proveTransactions(instruction, maxProofs: maxProofs)
     }
 
+    public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
+        try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+    }
+
+    public func recordMigrationPreparationBroadcast(
+        accountUUID: AccountUUID,
+        _ prepared: PreparedMigrationTransfer,
+        result: MigrationTransferResult
+    ) async throws {
+        try await migrationHost.migration(for: accountUUID).recordPreparationBroadcast(prepared, result: result)
+    }
 
     public func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
         try await migrationHost.migration(for: accountUUID).syncWakeups()
@@ -1231,14 +1252,13 @@ public actor SlipstreamSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).signAndStoreMigrationSchedule(schedule, usk: usk)
     }
 
-    public func executeNextPendingMigrationTransfer(
+    public func performMigrationBroadcast(
         accountUUID: AccountUUID,
-        options: MigrationNetworkPrivacyOptions,
-        useEstimatedTip: Bool
-    ) async throws -> MigrationTransferAttempt {
+        _ instruction: MigrationBroadcastInstruction,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferResult {
         try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID)
-            .executeNextPendingTransfer(options: options, useEstimatedTip: useEstimatedTip)
+        return try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
     }
 
     public func isMigrationSyncBlocked() async -> Bool {
@@ -1249,20 +1269,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
         migrationHost.syncBlockedStream
     }
 
-    public nonisolated var migrationPrivacySyncBufferDuration: TimeInterval {
-        migrationHost.privacySyncBufferDuration
-    }
-
     public func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool {
         try await migrationHost.migration(for: accountUUID).hasOverdueTransfers(useEstimatedTip: useEstimatedTip)
     }
 
     public func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
         try await migrationHost.migration(for: accountUUID).hasInvalidTransfers()
-    }
-
-    public func pendingMigrationTransferProposal(accountUUID: AccountUUID) async throws -> MigrationTransferProposal? {
-        try await migrationHost.migration(for: accountUUID).pendingTransferProposal()
     }
 
     public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
@@ -1348,7 +1360,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// Throws ``ZcashError/migrationBroadcastDuringSync`` when the synchronizer is actively syncing.
     ///
     /// Guards the two migration entry points that broadcast (``submitNoteSplit(accountUUID:proposal:usk:options:)``
-    /// and ``executeNextPendingMigrationTransfer(accountUUID:options:useEstimatedTip:)``): sync and migration
+    /// and ``performMigrationBroadcast(accountUUID:_:options:)``): sync and migration
     /// broadcasts must never share a session. Reads `latestState.internalSyncStatus` -- the same
     /// nonisolated status surface `start(retry:)`'s unprepared guard reads -- so the guard triggers on
     /// the syncing case only; unprepared/stopped/synced/disconnected/error all proceed. Advisory,

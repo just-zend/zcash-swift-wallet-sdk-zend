@@ -295,10 +295,10 @@ public enum ZcashErrorCode: String {
     case rustMigrationProposeTransfers = "ZRUST0106"
     /// Error from rust layer when calling ZcashRustBackend.migrationSignAndStoreSchedule
     case rustMigrationSignAndStoreSchedule = "ZRUST0108"
-    /// Error from rust layer when calling ZcashRustBackend.migrationNextDueTransfer
-    case rustMigrationNextDueTransfer = "ZRUST0111"
-    /// Error from rust layer when calling ZcashRustBackend.migrationExtractBroadcastTx
-    case rustMigrationExtractBroadcastTx = "ZRUST0112"
+    /// Error from rust layer when calling ZcashRustBackend.migrationTakeBroadcastTransaction
+    case rustMigrationTakeBroadcastTransaction = "ZRUST0111"
+    /// Error from rust layer when calling ZcashRustBackend.migrationTakePreparation
+    case rustMigrationTakePreparation = "ZRUST0149"
     /// Error from rust layer when calling ZcashRustBackend.migrationRecordTransferResult
     case rustMigrationRecordTransferResult = "ZRUST0113"
     /// Error from rust layer when calling ZcashRustBackend.migrationRestartStep
@@ -313,13 +313,11 @@ public enum ZcashErrorCode: String {
     case rustMigrationCreateUnsignedTransferPczts = "ZRUST0119"
     /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePczts
     case rustMigrationStoreSignedSchedulePczts = "ZRUST0120"
-    /// Error from rust layer when calling ZcashRustBackend.migrationPendingTransferProposal
-    case rustMigrationPendingTransferProposal = "ZRUST0123"
     /// Tor was requested for a migration broadcast but could not be established.
     case migrationTorUnavailable = "ZRUST0121"
     /// The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult.
     case migrationInvalidTxId = "ZRUST0122"
-    /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land and the privacy sync gate is already marked; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned.
+    /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned. The sync gate's in-flight marker is deliberately left set on this path and self-expires.
     case migrationRecordFailedAfterBroadcast = "ZRUST0124"
     /// Synchronizer.start() was refused because the migration privacy gate is active.
     case migrationSyncBlocked = "ZRUST0125"
@@ -349,8 +347,8 @@ public enum ZcashErrorCode: String {
     case rustMigrationKeystoneDecodeSignBatchPart = "ZRUST0137"
     /// Error from rust layer when calling ZcashRustBackend.migrationKeystoneApplyBatchSignatures
     case rustMigrationKeystoneApplyBatchSignatures = "ZRUST0138"
-    /// Error from rust layer when calling ZcashRustBackend.migrationProvePending
-    case rustMigrationProvePending = "ZRUST0140"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProveTransactions
+    case rustMigrationProveTransactions = "ZRUST0140"
     /// A stored migration transfer admits NO valid sync/proving wake-up height.
     case migrationWakeupInfeasible = "ZRUST0141"
     /// Error from rust layer when calling ZcashRustBackend.migrationAdvanceStep
@@ -365,8 +363,6 @@ public enum ZcashErrorCode: String {
     case rustMigrationBatchPcztsByActions = "ZRUST0146"
     /// No chain tip is available to estimate from: the wallet has never scanned a block.
     case migrationChainTipUnavailable = "ZRUST0147"
-    /// Error from rust layer when calling ZcashRustBackend.migrationHasReadyBroadcast
-    case rustMigrationHasReadyBroadcast = "ZRUST0148"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.

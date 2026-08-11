@@ -1475,7 +1475,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     // MARK: - Ironwood migration
 
     @DBActor
-    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep? {
+    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvance? {
         try await migrationAdvanceStep(for: account, estimatedTip: nil)
     }
 
@@ -1483,7 +1483,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     func migrationAdvanceStep(
         for account: AccountUUID,
         estimatedTip: BlockHeight?
-    ) async throws -> MigrationAdvanceStep? {
+    ) async throws -> MigrationAdvance? {
         // Clear any stale, unconsumed last-error before this sentinel read (see
         // `migrationIsNoteSplitNeeded` below): a NULL return overloads "no stored run" and
         // "error", and only a recorded last-error distinguishes the two.
@@ -1498,7 +1498,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
 
         // NULL with no recorded error is the benign "no migration run is stored" answer (the
-        // pointer analog of `migrationPendingTransferProposal`'s NULL sentinel).
+        // pointer analog of the bool/`-1` sentinel reads above).
         guard let stepPtr else {
             if zcashlc_last_error_length() > 0 {
                 throw ZcashError.rustMigrationAdvanceStep(
@@ -1511,13 +1511,13 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         defer { zcashlc_free_migration_advance_step(stepPtr) }
 
-        guard let step = stepPtr.pointee.unsafeToMigrationAdvanceStep() else {
+        guard let advance = stepPtr.pointee.unsafeToMigrationAdvance() else {
             throw ZcashError.rustMigrationAdvanceStep(
                 lastErrorMessage(fallback: "`migrationAdvanceStep` returned a malformed step")
             )
         }
 
-        return step
+        return advance
     }
 
     // DB-READ (audited 2026-08-05): zcashlc_migration_sync_wakeups — opens through the
@@ -1737,32 +1737,6 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
 
         return hasOverdue
-    }
-
-    // DB-READ (audited 2026-08-05): zcashlc_migration_has_ready_broadcast — opens through the
-    // FFI's `open_read` (both connections SQLITE_OPEN_READ_ONLY; no reconcile, no preamble
-    // writes), so read-only-ness is machine-enforced: a write anywhere down this path fails
-    // SQLITE_READONLY rather than silently reclassifying the call. Mined promotion is persisted
-    // by the write lanes (advance-step sweep, prove sweep, delivery serves).
-    func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool {
-        let outcome = zcashlc_migration_has_ready_broadcast(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId,
-            // `-1` disables the estimate on the rust side.
-            estimatedTip.map(Int64.init) ?? -1
-        )
-
-        // A dedicated `-1` error sentinel (unlike the bool-returning sentinel reads above), so no
-        // last-error disambiguation dance is needed.
-        guard outcome >= 0 else {
-            throw ZcashError.rustMigrationHasReadyBroadcast(
-                lastErrorMessage(fallback: "`migrationHasReadyBroadcast` failed with unknown error")
-            )
-        }
-
-        return outcome == 1
     }
 
     // DB-READ (audited 2026-08-05): zcashlc_migration_has_invalid_transfers — opens through the
@@ -2049,8 +2023,16 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     }
 
     @DBActor
-    func migrationProvePending(for account: AccountUUID) async throws -> Int {
-        // The sweep is CHUNKED: one proof per FFI call, with a suspension between calls. Each
+    func migrationProveTransactions(
+        ids: [UInt32],
+        maxProofs: Int,
+        for account: AccountUUID
+    ) async throws -> MigrationProveOutcome {
+        guard !ids.isEmpty, maxProofs > 0 else {
+            return MigrationProveOutcome(totalProved: 0, preparationTxids: [])
+        }
+
+        // The batch is CHUNKED: one proof per FFI call, with a suspension between calls. Each
         // proof is seconds of CPU. Since the read/write split, every read-only call runs OFF
         // `DBActor`, so readers never queue here at all — the actor now serializes only
         // Swift-initiated WRITES, and holding it through each chunk is the point: no other
@@ -2058,130 +2040,133 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         // chunks releases the actor briefly so queued WRITERS (broadcast bookkeeping, a user
         // send) wait at most one proof, not the whole sweep. See `DBActor.swift` for the
         // contract this method now relies on.
+        //
+        // Every chunk re-passes the WHOLE instruction rather than a remaining slice, and does NOT
+        // re-advance between chunks: the rust executor skips a row that is no longer awaiting its
+        // proof, so the rows earlier chunks already proved cost nothing to re-name, and the cap of
+        // 1 lands on the first row still outstanding. The loop ends when a chunk proves nothing —
+        // either the batch is exhausted or the remainder is transiently unprovable — or when the
+        // caller's `maxProofs` budget is spent. Because each chunk is capped at 1 and a skip never
+        // counts against the rust cap, the budget is honoured EXACTLY: this returns at most
+        // `maxProofs`, all of them real proofs.
+        //
+        // The chunks' PREPARATION TXIDS accumulate across the whole pass, in prove order, so the
+        // caller sees one handoff list for the pass rather than one per chunk.
         var totalProved = 0
-        while true {
-            // `-1` is never a legitimate count, so the return value alone decides success.
+        var preparationTxids: [Data] = []
+        while totalProved < maxProofs {
             // The last-error is cleared first so the message read on failure cannot be a
             // leftover from an earlier call on this thread.
             zcashlc_clear_last_error()
 
-            let proved = zcashlc_migration_prove_pending(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                1
-            )
-
-            guard proved >= 0 else {
-                throw migrationRoutedError(
-                    lastErrorMessage(fallback: "`migrationProvePending` failed with unknown error"),
-                    fallback: ZcashError.rustMigrationProvePending
+            let outcomePtr = ids.withUnsafeBufferPointer { buffer in
+                zcashlc_migration_prove_transactions(
+                    dbData.0,
+                    dbData.1,
+                    account.id,
+                    networkType.networkId,
+                    buffer.baseAddress,
+                    UInt(buffer.count),
+                    1
                 )
             }
-            guard proved > 0 else {
-                return totalProved
+
+            guard let outcomePtr else {
+                throw migrationRoutedError(
+                    lastErrorMessage(fallback: "`migrationProveTransactions` failed with unknown error"),
+                    fallback: ZcashError.rustMigrationProveTransactions
+                )
             }
-            totalProved += Int(proved)
+
+            let chunk = outcomePtr.pointee.unsafeToMigrationProveOutcome()
+            zcashlc_free_migration_prove_outcome(outcomePtr)
+
+            guard chunk.totalProved > 0 else {
+                return MigrationProveOutcome(totalProved: totalProved, preparationTxids: preparationTxids)
+            }
+            totalProved += chunk.totalProved
+            preparationTxids.append(contentsOf: chunk.preparationTxids)
 
             // Let queued `DBActor` writers run before the next proof.
             await Task.yield()
         }
+
+        // The budget is spent, with the batch possibly still holding provable rows: the caller
+        // advances again and re-passes whatever the next crank offers.
+        return MigrationProveOutcome(totalProved: totalProved, preparationTxids: preparationTxids)
     }
 
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
+    // DB-AUDIT (2026-08-07): WRITE — the accessor IS the store's atomic broadcast seam: it records
+    // the transaction in the wallet's own tables in the same database transaction that hands the
+    // bytes back. Stays serialized.
     @DBActor
-    func migrationNextDueTransfer(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> DueMigrationTransfer {
-        let preparedPtr = zcashlc_migration_next_due_transfer(
-            dbData.0,
-            dbData.1,
-            account.id,
-            networkType.networkId,
-            // `-1` disables the estimate on the rust side.
-            estimatedTip.map(Int64.init) ?? -1
-        )
+    func migrationTakePreparation(txid: Data, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
+        guard txid.count == 32 else {
+            throw ZcashError.rustMigrationTakePreparation(
+                "`migrationTakePreparation` was given a \(txid.count)-byte txid; it must be 32 bytes"
+            )
+        }
+
+        let preparedPtr: UnsafeMutablePointer<FfiPreparedTransfer>? = txid.withUnsafeBytes { buffer in
+            guard let bufferPtr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return nil
+            }
+
+            return zcashlc_migration_take_preparation_by_txid(
+                dbData.0,
+                dbData.1,
+                account.id,
+                networkType.networkId,
+                bufferPtr
+            )
+        }
 
         guard let preparedPtr else {
             throw migrationRoutedError(
-                lastErrorMessage(fallback: "`migrationNextDueTransfer` failed with unknown error"),
-                fallback: ZcashError.rustMigrationNextDueTransfer
+                lastErrorMessage(fallback: "`migrationTakePreparation` failed with unknown error"),
+                fallback: ZcashError.rustMigrationTakePreparation
             )
         }
 
         defer { zcashlc_free_migration_prepared_transfer(preparedPtr) }
 
-        guard let due = preparedPtr.pointee.unsafeToDueMigrationTransfer() else {
-            throw ZcashError.rustMigrationNextDueTransfer(
-                lastErrorMessage(fallback: "`migrationNextDueTransfer` returned a malformed outcome")
+        guard let prepared = preparedPtr.pointee.unsafeToPreparedMigrationTransfer() else {
+            throw ZcashError.rustMigrationTakePreparation(
+                lastErrorMessage(fallback: "`migrationTakePreparation` returned a malformed transaction")
             )
         }
 
-        return due
+        return prepared
     }
 
-    // DB-AUDIT (2026-08-03): read-shaped but WRITE — answers only after reconcile_mined,
-    // which persists Broadcast→Mined promotions (full-run replace_migration). Stays serialized.
+    // DB-AUDIT (2026-08-03): WRITE — the broadcast seam records the transaction in the wallet's
+    // own tables in the same database transaction that hands the bytes back. Stays serialized.
     @DBActor
-    func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal? {
-        // Clear any stale, unconsumed last-error before this sentinel read (see
-        // `migrationIsNoteSplitNeeded` above). Added alongside the pointer-sentinel accessor itself,
-        // which follows the same ambiguous-sentinel pattern as the five bool/`-1` wrappers.
-        zcashlc_clear_last_error()
-
-        let proposalPtr = zcashlc_migration_pending_transfer_proposal(
+    func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
+        let preparedPtr = zcashlc_migration_take_broadcast_transaction(
             dbData.0,
             dbData.1,
             account.id,
-            networkType.networkId
+            networkType.networkId,
+            id
         )
 
-        // A NULL pointer overloads "legitimately nothing pending" and "error"; check last-error to
-        // disambiguate (the pointer analog of `migrationResidualAfterMigration`'s `-1` sentinel).
-        guard let proposalPtr else {
-            if zcashlc_last_error_length() > 0 {
-                throw ZcashError.rustMigrationPendingTransferProposal(
-                    lastErrorMessage(fallback: "`migrationPendingTransferProposal` failed with unknown error")
-                )
-            }
-
-            return nil
-        }
-
-        defer { zcashlc_free_migration_transfer_proposal(proposalPtr) }
-
-        return proposalPtr.pointee.unsafeToMigrationTransferProposal()
-    }
-
-    // DB-AUDIT (2026-08-03): SELECT-only in steady state, but routes through the shared
-    // open() preamble (CREATE TABLE IF NOT EXISTS + first-call legacy-marks migration can
-    // write). Stays serialized.
-    @DBActor
-    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data {
-        let txPtr: UnsafeMutablePointer<FfiBoxedSlice>? = pczt.withUnsafeBytes { buffer in
-            guard let bufferPtr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return nil
-            }
-
-            return zcashlc_migration_extract_broadcast_tx(
-                dbData.0,
-                dbData.1,
-                account.id,
-                networkType.networkId,
-                bufferPtr,
-                UInt(pczt.count)
+        guard let preparedPtr else {
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationTakeBroadcastTransaction` failed with unknown error"),
+                fallback: ZcashError.rustMigrationTakeBroadcastTransaction
             )
         }
 
-        guard let txPtr else {
-            throw ZcashError.rustMigrationExtractBroadcastTx(
-                lastErrorMessage(fallback: "`migrationExtractBroadcastTx` failed with unknown error")
+        defer { zcashlc_free_migration_prepared_transfer(preparedPtr) }
+
+        guard let prepared = preparedPtr.pointee.unsafeToPreparedMigrationTransfer() else {
+            throw ZcashError.rustMigrationTakeBroadcastTransaction(
+                lastErrorMessage(fallback: "`migrationTakeBroadcastTransaction` returned a malformed transaction")
             )
         }
 
-        defer { zcashlc_free_boxed_slice(txPtr) }
-
-        return Data(bytes: txPtr.pointee.ptr, count: Int(txPtr.pointee.len))
+        return prepared
     }
 
     @DBActor
@@ -3032,29 +3017,83 @@ extension FfiMigrationTransactionStatuses {
 }
 
 extension FfiMigrationAdvanceStep {
-    /// Converts an [`FfiMigrationAdvanceStep`] into a [`MigrationAdvanceStep`], or `nil` for an
-    /// unrecognized step discriminant (should not happen; defensive only). The per-kind payload
-    /// fields (`kind_layer`/`kind_index`/`kind_crossing`) are meaningful only for the Prove step
-    /// and are zeroed otherwise — a verbatim mirror of the FFI contract. The step discriminants
-    /// are matched against the header's exported `ZCASHLC_ADVANCE_STEP_*` constants (U3), so this
-    /// marshal and the rust side share one set of names instead of re-hardcoding the numbers.
-    func unsafeToMigrationAdvanceStep() -> MigrationAdvanceStep? {
-        switch Int32(bitPattern: step) {
+    /// Converts an [`FfiMigrationAdvanceStep`] into a [`MigrationAdvance`], or `nil` for an
+    /// unrecognized step discriminant (should not happen; defensive only), an EMPTY Prove batch
+    /// (`prove_targets_len == 0` — upstream documents the batch never empty, so this is a
+    /// malformed step, not the ordinary "nothing to prove" answer, which is `.waiting`), or an
+    /// unrecognized `next_kind` while `next_height >= 0` (a malformed outlook — same defensive
+    /// contract as the step discriminant). The per-kind payload fields
+    /// (`kind_layer`/`kind_index`/`kind_crossing`) live on each `FfiProveTarget` row rather than on
+    /// the step itself. The step discriminants are matched against the header's exported
+    /// `ZCASHLC_ADVANCE_STEP_*` constants (U3), so this marshal and the rust side share one set of
+    /// names instead of re-hardcoding the numbers; the outlook's kind is matched the same way
+    /// against `ZCASHLC_STEP_KIND_*` (see [`MigrationStepKind.init(ffiValue:)`]).
+    func unsafeToMigrationAdvance() -> MigrationAdvance? {
+        let step: MigrationAdvanceStep
+        switch Int32(bitPattern: self.step) {
         case ZCASHLC_ADVANCE_STEP_PROVE:
-            let kind: MigrationTransactionStatus.Kind = kind_is_preparation
-                ? .preparation(layer: Int(kind_layer), index: Int(kind_index))
-                : .transfer(crossing: Int(kind_crossing))
-            return .prove(id: id, kind: kind)
+            var transactions: [MigrationProveTarget] = []
+            transactions.reserveCapacity(Int(prove_targets_len))
+            if let proveTargets = prove_targets {
+                for index in 0 ..< Int(prove_targets_len) {
+                    let target = proveTargets.advanced(by: index).pointee
+                    // Likewise the sole producer of a `MigrationProveTarget` (internal init).
+                    let kind: MigrationTransactionStatus.Kind = target.kind_is_preparation
+                        ? .preparation(layer: Int(target.kind_layer), index: Int(target.kind_index))
+                        : .transfer(crossing: Int(target.kind_crossing))
+                    transactions.append(
+                        MigrationProveTarget(id: target.id, kind: kind, isScheduleDue: target.schedule_due)
+                    )
+                }
+            }
+            guard !transactions.isEmpty else { return nil }
+            step = .prove(transactions: transactions)
         case ZCASHLC_ADVANCE_STEP_BROADCAST:
-            return .broadcast(id: id)
+            // THE SOLE PRODUCER of a `MigrationBroadcastInstruction`: its initializer is internal,
+            // so an instruction exists only because this marshal minted one for a crank that
+            // returned a BROADCAST step (see the type's doc).
+            step = .broadcast(MigrationBroadcastInstruction(id: self.id))
         case ZCASHLC_ADVANCE_STEP_REBUILD:
-            return .rebuild(id: id)
+            step = .rebuild(id: self.id)
         case ZCASHLC_ADVANCE_STEP_WAITING:
-            return .waiting
+            step = .waiting
         case ZCASHLC_ADVANCE_STEP_COMPLETE:
-            return .complete
+            step = .complete
         case ZCASHLC_ADVANCE_STEP_ATTEND:
-            return .requiresAttention(id: id)
+            step = .requiresAttention(id: self.id)
+        default:
+            return nil
+        }
+
+        var next: MigrationNextWork?
+        if next_height >= 0 {
+            guard let kind = MigrationStepKind(ffiValue: next_kind) else { return nil }
+            next = MigrationNextWork(height: BlockHeight(next_height), kind: kind)
+        }
+        return MigrationAdvance(step: step, next: next)
+    }
+}
+
+extension MigrationStepKind {
+    /// Marshals the header's `ZCASHLC_STEP_KIND_*` constants into a `MigrationStepKind`, or `nil`
+    /// for an unrecognized discriminant (should not happen; defensive only, same contract as the
+    /// step discriminant itself).
+    init?(ffiValue: UInt32) {
+        switch Int32(bitPattern: ffiValue) {
+        case ZCASHLC_STEP_KIND_PROVE:
+            self = .prove
+        case ZCASHLC_STEP_KIND_BROADCAST:
+            self = .broadcast
+        case ZCASHLC_STEP_KIND_REBUILD:
+            self = .rebuild
+        case ZCASHLC_STEP_KIND_REPLAN:
+            self = .replan
+        case ZCASHLC_STEP_KIND_REEVALUATE:
+            self = .reevaluate
+        case ZCASHLC_STEP_KIND_WAITING:
+            self = .waiting
+        case ZCASHLC_STEP_KIND_COMPLETE:
+            self = .complete
         default:
             return nil
         }
@@ -3077,8 +3116,8 @@ extension FfiNoteSplitProposal {
 
 extension FfiPreparedTransfer {
     /// Converts an [`FfiPreparedTransfer`] into a [`PreparedMigrationTransfer`], or `nil` when it
-    /// carries no broadcastable artifact (a null `pczt` — the "nothing due" sentinel and the
-    /// "awaiting proof" outcome both have one; their `id` is meaningless).
+    /// carries no artifact at all (a null `pczt` — should not happen; defensive only, since every
+    /// producer of this DTO either populates it or fails).
     func unsafeToPreparedMigrationTransfer() -> PreparedMigrationTransfer? {
         guard let pcztPtr = pczt else {
             return nil
@@ -3090,21 +3129,25 @@ extension FfiPreparedTransfer {
             pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
         )
     }
+}
 
-    /// Converts an [`FfiPreparedTransfer`] into the delivery lane's three-way outcome, or `nil`
-    /// when the rust side reported a status whose payload is malformed (a `Ready` without an
-    /// artifact, or an `AwaitingProof` without an id — should not happen; defensive only).
-    func unsafeToDueMigrationTransfer() -> DueMigrationTransfer? {
-        switch status {
-        case MigrationNothingDue:
-            return .nothingDue
-        case MigrationReady:
-            return unsafeToPreparedMigrationTransfer().map { .ready($0) }
-        case MigrationAwaitingProof:
-            return .awaitingProof(id: id)
-        default:
-            return nil
+extension FfiMigrationProveOutcome {
+    /// Converts an [`FfiMigrationProveOutcome`] into a [`MigrationProveOutcome`], copying the
+    /// preparation txids out of the rust-owned buffer (the caller still frees the DTO).
+    ///
+    /// Total-only is a valid shape: a pass that proved transfers alone reports its count with no
+    /// txids, because only preparations are retrievable.
+    func unsafeToMigrationProveOutcome() -> MigrationProveOutcome {
+        var txids: [Data] = []
+        txids.reserveCapacity(Int(preparation_txids_len))
+
+        if let txidsPtr = preparation_txids {
+            for index in 0 ..< Int(preparation_txids_len) {
+                txids.append(Data(FfiTxId(tuple: txidsPtr.advanced(by: index).pointee).array))
+            }
         }
+
+        return MigrationProveOutcome(totalProved: Int(total_proved), preparationTxids: txids)
     }
 }
 

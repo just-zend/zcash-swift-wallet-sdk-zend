@@ -10,7 +10,7 @@ import Foundation
 /// (`ZcashRustBackendWelding.migrationBlockRateSamples(window:)`).
 ///
 /// The projection feeds the migration delivery lane's `estimatedTip` inputs
-/// (`migrationHasOverdueTransfers(for:estimatedTip:)` / `migrationNextDueTransfer(for:estimatedTip:)`),
+/// (`migrationHasOverdueTransfers(for:estimatedTip:)` / `migrationAdvanceStep(for:estimatedTip:)`),
 /// where it may only ACCELERATE scheduled-height due-ness — the rust side takes
 /// `max(scanned, estimated)` and always evaluates expiry against the SCANNED tip — so an
 /// over-estimate here costs nothing worse than an early "due" answer, and an under-estimate

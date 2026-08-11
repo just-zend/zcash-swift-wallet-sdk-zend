@@ -415,23 +415,25 @@ protocol ZcashRustBackendWelding {
 
     // MARK: - Ironwood migration
 
-    /// The engine's next step to advance `account`'s stored migration run. This compatibility
-    /// overload drives at the scanned target; migration hosts use the estimate-aware overload.
-    /// Upstream `Reevaluate` and `Replan` project to ``MigrationAdvanceStep/requiresAttention(id:)``.
+    /// The engine's next step to advance `account`'s stored migration run, wrapped with its
+    /// advisory OUTLOOK (upstream #2936; see ``MigrationAdvance``). This compatibility overload
+    /// drives at the scanned target; migration hosts use the estimate-aware overload. Upstream
+    /// `Reevaluate` and `Replan` project to ``MigrationAdvanceStep/requiresAttention(id:)``.
     /// Mined
     /// transactions reconciled first like every other read. `nil` means NO run is stored at all
     /// (nothing to advance); a stored TERMINAL run — complete or cancelled — reports
-    /// ``MigrationAdvanceStep/complete`` verbatim and is never driven further. See
-    /// ``MigrationAdvanceStep`` for the step semantics and the discharge mapping.
+    /// ``MigrationAdvanceStep/complete`` verbatim (`next` is always `nil` for it) and is never
+    /// driven further. See ``MigrationAdvanceStep`` for the step semantics and the discharge
+    /// mapping, and ``MigrationAdvance`` / ``MigrationNextWork`` for the outlook's contract.
     /// - Throws: `rustMigrationAdvanceStep` if the rust layer returns an error.
-    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvanceStep?
+    func migrationAdvanceStep(for account: AccountUUID) async throws -> MigrationAdvance?
 
     /// Estimate-aware drive entry point. `estimatedTip` is the wall-clock chain-tip estimate;
     /// destructive judgments remain anchored to the wallet's fully-scanned height upstream.
     func migrationAdvanceStep(
         for account: AccountUUID,
         estimatedTip: BlockHeight?
-    ) async throws -> MigrationAdvanceStep?
+    ) async throws -> MigrationAdvance?
 
     /// Live migration progress, or `nil` when no snapshot is reportable: present only while an
     /// engine run is ACTIVE (not terminal) or a recorded immediate sweep is pending (unmined and
@@ -453,7 +455,7 @@ protocol ZcashRustBackendWelding {
     /// The most recently scanned blocks' `(height, header time)` samples, at most `window` rows,
     /// ASCENDING by height — the raw inputs ``ChainTipEstimator`` projects an ESTIMATED chain tip
     /// from (fed back into ``migrationHasOverdueTransfers(for:estimatedTip:)`` /
-    /// ``migrationNextDueTransfer(for:estimatedTip:)``). A read-only, best-effort read of
+    /// ``migrationAdvanceStep(for:estimatedTip:)``). A read-only, best-effort read of
     /// scanned-block metadata: a wallet with no scanned blocks yet returns the EMPTY list, never
     /// an error. Wallet-scoped, not account-scoped — the blocks table is shared.
     /// - Throws: `rustMigrationBlockRateSamples` if the rust layer returns an error.
@@ -499,7 +501,7 @@ protocol ZcashRustBackendWelding {
     ///
     /// NOT the sync-gate's work-pending predicate: a due-but-unproved `Signed` row this query
     /// counts needs MORE syncing (its proof is produced at sync wake-ups), so it must never hold
-    /// sync hostage — the gate asks ``migrationHasReadyBroadcast(for:estimatedTip:)`` instead.
+    /// sync hostage.
     ///
     /// `estimatedTip` (`nil` = disabled) is the platform's wall-clock chain-tip projection (see
     /// ``ChainTipEstimator``). It may only ACCELERATE scheduled-height due-ness — the effective
@@ -508,24 +510,6 @@ protocol ZcashRustBackendWelding {
     /// engine's own dual-target `DuenessTargets` rule).
     /// - Throws: `rustMigrationHasOverdueTransfers` if the rust layer returns an error.
     func migrationHasOverdueTransfers(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool
-
-    /// Whether `account`'s stored, NON-TERMINAL run has a broadcast the platform could serve
-    /// RIGHT NOW: a PROVED, schedule-due, dependency-mined, unexpired, valid transaction per the
-    /// upstream engine's transaction-status evaluation — the sync-gate's work-pending predicate
-    /// (`true` means exactly "broadcast instead of syncing", ZIP 318's broadcast-or-sync session
-    /// split). `Signed` rows — even due ones — and rows awaiting a proof or an external
-    /// signature never count (they need MORE syncing or other work, not a broadcast session),
-    /// which is why the gate cannot be derived from
-    /// ``migrationHasOverdueTransfers(for:estimatedTip:)``; rows marked invalid are excluded
-    /// upstream (a dead transfer gates nothing), and so is a broadcast whose expiry only the
-    /// ESTIMATED target has passed (upstream's protective withhold — served again once the
-    /// scanned tip proves it either way). No stored run and a terminal run answer `false`.
-    ///
-    /// `estimatedTip` (`nil` = disabled) follows the same dual-target rule as
-    /// ``migrationHasOverdueTransfers(for:estimatedTip:)``: it may only ACCELERATE
-    /// scheduled-height due-ness, never decide expiry or boundary settledness.
-    /// - Throws: `rustMigrationHasReadyBroadcast` if the rust layer returns an error.
-    func migrationHasReadyBroadcast(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> Bool
 
     /// Whether `account`'s stored, NON-TERMINAL run has a transaction that cannot proceed: one
     /// marked ``MigrationTransactionStatus/State/invalid(reason:)`` in the engine state (a
@@ -637,44 +621,92 @@ protocol ZcashRustBackendWelding {
         for account: AccountUUID
     ) async throws
 
-    /// Proves every migration transaction whose anchor the wallet can resolve right now,
-    /// persisting each proof, and returns how many were proved (`0` is the ordinary "nothing left
-    /// to prove" answer).
+    /// Proves the NAMED migration transactions — the batch a prior
+    /// ``migrationAdvanceStep(for:estimatedTip:)`` call returned as its
+    /// ``MigrationAdvanceStep/prove(transactions:)`` step — persisting each proof, and returns a
+    /// ``MigrationProveOutcome``: how many were proved (`0` is the ordinary "nothing left to prove
+    /// right now" answer) and THE TXIDS OF THE PREPARATIONS it proved.
     ///
-    /// Call this as the wallet scans, NOT when about to broadcast: a transaction's anchor becomes
-    /// witnessable long before its broadcast schedule arrives, and proving is expensive, so the
-    /// work belongs in the sync path. `migrationNextDueTransfer` deliberately does no proving, and
-    /// reports `.awaitingProof` for a due transaction whose proof has not been produced yet.
+    /// The txids are the handoff to ``migrationTakePreparation(txid:for:)``: a proved preparation
+    /// is submitted through the caller's ordinary raw-transaction machinery. Transfers are never
+    /// named — they are delivered by the drive's broadcast instruction alone.
     ///
-    /// A transaction the wallet cannot prove yet (its anchor not scanned/retained) is skipped and
-    /// retried by a later call, so this is safe to run on any schedule, including mid-sync.
+    /// This NEVER asks the engine what to prove: `migrationAdvanceStep` is the top-level call and
+    /// every executor is subservient to it, so there is no proving to do without having first been
+    /// instructed what to prove. Whether a candidate is worth proving at all, and whether a due
+    /// broadcast outranks proving this session, were settled by the advance that issued the batch.
+    ///
+    /// Per row: a transaction that is no longer awaiting its proof is SKIPPED, so acting on a
+    /// stale batch is safe (the engine re-offers whatever it has not recorded on the next
+    /// advance); so is one whose anchor the wallet cannot resolve yet, which a later call retries.
+    /// Safe to run on any schedule, including mid-sync — but call it as the wallet scans, NOT when
+    /// about to broadcast: proving is expensive, and the delivery lane deliberately does none.
+    ///
+    /// `maxProofs` bounds how many proofs this call PRODUCES — the caller's session budget, since
+    /// each proof is seconds of CPU. Skips do not count against it (that is the rust executor's
+    /// own rule), so a bounded call always spends its whole budget on rows that actually needed
+    /// proving. A budget below `1` proves nothing; the executor in front of this rejects that as a
+    /// caller bug rather than silently no-op'ing.
     /// - Throws: `migrationProvingUnavailable` when proving fails for a non-transient reason;
-    ///   `rustMigrationProvePending` for other rust-layer errors.
-    func migrationProvePending(for account: AccountUUID) async throws -> Int
+    ///   `rustMigrationProveTransactions` for other rust-layer errors.
+    func migrationProveTransactions(
+        ids: [UInt32],
+        maxProofs: Int,
+        for account: AccountUUID
+    ) async throws -> MigrationProveOutcome
 
-    /// The next height-due pre-signed transfer, if one is both due and already proved — see
-    /// `DueMigrationTransfer` for the three outcomes. Never proves; run `migrationProvePending`
-    /// for that.
+    /// Serves the PROVED PREPARATION with `txid` for submission — the retrieval half of the
+    /// handoff ``migrationProveTransactions(ids:maxProofs:for:)`` opens by returning the
+    /// preparations' txids.
     ///
-    /// `estimatedTip` (`nil` = disabled) may only ACCELERATE scheduled-height due-ness; expiry is
-    /// always evaluated against the SCANNED tip — the same rule as
-    /// ``migrationHasOverdueTransfers(for:estimatedTip:)``.
-    /// - Throws: `rustMigrationNextDueTransfer` if the rust layer returns an error.
-    func migrationNextDueTransfer(for account: AccountUUID, estimatedTip: BlockHeight?) async throws -> DueMigrationTransfer
+    /// A proved preparation is a complete PCZT, so its submission is the caller's ORDINARY path,
+    /// not the engine's delivery ceremony: preparations are ZIP 318-exempt and the engine's own
+    /// contract is that a preparation is broadcast as soon as it is proved. Submit the returned
+    /// ``PreparedMigrationTransfer/pczt`` — a FINALIZED CONSENSUS TRANSACTION, submittable as-is —
+    /// through whatever machinery already submits raw transactions, then close the loop with
+    /// ``migrationRecordTransferResult(transferId:result:for:)`` under the returned
+    /// ``PreparedMigrationTransfer/id`` — the ENGINE TRANSFER ID, so the caller keeps no identity
+    /// of its own. (The `Synchronizer` surface wraps that last step as
+    /// `recordMigrationPreparationBroadcast(accountUUID:_:result:)`, which gates it on the id
+    /// naming a preparation.) The WALLET's own record needs no separate call: it bound at
+    /// retrieval, below.
+    ///
+    /// THIS IS THE TAKE SEAM, NOT A BYTE READ: the retrieval goes through the store's atomic
+    /// broadcast seam, so the wallet's own record of the transaction binds AT RETRIEVAL, in the
+    /// same database transaction that hands the bytes back. It is idempotent — a consumer that
+    /// crashed between retrieving and submitting re-retrieves the same bytes over the same record.
+    /// Retrieved-but-never-submitted is therefore a bounded, engine-modelled state: the record is
+    /// idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces
+    /// through the ordinary attention path once it expires.
+    /// - Parameter txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
+    ///   raw/internal byte order.
+    /// - Throws: `migrationProvingUnavailable` when the stored artifact cannot be turned into
+    ///   servable bytes; `rustMigrationTakePreparation` otherwise — for a txid naming a TRANSFER
+    ///   (transfers are served by the drive's broadcast instruction alone), for a txid the stored
+    ///   run does not carry, and for the readiness refusal of a preparation that is not proved,
+    ///   which a caller discharges by proving again rather than retrying this.
+    func migrationTakePreparation(txid: Data, for account: AccountUUID) async throws -> PreparedMigrationTransfer
 
-    /// The next height-due scheduled transfer's full proposal (amount, anchor, timing) for the
-    /// active run, or `nil` when nothing is currently pending (no active run, or only the note-split
-    /// prep is pending). The proposal-level counterpart of `migrationNextDueTransfer`: it exposes the
-    /// heights (notably `nextExecutableAfterHeight`) so a host can re-arm its own background window
-    /// without parsing the signed PCZT.
-    /// - Throws: `rustMigrationPendingTransferProposal` if the rust layer returns an error.
-    func migrationPendingTransferProposal(for account: AccountUUID) async throws -> MigrationTransferProposal?
-
-    /// Extracts the broadcast-ready consensus transaction bytes from a signed PCZT (the
-    /// `PreparedMigrationTransfer.pczt` returned by `migrationNextDueTransfer` or
-    /// `migrationSignNoteSplit`).
-    /// - Throws: `rustMigrationExtractBroadcastTx` if the rust layer returns an error.
-    func migrationExtractBroadcastTx(pczt: Data, for account: AccountUUID) async throws -> Data
+    /// Serves the transaction `id` for broadcast — the instruction a prior
+    /// ``migrationAdvanceStep(for:estimatedTip:)`` call returned as its
+    /// ``MigrationAdvanceStep/broadcast(id:)`` step.
+    ///
+    /// This NEVER asks the engine what to serve: `migrationAdvanceStep` is the top-level call and
+    /// every executor is subservient to it, so there is no broadcast to make without having first
+    /// been instructed to make it. The re-spread, the satisfiability verification and the dueness
+    /// judgement all happened in the advance that issued the instruction.
+    ///
+    /// The serve goes through the store's atomic broadcast seam: the transaction is finalized,
+    /// extracted, and recorded in the wallet's own tables in the same database transaction that
+    /// hands the bytes back, so the wallet's record binds at the broadcast ATTEMPT. The returned
+    /// ``PreparedMigrationTransfer/pczt`` is therefore the FINALIZED CONSENSUS TRANSACTION,
+    /// submittable as-is. Retrying a failed submission re-serves the same transaction over the
+    /// same record.
+    /// - Throws: `migrationProvingUnavailable` when the stored artifact cannot be turned into
+    ///   servable bytes; `rustMigrationTakeBroadcastTransaction` for other rust-layer errors —
+    ///   including the STALENESS refusal of a row that is no longer proved-and-servable, which a
+    ///   caller discharges by advancing again rather than retrying the executor.
+    func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer
 
     /// Records the platform's broadcast outcome for `transferId`, advancing the engine's state.
     /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error;
@@ -843,7 +875,7 @@ extension ZcashRustBackendWelding {
     func migrationAdvanceStep(
         for account: AccountUUID,
         estimatedTip: BlockHeight?
-    ) async throws -> MigrationAdvanceStep? {
+    ) async throws -> MigrationAdvance? {
         try await migrationAdvanceStep(for: account)
     }
 }
