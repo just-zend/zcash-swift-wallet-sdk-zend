@@ -8,7 +8,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Pool-migration (Orchard→Ironwood) FFI: 24 `zcashlc_migration_*` entry points with their
+- Pool-migration (Orchard→Ironwood) FFI: 33 `zcashlc_migration_*` entry points with their
   `#[repr(C)]` return types and `zcashlc_free_migration_*` destructors, plus
   `zcashlc_ironwood_activation_height`. Each call takes the wallet-db path, a 16-byte account uuid
   and a network id, opens the wallet database and the account-keyed migration store, and reports
@@ -19,13 +19,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     decision into `FfiMigrationAdvanceStep`, freed by
     `zcashlc_free_migration_advance_step`; `NULL` with no last error means no run is stored; the
     step discriminants are exported as `ZCASHLC_ADVANCE_STEP_*` constants; upstream `Reevaluate`
-    and `Replan` map to the compatibility `_ATTEND` case), `_progress`,
-    `_is_note_split_needed`, `_has_overdue_transfers`, `_has_invalid_transfers` (true iff the
+    and `Replan` map to the compatibility `_ATTEND` case; a `Prove` step's `kind_*` fields moved
+    off the step itself onto `FfiProveTarget` rows — `prove_targets`/`prove_targets_len`, freed by
+    the step's own destructor — one per transaction of the WHOLE provable batch upstream now
+    serves in one call; `id` is `0` for `Prove`, the batch entries carrying their own; the step now
+    also carries the engine's advisory OUTLOOK (upstream #2936, `Advance::next`) as
+    `next_height`/`next_kind` — the earliest target height and kind of the migration's next
+    serviceable work, assuming the served step is executed and recorded, `next_height = -1` when
+    nothing is height-schedulable — with the kind exported as the `ZCASHLC_STEP_KIND_*` constants,
+    a verbatim mirror of upstream `state::StepKind`), `_progress`,
+    `_is_note_split_needed`, `_has_overdue_transfers`, and `_has_invalid_transfers` (true iff the
     NON-terminal stored run holds an engine-`Invalid` or expired-unmined transaction; a cancelled
-    run answers `false`), `_has_ready_broadcast` (the sync-gate's work-pending predicate:
-    `1`/`0`/`-1`, true iff a PROVED, due, unexpired, valid transaction is servable right now —
-    `Signed` or awaiting-proof rows never gate sync), and `_pending_transfer_proposal`.
-    `_has_overdue_transfers`, `_has_ready_broadcast` and `_next_due_transfer` (below) take an
+    run answers `false`).
+    `_advance_step` and `_has_overdue_transfers` take an
     `estimated_tip: i64` parameter (`-1` = disabled) evaluated under the upstream engine's
     `DuenessTargets` rule: the estimate may only ACCELERATE scheduled-height due-ness, expiry and
     boundary settledness stay on the SCANNED tip, and a broadcast whose expiry only the ESTIMATED
@@ -48,19 +54,92 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sessions bounded by a caller-supplied action budget, returning `FfiMigrationBatchSizes` (freed by
     `zcashlc_free_migration_batch_sizes`) — the per-session transaction COUNTS, summing to the input
     length, for the caller to re-slice its own ordered PCZT array by.
-  - Note split: `zcashlc_migration_prepare_note_split`, `_sign_note_split`.
+  - Note split: `zcashlc_migration_prepare_note_split`, `_sign_note_split`. The latter's
+    handback — the first note-split transaction, proved now and returned for immediate broadcast —
+    goes through the same atomic broadcast seam as the delivery executor, so its artifact is
+    likewise the finalized consensus transaction rather than a PCZT.
   - Proposal and commit: `zcashlc_migration_residual_after_migration`, `_propose_transfers`,
-    `_sign_and_store_schedule`.
-  - Proving: `zcashlc_migration_prove_pending` proves everything currently provable and returns the
-    count proved (`-1` = error), skipping rather than failing on a row whose anchor is not yet
-    scanned or retained. Call it from the sync path.
-  - Delivery: `zcashlc_migration_next_due_transfer` never proves, and its
-    `FfiPreparedTransfer.status` separates `MigrationNothingDue` from `MigrationAwaitingProof` and
-    `MigrationReady`; then `_extract_broadcast_tx`, `_record_transfer_result` (whose terminal
-    tags — 2 invalid, 3 expired — record `report_broadcast_failure` testimony stamped at the
-    observed wallet tip; the next drive call adjudicates it through sqlite's satisfiability
-    oracle, while unknown and already-mined rows remain no-ops), and
-    `_record_immediate_run`, which records a send-max sweep built outside the engine.
+    `_sign_and_store_schedule`. Committing a plan is linear in the wallet's note count: the
+    upstream `wallet::WalletMigration` adapter these calls run over snapshots its spendable-note
+    selection per adapter (librustzcash #2946), and the FFI builds one adapter per call.
+  - Proving: `zcashlc_migration_prove_transactions(ids, ids_len, max_proofs)` proves the
+    transactions the caller NAMES — the batch a prior `_advance_step` returned as its PROVE step —
+    and returns `FfiMigrationProveOutcome` (freed by `zcashlc_free_migration_prove_outcome`,
+    `NULL` = error): `total_proved` plus `preparation_txids`/`preparation_txids_len`, a heap array
+    of raw 32-byte txids naming THE PREPARATIONS IT PROVED and nothing else. A transfer's txid is
+    never returned, because appearing in that array means "retrievable through
+    `_take_preparation_by_txid`", and a transfer is delivered by the drive's BROADCAST instruction
+    alone. Like the delivery executor it never cranks the
+    engine: `advance_migration` is the top-level call, and there is no proving to do without an
+    instruction saying what to prove. Per row, a transaction that is no longer `Signed` is a SKIP
+    rather than an error (a stale instruction is safe — the engine re-offers un-recorded work on
+    the next crank), as is one whose anchor is not yet scanned or retained; every successful proof
+    persists through the store seam. `max_proofs <= 0` means unlimited, and a platform that
+    serializes database access behind one actor can pass `1` and loop, chunking a sweep without
+    re-cranking between chunks. Call it from the sync path.
+  - Preparation retrieval: `zcashlc_migration_take_preparation_by_txid(txid_ptr)` serves the
+    proved PREPARATION with that 32-byte raw txid, returning the same `FfiPreparedTransfer` the
+    delivery executor does (freed by `zcashlc_free_migration_prepared_transfer`) — finalized
+    consensus transaction bytes, the row's stored txid, and the ENGINE TRANSFER ID, so the caller
+    closes the loop through the existing `_record_transfer_result` — the same `Proved -> Broadcast`
+    mark the delivery executor's success path makes — with no identity of its own. A proved
+    preparation is a complete PCZT and its submission is the platform's ORDINARY path, not the engine's delivery ceremony: preparations are ZIP 318-exempt, and the engine's
+    contract is that a preparation is broadcast as soon as it is proved. The accessor IS the take
+    seam, not a byte read — `txid -> row -> PoolMigrations::take_transaction_for_broadcast` in one
+    database transaction, so the wallet's record binds AT RETRIEVAL and a crashed consumer
+    re-retrieves the same bytes over the same record. It is PREPARATION-GATED: a transfer's txid
+    is refused ("transfers are served by the drive's broadcast instruction alone"), bare, before
+    the seam is reached, as an unknown txid is — both are questions about WHICH row was named, not
+    about whether an artifact can be made servable, so neither carries
+    `MIGRATION_PROVING_UNAVAILABLE`. The seam's own refusal of a non-`Proved` row remains the
+    readiness gate. Retrieved-but-never-submitted is a bounded, engine-modelled state: the record
+    is idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces
+    through the ordinary attention path once it expires. Submitted-but-never-marked is bounded
+    too, and is the ACCIDENT rather than the ordinary path now that the caller marks: the engine
+    promotes any in-flight transaction its scan sees mine, by the id it stored when it BUILT the
+    transaction.
+  - Delivery: `zcashlc_migration_take_broadcast_transaction` serves the transaction the caller
+    NAMES — the instruction a prior `_advance_step` returned as its BROADCAST step. It never
+    proves and never cranks the engine: `advance_migration` is the top-level call and every
+    executor is subservient to it, so there is no broadcast to make without having first been
+    instructed to make it, and the re-spread, the satisfiability verification and the dueness
+    judgement all belong to that advance. Serving goes through the store's atomic broadcast seam
+    (`PoolMigrations::take_transaction_for_broadcast`), which finalizes and extracts the
+    transaction and records it in the wallet's own tables — raw bytes, sent outputs, input-spend
+    marks, status-queue entry — in the same database transaction that hands the bytes back, so the
+    wallet record binds at the broadcast attempt rather than after it. `FfiPreparedTransfer`'s
+    `pczt`/`pczt_len` therefore carry the FINALIZED CONSENSUS TRANSACTION bytes, submittable as-is.
+    The seam's own refusal of a row that is not `Proved` is the STALENESS GUARD — an instruction
+    that went stale between the advance and the serve fails here rather than being acted on, and
+    the caller discharges it by advancing again. `FfiPreparedTransfer` accordingly loses its
+    `status` field and `FfiPreparedTransferStatus` is gone: an executor either serves or errors, so
+    there is no "nothing due"/"awaiting proof" shape left to carry. WHETHER a missing proof is what
+    blocks delivery is now reported on the advance step itself — each `FfiProveTarget` row gains a
+    trailing `schedule_due` bool, true when the effective dueness target has already reached that
+    transaction's scheduled height. Then `_record_transfer_result` (whose terminal tags — 2
+    invalid, 3 expired — record `report_broadcast_failure` testimony stamped at the observed
+    wallet tip; the next drive call adjudicates it through sqlite's satisfiability oracle, while
+    unknown and already-mined rows remain no-ops), and `_record_immediate_run`, which records a
+    send-max sweep built outside the engine.
+  - Read-only reporting: the query that CANNOT drive the engine (it opens read-only connections
+    and must not mutate) — `_has_overdue_transfers` — derives its answer from upstream's public
+    per-row status view (`MigrationState::transaction_statuses`) instead of the exported
+    broadcast/prove queue
+    selectors. Only the DERIVATION moves; every answer is unchanged. The view agrees with the
+    kernel's queues by construction and renders the doomed-broadcast withhold as neither ready nor
+    actionable, so the protective withhold and the `Signed`/awaiting-signature exclusions hold
+    exactly as before; and the engine's broadcast-before-prove precedence is preserved explicitly —
+    the two-tier derivation takes the broadcast-ready `(scheduled_height, id)`-min first and reaches
+    the still-unproved rows only when that tier is empty, exactly as upstream
+    `MigrationState::next_step` consults its own two queues. What IS gone is the scratch-clone
+    VIRTUAL PROVE behind `_has_overdue_transfers` (a
+    `MigrationState` was cloned and every prove-ready row flipped `Proved` in memory, just to ask
+    what would then be broadcastable): dependency readiness is keyed on `Mined`, never `Proved`, so
+    proving can unblock nothing, and one pass per tier over the statuses gives the same answer the
+    clone did. The ordering key within each tier is re-derived rather than read off the engine —
+    the SDK's one accepted drift risk here, recorded on librustzcash #2938. It remains an
+    ADVISORY display read: no store-oracle verification happens on it, so it never promises
+    what the next delivery call will serve.
   - Recovery: `zcashlc_migration_restart_step`, and `_refresh_stale_transfers`, which rebuilds every
     expired transfer of the stored run and returns the full stored schedule, persisting
     all-or-nothing (NULL on any error).
@@ -106,9 +185,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report the device's firmware version on completion, erroring on a request-id mismatch; and
   `_keystone_apply_batch_signatures` applies the response's signatures positionally to the caller's
   unsigned PCZTs, erroring if the counts disagree.
-- `zcashlc_migration_create_unsigned_note_split_pczts` and `_create_unsigned_transfer_pczts` annotate
-  every returned PCZT with the account's ZIP 32 seed fingerprint and account index. Without it
-  Keystone rejects the batch with "None of inputs belongs to the provided account".
+- `zcashlc_migration_create_unsigned_note_split_pczts` and `_create_unsigned_transfer_pczts` return
+  PCZTs carrying the account's ZIP 32 spend derivation on every spend still awaiting a signature,
+  across the Orchard and Ironwood bundles alike. Without it Keystone rejects the batch with "None of
+  inputs belongs to the provided account". The migration engine stamps it during the build
+  (`Committer::start` resolves the account derivation and both builders pass it to
+  `build::finalize_pczt`), so these entry points marshal the engine's bytes through unmodified; an
+  account whose ZIP 32 derivation the wallet does not know (a UFVK import made without one) yields
+  unstamped PCZTs rather than an error from these calls.
 - `Balance` (inside `FfiAccountBalance` / `FfiWalletSummary`) gains a trailing `locked_value` field,
   keeping "the sum of the fields is the account's total" true.
 - `zcashlc_migration_propose_immediate_transfers` — briefly part of this unreleased cycle, never
@@ -172,6 +256,32 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `dropped_count`, exposing notes the canonical bundling policy discarded.
 - Migrated to `zcash_protocol 0.10.4`, `zcash_client_backend 0.24.0-rc.7`,
   `zcash_client_sqlite 0.22.0-rc.7`, `pczt 0.9.2`.
+- The migration engine's wallet adapter is UPSTREAM's (`zcash_pool_migration::wallet::WalletMigration`
+  plus `zcash_client_sqlite`'s account-scoped `PoolMigrations` store); the SDK's own fork of it is
+  deleted. Three consequences reach behaviour rather than just code:
+  - No migration type holds spend authority any more, and none can be given it. The adapter is
+    built from the account's VIEWING key alone, and the engine's two signing entry points
+    (`commit_preparation`, `rebuild_expired_transfer`) take an `orchard::keys::SpendingKey` per
+    call — deriving its full viewing key and checking it against the account's stored one BEFORE
+    building anything, refusing a foreign key with `CommitError::WrongSpendAuthority` /
+    `RebuildError::WrongSpendAuthority` rather than silently signing nothing — so the FFI functions
+    that sign pass the spending key they just decoded straight through and drop it with the call,
+    instead of parking a `UnifiedSpendingKey` inside an adapter that mostly does not need one. The
+    external-signer lanes are unchanged: they call the unsigned entry points, which take no
+    authority at all.
+  - The spendable-note snapshot that keeps a commit linear in the wallet's note count is
+    upstream's own (librustzcash #2946) rather than an SDK mirror of it.
+  - `PoolMigrationRead::mined_height` is answered by the adapter from the wallet's FULLY-SCANNED
+    bound instead of being delegated to the store. The two agree on every value — the store
+    applies the same rule at its own layer — so no answer changes; the store still answers
+    directly on the paths that use it without an adapter.
+
+  What remains SDK-side is the account's stored unified full viewing key: upstream's constructor
+  takes the key from its CALLER (a wallet may hold several keys that view one account), and this
+  SDK always supplies the one the account record holds, which is what lets an imported
+  hardware-wallet account — whose spending key never exists on this device — plan, build and prove.
+  A migration call against an account whose record holds no unified full viewing key now fails at
+  the point the adapter is built rather than at the first key-dependent operation.
 - `zcashlc_set_transaction_status` now returns `bool` (`true` on success) instead of `void`, so
   callers can detect a failed status write (previously any error — including an unknown chain
   height — was silently discarded). No `repr(C)` struct layout changes.
@@ -209,14 +319,26 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
   hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
   doomed-broadcast withhold (above).
-- Delivery- and prove-lane selection — `zcashlc_migration_next_due_transfer`,
-  `_has_ready_broadcast`, `_prove_pending`, and the `_has_overdue_transfers`/
-  `_pending_transfer_proposal` queries built on them — now delegates to the pinned engine's own
-  exported reads, `MigrationState::next_due_broadcast` and `next_provable`, instead of re-deriving
-  an ordering over `transaction_statuses`; the SDK-side hand-rolled twin of that ordering is gone.
-  The plan-preview numbering (`preparation_steps_from_plan`) likewise takes its ids, `layer`, and
-  `index` straight from the engine's own `MigrationPlan::planned_transactions` enumeration, so a
-  previewed id already equals the id the committed transaction will carry.
+- Which transaction each lane acts on is the engine's decision, not an SDK re-derivation, and it
+  is made ONCE: `zcashlc_migration_advance_step` cranks `advance_migration`, and the two EXECUTORS
+  — `_take_broadcast_transaction` and `_prove_transactions` — discharge the instruction it
+  returned (see their entries above), so what they act on was verified against the store's
+  satisfiability oracle before it was handed out. `_take_preparation_by_txid` is not a third
+  executor but the retrieval half of the prove executor's own return: it acts only on a txid that
+  return just named, and its gate refuses everything else. The READ-ONLY reporting query —
+  `_has_overdue_transfers` — cannot drive,
+  and reads the engine's public per-row status view instead; the SDK's hand-rolled twins of
+  upstream's readiness predicates are gone, leaving only the `(scheduled_height, id)` ordering key
+  that display read composes over the view. The note-split ceremony's immediate-broadcast pick
+  reads the same view, so a resumed ceremony re-serves an already-proved, due preparation rather
+  than proving another. The plan preview is likewise a READ of the engine's own
+  `MigrationPlan::planned_transactions` enumeration — the same rows `commit_preparation` builds
+  from — rather than a second derivation beside it: every preparation step's id, `layer`, `index`,
+  `depends_on` and `broadcast_height`, and every transfer row's id and
+  `next_executable_after_height`, come off that enumeration. A previewed row therefore describes
+  exactly the transaction the commit will build, by construction rather than by two derivations
+  agreeing; the values are unchanged (the enumeration's dependency and scheduling rules are the
+  ones the preview used to reproduce by hand).
 - Mined-transaction promotion is the upstream engine's: `advance_migration` sweeps every in-flight
   transaction and promotes the ones the wallet's scan has seen mine, so the drive path no longer
   reconciles first, and the read-only entry points reconcile through the engine's own
@@ -225,9 +347,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside the region a reorg truncation would roll back — and is the same bound the drive path
   promotes under, so a status read can no longer report `Mined` for a row `advance_migration`
   would refuse to promote.
-- The six migration read entry points (`zcashlc_migration_transaction_statuses`,
+- The five migration read entry points (`zcashlc_migration_transaction_statuses`,
   `zcashlc_migration_progress`, `zcashlc_migration_has_overdue_transfers`,
-  `zcashlc_migration_has_invalid_transfers`, `zcashlc_migration_has_ready_broadcast`,
+  `zcashlc_migration_has_invalid_transfers`,
   `zcashlc_migration_sync_wakeups`) now open the database read-only and report the persisted
   run without reconciling mined transactions first. Broadcast→Mined promotion is persisted by
   the write lanes (the advance-step engine sweep, the prove sweep, the delivery serves), which
@@ -240,8 +362,26 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrote raw SQL directly against the engine-owned pool-migration tables, retro-compressing a
   committed schedule so its transfers become due in quick succession for manual broadcast testing.
   That testing purpose is now covered on the engine side by compressed test-network scheduling at
-  commit time plus the opt-in spacing floors (`_advance_step`'s
-  `overdue_tolerance_floor`/`release_spacing_floor` params, above).
+  commit time.
+- `zcashlc_migration_pending_transfer_proposal` is removed, together with the standalone
+  `zcashlc_free_migration_transfer_proposal` destructor that freed its answer. It was a
+  KIND-FILTERED peek at the queue ("the next TRANSFER, specifically"), which the advance design
+  makes a malformed question: any answer either masks imminent work of another kind or contradicts
+  what the drive would serve. Its scheduling role belongs to `zcashlc_migration_advance_step`
+  (whose outlook names the next serviceable work of ANY kind) and its display role to
+  `zcashlc_migration_transaction_statuses` plus the schedule DTO. `FfiTransferProposal` itself
+  stays — it is the row type of `FfiMigrationSchedule::transfers` — but is no longer handed out
+  standalone.
+- `zcashlc_migration_has_ready_broadcast` is removed. It had no consumer anywhere: the 2026-08-05
+  D1 ruling deleted the sync gate's forward-looking clause, the only caller, and sync is now held
+  only while a migration submission is in flight — never because a broadcast is expected in the
+  future, and never for a fixed interval after one happened.
+  `zcashlc_migration_has_overdue_transfers` — an honest "the delivery lane has actionable work"
+  boolean, not a kind-filtered id peek — stays.
+- `zcashlc_migration_extract_broadcast_tx` is removed. It had zero consumers, in the SDK or the
+  app: every live flow receives already-finalized consensus transaction bytes from the store's
+  atomic broadcast seam, never a PCZT that needs extracting. Its private helper,
+  `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood
@@ -253,7 +393,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scanned. Shielded sent outputs stored by this call are also now tagged with
   their note commitment tree, as the transaction-builder spend path already did.
 - The migration prover's transient-vs-hard error classification (`ProveErrorClass::is_transient`,
-  behind `zcashlc_migration_prove_pending` / `_next_due_transfer`): `UnknownSpentNote` (a
+  behind `zcashlc_migration_prove_transactions` / `_advance_step`): `UnknownSpentNote` (a
   late-mining dependency's note the wallet has not seen yet) and `Tree(ShardTreeError::Query(_))`
   (shard-tree query races during sync — this exact case crash-looped a prove batch on Android on
   2026-07-28) now correctly resolve as the transient "retry on a later sweep" outcome instead of a
@@ -268,8 +408,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Due-ness and expiry are evaluated on the engine's target-height contract (`chain tip + 1`) in every
   read path, with the "never expires" case honoured. Transfers now become due and expire one block
   earlier, consistently, and a doomed transfer is no longer served for broadcast. This now includes
-  the `zcashlc_migration_prove_pending` sweep — the one remaining raw-tip caller — so a preparation
-  scheduled exactly at the target is proved on the sweep that sees it rather than one block late.
+  the proving sweep — the one remaining raw-tip caller — so a preparation scheduled exactly at the
+  target is offered for proving on the advance that sees it rather than one block late.
 - An `estimated_tip` at or beyond `u32::MAX` saturates below the height ceiling instead of
   overflowing the `+ 1` target conversion.
 - `FfiMigrationProgress.next_transfer_ready_at_height` reports the next transfer still awaiting
