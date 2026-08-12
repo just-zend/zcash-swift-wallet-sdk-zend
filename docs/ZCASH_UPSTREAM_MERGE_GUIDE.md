@@ -657,3 +657,23 @@ funded-device migration evidence as a prerequisite for the full-parity PR `#34`.
 
 No new upstream-main commit or carry-worthy bleeding-edge work was found. Do not create another
 parity branch or run Swift validation for this documentation-only tracker update.
+
+## Bleeding-edge refresh (2026-08-11)
+
+- After a fresh fetch, both defaults remain `main`: `origin/main=4497fe9e` and
+  `upstream/main=ee7b05c9`; their divergence is `174 398`. Existing Zend draft PR `#34`
+  (`codex/zcash-upstream-sync-2026-08-01`) now contains the exact upstream tip at
+  `013a024d`. It remains the sole full-parity vehicle; do not create a duplicate.
+- The upstream `#1955`, `#1957`, `#1958`, and `#1959` integration sequence updated the
+  Ironwood/Slipstream migration and released `librustzcash` graph. The parity merge had one
+  `Cargo.toml` conflict; it takes upstream's released `13ce6c4e` pin instead of retaining
+  Zend's superseded interim pin. Zend's private-engine artifact and release gate remain intact.
+- `swift build` on `#34` still fails before tests because Zend's released XCFramework header and
+  binary lack the new migration and Slipstream FFI declarations, including
+  `FfiMigrationProgress`, `zcashlc_slipstream_open`, and `zcashlc_slipstream_snapshot`.
+  Do not run OfflineTests until a provenance-verified matching arm64 XCFramework is built,
+  release wiring is updated, and funded-device migration evidence is captured.
+- Open PRs `#1961` (send-max), `#1960` (post-merge Cargo.lock repair), `#1944`, `#1895`,
+  `#1893`, and the Dependabot set are not independent Zend carries. They are feature work,
+  maintenance-line-only, migration/artifact-coupled, draft or review-required, or broad
+  dependency updates. No candidate is ready, useful, and low-risk enough to carry early.
