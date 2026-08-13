@@ -4839,10 +4839,10 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         return extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsCallsCount > 0
     }
     var extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReceivedArguments: (pcztWithProofs: Pczt, pcztWithSigs: Pczt)?
-    var extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue: Data!
-    var extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsClosure: ((Pczt, Pczt) async throws -> Data)?
+    var extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue: CreatedTransaction!
+    var extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsClosure: ((Pczt, Pczt) async throws -> CreatedTransaction)?
 
-    func extractAndStoreTxFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> Data {
+    func extractAndStoreTxFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> CreatedTransaction {
         if let error = extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsThrowableError {
             throw error
         }

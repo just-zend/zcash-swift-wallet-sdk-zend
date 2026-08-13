@@ -66,9 +66,10 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
-- Newly created transactions are now returned for broadcast from the wallet store instead of being
-  reconstructed from `v_transactions`. If that history view has not projected the stored row yet,
-  sends and transparent-fund shielding continue to submission instead of failing with
+- Transactions created from both ordinary proposals and finalized PCZTs are now returned for
+  broadcast from the wallet store instead of being reconstructed from `v_transactions`. If that
+  history view has not projected the stored row yet, sends and transparent-fund shielding continue
+  to submission instead of failing with
   `ZTREE0001 transactionRepositoryEntityNotFound`; only the creation-time history event is omitted
   when no overview is available.
 - Fetching transactions no longer fails on wallets whose `trust_status` column is NULL — which is

@@ -101,7 +101,11 @@ final class BroadcasterTests: ZcashTestCase {
         let overviews = [makeTransaction(raw: Data([0x05, 0x06]), rawID: rawID)]
         let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
+        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = CreatedTransaction(
+            txId: rawID,
+            raw: Data([0x05, 0x06]),
+            expiryHeight: nil
+        )
         let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder, rustBackend: rustBackend)
         await synchronizer.updateStatus(.stopped)
 
@@ -114,6 +118,31 @@ final class BroadcasterTests: ZcashTestCase {
         let store = mockContainer.resolve(SubmitPlanStoring.self)
         let plan = await store.plan(for: rawID)
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
+    }
+
+    func testCreateTransactionFromPCZTContinuesWhenHistoryViewDoesNotContainCreatedTransaction() async throws {
+        let rawID = Data(repeating: 0xCD, count: 32)
+        let rawTransaction = Data([0x05, 0x06])
+        let overviews = [makeTransaction(raw: rawTransaction, rawID: rawID)]
+        let transactionEncoder = StubTransactionEncoder(
+            createdTransactions: overviews,
+            fetchError: ZcashError.transactionRepositoryEntityNotFound
+        )
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = CreatedTransaction(
+            txId: rawID,
+            raw: rawTransaction,
+            expiryHeight: nil
+        )
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder, rustBackend: rustBackend)
+        await synchronizer.updateStatus(.stopped)
+
+        let transactions = try await synchronizer.broadcaster.createTransactionFromPCZT(
+            pcztWithProofs: Pczt([0x10, 0x11]),
+            pcztWithSigs: Pczt([0x12, 0x13])
+        )
+
+        XCTAssertEqual(transactions, [CreatedTransaction(txId: rawID, raw: rawTransaction, expiryHeight: nil)])
     }
 
     func testBroadcasterThrowsWhenNotPrepared() async throws {
@@ -302,7 +331,11 @@ final class BroadcasterTests: ZcashTestCase {
         let overviews = [makeTransaction(raw: rawTransaction, rawID: rawID)]
         let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
+        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = CreatedTransaction(
+            txId: rawID,
+            raw: rawTransaction,
+            expiryHeight: nil
+        )
         let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder, rustBackend: rustBackend)
         await synchronizer.updateStatus(.stopped)
 

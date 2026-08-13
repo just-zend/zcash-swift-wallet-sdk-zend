@@ -361,7 +361,7 @@ protocol ZcashRustBackendWelding {
     /// - Returns The submission result of the completed transaction.
     ///
     /// - Throws  PcztException.ExtractAndStoreTxFromPcztException as a common indicator of the operation failure
-    func extractAndStoreTxFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> Data
+    func extractAndStoreTxFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> CreatedTransaction
 
     /// Gets the consensus branch id for the given height
     /// - Parameter height: the height you what to know the branch id for

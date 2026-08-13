@@ -134,16 +134,15 @@ final class SDKBroadcaster: Broadcaster {
         try statusCheck()
         try await downloadSaplingParamsIfNeeded()
 
-        let txId = try await initializer.rustBackend.extractAndStoreTxFromPCZT(
+        let createdTransaction = try await initializer.rustBackend.extractAndStoreTxFromPCZT(
             pcztWithProofs: pcztWithProofs,
             pcztWithSigs: pcztWithSigs
         )
 
-        let overviews = try await transactionEncoder.fetchTransactionsForTxIds([txId])
+        let overviews = try await overviewsForEvent(txIds: [createdTransaction.txId])
 
-        let createdTransactions = try overviews.map { try CreatedTransaction(overview: $0) }
         return await finishCreation(
-            createdTransactions: createdTransactions,
+            createdTransactions: [createdTransaction],
             overviews: overviews,
             recordingPlans: recordingPlans
         )

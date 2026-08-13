@@ -540,7 +540,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     func extractAndStoreTxFromPCZT(
         pcztWithProofs: Pczt,
         pcztWithSigs: Pczt
-    ) async throws -> Data {
+    ) async throws -> CreatedTransaction {
         let txidPtr: UnsafeMutablePointer<FfiBoxedSlice>? = pcztWithProofs.withUnsafeBytes { pcztWithProofsBuffer in
             guard let pcztWithProofsBufferPtr = pcztWithProofsBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                 return nil
@@ -577,10 +577,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         defer { zcashlc_free_boxed_slice(txidPtr) }
 
-        return Data(
+        let txId = Data(
             bytes: txidPtr.pointee.ptr,
             count: Int(txidPtr.pointee.len)
         )
+
+        return try createdTransaction(txId: txId) { message in
+            ZcashError.rustExtractAndStoreTxFromPCZT(message)
+        }
     }
 
     @DBActor
@@ -1303,35 +1307,47 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         for i in (0 ..< Int(txIdsPtr.pointee.len)) {
             let txId = FfiTxId(tuple: txIdsPtr.pointee.ptr.advanced(by: i).pointee)
             let txIdData = Data(txId.array)
-            let transactionPtr = txId.array.withUnsafeBufferPointer { txIdPtr in
-                zcashlc_get_created_transaction(
-                    dbData.0,
-                    dbData.1,
-                    txIdPtr.baseAddress,
-                    networkType.networkId
-                )
-            }
-
-            guard let transactionPtr else {
-                throw ZcashError.rustCreateToAddress(
-                    lastErrorMessage(fallback: "Created transaction is unavailable in the wallet store")
-                )
-            }
-
-            defer { zcashlc_free_created_transaction(transactionPtr) }
-
-            guard let transaction = transactionPtr.pointee.unsafeToCreatedTransaction() else {
-                throw ZcashError.rustCreateToAddress("Created transaction has no encoded bytes")
-            }
-
-            guard transaction.txId == txIdData else {
-                throw ZcashError.rustCreateToAddress("Created transaction id does not match the requested id")
-            }
-
-            transactions.append(transaction)
+            transactions.append(try createdTransaction(txId: txIdData) { message in
+                ZcashError.rustCreateToAddress(message)
+            })
         }
 
         return transactions
+    }
+
+    private func createdTransaction(
+        txId: Data,
+        makeError: (String) -> ZcashError
+    ) throws -> CreatedTransaction {
+        guard txId.count == 32 else {
+            throw makeError("Created transaction id has an incorrect length")
+        }
+
+        let txIdBytes = [UInt8](txId)
+        let transactionPtr = txIdBytes.withUnsafeBufferPointer { txIdPtr in
+            zcashlc_get_created_transaction(
+                dbData.0,
+                dbData.1,
+                txIdPtr.baseAddress,
+                networkType.networkId
+            )
+        }
+
+        guard let transactionPtr else {
+            throw makeError(lastErrorMessage(fallback: "Created transaction is unavailable in the wallet store"))
+        }
+
+        defer { zcashlc_free_created_transaction(transactionPtr) }
+
+        guard let transaction = transactionPtr.pointee.unsafeToCreatedTransaction() else {
+            throw makeError("Created transaction has no encoded bytes")
+        }
+
+        guard transaction.txId == txId else {
+            throw makeError("Created transaction id does not match the requested id")
+        }
+
+        return transaction
     }
 
     nonisolated func consensusBranchIdFor(height: Int32) throws -> Int32 {
