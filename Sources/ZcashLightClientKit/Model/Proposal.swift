@@ -64,7 +64,7 @@ public extension Proposal {
 
         if spendsLegacyOrchardFunds {
             var receivedOutput = FfiReceivedOutput()
-            receivedOutput.txid = Data(repeating: 0, count: 32)
+            receivedOutput.txid = Data(repeating: 0, count: TxId.byteLength)
             receivedOutput.valuePool = .orchard
             receivedOutput.index = 0
             receivedOutput.value = 0
