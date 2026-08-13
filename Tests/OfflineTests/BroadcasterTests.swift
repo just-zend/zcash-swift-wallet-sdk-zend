@@ -79,6 +79,27 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
     }
 
+    func testCreateProposedTransactionsContinuesWhenHistoryEnrichmentThrowsAnotherError() async throws {
+        struct TransientHistoryError: Error {}
+        let rawTransaction = Data([0x01, 0x02, 0x03, 0x04])
+        let rawID = Data(repeating: 0xAC, count: 32)
+        let transactionEncoder = StubTransactionEncoder(
+            createdTransactions: [makeTransaction(raw: rawTransaction, rawID: rawID)],
+            fetchError: TransientHistoryError()
+        )
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let transactions = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+
+        XCTAssertEqual(transactions, [CreatedTransaction(txId: rawID, raw: rawTransaction, expiryHeight: 123_456)])
+        let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
+    }
+
     func testCreateProposedTransactionsEmitsAvailableHistoryWhenOnlyOneOverviewIsMissing() async throws {
         let foundRawID = Data(repeating: 0xAB, count: 32)
         let missingRawID = Data(repeating: 0xCD, count: 32)
@@ -160,17 +181,48 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(rustBackend.getTransactionTxIdReceivedTxId, rawID)
     }
 
+    func testWalletTransactionEncoderReportsFailedAndAlreadyReadTransactionIds() async throws {
+        let firstTxId = Data(repeating: 0xBC, count: 32)
+        let missingTxId = Data(repeating: 0xBD, count: 32)
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.createProposedTransactionsProposalUskReturnValue = [firstTxId, missingTxId]
+        rustBackend.getTransactionTxIdClosure = { txId in
+            guard txId == firstTxId else { return nil }
+            return TransactionData(txId: firstTxId, raw: Data([0x01]), expiryHeight: 123_456)
+        }
+        let encoder = WalletTransactionEncoder(
+            rustBackend: rustBackend,
+            dataDb: try __dataDbURL(),
+            fsBlockDbRoot: testTempDirectory,
+            service: LightWalletServiceMock(),
+            repository: TransactionRepositoryMock(),
+            outputParams: try __outputParamsURL(),
+            spendParams: try __spendParamsURL(),
+            networkType: .testnet,
+            logger: submissionLifecycleLogger(),
+            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+        )
+
+        do {
+            _ = try await encoder.createProposedTransactions(
+                proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+                spendingKey: TestsData(networkType: .testnet).spendingKey
+            )
+            XCTFail("Expected wallet-store readback to fail")
+        } catch ZcashError.rustGetTransaction(let message) {
+            XCTAssertTrue(message.contains(missingTxId.toHexStringTxId()))
+            XCTAssertTrue(message.contains(firstTxId.toHexStringTxId()))
+        } catch {
+            XCTFail("Expected rustGetTransaction but got \(error.localizedDescription)")
+        }
+    }
+
     func testCreateTransactionFromPCZTMarksAwaitingAndEmitsEvent() async throws {
         let rawID = Data(repeating: 0xCD, count: 32)
         let overviews = [makeTransaction(raw: Data([0x05, 0x06]), rawID: rawID)]
         let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
         let rustBackend = ZcashRustBackendWeldingMock()
         rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
-        rustBackend.getTransactionTxIdReturnValue = TransactionData(
-            txId: rawID,
-            raw: Data([0x05, 0x06]),
-            expiryHeight: nil
-        )
         let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder, rustBackend: rustBackend)
         await synchronizer.updateStatus(.stopped)
 
@@ -180,7 +232,6 @@ final class BroadcasterTests: ZcashTestCase {
         )
 
         XCTAssertEqual(transactions.map(\.txId), [rawID])
-        XCTAssertEqual(rustBackend.getTransactionTxIdReceivedTxId, rawID)
         let store = mockContainer.resolve(SubmitPlanStoring.self)
         let plan = await store.plan(for: rawID)
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
@@ -196,11 +247,6 @@ final class BroadcasterTests: ZcashTestCase {
         )
         let rustBackend = ZcashRustBackendWeldingMock()
         rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
-        rustBackend.getTransactionTxIdReturnValue = TransactionData(
-            txId: rawID,
-            raw: rawTransaction,
-            expiryHeight: nil
-        )
         let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder, rustBackend: rustBackend)
         await synchronizer.updateStatus(.stopped)
 
@@ -209,7 +255,7 @@ final class BroadcasterTests: ZcashTestCase {
             pcztWithSigs: Pczt([0x12, 0x13])
         )
 
-        XCTAssertEqual(transactions, [CreatedTransaction(txId: rawID, raw: rawTransaction, expiryHeight: nil)])
+        XCTAssertEqual(transactions, [CreatedTransaction(txId: rawID, raw: rawTransaction, expiryHeight: 123_456)])
     }
 
     func testBroadcasterThrowsWhenNotPrepared() async throws {
@@ -399,11 +445,6 @@ final class BroadcasterTests: ZcashTestCase {
         let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
         let rustBackend = ZcashRustBackendWeldingMock()
         rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
-        rustBackend.getTransactionTxIdReturnValue = TransactionData(
-            txId: rawID,
-            raw: rawTransaction,
-            expiryHeight: nil
-        )
         let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder, rustBackend: rustBackend)
         await synchronizer.updateStatus(.stopped)
 
@@ -506,8 +547,11 @@ private final class StubTransactionEncoder: TransactionEncoder {
         missingHistoryTxIds: Set<Data> = []
     ) {
         self.overviews = overviews
-        self.createdTransactions = overviews.compactMap { overview in
-            guard let raw = overview.raw else { return nil }
+        self.createdTransactions = overviews.map { overview in
+            guard let raw = overview.raw else {
+                XCTFail("StubTransactionEncoder requires raw transaction bytes")
+                return CreatedTransaction(txId: overview.rawID, raw: Data(), expiryHeight: overview.expiryHeight)
+            }
             return CreatedTransaction(txId: overview.rawID, raw: raw, expiryHeight: overview.expiryHeight)
         }
         self.fetchError = fetchError
@@ -542,6 +586,12 @@ private final class StubTransactionEncoder: TransactionEncoder {
     ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
         return createdTransactions
+    }
+
+    func createdTransactions(forTxIds txIds: [Data]) async throws -> [CreatedTransaction] {
+        txIds.compactMap { txId in
+            createdTransactions.first { $0.txId == txId }
+        }
     }
 
     func proposeFulfillingPaymentFromURI(

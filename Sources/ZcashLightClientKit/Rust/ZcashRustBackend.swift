@@ -1308,7 +1308,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return txIds
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-13): WalletRead::get_transaction — opens the wallet database
+    // read-only and executes SELECT-only transaction lookup and parsing.
     func getTransaction(txId: Data) async throws -> TransactionData? {
         guard txId.count == TxId.byteLength else {
             throw ZcashError.rustGetTransaction("Transaction id must be \(TxId.byteLength) bytes")
@@ -2807,12 +2808,12 @@ extension FfiBoxedSlice {
 extension FfiTransactionData {
     /// Copies rust-owned wallet transaction data into Swift, or returns `nil` when raw bytes are unavailable.
     func unsafeToTransactionData() -> TransactionData? {
-        guard let raw else { return nil }
+        guard let raw, raw_len > 0, let rawCount = Int(exactly: raw_len) else { return nil }
 
         return TransactionData(
             txId: Data(FfiTxId(tuple: txid).array),
-            raw: Data(bytes: raw, count: Int(raw_len)),
-            expiryHeight: BlockHeight(expiry_height)
+            raw: Data(bytes: raw, count: rawCount),
+            expiryHeight: expiry_height == 0 ? nil : BlockHeight(expiry_height)
         )
     }
 }

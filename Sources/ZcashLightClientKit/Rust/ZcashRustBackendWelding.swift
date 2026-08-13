@@ -319,6 +319,7 @@ protocol ZcashRustBackendWelding {
     /// Returns the wallet-store data available for the given transaction, or `nil` if the
     /// transaction is unknown or its raw bytes are unavailable. This works for both sent and
     /// received transactions.
+    /// - Throws: `rustGetTransaction` if the wallet store cannot be read or the transaction cannot be decoded.
     func getTransaction(txId: Data) async throws -> TransactionData?
 
     /// Creates a partially-created (unsigned without proofs) transaction from the given proposal.

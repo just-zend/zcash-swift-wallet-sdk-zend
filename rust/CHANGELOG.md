@@ -8,6 +8,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_get_transaction`, `zcashlc_free_transaction_data`, and `FfiTransactionData` expose the
+  serialized bytes and expiry height available for any wallet-store transaction without depending
+  on the transaction-history projection.
 - Pool-migration (Orchard→Ironwood) FFI: 33 `zcashlc_migration_*` entry points with their
   `#[repr(C)]` return types and `zcashlc_free_migration_*` destructors, plus
   `zcashlc_ironwood_activation_height`. Each call takes the wallet-db path, a 16-byte account uuid

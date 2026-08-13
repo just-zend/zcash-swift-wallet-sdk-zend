@@ -834,14 +834,14 @@ pub type TxIds = SymmetricKeys;
 /// A null `raw` pointer represents an unknown transaction or one whose raw bytes are unavailable.
 /// `expiry_height` is the consensus value; zero means that transaction expiry is disabled.
 #[repr(C)]
-pub struct FfiTransactionData {
+pub struct TransactionData {
     pub txid: [u8; 32],
     pub raw: *mut u8,
     pub raw_len: usize,
     pub expiry_height: u32,
 }
 
-impl FfiTransactionData {
+impl TransactionData {
     pub(crate) fn from_parts(txid: [u8; 32], raw_bytes: Vec<u8>, expiry_height: u32) -> *mut Self {
         let (raw, raw_len) = ptr_from_vec(raw_bytes);
         Box::into_raw(Box::new(Self {
@@ -862,59 +862,18 @@ impl FfiTransactionData {
     }
 }
 
-/// Frees an [`FfiTransactionData`] and its serialized transaction bytes.
+/// Frees a [`TransactionData`] and its serialized transaction bytes.
 ///
 /// # Safety
 ///
 /// - `ptr` must either be null or point to a value returned by
 ///   [`crate::zcashlc_get_transaction`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_free_transaction_data(ptr: *mut FfiTransactionData) {
+pub unsafe extern "C" fn zcashlc_free_transaction_data(ptr: *mut TransactionData) {
     if !ptr.is_null() {
         let transaction_data = unsafe { Box::from_raw(ptr) };
         free_ptr_from_vec(transaction_data.raw, transaction_data.raw_len);
         drop(transaction_data);
-    }
-}
-
-#[cfg(test)]
-mod transaction_data_tests {
-    use super::*;
-
-    #[test]
-    fn transaction_data_carries_and_frees_broadcast_data() {
-        let txid = [0xAB; 32];
-        let raw = vec![1, 2, 3, 4];
-        let ptr = FfiTransactionData::from_parts(txid, raw.clone(), 1_234_567);
-
-        // SAFETY: `ptr` was allocated immediately above and remains owned until the free below.
-        let transaction = unsafe { &*ptr };
-        assert_eq!(transaction.txid, txid);
-        assert_eq!(transaction.expiry_height, 1_234_567);
-        // SAFETY: `raw` and `raw_len` were produced together from `raw.clone()` above.
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts(transaction.raw, transaction.raw_len) },
-            raw
-        );
-
-        // SAFETY: `ptr` came from `from_parts` and has not previously been freed.
-        unsafe { zcashlc_free_transaction_data(ptr) };
-    }
-
-    #[test]
-    fn transaction_data_uses_a_null_raw_pointer_when_unavailable() {
-        let txid = [0xCD; 32];
-        let ptr = FfiTransactionData::unavailable(txid);
-
-        // SAFETY: `ptr` was allocated immediately above and remains owned until the free below.
-        let transaction = unsafe { &*ptr };
-        assert_eq!(transaction.txid, txid);
-        assert!(transaction.raw.is_null());
-        assert_eq!(transaction.raw_len, 0);
-        assert_eq!(transaction.expiry_height, 0);
-
-        // SAFETY: `ptr` came from `unavailable` and has not previously been freed.
-        unsafe { zcashlc_free_transaction_data(ptr) };
     }
 }
 

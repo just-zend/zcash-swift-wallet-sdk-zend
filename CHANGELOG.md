@@ -69,9 +69,10 @@ Changes are relative to `2.8.0-rc.3`.
 - Transactions created from both ordinary proposals and finalized PCZTs are now returned for
   broadcast from the wallet store instead of being reconstructed from `v_transactions`. If that
   history view has not projected the stored row yet, sends and transparent-fund shielding continue
-  to submission instead of failing with
-  `ZTREE0001 transactionRepositoryEntityNotFound`; only the creation-time history event is omitted
-  when no overview is available.
+  to submission instead of failing with `ZTREE0001 transactionRepositoryEntityNotFound`.
+  Creation-time history events contain every overview currently available and omit only the
+  missing entries; failure to read required wallet-store bytes reports `ZRUST0150
+  rustGetTransaction` with the affected transaction id and any ids already read.
 - Fetching transactions no longer fails on wallets whose `trust_status` column is NULL — which is
   every wallet today, since transaction trust (`set_tx_trust`) is an opt-in marker with no default,
   no backfill, and no caller yet. The strict `Overview` decode threw on the first row and the whole

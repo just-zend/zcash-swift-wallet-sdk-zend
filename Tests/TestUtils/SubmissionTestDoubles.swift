@@ -238,8 +238,10 @@ final class StubTransactionEncoder: TransactionEncoder {
 
     init(createdTransactions overviews: [ZcashTransaction.Overview]) {
         self.overviews = overviews
-        self.createdTransactions = overviews.compactMap { overview in
-            guard let raw = overview.raw else { return nil }
+        self.createdTransactions = overviews.map { overview in
+            guard let raw = overview.raw else {
+                preconditionFailure("StubTransactionEncoder requires raw transaction bytes")
+            }
             return CreatedTransaction(txId: overview.rawID, raw: raw, expiryHeight: overview.expiryHeight)
         }
     }
@@ -272,6 +274,12 @@ final class StubTransactionEncoder: TransactionEncoder {
     ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
         return createdTransactions
+    }
+
+    func createdTransactions(forTxIds txIds: [Data]) async throws -> [CreatedTransaction] {
+        txIds.compactMap { txId in
+            createdTransactions.first { $0.txId == txId }
+        }
     }
 
     func proposeFulfillingPaymentFromURI(

@@ -123,10 +123,17 @@ class WalletTransactionEncoder: TransactionEncoder {
             usk: spendingKey
         )
 
+        return try await createdTransactions(forTxIds: txIds)
+    }
+
+    func createdTransactions(forTxIds txIds: [Data]) async throws -> [CreatedTransaction] {
         var createdTransactions: [CreatedTransaction] = []
         for txId in txIds {
             guard let transactionData = try await rustBackend.getTransaction(txId: txId) else {
-                throw TransactionEncoderError.notFound(txId: txId)
+                let completedTxIds = createdTransactions.map { $0.txId.toHexStringTxId() }.joined(separator: ", ")
+                throw ZcashError.rustGetTransaction(
+                    "Transaction \(txId.toHexStringTxId()) is unavailable in the wallet store; already read transaction ids: [\(completedTxIds)]"
+                )
             }
             createdTransactions.append(CreatedTransaction(transactionData: transactionData))
         }

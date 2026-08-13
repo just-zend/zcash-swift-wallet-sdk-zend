@@ -2916,7 +2916,11 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
 /// This works for any stored transaction, including received transactions. It deliberately does
 /// not depend on wallet history views, which may omit a stored transaction until all of the view's
 /// derived relations are populated. If the transaction is unknown or its raw bytes are not
-/// available, the returned [`ffi::FfiTransactionData`] has a null `raw` pointer.
+/// available, the returned [`ffi::TransactionData`] has a null `raw` pointer.
+///
+/// Parsing an unmined transaction requires a known consensus branch. Consequently, an
+/// expiry-disabled unmined transaction whose branch cannot be inferred is reported through the
+/// last-error channel instead of being returned as unavailable.
 ///
 /// # Safety
 ///
@@ -2930,19 +2934,17 @@ pub unsafe extern "C" fn zcashlc_get_transaction(
     db_data_len: usize,
     txid_bytes: *const u8,
     network_id: u32,
-) -> *mut ffi::FfiTransactionData {
+) -> *mut ffi::TransactionData {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
-        let txid_bytes: [u8; 32] = unsafe { slice::from_raw_parts(txid_bytes, 32) }
-            .try_into()
-            .map_err(|_| anyhow!("Transaction id must be 32 bytes"))?;
+        let txid_bytes = unsafe { *(txid_bytes.cast::<[u8; 32]>()) };
         let txid = TxId::from_bytes(txid_bytes);
         let Some(transaction) = db_data
             .get_transaction(txid)
             .map_err(|e| anyhow!("Failed to read transaction {txid}: {e:?}"))?
         else {
-            return Ok(ffi::FfiTransactionData::unavailable(txid_bytes));
+            return Ok(ffi::TransactionData::unavailable(txid_bytes));
         };
 
         let expiry_height = u32::from(transaction.expiry_height());
@@ -2951,8 +2953,8 @@ pub unsafe extern "C" fn zcashlc_get_transaction(
             .write(&mut raw)
             .map_err(|e| anyhow!("Failed to encode transaction {txid}: {e}"))?;
 
-        Ok(ffi::FfiTransactionData::from_parts(
-            txid_bytes,
+        Ok(ffi::TransactionData::from_parts(
+            *transaction.txid().as_ref(),
             raw,
             expiry_height,
         ))

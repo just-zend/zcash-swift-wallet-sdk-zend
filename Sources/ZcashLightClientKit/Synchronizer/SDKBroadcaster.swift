@@ -117,7 +117,7 @@ final class SDKBroadcaster: Broadcaster {
             proposal: proposal,
             spendingKey: spendingKey
         )
-        let overviews = try await overviewsForEvent(txIds: createdTransactions.map(\.txId))
+        let overviews = await overviewsForEvent(txIds: createdTransactions.map(\.txId))
 
         return await finishCreation(
             createdTransactions: createdTransactions,
@@ -138,12 +138,13 @@ final class SDKBroadcaster: Broadcaster {
             pcztWithProofs: pcztWithProofs,
             pcztWithSigs: pcztWithSigs
         )
-        guard let transactionData = try await initializer.rustBackend.getTransaction(txId: txId) else {
-            throw TransactionEncoderError.notFound(txId: txId)
+        guard let createdTransaction = try await transactionEncoder.createdTransactions(forTxIds: [txId]).first else {
+            throw ZcashError.rustGetTransaction(
+                "Transaction \(txId.toHexStringTxId()) is unavailable in the wallet store"
+            )
         }
-        let createdTransaction = CreatedTransaction(transactionData: transactionData)
 
-        let overviews = try await overviewsForEvent(txIds: [createdTransaction.txId])
+        let overviews = await overviewsForEvent(txIds: [createdTransaction.txId])
 
         return await finishCreation(
             createdTransactions: [createdTransaction],
@@ -164,16 +165,18 @@ final class SDKBroadcaster: Broadcaster {
         )
     }
 
-    private func overviewsForEvent(txIds: [Data]) async throws -> [ZcashTransaction.Overview] {
+    private func overviewsForEvent(txIds: [Data]) async -> [ZcashTransaction.Overview] {
         var overviews: [ZcashTransaction.Overview] = []
 
         for txId in txIds {
             do {
                 overviews.append(contentsOf: try await transactionEncoder.fetchTransactionsForTxIds([txId]))
-            } catch ZcashError.transactionRepositoryEntityNotFound {
+            } catch {
                 logger.warn(
-                    "Created transaction is not yet present in v_transactions; continuing with wallet-store bytes: " +
-                    "\(txId.toHexStringTxId())."
+                    """
+                    Created transaction \(txId.toHexStringTxId()) could not be enriched from v_transactions; \
+                    continuing with wallet-store bytes. \(error.localizedDescription)
+                    """
                 )
             }
         }
