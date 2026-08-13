@@ -12,10 +12,11 @@
 //  history only if at least one of its inputs was already recorded, or it has a wallet-internal
 //  shielded output (change or self-send).
 //
-//  Shielding and cross-pay both have NO wallet-internal output, which removes the second half of
-//  that rule and leaves the input match as the only thing creating the row. These tests pin the
-//  resulting behaviour: the transaction is fully present in `transactions`, and invisible through
-//  the view.
+//  A shielding or cross-pay send normally has both halves: recorded input spends and a
+//  wallet-internal change output. The field failure means neither was recorded for the affected
+//  wallets — which write went missing is an open librustzcash question. These tests pin the
+//  resulting behaviour rather than its upstream cause: a transaction in that state is fully
+//  present in `transactions`, and invisible through the view.
 //
 
 import SQLite
@@ -94,9 +95,12 @@ final class MissingEntityReproTests: XCTestCase {
     /// it; fabricated bytes exercise the parse-failure path instead of the readback. The heights
     /// come with them, since the consensus branch used to parse is derived from them.
     ///
-    /// The row's `txid` is deliberately NOT the hash of the copied `raw` bytes. Nothing recomputes
-    /// it: the view matches on the column, and the readback echoes back the txid it was asked for
-    /// rather than deriving one from the transaction it parsed.
+    /// The row's `txid` is deliberately NOT the hash of the copied `raw` bytes. The view never
+    /// parses `raw` and matches on the column alone, so the mismatch is invisible to every
+    /// view-side assertion. The readback, by contrast, derives the txid from the transaction it
+    /// parsed and rejects the mismatch — which is why the readback tests use
+    /// `stripNotesRows()` (a real transaction made view-invisible) and this helper doubles as
+    /// the fixture for the integrity-guard test.
     ///
     /// - Parameter mined: when `false`, `mined_height` is left NULL, mirroring the field state of a
     ///   freshly created transaction that has not been mined. Pass `false` only for assertions
@@ -134,6 +138,51 @@ final class MissingEntityReproTests: XCTestCase {
         return Orphan(
             txId: Self.orphanTxId,
             raw: sourceRaw,
+            expiryHeight: expiryHeight.map { BlockHeight($0) }
+        )
+    }
+
+    /// Makes a REAL fixture transaction view-invisible by deleting the notes rows that connect it
+    /// to the wallet: every received output it created and every spend row it contributed. The
+    /// `transactions` row itself — txid, raw bytes, heights — is untouched, so `txid` still equals
+    /// the hash of `raw`, exactly as for a wallet-created transaction whose bookkeeping writes
+    /// went missing. This is the honest fixture for the readback tests: the readback parses the
+    /// stored bytes and verifies the derived txid against the requested one, which a fabricated
+    /// txid cannot survive.
+    private func stripNotesRows() throws -> Orphan {
+        let connection = try provider.connection()
+
+        var idTx: Int64?
+        var txId: Data?
+        var raw: Data?
+        var expiryHeight: Int64?
+        for row in try connection.prepare(
+            "SELECT id_tx, txid, raw, expiry_height FROM transactions WHERE raw IS NOT NULL LIMIT 1"
+        ) {
+            idTx = row[0] as? Int64
+            txId = (row[1] as? Blob).map { Data(blob: $0) }
+            raw = (row[2] as? Blob).map { Data(blob: $0) }
+            expiryHeight = row[3] as? Int64
+        }
+
+        let donorId = try XCTUnwrap(idTx, "the fixture must hold at least one serialized transaction")
+        let donorTxId = try XCTUnwrap(txId)
+        let donorRaw = try XCTUnwrap(raw)
+
+        // Received outputs this transaction created (deleting the notes cascades their spend rows),
+        // and spend rows this transaction contributed against other transactions' outputs.
+        for table in [
+            "sapling_received_notes", "orchard_received_notes", "ironwood_received_notes",
+            "transparent_received_outputs",
+            "sapling_received_note_spends", "orchard_received_note_spends",
+            "ironwood_received_note_spends", "transparent_received_output_spends"
+        ] {
+            try connection.run("DELETE FROM \(table) WHERE transaction_id = ?", donorId)
+        }
+
+        return Orphan(
+            txId: donorTxId,
+            raw: donorRaw,
             expiryHeight: expiryHeight.map { BlockHeight($0) }
         )
     }
@@ -245,10 +294,9 @@ final class MissingEntityReproTests: XCTestCase {
     /// is visible. This is the positive half of the rule the tests above probe from one side: the
     /// `notes` union has two arms, and either one alone suffices.
     ///
-    /// It is also the exact recovery path for the reported failure. A shielding or cross-pay send
-    /// has no wallet-internal output, so this arm is the only thing that can make it visible, and
-    /// one matched input is all it takes. If this ever stops holding, every such transaction
-    /// disappears from history.
+    /// It is also a recovery path for the reported failure. A no-change send has no wallet-internal
+    /// output, so this arm is the only thing that can make it visible, and one matched input is all
+    /// it takes. If this ever stops holding, every such transaction disappears from history.
     ///
     /// Uses a note already in the fixture, so nothing here depends on hand-built note columns.
     func testATransactionVisibleOnlyThroughASpendOfAnExistingNote() async throws {
@@ -349,11 +397,15 @@ final class MissingEntityReproTests: XCTestCase {
     /// The fix. What `v_transactions` drops, `zcashlc_get_transaction` returns.
     ///
     /// Both halves run against the same database, so this is direct evidence that the readback
-    /// introduced by PR #1965 recovers exactly the transaction the history projection loses, rather
-    /// than the send path merely tolerating the loss. The view is deliberately re-checked here: the
-    /// fix must not change what history shows, only where the broadcast path reads from.
+    /// recovers exactly the transaction the history projection loses, rather than the send path
+    /// merely tolerating the loss. The view is deliberately re-checked here: the fix must not
+    /// change what history shows, only where the broadcast path reads from.
+    ///
+    /// Uses a real fixture transaction stripped of its notes rows, so the txid the readback
+    /// derives from the parsed bytes matches the stored one — the txid equality below is a
+    /// genuine round-trip check, not an echo.
     func testGetTransactionReturnsTheRowTheHistoryViewDrops() async throws {
-        let orphan = try insertTransactionWithoutNotes()
+        let orphan = try stripNotesRows()
 
         do {
             _ = try await transactionRepository.find(rawID: orphan.txId)
@@ -373,6 +425,22 @@ final class MissingEntityReproTests: XCTestCase {
             + "the row, so any divergence here would broadcast a different transaction than the "
             + "one the wallet recorded"
         )
+    }
+
+    /// The readback refuses to hand back bytes that are not the transaction they are filed under:
+    /// a row whose `raw` parses to a different txid than its `txid` column is rejected rather than
+    /// returned. This pins the integrity guard on the parsed-txid round trip — the property that
+    /// re-encoding the parsed transaction could otherwise silently violate.
+    func testGetTransactionRejectsARowWhoseBytesHashToADifferentTxId() async throws {
+        let orphan = try insertTransactionWithoutNotes()
+
+        do {
+            _ = try await rustBackend.getTransaction(txId: orphan.txId)
+            XCTFail("bytes filed under a foreign txid must be rejected, not broadcast")
+        } catch ZcashError.rustGetTransaction {
+            // Rejected, as intended: broadcasting these bytes would send a different
+            // transaction than the one the caller asked for.
+        }
     }
 
     /// A txid the wallet has never stored is reported as absent rather than as an error, so the
