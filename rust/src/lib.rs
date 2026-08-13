@@ -2915,8 +2915,8 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
 ///
 /// This works for any stored transaction, including received transactions. It deliberately does
 /// not depend on wallet history views, which may omit a stored transaction until all of the view's
-/// derived relations are populated. If the transaction is not found, the returned
-/// [`ffi::FfiTransactionData`] has a null `raw` pointer.
+/// derived relations are populated. If the transaction is unknown or its raw bytes are not
+/// available, the returned [`ffi::FfiTransactionData`] has a null `raw` pointer.
 ///
 /// # Safety
 ///
@@ -2942,7 +2942,7 @@ pub unsafe extern "C" fn zcashlc_get_transaction(
             .get_transaction(txid)
             .map_err(|e| anyhow!("Failed to read transaction {txid}: {e:?}"))?
         else {
-            return Ok(ffi::FfiTransactionData::not_found(txid_bytes));
+            return Ok(ffi::FfiTransactionData::unavailable(txid_bytes));
         };
 
         let expiry_height = u32::from(transaction.expiry_height());

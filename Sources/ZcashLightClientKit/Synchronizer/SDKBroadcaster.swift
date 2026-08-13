@@ -165,15 +165,20 @@ final class SDKBroadcaster: Broadcaster {
     }
 
     private func overviewsForEvent(txIds: [Data]) async throws -> [ZcashTransaction.Overview] {
-        do {
-            return try await transactionEncoder.fetchTransactionsForTxIds(txIds)
-        } catch ZcashError.transactionRepositoryEntityNotFound {
-            let txIdList = txIds.map { $0.toHexStringTxId() }.joined(separator: ", ")
-            logger.warn(
-                "Created transaction(s) are not yet present in v_transactions; continuing with wallet-store bytes: \(txIdList)."
-            )
-            return []
+        var overviews: [ZcashTransaction.Overview] = []
+
+        for txId in txIds {
+            do {
+                overviews.append(contentsOf: try await transactionEncoder.fetchTransactionsForTxIds([txId]))
+            } catch ZcashError.transactionRepositoryEntityNotFound {
+                logger.warn(
+                    "Created transaction is not yet present in v_transactions; continuing with wallet-store bytes: " +
+                    "\(txId.toHexStringTxId())."
+                )
+            }
         }
+
+        return overviews
     }
 
     private func finishCreation(

@@ -831,8 +831,8 @@ pub type TxIds = SymmetricKeys;
 
 /// Transaction data stored by the wallet, with the bytes required for broadcast.
 ///
-/// A null `raw` pointer represents a transaction that was not found.
-/// `expiry_height == 0` represents no expiry height.
+/// A null `raw` pointer represents an unknown transaction or one whose raw bytes are unavailable.
+/// `expiry_height` is the consensus value; zero means that transaction expiry is disabled.
 #[repr(C)]
 pub struct FfiTransactionData {
     pub txid: [u8; 32],
@@ -852,7 +852,7 @@ impl FfiTransactionData {
         }))
     }
 
-    pub(crate) fn not_found(txid: [u8; 32]) -> *mut Self {
+    pub(crate) fn unavailable(txid: [u8; 32]) -> *mut Self {
         Box::into_raw(Box::new(Self {
             txid,
             raw: ptr::null_mut(),
@@ -902,9 +902,9 @@ mod transaction_data_tests {
     }
 
     #[test]
-    fn transaction_data_uses_a_null_raw_pointer_for_not_found() {
+    fn transaction_data_uses_a_null_raw_pointer_when_unavailable() {
         let txid = [0xCD; 32];
-        let ptr = FfiTransactionData::not_found(txid);
+        let ptr = FfiTransactionData::unavailable(txid);
 
         // SAFETY: `ptr` was allocated immediately above and remains owned until the free below.
         let transaction = unsafe { &*ptr };
@@ -913,7 +913,7 @@ mod transaction_data_tests {
         assert_eq!(transaction.raw_len, 0);
         assert_eq!(transaction.expiry_height, 0);
 
-        // SAFETY: `ptr` came from `not_found` and has not previously been freed.
+        // SAFETY: `ptr` came from `unavailable` and has not previously been freed.
         unsafe { zcashlc_free_transaction_data(ptr) };
     }
 }

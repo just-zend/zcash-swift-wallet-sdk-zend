@@ -317,7 +317,8 @@ protocol ZcashRustBackendWelding {
     ) async throws -> [Data]
 
     /// Returns the wallet-store data available for the given transaction, or `nil` if the
-    /// transaction is not stored. This works for both sent and received transactions.
+    /// transaction is unknown or its raw bytes are unavailable. This works for both sent and
+    /// received transactions.
     func getTransaction(txId: Data) async throws -> TransactionData?
 
     /// Creates a partially-created (unsigned without proofs) transaction from the given proposal.

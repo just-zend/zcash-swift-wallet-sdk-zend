@@ -2805,14 +2805,14 @@ extension FfiBoxedSlice {
 }
 
 extension FfiTransactionData {
-    /// Copies rust-owned wallet transaction data into Swift, or returns `nil` for the not-found sentinel.
+    /// Copies rust-owned wallet transaction data into Swift, or returns `nil` when raw bytes are unavailable.
     func unsafeToTransactionData() -> TransactionData? {
         guard let raw else { return nil }
 
         return TransactionData(
             txId: Data(FfiTxId(tuple: txid).array),
             raw: Data(bytes: raw, count: Int(raw_len)),
-            expiryHeight: expiry_height == 0 ? nil : BlockHeight(expiry_height)
+            expiryHeight: BlockHeight(expiry_height)
         )
     }
 }

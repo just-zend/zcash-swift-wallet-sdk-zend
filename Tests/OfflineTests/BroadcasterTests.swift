@@ -79,6 +79,38 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
     }
 
+    func testCreateProposedTransactionsEmitsAvailableHistoryWhenOnlyOneOverviewIsMissing() async throws {
+        let foundRawID = Data(repeating: 0xAB, count: 32)
+        let missingRawID = Data(repeating: 0xCD, count: 32)
+        let overviews = [
+            makeTransaction(raw: Data([0x01]), rawID: foundRawID),
+            makeTransaction(raw: Data([0x02]), rawID: missingRawID)
+        ]
+        let transactionEncoder = StubTransactionEncoder(
+            createdTransactions: overviews,
+            missingHistoryTxIds: [missingRawID]
+        )
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        let foundTransactionsExpectation = XCTestExpectation(description: "available history event")
+        synchronizer.eventStream
+            .sink { event in
+                guard case let .foundTransactions(transactions, range) = event else { return }
+                XCTAssertNil(range)
+                XCTAssertEqual(transactions.map(\.rawID), [foundRawID])
+                foundTransactionsExpectation.fulfill()
+            }
+            .store(in: &cancellables)
+        await synchronizer.updateStatus(.stopped)
+
+        let transactions = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+
+        XCTAssertEqual(transactions.map(\.txId), [foundRawID, missingRawID])
+        await fulfillment(of: [foundTransactionsExpectation], timeout: 1.0)
+    }
+
     func testCreateMarksTransactionsAwaitingSubmission() async throws {
         let rawID = Data(repeating: 0xAB, count: 32)
         let overviews = [makeTransaction(raw: Data([0x01]), rawID: rawID)]
@@ -463,17 +495,23 @@ private final class StubTransactionEncoder: TransactionEncoder {
     private let createdTransactions: [CreatedTransaction]
     private let overviews: [ZcashTransaction.Overview]
     private let fetchError: Error?
+    private let missingHistoryTxIds: Set<Data>
     private(set) var receivedCreateArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
     private(set) var receivedFetchTxIds: [Data]?
     private(set) var submittedTransactions: [EncodedTransaction] = []
 
-    init(createdTransactions overviews: [ZcashTransaction.Overview], fetchError: Error? = nil) {
+    init(
+        createdTransactions overviews: [ZcashTransaction.Overview],
+        fetchError: Error? = nil,
+        missingHistoryTxIds: Set<Data> = []
+    ) {
         self.overviews = overviews
         self.createdTransactions = overviews.compactMap { overview in
             guard let raw = overview.raw else { return nil }
             return CreatedTransaction(txId: overview.rawID, raw: raw, expiryHeight: overview.expiryHeight)
         }
         self.fetchError = fetchError
+        self.missingHistoryTxIds = missingHistoryTxIds
     }
 
     func proposeTransfer(
@@ -525,6 +563,9 @@ private final class StubTransactionEncoder: TransactionEncoder {
         receivedFetchTxIds = txIds
         if let fetchError {
             throw fetchError
+        }
+        if txIds.contains(where: missingHistoryTxIds.contains) {
+            throw ZcashError.transactionRepositoryEntityNotFound
         }
         return txIds.compactMap { txId in
             overviews.first { $0.rawID == txId }
