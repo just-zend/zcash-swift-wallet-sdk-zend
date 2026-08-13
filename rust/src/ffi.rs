@@ -829,6 +829,69 @@ impl SymmetricKeys {
 
 pub type TxIds = SymmetricKeys;
 
+/// A transaction created and stored by the wallet, with the bytes required for broadcast.
+///
+/// `expiry_height == 0` represents no expiry height.
+#[repr(C)]
+pub struct FfiCreatedTransaction {
+    pub txid: [u8; 32],
+    pub raw: *mut u8,
+    pub raw_len: usize,
+    pub expiry_height: u32,
+}
+
+impl FfiCreatedTransaction {
+    pub(crate) fn from_parts(txid: [u8; 32], raw_bytes: Vec<u8>, expiry_height: u32) -> *mut Self {
+        let (raw, raw_len) = ptr_from_vec(raw_bytes);
+        Box::into_raw(Box::new(Self {
+            txid,
+            raw,
+            raw_len,
+            expiry_height,
+        }))
+    }
+}
+
+/// Frees an [`FfiCreatedTransaction`] and its serialized transaction bytes.
+///
+/// # Safety
+///
+/// - `ptr` must either be null or point to a value returned by
+///   [`crate::zcashlc_get_created_transaction`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_created_transaction(ptr: *mut FfiCreatedTransaction) {
+    if !ptr.is_null() {
+        let transaction = unsafe { Box::from_raw(ptr) };
+        free_ptr_from_vec(transaction.raw, transaction.raw_len);
+        drop(transaction);
+    }
+}
+
+#[cfg(test)]
+mod created_transaction_tests {
+    use super::*;
+
+    #[test]
+    fn created_transaction_carries_and_frees_broadcast_data() {
+        let txid = [0xAB; 32];
+        let raw = vec![1, 2, 3, 4];
+        let ptr = FfiCreatedTransaction::from_parts(txid, raw.clone(), 1_234_567);
+
+        // SAFETY: `ptr` was allocated immediately above and remains owned until the free below.
+        let transaction = unsafe { &*ptr };
+        assert_eq!(transaction.txid, txid);
+        assert_eq!(transaction.expiry_height, 1_234_567);
+        // SAFETY: `raw` and `raw_len` were produced together from `raw.clone()` above.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(transaction.raw, transaction.raw_len) },
+            raw
+        );
+
+        // SAFETY: `ptr` came from `from_parts` and has not previously been freed.
+        unsafe { zcashlc_free_created_transaction(ptr) };
+    }
+}
+
 /// Frees an array of `[u8; 32]` values.
 ///
 /// # Safety

@@ -113,12 +113,17 @@ final class SDKBroadcaster: Broadcaster {
         try statusCheck()
         try await downloadSaplingParamsIfNeeded()
 
-        let overviews = try await transactionEncoder.createProposedTransactions(
+        let createdTransactions = try await transactionEncoder.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey
         )
+        let overviews = try await overviewsForEvent(txIds: createdTransactions.map(\.txId))
 
-        return try await finishCreation(overviews: overviews, recordingPlans: recordingPlans)
+        return await finishCreation(
+            createdTransactions: createdTransactions,
+            overviews: overviews,
+            recordingPlans: recordingPlans
+        )
     }
 
     func createTransactionFromPCZT(
@@ -136,7 +141,12 @@ final class SDKBroadcaster: Broadcaster {
 
         let overviews = try await transactionEncoder.fetchTransactionsForTxIds([txId])
 
-        return try await finishCreation(overviews: overviews, recordingPlans: recordingPlans)
+        let createdTransactions = try overviews.map { try CreatedTransaction(overview: $0) }
+        return await finishCreation(
+            createdTransactions: createdTransactions,
+            overviews: overviews,
+            recordingPlans: recordingPlans
+        )
     }
 
     // MARK: - Private
@@ -151,12 +161,23 @@ final class SDKBroadcaster: Broadcaster {
         )
     }
 
+    private func overviewsForEvent(txIds: [Data]) async throws -> [ZcashTransaction.Overview] {
+        do {
+            return try await transactionEncoder.fetchTransactionsForTxIds(txIds)
+        } catch ZcashError.transactionRepositoryEntityNotFound {
+            let txIdList = txIds.map { $0.toHexStringTxId() }.joined(separator: ", ")
+            logger.warn(
+                "Created transaction(s) are not yet present in v_transactions; continuing with wallet-store bytes: \(txIdList)."
+            )
+            return []
+        }
+    }
+
     private func finishCreation(
+        createdTransactions: [CreatedTransaction],
         overviews: [ZcashTransaction.Overview],
         recordingPlans: Bool
-    ) async throws -> [CreatedTransaction] {
-        let createdTransactions = try overviews.map { try CreatedTransaction(overview: $0) }
-
+    ) async -> [CreatedTransaction] {
         let txIdList = createdTransactions.map { $0.txId.toHexStringTxId() }.joined(separator: ", ")
         if recordingPlans {
             logger.debug("Created \(createdTransactions.count) transaction(s) awaiting submission by the app: \(txIdList).")

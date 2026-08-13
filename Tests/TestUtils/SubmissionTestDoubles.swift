@@ -225,7 +225,8 @@ final class EndpointSubmitterMock: EndpointSubmitter {
 }
 
 final class StubTransactionEncoder: TransactionEncoder {
-    private let createdTransactions: [ZcashTransaction.Overview]
+    private let createdTransactions: [CreatedTransaction]
+    private let overviews: [ZcashTransaction.Overview]
     private(set) var receivedCreateArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
     private(set) var receivedFetchTxIds: [Data]?
     private(set) var submittedTransactions: [EncodedTransaction] = []
@@ -235,8 +236,12 @@ final class StubTransactionEncoder: TransactionEncoder {
     /// `isTransactionKnownToServer(txId:)` returns `true` for txids in this set.
     var knownToServerTxIds: Set<Data> = []
 
-    init(createdTransactions: [ZcashTransaction.Overview]) {
-        self.createdTransactions = createdTransactions
+    init(createdTransactions overviews: [ZcashTransaction.Overview]) {
+        self.overviews = overviews
+        self.createdTransactions = overviews.compactMap { overview in
+            guard let raw = overview.raw else { return nil }
+            return CreatedTransaction(txId: overview.rawID, raw: raw, expiryHeight: overview.expiryHeight)
+        }
     }
 
     func proposeTransfer(
@@ -264,7 +269,7 @@ final class StubTransactionEncoder: TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey
-    ) async throws -> [ZcashTransaction.Overview] {
+    ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
         return createdTransactions
     }
@@ -290,7 +295,7 @@ final class StubTransactionEncoder: TransactionEncoder {
     func fetchTransactionsForTxIds(_ txIds: [Data]) async throws -> [ZcashTransaction.Overview] {
         receivedFetchTxIds = txIds
         return txIds.compactMap { txId in
-            createdTransactions.first { $0.rawID == txId }
+            overviews.first { $0.rawID == txId }
         }
     }
 

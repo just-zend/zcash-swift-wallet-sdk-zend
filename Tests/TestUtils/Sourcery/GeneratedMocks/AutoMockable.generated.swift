@@ -4723,10 +4723,10 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         return createProposedTransactionsProposalUskCallsCount > 0
     }
     var createProposedTransactionsProposalUskReceivedArguments: (proposal: FfiProposal, usk: UnifiedSpendingKey)?
-    var createProposedTransactionsProposalUskReturnValue: [Data]!
-    var createProposedTransactionsProposalUskClosure: ((FfiProposal, UnifiedSpendingKey) async throws -> [Data])?
+    var createProposedTransactionsProposalUskReturnValue: [CreatedTransaction]!
+    var createProposedTransactionsProposalUskClosure: ((FfiProposal, UnifiedSpendingKey) async throws -> [CreatedTransaction])?
 
-    func createProposedTransactions(proposal: FfiProposal, usk: UnifiedSpendingKey) async throws -> [Data] {
+    func createProposedTransactions(proposal: FfiProposal, usk: UnifiedSpendingKey) async throws -> [CreatedTransaction] {
         if let error = createProposedTransactionsProposalUskThrowableError {
             throw error
         }

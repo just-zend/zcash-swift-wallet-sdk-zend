@@ -1271,7 +1271,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     func createProposedTransactions(
         proposal: FfiProposal,
         usk: UnifiedSpendingKey
-    ) async throws -> [Data] {
+    ) async throws -> [CreatedTransaction] {
         let proposalBytes = try proposal.serializedData(partial: false).bytes
 
         let txIdsPtr = proposalBytes.withUnsafeBufferPointer { proposalPtr in
@@ -1298,14 +1298,40 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         defer { zcashlc_free_txids(txIdsPtr) }
 
-        var txIds: [Data] = []
+        var transactions: [CreatedTransaction] = []
 
         for i in (0 ..< Int(txIdsPtr.pointee.len)) {
             let txId = FfiTxId(tuple: txIdsPtr.pointee.ptr.advanced(by: i).pointee)
-            txIds.append(Data(txId.array))
+            let txIdData = Data(txId.array)
+            let transactionPtr = txId.array.withUnsafeBufferPointer { txIdPtr in
+                zcashlc_get_created_transaction(
+                    dbData.0,
+                    dbData.1,
+                    txIdPtr.baseAddress,
+                    networkType.networkId
+                )
+            }
+
+            guard let transactionPtr else {
+                throw ZcashError.rustCreateToAddress(
+                    lastErrorMessage(fallback: "Created transaction is unavailable in the wallet store")
+                )
+            }
+
+            defer { zcashlc_free_created_transaction(transactionPtr) }
+
+            guard let transaction = transactionPtr.pointee.unsafeToCreatedTransaction() else {
+                throw ZcashError.rustCreateToAddress("Created transaction has no encoded bytes")
+            }
+
+            guard transaction.txId == txIdData else {
+                throw ZcashError.rustCreateToAddress("Created transaction id does not match the requested id")
+            }
+
+            transactions.append(transaction)
         }
 
-        return txIds
+        return transactions
     }
 
     nonisolated func consensusBranchIdFor(height: Int32) throws -> Int32 {
@@ -2769,6 +2795,19 @@ extension FfiBoxedSlice {
         .init(
             network: network,
             bytes: self.ptr.toByteArray(length: Int(self.len))
+        )
+    }
+}
+
+extension FfiCreatedTransaction {
+    /// Copies a rust-owned created transaction into the Swift submission model.
+    func unsafeToCreatedTransaction() -> CreatedTransaction? {
+        guard let raw else { return nil }
+
+        return CreatedTransaction(
+            txId: Data(FfiTxId(tuple: txid).array),
+            raw: Data(bytes: raw, count: Int(raw_len)),
+            expiryHeight: expiry_height == 0 ? nil : BlockHeight(expiry_height)
         )
     }
 }

@@ -313,7 +313,7 @@ protocol ZcashRustBackendWelding {
     func createProposedTransactions(
         proposal: FfiProposal,
         usk: UnifiedSpendingKey
-    ) async throws -> [Data]
+    ) async throws -> [CreatedTransaction]
 
     /// Creates a partially-created (unsigned without proofs) transaction from the given proposal.
     ///

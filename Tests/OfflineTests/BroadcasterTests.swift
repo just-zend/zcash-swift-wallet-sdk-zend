@@ -55,6 +55,30 @@ final class BroadcasterTests: ZcashTestCase {
         await fulfillment(of: [foundTransactionsExpectation], timeout: 1.0)
     }
 
+    func testCreateProposedTransactionsContinuesWhenHistoryViewDoesNotContainCreatedTransaction() async throws {
+        let rawTransaction = Data([0x01, 0x02, 0x03, 0x04])
+        let rawID = Data(repeating: 0xAB, count: 32)
+        let overviews = [makeTransaction(raw: rawTransaction, rawID: rawID)]
+        let transactionEncoder = StubTransactionEncoder(
+            createdTransactions: overviews,
+            fetchError: ZcashError.transactionRepositoryEntityNotFound
+        )
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let transactions = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+
+        XCTAssertEqual(transactions.map(\.txId), [rawID])
+        XCTAssertEqual(transactions.map(\.raw), [rawTransaction])
+
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let plan = await store.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
+    }
+
     func testCreateMarksTransactionsAwaitingSubmission() async throws {
         let rawID = Data(repeating: 0xAB, count: 32)
         let overviews = [makeTransaction(raw: Data([0x01]), rawID: rawID)]
@@ -367,13 +391,20 @@ final class BroadcasterTests: ZcashTestCase {
 // MARK: - Test Doubles
 
 private final class StubTransactionEncoder: TransactionEncoder {
-    private let createdTransactions: [ZcashTransaction.Overview]
+    private let createdTransactions: [CreatedTransaction]
+    private let overviews: [ZcashTransaction.Overview]
+    private let fetchError: Error?
     private(set) var receivedCreateArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
     private(set) var receivedFetchTxIds: [Data]?
     private(set) var submittedTransactions: [EncodedTransaction] = []
 
-    init(createdTransactions: [ZcashTransaction.Overview]) {
-        self.createdTransactions = createdTransactions
+    init(createdTransactions overviews: [ZcashTransaction.Overview], fetchError: Error? = nil) {
+        self.overviews = overviews
+        self.createdTransactions = overviews.compactMap { overview in
+            guard let raw = overview.raw else { return nil }
+            return CreatedTransaction(txId: overview.rawID, raw: raw, expiryHeight: overview.expiryHeight)
+        }
+        self.fetchError = fetchError
     }
 
     func proposeTransfer(
@@ -401,7 +432,7 @@ private final class StubTransactionEncoder: TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey
-    ) async throws -> [ZcashTransaction.Overview] {
+    ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
         return createdTransactions
     }
@@ -423,8 +454,11 @@ private final class StubTransactionEncoder: TransactionEncoder {
 
     func fetchTransactionsForTxIds(_ txIds: [Data]) async throws -> [ZcashTransaction.Overview] {
         receivedFetchTxIds = txIds
+        if let fetchError {
+            throw fetchError
+        }
         return txIds.compactMap { txId in
-            createdTransactions.first { $0.rawID == txId }
+            overviews.first { $0.rawID == txId }
         }
     }
 
