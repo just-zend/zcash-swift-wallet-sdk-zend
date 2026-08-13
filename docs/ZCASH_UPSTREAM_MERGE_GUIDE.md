@@ -2,13 +2,39 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-07
+Last reviewed: 2026-08-12
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-12)
+
+- Fresh fetches confirm `origin/main=4497fe9e` and `upstream/main=ee7b05c9`, with
+  divergence `174 398`. `upstream/main` is not an ancestor of Zend `main`, but Zend
+  draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34) at
+  `013a024d` contains the exact upstream tip (`179 0` against `upstream/main`). Reuse
+  #34 as the sole full-parity vehicle; do not open another default-branch sync PR.
+- Keep #34 draft: its Ironwood/Slipstream source surface requires a matching
+  provenance-verified arm64 `libzcashlc` XCFramework. The current released framework
+  lacks `FfiMigrationProgress`, `zcashlc_slipstream_open`, and related declarations,
+  so source parity is not a release-ready Zend artifact. The remaining gates are exact
+  `librustzcash`/`slipstream-internal` provenance, artifact rebuild and release wiring,
+  and funded-device migration evidence.
+- Newly fetched `chp-re-enable` is not a safe early carry. It is a seven-commit,
+  19-file voting/FFI migration branch (including `Cargo.lock`, `Cargo.toml`,
+  `MIGRATING.md`, Rust voting serialization, Swift voting bindings, and new Offline
+  Tests) that is still based on the Ironwood transition. Its 2,733 additions and 1,890
+  deletions require the same source/FFI/artifact and device-validation reconciliation.
+  Do not split the snapshot-validation fix from that graph. Open #1961 (send-max),
+  #1960 (post-merge `Cargo.lock` repair), #1944, #1895, #1893, and Dependabot work are
+  likewise feature, artifact-coupled, maintenance-line-only, draft/dirty, or broad
+  dependency changes; none is independently ready, useful, and low-risk for Zend.
+- This is a documentation-only monitor record. `git diff --check` passed; `swift build`
+  and `swift test --filter OfflineTests` were not rerun because no SDK source or FFI
+  artifact changed in Zend during this review.
 
 ## Parity and bleeding-edge refresh (2026-08-07)
 
