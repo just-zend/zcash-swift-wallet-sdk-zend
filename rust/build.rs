@@ -49,6 +49,7 @@ fn main() {
         .rename_item("BlocksMeta", "FFIBlocksMeta")
         .rename_item("BoxedSlice", "FfiBoxedSlice")
         .rename_item("TxIds", "FfiTxIds")
+        .rename_item("TransactionData", "FfiTransactionData")
         .rename_item("MaxSpendMode", "FfiMaxSpendMode")
         .rename_item("TransactionStatus", "FfiTransactionStatus")
         .rename_item("TransactionDataRequest", "FfiTransactionDataRequest")

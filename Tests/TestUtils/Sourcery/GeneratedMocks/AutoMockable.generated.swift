@@ -4739,6 +4739,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
+    // MARK: - getTransaction
+
+    var getTransactionTxIdThrowableError: Error?
+    var getTransactionTxIdCallsCount = 0
+    var getTransactionTxIdCalled: Bool {
+        return getTransactionTxIdCallsCount > 0
+    }
+    var getTransactionTxIdReceivedTxId: Data?
+    var getTransactionTxIdReturnValue: TransactionData?
+    var getTransactionTxIdClosure: ((Data) async throws -> TransactionData?)?
+
+    func getTransaction(txId: Data) async throws -> TransactionData? {
+        if let error = getTransactionTxIdThrowableError {
+            throw error
+        }
+        getTransactionTxIdCallsCount += 1
+        getTransactionTxIdReceivedTxId = txId
+        if let closure = getTransactionTxIdClosure {
+            return try await closure(txId)
+        } else {
+            return getTransactionTxIdReturnValue
+        }
+    }
+
     // MARK: - createPCZTFromProposal
 
     var createPCZTFromProposalAccountUUIDProposalThrowableError: Error?

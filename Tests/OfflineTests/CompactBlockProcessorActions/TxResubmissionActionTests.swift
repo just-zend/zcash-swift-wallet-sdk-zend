@@ -220,6 +220,36 @@ final class TxResubmissionActionTests: ZcashTestCase {
         XCTAssertTrue(remaining.isEmpty)
     }
 
+    func testPruningKeepsViewInvisibleUnexpiredWalletStoreTransaction() async throws {
+        let txId = Data(repeating: 0x10, count: 32)
+        let walletStoreTransaction = makeOverview(rawID: txId, expiryHeight: latestBlockHeight + 1)
+        let action = setupAction(candidates: [], encoderTransactions: [walletStoreTransaction])
+        await submitPlanStore.recordPlan(txId: txId, endpoints: [endpointA])
+        transactionRepository.findRawIDClosure = { _ in
+            throw ZcashError.transactionRepositoryEntityNotFound
+        }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let remaining = await submitPlanStore.allPlannedTransactionIds()
+        XCTAssertEqual(remaining, [txId])
+    }
+
+    func testPruningRemovesViewInvisibleExpiredWalletStoreTransaction() async throws {
+        let txId = Data(repeating: 0x11, count: 32)
+        let walletStoreTransaction = makeOverview(rawID: txId, expiryHeight: latestBlockHeight)
+        let action = setupAction(candidates: [], encoderTransactions: [walletStoreTransaction])
+        await submitPlanStore.recordPlan(txId: txId, endpoints: [endpointA])
+        transactionRepository.findRawIDClosure = { _ in
+            throw ZcashError.transactionRepositoryEntityNotFound
+        }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let remaining = await submitPlanStore.allPlannedTransactionIds()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
     func testFreshActionThrottlesFirstInvocation() async throws {
         let rawID = Data(repeating: 0x0F, count: 32)
         let candidate = makeOverview(rawID: rawID)

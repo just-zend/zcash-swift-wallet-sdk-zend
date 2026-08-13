@@ -73,7 +73,16 @@ protocol TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey
-    ) async throws -> [ZcashTransaction.Overview]
+    ) async throws -> [CreatedTransaction]
+
+    /// Returns broadcast-ready data for transactions stored by the wallet, independently of
+    /// whether they are currently represented by the transaction-history view.
+    ///
+    /// - Parameter txIds: The transaction identifiers to read from the wallet store.
+    /// - Returns: The stored transactions, in the same order as `txIds`.
+    /// - Throws: `ZcashError.rustGetTransaction` when any transaction cannot be read. A throw
+    ///   after transaction creation does not mean that Rust rolled back the created transactions.
+    func createdTransactions(forTxIds txIds: [Data]) async throws -> [CreatedTransaction]
 
     /// Creates a transaction proposal to fulfill a [ZIP-321](https://zips.z.cash/zip-0321), throwing an exception whenever things are missing. When the provided wallet implementation
     /// doesn't throw an exception, we wrap the issue into a descriptive exception ourselves (rather than using

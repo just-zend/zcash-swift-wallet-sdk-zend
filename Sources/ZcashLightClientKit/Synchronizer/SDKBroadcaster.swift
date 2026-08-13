@@ -113,12 +113,17 @@ final class SDKBroadcaster: Broadcaster {
         try statusCheck()
         try await downloadSaplingParamsIfNeeded()
 
-        let overviews = try await transactionEncoder.createProposedTransactions(
+        let createdTransactions = try await transactionEncoder.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey
         )
+        let overviews = await overviewsForEvent(txIds: createdTransactions.map(\.txId))
 
-        return try await finishCreation(overviews: overviews, recordingPlans: recordingPlans)
+        return await finishCreation(
+            createdTransactions: createdTransactions,
+            overviews: overviews,
+            recordingPlans: recordingPlans
+        )
     }
 
     func createTransactionFromPCZT(
@@ -133,10 +138,19 @@ final class SDKBroadcaster: Broadcaster {
             pcztWithProofs: pcztWithProofs,
             pcztWithSigs: pcztWithSigs
         )
+        guard let createdTransaction = try await transactionEncoder.createdTransactions(forTxIds: [txId]).first else {
+            throw ZcashError.rustGetTransaction(
+                "Transaction \(txId.toHexStringTxId()) is unavailable in the wallet store"
+            )
+        }
 
-        let overviews = try await transactionEncoder.fetchTransactionsForTxIds([txId])
+        let overviews = await overviewsForEvent(txIds: [createdTransaction.txId])
 
-        return try await finishCreation(overviews: overviews, recordingPlans: recordingPlans)
+        return await finishCreation(
+            createdTransactions: [createdTransaction],
+            overviews: overviews,
+            recordingPlans: recordingPlans
+        )
     }
 
     // MARK: - Private
@@ -151,12 +165,30 @@ final class SDKBroadcaster: Broadcaster {
         )
     }
 
+    private func overviewsForEvent(txIds: [Data]) async -> [ZcashTransaction.Overview] {
+        var overviews: [ZcashTransaction.Overview] = []
+
+        for txId in txIds {
+            do {
+                overviews.append(contentsOf: try await transactionEncoder.fetchTransactionsForTxIds([txId]))
+            } catch {
+                logger.warn(
+                    """
+                    Created transaction \(txId.toHexStringTxId()) could not be enriched from v_transactions; \
+                    continuing with wallet-store bytes. \(error.localizedDescription)
+                    """
+                )
+            }
+        }
+
+        return overviews
+    }
+
     private func finishCreation(
+        createdTransactions: [CreatedTransaction],
         overviews: [ZcashTransaction.Overview],
         recordingPlans: Bool
-    ) async throws -> [CreatedTransaction] {
-        let createdTransactions = try overviews.map { try CreatedTransaction(overview: $0) }
-
+    ) async -> [CreatedTransaction] {
         let txIdList = createdTransactions.map { $0.txId.toHexStringTxId() }.joined(separator: ", ")
         if recordingPlans {
             logger.debug("Created \(createdTransactions.count) transaction(s) awaiting submission by the app: \(txIdList).")
