@@ -118,10 +118,20 @@ class WalletTransactionEncoder: TransactionEncoder {
             throw ZcashError.walletTransEncoderCreateTransactionMissingSaplingParams
         }
 
-        return try await rustBackend.createProposedTransactions(
+        let txIds = try await rustBackend.createProposedTransactions(
             proposal: proposal.inner,
             usk: spendingKey
         )
+
+        var createdTransactions: [CreatedTransaction] = []
+        for txId in txIds {
+            guard let transactionData = try await rustBackend.getTransaction(txId: txId) else {
+                throw TransactionEncoderError.notFound(txId: txId)
+            }
+            createdTransactions.append(CreatedTransaction(transactionData: transactionData))
+        }
+
+        return createdTransactions
     }
 
     func fetchTransactionsForTxIds(_ txIds: [Data]) async throws -> [ZcashTransaction.Overview] {

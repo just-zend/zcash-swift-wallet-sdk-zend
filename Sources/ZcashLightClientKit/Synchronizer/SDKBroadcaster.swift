@@ -134,10 +134,14 @@ final class SDKBroadcaster: Broadcaster {
         try statusCheck()
         try await downloadSaplingParamsIfNeeded()
 
-        let createdTransaction = try await initializer.rustBackend.extractAndStoreTxFromPCZT(
+        let txId = try await initializer.rustBackend.extractAndStoreTxFromPCZT(
             pcztWithProofs: pcztWithProofs,
             pcztWithSigs: pcztWithSigs
         )
+        guard let transactionData = try await initializer.rustBackend.getTransaction(txId: txId) else {
+            throw TransactionEncoderError.notFound(txId: txId)
+        }
+        let createdTransaction = CreatedTransaction(transactionData: transactionData)
 
         let overviews = try await overviewsForEvent(txIds: [createdTransaction.txId])
 

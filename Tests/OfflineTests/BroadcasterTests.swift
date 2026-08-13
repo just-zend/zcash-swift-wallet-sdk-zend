@@ -96,12 +96,45 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
     }
 
+    func testWalletTransactionEncoderReadsCreatedTransactionThroughGeneralFFI() async throws {
+        let rawID = Data(repeating: 0xBC, count: 32)
+        let transactionData = TransactionData(
+            txId: rawID,
+            raw: Data([0x01, 0x02, 0x03]),
+            expiryHeight: 123_456
+        )
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.createProposedTransactionsProposalUskReturnValue = [rawID]
+        rustBackend.getTransactionTxIdReturnValue = transactionData
+        let encoder = WalletTransactionEncoder(
+            rustBackend: rustBackend,
+            dataDb: try __dataDbURL(),
+            fsBlockDbRoot: testTempDirectory,
+            service: LightWalletServiceMock(),
+            repository: TransactionRepositoryMock(),
+            outputParams: try __outputParamsURL(),
+            spendParams: try __spendParamsURL(),
+            networkType: .testnet,
+            logger: submissionLifecycleLogger(),
+            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+        )
+
+        let transactions = try await encoder.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+
+        XCTAssertEqual(transactions, [CreatedTransaction(transactionData: transactionData)])
+        XCTAssertEqual(rustBackend.getTransactionTxIdReceivedTxId, rawID)
+    }
+
     func testCreateTransactionFromPCZTMarksAwaitingAndEmitsEvent() async throws {
         let rawID = Data(repeating: 0xCD, count: 32)
         let overviews = [makeTransaction(raw: Data([0x05, 0x06]), rawID: rawID)]
         let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = CreatedTransaction(
+        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
+        rustBackend.getTransactionTxIdReturnValue = TransactionData(
             txId: rawID,
             raw: Data([0x05, 0x06]),
             expiryHeight: nil
@@ -115,6 +148,7 @@ final class BroadcasterTests: ZcashTestCase {
         )
 
         XCTAssertEqual(transactions.map(\.txId), [rawID])
+        XCTAssertEqual(rustBackend.getTransactionTxIdReceivedTxId, rawID)
         let store = mockContainer.resolve(SubmitPlanStoring.self)
         let plan = await store.plan(for: rawID)
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
@@ -129,7 +163,8 @@ final class BroadcasterTests: ZcashTestCase {
             fetchError: ZcashError.transactionRepositoryEntityNotFound
         )
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = CreatedTransaction(
+        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
+        rustBackend.getTransactionTxIdReturnValue = TransactionData(
             txId: rawID,
             raw: rawTransaction,
             expiryHeight: nil
@@ -331,7 +366,8 @@ final class BroadcasterTests: ZcashTestCase {
         let overviews = [makeTransaction(raw: rawTransaction, rawID: rawID)]
         let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = CreatedTransaction(
+        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
+        rustBackend.getTransactionTxIdReturnValue = TransactionData(
             txId: rawID,
             raw: rawTransaction,
             expiryHeight: nil

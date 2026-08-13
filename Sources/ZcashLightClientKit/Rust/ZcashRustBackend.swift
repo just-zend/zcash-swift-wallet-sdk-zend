@@ -540,7 +540,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     func extractAndStoreTxFromPCZT(
         pcztWithProofs: Pczt,
         pcztWithSigs: Pczt
-    ) async throws -> CreatedTransaction {
+    ) async throws -> Data {
         let txidPtr: UnsafeMutablePointer<FfiBoxedSlice>? = pcztWithProofs.withUnsafeBytes { pcztWithProofsBuffer in
             guard let pcztWithProofsBufferPtr = pcztWithProofsBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                 return nil
@@ -577,14 +577,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         defer { zcashlc_free_boxed_slice(txidPtr) }
 
-        let txId = Data(
+        return Data(
             bytes: txidPtr.pointee.ptr,
             count: Int(txidPtr.pointee.len)
         )
-
-        return try createdTransaction(txId: txId) { message in
-            ZcashError.rustExtractAndStoreTxFromPCZT(message)
-        }
     }
 
     @DBActor
@@ -1275,7 +1271,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     func createProposedTransactions(
         proposal: FfiProposal,
         usk: UnifiedSpendingKey
-    ) async throws -> [CreatedTransaction] {
+    ) async throws -> [Data] {
         let proposalBytes = try proposal.serializedData(partial: false).bytes
 
         let txIdsPtr = proposalBytes.withUnsafeBufferPointer { proposalPtr in
@@ -1302,30 +1298,25 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         defer { zcashlc_free_txids(txIdsPtr) }
 
-        var transactions: [CreatedTransaction] = []
+        var txIds: [Data] = []
 
         for i in (0 ..< Int(txIdsPtr.pointee.len)) {
             let txId = FfiTxId(tuple: txIdsPtr.pointee.ptr.advanced(by: i).pointee)
-            let txIdData = Data(txId.array)
-            transactions.append(try createdTransaction(txId: txIdData) { message in
-                ZcashError.rustCreateToAddress(message)
-            })
+            txIds.append(Data(txId.array))
         }
 
-        return transactions
+        return txIds
     }
 
-    private func createdTransaction(
-        txId: Data,
-        makeError: (String) -> ZcashError
-    ) throws -> CreatedTransaction {
+    @DBActor
+    func getTransaction(txId: Data) async throws -> TransactionData? {
         guard txId.count == 32 else {
-            throw makeError("Created transaction id has an incorrect length")
+            throw ZcashError.rustGetTransaction("Transaction id must be 32 bytes")
         }
 
         let txIdBytes = [UInt8](txId)
         let transactionPtr = txIdBytes.withUnsafeBufferPointer { txIdPtr in
-            zcashlc_get_created_transaction(
+            zcashlc_get_transaction(
                 dbData.0,
                 dbData.1,
                 txIdPtr.baseAddress,
@@ -1334,17 +1325,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
 
         guard let transactionPtr else {
-            throw makeError(lastErrorMessage(fallback: "Created transaction is unavailable in the wallet store"))
+            throw ZcashError.rustGetTransaction(lastErrorMessage(fallback: "Failed to read transaction from the wallet store"))
         }
 
-        defer { zcashlc_free_created_transaction(transactionPtr) }
+        defer { zcashlc_free_transaction_data(transactionPtr) }
 
-        guard let transaction = transactionPtr.pointee.unsafeToCreatedTransaction() else {
-            throw makeError("Created transaction has no encoded bytes")
-        }
+        guard let transaction = transactionPtr.pointee.unsafeToTransactionData() else { return nil }
 
         guard transaction.txId == txId else {
-            throw makeError("Created transaction id does not match the requested id")
+            throw ZcashError.rustGetTransaction("Stored transaction id does not match the requested id")
         }
 
         return transaction
@@ -2815,12 +2804,12 @@ extension FfiBoxedSlice {
     }
 }
 
-extension FfiCreatedTransaction {
-    /// Copies a rust-owned created transaction into the Swift submission model.
-    func unsafeToCreatedTransaction() -> CreatedTransaction? {
+extension FfiTransactionData {
+    /// Copies rust-owned wallet transaction data into Swift, or returns `nil` for the not-found sentinel.
+    func unsafeToTransactionData() -> TransactionData? {
         guard let raw else { return nil }
 
-        return CreatedTransaction(
+        return TransactionData(
             txId: Data(FfiTxId(tuple: txid).array),
             raw: Data(bytes: raw, count: Int(raw_len)),
             expiryHeight: expiry_height == 0 ? nil : BlockHeight(expiry_height)

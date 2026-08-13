@@ -309,11 +309,16 @@ protocol ZcashRustBackendWelding {
     /// Creates a transaction from the given proposal.
     /// - Parameter proposal: the transaction proposal.
     /// - Parameter usk: `UnifiedSpendingKey` for the account that controls the funds to be spent.
+    /// - Returns: The ids of the created transactions.
     /// - Throws: `rustCreateToAddress`.
     func createProposedTransactions(
         proposal: FfiProposal,
         usk: UnifiedSpendingKey
-    ) async throws -> [CreatedTransaction]
+    ) async throws -> [Data]
+
+    /// Returns the wallet-store data available for the given transaction, or `nil` if the
+    /// transaction is not stored. This works for both sent and received transactions.
+    func getTransaction(txId: Data) async throws -> TransactionData?
 
     /// Creates a partially-created (unsigned without proofs) transaction from the given proposal.
     ///
@@ -358,10 +363,10 @@ protocol ZcashRustBackendWelding {
     /// - Parameter pcztWithProofs
     /// - Parameter pcztWithSigs
     ///
-    /// - Returns The submission result of the completed transaction.
+    /// - Returns The id of the completed transaction.
     ///
     /// - Throws  PcztException.ExtractAndStoreTxFromPcztException as a common indicator of the operation failure
-    func extractAndStoreTxFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> CreatedTransaction
+    func extractAndStoreTxFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> Data
 
     /// Gets the consensus branch id for the given height
     /// - Parameter height: the height you what to know the branch id for

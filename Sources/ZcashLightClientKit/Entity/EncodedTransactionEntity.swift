@@ -12,6 +12,13 @@ struct EncodedTransaction {
     let raw: Data
 }
 
+/// The wallet-store data available for a transaction, independent of whether it was sent or received.
+struct TransactionData: Equatable {
+    let txId: Data
+    let raw: Data
+    let expiryHeight: BlockHeight?
+}
+
 extension EncodedTransaction: Hashable {
     func hash(into hasher: inout Hasher) {
         hasher.combine(transactionId)

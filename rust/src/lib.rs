@@ -2911,25 +2911,26 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
     unwrap_exc_or_null(res)
 }
 
-/// Returns a locally-created transaction directly from the wallet store.
+/// Returns transaction data directly from the wallet store.
 ///
-/// This is the broadcast read path for a transaction that has just been created. It deliberately
-/// does not depend on wallet history views, which may omit a stored transaction until all of the
-/// view's derived relations are populated.
+/// This works for any stored transaction, including received transactions. It deliberately does
+/// not depend on wallet history views, which may omit a stored transaction until all of the view's
+/// derived relations are populated. If the transaction is not found, the returned
+/// [`ffi::FfiTransactionData`] has a null `raw` pointer.
 ///
 /// # Safety
 ///
 /// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and must contain a
 ///   valid operating-system path.
 /// - `txid_bytes` must be non-null and valid for reads for exactly 32 bytes.
-/// - Call [`ffi::zcashlc_free_created_transaction`] to free the returned pointer.
+/// - Call [`ffi::zcashlc_free_transaction_data`] to free the returned pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_get_created_transaction(
+pub unsafe extern "C" fn zcashlc_get_transaction(
     db_data: *const u8,
     db_data_len: usize,
     txid_bytes: *const u8,
     network_id: u32,
-) -> *mut ffi::FfiCreatedTransaction {
+) -> *mut ffi::FfiTransactionData {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
@@ -2937,20 +2938,20 @@ pub unsafe extern "C" fn zcashlc_get_created_transaction(
             .try_into()
             .map_err(|_| anyhow!("Transaction id must be 32 bytes"))?;
         let txid = TxId::from_bytes(txid_bytes);
-        let transaction = db_data
+        let Some(transaction) = db_data
             .get_transaction(txid)
-            .map_err(|e| anyhow!("Failed to read created transaction {txid}: {e:?}"))?
-            .ok_or_else(|| {
-                anyhow!("Created transaction {txid} is not available in the wallet store")
-            })?;
+            .map_err(|e| anyhow!("Failed to read transaction {txid}: {e:?}"))?
+        else {
+            return Ok(ffi::FfiTransactionData::not_found(txid_bytes));
+        };
 
         let expiry_height = u32::from(transaction.expiry_height());
         let mut raw = Vec::new();
         transaction
             .write(&mut raw)
-            .map_err(|e| anyhow!("Failed to encode created transaction {txid}: {e}"))?;
+            .map_err(|e| anyhow!("Failed to encode transaction {txid}: {e}"))?;
 
-        Ok(ffi::FfiCreatedTransaction::from_parts(
+        Ok(ffi::FfiTransactionData::from_parts(
             txid_bytes,
             raw,
             expiry_height,
