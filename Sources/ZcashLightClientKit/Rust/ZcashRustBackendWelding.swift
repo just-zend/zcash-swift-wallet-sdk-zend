@@ -309,11 +309,18 @@ protocol ZcashRustBackendWelding {
     /// Creates a transaction from the given proposal.
     /// - Parameter proposal: the transaction proposal.
     /// - Parameter usk: `UnifiedSpendingKey` for the account that controls the funds to be spent.
+    /// - Returns: The ids of the created transactions.
     /// - Throws: `rustCreateToAddress`.
     func createProposedTransactions(
         proposal: FfiProposal,
         usk: UnifiedSpendingKey
     ) async throws -> [Data]
+
+    /// Returns the wallet-store data available for the given transaction, or `nil` if the
+    /// transaction is unknown or its raw bytes are unavailable. This works for both sent and
+    /// received transactions.
+    /// - Throws: `rustGetTransaction` if the wallet store cannot be read or the transaction cannot be decoded.
+    func getTransaction(txId: Data) async throws -> TransactionData?
 
     /// Creates a partially-created (unsigned without proofs) transaction from the given proposal.
     ///
@@ -358,7 +365,7 @@ protocol ZcashRustBackendWelding {
     /// - Parameter pcztWithProofs
     /// - Parameter pcztWithSigs
     ///
-    /// - Returns The submission result of the completed transaction.
+    /// - Returns The id of the completed transaction.
     ///
     /// - Throws  PcztException.ExtractAndStoreTxFromPcztException as a common indicator of the operation failure
     func extractAndStoreTxFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> Data
