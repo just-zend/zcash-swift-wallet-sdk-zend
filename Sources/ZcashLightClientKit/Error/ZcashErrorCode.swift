@@ -203,6 +203,8 @@ public enum ZcashErrorCode: String {
     case rustPutIronwoodSubtreeRootsAllocationProblem = "ZRUST0109"
     /// Error from rust layer when calling ZcashRustBackend.putIronwoodSubtreeRoots
     case rustPutIronwoodSubtreeRoots = "ZRUST0110"
+    /// Error from rust layer when calling ZcashRustBackend.getTransaction
+    case rustGetTransaction = "ZRUST0150"
     /// Error from rust layer when calling TorClient.init
     case rustTorClientInit = "ZRUST0062"
     /// Error from rust layer when calling TorClient.get

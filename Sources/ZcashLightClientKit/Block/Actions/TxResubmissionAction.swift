@@ -137,10 +137,34 @@ private extension TxResubmissionAction {
                     staleTxIds.append(txId)
                 }
             } catch ZcashError.transactionRepositoryEntityNotFound {
-                staleTxIds.append(txId)
+                do {
+                    guard let created = try await transactionEncoder.createdTransactions(forTxIds: [txId]).first,
+                          let expiryHeight = created.expiryHeight,
+                          expiryHeight > latestBlockHeight
+                    else {
+                        staleTxIds.append(txId)
+                        continue
+                    }
+                    logger.warn(
+                        "TxResubmissionAction keeping plan for view-invisible wallet-store transaction \(txId.toHexStringTxId())."
+                    )
+                } catch {
+                    // An unreadable wallet store is inconclusive. Keep the plan and retry later.
+                    logger.warn(
+                        """
+                        TxResubmissionAction could not verify view-invisible transaction \(txId.toHexStringTxId()): \
+                        \(error.localizedDescription)
+                        """
+                    )
+                }
             } catch {
                 // Unknown repository error — keep the plan, try again next pass.
-                logger.warn("TxResubmissionAction could not check plan staleness for \(txId.toHexStringTxId()): \(error)")
+                logger.warn(
+                    """
+                    TxResubmissionAction could not check plan staleness for \(txId.toHexStringTxId()): \
+                    \(error.localizedDescription)
+                    """
+                )
             }
         }
 
