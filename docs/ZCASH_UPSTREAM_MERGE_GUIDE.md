@@ -703,3 +703,26 @@ parity branch or run Swift validation for this documentation-only tracker update
   `#1893`, and the Dependabot set are not independent Zend carries. They are feature work,
   maintenance-line-only, migration/artifact-coupled, draft or review-required, or broad
   dependency updates. No candidate is ready, useful, and low-risk enough to carry early.
+
+## Bleeding-edge refresh (2026-08-13)
+
+- Fresh fetch confirms both defaults remain `main`: `origin/main=4497fe9e` and
+  `upstream/main=ee7b05c9`, with divergence `174 398`. Zend draft PR `#34`
+  (`codex/zcash-upstream-sync-2026-08-01`) remains `179 0` against `upstream/main`, and
+  ancestry confirms it contains the exact upstream tip. It is still the only full-parity
+  vehicle; do not create a duplicate.
+- New upstream PR `#1968` is `DIRTY` and is stacked on `dw/missing-entity-repro`, not `main`.
+  Its submit-plan staleness fix depends on a database-level missing-transaction reproduction;
+  wait for the upstream stack to land and for the Zend migration/artifact reconciliation.
+- New upstream PR `#1964` is clean but is an explicit ZODL Slipstream vendoring and dual
+  MIT/AGPL artifact design. It changes release tooling, CI, Rust FFI, a separate
+  `ZODLSlipstream` product, and licensing documentation. It is neither a Zend-original
+  improvement nor a safe SDK parity carry; do not import it or apply a Zend label.
+- Active `chp-re-enable` / PR `#1962` is 10 commits ahead of `main`, `BLOCKED`, and changes
+  voting, Rust/Swift FFI, dependency pins, and public migration constants. `#1961` remains
+  blocked send-max API work, while the active readback/send-error branches are descendants of
+  the non-default Ironwood stack. None is independently ready or low-risk.
+- The still-active `feature/ironwood-slipstream`, `pacu/zodl-slipstream-vendoring`, and
+  private Slipstream branches remain coupled to the same private-engine, FFI artifact,
+  licensing, and funded-device migration gates. Dependabot and maintenance-line branches stay
+  review- or merge-blocked. No early carry is appropriate, and no label changes are needed.
