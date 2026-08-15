@@ -135,6 +135,11 @@ Changes are relative to `2.8.0-rc.3`.
   and so absent from `getTransactionOutputs(for:)`, until the transaction was
   mined and scanned. Shielded outputs stored by this path are also now tagged with
   their note commitment tree, as the ordinary send path already did.
+- `SlipstreamSynchronizer.wipe()` now deletes the submit-plan database file, restoring the
+  documented `Synchronizer.wipe()` contract ("`Synchronizer.wipe()` deletes the plan database
+  file") that previously only `SDKSynchronizer.wipe()` honored: a wallet wiped through the
+  Slipstream synchronizer left `submit_plans_<networkId>.db` behind, together with any retry
+  plans it held for transactions the wipe had just erased. [#1976]
 
 ## Added
 

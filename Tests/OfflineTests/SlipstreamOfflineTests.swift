@@ -7,8 +7,8 @@
 //  Tests:
 //    1. Progress mapping: chainTip == 0 → syncStatus .syncing(0.0) without crash.
 //    2. Dealloc-without-stop: create + release SlipstreamSynchronizer without stop() → no crash.
-//    3. wipe() removes database files + resets state; switchTo() when-never-started
-//       succeeds (endpoint swapped, no crash).
+//    3. wipe() removes database files (incl. the submit-plan store, [#1976]) + resets state;
+//       switchTo() when-never-started succeeds (endpoint swapped, no crash).
 //    4. Engine FFI smoke (Offline-safe):
 //       - zcashlc_slipstream_open with invalid path → throws rustSlipstreamOpen.
 //       - start before open → throws rustSlipstreamNotOpen.
@@ -301,6 +301,56 @@ class SlipstreamOfflineTests: ZcashTestCase {
         // State must be reset.
         XCTAssertEqual(sync.latestState.syncSessionID, SynchronizerState.zero.syncSessionID,
                        "state must be reset to .zero after wipe")
+    }
+
+    /// [#1976] wipe() must also delete the submit-plan-store database file — mirroring
+    /// `SDKSynchronizer.wipe()` (SDKSynchronizer.swift:815-818), which wipes the plan store
+    /// only when the wallet wipe itself succeeds. Regression test: `SlipstreamSynchronizer.wipe()`
+    /// used to leave `submit_plans_*.db` behind after a wipe.
+    func testWipeDeletesSubmitPlanStoreDatabase() async throws {
+        let initializer = try makeInitializer()
+        let store = initializer.container.resolve(SubmitPlanStoring.self)
+
+        await store.recordPlan(
+            txId: Data(repeating: 0x01, count: 32),
+            endpoints: [LightWalletEndpoint(address: "example.com", port: 443, secure: true)]
+        )
+
+        // Same construction as Dependencies.swift:58-64.
+        let submitPlansDbURL = initializer.generalStorageURL
+            .appendingPathComponent("submit_plans_\(initializer.network.networkType.networkId).db")
+
+        let fm = FileManager.default
+        XCTAssertTrue(fm.fileExists(atPath: submitPlansDbURL.path),
+                      "submit-plan database must exist after recordPlan")
+
+        let sync = SlipstreamSynchronizer(initializer: initializer)
+
+        let wipeExpectation = XCTestExpectation(description: "wipe completes")
+        var receivedError: Error?
+
+        sync.wipe()
+            .sink(
+                receiveCompletion: { completion in
+                    if case let .failure(error) = completion {
+                        receivedError = error
+                    }
+                    wipeExpectation.fulfill()
+                },
+                receiveValue: { _ in }
+            )
+            .store(in: &cancellables)
+
+        await fulfillment(of: [wipeExpectation], timeout: 5)
+        XCTAssertNil(receivedError,
+                     "wipe() must not error when a submit plan exists, got \(String(describing: receivedError))")
+
+        // Check file absence BEFORE any store call that would lazily recreate it.
+        XCTAssertFalse(fm.fileExists(atPath: submitPlansDbURL.path),
+                       "submit-plan database must be removed after wipe")
+
+        let plan = await store.plan(for: Data(repeating: 0x01, count: 32))
+        XCTAssertNil(plan, "plan lookup after wipe must find no row, got \(String(describing: plan))")
     }
 
     /// `switchTo(endpoint:)` on a synchronizer that was never started must complete

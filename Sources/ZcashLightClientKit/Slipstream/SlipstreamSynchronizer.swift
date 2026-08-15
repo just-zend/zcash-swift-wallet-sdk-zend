@@ -49,6 +49,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
     private let transactionRepository: TransactionRepository
     private let transactionEncoder: TransactionEncoder
     private let broadcasterStorage: Broadcaster
+    /// [#1976] Resolved once in `init` from the container (same singleton `broadcasterStorage`'s
+    /// `SDKBroadcaster` uses) so `wipe()` can delete the plan database directly — mirrors
+    /// `SDKSynchronizer`'s `submitPlanStore` property exactly.
+    private let submitPlanStore: SubmitPlanStoring
 
     /// The one migration host this synchronizer owns (see `OrchardMigrationHost`'s type doc: each
     /// synchronizer holds exactly one). Registered on `initializer.container` and resolved
@@ -203,6 +207,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         self.migrationHost = initializer.container.resolve(OrchardMigrationHost.self)
 
         let transactionEncoderRef = WalletTransactionEncoder(initializer: initializer)
+        // [#1976] Resolved once here (it's a singleton) and stored on `self` so `wipeImpl(_:)`
+        // can wipe it directly; the same instance is handed to `SDKBroadcaster` below.
+        self.submitPlanStore = initializer.container.resolve(SubmitPlanStoring.self)
         // [#1755] zcash #1757 (multiserver submission) reworked SDKBroadcaster's init: it now
         // takes submitPlanStore + multiEndpointSubmitter (resolved from the container, same as
         // SDKSynchronizer) and no longer takes sdkFlags. Mirror SDKSynchronizer exactly.
@@ -211,7 +218,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             initializer: initializer,
             logger: logger,
             eventSubject: eventSubjectRef,
-            submitPlanStore: initializer.container.resolve(SubmitPlanStoring.self),
+            submitPlanStore: submitPlanStore,
             multiEndpointSubmitter: initializer.container.resolve(MultiEndpointSubmitter.self),
             statusCheck: {}
         )
@@ -1069,8 +1076,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// 4. Delete `data.db` + its WAL (`-wal`) and shared-memory (`-shm`) siblings.
     /// 5. Delete the `fsBlockDbRoot` directory (parity with old SDK's `storage.clear()` +
     ///    FS-cache directory removal; Slipstream does not use it but the app may have created it).
-    /// 6. Reset the state subject to `.zero` (status `.unprepared`).
-    /// 7. Complete the returned publisher — or fail it if any file-removal throws.
+    /// 6. Delete the submit-plan-store database file (`submitPlanStore.wipe()`) — restores the
+    ///    documented `Synchronizer.wipe()` contract ("`Synchronizer.wipe()` deletes the plan
+    ///    database file", MIGRATING.md) that only `SDKSynchronizer` used to honor ([#1976]).
+    /// 7. Reset the state subject to `.zero` (status `.unprepared`).
+    /// 8. Complete the returned publisher — or fail it if any file-removal throws.
     ///
     /// The publisher uses a `PassthroughSubject` driven from a `Task(priority: .high)`,
     /// mirroring the `SDKSynchronizer.wipe()` idiom.
@@ -1131,10 +1141,15 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 try fileManager.removeItem(at: fsRoot)
             }
 
-            // 6. Reset state to unprepared/zero.
+            // 6. Delete the submit-plan-store database file — mirrors SDKSynchronizer.wipe()
+            //    (SDKSynchronizer.swift:815-818), which wipes the plan store only when the
+            //    wallet wipe succeeded (this `do` block only reaches here on success).
+            await submitPlanStore.wipe()
+
+            // 7. Reset state to unprepared/zero.
             stateSubject.send(.zero)
 
-            // 7. Signal completion.
+            // 8. Signal completion.
             subject.send(completion: .finished)
         } catch {
             subject.send(completion: .failure(error))
