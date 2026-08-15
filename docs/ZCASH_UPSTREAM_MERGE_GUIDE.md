@@ -2,13 +2,39 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-12
+Last reviewed: 2026-08-14
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-14)
+
+- Fresh fetches confirm `origin/main=4497fe9e` and `upstream/main=785c7618`, with
+  divergence `174 410`. The upstream default advanced through merge PR
+  [#1971](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1971), which incorporates
+  the created-transaction readback and resubmission repair sequence. Existing Zend draft
+  [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34) was refreshed at
+  `ee24ba3e` and contains the exact upstream tip; it remains the sole parity vehicle.
+- The merge was clean and preserves Zend identity and release wiring. The 24-file upstream
+  delta adds the readback/rebroadcast handling and test coverage, plus the matching Rust FFI
+  surface. `cargo fmt` completed with no changes and `git diff --check HEAD^1..HEAD` passed.
+  The broader branch still carries pre-existing trailing-whitespace differences from the
+  already-open parity range; they are not introduced by this upstream refresh.
+- `swift build` fails before tests against Zend's released XCFramework because its header and
+  binary lack the required migration and Slipstream FFI surface, including
+  `FfiTransactionData`, `FfiMigrationProgress`, `FfiSlipstreamSnapshot`, and
+  `zcashlc_slipstream_open`. Do not run `swift test --filter OfflineTests` until exact
+  `librustzcash`/`slipstream-internal` provenance is reconciled, a matching arm64 artifact is
+  built and verified, release wiring is updated, and funded-device migration evidence exists.
+- No bleeding-edge carry is appropriate. Open #1962 is clean but is a large voting/FFI and
+  dependency migration; #1968 is dirty and stacked on a non-main reproduction branch; #1964
+  is blocked ZODL-specific dual MIT/AGPL artifact work; #1973 is blocked CI-timeout tuning;
+  and #1974 is only its stacked backport. The `chp-*`, readback, vendoring, and private
+  Slipstream branches remain coupled to migration, artifact, licensing, or release gates.
+  No Zend labels are applied to upstream parity work.
 
 ## Parity and bleeding-edge refresh (2026-08-12)
 
