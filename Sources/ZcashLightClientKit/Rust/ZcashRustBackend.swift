@@ -571,7 +571,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             throw ZcashError.rustExtractAndStoreTxFromPCZT(lastErrorMessage(fallback: "`extractAndStoreTxFromPCZT` failed with unknown error"))
         }
 
-        guard txidPtr.pointee.len == 32 else {
+        guard txidPtr.pointee.len == UInt(TxId.byteLength) else {
             throw ZcashError.rustTxidPtrIncorrectLength(lastErrorMessage(fallback: "`extractAndStoreTxFromPCZT` failed with unknown error"))
         }
 
@@ -585,7 +585,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func decryptAndStoreTransaction(txBytes: [UInt8], minedHeight: UInt32?) async throws -> Data {
-        var contiguousTxidBytes = ContiguousArray<UInt8>(Data(count: 32))
+        var contiguousTxidBytes = ContiguousArray<UInt8>(Data(count: TxId.byteLength))
 
         let result = contiguousTxidBytes.withUnsafeMutableBufferPointer { txidBytePtr in
             zcashlc_decrypt_and_store_transaction(
@@ -657,7 +657,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     // DB-READ (audited 2026-08-03): get_sent_memo / get_received_memo — two query_row
     // SELECTs.
     func getMemo(txId: Data, outputPool: UInt32, outputIndex: UInt16) async throws -> Memo? {
-        guard txId.count == 32 else {
+        guard txId.count == TxId.byteLength else {
             throw ZcashError.rustGetMemoInvalidTxIdLength
         }
 
@@ -1306,6 +1306,38 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
 
         return txIds
+    }
+
+    // DB-READ (audited 2026-08-13): WalletRead::get_transaction — opens the wallet database
+    // read-only and executes SELECT-only transaction lookup and parsing.
+    func getTransaction(txId: Data) async throws -> TransactionData? {
+        guard txId.count == TxId.byteLength else {
+            throw ZcashError.rustGetTransaction("Transaction id must be \(TxId.byteLength) bytes")
+        }
+
+        let txIdBytes = [UInt8](txId)
+        let transactionPtr = txIdBytes.withUnsafeBufferPointer { txIdPtr in
+            zcashlc_get_transaction(
+                dbData.0,
+                dbData.1,
+                txIdPtr.baseAddress,
+                networkType.networkId
+            )
+        }
+
+        guard let transactionPtr else {
+            throw ZcashError.rustGetTransaction(lastErrorMessage(fallback: "Failed to read transaction from the wallet store"))
+        }
+
+        defer { zcashlc_free_transaction_data(transactionPtr) }
+
+        guard let transaction = transactionPtr.pointee.unsafeToTransactionData() else { return nil }
+
+        guard transaction.txId == txId else {
+            throw ZcashError.rustGetTransaction("Stored transaction id does not match the requested id")
+        }
+
+        return transaction
     }
 
     nonisolated func consensusBranchIdFor(height: Int32) throws -> Int32 {
@@ -2101,9 +2133,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     // bytes back. Stays serialized.
     @DBActor
     func migrationTakePreparation(txid: Data, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
-        guard txid.count == 32 else {
+        guard txid.count == TxId.byteLength else {
             throw ZcashError.rustMigrationTakePreparation(
-                "`migrationTakePreparation` was given a \(txid.count)-byte txid; it must be 32 bytes"
+                "`migrationTakePreparation` was given a \(txid.count)-byte txid; it must be \(TxId.byteLength) bytes"
             )
         }
 
@@ -2183,7 +2215,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
             // `txId` is the display-form hex string (see `MigrationTransferResult.success`); the
             // FFI wants the raw 32-byte internal-order id, so round-trip it through `TxId`, which
             // both validates the length and undoes the display byte-reversal.
-            guard let parsedTxId = try? TxId(txId), parsedTxId.id.count == 32 else {
+            guard let parsedTxId = try? TxId(txId), parsedTxId.id.count == TxId.byteLength else {
                 throw ZcashError.migrationInvalidTxId(txId)
             }
 
@@ -2218,7 +2250,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
     @DBActor
     func migrationRecordImmediateRun(txid: Data, for account: AccountUUID) async throws {
-        guard txid.count == 32 else {
+        guard txid.count == TxId.byteLength else {
             throw ZcashError.migrationRecordImmediateRunInvalidTxId(txid.count)
         }
 
@@ -2769,6 +2801,19 @@ extension FfiBoxedSlice {
         .init(
             network: network,
             bytes: self.ptr.toByteArray(length: Int(self.len))
+        )
+    }
+}
+
+extension FfiTransactionData {
+    /// Copies rust-owned wallet transaction data into Swift, or returns `nil` when raw bytes are unavailable.
+    func unsafeToTransactionData() -> TransactionData? {
+        guard let raw, raw_len > 0, let rawCount = Int(exactly: raw_len) else { return nil }
+
+        return TransactionData(
+            txId: Data(FfiTxId(tuple: txid).array),
+            raw: Data(bytes: raw, count: rawCount),
+            expiryHeight: expiry_height == 0 ? nil : BlockHeight(expiry_height)
         )
     }
 }
