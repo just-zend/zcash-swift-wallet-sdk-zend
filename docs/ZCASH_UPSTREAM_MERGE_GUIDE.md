@@ -2,13 +2,33 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-14
+Last reviewed: 2026-08-15
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-15)
+
+- Fresh fetches confirm the remote and default-branch invariants, with
+  `origin/main=4497fe9e` and `upstream/main=785c7618`; divergence remains
+  `174 410`. Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  at `ee24ba3e` contains the exact upstream tip (`180 0` against `upstream/main`).
+  Reuse it as the sole full-parity vehicle; do not create a duplicate sync branch or PR.
+- New upstream [#1978](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1978)
+  (`slipstream-parity-gaps`) has green CI but remains blocked and review-required. Its three
+  commits change five files (+556/-150) to share transaction resubmission with the legacy
+  pipeline and to make `SlipstreamSynchronizer.wipe()` remove submit-plan state. Those changes
+  alter Slipstream polling, cancellation, wallet-wipe ordering, and persistent-state behavior.
+  They are coupled to the Ironwood/Slipstream source and matching XCFramework artifact gate
+  already blocking #34, so they are not an independently ready, useful, low-risk early Zend carry.
+- Existing #1962 voting/FFI, #1968 stacked dirty readback, #1964 ZODL licensing/artifact,
+  #1973/#1974 CI-timeout, migration, release, and dependency branches remain blocked, dirty,
+  review-required, or coupled. No Zend labels apply to this upstream parity decision.
+- This is a documentation-only monitor record. No Zend SDK source or artifact changed, so
+  `swift build` and `swift test --filter OfflineTests` were intentionally not rerun.
 
 ## Parity and bleeding-edge refresh (2026-08-14)
 
