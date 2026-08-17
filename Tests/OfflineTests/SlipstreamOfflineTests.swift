@@ -7,8 +7,8 @@
 //  Tests:
 //    1. Progress mapping: chainTip == 0 → syncStatus .syncing(0.0) without crash.
 //    2. Dealloc-without-stop: create + release SlipstreamSynchronizer without stop() → no crash.
-//    3. wipe() removes database files + resets state; switchTo() when-never-started
-//       succeeds (endpoint swapped, no crash).
+//    3. wipe() removes database files (incl. the submit-plan store, [#1976]) + resets state;
+//       switchTo() when-never-started succeeds (endpoint swapped, no crash).
 //    4. Engine FFI smoke (Offline-safe):
 //       - zcashlc_slipstream_open with invalid path → throws rustSlipstreamOpen.
 //       - start before open → throws rustSlipstreamNotOpen.
@@ -301,6 +301,56 @@ class SlipstreamOfflineTests: ZcashTestCase {
         // State must be reset.
         XCTAssertEqual(sync.latestState.syncSessionID, SynchronizerState.zero.syncSessionID,
                        "state must be reset to .zero after wipe")
+    }
+
+    /// [#1976] wipe() must also delete the submit-plan-store database file — mirroring
+    /// `SDKSynchronizer.wipe()` (SDKSynchronizer.swift:815-818), which wipes the plan store
+    /// only when the wallet wipe itself succeeds. Regression test: `SlipstreamSynchronizer.wipe()`
+    /// used to leave `submit_plans_*.db` behind after a wipe.
+    func testWipeDeletesSubmitPlanStoreDatabase() async throws {
+        let initializer = try makeInitializer()
+        let store = initializer.container.resolve(SubmitPlanStoring.self)
+
+        await store.recordPlan(
+            txId: Data(repeating: 0x01, count: 32),
+            endpoints: [LightWalletEndpoint(address: "example.com", port: 443, secure: true)]
+        )
+
+        // Same construction as Dependencies.swift:58-64.
+        let submitPlansDbURL = initializer.generalStorageURL
+            .appendingPathComponent("submit_plans_\(initializer.network.networkType.networkId).db")
+
+        let fm = FileManager.default
+        XCTAssertTrue(fm.fileExists(atPath: submitPlansDbURL.path),
+                      "submit-plan database must exist after recordPlan")
+
+        let sync = SlipstreamSynchronizer(initializer: initializer)
+
+        let wipeExpectation = XCTestExpectation(description: "wipe completes")
+        var receivedError: Error?
+
+        sync.wipe()
+            .sink(
+                receiveCompletion: { completion in
+                    if case let .failure(error) = completion {
+                        receivedError = error
+                    }
+                    wipeExpectation.fulfill()
+                },
+                receiveValue: { _ in }
+            )
+            .store(in: &cancellables)
+
+        await fulfillment(of: [wipeExpectation], timeout: 5)
+        XCTAssertNil(receivedError,
+                     "wipe() must not error when a submit plan exists, got \(String(describing: receivedError))")
+
+        // Check file absence BEFORE any store call that would lazily recreate it.
+        XCTAssertFalse(fm.fileExists(atPath: submitPlansDbURL.path),
+                       "submit-plan database must be removed after wipe")
+
+        let plan = await store.plan(for: Data(repeating: 0x01, count: 32))
+        XCTAssertNil(plan, "plan lookup after wipe must find no row, got \(String(describing: plan))")
     }
 
     /// `switchTo(endpoint:)` on a synchronizer that was never started must complete
@@ -939,5 +989,129 @@ class SlipstreamOfflineTests: ZcashTestCase {
             SlipstreamSynchronizer.effectiveStallSeconds(engineReported: 497, secondsSinceHandleStart: -5),
             0
         )
+    }
+
+    // MARK: - 15. [#1975] Background transaction-resubmission driver
+    //
+    // Parity with the old pipeline's `TxResubmissionAction`, which ran once per sync pass.
+    // The poll loop asks `resubmissionCheckDue` on every 2 s tick; the answer gates a
+    // `TxResubmitter.checkAndResubmit` call (prune every check, actual re-broadcast throttled
+    // to 300 s INSIDE the resubmitter — the cadence tested here is only the CHECK cadence).
+
+    /// Syncing (1) and Done (3) both check: the old pipeline ran the action once per sync pass,
+    /// and a Done engine still holds unmined transactions worth re-broadcasting.
+    func testResubmissionCheckDueWhileSyncingOrDone() {
+        for state: UInt8 in [1, 3] {
+            XCTAssertTrue(SlipstreamSynchronizer.resubmissionCheckDue(
+                isCancelled: false, state: state, chainTip: 2_400_000, secondsSinceLastCheck: 1_000, inFlight: false
+            ), "state \(state) must run the resubmission check")
+        }
+    }
+
+    /// Disconnected (0) and Error (2) never check: there is no network to submit through,
+    /// so a check could only burn a database walk and log failures.
+    func testResubmissionCheckNotDueWhileDisconnectedOrError() {
+        for state: UInt8 in [0, 2] {
+            XCTAssertFalse(SlipstreamSynchronizer.resubmissionCheckDue(
+                isCancelled: false, state: state, chainTip: 2_400_000, secondsSinceLastCheck: 1_000, inFlight: false
+            ), "state \(state) must never run the resubmission check")
+        }
+    }
+
+    /// A cancelled caller never checks, however perfect the rest of the tick looks. This is the
+    /// teardown guard: `stopPolling()` cancels `pollTask` without awaiting it, and `wipeImpl`
+    /// then suspends (`engine.stop()`/`engine.close()`), so a `tickPoll` suspended mid-tick can
+    /// resume INSIDE the wipe. Firing there would read `data.db` and re-create the submit-plan
+    /// database the wipe had just deleted (SQLite recreates the file on connect), undoing
+    /// [#1976] milliseconds later.
+    func testResubmissionCheckNotDueWhenTheCallerIsCancelled() {
+        for state: UInt8 in [1, 3] {
+            XCTAssertFalse(SlipstreamSynchronizer.resubmissionCheckDue(
+                isCancelled: true, state: state, chainTip: 2_400_000, secondsSinceLastCheck: 100_000, inFlight: false
+            ), "state \(state) must not check while the calling task is cancelled")
+        }
+    }
+
+    /// A zero chain tip means the server tip is not yet known; resubmission candidates are
+    /// selected `upTo:` that height, so checking with 0 would resolve nothing.
+    func testResubmissionCheckNotDueWithoutAChainTip() {
+        XCTAssertFalse(SlipstreamSynchronizer.resubmissionCheckDue(
+            isCancelled: false, state: 1, chainTip: 0, secondsSinceLastCheck: 1_000, inFlight: false
+        ))
+        XCTAssertFalse(SlipstreamSynchronizer.resubmissionCheckDue(
+            isCancelled: false, state: 3, chainTip: 0, secondsSinceLastCheck: 1_000, inFlight: false
+        ))
+    }
+
+    /// A check already in flight blocks the next one however long ago the last one started:
+    /// a slow submit round must never be joined by a second concurrent pass over the same
+    /// transactions.
+    func testResubmissionCheckNotDueWhileAnotherCheckIsInFlight() {
+        XCTAssertFalse(SlipstreamSynchronizer.resubmissionCheckDue(
+            isCancelled: false, state: 1, chainTip: 2_400_000, secondsSinceLastCheck: 100_000, inFlight: true
+        ))
+    }
+
+    /// The 60 s check cadence, at the tick granularity that actually asks (2 s) and at the
+    /// boundary itself (`>=` semantics, mirroring the stall watchdog).
+    func testResubmissionCheckHonorsTheCheckInterval() {
+        XCTAssertFalse(SlipstreamSynchronizer.resubmissionCheckDue(
+            isCancelled: false, state: 1, chainTip: 2_400_000, secondsSinceLastCheck: 2, inFlight: false
+        ), "the next poll tick is inside the window")
+        XCTAssertFalse(SlipstreamSynchronizer.resubmissionCheckDue(
+            isCancelled: false, state: 1, chainTip: 2_400_000, secondsSinceLastCheck: 59.9, inFlight: false
+        ))
+        XCTAssertTrue(SlipstreamSynchronizer.resubmissionCheckDue(
+            isCancelled: false, state: 1, chainTip: 2_400_000, secondsSinceLastCheck: 60, inFlight: false
+        ), "exactly at the interval must fire (>= semantics)")
+    }
+
+    /// The shipped check cadence is 60 s.
+    func testResubmissionCheckIntervalConstant() {
+        XCTAssertEqual(SlipstreamSynchronizer.resubmissionCheckInterval, 60)
+    }
+
+    /// Actor-level: the driver fires the first eligible tick and then holds the line for the
+    /// rest of the interval — the poll loop calls it every 2 s, so without the gate a wallet
+    /// would walk its transaction table 30× a minute.
+    ///
+    /// Also pins the single-writer invariant: a COMPLETED check leaves no in-flight handle,
+    /// because the task's own `finishResubmissionCheck()` cleared it. A regression that re-adds
+    /// `resubmissionTask = nil` to teardown, or that leaks the handle, fails here rather than
+    /// hiding behind the interval-vs-in-flight ambiguity.
+    ///
+    /// Offline caveat: the temp `data.db` has no wallet tables, so the fired check's
+    /// `findForResubmission` throws and `TxResubmitter` swallows it — the task completes with
+    /// zero work, which is exactly what this test needs (it asserts the GATE, not the work).
+    /// `awaitResubmissionCheckForTesting()` awaits that task instead of sleeping, so the
+    /// second call is guaranteed to be gated by the interval and not merely by "in flight".
+    func testResubmissionDriverFiresOncePerInterval() async throws {
+        let sync = SlipstreamSynchronizer(initializer: try makeInitializer())
+
+        await sync.maybeRunTxResubmission(state: 1, chainTip: 2_400_000, isCancelled: false)
+        let firstCheck = await sync.awaitResubmissionCheckForTesting()
+        XCTAssertGreaterThan(firstCheck, 0, "a Syncing tick with a known chain tip must fire the first check")
+        var inFlight = await sync.resubmissionCheckInFlightForTesting
+        XCTAssertFalse(inFlight, "the finished check must have cleared its own handle")
+
+        await sync.maybeRunTxResubmission(state: 3, chainTip: 2_400_002, isCancelled: false)
+        let secondCheck = await sync.awaitResubmissionCheckForTesting()
+        XCTAssertEqual(secondCheck, firstCheck, "a tick inside the 60 s window must not fire a second check")
+        inFlight = await sync.resubmissionCheckInFlightForTesting
+        XCTAssertFalse(inFlight, "a gated tick must not leave a check in flight")
+    }
+
+    /// Actor-level counterpart of the cancellation row: the driver must PLUMB the caller's
+    /// cancellation, not just accept it. A tick resuming inside a teardown fires nothing —
+    /// no stamp, no task — so a `wipe()` in progress cannot be raced by a fresh check.
+    func testResubmissionDriverSkipsWhenTheCallingTaskIsCancelled() async throws {
+        let sync = SlipstreamSynchronizer(initializer: try makeInitializer())
+
+        await sync.maybeRunTxResubmission(state: 1, chainTip: 2_400_000, isCancelled: true)
+
+        let stamp = await sync.awaitResubmissionCheckForTesting()
+        XCTAssertEqual(stamp, 0, "a cancelled caller must not fire a check")
+        let inFlight = await sync.resubmissionCheckInFlightForTesting
+        XCTAssertFalse(inFlight, "a cancelled caller must not spawn a check task")
     }
 }
