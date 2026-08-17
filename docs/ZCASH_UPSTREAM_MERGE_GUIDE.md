@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-15
+Last reviewed: 2026-08-16
 
 ## Remote and branch invariants
 
@@ -10,7 +10,7 @@ Last reviewed: 2026-08-15
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Parity and bleeding-edge refresh (2026-08-15)
+## Parity and bleeding-edge refresh (2026-08-16)
 
 - Fresh fetches confirm the remote and default-branch invariants, with
   `origin/main=4497fe9e` and `upstream/main=785c7618`; divergence remains
@@ -24,9 +24,19 @@ Last reviewed: 2026-08-15
   alter Slipstream polling, cancellation, wallet-wipe ordering, and persistent-state behavior.
   They are coupled to the Ironwood/Slipstream source and matching XCFramework artifact gate
   already blocking #34, so they are not an independently ready, useful, low-risk early Zend carry.
-- Existing #1962 voting/FFI, #1968 stacked dirty readback, #1964 ZODL licensing/artifact,
-  #1973/#1974 CI-timeout, migration, release, and dependency branches remain blocked, dirty,
-  review-required, or coupled. No Zend labels apply to this upstream parity decision.
+- Upstream [#1962](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1962) is now clean and
+  approved, but still adds eight commits across 19 files (+3,248/-1,891) spanning
+  `zcash_voting`, Rust and Swift FFI, public migration constants, and new voting tests. It remains
+  coupled to the Ironwood artifact/provenance gate and has no independently verifiable Zend
+  release path, so do not carry it ahead of upstream. The post-merge `Cargo.lock` repair #1960
+  is likewise only meaningful with that integration sequence.
+- Upstream #1973/#1974 change the upstream-only `make ffi-macos` timeout from 30 to 60 minutes;
+  #1974 is stacked on the voting bump. Zend's workflow instead runs `swift test --filter
+  OfflineTests` with a 15-minute cap and has no observed timeout, so the patch neither applies
+  cleanly nor establishes a Zend-specific need. Keep CI timeout changes out of this monitor until
+  a Zend job provides evidence. The remaining readback, ZODL licensing/artifact, migration,
+  release, and dependency branches are blocked, dirty, review-required, or coupled. No Zend
+  labels apply to this upstream parity decision.
 - This is a documentation-only monitor record. No Zend SDK source or artifact changed, so
   `swift build` and `swift test --filter OfflineTests` were intentionally not rerun.
 
