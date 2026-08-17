@@ -135,6 +135,20 @@ Changes are relative to `2.8.0-rc.3`.
   and so absent from `getTransactionOutputs(for:)`, until the transaction was
   mined and scanned. Shielded outputs stored by this path are also now tagged with
   their note commitment tree, as the ordinary send path already did.
+- `SlipstreamSynchronizer.wipe()` now deletes the submit-plan database file, restoring the
+  documented `Synchronizer.wipe()` contract ("`Synchronizer.wipe()` deletes the plan database
+  file") that previously only `SDKSynchronizer.wipe()` honored: a wallet wiped through the
+  Slipstream synchronizer left `submit_plans_<networkId>.db` behind, together with any retry
+  plans it held for transactions the wipe had just erased. [#1976]
+- Background transaction resubmission now runs under `SlipstreamSynchronizer` too: unmined,
+  unexpired transactions are periodically re-broadcast through their recorded submit plans, and
+  plans whose transactions have expired are pruned — matching `SDKSynchronizer`. A transaction
+  that never reached the network (submitted while the server was unreachable, or dropped from
+  every mempool it was sent to) previously got a second chance only on the old sync pipeline,
+  which ran the resubmission step once per sync pass; the Slipstream synchronizer has no action
+  list and so did nothing at all. It now drives the same resubmission core from its poll loop —
+  a check at most once a minute while the engine is syncing or synced, with the re-broadcast
+  itself throttled exactly as it always was. [#1975]
 
 ## Added
 
