@@ -49,6 +49,13 @@ public actor SlipstreamSynchronizer: Synchronizer {
     private let transactionRepository: TransactionRepository
     private let transactionEncoder: TransactionEncoder
     private let broadcasterStorage: Broadcaster
+    /// [#1976] Resolved once in `init` from the container (same singleton `broadcasterStorage`'s
+    /// `SDKBroadcaster` uses) so `wipe()` can delete the plan database directly — mirrors
+    /// `SDKSynchronizer`'s `submitPlanStore` property exactly.
+    private let submitPlanStore: SubmitPlanStoring
+    /// [#1975] The resubmission core shared with the old pipeline's `TxResubmissionAction`
+    /// (same type, same retry policy, same 300 s throttle) — see the driver block below.
+    private let txResubmitter: TxResubmitter
 
     /// The one migration host this synchronizer owns (see `OrchardMigrationHost`'s type doc: each
     /// synchronizer holds exactly one). Registered on `initializer.container` and resolved
@@ -127,6 +134,46 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// healthy sync. `internal` so tests can reference the constant.
     static let stallWatchdogThresholdSeconds: TimeInterval = 120
 
+    // ── [#1975] Background transaction resubmission ────────────────────────────
+    // Parity with the old pipeline's `TxResubmissionAction`, which ran once per sync pass:
+    // unmined, unexpired transactions are re-broadcast through their recorded submit plans,
+    // and plans whose transactions expired are pruned. `SlipstreamSynchronizer` has no action
+    // list, so the poll loop drives it — `tickPoll` asks `maybeRunTxResubmission` on every
+    // 2 s tick and the guards below decide.
+    //
+    // Two cadences, deliberately: the CHECK runs at most every
+    // `resubmissionCheckInterval` (60 s — it walks the transaction table and the plan store),
+    // while the actual re-broadcast is throttled to 300 s INSIDE `TxResubmitter`
+    // (`Constants.thresholdToTrigger`, shared with the old pipeline). The prune runs on every
+    // check. This host duplicates neither number.
+    //
+    // Teardown (`stopImpl`, `wipeImpl`) only CANCELS `resubmissionTask`; it never nils the
+    // handle. The fired task clears it itself, as its last step, through the actor-isolated
+    // `finishResubmissionCheck()` — a single writer. If teardown also nil'd the handle, a fast
+    // stop→start could let a stale task's finish clear a NEWER task's handle and re-open the
+    // spawn guard while that new task still runs (double-spawn). Cancel-only teardown keeps
+    // the guard closed until the cancelled task's own finish clears it, which is benign and
+    // self-healing. Note the LIMIT of that cancellation: only the SUBMIT stage observes it
+    // (`SubmitPlanExecutor.submit` checks `Task.checkCancellation`, and `TxResubmitter` catches
+    // per transaction). The prune stage has no cancellation checks at all and runs to
+    // completion — which is why `wipeImpl` cancels AND joins (below), rather than trusting
+    // cancellation to stop a check that would otherwise write to files it is deleting.
+    //
+    // The driver is also gated on the CALLER's cancellation (`isCancelled`, defaulted to
+    // `Task.isCancelled` so it is evaluated in the caller's task context). `stopPolling()`
+    // cancels `pollTask` without awaiting it, and teardown then suspends (`engine.stop()`,
+    // `engine.close()`), so a `tickPoll` that was suspended mid-tick can RESUME inside the
+    // teardown and walk on to this driver. Without that gate a wipe could spawn a fresh,
+    // uncancelled check that reads `data.db` and re-creates the submit-plan database SQLite
+    // just deleted (a connect resurrects the file), undoing [#1976] a few milliseconds later.
+    /// Wall-clock stamp (`timeIntervalSince1970`) of the last check the driver FIRED; 0 = never.
+    private var lastResubmissionCheckTime: TimeInterval = 0
+    /// The in-flight check, if any. Doubles as the "one at a time" guard: a slow submit round
+    /// must never be joined by a second concurrent pass over the same transactions.
+    private var resubmissionTask: Task<Void, Never>?
+    /// How often the poll loop may run a resubmission check: 60 s (the poll tick is 2 s).
+    /// `internal` so tests can reference the constant, like `stallWatchdogThresholdSeconds`.
+    static let resubmissionCheckInterval: TimeInterval = 60
 
     // [v2.1 E-3] The host-side summary cache is GONE: the engine caches the summary itself
     // (E-1) and the warm-start emissions it fed read the truthful-from-open snapshot instead.
@@ -203,6 +250,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
         self.migrationHost = initializer.container.resolve(OrchardMigrationHost.self)
 
         let transactionEncoderRef = WalletTransactionEncoder(initializer: initializer)
+        // [#1976] Resolved once here (it's a singleton) and stored on `self` so `wipeImpl(_:)`
+        // can wipe it directly; the same instance is handed to `SDKBroadcaster` below.
+        self.submitPlanStore = initializer.container.resolve(SubmitPlanStoring.self)
+        // [#1975] Same container, same singletons the old pipeline's `TxResubmissionAction`
+        // resolves — so both synchronizers resubmit through one implementation.
+        self.txResubmitter = TxResubmitter(container: initializer.container)
         // [#1755] zcash #1757 (multiserver submission) reworked SDKBroadcaster's init: it now
         // takes submitPlanStore + multiEndpointSubmitter (resolved from the container, same as
         // SDKSynchronizer) and no longer takes sdkFlags. Mirror SDKSynchronizer exactly.
@@ -211,7 +264,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             initializer: initializer,
             logger: logger,
             eventSubject: eventSubjectRef,
-            submitPlanStore: initializer.container.resolve(SubmitPlanStoring.self),
+            submitPlanStore: submitPlanStore,
             multiEndpointSubmitter: initializer.container.resolve(MultiEndpointSubmitter.self),
             statusCheck: {}
         )
@@ -358,6 +411,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
     private func stopImpl() async {
         isRunning = false
         stopPolling()
+        // [#1975] Cancel, don't join: nothing is being deleted here, so a check that runs a
+        //   moment longer is harmless, and `stop()` must stay prompt. Cancel ONLY — the fired
+        //   task clears the handle itself (see the driver block).
+        resubmissionTask?.cancel()
         // T8.3 (T5.5 wart fix): only emit .stopped if we were prepared. stop() on an
         // unprepared synchronizer (Zodl calls it unconditionally on didEnterBackground,
         // RootInitialization.swift:75-76) must NOT forge isPrepared by moving
@@ -535,6 +592,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
             ))
         }
 
+        // ── [#1975] Background resubmission ───────────────────────────────────
+        // Non-blocking: the guards are evaluated inline and the work (if any) runs in its own
+        // task, so a slow submit round can never stretch a poll tick.
+        maybeRunTxResubmission(state: snap.state, chainTip: snap.chainTip)
+
         // ── foundTransactions: the E-4 one-line rule ──────────────────────────
         // The ENGINE versions the stored tx set (`snap.txSetVersion`: enhancement writes,
         // mempool hits, boundary reconcile-linkage transitions, post-submit pokes — a
@@ -550,6 +612,106 @@ public actor SlipstreamSynchronizer: Synchronizer {
             let txs = await droppingUnreconciled(await enhanceWithState((try? await transactionRepository.find(offset: 0, limit: 50, kind: .all)) ?? []))
             eventSubject.send(.foundTransactions(txs, nil))
         }
+    }
+
+    /// [#1975] The poll loop's background-resubmission driver: decides (via the pure
+    /// `resubmissionCheckDue` gate) whether this tick runs a resubmission check, and if so fires
+    /// it in `resubmissionTask`. Synchronous and non-blocking — the caller's tick never waits on
+    /// the check. See the driver block at the top of the type for the two cadences and the
+    /// cancel-only teardown rule.
+    ///
+    /// `internal` (not `private`) so `@testable` tests can drive the gate directly, mirroring
+    /// `setInternalSyncStatusForTesting`; production's only caller is `tickPoll`.
+    ///
+    /// - Parameters:
+    ///   - state: `snap.state` (0 = disconnected, 1 = syncing, 2 = error, 3 = done).
+    ///   - chainTip: `snap.chainTip` — the resubmission candidates are selected `upTo:` it.
+    ///   - isCancelled: whether the CALLING task is cancelled. Defaulted to `Task.isCancelled`,
+    ///     which — because default arguments are evaluated at the call site — reads the poll
+    ///     task's own flag when `tickPoll` calls this. A tick that resumes after teardown
+    ///     cancelled `pollTask` therefore fires nothing; see the driver block above for the
+    ///     wipe-resurrects-the-plan-database failure this closes. Tests pass it explicitly.
+    func maybeRunTxResubmission(state: UInt8, chainTip: UInt64, isCancelled: Bool = Task.isCancelled) {
+        let now = Date().timeIntervalSince1970
+        guard SlipstreamSynchronizer.resubmissionCheckDue(
+            isCancelled: isCancelled,
+            state: state,
+            chainTip: chainTip,
+            secondsSinceLastCheck: now - lastResubmissionCheckTime,
+            inFlight: resubmissionTask != nil
+        ) else { return }
+
+        // Stamped at FIRE time, not at completion: the cadence is "a check every 60 s", and a
+        // check that takes a while must not push the next one further out.
+        lastResubmissionCheckTime = now
+        let latestBlockHeight = BlockHeight(chainTip)
+        resubmissionTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runResubmissionCheck(latestBlockHeight: latestBlockHeight)
+        }
+    }
+
+    /// The actor-isolated body of one resubmission check: hops back onto the actor so
+    /// `txResubmitter` never leaves it, and clears the in-flight handle on every exit path.
+    private func runResubmissionCheck(latestBlockHeight: BlockHeight) async {
+        defer { finishResubmissionCheck() }
+        // Non-throwing: `TxResubmitter` logs and swallows both the candidate lookup and every
+        // per-transaction submit failure (a cancelled submit included), so one dead endpoint —
+        // or a teardown mid-check — can never escape as an unhandled error here.
+        await txResubmitter.checkAndResubmit(latestBlockHeight: latestBlockHeight)
+    }
+
+    /// Clears the in-flight handle. THE single writer that nils `resubmissionTask` (teardown only
+    /// cancels) — see the driver block for why that ordering is what keeps the spawn guard sound.
+    private func finishResubmissionCheck() {
+        resubmissionTask = nil
+    }
+
+    /// Test-only seam: awaits the in-flight resubmission check (if any) and returns the stamp of
+    /// the last check the driver FIRED (0 = never). Lets `@testable` tests observe the interval
+    /// gate deterministically instead of sleeping, and guarantees a follow-up call is gated by
+    /// the interval rather than merely by "in flight". `internal`, never called by production.
+    func awaitResubmissionCheckForTesting() async -> TimeInterval {
+        await resubmissionTask?.value
+        return lastResubmissionCheckTime
+    }
+
+    /// Test-only seam: whether a check is in flight. Pins the single-writer invariant — after a
+    /// completed check this must read false (the task's own `finishResubmissionCheck()` cleared
+    /// the handle), and it must NOT be false merely because teardown nil'd it. `internal`.
+    var resubmissionCheckInFlightForTesting: Bool { resubmissionTask != nil }
+
+    /// Pure gate for the background-resubmission driver. Static + pure so the truth table is
+    /// unit-testable without an engine, mirroring `isSyncStalled`.
+    ///
+    /// - Parameters:
+    ///   - isCancelled: whether the calling task is cancelled. Checked FIRST: a cancelled poll
+    ///     task means teardown is in progress (possibly a `wipe()` deleting the very databases a
+    ///     check would touch), so nothing else about the tick can make a check legitimate.
+    ///   - state: `snap.state`. Only Syncing (1) and Done (3) check — those are the states with
+    ///     a live server connection, and they mirror the old pipeline, which ran
+    ///     `TxResubmissionAction` once per sync pass. Disconnected (0) / Error (2) have no
+    ///     network, so a check there could only burn a database walk and log failures.
+    ///   - chainTip: `snap.chainTip`; 0 means the server tip is not known yet, and candidates
+    ///     are selected `upTo:` that height, so there is nothing to resolve.
+    ///   - secondsSinceLastCheck: elapsed wall time since the last check FIRED (an elapsed span
+    ///     rather than two timestamps, mirroring `isSyncStalled`). Enormous before the first
+    ///     check (the stamp starts at 0), so the first eligible tick always fires; a backwards
+    ///     clock adjustment can make it negative, which merely defers the next check.
+    ///   - inFlight: whether a check is already running.
+    /// - Returns: true when this tick should run a resubmission check.
+    static func resubmissionCheckDue(
+        isCancelled: Bool,
+        state: UInt8,
+        chainTip: UInt64,
+        secondsSinceLastCheck: TimeInterval,
+        inFlight: Bool
+    ) -> Bool {
+        guard !isCancelled else { return false }
+        guard state == 1 || state == 3 else { return false }
+        guard chainTip > 0 else { return false }
+        guard !inFlight else { return false }
+        return secondsSinceLastCheck >= resubmissionCheckInterval
     }
 
     /// [v2.1 Phase 2] THE summary source for the slipstream path: the engine's unified
@@ -1063,14 +1225,18 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// Wipes all wallet data managed by this synchronizer.
     ///
     /// Mirrors `SDKSynchronizer.wipe()` + `CompactBlockProcessor.doWipe()`:
-    /// 1. Stop the poll loop.
+    /// 1. Stop the poll loop, then cancel AND await any in-flight background resubmission
+    ///    check ([#1975]) — it must not still be reading or writing the files step 4 deletes.
     /// 2. `engine.stop()` — cancel any in-flight sync task.
     /// 3. `engine.close()` — free the Rust handle so no Rust-side state survives file deletion.
     /// 4. Delete `data.db` + its WAL (`-wal`) and shared-memory (`-shm`) siblings.
     /// 5. Delete the `fsBlockDbRoot` directory (parity with old SDK's `storage.clear()` +
     ///    FS-cache directory removal; Slipstream does not use it but the app may have created it).
-    /// 6. Reset the state subject to `.zero` (status `.unprepared`).
-    /// 7. Complete the returned publisher — or fail it if any file-removal throws.
+    /// 6. Delete the submit-plan-store database file (`submitPlanStore.wipe()`) — restores the
+    ///    documented `Synchronizer.wipe()` contract ("`Synchronizer.wipe()` deletes the plan
+    ///    database file", MIGRATING.md) that only `SDKSynchronizer` used to honor ([#1976]).
+    /// 7. Reset the state subject to `.zero` (status `.unprepared`).
+    /// 8. Complete the returned publisher — or fail it if any file-removal throws.
     ///
     /// The publisher uses a `PassthroughSubject` driven from a `Task(priority: .high)`,
     /// mirroring the `SDKSynchronizer.wipe()` idiom.
@@ -1090,6 +1256,18 @@ public actor SlipstreamSynchronizer: Synchronizer {
     private func wipeImpl(_ subject: PassthroughSubject<Void, Error>) async {
         // 1. Stop polling.
         stopPolling()
+        // 1a. [#1975] Cancel AND JOIN any in-flight resubmission check — it reads and writes the
+        //     very database files about to be deleted. Cancel alone is not enough: only the
+        //     SUBMIT stage observes cancellation (`SubmitPlanExecutor.submit`), while the prune
+        //     stage has no cancellation checks and would run on to `deletePlans` after the plan
+        //     file was removed. Joining does not violate the single-writer rule (that forbids
+        //     nil'ing the handle here, not awaiting it): the task's own `finishResubmissionCheck()`
+        //     clears it, and has done so by the time `.value` returns. No deadlock — awaiting
+        //     suspends `wipeImpl` and frees the actor for that finish hop. A tick that resumes
+        //     during this wipe cannot start a new check: `pollTask` is cancelled, and the driver
+        //     is gated on the caller's cancellation.
+        resubmissionTask?.cancel()
+        await resubmissionTask?.value
 
         // 2. Stop the in-flight sync (non-blocking cancel in Rust).
         await engine.stop()
@@ -1131,10 +1309,15 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 try fileManager.removeItem(at: fsRoot)
             }
 
-            // 6. Reset state to unprepared/zero.
+            // 6. Delete the submit-plan-store database file — mirrors SDKSynchronizer.wipe()
+            //    (SDKSynchronizer.swift:815-818), which wipes the plan store only when the
+            //    wallet wipe succeeded (this `do` block only reaches here on success).
+            await submitPlanStore.wipe()
+
+            // 7. Reset state to unprepared/zero.
             stateSubject.send(.zero)
 
-            // 7. Signal completion.
+            // 8. Signal completion.
             subject.send(completion: .finished)
         } catch {
             subject.send(completion: .failure(error))
