@@ -211,7 +211,13 @@ pub unsafe extern "C" fn zcashlc_voting_extract_orchard_fvk_from_ufvk(
     unwrap_exc_or_null(res)
 }
 
-/// Extract the Orchard note commitment tree root from a protobuf-encoded TreeState.
+/// Extract the Ironwood note commitment tree root from a protobuf-encoded TreeState.
+///
+/// Voting rounds anchor to the Ironwood pool — `zcash_voting 2.0` supports no
+/// other shielded protocol — so a round's `nc_root` is the root of the Ironwood
+/// tree, not the Orchard one. They are distinct pools with distinct trees whose
+/// roots never coincide on a live chain, so reading the wrong field does not
+/// degrade gracefully: it fails every round, always.
 ///
 /// Returns the 32-byte nc_root as `*mut FfiBoxedSlice`, or null on error.
 ///
@@ -227,10 +233,10 @@ pub unsafe extern "C" fn zcashlc_voting_extract_nc_root(
         let bytes = unsafe { bytes_from_ptr(tree_state_bytes, tree_state_bytes_len) }?;
         let tree_state = TreeState::decode(bytes)
             .map_err(|e| anyhow!("failed to decode TreeState protobuf: {}", e))?;
-        let orchard_ct = tree_state
-            .orchard_tree()
-            .map_err(|e| anyhow!("failed to parse orchard tree from TreeState: {}", e))?;
-        let nc_root = orchard_ct.root().to_bytes().to_vec();
+        let ironwood_ct = tree_state
+            .ironwood_tree()
+            .map_err(|e| anyhow!("failed to parse ironwood tree from TreeState: {}", e))?;
+        let nc_root = ironwood_ct.root().to_bytes().to_vec();
         Ok(crate::ffi::BoxedSlice::some(nc_root))
     });
     unwrap_exc_or_null(res)
@@ -264,10 +270,14 @@ pub unsafe extern "C" fn zcashlc_voting_verify_witness(
 
 #[cfg(test)]
 mod tests {
-    use orchard::tree::Anchor;
+    use ff::PrimeField;
+    use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
+    use orchard::tree::{Anchor, MerkleHashOrchard};
+    use pasta_curves::pallas;
     use prost::Message;
     use zcash_client_backend::proto::service::TreeState;
     use zcash_keys::keys::UnifiedSpendingKey;
+    use zcash_primitives::merkle_tree::write_commitment_tree;
     use zcash_protocol::consensus::Network;
 
     use super::*;
@@ -561,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_nc_root_returns_empty_orchard_root_for_empty_tree_state() {
+    fn extract_nc_root_returns_empty_ironwood_root_for_empty_tree_state() {
         let tree_state = TreeState {
             network: "main".to_string(),
             height: 1,
@@ -580,6 +590,69 @@ mod tests {
         let root = boxed_slice_to_vec(result);
         assert_eq!(root.len(), 32);
         assert_eq!(root, Anchor::empty_tree().to_bytes().to_vec());
+    }
+
+    const TREE_DEPTH: u8 = orchard::NOTE_COMMITMENT_TREE_DEPTH as u8;
+
+    /// A distinguishable Orchard-tree leaf built from a small field element.
+    fn merkle_hash(tag: u64) -> MerkleHashOrchard {
+        let repr = pallas::Base::from(tag).to_repr();
+        MerkleHashOrchard::from_bytes(&repr).expect("small field element is canonical")
+    }
+
+    /// A commitment-tree frontier holding one leaf per tag.
+    fn frontier_with(tags: &[u64]) -> Frontier<MerkleHashOrchard, TREE_DEPTH> {
+        let mut frontier = Frontier::empty();
+        for tag in tags {
+            assert!(frontier.append(merkle_hash(*tag)));
+        }
+        frontier
+    }
+
+    /// The hex tree-state encoding `TreeState` carries for a frontier.
+    fn tree_hex(frontier: &Frontier<MerkleHashOrchard, TREE_DEPTH>) -> String {
+        let commitment_tree = CommitmentTree::from_frontier(frontier);
+        let mut tree_bytes = Vec::new();
+        write_commitment_tree(&commitment_tree, &mut tree_bytes)
+            .expect("serialize note commitment tree state");
+        hex::encode(tree_bytes)
+    }
+
+    /// Voting rounds are anchored to the **Ironwood** note commitment tree, so
+    /// when the cached `TreeState` carries both pools the extracted `nc_root`
+    /// must be the Ironwood root, not the Orchard one. This is the second half
+    /// of the `8a40d1f9` fix that the `eea6cde8` merge lost; without it, nothing
+    /// in the suite notices which field this FFI reads.
+    #[test]
+    fn extract_nc_root_returns_ironwood_root_when_both_trees_present() {
+        let orchard_frontier = frontier_with(&[1, 2, 3]);
+        let ironwood_frontier = frontier_with(&[7, 8]);
+        assert_ne!(
+            orchard_frontier.root().to_bytes(),
+            ironwood_frontier.root().to_bytes(),
+            "test needs distinguishable roots"
+        );
+        let tree_state = TreeState {
+            network: "test".to_string(),
+            height: 100,
+            hash: String::new(),
+            time: 0,
+            sapling_tree: String::new(),
+            orchard_tree: tree_hex(&orchard_frontier),
+            ironwood_tree: tree_hex(&ironwood_frontier),
+        };
+        let tree_state_bytes = tree_state.encode_to_vec();
+
+        let result = unsafe {
+            zcashlc_voting_extract_nc_root(tree_state_bytes.as_ptr(), tree_state_bytes.len())
+        };
+
+        let root = boxed_slice_to_vec(result);
+        assert_eq!(
+            root,
+            ironwood_frontier.root().to_bytes().to_vec(),
+            "nc_root must come from the Ironwood tree"
+        );
     }
 
     #[test]
