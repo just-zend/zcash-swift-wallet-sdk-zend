@@ -76,7 +76,7 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Changed
 
-- Voting is pinned to `zcash_voting = "=3.0.0-rc.3"` (exactly; a non-`=` requirement resolves to
+- Voting is pinned to `zcash_voting = "=3.0.0"` (exactly; a non-`=` requirement resolves to
   1.0.0). The 2.0 family made the PIR layout an explicit client/server handshake, so
   `VotingRustBackend.precomputeDelegationPir(...)` and `buildAndProveDelegation(...)` take a
   `pirLayout: VotingPirLayout` — the `pir_depth`/`tier0_layers`/`tier1_layers` triple from the
