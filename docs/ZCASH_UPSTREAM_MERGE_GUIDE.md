@@ -2,13 +2,43 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-16
+Last reviewed: 2026-08-17
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-17)
+
+- Fresh fetches confirm the remote and default-branch invariants, with
+  `origin/main=4497fe9e` and `upstream/main=02e04161`; divergence is `174 418`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  was refreshed at `04602365` and contains the exact upstream tip (`181 0` against
+  `upstream/main`). It remains the sole full-parity vehicle; do not create a duplicate
+  sync branch or PR.
+- Upstream [#1979](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1979) merged the
+  Ironwood/Slipstream integration sequence containing #1978 and #1973. The Zend parity merge
+  applied with no conflicts, retaining Zend's existing private-engine provenance and fork-hosted
+  XCFramework release wiring. The delta extracts `TxResubmitter`, uses it for legacy and
+  Slipstream background resubmission, and makes `SlipstreamSynchronizer.wipe()` clear
+  submit-plan state.
+- `git diff --check` passes on the parity merge. `swift build` reaches compilation but fails
+  before tests because the released Zend XCFramework lacks the required migration, transaction
+  readback, custom-network, and Slipstream declarations, including `FfiTransactionData`,
+  `FfiMigrationProgress`, `FfiSlipstreamSnapshot`, and `zcashlc_set_custom_network`.
+  Do not run OfflineTests until the exact private `librustzcash` / `slipstream-internal`
+  provenance is frozen, the matching committed arm64 artifact and generated headers are rebuilt
+  and verified, release wiring is reviewed, and funded-device migration evidence exists.
+- No newly active unmerged branch is an early Zend carry. #1972 is a clean voting dependency
+  bump but changes `zcash_voting` and the Ironwood migration graph; #1961 (send max) and #1962
+  (voting restoration) are dirty; #1960 is only their Cargo.lock repair; #1968 is dirty and
+  stacked on a database reproduction; and #1893/#1964 remain blocked migration or ZODL
+  licensing/artifact work. Dependabot and maintenance branches remain review- or merge-blocked.
+  No Zend labels apply to upstream parity work, and no source-independent carry is justified.
+- This tracker update is documentation-only. `git diff --check` is sufficient; source builds and
+  tests are recorded on #34 instead.
 
 ## Parity and bleeding-edge refresh (2026-08-16)
 
