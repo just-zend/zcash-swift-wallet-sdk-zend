@@ -22,9 +22,9 @@ import Foundation
 ///
 /// WHAT THIS ACTOR GUARANTEES: no two Swift-initiated writes ever interleave.
 ///
-/// WHAT IT DOES NOT AND CANNOT GUARANTEE: the slipstream engine writes to the same database
-/// files from Rust-managed threads continuously, outside any Swift actor — Swift-side
-/// serialization has never covered it. Nor does the actor provide cross-call snapshot
+/// WHAT IT DOES NOT AND CANNOT GUARANTEE: Rust writes to the same database files on its own
+/// connections, outside any Swift actor — the migration store's `open_store_conn` is one such
+/// writer — so Swift-side serialization has never covered it. Nor does the actor provide cross-call snapshot
 /// consistency: every FFI call opens its own connection and sees its own WAL snapshot. Data
 /// safety below the actor is per-call connections + WAL + the 15-second busy_timeout, which is
 /// also why long CPU-bound writes (proof generation) are CHUNKED rather than detached: the
