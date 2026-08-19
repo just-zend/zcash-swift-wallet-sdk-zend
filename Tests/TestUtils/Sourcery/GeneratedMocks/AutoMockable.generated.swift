@@ -3935,28 +3935,6 @@ class TransactionRepositoryMock: TransactionRepository {
         }
     }
 
-    // MARK: - unreconciledTxids
-
-    var unreconciledTxidsThrowableError: Error?
-    var unreconciledTxidsCallsCount = 0
-    var unreconciledTxidsCalled: Bool {
-        return unreconciledTxidsCallsCount > 0
-    }
-    var unreconciledTxidsReturnValue: Set<Data>!
-    var unreconciledTxidsClosure: (() async throws -> Set<Data>)?
-
-    func unreconciledTxids() async throws -> Set<Data> {
-        if let error = unreconciledTxidsThrowableError {
-            throw error
-        }
-        unreconciledTxidsCallsCount += 1
-        if let closure = unreconciledTxidsClosure {
-            return try await closure()
-        } else {
-            return unreconciledTxidsReturnValue
-        }
-    }
-
 }
 class UTXOFetcherMock: UTXOFetcher {
 
