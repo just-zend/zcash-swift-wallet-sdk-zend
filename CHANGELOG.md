@@ -84,12 +84,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first-touch reads (possible since read-only calls left the database actor) could race the
   unsynchronized check-then-assign and construct two SQLite connections, silently dropping
   one and its serial queue with it.
-- The Slipstream stall watchdog no longer fires on a restarted engine's inherited history: the
-  engine-owned stall span can survive a stop→start, so a restart's first snapshots reported
-  stall time accumulated before — and across — a deliberate stop (a 497 s "stall" of which ~4.5
-  minutes the engine was stopped behind the migration gate), tripping the loud hung-engine log
-  at the exact moment recovery was working. The evaluated span is now clamped to the current
-  handle's own lifetime.
 - The migration sync gate's blocked stream now wakes AT its own known boundary: the in-flight
   marker's expiry is a wall-clock deadline the gate itself persists, yet the stream only
   re-evaluated on a flat 15-second ticker, leaving a cleared gate unnoticed for up to a whole
@@ -135,20 +129,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and so absent from `getTransactionOutputs(for:)`, until the transaction was
   mined and scanned. Shielded outputs stored by this path are also now tagged with
   their note commitment tree, as the ordinary send path already did.
-- `SlipstreamSynchronizer.wipe()` now deletes the submit-plan database file, restoring the
-  documented `Synchronizer.wipe()` contract ("`Synchronizer.wipe()` deletes the plan database
-  file") that previously only `SDKSynchronizer.wipe()` honored: a wallet wiped through the
-  Slipstream synchronizer left `submit_plans_<networkId>.db` behind, together with any retry
-  plans it held for transactions the wipe had just erased. [#1976]
-- Background transaction resubmission now runs under `SlipstreamSynchronizer` too: unmined,
-  unexpired transactions are periodically re-broadcast through their recorded submit plans, and
-  plans whose transactions have expired are pruned — matching `SDKSynchronizer`. A transaction
-  that never reached the network (submitted while the server was unreachable, or dropped from
-  every mempool it was sent to) previously got a second chance only on the old sync pipeline,
-  which ran the resubmission step once per sync pass; the Slipstream synchronizer has no action
-  list and so did nothing at all. It now drives the same resubmission core from its poll loop —
-  a check at most once a minute while the engine is syncing or synced, with the re-broadcast
-  itself throttled exactly as it always was. [#1975]
 
 ## Added
 
@@ -402,33 +382,26 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle `0` — re-propose instead of committing a persisted schedule.
 - New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0113`,
   `ZRUST0115`–`ZRUST0122`, `ZRUST0124`–`ZRUST0138`, `ZRUST0140`–`ZRUST0147`, and `ZRUST0149`
-  (`rustMigrationTakePreparation`, the preparation accessor). Five codes were
+  (`rustMigrationTakePreparation`, the preparation accessor). Ten codes were
   retired pre-release with the members they served — which is every gap in those ranges — and none
-  is reused: `ZRUST0098`
+  is reused: `ZRUST0093`–`ZRUST0097` (with the alternative sync engine they reported on, and its
+  whole handle lifecycle), `ZRUST0098`
   (`rustMigrationState`, with the SDK-side migration state machine), `ZRUST0114`
   (`rustMigrationIsSyncRequired`, with the always-false `zcashlc_migration_is_sync_required`, which
   never threw), `ZRUST0123`
   (`rustMigrationPendingTransferProposal`, with the kind-filtered queue peek), `ZRUST0139`
   (`rustMigrationDebugRescheduleTransfers`, with the debug-reschedule FFI), and `ZRUST0148`
   (`rustMigrationHasReadyBroadcast`, with the consumer-less ready-broadcast probe).
-
-### Slipstream sync engine
-
-- `SlipstreamSynchronizer`, an alternative `Synchronizer` implementation with non-linear
-  Spend-before-Sync scheduling, concurrent density-adaptive fetch, per-call Tor policy with server
-  failover, and a stall watchdog. Hosts opt in by constructing it; `SDKSynchronizer` remains the
-  default. It implements the migration group above with the same session separation. Error codes
-  `ZRUST0093`–`ZRUST0097`.
-- `SynchronizerState.isRecovering`.
-- `Synchronizer.allTransactions()` is now a protocol requirement, and
-  `TransactionRepository.unreconciledTxids()` exposes the read-side reconciliation view, defaulting
-  to empty where the engine's view is absent.
 - `Proposal.spendsLegacyOrchardFunds` — whether the proposal spends notes from
   the legacy Orchard pool, so wallets can warn before a turnstile-crossing send.
   `Proposal.testOnlyFakeProposal(totalFee:spendsLegacyOrchardFunds:)` gained a
   defaulted parameter for building test fixtures.
 
 ## Changed
+
+- `Synchronizer.allTransactions()` is now a protocol requirement. `SDKSynchronizer` already
+  implemented it, so no in-tree conformer changes; a downstream type conforming to `Synchronizer`
+  directly must now supply it.
 
 - `DBActor` now serializes only Swift-initiated writes, audited per call: verified read-only
   calls (wallet getters, balances, memos, the propose* family, DAO reads, migration
@@ -518,9 +491,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrecognized shielded protocol.
 - `getAccountsBalances()` no longer reports empty balances for up to ~30 s after a restore completes,
   which briefly zeroed the restored funds and any migration eligibility derived from them.
-- Under `SlipstreamSynchronizer`, the collapsed balance reported during a restore lands in the
-  Ironwood pool once NU6.3 is active rather than in Orchard, so a host gating a migration prompt on a
-  nonzero Orchard balance is no longer prompted on a guess. Totals are unchanged.
 - `applyKeystoneBatchSignatures(pczts:batchSignResponse:)` accepts a batch whose PCZT ids are not
   engine-numeric; it previously failed after an otherwise successful device scan.
 - A malformed or hostile lightwalletd subtree-roots response no longer crashes the process on an

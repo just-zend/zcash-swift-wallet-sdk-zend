@@ -553,7 +553,7 @@ The `WalletInitMode` enum is gone. `prepare(with:walletBirthday:...)` no longer 
 
 - an account already exists in `data.db` → open the existing wallet;
 - no account + a (past) birthday → **restore**: `recover_until` is set to the current chain tip, so
-  the `[birthday … tip]` backfill is tracked as recovery (`SynchronizerState.isRecovering`);
+  the `[birthday … tip]` backfill is tracked as recovery by the wallet backend;
 - no account + `nil` birthday → **new wallet**: starts at a reorg-safe recent height, no recovery phase.
 
 A deliberate re-scan is an explicit action — `rewind(_:)` — not an init mode. Update call sites:

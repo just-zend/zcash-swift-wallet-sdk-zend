@@ -403,8 +403,8 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     // Unlike the rest of this group, these four bypass `migrationHost.migration(for:)` entirely --
     // DB-free and account-free, they forward straight to `initializer.rustBackend` (see
     // `SDKSynchronizer.swift`'s own "ordinary PCZT operations" precedent: `createPCZTFromProposal`,
-    // `redactPCZTForSigner`, et al.), mirroring `SlipstreamSynchronizer`'s override of the same
-    // four. `ZcashRustBackendWelding` is substituted into the SAME container `SDKSynchronizer.init`
+    // `redactPCZTForSigner`, et al.).
+    // `ZcashRustBackendWelding` is substituted into the SAME container `SDKSynchronizer.init`
     // resolves `initializer.rustBackend` from (mirrors
     // `SynchronizerOfflineTests.testPreparePropagatesSeedNotRelevantFromRustBackend`'s seam), so
     // `welding` backs both the (here, unused) `OrchardMigrationHost` and the direct rust-backend

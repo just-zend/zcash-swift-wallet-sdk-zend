@@ -367,15 +367,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   broadcast rather than one already in the mempool.
 - Transfer amounts are read from the engine's `crossing_values()` instead of being re-derived at
   three marshal sites. The values are identical by construction, so no reported number changes.
-- `zcashlc_slipstream_start` sets the engine's anchor-retention floor to the NU6.3 activation height,
-  so a scheduled transfer's boundary anchor survives checkpoint pruning. Delivery previously stalled
-  in a permanent `AnchorNotFound` retry until the transfer expired.
-- Overlapping `zcashlc_slipstream_start` passes on one handle are serialized, fixing the panic
-  (`SyncState::Error(2)`, surfaced as `rustSlipstreamSyncFailed`) when an `importAccount`-triggered
-  restart ran two sessions against the same database.
-- `zcashlc_slipstream_wallet_summary` no longer returns the empty sentinel during the ~30 s gap after
-  a restore completes, and once NU6.3 is active reports the collapsed recovery balance in the
-  Ironwood pool rather than Orchard.
 
 ## 2.8.0-rc.2 - 2026-07-28
 
