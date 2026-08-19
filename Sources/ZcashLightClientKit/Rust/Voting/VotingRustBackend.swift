@@ -135,12 +135,17 @@ extension VotingRustBackend {
     /// `pirEndpoints` are probed in parallel via `pirResolver`. The first
     /// endpoint whose served snapshot height equals `expectedSnapshotHeight`
     /// exactly is used. See `PirSnapshotResolver` for the failure semantics.
+    ///
+    /// `pirLayout` must come from the round's resolved dynamic voting config.
+    /// `zcash_voting` fails the config/server layout handshake closed before any
+    /// private query, and rejects the `.unknown` default outright.
     public func precomputeDelegationPir(
         roundId: String,
         bundleIndex: UInt32,
         notes: [VotingNoteInfo],
         pirEndpoints: [String],
         expectedSnapshotHeight: UInt64,
+        pirLayout: VotingPirLayout = .unknown,
         pirResolver: PirSnapshotResolver = PirSnapshotResolver()
     ) async throws -> VotingDelegationPirPrecomputeResult {
         try requireOpenDatabase()
@@ -170,7 +175,11 @@ extension VotingRustBackend {
                             notesBuf.baseAddress,
                             UInt(notesBuf.count),
                             urlBuf.baseAddress,
-                            UInt(urlBuf.count)
+                            UInt(urlBuf.count),
+                            pirLayout.pirDepth,
+                            pirLayout.tier0Layers,
+                            pirLayout.tier1Layers,
+                            pirLayout.polyLen
                         )
                     }
                 }
@@ -406,6 +415,63 @@ extension VotingRustBackend {
             }
         }
     }
+
+    /// Record a confirmed cast-vote transaction in one atomic step.
+    ///
+    /// `zcash_voting` parses the confirmation events, records the transaction
+    /// hash, advances the vote-authority-note position and records the
+    /// vote-commitment tree position inside a single database transaction, then
+    /// returns both positions. Callers must not parse the events themselves:
+    /// splitting the `leaf_index` attribute by hand is exactly the duplicated
+    /// state this entry point exists to delete.
+    ///
+    /// `eventsJson` is the confirmation-events array the wallet's chain client
+    /// already fetches, serialized as JSON — a list of
+    /// `{"type": …, "attributes": [{"key": …, "value": …}]}` objects.
+    ///
+    /// Repeating the call with the same transaction hash and position is
+    /// accepted; a stale confirmation cannot rewind a position that a later one
+    /// already advanced.
+    public func confirmVoteSubmission(
+        roundId: String,
+        bundleIndex: UInt32,
+        proposalId: UInt32,
+        txHash: String,
+        eventsJson: String
+    ) throws -> VotingVoteConfirmation {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        let txHashBytes = [UInt8](txHash.utf8)
+        let eventsBytes = [UInt8](eventsJson.utf8)
+
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
+                txHashBytes.withUnsafeBufferPointer { txBuf in
+                    eventsBytes.withUnsafeBufferPointer { evBuf in
+                        zcashlc_voting_confirm_vote_submission(
+                            dbh,
+                            ridBuf.baseAddress,
+                            UInt(ridBuf.count),
+                            bundleIndex,
+                            proposalId,
+                            txBuf.baseAddress,
+                            UInt(txBuf.count),
+                            evBuf.baseAddress,
+                            UInt(evBuf.count)
+                        )
+                    }
+                }
+            }
+
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`confirm_vote_submission` failed")
+                )
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try decodeJSON(from: ptr)
+    }
 }
 
 // MARK: - Share tracking (static)
@@ -452,6 +518,77 @@ extension VotingRustBackend {
         }
         defer { zcashlc_string_free(ptr) }
         return String(cString: ptr)
+    }
+
+    /// Rebuild one helper-server share payload as `zcash_voting`'s own wire JSON.
+    ///
+    /// The crate parses the persisted recovery bundle, selects the requested
+    /// share, late-binds the confirmed vote-commitment-tree position and the
+    /// scheduled submission time, and serializes the payload itself. Nothing is
+    /// re-proved and nothing is committed a second time.
+    ///
+    /// - Parameters:
+    ///   - commitmentBundleJson: ``VotingStoredCommitmentBundle/bundleJson`` from
+    ///     `getCommitmentBundle(roundId:bundleIndex:proposalId:)`.
+    ///   - voteCommitmentTreePosition: the confirmed position, from
+    ///     ``VotingVoteConfirmation/voteCommitmentTreePosition``.
+    /// - Returns: the helper request body. POST it verbatim; do not decode,
+    ///   re-shape or re-encode it.
+    /// - Throws: `VotingRustBackendError.rustError` if the bundle JSON is
+    ///   malformed, its proposal does not match `proposalId`, or the share index
+    ///   is not present in it.
+    public static func recoverWireJson(
+        commitmentBundleJson: String,
+        proposalId: UInt32,
+        shareIndex: UInt32,
+        voteCommitmentTreePosition: UInt64,
+        submitAt: UInt64
+    ) throws -> String {
+        let bundleBytes = [UInt8](commitmentBundleJson.utf8)
+        let payload = try staticBoxedSliceFFI(fallback: "`recover_wire_json` failed") {
+            bundleBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_recover_wire_json(
+                    buf.baseAddress,
+                    UInt(buf.count),
+                    proposalId,
+                    shareIndex,
+                    voteCommitmentTreePosition,
+                    submitAt
+                )
+            }
+        }
+        return String(decoding: payload, as: UTF8.self)
+    }
+
+    /// List the share indices recoverable from a persisted vote recovery bundle.
+    ///
+    /// The crate parses the bundle and applies its own single-share slicing
+    /// (one share when the vote was single-share, all of them otherwise);
+    /// this reads off each recovered payload's own share index. Crash
+    /// recovery calls this instead of guessing a share count from
+    /// `singleShare` alone (`singleShare ? 1 : numOptions`), so a caller-side
+    /// guess can never under- or over-deliver relative to what the crate
+    /// actually reconstructs.
+    ///
+    /// - Parameter commitmentBundleJson: ``VotingStoredCommitmentBundle/bundleJson``
+    ///   from `getCommitmentBundle(roundId:bundleIndex:proposalId:)`.
+    /// - Returns: the recoverable share indices, in the crate's own order.
+    /// - Throws: `VotingRustBackendError.rustError` if the bundle JSON is
+    ///   malformed or its vote fields are out of range.
+    public static func recoverableShareIndices(
+        commitmentBundleJson: String
+    ) throws -> [UInt32] {
+        let bundleBytes = [UInt8](commitmentBundleJson.utf8)
+        let ptr = bundleBytes.withUnsafeBufferPointer { buf in
+            zcashlc_voting_recoverable_share_indices(buf.baseAddress, UInt(buf.count))
+        }
+        guard let ptr else {
+            throw VotingRustBackendError.rustError(
+                staticLastErrorMessage(fallback: "`recoverable_share_indices` failed")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try staticDecodeJSON(from: ptr)
     }
 }
 
@@ -585,8 +722,11 @@ extension VotingRustBackend {
         }
     }
 
-    /// Extract the 32-byte Orchard note-commitment-tree root from a
+    /// Extract the 32-byte Ironwood note-commitment-tree root from a
     /// protobuf-encoded `TreeState`.
+    ///
+    /// Voting rounds anchor to the Ironwood pool, so a round's `nc_root` is the
+    /// Ironwood tree's root at the snapshot height — not the Orchard tree's.
     public static func extractNcRoot(treeState: [UInt8]) throws -> [UInt8] {
         try staticBoxedSliceFFI(fallback: "`extract_nc_root` failed") {
             treeState.withUnsafeBufferPointer { buf in
@@ -1427,6 +1567,101 @@ extension VotingRustBackend {
         }
     }
 
+    /// Sign one delegation bundle's PCZT sighash with this account's own Orchard
+    /// SpendAuth key.
+    ///
+    /// `zcash_voting` 2.0 stopped deriving account keys and signing for its
+    /// callers, and prescribes this replacement for software wallets: load the
+    /// bundle's signing request (account index, network, seed fingerprint,
+    /// sighash and spend-auth randomizer), derive the account SpendAuth key from
+    /// the wallet seed, randomize it with the randomizer, and sign the sighash.
+    /// All of that happens in Rust — the seed goes in, only the detached
+    /// signature comes back out.
+    ///
+    /// This is the software counterpart of the Keystone flow: there, the device
+    /// produces the signature and the app extracts it from the signed PCZT; here
+    /// the wallet produces it itself. Both then call the same
+    /// ``getDelegationSubmission(roundId:bundleIndex:signature:sighash:)``,
+    /// which is the only remaining path into a submission payload.
+    ///
+    /// - Parameters:
+    ///   - keys: the same ``VotingDelegationKeyInputs`` used to build and prove
+    ///     this bundle. The crate loads the signing request through them, so a
+    ///     different account index, hotkey secret or seed fingerprint fails
+    ///     instead of silently signing for the wrong account.
+    ///   - seed: the wallet's root seed, at least 32 bytes. It is borrowed for
+    ///     the duration of this call, is never persisted or logged, and must be
+    ///     the seed whose fingerprint is in `keys` — a mismatch throws rather
+    ///     than producing a signature the chain would reject.
+    /// - Returns: the detached 64-byte SpendAuth signature and the 32-byte
+    ///   ZIP-244 sighash it covers. Pass both to `getDelegationSubmission`
+    ///   unchanged.
+    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
+    ///   open; ``VotingRustBackendError/invalidData`` if `seed` or the seed
+    ///   fingerprint is the wrong length; ``VotingRustBackendError/rustError``
+    ///   if the bundle has no stored signing request yet (its PCZT setup has not
+    ///   run), or the seed does not match the request.
+    public func signDelegationRequest(
+        roundId: String,
+        bundleIndex: UInt32,
+        keys: VotingDelegationKeyInputs,
+        seed: [UInt8]
+    ) throws -> VotingDelegationSignature {
+        guard keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
+            throw VotingRustBackendError.invalidData(
+                "seedFingerprint must be exactly \(votingSeedFingerprintByteCount) bytes"
+            )
+        }
+        guard seed.count >= votingMinSeedByteCount else {
+            throw VotingRustBackendError.invalidData(
+                "seed must be at least \(votingMinSeedByteCount) bytes"
+            )
+        }
+
+        let roundIdBytes = [UInt8](roundId.utf8)
+        let roundNameBytes = [UInt8](keys.roundName.utf8)
+
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
+                keys.fvk.withUnsafeBufferPointer { fvkBuf in
+                    keys.hotkeyStoredSecret.withUnsafeBufferPointer { secretBuf in
+                        keys.seedFingerprint.withUnsafeBufferPointer { fpBuf in
+                            roundNameBytes.withUnsafeBufferPointer { nameBuf in
+                                seed.withUnsafeBufferPointer { seedBuf in
+                                    zcashlc_voting_sign_delegation_request(
+                                        dbh,
+                                        ridBuf.baseAddress,
+                                        UInt(ridBuf.count),
+                                        bundleIndex,
+                                        fvkBuf.baseAddress,
+                                        UInt(fvkBuf.count),
+                                        secretBuf.baseAddress,
+                                        UInt(secretBuf.count),
+                                        fpBuf.baseAddress,
+                                        UInt(fpBuf.count),
+                                        keys.accountIndex,
+                                        nameBuf.baseAddress,
+                                        UInt(nameBuf.count),
+                                        seedBuf.baseAddress,
+                                        UInt(seedBuf.count)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`sign_delegation_request` failed")
+                )
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try decodeJSON(from: ptr)
+    }
+
     /// Get the delegation submission payload for an externally produced
     /// signature.
     ///
@@ -1523,6 +1758,7 @@ extension VotingRustBackend {
         _ params: VotingDelegationProofParams,
         pirEndpoints: [String],
         expectedSnapshotHeight: UInt64,
+        pirLayout: VotingPirLayout = .unknown,
         pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
         progress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> VotingDelegationProofResult {
@@ -1547,6 +1783,7 @@ extension VotingRustBackend {
             try syncBuildAndProveDelegation(
                 params,
                 pirServerUrl: pirServerUrl,
+                pirLayout: pirLayout,
                 progress: progress
             )
         }.value
@@ -1789,6 +2026,7 @@ private extension VotingRustBackend {
     func syncBuildAndProveDelegation(
         _ params: VotingDelegationProofParams,
         pirServerUrl: String,
+        pirLayout: VotingPirLayout,
         progress: (@Sendable (Double) -> Void)?
     ) throws -> VotingDelegationProofResult {
         let keys = params.keys
@@ -1833,6 +2071,10 @@ private extension VotingRustBackend {
                                             UInt(nameBuf.count),
                                             urlBuf.baseAddress,
                                             UInt(urlBuf.count),
+                                            pirLayout.pirDepth,
+                                            pirLayout.tier0Layers,
+                                            pirLayout.tier1Layers,
+                                            pirLayout.polyLen,
                                             trampoline,
                                             progressContext
                                         )

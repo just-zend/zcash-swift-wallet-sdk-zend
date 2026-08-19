@@ -37,7 +37,73 @@ Changes are relative to `2.8.0-rc.3`.
   network — a modified-mainnet chain votes with mainnet hotkeys and address
   HRPs — so `open` fails if that network has not been configured yet.
 
+- Two thin passthroughs to `zcash_voting` operations the SDK previously made callers assemble by
+  hand. `VotingRustBackend.confirmVoteSubmission(roundId:bundleIndex:proposalId:txHash:eventsJson:)`
+  hands the chain's confirmation events to the crate, which parses them, records the transaction
+  hash, advances the vote-authority-note position and records the vote-commitment tree position in
+  one database transaction, returning both as `VotingVoteConfirmation` — replacing a caller-side
+  `leaf_index` string split and a two-write window in which a crash could leave the two positions
+  disagreeing. `VotingRustBackend.recoverWireJson(commitmentBundleJson:proposalId:shareIndex:voteCommitmentTreePosition:submitAt:)`
+  rebuilds one helper-server payload from the persisted recovery bundle with the confirmed position
+  late-bound into it, without re-proving or committing again; the returned string is the helper
+  request body verbatim.
+
+- `ZcashSDK.nu63ConsensusBranchID` publishes the NU6.3 ("Ironwood") consensus branch ID,
+  `0x37a5_165b`. It was already used internally by the server-validation path; it is public now so
+  hosts that must name the era — voting delegations are rejected outright when built for the wrong
+  branch — take it from the SDK rather than copying the literal.
+
+- `VotingRustBackend.signDelegationRequest(roundId:bundleIndex:keys:seed:)` lets a software
+  wallet produce the SpendAuth signature a delegation submission needs. `zcash_voting 2.0` no
+  longer derives account keys or signs for its callers, which left
+  `getDelegationSubmission(roundId:bundleIndex:signature:sighash:)` reachable only by hardware
+  signers; this is the crate's own prescribed software path — it loads the bundle's signing
+  request, derives the account Orchard SpendAuth key from the wallet seed, randomizes it with
+  the request's spend-auth randomizer and signs the stored ZIP-244 sighash, returning the
+  detached signature and that sighash as `VotingDelegationSignature`. The seed is borrowed for
+  the call and never persisted, logged or handed to `zcash_voting`; the signature is checked
+  against the seed fingerprint the bundle was built for, so signing with the wrong seed fails
+  instead of producing a rejected transaction. Software and hardware delegation now converge on
+  the same submission entry point.
+
+- `VotingRustBackend.recoverableShareIndices(commitmentBundleJson:)` lists the share indices a
+  persisted vote recovery bundle can actually rebuild, via `zcash_voting::share::recover_payloads`'s
+  own single-share slicing. Crash recovery previously guessed a share count from `singleShare`
+  alone (`singleShare ? 1 : numOptions`), which under-delivers whenever the built share count
+  differs from the option count — four of sixteen built shares on a four-option proposal, in the
+  case that found this. The crate's recovered payloads are now the source of truth for which
+  indices to resubmit.
+
 ## Changed
+
+- Voting is pinned to `zcash_voting = "=3.0.0"` (exactly; a non-`=` requirement resolves to
+  1.0.0). The 2.0 family made the PIR layout an explicit client/server handshake, so
+  `VotingRustBackend.precomputeDelegationPir(...)` and `buildAndProveDelegation(...)` take a
+  `pirLayout: VotingPirLayout` — the `pir_depth`/`tier0_layers`/`tier1_layers` triple from the
+  round's resolved dynamic voting config. It defaults to `VotingPirLayout.unknown`, the crate's own
+  `PirLayout::UNKNOWN` sentinel, which `zcash_voting` rejects: a caller that does not pass a
+  resolved layout fails closed before any private query rather than querying with a guessed
+  geometry.
+
+  3.0 extends the handshake with the YPIR RLWE polynomial degree: `VotingPirLayout` gains a
+  required `polyLen` (2048 or 4096), sourced from the dynamic config's `pir_layout.poly_len` and
+  threaded through both wrappers, so PIR queries are built for the degree the server actually
+  serves. The 2.0 family hardcoded 2048 and fails against 4096 datasets with opaque tier-1 query
+  errors; 3.0 additionally verifies the advertised degree at connect and fails loudly on mismatch.
+  `VotingPirLayout.unknown` (`polyLen` 0) still fails closed. Separately, `VoteShareWire` now
+  carries `vote_round_id` (32 bytes, lowercase hex), so helper payloads from
+  `recoverWireJson(...)` include it — wallets that injected the field into the request body can
+  delete the injection.
+
+- The voting FFI no longer maintains its own copies of `zcash_voting`'s wire formats. Payloads bound
+  for the vote chain and the helper servers are serialized by the crate and handed across the
+  boundary verbatim, which makes two rc.4 wire corrections automatic rather than hand-written:
+  `VotingDelegationSubmission` gains `tx1Effects` (and loses the wire-level `sighash`), and helper
+  payloads no longer carry every helper's share. Concretely: `VotingDelegationSubmission`'s byte
+  fields are now base64 `String`s matching the crate's encoding; `VotingWireEncryptedShare`'s
+  `ciphertext1`/`ciphertext2` are base64 `String`s; `VotingSharePayload` is removed; and
+  `VotingVoteCommit` no longer carries `sharePayloads`, because payloads built before the vote's
+  tree position is confirmed are provisional and must not be submitted.
 
 - The migration sync gate is now BEHAVIOR-BASED, and its post-broadcast privacy buffer is gone
   along with `Synchronizer.migrationPrivacySyncBufferDuration` (the protocol requirement and its
@@ -178,6 +244,18 @@ Changes are relative to `2.8.0-rc.3`.
   list and so did nothing at all. It now drives the same resubmission core from its poll loop —
   a check at most once a minute while the engine is syncing or synced, with the re-broadcast
   itself throttled exactly as it always was. [#1975]
+- Voting delegation reads the **Ironwood** note-commitment tree, not the Orchard one. Voting notes
+  live in the Ironwood pool and a round's `nc_root` is the Ironwood tree's root at the snapshot
+  height, but `zcashlc_voting_generate_note_witnesses` decoded the Orchard tree out of the cached
+  `TreeState`, validated that Orchard root against the round's Ironwood `nc_root`, and generated
+  witnesses from the wallet's Orchard commitment tree; `VotingRustBackend.extractNcRoot(treeState:)`
+  computed the Orchard root too. The two pools are tracked separately and their roots never
+  coincide, so every delegation failed with `cached TreeState orchard root does not match round
+  nc_root` — on every chain, against every server, for every round. Witness generation now goes
+  through `zcash_voting`'s own Ironwood-aware path, which additionally rejects a wallet database
+  whose network differs from the round's and a snapshot height that is not NU6.3, and `extractNcRoot`
+  returns the Ironwood root. Two regression tests seed a `TreeState` carrying *both* pools and
+  assert the Ironwood one wins, so the wrong-pool read cannot return unnoticed.
 
 ## Added
 

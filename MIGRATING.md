@@ -1,5 +1,44 @@
 # Migrating from previous versions to _Unreleased_
 
+## Voting rides `zcash_voting` 3.0 — `VotingPirLayout` gains `polyLen`
+
+`VotingPirLayout`'s memberwise initializer gains a required `polyLen: UInt32` — the YPIR RLWE
+polynomial degree (2048 or 4096), taken from the dynamic voting config's `pir_layout.poly_len` —
+and `precomputeDelegationPir(...)` / `buildAndProveDelegation(...)` consume it through the layout.
+`VotingPirLayout.unknown` (`polyLen` 0) fails closed before any private query. Treat a config
+without `poly_len` as a configuration error rather than defaulting: the server's dataset geometry
+is bound to the value, and 3.0 clients verify the advertised degree at connect.
+
+Helper-server payloads returned by `recoverWireJson(...)` now include `vote_round_id`
+(lowercase hex). Remove any app-side injection of that field; the payload remains verbatim wire
+JSON — do not decode, re-shape or re-encode it.
+
+## Voting wire payloads are produced by `zcash_voting`, not by the SDK
+
+`VotingSharePayload` is removed and `VotingVoteCommit.sharePayloads` is gone with it. Helper-server
+payloads are now obtained after confirmation, one per share index:
+
+```swift
+let bundle = try backend.getCommitmentBundle(
+    roundId: roundId, bundleIndex: bundleIndex, proposalId: proposalId
+)
+let payload = try VotingRustBackend.recoverWireJson(
+    commitmentBundleJson: bundle!.bundleJson,
+    proposalId: proposalId,
+    shareIndex: shareIndex,
+    voteCommitmentTreePosition: confirmation.voteCommitmentTreePosition,
+    submitAt: submitAt
+)
+```
+
+`payload` is the helper request body verbatim — do not decode, re-shape or re-encode it.
+
+`VotingDelegationSubmission` and `VotingWireEncryptedShare` are now decoded from the crate's own
+wire structs, so their byte fields are base64 `String`s rather than `[UInt8]`, `sighash` is gone
+from the delegation submission (the vote chain derives the signing digest itself), and
+`tx1Effects` is present. A host that base64-encoded these fields itself before putting them on the
+wire must stop and send the strings as they arrive.
+
 ## The SDK-side migration state machine is removed — `migrationAdvanceStep` replaces it
 
 The public 5-state `MigrationState` enum, `MigrationAttentionReason`, and
