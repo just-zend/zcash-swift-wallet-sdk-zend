@@ -2,13 +2,43 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-17
+Last reviewed: 2026-08-18
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-18)
+
+- Fresh fetches confirm the remote and default-branch invariants, with
+  `origin/main=4497fe9e` and `upstream/main=31a35c56`; divergence is `174 434`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  was refreshed at `f0742dc2` and contains the exact upstream tip (`181 0` against
+  `upstream/main`). It remains the sole full-parity vehicle; do not create a duplicate
+  sync branch or PR.
+- Upstream [#1983](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1983) merged the
+  approved voting 3.0 sequence from #1972 into the formerly blocked #1962 branch. The
+  16-commit parity delta updates `zcash_voting`, Rust and Swift voting bindings, the NU6.3
+  consensus-branch constant, migration documentation, and voting OfflineTests. The Zend merge
+  applied without conflicts. `cargo fmt` made only two test-assertion layout adjustments;
+  `git diff --check` passes for both merge parents.
+- `swift build` fails before tests because the released Zend XCFramework lacks both the existing
+  migration/Slipstream/readback declarations and now the voting 3.0 FFI surface. Representative
+  missing symbols include `FfiTransactionData`, `FfiMigrationProgress`,
+  `FfiSlipstreamSnapshot`, `zcashlc_slipstream_open`, and
+  `zcashlc_voting_confirm_vote_submission`; several legacy voting calls also have stale
+  signatures. Do not run OfflineTests until exact private `librustzcash`,
+  `slipstream-internal`, and `zcash_voting` provenance is frozen; all arm64 artifact slices and
+  generated headers are rebuilt and verified; release wiring is reviewed; and funded-device
+  migration and voting evidence exists.
+- No unmerged upstream candidate is independently ready, useful, and low risk. #1985 is green
+  but review-required and alters Slipstream reconciliation views; #1984 is a 3.0.0 release PR
+  with requested changes; #1982 is draft and conflicting; #1964 is the ZODL-specific AGPL
+  vendoring option; and #1968, #1961, #1895, and the Dependabot set are conflicting,
+  review-required, or migration/artifact-coupled. No Zend labels apply to upstream parity work,
+  and no source-independent early carry is justified.
 
 ## Parity and bleeding-edge refresh (2026-08-17)
 
