@@ -2,13 +2,35 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-18
+Last reviewed: 2026-08-19
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-19)
+
+- Fresh fetches leave the default-branch relationship unchanged:
+  `origin/main=4497fe9e`, `upstream/main=31a35c56`, and divergence is `174 434`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  still contains the exact upstream tip (`0 182` against `upstream/main`), so it remains the
+  sole full-parity vehicle. Do not create another sync branch or PR.
+- Upstream [#1984](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1984) is the active
+  `review/3.0.0` release review. It is `BLOCKED` with requested changes and is 10 commits ahead
+  but 40 commits behind `upstream/main`. Its latest merged review layer, upstream
+  [#1987](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1987), removes the
+  ZODL Slipstream engine, its FFI and tests, and the private-dependency CI authorization so the
+  release can be MIT-only. This broad, release-line reconciliation is neither upstream-ready nor
+  independently verifiable against Zend's existing migration/FFI artifact gate; wait for upstream
+  release completion and a separately verified Zend artifact plan.
+- The newly active `pacu/zodl-slipstream-vendoring` branch is a 17-commit, 78-file dual-artifact
+  and licensing design that explicitly vendors the ZODL Slipstream variant. Its small dependent
+  `pacu/fix-ext-slipstream-view-names` follow-up still relies on that unmerged engine surface.
+  Neither is a Zend early-carry candidate. Existing open migration, send-max, release, and
+  Dependabot work remains draft, conflicting, review-required, or artifact-coupled. No labels
+  apply and no source-independent carry is justified.
 
 ## Parity and bleeding-edge refresh (2026-08-18)
 
