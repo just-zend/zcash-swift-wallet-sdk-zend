@@ -2,13 +2,34 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-19
+Last reviewed: 2026-08-20
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-20)
+
+- Fresh fetches leave the default-branch relationship unchanged:
+  `origin/main=4497fe9e`, `upstream/main=31a35c56`, and divergence is `174 434`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  at `f0742dc2` still contains the exact upstream tip (`182 0` against
+  `upstream/main`). Reuse it as the sole full-parity vehicle; do not create a
+  duplicate sync branch or PR.
+- New upstream [#1988](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1988) is a clean,
+  approved, one-file release-script option-order repair, but it targets `maint/v2.7.x` rather
+  than `main` and its branch is 11 commits beyond the current upstream default. Zend has no
+  evidence of the maintenance-line invocation failure, and a mainline parity merge would absorb
+  a successor only after upstream integration. Do not early-carry this release-line-only patch.
+- The open 3.0 release review, Ironwood migration and send-max branches, Slipstream vendoring
+  branches, database stack, and Dependabot set remain blocked, dirty, draft, review-required,
+  release-line-only, or coupled to the same private-engine/FFI artifact gate. No independently
+  ready, useful, low-risk Zend carry exists, and no labels apply to upstream parity work.
+- This is a documentation-only monitoring record. `git diff --check` is sufficient; no Zend SDK
+  source or FFI artifact changed, so `swift build` and `swift test --filter OfflineTests` are not
+  rerun.
 
 ## Parity and bleeding-edge refresh (2026-08-19)
 
