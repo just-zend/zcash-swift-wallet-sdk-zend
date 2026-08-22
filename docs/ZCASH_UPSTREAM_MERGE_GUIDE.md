@@ -2,13 +2,37 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-20
+Last reviewed: 2026-08-21
 
 ## Remote and branch invariants
 
 - `origin` must point to `git@github.com:just-zend/zcash-swift-wallet-sdk-zend.git`.
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
+
+## Parity and bleeding-edge refresh (2026-08-21)
+
+- Fresh fetches leave the default-branch relationship unchanged:
+  `origin/main=4497fe9e`, `upstream/main=31a35c56`, and divergence is `174 434`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  at `f0742dc2` still contains the exact upstream tip (`182 0` against
+  `upstream/main`). Reuse it as the sole full-parity vehicle; do not create a
+  duplicate sync branch or PR.
+- New upstream [#1989](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1989)
+  (`dw/redact-rust-errors`) would turn proposal failures into typed, redacted Rust-to-Swift
+  error reports, which is directionally compatible with Zend's rule never to log raw FFI error
+  payloads. However, it is a draft, `BLOCKED`, and review-required two-commit migration across
+  19 files: a new Rust error-reporting ABI, FFI welding, generated error cases, public error
+  behavior, Slipstream synchronization, and tests. It is not independently verifiable while
+  Zend's matching XCFramework/header provenance remains gated, so do not early-carry it; wait
+  for upstream review/merge and reconcile it through the artifact-backed parity path.
+- The 3.0 release review, migration and send-max branches, Slipstream vendoring, database stack,
+  maintenance-line fixes, and Dependabot set remain draft, dirty, blocked, review-required,
+  release-line-only, or coupled to the same private-engine/FFI artifact gate. No independently
+  ready, useful, low-risk Zend carry exists, and no labels apply to upstream parity work.
+- This is a documentation-only monitoring record. `git diff --check` is sufficient; no Zend SDK
+  source or FFI artifact changed, so `swift build` and `swift test --filter OfflineTests` are not
+  rerun.
 
 ## Parity and bleeding-edge refresh (2026-08-20)
 
