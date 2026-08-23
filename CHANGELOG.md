@@ -161,6 +161,9 @@ Changes are relative to `2.8.0-rc.3`.
 
 ## Fixed
 
+- `ZcashRustBackend.decryptAndStoreTransaction` now treats the FFI's `-1` error sentinel as a
+  failure. Failed transaction enhancement is retried instead of being recorded as a zero txid.
+
 - Transactions created from both ordinary proposals and finalized PCZTs are now returned for
   broadcast from the wallet store instead of being reconstructed from `v_transactions`. If that
   history view has not projected the stored row yet, sends and transparent-fund shielding continue
