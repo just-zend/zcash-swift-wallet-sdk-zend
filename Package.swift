@@ -6,7 +6,12 @@ import Foundation
 // When LocalPackages/Package.swift exists (created by Scripts/init-local-ffi.sh),
 // the SDK builds against the locally-built FFI instead of the pre-built binary
 // from GitHub Releases. Run `rm -rf LocalPackages` to switch back.
-let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
+// SwiftPM may evaluate `#filePath` as the relative string `Package.swift` when
+// running tests, which makes the old path calculation point at `/LocalPackages`
+// and silently selects the published FFI instead. SwiftPM invokes package
+// commands from the package root, so its working directory is the reliable
+// location for this development-only override.
+let packageDir = FileManager.default.currentDirectoryPath
 let useLocalFFI = FileManager.default.fileExists(atPath: packageDir + "/LocalPackages/Package.swift")
 
 var dependencies: [Package.Dependency] = [
