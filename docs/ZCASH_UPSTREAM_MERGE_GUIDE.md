@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-07-26
+Last reviewed: 2026-08-22
 
 ## Remote and branch invariants
 
@@ -10,7 +10,24 @@ Last reviewed: 2026-07-26
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current monitor status (2026-07-26)
+## Current reconciliation boundary (2026-08-22)
+
+- Zend `main` is `c70edbcd` and upstream `main` is `31a35c56` after fresh
+  fetches. Draft Zend [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  contains the upstream tip, but the source and its matching released FFI
+  artifact are not yet reconciled.
+- Keep #34 draft until the exact `librustzcash` and private-engine revisions,
+  generated headers, required XCFramework slices, release wiring, and
+  funded-device migration evidence are verified together. Its current dirty
+  merge state must be resolved against the then-current Zend `main` before
+  merge readiness is reconsidered.
+- Reuse an existing parity or tracker PR when it covers the same upstream
+  range. Do not create competing sync branches or documentation-only PRs.
+- A directionally useful upstream change is not a safe early carry when it
+  crosses a coupled migration, FFI, generated-code, artifact, or release graph
+  that Zend cannot independently verify.
+
+## Historical monitor status (2026-07-26)
 
 - After fetching both remotes, both default branches remain `main`; `origin/main` is
   `203473ba` and `upstream/main` is `769809a2`. The parity count is `173 0`, and
@@ -40,13 +57,17 @@ Use this flow when `upstream/main` has commits not present in `origin/main`.
 
 1. `git fetch --prune origin && git fetch --prune upstream`
 2. Compute parity gap: `git log --oneline origin/main..upstream/main`
-3. Create sync branch: `codex/zcash-upstream-sync-YYYY-MM-DD` (add `-2`, `-3`, ... if needed)
+3. Reuse an existing Zend parity branch that already contains the upstream tip;
+   otherwise create `codex/zcash-upstream-sync-YYYY-MM-DD` (add `-2`, `-3`, ... if needed).
 4. Start from fork default branch: `git switch -c <branch> origin/main`
 5. Prefer `git merge --no-ff upstream/main` for low-risk parity adoption.
-6. Resolve conflicts by preserving Zend-specific behavior/branding while adopting upstream SDK fixes.
+6. Resolve conflicts by preserving Zend-specific branding, release integration,
+   privacy/Tor behavior, and audited artifact policy while adopting upstream
+   protocol-correctness fixes.
 7. Verify:
    - `swift build`
    - `swift test --filter OfflineTests`
+   - `cargo fmt` in `rust/` when Rust changes.
 8. Open a **draft PR** to `main` with:
    - upstream commit list,
    - conflict resolutions,
@@ -60,6 +81,8 @@ Treat non-merged upstream work as optional and higher risk. Carry only when all 
 - Ready: non-draft or demonstrably stable, no unresolved structural conflicts.
 - Useful: immediate Zend roadmap value.
 - Low risk: scoped changes, manageable blast radius, and testable locally.
+- Independently verifiable: it can be tested against Zend's committed FFI
+  artifact without relying on unresolved provenance or funded-device evidence.
 
 If carried early:
 
@@ -68,7 +91,23 @@ If carried early:
 3. Run `swift build` and `swift test --filter OfflineTests` when feasible.
 4. Open a **draft PR** linking the upstream PR/branch and documenting risks.
 
-If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
+If not carried, record the explicit reason (draft/WIP, dirty rebase state,
+blocked reviews, coupled dependency/artifact graph, high risk, or low Zend
+value).
+
+## Artifact and release gates
+
+The SDK source, generated headers, and committed `libzcashlc` XCFramework are
+one provenance-checked release unit. Before merging a Rust/Swift FFI or
+migration-surface change, require the exact source revisions, rebuilt and
+verified headers and framework slices, reviewed `Package.swift` release
+wiring, and funded-device migration validation. Passing a source merge or a
+local Swift build alone does not clear these gates.
+
+For documentation-only monitoring changes, `git diff --check` is sufficient;
+state that source and artifact checks were not run. For source or artifact
+changes, run `Scripts/verify-ironwood-ffi-artifact.sh`, `swift build`, and
+`swift test --filter OfflineTests`, plus `cargo fmt` for Rust changes.
 
 ## Zend divergence notes
 
@@ -179,7 +218,9 @@ checks together. Zend SDK release numbering remains separate from upstream and F
 When conflicts occur:
 
 - Keep upstream protocol/consensus correctness changes unless Zend has an audited override.
-- Keep Zend-facing naming/branding and integration points where they intentionally differ.
+- Keep Zend-facing naming/branding, artifact URLs and checksums, release
+  integration, privacy/Tor behavior, and integration points where they
+  intentionally differ.
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
