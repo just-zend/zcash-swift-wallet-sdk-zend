@@ -51,6 +51,7 @@ VERSION="$1"
 # Release onto the repo the workflow runs in (GITHUB_REPOSITORY in Actions), so forks can
 # publish their own FFI releases — the hardcoded upstream 403s under a fork's CI token.
 REPO="${GITHUB_REPOSITORY:-zcash/zcash-swift-wallet-sdk}"
+SOURCE_REVISION="${GITHUB_SHA:-$(git rev-parse HEAD)}"
 PRODUCTS_DIR="BuildSupport/products"
 ZIP_FILE="libzcashlc.xcframework.zip"
 
@@ -126,11 +127,19 @@ if gh release view "$VERSION" --repo "$REPO" &>/dev/null; then
         gh release edit "$VERSION" --repo "$REPO" "${PRERELEASE_FLAG[@]}"
     fi
 else
+    RELEASE_NOTES="Zcash Light Client SDK ${VERSION}
+
+Source: https://github.com/${REPO}/commit/${SOURCE_REVISION}"
+    if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+        RELEASE_NOTES="${RELEASE_NOTES}
+Workflow: https://github.com/${REPO}/actions/runs/${GITHUB_RUN_ID}"
+    fi
     gh release create "$VERSION" \
         "$PRODUCTS_DIR/$ZIP_FILE" \
         --repo "$REPO" \
+        --target "$SOURCE_REVISION" \
         --title "$VERSION" \
-        --notes "Zcash Light Client SDK ${VERSION}" \
+        --notes "$RELEASE_NOTES" \
         --draft \
         "${PRERELEASE_FLAG[@]}"
 fi
