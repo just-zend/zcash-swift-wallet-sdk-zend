@@ -327,7 +327,7 @@ class PaymentURIFulfillmentTests: ZcashTestCase {
         } catch ZcashError.rustProposeTransferFromURI {
             XCTAssertTrue(true)
         } catch {
-            XCTFail("Expected ZcashError.rustCreateToAddress but got \(error.localizedDescription)")
+            XCTFail("Expected ZcashError.rustProposeTransferFromURI but got \(error.localizedDescription)")
         }
     }
 
