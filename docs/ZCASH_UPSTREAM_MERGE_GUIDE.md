@@ -35,6 +35,13 @@ Last reviewed: 2026-08-27
 - A directionally useful upstream change is not a safe early carry when it
   crosses a coupled migration, FFI, generated-code, artifact, or release graph
   that Zend cannot independently verify.
+- The 2026-08-27 bleeding-edge scan has no ready Zend carry: #1988 is an
+  approved `maint/v2.7.x`-only release-script fix with no Zend failure
+  evidence; #1984 is blocked with requested changes; #1982, #1961, #1895,
+  and #1893 are draft and/or dirty migration, send-max, or Slipstream work;
+  #1968 and #1944 are dirty or blocked; and the active ZODL vendoring,
+  dependency, release, and maintenance branches remain coupled or
+  review-required. Do not label upstream parity with `zodl`.
 
 ## Historical monitor status (2026-07-26)
 
