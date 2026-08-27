@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-22
+Last reviewed: 2026-08-27
 
 ## Remote and branch invariants
 
@@ -10,12 +10,21 @@ Last reviewed: 2026-08-22
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current reconciliation boundary (2026-08-22)
+## Current reconciliation boundary (2026-08-27)
 
-- Zend `main` is `c70edbcd` and upstream `main` is `31a35c56` after fresh
+- Zend `main` is `95231c39` and upstream `main` is `2099bf71` after fresh
   fetches. Draft Zend [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
-  contains the upstream tip, but the source and its matching released FFI
-  artifact are not yet reconciled.
+  contains the upstream tip, including #1989's typed, redacted Rust proposal
+  errors, but the source and its matching released FFI artifact are not yet
+  reconciled.
+- The #1989 merge applied without conflicts and preserves Zend release wiring,
+  branding, privacy/Tor behavior, and provenance controls. `cargo fmt` and
+  both merge-parent `git diff --check` checks pass. `swift build --jobs 2`
+  fails before tests because the released Zend XCFramework header lacks the
+  required upstream migration, Slipstream, and voting declarations, including
+  `FfiTransactionData`, `FfiMigrationProgress`, `FfiSlipstreamSnapshot`, and
+  `zcashlc_voting_confirm_vote_submission`. Do not run OfflineTests until a
+  matching artifact permits compilation.
 - Keep #34 draft until the exact `librustzcash` and private-engine revisions,
   generated headers, required XCFramework slices, release wiring, and
   funded-device migration evidence are verified together. Its current dirty
