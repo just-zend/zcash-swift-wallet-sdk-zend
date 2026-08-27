@@ -63,6 +63,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write-lane pass (the platform's next advance-step, prove, or delivery call — typically its next
   sync edge or UI refresh); checkmark/"done" rendering is unaffected (it derives from the
   wallet's own mined transactions).
+- `Synchronizer.allTransactions()` is now a protocol requirement. `SDKSynchronizer` already
+  implemented it, so no in-tree conformer changes; a downstream type conforming to `Synchronizer`
+  directly must now supply it.
+- `DBActor` now serializes only Swift-initiated writes, audited per call: verified read-only
+  calls (wallet getters, balances, memos, the propose* family, DAO reads, migration
+  block-rate samples) run off the actor and never queue behind proof generation or other
+  writes, while every write-bearing call — including each proof chunk, and the migration
+  status/progress reads, which persist mined-ness promotions under the hood — holds the
+  actor so no two Swift-initiated writes can interleave.
+- Updated the librustzcash crates to `zcash_client_backend 0.24.0-rc.7`,
+  `zcash_client_sqlite 0.22.0-rc.8`, `zcash_protocol 0.10.4` and `pczt 0.9.3`, which are the
+  source of `ZcashTransaction.Overview.zip318Kind` and of the
+  `createTransactionFromPCZT` Ironwood-output fix.
 
 ## Fixed
 
@@ -129,6 +142,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and so absent from `getTransactionOutputs(for:)`, until the transaction was
   mined and scanned. Shielded outputs stored by this path are also now tagged with
   their note commitment tree, as the ordinary send path already did.
+- `SynchronizerEvent.minedTransaction` fires again. The event had been dead in production since
+  the adoption of transaction data requests — `BlockEnhancer` never invoked its mined-transaction
+  callback, so an app never learned a pending sent transaction had mined except by chance. It now
+  fires exactly once per unmined→mined transition of a sent transaction: from the enhancement arm
+  for shielded transactions, and from a mined `GetStatus` answer for fully-transparent ones. A
+  failed status write, previously discarded, now throws the new
+  `ZcashError.rustSetTransactionStatus` (`ZRUST0107`).
+- Server validation now rejects a server whose tip tree state carries no Ironwood frontier while
+  the chain is on the NU6.3 branch, with the new
+  `ZcashError.compactBlockProcessorServerMissingIronwoodSupport` (`ZCBPEO0024`). Absent Ironwood
+  chain metadata previously read as zero and satisfied the scanner's tree-size check, so such a
+  server failed silently — and scanning is the only mined-status oracle for shielded
+  transactions, whose txids are never disclosed for status polling.
 
 ## Added
 
@@ -180,13 +206,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   members work without `prepare()`, so a background session can deliver a transfer without starting
   sync, and on custom networks without a prior `Initializer`. `ClosureSynchronizer` and
   `CombineSynchronizer` do not mirror the group.
-- Value types: `MigrationAdvanceStep`, `MigrationBroadcastInstruction`, `MigrationProveTarget`,
+- Value types: `MigrationAdvanceStep`, `MigrationAdvance` (with `MigrationNextWork` and
+  `MigrationStepKind`), `MigrationBroadcastInstruction`, `MigrationProveTarget`,
   `MigrationProveOutcome`, `MigrationProgress`, `MigrationSchedule`,
   `MigrationTransferProposal`, `MigrationTransferResult`,
   `MigrationRunEstimate` (with `MigrationRunEstimate.Run`), `MigrationSyncWakeup`,
   `MigrationPreparationStep`, `MigrationSigningBudget`, `NoteSplitProposal`,
   `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`,
-  `MigrationTransactionStatus`, `KeystoneBatchDecodeResult`, and
+  `MigrationTransactionStatus` (with `MigrationInvalidReason`), `KeystoneBatchDecodeResult`, and
   `KeystoneFirmwareVersion`. Migration transaction ids are `UInt32`.
 - State: `migrationAdvanceStep(accountUUID:)` drives the migration engine's public
   `advance_migration` decision, ALWAYS projecting the wall-clock chain-tip estimate alongside the
@@ -383,8 +410,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0113`,
   `ZRUST0115`–`ZRUST0122`, `ZRUST0124`–`ZRUST0138`, `ZRUST0140`–`ZRUST0147`, and `ZRUST0149`
   (`rustMigrationTakePreparation`, the preparation accessor). Ten codes were
-  retired pre-release with the members they served — which is every gap in those ranges — and none
-  is reused: `ZRUST0093`–`ZRUST0097` (with the alternative sync engine they reported on, and its
+  retired pre-release with the members they served, and none is reused; the ranges' other gaps
+  are accounted for elsewhere (`ZRUST0107` is the enhancement-path case above, and
+  `ZRUST0109`/`ZRUST0110` predate this release). The retired codes:
+  `ZRUST0093`–`ZRUST0097` (with the alternative sync engine they reported on, and its
   whole handle lifecycle), `ZRUST0098`
   (`rustMigrationState`, with the SDK-side migration state machine), `ZRUST0114`
   (`rustMigrationIsSyncRequired`, with the always-false `zcashlc_migration_is_sync_required`, which
@@ -396,23 +425,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the legacy Orchard pool, so wallets can warn before a turnstile-crossing send.
   `Proposal.testOnlyFakeProposal(totalFee:spendsLegacyOrchardFunds:)` gained a
   defaulted parameter for building test fixtures.
-
-## Changed
-
-- `Synchronizer.allTransactions()` is now a protocol requirement. `SDKSynchronizer` already
-  implemented it, so no in-tree conformer changes; a downstream type conforming to `Synchronizer`
-  directly must now supply it.
-
-- `DBActor` now serializes only Swift-initiated writes, audited per call: verified read-only
-  calls (wallet getters, balances, memos, the propose* family, DAO reads, migration
-  block-rate samples) run off the actor and never queue behind proof generation or other
-  writes, while every write-bearing call — including each proof chunk, and the migration
-  status/progress reads, which persist mined-ness promotions under the hood — holds the
-  actor so no two Swift-initiated writes can interleave.
-- Updated the librustzcash crates to `zcash_client_backend 0.24.0-rc.7`,
-  `zcash_client_sqlite 0.22.0-rc.7`, `zcash_protocol 0.10.4` and `pczt 0.9.2`, which are the
-  source of `ZcashTransaction.Overview.zip318Kind` and of the
-  `createTransactionFromPCZT` Ironwood-output fix.
 
 # 2.8.0-rc.3 - 2026-07-29
 

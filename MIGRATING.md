@@ -1,4 +1,4 @@
-# Migrating from previous versions to _Unreleased_
+# Migrating from previous versions to 3.0.0
 
 ## The SDK-side migration state machine is removed — `migrationAdvanceStep` replaces it
 
