@@ -154,7 +154,9 @@ or one whose anchor the wallet cannot resolve yet) do not spend the budget.
 `proveMigrationTransactions(accountUUID:_:maxProofs:)` no longer returns a bare `Int`. It returns
 `MigrationProveOutcome` — `totalProved` plus `preparationTxids`. **Breaking, with no deprecation
 period** (nothing here has shipped in a release): a caller that used the count reads
-`outcome.totalProved`.
+`outcome.totalProved`. The transaction-id handoff is semantically typed: `preparationTxids` is
+`[TxId]`, `takeMigrationPreparation(accountUUID:byTxid:)` takes `TxId`, and the returned
+`PreparedMigrationTransfer.txid` and `MigrationTransferResult.success(txId:)` both carry `TxId`.
 
 The ruling behind the new shape, verbatim in substance:
 
@@ -497,8 +499,9 @@ the app executes through the normal transaction pipeline, with one new call to r
   no engine plan cache behind it: nothing about the returned proposal can go stale the way a
   `MigrationSchedule` preview can, and `signAndStoreMigrationSchedule` is not part of this lane (it
   remains for `proposeMigrationTransfers`'s gradual path).
-- **New: `recordImmediateMigration(accountUUID:txid:) async throws`.** Call it after a successful
-  broadcast (software or Keystone lane) so the platform migration state machine reports the sweep:
+- **New: `recordImmediateMigration(accountUUID:txid:) async throws`.** Pass the broadcast
+  transaction's `TxId` after a successful broadcast (software or Keystone lane) so the platform
+  migration state machine reports the sweep:
   `InProgress(0 of 1)` while unmined, then a quiet `NotStarted` once it mines. A MINED immediate
   sweep is CONSUMED — it is NOT surfaced as `Complete`, so there is nothing for the user to
   acknowledge and no per-run completion screen (the sweep zeroes the spendable Orchard balance, so
@@ -575,7 +578,7 @@ behavior (`SDKSynchronizer` does):
 - **New: `migrationTransactionStatuses(accountUUID:) async throws -> [MigrationTransactionStatus]`.**
   The live per-transaction detail view behind `migrationProgress(accountUUID:)`'s aggregate
   summary: every committed migration transaction's kind (preparation layer/index or transfer
-  crossing), lifecycle state (`broadcast`/`mined` fold the engine's txid/mined-height payload into
+  crossing), lifecycle state (`broadcast(txid:)` carries `TxId`, while `mined` folds the engine's height into
   the matching case, so illegal combinations are unrepresentable — a MINED row's txid is NOT
   carried by the engine's own state model), scheduled/expiry heights, readiness, and next
   action/blocker, keyed by a stable id. A verbatim marshal of the engine's own

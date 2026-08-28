@@ -582,9 +582,6 @@ public enum ZcashError: Equatable, Error {
     /// Thrown by MigrationBroadcaster when the dedicated migration Tor runtime or an isolated connection cannot be established before the submit attempt; the transaction was not broadcast.
     /// ZRUST0121
     case migrationTorUnavailable
-    /// The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult.
-    /// ZRUST0122
-    case migrationInvalidTxId(_ txId: String)
     /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned. The sync gate's in-flight marker is deliberately left set on this path and self-expires.
     /// - `error` is the underlying failure from ZcashRustBackend.migrationRecordTransferResult.
     /// ZRUST0124
@@ -1120,7 +1117,6 @@ public enum ZcashError: Equatable, Error {
         case .rustMigrationCreateUnsignedTransferPczts: return "Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedTransferPczts"
         case .rustMigrationStoreSignedSchedulePczts: return "Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePczts"
         case .migrationTorUnavailable: return "Tor was requested for a migration broadcast but could not be established."
-        case .migrationInvalidTxId: return "The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult."
         case .migrationRecordFailedAfterBroadcast: return "The migration engine failed to record a successfully submitted broadcast. The broadcast DID land; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned. The sync gate's in-flight marker is deliberately left set on this path and self-expires."
         case .migrationSyncBlocked: return "Synchronizer.start() was refused because the migration privacy gate is active."
         case .migrationBroadcastDuringSync: return "A broadcast-performing migration method was called while the synchronizer is actively syncing."
@@ -1391,7 +1387,6 @@ public enum ZcashError: Equatable, Error {
         case .rustMigrationCreateUnsignedTransferPczts: return .rustMigrationCreateUnsignedTransferPczts
         case .rustMigrationStoreSignedSchedulePczts: return .rustMigrationStoreSignedSchedulePczts
         case .migrationTorUnavailable: return .migrationTorUnavailable
-        case .migrationInvalidTxId: return .migrationInvalidTxId
         case .migrationRecordFailedAfterBroadcast: return .migrationRecordFailedAfterBroadcast
         case .migrationSyncBlocked: return .migrationSyncBlocked
         case .migrationBroadcastDuringSync: return .migrationBroadcastDuringSync

@@ -135,7 +135,7 @@ private func performDictate(
     on synchronizer: Synchronizer,
     options: MigrationNetworkPrivacyOptions,
     maxProofs: Int,
-    submitRawTransaction: (Data) async -> String?
+    submitRawTransaction: (Data) async -> TxId?
 ) async throws {
     switch advance?.step {
     case .prove(let instruction):

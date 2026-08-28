@@ -260,7 +260,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `proveMigrationTransactions(accountUUID:_:maxProofs:)` returns `MigrationProveOutcome` — the
   total proved plus THE TXIDS OF THE PREPARATIONS IT PROVED, and only those — and the new
   `takeMigrationPreparation(accountUUID:byTxid:)` hands each one back as a
-  `PreparedMigrationTransfer`. THE ACCESSOR IS THE SEAM: `txid -> row -> the store's atomic
+  `PreparedMigrationTransfer`. Transaction ids use `TxId` throughout this public handoff:
+  `MigrationProveOutcome.preparationTxids`, `PreparedMigrationTransfer.txid`,
+  `MigrationTransactionStatus.State.broadcast(txid:)`, `MigrationTransferResult.success(txId:)`,
+  and the accessor's `byTxid` parameter.
+  THE ACCESSOR IS THE SEAM: `txid -> row -> the store's atomic
   broadcast seam`, in one database transaction, so the wallet's record binds AT RETRIEVAL and a
   consumer that crashed before submitting re-retrieves the same bytes over the same record. It is
   PREPARATION-GATED — a transfer's txid is refused, because transfers are served by the drive's
@@ -408,7 +412,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process-lifetime plan-cache key no persisted copy could honor), so every decoded copy carries
   handle `0` — re-propose instead of committing a persisted schedule.
 - New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0113`,
-  `ZRUST0115`–`ZRUST0122`, `ZRUST0124`–`ZRUST0138`, `ZRUST0140`–`ZRUST0147`, and `ZRUST0149`
+  `ZRUST0115`–`ZRUST0121`, `ZRUST0124`–`ZRUST0138`, `ZRUST0140`–`ZRUST0147`, and `ZRUST0149`
   (`rustMigrationTakePreparation`, the preparation accessor). Ten codes were
   retired pre-release with the members they served, and none is reused; the ranges' other gaps
   are accounted for elsewhere (`ZRUST0107` is the enhancement-path case above, and

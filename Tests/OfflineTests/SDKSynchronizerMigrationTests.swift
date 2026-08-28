@@ -304,11 +304,11 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
             receivedAccount = account
         }
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
-        let txid = Data(repeating: 0xEF, count: 32)
+        let txid = TxId([UInt8](repeating: 0xEF, count: 32))
 
         try await synchronizer.recordImmediateMigration(accountUUID: accountUUID, txid: txid)
 
-        XCTAssertEqual(receivedTxid, txid)
+        XCTAssertEqual(receivedTxid, Data(txid.id))
         XCTAssertEqual(receivedAccount, accountUUID)
     }
 
@@ -746,7 +746,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         do {
             _ = try await synchronizer.takeMigrationPreparation(
                 accountUUID: accountUUID,
-                byTxid: Data(repeating: 7, count: 32)
+                byTxid: TxId([UInt8](repeating: 7, count: 32))
             )
             XCTFail("expected the stubbed take-preparation failure to propagate")
         } catch let error as StubTakePreparationFailure {
@@ -764,7 +764,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
     /// included, which is what lets a host record the submission's outcome with no identity of
     /// its own.
     func testTakeMigrationPreparationPassesTheTxidThroughAndReturnsTheEngineId() async throws {
-        let txid = Data(repeating: 0x5A, count: 32)
+        let txid = TxId([UInt8](repeating: 0x5A, count: 32))
         let welding = ZcashRustBackendWeldingMock()
         welding.migrationTakePreparationTxidForReturnValue = PreparedMigrationTransfer(
             id: 11,
@@ -778,7 +778,7 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(prepared.id, 11, "the engine transfer id crosses the surface")
         XCTAssertEqual(prepared.txid, txid)
         XCTAssertEqual(prepared.pczt, Data([0xDE, 0xAD, 0xBE, 0xEF]), "the finalized transaction is submittable as-is")
-        XCTAssertEqual(welding.migrationTakePreparationTxidForReceivedArguments?.txid, txid)
+        XCTAssertEqual(welding.migrationTakePreparationTxidForReceivedArguments?.txid, Data(txid.id))
         XCTAssertEqual(welding.migrationTakePreparationTxidForReceivedArguments?.account, accountUUID)
     }
 
@@ -806,11 +806,11 @@ final class SDKSynchronizerMigrationTests: ZcashTestCase {
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
         await synchronizer.updateStatus(.syncing(0.5, false))
 
-        let prepared = PreparedMigrationTransfer(id: 5, txid: Data(repeating: 0x5A, count: 32), pczt: Data([0x01]))
+        let prepared = PreparedMigrationTransfer(id: 5, txid: TxId([UInt8](repeating: 0x5A, count: 32)), pczt: Data([0x01]))
         try await synchronizer.recordMigrationPreparationBroadcast(
             accountUUID: accountUUID,
             prepared,
-            result: .success(txId: prepared.txid.toHexStringTxId())
+            result: .success(txId: prepared.txid)
         )
 
         let received = try XCTUnwrap(welding.migrationRecordTransferResultTransferIdResultForReceivedArguments)

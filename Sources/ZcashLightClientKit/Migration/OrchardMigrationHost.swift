@@ -243,7 +243,7 @@ actor OrchardMigrationHost {
         do {
             accounts = try await welding.listAccounts()
         } catch {
-            logger.error("OrchardMigrationHost: failed to enumerate wallet accounts for the sync-blocked check; degrading to unblocked: \(error)")
+            logger.error("OrchardMigrationHost: account enumeration failed; treating sync as unblocked: \(error.localizedDescription)")
             return false
         }
 

@@ -631,9 +631,6 @@ enum ZcashErrorDefinition {
     /// Thrown by MigrationBroadcaster when the dedicated migration Tor runtime or an isolated connection cannot be established before the submit attempt; the transaction was not broadcast.
     // sourcery: code="ZRUST0121"
     case migrationTorUnavailable
-    /// The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult.
-    // sourcery: code="ZRUST0122"
-    case migrationInvalidTxId(_ txId: String)
     /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned. The sync gate's in-flight marker is deliberately left set on this path and self-expires.
     /// - `error` is the underlying failure from ZcashRustBackend.migrationRecordTransferResult.
     // sourcery: code="ZRUST0124"

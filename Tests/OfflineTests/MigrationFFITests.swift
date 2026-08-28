@@ -13,7 +13,7 @@
 //  Ported from the michal/MOB-1455-ironwood-migration-prototype-ffi branch (commit 86450d54) to the
 //  committed API, then updated again when the SDK-side `MigrationState`/`migrationState(for:)` state
 //  machine was replaced by the verbatim `migrationAdvanceStep(for:)` conduit:
-//  `MigrationTransferResult.success` takes `txId:` (display-hex) rather than `txid:`, and there is no
+//  `MigrationTransferResult.success` takes a semantic `TxId`, and there is no
 //  `migrationInitializePostUpgrade` in the committed surface -- account creation goes through the
 //  standard `createAccount` fixture pattern instead.
 //
@@ -275,7 +275,7 @@ final class MigrationFFITests: XCTestCase {
         do {
             try await rustBackend.migrationRecordTransferResult(
                 transferId: 4_294_967_295,
-                result: MigrationTransferResult.success(txId: String(repeating: "ab", count: 32)),
+                result: MigrationTransferResult.success(txId: TxId([UInt8](repeating: 0xAB, count: 32))),
                 for: account
             )
             XCTFail("Expected recording a success with no active migration run to throw")
@@ -502,7 +502,7 @@ final class MigrationFFITests: XCTestCase {
         do {
             try await rustBackend.migrationRecordTransferResult(
                 transferId: 4_294_967_295,
-                result: MigrationTransferResult.success(txId: String(repeating: "ab", count: 32)),
+                result: MigrationTransferResult.success(txId: TxId([UInt8](repeating: 0xAB, count: 32))),
                 for: account
             )
             XCTFail("Expected recording a result with no active migration run to throw")
@@ -570,7 +570,7 @@ final class MigrationFFITests: XCTestCase {
         let bytes = (0 ..< 32).map { UInt8($0) }
         let ffi = makeStatus(state: 3, txid: Self.tuple32(bytes), hasTxid: true)
         let decoded = try XCTUnwrap(ffi.unsafeToMigrationTransactionStatus())
-        XCTAssertEqual(decoded.state, .broadcast(txid: Data(bytes)))
+        XCTAssertEqual(decoded.state, .broadcast(txid: TxId(bytes)))
     }
 
     /// A mined row's txid is NOT carried by the engine's state model (`has_txid` drops back to
@@ -901,7 +901,7 @@ final class MigrationFFITests: XCTestCase {
 
         XCTAssertEqual(
             outcome.unsafeToMigrationProveOutcome(),
-            MigrationProveOutcome(totalProved: 3, preparationTxids: [Data(first), Data(second)]),
+            MigrationProveOutcome(totalProved: 3, preparationTxids: [TxId(first), TxId(second)]),
             "the total counts every kind; the txids marshal element-by-element, in buffer order"
         )
     }
