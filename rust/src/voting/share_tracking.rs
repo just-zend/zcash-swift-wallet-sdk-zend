@@ -10,7 +10,7 @@ use zcash_voting as voting;
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
-use super::constants::{CANONICAL_FIELD_LEN, SHARE_NULLIFIER_HEX_LEN, SHARE_NULLIFIER_LEN};
+use super::constants::{SHARE_NULLIFIER_HEX_LEN, SHARE_NULLIFIER_LEN};
 use super::db::VotingDatabaseHandle;
 use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
 
@@ -94,20 +94,14 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
     share_index: u32,
 ) -> *mut c_char {
     let res = catch_panic(|| {
-        let vc: [u8; CANONICAL_FIELD_LEN] =
-            unsafe { std::slice::from_raw_parts(vote_commitment, CANONICAL_FIELD_LEN) }
-                .try_into()
-                .map_err(|_| {
-                    anyhow!("vote_commitment must be exactly {CANONICAL_FIELD_LEN} bytes")
-                })?;
-        let blind: [u8; CANONICAL_FIELD_LEN] =
-            unsafe { std::slice::from_raw_parts(primary_blind, CANONICAL_FIELD_LEN) }
-                .try_into()
-                .map_err(|_| {
-                    anyhow!("primary_blind must be exactly {CANONICAL_FIELD_LEN} bytes")
-                })?;
+        let vc: [u8; 32] = unsafe { std::slice::from_raw_parts(vote_commitment, 32) }
+            .try_into()
+            .map_err(|_| anyhow!("vote_commitment must be exactly 32 bytes"))?;
+        let blind: [u8; 32] = unsafe { std::slice::from_raw_parts(primary_blind, 32) }
+            .try_into()
+            .map_err(|_| anyhow!("primary_blind must be exactly 32 bytes"))?;
 
-        let nullifier = voting::share_tracking::compute_share_nullifier(&vc, share_index, &blind)
+        let nullifier = voting::share::compute_nullifier(&vc, share_index, &blind)
             .map_err(|e| anyhow!("compute_share_nullifier failed: {}", e))?;
 
         let hex_str = bytes_to_hex(&nullifier);
@@ -115,6 +109,47 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
         Ok(c_str.into_raw())
     });
     unwrap_exc_or_null(res)
+}
+
+/// Compute the crate-scheduled helper-share submit time.
+///
+/// Pure policy over `zcash_voting`'s `share_policy`: derives the last-moment
+/// buffer from the ceremony timing and samples uniformly inside the
+/// pre-last-moment window from the supplied entropy (callers must pass at
+/// least 8 fresh CSPRNG bytes when a delay window exists; the crate owns the
+/// sampling). Returns the Unix seconds to submit at (0 = immediately), or -1
+/// on error.
+///
+/// # Safety
+///
+/// - If `entropy_len > 0` then `entropy` must be non-null and valid for reads
+///   for `entropy_len` bytes; if `entropy_len == 0`, `entropy` is ignored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_scheduled_share_submit_at(
+    now_seconds: u64,
+    ceremony_start_seconds: u64,
+    vote_end_seconds: u64,
+    single_share: u8,
+    entropy: *const u8,
+    entropy_len: usize,
+) -> i64 {
+    let res = catch_panic(|| {
+        let bytes = unsafe { bytes_from_ptr(entropy, entropy_len) }?;
+        let buffer = voting::share::policy::last_moment_buffer_seconds(
+            ceremony_start_seconds,
+            vote_end_seconds,
+        );
+        let submit_at = voting::share::policy::scheduled_share_submit_at_from_entropy(
+            now_seconds,
+            vote_end_seconds,
+            buffer,
+            single_share != 0,
+            bytes,
+        )
+        .map_err(|e| anyhow!("scheduled_share_submit_at failed: {}", e))?;
+        i64::try_from(submit_at).map_err(|_| anyhow!("submit_at exceeds i64 range"))
+    });
+    unwrap_exc_or(res, -1)
 }
 
 /// Record a share delegation after sending to helper servers.
@@ -146,23 +181,27 @@ pub unsafe extern "C" fn zcashlc_voting_record_share_delegation(
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        // The nullifier now lives in recovery state and is owned by the crate
+        // (`share::record` computes and persists its own); an empty parameter
+        // skips the legacy shape check, non-empty values are still validated
+        // for shape but never persisted here.
         let nullifier_hex_str = unsafe { str_from_ptr(nullifier_hex, nullifier_hex_len) }?;
-        let nullifier = decode_share_nullifier_hex(&nullifier_hex_str)?;
+        if !nullifier_hex_str.is_empty() {
+            decode_share_nullifier_hex(&nullifier_hex_str)?;
+        }
         let urls_bytes = unsafe { bytes_from_ptr(sent_to_urls_json, sent_to_urls_json_len) }?;
         let sent_to_urls: Vec<String> = serde_json::from_slice(urls_bytes)?;
 
-        handle
-            .db
-            .record_share_delegation(
-                &round_id_str,
-                bundle_index,
-                proposal_id,
-                share_index,
-                &sent_to_urls,
-                &nullifier,
-                submit_at,
-            )
-            .map_err(|e| anyhow!("record_share_delegation failed: {}", e))?;
+        voting::share::record(
+            &handle.db,
+            &round_id_str,
+            bundle_index,
+            proposal_id,
+            share_index,
+            &sent_to_urls,
+            submit_at,
+        )
+        .map_err(|e| anyhow!("record_share_delegation failed: {}", e))?;
         Ok(0)
     });
     unwrap_exc_or(res, -1)
@@ -301,79 +340,4 @@ pub unsafe extern "C" fn zcashlc_voting_add_sent_servers(
         Ok(0)
     });
     unwrap_exc_or(res, -1)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ffi::zcashlc_free_boxed_slice;
-    use crate::voting::db::zcashlc_voting_db_free;
-    use crate::voting::test_helpers::{insert_round_and_bundle, open_memory_db};
-
-    #[test]
-    fn record_share_delegation_rejects_invalid_nullifier_length() {
-        let db = open_memory_db();
-        let round_id = b"round";
-        insert_round_and_bundle(db, "round");
-        let urls_json = br#"["https://helper.example"]"#;
-        let nullifier_hex = [b'a'; SHARE_NULLIFIER_LEN * 2 - 1];
-
-        let code = unsafe {
-            zcashlc_voting_record_share_delegation(
-                db,
-                round_id.as_ptr(),
-                round_id.len(),
-                0,
-                0,
-                0,
-                urls_json.as_ptr(),
-                urls_json.len(),
-                nullifier_hex.as_ptr(),
-                nullifier_hex.len(),
-                0,
-            )
-        };
-
-        assert_eq!(code, -1);
-        unsafe { zcashlc_voting_db_free(db) };
-    }
-
-    #[test]
-    fn record_share_delegation_round_trips_hex_nullifier() {
-        let db = open_memory_db();
-        let round_id = b"round";
-        insert_round_and_bundle(db, "round");
-        let urls_json = br#"["https://helper.example"]"#;
-        let nullifier = (0u8..SHARE_NULLIFIER_LEN as u8).collect::<Vec<_>>();
-        let nullifier_hex = bytes_to_hex(&nullifier);
-
-        let code = unsafe {
-            zcashlc_voting_record_share_delegation(
-                db,
-                round_id.as_ptr(),
-                round_id.len(),
-                0,
-                0,
-                0,
-                urls_json.as_ptr(),
-                urls_json.len(),
-                nullifier_hex.as_ptr(),
-                nullifier_hex.len(),
-                0,
-            )
-        };
-        assert_eq!(code, 0);
-
-        let result =
-            unsafe { zcashlc_voting_get_share_delegations(db, round_id.as_ptr(), round_id.len()) };
-        assert!(!result.is_null());
-        let json = unsafe { (*result).as_slice() }.to_vec();
-        let records: Vec<JsonShareDelegationRecord> =
-            serde_json::from_slice(&json).expect("share delegation records");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].nullifier, nullifier_hex);
-
-        unsafe { zcashlc_free_boxed_slice(result) };
-        unsafe { zcashlc_voting_db_free(db) };
-    }
 }

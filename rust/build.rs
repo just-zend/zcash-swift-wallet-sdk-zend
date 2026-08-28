@@ -3,9 +3,9 @@ extern crate cbindgen;
 use std::{env, path::PathBuf};
 
 fn main() {
-    println!("cargo:rerun-if-changed=rust/src/lib.rs");
-    println!("cargo:rerun-if-changed=rust/src/voting.rs");
-    println!("cargo:rerun-if-changed=rust/src/voting");
+    // The whole source tree feeds cbindgen (ffi.rs carries the #[repr(C)] types) —
+    // watching only lib.rs left the generated header stale after ffi.rs-only edits.
+    println!("cargo:rerun-if-changed=rust/src");
     println!("cargo:rerun-if-changed=rust/wrapper.c");
     println!("cargo:rerun-if-changed=rust/wrapper.h");
 
@@ -49,6 +49,7 @@ fn main() {
         .rename_item("BlocksMeta", "FFIBlocksMeta")
         .rename_item("BoxedSlice", "FfiBoxedSlice")
         .rename_item("TxIds", "FfiTxIds")
+        .rename_item("TransactionData", "FfiTransactionData")
         .rename_item("MaxSpendMode", "FfiMaxSpendMode")
         .rename_item("TransactionStatus", "FfiTransactionStatus")
         .rename_item("TransactionDataRequest", "FfiTransactionDataRequest")

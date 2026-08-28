@@ -42,6 +42,7 @@ use zcash_client_backend::{
         Account, AccountBirthday, AccountPurpose, CoinbaseFilter, InputSource, MaxSpendMode,
         SeedRelevance, TransactionDataRequest, TransactionStatus, TransparentKeyOrigin,
         WalletCommitmentTrees, WalletRead, WalletWrite, Zip32Derivation,
+        anchor_retention::AnchorRetentionInterval,
         chain::{CommitmentTreeRoot, scan_cached_blocks},
         scanning::ScanPriority,
         wallet::{
@@ -68,11 +69,12 @@ use zcash_client_sqlite::{
     chain::{BlockMeta, init::init_blockmeta_db},
     error::SqliteClientError,
     util::SystemClock,
-    wallet::init::{WalletMigrationError, init_wallet_db},
+    wallet::init::{WalletMigrationError, WalletMigrator},
 };
 use zcash_primitives::{
     block::BlockHash,
     merkle_tree::HashSer,
+    transaction::builder::BundlePadding,
     transaction::{Transaction, TxId},
 };
 use zcash_proofs::prover::LocalTxProver;
@@ -81,7 +83,9 @@ use zcash_protocol::{
     consensus::{
         BlockHeight, BranchId, Network,
         Network::{MainNetwork, TestNetwork},
+        NetworkType, NetworkUpgrade, Parameters,
     },
+    local_consensus::LocalNetwork,
     memo::MemoBytes,
     value::{ZatBalance, Zatoshis},
 };
@@ -90,12 +94,18 @@ use zip32::fingerprint::SeedFingerprint;
 
 mod derivation;
 mod eip681;
+mod ext_schema;
 mod ffi;
 mod migration;
+mod migration_engine;
+mod migration_finalize;
+mod migration_keystone;
+mod migration_plan_cache;
+mod migration_turnstile;
 mod tor;
-// Voting is gated off on the Ironwood (NU6.3) deps: zcash_voting cannot resolve
-// against orchard 0.15 (see Cargo.toml). Re-enable with the `voting` feature
-// once the voting crates support orchard 0.15.
+// Voting is gated off on this line: the `zcash_voting` dependency is commented out in
+// Cargo.toml (see there), so the module and its `zcashlc_voting_*` symbols are not compiled.
+// The sources are retained so the surface can be reinstated by re-enabling the dependency.
 #[cfg(zcash_voting)]
 mod voting;
 
@@ -121,7 +131,45 @@ where
     }
 }
 
+/// The anchor bucket interval used on every network other than production mainnet: 12 blocks, so
+/// that a ZIP 318 pool migration passes through enough anchor boundaries to be exercised end to
+/// end in a test run instead of over days of chain.
+///
+/// Shortening the grid also shortens the transfer and preparation delays, which the migration
+/// backend derives from it, so this is the only value to choose.
+const TEST_ANCHOR_RETENTION_INTERVAL: AnchorRetentionInterval =
+    AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("12 is nonzero"));
+
+/// The grid on which a wallet on `network` retains note commitment tree checkpoints as durable
+/// anchors, and correspondingly the grid its pool migrations anchor their transfers to.
+///
+/// Production mainnet gets the ZIP 318 interval, which every wallet on that network must share:
+/// the anonymity set a boundary anchor provides is exactly the set of transfers that chose the same
+/// boundary, so a wallet retaining a different grid than its peers is distinguishable from them.
+/// Testnet and custom-parameter networks — which exist to exercise the migration, not to hide in a
+/// crowd — get [`TEST_ANCHOR_RETENTION_INTERVAL`].
+pub(crate) fn anchor_retention_interval(network: NetworkParams) -> AnchorRetentionInterval {
+    match network {
+        NetworkParams::Standard(MainNetwork) => AnchorRetentionInterval::ZIP_318,
+        NetworkParams::Standard(TestNetwork) | NetworkParams::Custom { .. } => {
+            TEST_ANCHOR_RETENTION_INTERVAL
+        }
+    }
+}
+
+/// The busy_timeout every connection onto the wallet database file must use, because more than one
+/// connection is open onto it at a time. Upstream sets none, so a host write landing while another
+/// connection holds the lock would die with an instant SQLITE_BUSY instead of waiting. The migration
+/// store is the concurrent writer that makes this reachable: `migration::open_store_conn` opens its
+/// own connection onto the same file, and every FFI call opens one of its own besides.
+pub(crate) const WALLET_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Helper method for construcing a WalletDb value from path data provided over the FFI.
+///
+/// The returned handle retains its durable anchor checkpoints on the interval
+/// [`anchor_retention_interval`] selects for `network`, which is also the grid the next pool
+/// migration planned over this wallet will anchor to. Every wallet handle the FFI hands out is
+/// built here, so the two cannot be configured inconsistently.
 ///
 /// # Safety
 ///
@@ -134,13 +182,21 @@ where
 unsafe fn wallet_db(
     db_data: *const u8,
     db_data_len: usize,
-    network: Network,
-) -> anyhow::Result<WalletDb<rusqlite::Connection, Network, SystemClock, OsRng>> {
+    network: NetworkParams,
+) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, OsRng>> {
     let db_data = Path::new(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
-    WalletDb::for_path(db_data, network, SystemClock, OsRng)
-        .map_err(|e| anyhow!("Error opening wallet database connection: {}", e))
+    // Mirror `WalletDb::for_path` (open + array vtab + wrap) but give the connection
+    // a busy_timeout first — see `WALLET_DB_BUSY_TIMEOUT` above for the rationale.
+    let conn = rusqlite::Connection::open(db_data)
+        .map_err(|e| anyhow!("Error opening wallet database connection: {}", e))?;
+    conn.busy_timeout(WALLET_DB_BUSY_TIMEOUT)
+        .map_err(|e| anyhow!("Error setting wallet database busy_timeout: {}", e))?;
+    rusqlite::vtab::array::load_module(&conn)
+        .map_err(|e| anyhow!("Error loading wallet database array module: {}", e))?;
+    Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng)
+        .with_anchor_retention_interval(anchor_retention_interval(network)))
 }
 
 /// Helper method for construcing a FsBlockDb value from path data provided over the FFI.
@@ -161,7 +217,9 @@ fn block_db(fsblock_db: *const u8, fsblock_db_len: usize) -> anyhow::Result<FsBl
         .map_err(|e| anyhow!("Error opening block source database connection: {}", e))
 }
 
-fn account_uuid_from_bytes(uuid_bytes: *const u8) -> Result<AccountUuid, TryFromSliceError> {
+pub(crate) fn account_uuid_from_bytes(
+    uuid_bytes: *const u8,
+) -> Result<AccountUuid, TryFromSliceError> {
     let uuid_bytes = unsafe { slice::from_raw_parts(uuid_bytes, 16) };
     Ok(AccountUuid::from_uuid(Uuid::from_bytes(
         <[u8; 16]>::try_from(uuid_bytes)?,
@@ -213,6 +271,19 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
             })
     };
 
+    // Per-target filter instead of a bare global level:
+    // upstream `zcash_client_backend` #[instrument]s every block and batch
+    // (~600k spans per fresh restore) at INFO, and through the os_log +
+    // signpost layers each span costs syscalls on the scan producer thread
+    // — measured as production pass1 3.4 s vs 0.5 s in the filtered
+    // CLI/probe (2026-07-08 A18 seal log). Cap that crate at WARN; the
+    // host-chosen level still governs everything else (engine logs
+    // unchanged). Mirrors the filter the CLI and bench probe ship since
+    // v0.6 P6.
+    let log_filter = tracing_subscriber::filter::Targets::new()
+        .with_default(log_filter)
+        .with_target("zcash_client_backend", LevelFilter::WARN);
+
     // Set up the tracing layers for the Apple OS logging framework.
     #[cfg(target_vendor = "apple")]
     let (log_layer, signpost_layer) = os_log::layers("co.electriccoin.ios", "rust");
@@ -223,14 +294,40 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     let registry = registry.with(log_layer).with(signpost_layer);
     registry.with(log_filter).init();
 
+    // Freshness marker for the FFI layer itself (the engine's ENGINE_BUILD
+    // can't see rust/ changes — this line is the slice-staleness truth for
+    // the subscriber): greppable in device logs AND via `strings` on the
+    // built slice.
+    tracing::info!(
+        zcashlc_build = "2026-08-02.v0.13-proved-tx-wallet-persistence",
+        "tracing initialized (zcash_client_backend capped at WARN)"
+    );
+
     // Log panics instead of writing them to stderr.
     log_panics::init();
 
-    // Manually build the Rayon thread pool, so we can name the threads.
-    rayon::ThreadPoolBuilder::new()
-        .thread_name(|i| format!("zc-rayon-{}", i))
-        .build_global()
-        .expect("Only initialized once");
+    // Manually build the Rayon thread pool, so we can name the threads — and, on Apple
+    // platforms, drop every worker to UTILITY QoS. Halo2 proving saturates all cores through
+    // this pool for seconds per proof; at default priority that starves the UI (an app-open
+    // prove sweep froze interactive screens for the sweep's whole duration). UTILITY keeps
+    // full-width proving when the device is idle (the overnight BGTask path) while letting
+    // user-interactive work preempt it. Thread count is deliberately unchanged.
+    #[cfg(target_vendor = "apple")]
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(
+            qos_class: core::ffi::c_uint,
+            relative_priority: core::ffi::c_int,
+        ) -> core::ffi::c_int;
+    }
+    #[cfg(target_vendor = "apple")]
+    const QOS_CLASS_UTILITY: core::ffi::c_uint = 0x11;
+
+    let pool_builder = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("zc-rayon-{}", i));
+    #[cfg(target_vendor = "apple")]
+    let pool_builder = pool_builder.start_handler(|_| unsafe {
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    });
+    pool_builder.build_global().expect("Only initialized once");
 
     debug!("Rust backend has been initialized successfully");
     cfg_if::cfg_if! {
@@ -311,7 +408,13 @@ pub unsafe extern "C" fn zcashlc_init_data_database(
             ))
         };
 
-        match init_wallet_db(&mut db_data, seed) {
+        let migrator =
+            WalletMigrator::new().with_external_migrations(ext_schema::external_migrations());
+        let migrator = match seed {
+            Some(seed) => migrator.with_seed(seed),
+            None => migrator,
+        };
+        match migrator.init_or_migrate(&mut db_data) {
             Ok(_) => Ok(0),
             Err(e)
                 if matches!(
@@ -477,6 +580,10 @@ pub unsafe extern "C" fn zcashlc_create_account(
                 BirthdayError::Decode(e) => {
                     anyhow!("Invalid TreeState: Invalid frontier encoding: {}", e)
                 }
+                // `BirthdayError` is `#[non_exhaustive]`; this arm is unreachable
+                // against enum versions that expose only the variants above.
+                #[allow(unreachable_patterns)]
+                _ => anyhow!("Invalid TreeState: unrecognized birthday error"),
             })?;
 
         let account_name = unsafe { CStr::from_ptr(account_name).to_str()? };
@@ -567,6 +674,10 @@ pub unsafe extern "C" fn zcashlc_import_account_ufvk(
                 BirthdayError::Decode(e) => {
                     anyhow!("Invalid TreeState: Invalid frontier encoding: {}", e)
                 }
+                // `BirthdayError` is `#[non_exhaustive]`; this arm is unreachable
+                // against enum versions that expose only the variants above.
+                #[allow(unreachable_patterns)]
+                _ => anyhow!("Invalid TreeState: unrecognized birthday error"),
             })?;
 
         let hd_account_index = zip32::AccountId::try_from(hd_account_index_raw).ok();
@@ -721,7 +832,10 @@ pub unsafe extern "C" fn zcashlc_delete_account(
 /// - The memory referenced by `usk_ptr` must not be mutated for the duration of the function call.
 /// - The total size `usk_len` must be no larger than `isize::MAX`. See the safety documentation
 ///   of pointer::offset.
-unsafe fn decode_usk(usk_ptr: *const u8, usk_len: usize) -> anyhow::Result<UnifiedSpendingKey> {
+pub(crate) unsafe fn decode_usk(
+    usk_ptr: *const u8,
+    usk_len: usize,
+) -> anyhow::Result<UnifiedSpendingKey> {
     let usk_bytes = unsafe { slice::from_raw_parts(usk_ptr, usk_len) };
 
     // The remainder of the function is safe.
@@ -1217,10 +1331,14 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance_for_account(
     unwrap_exc_or(res, -1)
 }
 
+/// Decodes a wallet-database pool code (`zcash_client_sqlite`'s `pool_code`) into its shielded
+/// protocol. Transparent (0) has no shielded protocol and yields `None`, as does any code the
+/// wallet database does not use.
 fn parse_protocol(code: u32) -> Option<ShieldedPool> {
     match code {
         2 => Some(ShieldedPool::Sapling),
         3 => Some(ShieldedPool::Orchard),
+        4 => Some(ShieldedPool::Ironwood),
         _ => None,
     }
 }
@@ -1901,6 +2019,9 @@ pub unsafe extern "C" fn zcashlc_put_utxo(
         let script_bytes = unsafe { slice::from_raw_parts(script_bytes, script_bytes_len) };
         let script_pubkey = transparent::address::Script(script::Code(script_bytes.to_vec()));
 
+        // The ironwood-era API adds optional recipient/funding attribution
+        // params — `None` defers to the store's own address→account resolution
+        // (the pre-existing behavior of this ingest path).
         let recipient_account = None;
         let key_scope = None;
         let funding_account = None;
@@ -2262,45 +2383,6 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
     unwrap_exc_or_null(res)
 }
 
-/// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
-///
-/// Sends the maximum from Orchard to the account's own internal Orchard receiver,
-/// with the fee computed so nothing is left over. Fails unless NU6.3 is active at
-/// the chain tip. See [`crate::migration::propose_orchard_to_ironwood`].
-///
-/// # Safety
-///
-/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
-///   alignment of `1`. Its contents must be a string representing a valid system path in the
-///   operating system's preferred representation.
-/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
-/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
-///   documentation of pointer::offset.
-/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an alignment
-///   of `1`.
-/// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
-///   pointer when done using it.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_propose_orchard_to_ironwood_migration(
-    db_data: *const u8,
-    db_data_len: usize,
-    account_uuid_bytes: *const u8,
-    network_id: u32,
-) -> *mut ffi::BoxedSlice {
-    let res = catch_panic(|| {
-        let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
-        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
-
-        let proposal =
-            migration::propose_orchard_to_ironwood(&mut db_data, &network, account_uuid)?;
-
-        let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
-        Ok(ffi::BoxedSlice::some(encoded))
-    });
-    unwrap_exc_or_null(res)
-}
-
 /// Selects all spendable transaction inputs, computes fees, and constructs a proposal for a transaction
 /// that can then be authorized and made ready for submission to the network with
 /// `zcashlc_create_proposed_transaction`.
@@ -2320,6 +2402,9 @@ pub unsafe extern "C" fn zcashlc_propose_orchard_to_ironwood_migration(
 /// - `to` must be non-null and must point to a null-terminated UTF-8 string.
 /// - `memo` must either be null (indicating an empty memo or a transparent recipient) or point to a
 ///   512-byte array.
+/// - `orchard_only`: when `true`, restricts the spendable pools to Orchard alone (the Orchard→
+///   Ironwood immediate migration lane's sweep, which must not draw on Sapling funds); when
+///   `false`, spends from both Sapling and Orchard (pre-existing behavior).
 /// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
 ///   pointer when done using it.
 #[unsafe(no_mangle)]
@@ -2332,6 +2417,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
     memo: *const u8,
     mode: ffi::MaxSpendMode,
     confirmations_policy: ffi::ConfirmationsPolicy,
+    orchard_only: bool,
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
@@ -2365,17 +2451,25 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         // so Ironwood is included alongside Sapling and Orchard; omitting it would
         // silently leave a post-NU6.3 wallet's Ironwood funds behind. Including it
         // is a no-op when the account holds no Ironwood notes.
-        let spend_pools = [
-            ShieldedPool::Sapling,
-            ShieldedPool::Orchard,
-            ShieldedPool::Ironwood,
-        ];
+        //
+        // `orchard_only` narrows that to Orchard alone: the immediate migration lane
+        // sweeps what the turnstile is for, and must not drag Sapling value (or value
+        // already sitting in Ironwood) along with it.
+        let spend_pools: &[ShieldedPool] = if orchard_only {
+            &[ShieldedPool::Orchard]
+        } else {
+            &[
+                ShieldedPool::Sapling,
+                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
+            ]
+        };
 
         let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
             &mut db_data,
             &network,
             account_uuid,
-            &spend_pools,
+            spend_pools,
             &StandardFeeRule::Zip317,
             to,
             memo,
@@ -2388,6 +2482,48 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
+        Ok(ffi::BoxedSlice::some(encoded))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
+///
+/// Sends the maximum from Orchard to the account's own internal Orchard receiver,
+/// with the fee computed so nothing is left over. Fails unless NU6.3 is active at
+/// the chain tip. See [`crate::migration_turnstile::propose_orchard_to_ironwood`].
+///
+/// This is the single-transaction sweep released in 2.8.0-rc.1, NOT the staged migration
+/// engine (`zcashlc_migration_*`), which is what migrates a real Orchard balance.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an alignment
+///   of `1`.
+/// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
+///   pointer when done using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_propose_orchard_to_ironwood_migration(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+        let proposal =
+            migration_turnstile::propose_orchard_to_ironwood(&mut db_data, &network, account_uuid)?;
+
+        let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
         Ok(ffi::BoxedSlice::some(encoded))
     });
     unwrap_exc_or_null(res)
@@ -2772,6 +2908,58 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
     unwrap_exc_or_null(res)
 }
 
+/// Returns transaction data directly from the wallet store.
+///
+/// This works for any stored transaction, including received transactions. It deliberately does
+/// not depend on wallet history views, which may omit a stored transaction until all of the view's
+/// derived relations are populated. If the transaction is unknown or its raw bytes are not
+/// available, the returned [`ffi::TransactionData`] has a null `raw` pointer.
+///
+/// Parsing an unmined transaction requires a known consensus branch. Consequently, an
+/// expiry-disabled unmined transaction whose branch cannot be inferred is reported through the
+/// last-error channel instead of being returned as unavailable.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and must contain a
+///   valid operating-system path.
+/// - `txid_bytes` must be non-null and valid for reads for exactly 32 bytes.
+/// - Call [`ffi::zcashlc_free_transaction_data`] to free the returned pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_get_transaction(
+    db_data: *const u8,
+    db_data_len: usize,
+    txid_bytes: *const u8,
+    network_id: u32,
+) -> *mut ffi::TransactionData {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let txid_bytes = unsafe { *(txid_bytes.cast::<[u8; 32]>()) };
+        let txid = TxId::from_bytes(txid_bytes);
+        let Some(transaction) = db_data
+            .get_transaction(txid)
+            .map_err(|e| anyhow!("Failed to read transaction {txid}: {e:?}"))?
+        else {
+            return Ok(ffi::TransactionData::unavailable(txid_bytes));
+        };
+
+        let expiry_height = u32::from(transaction.expiry_height());
+        let mut raw = Vec::new();
+        transaction
+            .write(&mut raw)
+            .map_err(|e| anyhow!("Failed to encode transaction {txid}: {e}"))?;
+
+        Ok(ffi::TransactionData::from_parts(
+            *transaction.txid().as_ref(),
+            raw,
+            expiry_height,
+        ))
+    });
+
+    unwrap_exc_or_null(res)
+}
+
 /// Creates a partially-constructed (unsigned without proofs) transaction from the given proposal.
 ///
 /// Returns the partially constructed transaction in the `postcard` format generated by the `pczt`
@@ -2829,8 +3017,7 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
 
         if proposal.steps().len() == 1 {
             let target_expiry_height = None;
-            let orchard_pool_padding =
-                zcash_primitives::transaction::builder::BundlePadding::DEFAULT;
+            let orchard_pool_padding = BundlePadding::DEFAULT;
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
                 &mut db_data,
                 &network,
@@ -3022,6 +3209,14 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
         assert!(!prover.requires_orchard_proof());
 
         if prover.requires_ironwood_proof() {
+            // Post-NU6.3 proposals route orchard-receiver outputs and change
+            // into Ironwood bundles (the Orchard turnstile forbids adding value
+            // to Orchard once NU6.3 is active), so any PCZT built after
+            // activation can carry an Ironwood bundle that must be proven before
+            // extraction — otherwise a hardware-signed transaction fails at
+            // extract with MissingProof. The Ironwood bundle uses the PostNu6_3
+            // circuit (the fixed circuit plus the `disableCrossAddress`
+            // constraint), a distinct proving key from the Orchard pool's.
             let circuit_version =
                 circuit_version_for(orchard::ValuePool::Ironwood).ok_or_else(|| {
                     anyhow!("PCZT's consensus branch does not support the Ironwood pool")
@@ -3206,7 +3401,7 @@ pub unsafe extern "C" fn zcashlc_set_transaction_status(
     txid_bytes: *const u8,
     txid_bytes_len: usize,
     status: ffi::TransactionStatus,
-) {
+) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
@@ -3222,10 +3417,12 @@ pub unsafe extern "C" fn zcashlc_set_transaction_status(
 
         db_data
             .set_transaction_status(txid, status)
-            .map_err(|e| anyhow!("Error setting transaction status for txid {}: {}", txid, e))
+            .map_err(|e| anyhow!("Error setting transaction status for txid {}: {}", txid, e))?;
+
+        Ok(true)
     });
 
-    unwrap_exc_or(res, ())
+    unwrap_exc_or(res, false)
 }
 
 /// Returns a list of transaction data requests that the network client should satisfy.
@@ -4327,15 +4524,142 @@ pub(crate) const NETWORK_ID_TESTNET: u32 = 0;
 /// `zcashlc_*` FFI that takes a `network_id` parameter.
 pub(crate) const NETWORK_ID_MAINNET: u32 = 1;
 
-pub(crate) fn parse_network(value: u32) -> anyhow::Result<Network> {
+/// `network_id` value for a custom-parameter network. Its base identity + per-NU activation heights must
+/// be registered once via [`zcashlc_set_custom_network`] before any `zcashlc_*` call uses it.
+pub(crate) const NETWORK_ID_REGTEST: u32 = 2;
+
+/// Consensus parameters passed across the FFI: either a standard [`Network`] (Mainnet/Testnet, with
+/// activation heights baked into librustzcash) or a **custom network** — a chosen base identity
+/// (`base`, which determines address encoding and `chainName`) combined with per-NU activation heights
+/// ([`LocalNetwork`]) configured at runtime. This is how the SDK connects to a custom-parameter node
+/// (e.g. a modified-mainnet Ironwood backend: `base = Main`, NU6.3 at a custom height). Implements
+/// [`Parameters`] purely by delegation, so it is a drop-in replacement for the concrete `Network`
+/// everywhere the FFI threads network parameters.
+#[derive(Clone, Copy)]
+pub(crate) enum NetworkParams {
+    Standard(Network),
+    Custom {
+        base: NetworkType,
+        local: LocalNetwork,
+    },
+}
+
+impl Parameters for NetworkParams {
+    fn network_type(&self) -> NetworkType {
+        match self {
+            NetworkParams::Standard(network) => network.network_type(),
+            // Identity (address HRPs, chainName) comes from the chosen base network, not from
+            // `LocalNetwork` (whose `network_type()` is always Regtest).
+            NetworkParams::Custom { base, .. } => *base,
+        }
+    }
+
+    fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+        match self {
+            NetworkParams::Standard(network) => network.activation_height(nu),
+            NetworkParams::Custom { local, .. } => local.activation_height(nu),
+        }
+    }
+}
+
+/// The custom network's base identity + per-NU activation heights, configured once via
+/// [`zcashlc_set_custom_network`] and read back by [`parse_network`] for `network_id`
+/// [`NETWORK_ID_REGTEST`]. `None` until set.
+static CUSTOM_PARAMS: std::sync::RwLock<Option<(NetworkType, LocalNetwork)>> =
+    std::sync::RwLock::new(None);
+
+/// Maps an FFI `network_id` to its [`NetworkType`], used to select the base identity of a custom network.
+fn network_type_for_id(network_id: u32) -> Option<NetworkType> {
+    match network_id {
+        NETWORK_ID_TESTNET => Some(NetworkType::Test),
+        NETWORK_ID_MAINNET => Some(NetworkType::Main),
+        NETWORK_ID_REGTEST => Some(NetworkType::Regtest),
+        _ => None,
+    }
+}
+
+/// Registers the **custom network** resolved for `network_id` [`NETWORK_ID_REGTEST`], which every
+/// subsequent `zcashlc_*` call resolves through [`parse_network`]. `base_network_id` selects the base
+/// identity — address encoding and `chainName` — as mainnet (1), testnet (0), or regtest (2); the
+/// activation heights are custom regardless. Each height argument is a block height, or a negative value
+/// meaning "not activated on this network"; set them to mirror the `nuparams` of the node /
+/// `lightwalletd` being connected to. Idempotent; intended to be called once at init.
+///
+/// Returns `true` on a fresh registration or an identical re-registration. Returns `false` on an
+/// invalid `base_network_id`, a poisoned lock, or when the call **replaced a different existing
+/// configuration** — the replacement is still applied (last writer wins, since per-instance state
+/// such as checkpoint sources follows the newest `Initializer`), but the caller should treat a
+/// conflicting re-registration as a host configuration bug: the parameters are process-global, so
+/// two live instances with different custom networks cannot both be honored.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_set_custom_network(
+    base_network_id: u32,
+    overwinter: i64,
+    sapling: i64,
+    blossom: i64,
+    heartwood: i64,
+    canopy: i64,
+    nu5: i64,
+    nu6: i64,
+    nu6_1: i64,
+    nu6_2: i64,
+    nu6_3: i64,
+) -> bool {
+    fn height(value: i64) -> Option<BlockHeight> {
+        u32::try_from(value).ok().map(BlockHeight::from_u32)
+    }
+
+    let Some(base) = network_type_for_id(base_network_id) else {
+        return false;
+    };
+
+    let local = LocalNetwork {
+        overwinter: height(overwinter),
+        sapling: height(sapling),
+        blossom: height(blossom),
+        heartwood: height(heartwood),
+        canopy: height(canopy),
+        nu5: height(nu5),
+        nu6: height(nu6),
+        nu6_1: height(nu6_1),
+        nu6_2: height(nu6_2),
+        nu6_3: height(nu6_3),
+    };
+
+    match CUSTOM_PARAMS.write() {
+        Ok(mut guard) => {
+            let replaced_different = matches!(*guard, Some(existing) if existing != (base, local));
+            *guard = Some((base, local));
+            !replaced_different
+        }
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn parse_network(value: u32) -> anyhow::Result<NetworkParams> {
     match value {
-        NETWORK_ID_TESTNET => Ok(TestNetwork),
-        NETWORK_ID_MAINNET => Ok(MainNetwork),
+        NETWORK_ID_TESTNET => Ok(NetworkParams::Standard(TestNetwork)),
+        NETWORK_ID_MAINNET => Ok(NetworkParams::Standard(MainNetwork)),
+        NETWORK_ID_REGTEST => {
+            let guard = CUSTOM_PARAMS
+                .read()
+                .map_err(|_| anyhow!("custom network params lock is poisoned"))?;
+            // `Option<(NetworkType, LocalNetwork)>` is `Copy`, so deref-copy out of the read guard.
+            let (base, local) = (*guard).ok_or_else(|| {
+                anyhow!(
+                    "custom network (id {}) used before it was configured; call \
+                     zcashlc_set_custom_network first",
+                    NETWORK_ID_REGTEST,
+                )
+            })?;
+            Ok(NetworkParams::Custom { base, local })
+        }
         _ => Err(anyhow!(
-            "Invalid network type: {}. Expected either {} or {} for Testnet or Mainnet, respectively.",
+            "Invalid network type: {}. Expected {}, {}, or {} for Testnet, Mainnet, or a custom network, respectively.",
             value,
             NETWORK_ID_TESTNET,
             NETWORK_ID_MAINNET,
+            NETWORK_ID_REGTEST,
         )),
     }
 }
@@ -4392,4 +4716,51 @@ pub(crate) fn parse_optional_height(value: i64) -> anyhow::Result<Option<BlockHe
         -1 => None,
         _ => Some(BlockHeight::try_from(value)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the production network gets the ZIP 318 grid, whose anonymity set depends on every
+    /// wallet sharing it. Testnet gets the shortened grid, so a migration passes through anchor
+    /// boundaries fast enough to be exercised.
+    #[test]
+    fn only_mainnet_retains_anchors_on_the_zip_318_grid() {
+        assert_eq!(
+            anchor_retention_interval(NetworkParams::Standard(MainNetwork)),
+            AnchorRetentionInterval::ZIP_318,
+        );
+        assert_eq!(
+            anchor_retention_interval(NetworkParams::Standard(TestNetwork)),
+            TEST_ANCHOR_RETENTION_INTERVAL,
+        );
+        assert_eq!(TEST_ANCHOR_RETENTION_INTERVAL.block_count().get(), 12);
+    }
+
+    /// A custom-parameter network is a test deployment even when it borrows mainnet's address
+    /// encoding, so it must not inherit the production grid along with that identity.
+    #[test]
+    fn a_mainnet_based_custom_network_is_not_the_production_network() {
+        let height = Some(BlockHeight::from_u32(1));
+        let custom = NetworkParams::Custom {
+            base: NetworkType::Main,
+            local: LocalNetwork {
+                overwinter: height,
+                sapling: height,
+                blossom: height,
+                heartwood: height,
+                canopy: height,
+                nu5: height,
+                nu6: height,
+                nu6_1: height,
+                nu6_2: height,
+                nu6_3: height,
+            },
+        };
+        assert_eq!(
+            anchor_retention_interval(custom),
+            TEST_ANCHOR_RETENTION_INTERVAL,
+        );
+    }
 }

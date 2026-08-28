@@ -63,8 +63,7 @@ class WalletTests: ZcashTestCase {
         do {
             guard case .success = try await synchronizer.prepare(
                 with: seedData.bytes,
-                walletBirthday: 663194,
-                for: .newWallet,
+                walletBirthday: nil,
                 name: "",
                 keySource: nil
             ) else {
@@ -114,7 +113,6 @@ class WalletTests: ZcashTestCase {
         let result = try await initializer.initialize(
             with: seedData.bytes,
             walletBirthday: 663194,
-            for: .existingWallet,
             name: ""
         )
 
@@ -152,7 +150,6 @@ class WalletTests: ZcashTestCase {
         let result = try await initializer.initialize(
             with: nil,
             walletBirthday: 663194,
-            for: .existingWallet,
             name: ""
         )
 
@@ -208,7 +205,6 @@ class WalletTests: ZcashTestCase {
             _ = try await initializer.initialize(
                 with: seedData.bytes,
                 walletBirthday: 663194,
-                for: .existingWallet,
                 name: ""
             )
             XCTFail("Expected `initialize` to throw `ZcashError.initializerSeedMismatch` when the seed isn't relevant to any existing account.")
@@ -264,7 +260,6 @@ class WalletTests: ZcashTestCase {
         let result = try await initializer.initialize(
             with: seedData.bytes,
             walletBirthday: 663194,
-            for: .existingWallet,
             name: ""
         )
 
@@ -311,7 +306,6 @@ class WalletTests: ZcashTestCase {
         let result = try await initializer.initialize(
             with: seedData.bytes,
             walletBirthday: 663194,
-            for: .existingWallet,
             name: ""
         )
 
@@ -364,7 +358,6 @@ class WalletTests: ZcashTestCase {
         let result = try await initializer.initialize(
             with: nil,
             walletBirthday: 663194,
-            for: .existingWallet,
             name: ""
         )
 

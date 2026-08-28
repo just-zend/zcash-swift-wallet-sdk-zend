@@ -343,32 +343,6 @@ impl From<voting::SharePayload> for JsonSharePayload {
     }
 }
 
-/// JSON-serializable CastVoteSignature.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JsonCastVoteSignature {
-    pub vote_auth_sig: Vec<u8>,
-}
-
-impl From<voting::CastVoteSignature> for JsonCastVoteSignature {
-    fn from(s: voting::CastVoteSignature) -> Self {
-        Self {
-            vote_auth_sig: s.vote_auth_sig,
-        }
-    }
-}
-
-/// JSON-serializable DelegationInputs.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JsonDelegationInputs {
-    pub fvk_bytes: Vec<u8>,
-    pub g_d_new_x: Vec<u8>,
-    pub pk_d_new_x: Vec<u8>,
-    pub hotkey_raw_address: Vec<u8>,
-    pub hotkey_public_key: Vec<u8>,
-    pub hotkey_address: String,
-    pub seed_fingerprint: Vec<u8>,
-}
-
 /// JSON-serializable VanWitness.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonVanWitness {
@@ -380,8 +354,8 @@ pub struct JsonVanWitness {
     pub anchor_height: u32,
 }
 
-impl From<voting::tree_sync::VanWitness> for JsonVanWitness {
-    fn from(w: voting::tree_sync::VanWitness) -> Self {
+impl From<voting::vote::VanWitness> for JsonVanWitness {
+    fn from(w: voting::vote::VanWitness) -> Self {
         Self {
             auth_path: w.auth_path.iter().map(|h| h.to_vec()).collect(),
             position: w.position,

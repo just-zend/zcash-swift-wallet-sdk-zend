@@ -225,13 +225,25 @@ final class EndpointSubmitterMock: EndpointSubmitter {
 }
 
 final class StubTransactionEncoder: TransactionEncoder {
-    private let createdTransactions: [ZcashTransaction.Overview]
+    private let createdTransactions: [CreatedTransaction]
+    private let overviews: [ZcashTransaction.Overview]
     private(set) var receivedCreateArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
     private(set) var receivedFetchTxIds: [Data]?
     private(set) var submittedTransactions: [EncodedTransaction] = []
 
-    init(createdTransactions: [ZcashTransaction.Overview]) {
-        self.createdTransactions = createdTransactions
+    /// When set, `submit(transaction:)` records the transaction and then throws this error.
+    var submitError: Error?
+    /// `isTransactionKnownToServer(txId:)` returns `true` for txids in this set.
+    var knownToServerTxIds: Set<Data> = []
+
+    init(createdTransactions overviews: [ZcashTransaction.Overview]) {
+        self.overviews = overviews
+        self.createdTransactions = overviews.map { overview in
+            guard let raw = overview.raw else {
+                preconditionFailure("StubTransactionEncoder requires raw transaction bytes")
+            }
+            return CreatedTransaction(txId: overview.rawID, raw: raw, expiryHeight: overview.expiryHeight)
+        }
     }
 
     func proposeTransfer(
@@ -259,9 +271,15 @@ final class StubTransactionEncoder: TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey
-    ) async throws -> [ZcashTransaction.Overview] {
+    ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
         return createdTransactions
+    }
+
+    func createdTransactions(forTxIds txIds: [Data]) async throws -> [CreatedTransaction] {
+        txIds.compactMap { txId in
+            createdTransactions.first { $0.txId == txId }
+        }
     }
 
     func proposeFulfillingPaymentFromURI(
@@ -273,16 +291,19 @@ final class StubTransactionEncoder: TransactionEncoder {
 
     func submit(transaction: EncodedTransaction) async throws {
         submittedTransactions.append(transaction)
+        if let submitError {
+            throw submitError
+        }
     }
 
     func isTransactionKnownToServer(txId: Data) async -> Bool {
-        false
+        knownToServerTxIds.contains(txId)
     }
 
     func fetchTransactionsForTxIds(_ txIds: [Data]) async throws -> [ZcashTransaction.Overview] {
         receivedFetchTxIds = txIds
         return txIds.compactMap { txId in
-            createdTransactions.first { $0.rawID == txId }
+            overviews.first { $0.rawID == txId }
         }
     }
 

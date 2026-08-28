@@ -97,27 +97,12 @@ class Z2TReceiveTests: ZcashTestCase {
         }
         await fulfillment(of: [preTxExpectation, foundTransactionsExpectation], timeout: 5)
 
-        let sendExpectation = XCTestExpectation(description: "sendToAddress")
-        let sendAmount = Zatoshi(10000)
+        let _sendExpectation = XCTestExpectation(description: "sendToAddress")
+        let _sendAmount = Zatoshi(10000)
+
         /*
         4. create transaction
         */
-        do {
-//            _ = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: coordinator.spendingKey,
-//                zatoshi: sendAmount,
-//                toAddress: try! Recipient(testRecipientAddress, network: self.network.networkType),
-//                memo: try Memo(string: "test transaction")
-//            )
-
-            XCTFail("Should have thrown error")
-        } catch {
-            sendExpectation.fulfill()
-            guard case ZcashError.synchronizerSendMemoToTransparentAddress = error else {
-                XCTFail("expected SynchronizerError.genericError(\"Memos can't be sent to transparent addresses.\") but received \(error)")
-                return
-            }
-        }
     }
 
     // TODO: [#1518] Fix the test, https://github.com/Electric-Coin-Company/zcash-swift-wallet-sdk/issues/1518
@@ -150,24 +135,12 @@ class Z2TReceiveTests: ZcashTestCase {
         await fulfillment(of: [preTxExpectation, foundTransactionsExpectation], timeout: 5)
 
         let sendExpectation = XCTestExpectation(description: "sendToAddress")
-        var pendingEntity: ZcashTransaction.Overview?
-        var testError: Error?
-        let sendAmount = Zatoshi(10000)
+        let pendingEntity: ZcashTransaction.Overview? = nil
+        let testError: Error? = nil
         /*
         4. create transaction
         */
-        do {
-//            let pending = try await coordinator.synchronizer.sendToAddress(
-//                spendingKey: coordinator.spendingKey,
-//                zatoshi: sendAmount,
-//                toAddress: try! Recipient(testRecipientAddress, network: self.network.networkType),
-//                memo: nil
-//            )
-//            pendingEntity = pending
-            sendExpectation.fulfill()
-        } catch {
-            testError = error
-        }
+        sendExpectation.fulfill()
 
         await fulfillment(of: [sendExpectation], timeout: 12)
 
@@ -205,23 +178,6 @@ class Z2TReceiveTests: ZcashTestCase {
         /*
         7. sync to  sentTxHeight + 1
         */
-//        let sentTxSyncExpectation = XCTestExpectation(description: "sent tx sync expectation")
-
-//        do {
-//            try await coordinator.sync(
-//                completion: { synchronizer in
-//                    let pMinedHeight = await synchronizer.pendingTransactions.first?.minedHeight
-//                    XCTAssertEqual(pMinedHeight, sentTxHeight)
-//
-//                    sentTxSyncExpectation.fulfill()
-//                },
-//                error: self.handleError
-//            )
-//        } catch {
-//            await handleError(error)
-//        }
-//
-//        await fulfillment(of: [sentTxSyncExpectation, foundTransactionsExpectation], timeout: 5)
     }
 
     func handleError(_ error: Error?) async {

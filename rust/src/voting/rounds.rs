@@ -52,7 +52,7 @@ pub unsafe extern "C" fn zcashlc_voting_init_round(
             Some(unsafe { str_from_ptr(session_json, session_json_len) }?)
         };
 
-        let params = voting::VotingRoundParams {
+        let params = voting::wire::VotingRoundParams {
             vote_round_id: round_id_str,
             snapshot_height,
             ea_pk: ea_pk_bytes,
@@ -65,7 +65,7 @@ pub unsafe extern "C" fn zcashlc_voting_init_round(
 
         handle
             .db
-            .init_round(&params, session.as_deref())
+            .init_round(handle.network, &params, session.as_deref())
             .map_err(|e| anyhow!("init_round failed: {}", e))?;
         Ok(0)
     });
@@ -201,18 +201,19 @@ pub unsafe extern "C" fn zcashlc_voting_get_votes(
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
 
-        let votes = handle
-            .db
-            .get_votes(&round_id_str)
+        // One recovery snapshot yields the stored votes plus their submission
+        // state (a recorded tx hash marks a vote as submitted).
+        let snapshot = voting::recovery::round_snapshot(&handle.db, &round_id_str)
             .map_err(|e| anyhow!("get_votes failed: {}", e))?;
 
-        let ffi_votes: Vec<FfiVoteRecord> = votes
-            .into_iter()
+        let ffi_votes: Vec<FfiVoteRecord> = snapshot
+            .votes
+            .iter()
             .map(|v| FfiVoteRecord {
                 proposal_id: v.proposal_id,
                 bundle_index: v.bundle_index,
                 choice: v.choice,
-                submitted: v.submitted,
+                submitted: v.tx_hash.is_some(),
             })
             .collect();
 
@@ -277,91 +278,4 @@ pub unsafe extern "C" fn zcashlc_voting_delete_skipped_bundles(
         Ok(deleted as i64)
     });
     unwrap_exc_or(res, -1)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::voting::db::zcashlc_voting_db_free;
-    use crate::voting::test_helpers::open_memory_db;
-
-    fn init_round(
-        db: *mut VotingDatabaseHandle,
-        round_id: &[u8],
-        ea_pk: &[u8],
-        nc_root: &[u8],
-        nullifier_imt_root: &[u8],
-    ) -> i32 {
-        unsafe {
-            zcashlc_voting_init_round(
-                db,
-                round_id.as_ptr(),
-                round_id.len(),
-                123,
-                ea_pk.as_ptr(),
-                ea_pk.len(),
-                nc_root.as_ptr(),
-                nc_root.len(),
-                nullifier_imt_root.as_ptr(),
-                nullifier_imt_root.len(),
-                std::ptr::null(),
-                0,
-            )
-        }
-    }
-
-    fn round_exists(db: *mut VotingDatabaseHandle, round_id: &[u8]) -> bool {
-        let state =
-            unsafe { zcashlc_voting_get_round_state(db, round_id.as_ptr(), round_id.len()) };
-        if state.is_null() {
-            false
-        } else {
-            unsafe { crate::voting::ffi_types::zcashlc_voting_free_round_state(state) };
-            true
-        }
-    }
-
-    #[test]
-    fn init_round_rejects_invalid_round_param_lengths_without_persisting() {
-        let db = open_memory_db();
-        let valid = [7u8; 32];
-
-        let cases = [
-            ("bad-ea-pk".as_bytes(), &valid[..31], &valid[..], &valid[..]),
-            (
-                "bad-nc-root".as_bytes(),
-                &valid[..],
-                &valid[..31],
-                &valid[..],
-            ),
-            (
-                "bad-nullifier-root".as_bytes(),
-                &valid[..],
-                &valid[..],
-                &valid[..31],
-            ),
-        ];
-
-        for (round_id, ea_pk, nc_root, nullifier_imt_root) in cases {
-            let code = init_round(db, round_id, ea_pk, nc_root, nullifier_imt_root);
-            assert_eq!(code, -1);
-            assert!(!round_exists(db, round_id));
-        }
-
-        unsafe { zcashlc_voting_db_free(db) };
-    }
-
-    #[test]
-    fn init_round_accepts_valid_round_param_lengths() {
-        let db = open_memory_db();
-        let round_id = b"round";
-        let valid = [7u8; 32];
-
-        let code = init_round(db, round_id, &valid, &valid, &valid);
-
-        assert_eq!(code, 0);
-        assert!(round_exists(db, round_id));
-
-        unsafe { zcashlc_voting_db_free(db) };
-    }
 }

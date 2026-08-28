@@ -131,34 +131,39 @@ jobs:
 
     - name: Cache Cargo
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
-      uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+      uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
+        # Swatinem/rust-cache did): that includes `~/.cargo/git`, so a fork PR restoring a cache
+        # created on the base branch could reach whatever any future git dependency was cloned
+        # from. Every path below is crates.io content or this repository's own build output.
+        path: |
+          target
+          ~/.cargo/bin
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/registry/src
+        key: ${{ runner.os }}-cargo-v1-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-v1-
 
     - name: Build FFI for macOS
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
       timeout-minutes: 30
-      working-directory: ./BuildSupport
-      run: |
-        echo "Building FFI for macOS..."
-        make macos
-        mkdir -p products/libzcashlc.xcframework
-        cp -R products/macos/frameworks products/libzcashlc.xcframework/macos-arm64_x86_64
-        cp Info.plist products/libzcashlc.xcframework
+      run: make ffi-macos
 
     - name: Configure local FFI
       if: matrix.language == 'swift'
-      run: |
-        mkdir -p LocalPackages
-        cp -R BuildSupport/products/libzcashlc.xcframework LocalPackages/
-        cp BuildSupport/LocalPackages-Package.swift LocalPackages/Package.swift
+      run: make configure-local-ffi
 
     - name: Resolve Swift dependencies
       if: matrix.language == 'swift'
-      run: swift package resolve
+      run: make resolve
 
     - name: Build Swift package
       if: matrix.language == 'swift'
       timeout-minutes: 30
-      run: swift build
+      run: make build
 
     # --- End Swift manual build steps ---
 

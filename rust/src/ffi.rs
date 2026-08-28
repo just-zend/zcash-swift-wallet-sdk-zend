@@ -8,7 +8,7 @@ use bytes::Bytes;
 use transparent::address::TransparentAddress;
 use zcash_client_backend::{address::UnifiedAddress, data_api, encoding::AddressCodec as _};
 use zcash_client_sqlite::AccountUuid;
-use zcash_protocol::{consensus::Network, value::ZatBalance};
+use zcash_protocol::{consensus::Parameters, value::ZatBalance};
 use zip32::DiversifierIndex;
 
 use crate::{free_ptr_from_vec, free_ptr_from_vec_with, ptr_from_vec, zcashlc_string_free};
@@ -319,6 +319,13 @@ pub struct Balance {
     /// confirmations to be spendable, or for which witnesses cannot yet be constructed without
     /// additional scanning.
     value_pending_spendability: i64,
+
+    /// The value in the account that is currently locked by an explicit output lock (e.g. the
+    /// migration residual locked via `zcashlc_migration_lock_residual`) and therefore excluded
+    /// from `spendable_value`. Locked value still belongs to the account: it is part of the
+    /// account's total (the sum of this struct's fields), it just cannot be selected for spending
+    /// until it is unlocked.
+    locked_value: i64,
 }
 
 impl Balance {
@@ -329,8 +336,10 @@ impl Balance {
                 .into(),
             value_pending_spendability: ZatBalance::from(balance.value_pending_spendability())
                 .into(),
+            locked_value: ZatBalance::from(balance.locked_value()).into(),
         }
     }
+
 }
 
 /// Balance information for a single account.
@@ -705,6 +714,54 @@ impl SymmetricKeys {
 
 pub type TxIds = SymmetricKeys;
 
+/// Transaction data stored by the wallet, with the bytes required for broadcast.
+///
+/// A null `raw` pointer represents an unknown transaction or one whose raw bytes are unavailable.
+/// `expiry_height` is the consensus value; zero means that transaction expiry is disabled.
+#[repr(C)]
+pub struct TransactionData {
+    pub txid: [u8; 32],
+    pub raw: *mut u8,
+    pub raw_len: usize,
+    pub expiry_height: u32,
+}
+
+impl TransactionData {
+    pub(crate) fn from_parts(txid: [u8; 32], raw_bytes: Vec<u8>, expiry_height: u32) -> *mut Self {
+        let (raw, raw_len) = ptr_from_vec(raw_bytes);
+        Box::into_raw(Box::new(Self {
+            txid,
+            raw,
+            raw_len,
+            expiry_height,
+        }))
+    }
+
+    pub(crate) fn unavailable(txid: [u8; 32]) -> *mut Self {
+        Box::into_raw(Box::new(Self {
+            txid,
+            raw: ptr::null_mut(),
+            raw_len: 0,
+            expiry_height: 0,
+        }))
+    }
+}
+
+/// Frees a [`TransactionData`] and its serialized transaction bytes.
+///
+/// # Safety
+///
+/// - `ptr` must either be null or point to a value returned by
+///   [`crate::zcashlc_get_transaction`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_transaction_data(ptr: *mut TransactionData) {
+    if !ptr.is_null() {
+        let transaction_data = unsafe { Box::from_raw(ptr) };
+        free_ptr_from_vec(transaction_data.raw, transaction_data.raw_len);
+        drop(transaction_data);
+    }
+}
+
 /// Frees an array of `[u8; 32]` values.
 ///
 /// # Safety
@@ -978,7 +1035,7 @@ pub struct Address {
 
 impl Address {
     pub(crate) fn new(
-        network: &Network,
+        network: &impl Parameters,
         address: UnifiedAddress,
         diversifier_index: DiversifierIndex,
     ) -> Self {
@@ -1232,7 +1289,7 @@ pub struct SingleUseTaddr {
 
 impl SingleUseTaddr {
     pub(crate) fn from_rust(
-        network: &Network,
+        network: &impl Parameters,
         address: &TransparentAddress,
         gap_position: u32,
         gap_limit: u32,
@@ -1272,7 +1329,10 @@ pub enum AddressCheckResult {
 }
 
 impl AddressCheckResult {
-    pub(crate) fn from_rust(network: &Network, found: Option<TransparentAddress>) -> *mut Self {
+    pub(crate) fn from_rust(
+        network: &impl Parameters,
+        found: Option<TransparentAddress>,
+    ) -> *mut Self {
         let res = match found {
             None => AddressCheckResult::NotFound,
             Some(addr) => {

@@ -287,7 +287,7 @@ public class TorLwdConn {
     /// - Returns: LightWalletServiceResponse
     /// - Throws: `serviceFetchTransactionFailed` when GRPC call fails.
     func fetchTransaction(txId: Data) throws -> (tx: ZcashTransaction.Fetched?, status: TransactionStatus) {
-        guard txId.count == 32 else {
+        guard txId.count == TxId.byteLength else {
             throw ZcashError.rustGetMemoInvalidTxIdLength
         }
 

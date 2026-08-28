@@ -31,7 +31,21 @@ jobs:
           targets: aarch64-apple-ios, x86_64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-darwin, aarch64-apple-darwin
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
+          # Swatinem/rust-cache did): that includes `~/.cargo/git`, so a fork PR restoring a cache
+          # created on the base branch could reach whatever any future git dependency was cloned
+          # from. Every path below is crates.io content or this repository's own build output.
+          path: |
+            target
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v1-
 
       - name: Build and upload draft release
         env:

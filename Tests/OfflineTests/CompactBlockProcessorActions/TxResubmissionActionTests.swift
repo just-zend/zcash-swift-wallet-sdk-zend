@@ -41,7 +41,11 @@ final class TxResubmissionActionTests: ZcashTestCase {
             value: Zatoshi(-1_000),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
     }
 
@@ -206,6 +210,36 @@ final class TxResubmissionActionTests: ZcashTestCase {
         let staleTxId = Data(repeating: 0x09, count: 32)
         let action = setupAction(candidates: [])
         await submitPlanStore.recordPlan(txId: staleTxId, endpoints: [endpointA])
+        transactionRepository.findRawIDClosure = { _ in
+            throw ZcashError.transactionRepositoryEntityNotFound
+        }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let remaining = await submitPlanStore.allPlannedTransactionIds()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testPruningKeepsViewInvisibleUnexpiredWalletStoreTransaction() async throws {
+        let txId = Data(repeating: 0x10, count: 32)
+        let walletStoreTransaction = makeOverview(rawID: txId, expiryHeight: latestBlockHeight + 1)
+        let action = setupAction(candidates: [], encoderTransactions: [walletStoreTransaction])
+        await submitPlanStore.recordPlan(txId: txId, endpoints: [endpointA])
+        transactionRepository.findRawIDClosure = { _ in
+            throw ZcashError.transactionRepositoryEntityNotFound
+        }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let remaining = await submitPlanStore.allPlannedTransactionIds()
+        XCTAssertEqual(remaining, [txId])
+    }
+
+    func testPruningRemovesViewInvisibleExpiredWalletStoreTransaction() async throws {
+        let txId = Data(repeating: 0x11, count: 32)
+        let walletStoreTransaction = makeOverview(rawID: txId, expiryHeight: latestBlockHeight)
+        let action = setupAction(candidates: [], encoderTransactions: [walletStoreTransaction])
+        await submitPlanStore.recordPlan(txId: txId, endpoints: [endpointA])
         transactionRepository.findRawIDClosure = { _ in
             throw ZcashError.transactionRepositoryEntityNotFound
         }

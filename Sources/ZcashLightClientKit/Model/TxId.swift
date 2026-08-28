@@ -7,11 +7,13 @@
 
 import Foundation
 
-public struct TxId: Equatable, Hashable, Identifiable {
+public struct TxId: Equatable, Hashable, Identifiable, Sendable {
+    static let byteLength = 32
+
     public var id: [UInt8]
 
     private static func txIdStringToBytes(_ txId: String) throws -> [UInt8] {
-        guard txId.count == 64 else {
+        guard txId.count == byteLength * 2 else {
             throw ZcashError.txIdNot32Bytes
         }
 
