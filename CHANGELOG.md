@@ -12,7 +12,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ironwood (NU6.3) receive, sync, and send support. Once NU6.3 activates,
   payments to Orchard receivers are delivered through Ironwood bundles in
   version 6 transactions. `AccountBalance.ironwoodBalance` reports the
-  Ironwood balance, and `Proposal` reports Ironwood payments and change.
+  Ironwood balance, `ZcashTransaction.Output.Pool.ironwood` identifies Ironwood
+  outputs, and `Proposal` reports Ironwood payments and change.
+- `Synchronizer.proposeOrchardToIronwoodMigration(accountUUID:)` and its closure
+  and Combine adapters propose moving an account's entire Orchard balance to
+  its internal Ironwood receiver after NU6.3 activation. The proposal spends
+  every Orchard note, deducts the ZIP 317 fee from the transferred value, and
+  leaves Sapling and transparent funds untouched. The method throws before
+  NU6.3 activation.
 - Server validation throws
   `ZcashError.compactBlockProcessorServerMissingIronwoodSupport` (`ZCBPEO0024`)
   when NU6.3 is active but the connected lightwalletd does not provide Ironwood
@@ -24,6 +31,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration. `notClassified` means the transaction predates the classification
   data, has not been decrypted, or uses an encoding unknown to this SDK; rescan
   eligible transactions before relying on the value.
+- `ZcashTransaction.Overview.spentNoteCount` reports how many of the account's
+  notes the transaction spent. `poolCrossingValue` reports the amount moved by
+  a wallet-internal shielded-pool transfer, for which `value` contains only the
+  negated fee. `isTrusted` reports whether the transaction's outputs become
+  spendable at the trusted rather than untrusted confirmation count.
 
 ## Changed
 - `proposeTransfer` and `proposefulfillingPaymentURI` now propose a ZIP 318
