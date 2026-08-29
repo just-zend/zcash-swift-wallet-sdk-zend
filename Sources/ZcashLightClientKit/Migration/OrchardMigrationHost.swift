@@ -8,7 +8,7 @@ import Foundation
 
 /// The per-synchronizer owner of all Orchard -> Ironwood migration machinery.
 ///
-/// `SDKSynchronizer` (and, later, `SlipstreamSynchronizer`) each hold exactly one host. It owns the
+/// `SDKSynchronizer` holds exactly one host. It owns the
 /// lazily-created, per-account ``OrchardMigration`` actors, a single ``MigrationBroadcaster`` shared
 /// across every account (so two accounts never race two independent Tor bootstraps against the shared
 /// `migration_tor` directory), and the wallet-scope sync-blocked predicate/stream the synchronizer's
@@ -243,7 +243,7 @@ actor OrchardMigrationHost {
         do {
             accounts = try await welding.listAccounts()
         } catch {
-            logger.error("OrchardMigrationHost: failed to enumerate wallet accounts for the sync-blocked check; degrading to unblocked: \(error)")
+            logger.error("OrchardMigrationHost: account enumeration failed; treating sync as unblocked: \(error.localizedDescription)")
             return false
         }
 

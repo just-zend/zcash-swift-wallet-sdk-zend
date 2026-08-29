@@ -6,7 +6,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
-Changes are relative to `2.8.0-rc.3`.
+# 3.0.0 - 2026-08-18
 
 ## Changed
 
@@ -63,6 +63,19 @@ Changes are relative to `2.8.0-rc.3`.
   write-lane pass (the platform's next advance-step, prove, or delivery call — typically its next
   sync edge or UI refresh); checkmark/"done" rendering is unaffected (it derives from the
   wallet's own mined transactions).
+- `Synchronizer.allTransactions()` is now a protocol requirement. `SDKSynchronizer` already
+  implemented it, so no in-tree conformer changes; a downstream type conforming to `Synchronizer`
+  directly must now supply it.
+- `DBActor` now serializes only Swift-initiated writes, audited per call: verified read-only
+  calls (wallet getters, balances, memos, the propose* family, DAO reads, migration
+  block-rate samples) run off the actor and never queue behind proof generation or other
+  writes, while every write-bearing call — including each proof chunk, and the migration
+  status/progress reads, which persist mined-ness promotions under the hood — holds the
+  actor so no two Swift-initiated writes can interleave.
+- Updated the librustzcash crates to `zcash_client_backend 0.24.0-rc.7`,
+  `zcash_client_sqlite 0.22.0-rc.8`, `zcash_protocol 0.10.4` and `pczt 0.9.3`, which are the
+  source of `ZcashTransaction.Overview.zip318Kind` and of the
+  `createTransactionFromPCZT` Ironwood-output fix.
 
 ## Fixed
 
@@ -84,12 +97,6 @@ Changes are relative to `2.8.0-rc.3`.
   first-touch reads (possible since read-only calls left the database actor) could race the
   unsynchronized check-then-assign and construct two SQLite connections, silently dropping
   one and its serial queue with it.
-- The Slipstream stall watchdog no longer fires on a restarted engine's inherited history: the
-  engine-owned stall span can survive a stop→start, so a restart's first snapshots reported
-  stall time accumulated before — and across — a deliberate stop (a 497 s "stall" of which ~4.5
-  minutes the engine was stopped behind the migration gate), tripping the loud hung-engine log
-  at the exact moment recovery was working. The evaluated span is now clamped to the current
-  handle's own lifetime.
 - The migration sync gate's blocked stream now wakes AT its own known boundary: the in-flight
   marker's expiry is a wall-clock deadline the gate itself persists, yet the stream only
   re-evaluated on a flat 15-second ticker, leaving a cleared gate unnoticed for up to a whole
@@ -135,20 +142,19 @@ Changes are relative to `2.8.0-rc.3`.
   and so absent from `getTransactionOutputs(for:)`, until the transaction was
   mined and scanned. Shielded outputs stored by this path are also now tagged with
   their note commitment tree, as the ordinary send path already did.
-- `SlipstreamSynchronizer.wipe()` now deletes the submit-plan database file, restoring the
-  documented `Synchronizer.wipe()` contract ("`Synchronizer.wipe()` deletes the plan database
-  file") that previously only `SDKSynchronizer.wipe()` honored: a wallet wiped through the
-  Slipstream synchronizer left `submit_plans_<networkId>.db` behind, together with any retry
-  plans it held for transactions the wipe had just erased. [#1976]
-- Background transaction resubmission now runs under `SlipstreamSynchronizer` too: unmined,
-  unexpired transactions are periodically re-broadcast through their recorded submit plans, and
-  plans whose transactions have expired are pruned — matching `SDKSynchronizer`. A transaction
-  that never reached the network (submitted while the server was unreachable, or dropped from
-  every mempool it was sent to) previously got a second chance only on the old sync pipeline,
-  which ran the resubmission step once per sync pass; the Slipstream synchronizer has no action
-  list and so did nothing at all. It now drives the same resubmission core from its poll loop —
-  a check at most once a minute while the engine is syncing or synced, with the re-broadcast
-  itself throttled exactly as it always was. [#1975]
+- `SynchronizerEvent.minedTransaction` fires again. The event had been dead in production since
+  the adoption of transaction data requests — `BlockEnhancer` never invoked its mined-transaction
+  callback, so an app never learned a pending sent transaction had mined except by chance. It now
+  fires exactly once per unmined→mined transition of a sent transaction: from the enhancement arm
+  for shielded transactions, and from a mined `GetStatus` answer for fully-transparent ones. A
+  failed status write, previously discarded, now throws the new
+  `ZcashError.rustSetTransactionStatus` (`ZRUST0107`).
+- Server validation now rejects a server whose tip tree state carries no Ironwood frontier while
+  the chain is on the NU6.3 branch, with the new
+  `ZcashError.compactBlockProcessorServerMissingIronwoodSupport` (`ZCBPEO0024`). Absent Ironwood
+  chain metadata previously read as zero and satisfied the scanner's tree-size check, so such a
+  server failed silently — and scanning is the only mined-status oracle for shielded
+  transactions, whose txids are never disclosed for status polling.
 
 ## Added
 
@@ -200,13 +206,14 @@ Changes are relative to `2.8.0-rc.3`.
   members work without `prepare()`, so a background session can deliver a transfer without starting
   sync, and on custom networks without a prior `Initializer`. `ClosureSynchronizer` and
   `CombineSynchronizer` do not mirror the group.
-- Value types: `MigrationAdvanceStep`, `MigrationBroadcastInstruction`, `MigrationProveTarget`,
+- Value types: `MigrationAdvanceStep`, `MigrationAdvance` (with `MigrationNextWork` and
+  `MigrationStepKind`), `MigrationBroadcastInstruction`, `MigrationProveTarget`,
   `MigrationProveOutcome`, `MigrationProgress`, `MigrationSchedule`,
   `MigrationTransferProposal`, `MigrationTransferResult`,
   `MigrationRunEstimate` (with `MigrationRunEstimate.Run`), `MigrationSyncWakeup`,
   `MigrationPreparationStep`, `MigrationSigningBudget`, `NoteSplitProposal`,
   `PreparedMigrationTransfer`, `MigrationUnsignedTransferPczt`, `MigrationSignedTransferPczt`,
-  `MigrationTransactionStatus`, `KeystoneBatchDecodeResult`, and
+  `MigrationTransactionStatus` (with `MigrationInvalidReason`), `KeystoneBatchDecodeResult`, and
   `KeystoneFirmwareVersion`. Migration transaction ids are `UInt32`.
 - State: `migrationAdvanceStep(accountUUID:)` drives the migration engine's public
   `advance_migration` decision, ALWAYS projecting the wall-clock chain-tip estimate alongside the
@@ -253,7 +260,11 @@ Changes are relative to `2.8.0-rc.3`.
   `proveMigrationTransactions(accountUUID:_:maxProofs:)` returns `MigrationProveOutcome` — the
   total proved plus THE TXIDS OF THE PREPARATIONS IT PROVED, and only those — and the new
   `takeMigrationPreparation(accountUUID:byTxid:)` hands each one back as a
-  `PreparedMigrationTransfer`. THE ACCESSOR IS THE SEAM: `txid -> row -> the store's atomic
+  `PreparedMigrationTransfer`. Transaction ids use `TxId` throughout this public handoff:
+  `MigrationProveOutcome.preparationTxids`, `PreparedMigrationTransfer.txid`,
+  `MigrationTransactionStatus.State.broadcast(txid:)`, `MigrationTransferResult.success(txId:)`,
+  and the accessor's `byTxid` parameter.
+  THE ACCESSOR IS THE SEAM: `txid -> row -> the store's atomic
   broadcast seam`, in one database transaction, so the wallet's record binds AT RETRIEVAL and a
   consumer that crashed before submitting re-retrieves the same bytes over the same record. It is
   PREPARATION-GATED — a transfer's txid is refused, because transfers are served by the drive's
@@ -401,45 +412,23 @@ Changes are relative to `2.8.0-rc.3`.
   process-lifetime plan-cache key no persisted copy could honor), so every decoded copy carries
   handle `0` — re-propose instead of committing a persisted schedule.
 - New `ZcashError` cases: `ZRUST0099`–`ZRUST0106`, `ZRUST0108`, `ZRUST0111`–`ZRUST0113`,
-  `ZRUST0115`–`ZRUST0122`, `ZRUST0124`–`ZRUST0138`, `ZRUST0140`–`ZRUST0147`, and `ZRUST0149`
-  (`rustMigrationTakePreparation`, the preparation accessor). Five codes were
-  retired pre-release with the members they served — which is every gap in those ranges — and none
-  is reused: `ZRUST0098`
+  `ZRUST0115`–`ZRUST0121`, `ZRUST0124`–`ZRUST0138`, `ZRUST0140`–`ZRUST0147`, and `ZRUST0149`
+  (`rustMigrationTakePreparation`, the preparation accessor). Ten codes were
+  retired pre-release with the members they served, and none is reused; the ranges' other gaps
+  are accounted for elsewhere (`ZRUST0107` is the enhancement-path case above, and
+  `ZRUST0109`/`ZRUST0110` predate this release). The retired codes:
+  `ZRUST0093`–`ZRUST0097` (with the alternative sync engine they reported on, and its
+  whole handle lifecycle), `ZRUST0098`
   (`rustMigrationState`, with the SDK-side migration state machine), `ZRUST0114`
   (`rustMigrationIsSyncRequired`, with the always-false `zcashlc_migration_is_sync_required`, which
   never threw), `ZRUST0123`
   (`rustMigrationPendingTransferProposal`, with the kind-filtered queue peek), `ZRUST0139`
   (`rustMigrationDebugRescheduleTransfers`, with the debug-reschedule FFI), and `ZRUST0148`
   (`rustMigrationHasReadyBroadcast`, with the consumer-less ready-broadcast probe).
-
-### Slipstream sync engine
-
-- `SlipstreamSynchronizer`, an alternative `Synchronizer` implementation with non-linear
-  Spend-before-Sync scheduling, concurrent density-adaptive fetch, per-call Tor policy with server
-  failover, and a stall watchdog. Hosts opt in by constructing it; `SDKSynchronizer` remains the
-  default. It implements the migration group above with the same session separation. Error codes
-  `ZRUST0093`–`ZRUST0097`.
-- `SynchronizerState.isRecovering`.
-- `Synchronizer.allTransactions()` is now a protocol requirement, and
-  `TransactionRepository.unreconciledTxids()` exposes the read-side reconciliation view, defaulting
-  to empty where the engine's view is absent.
 - `Proposal.spendsLegacyOrchardFunds` — whether the proposal spends notes from
   the legacy Orchard pool, so wallets can warn before a turnstile-crossing send.
   `Proposal.testOnlyFakeProposal(totalFee:spendsLegacyOrchardFunds:)` gained a
   defaulted parameter for building test fixtures.
-
-## Changed
-
-- `DBActor` now serializes only Swift-initiated writes, audited per call: verified read-only
-  calls (wallet getters, balances, memos, the propose* family, DAO reads, migration
-  block-rate samples) run off the actor and never queue behind proof generation or other
-  writes, while every write-bearing call — including each proof chunk, and the migration
-  status/progress reads, which persist mined-ness promotions under the hood — holds the
-  actor so no two Swift-initiated writes can interleave.
-- Updated the librustzcash crates to `zcash_client_backend 0.24.0-rc.7`,
-  `zcash_client_sqlite 0.22.0-rc.7`, `zcash_protocol 0.10.4` and `pczt 0.9.2`, which are the
-  source of `ZcashTransaction.Overview.zip318Kind` and of the
-  `createTransactionFromPCZT` Ironwood-output fix.
 
 # 2.8.0-rc.3 - 2026-07-29
 
@@ -518,9 +507,6 @@ Changes are relative to `2.8.0-rc.3`.
   unrecognized shielded protocol.
 - `getAccountsBalances()` no longer reports empty balances for up to ~30 s after a restore completes,
   which briefly zeroed the restored funds and any migration eligibility derived from them.
-- Under `SlipstreamSynchronizer`, the collapsed balance reported during a restore lands in the
-  Ironwood pool once NU6.3 is active rather than in Orchard, so a host gating a migration prompt on a
-  nonzero Orchard balance is no longer prompted on a guess. Totals are unchanged.
 - `applyKeystoneBatchSignatures(pczts:batchSignResponse:)` accepts a batch whose PCZT ids are not
   engine-numeric; it previously failed after an otherwise successful device scan.
 - A malformed or hostile lightwalletd subtree-roots response no longer crashes the process on an

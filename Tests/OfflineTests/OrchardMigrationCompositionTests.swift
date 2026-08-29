@@ -63,7 +63,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         welding.migrationRecordTransferResultTransferIdResultForClosure = { transferId, result, _ in
             recorder.record("record")
             XCTAssertEqual(transferId, prepared.id)
-            XCTAssertEqual(result, MigrationTransferResult.success(txId: prepared.txid.toHexStringTxId()))
+            XCTAssertEqual(result, MigrationTransferResult.success(txId: prepared.txid))
             // Ordering proof: the submit-to-record window must still be open when record runs.
             XCTAssertNotNil(self.gate.currentInFlightUntil())
         }
@@ -78,7 +78,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
         )
 
-        XCTAssertEqual(result, MigrationTransferResult.success(txId: prepared.txid.toHexStringTxId()))
+        XCTAssertEqual(result, MigrationTransferResult.success(txId: prepared.txid))
         XCTAssertEqual(recorder.events, ["sign", "broadcast", "record"])
         XCTAssertEqual(broadcaster.receivedCalls.count, 1)
         XCTAssertEqual(
@@ -213,10 +213,10 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
         )
 
-        XCTAssertEqual(result, .success(txId: prepared.txid.toHexStringTxId()))
+        XCTAssertEqual(result, .success(txId: prepared.txid))
         XCTAssertEqual(
             welding.migrationRecordTransferResultTransferIdResultForReceivedArguments?.result,
-            MigrationTransferResult.success(txId: prepared.txid.toHexStringTxId())
+            MigrationTransferResult.success(txId: prepared.txid)
         )
         XCTAssertNil(gate.currentInFlightUntil(), "the recorded outcome closes the submit-to-record window")
         XCTAssertFalse(gate.currentlyBlocked(), "a completed broadcast leaves no timed hold behind")
@@ -363,15 +363,11 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// identical bytes is a no-op; those tests would stay green even if the byte-order reversal
     /// silently dropped out of `OrchardMigration.broadcastAndRecord`).
     ///
-    /// `expectedDisplayTxId` is hand-derived from the documented convention (reverse `prepared.txid`'s
-    /// byte order, then hex-encode -- see `PreparedMigrationTransfer.txid` and
-    /// `MigrationTransferResult.success`'s doc comments) independently of `Data.toHexStringTxId()`,
-    /// not produced by running it and pasting the output. See `TxIdTests` for the same convention
-    /// pinned directly against the conversion helpers themselves, off the actor.
+    /// The raw bytes are asymmetric, so the welding assertion below detects any accidental byte
+    /// reversal between the public semantic type and the FFI.
     func testPerformBroadcastRecordsTheDocumentedByteOrderForAnAsymmetricTxId() async throws {
         let rawTxId: [UInt8] = (0..<32).map { UInt8($0) }
-        let expectedDisplayTxId = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
-        let prepared = PreparedMigrationTransfer(id: 1, txid: Data(rawTxId), pczt: Data([0x01, 0x02]))
+        let prepared = PreparedMigrationTransfer(id: 1, txid: TxId(rawTxId), pczt: Data([0x01, 0x02]))
         welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
@@ -382,10 +378,10 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
         )
 
-        XCTAssertEqual(result, .success(txId: expectedDisplayTxId))
+        XCTAssertEqual(result, .success(txId: prepared.txid))
         XCTAssertEqual(
             welding.migrationRecordTransferResultTransferIdResultForReceivedArguments?.result,
-            MigrationTransferResult.success(txId: expectedDisplayTxId)
+            MigrationTransferResult.success(txId: prepared.txid)
         )
     }
 
@@ -605,7 +601,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// the OUTCOME the engine reports — count and preparation txids alike, passed through
     /// untouched (no kind judgment of its own: the engine's return already carries it).
     func testProveTransactionsNamesTheInstructionsIdsWithoutCrankingTheDrive() async throws {
-        let preparationTxid = Data(repeating: 8, count: 32)
+        let preparationTxid = TxId([UInt8](repeating: 8, count: 32))
         welding.migrationProveTransactionsIdsMaxProofsForReturnValue =
             MigrationProveOutcome(totalProved: 2, preparationTxids: [preparationTxid])
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
@@ -701,7 +697,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         ]
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
-        let landed = MigrationTransferResult.success(txId: prepared.txid.toHexStringTxId())
+        let landed = MigrationTransferResult.success(txId: prepared.txid)
 
         try await migration.recordPreparationBroadcast(prepared, result: landed)
 
@@ -723,7 +719,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         do {
-            try await migration.recordPreparationBroadcast(prepared, result: .success(txId: "landed"))
+            try await migration.recordPreparationBroadcast(prepared, result: .success(txId: prepared.txid))
             XCTFail("a transfer's id must be refused")
         } catch let ZcashError.rustMigrationRecordTransferResult(message) {
             XCTAssertTrue(
@@ -749,7 +745,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
 
         do {
-            try await migration.recordPreparationBroadcast(prepared, result: .success(txId: "landed"))
+            try await migration.recordPreparationBroadcast(prepared, result: .success(txId: prepared.txid))
             XCTFail("an id the run does not carry must be refused")
         } catch let ZcashError.rustMigrationRecordTransferResult(message) {
             XCTAssertTrue(message.contains("no migration transaction with id 99"), "got: \(message)")
@@ -814,7 +810,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
         let broadcastsStarted = await broadcaster.startedCount
         XCTAssertEqual(broadcastsStarted, 1, "the same due transfer must be broadcast exactly once")
-        XCTAssertEqual(firstResult, .success(txId: prepared.txid.toHexStringTxId()))
+        XCTAssertEqual(firstResult, .success(txId: prepared.txid))
         XCTAssertFalse(
             welding.migrationAdvanceStepForEstimatedTipCalled,
             "neither caller advances: the executor is not a lane with a mind of its own"
@@ -870,8 +866,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let transferResult = try await transferCall.value
         let splitResult = try await splitCall.value
 
-        XCTAssertEqual(transferResult, .success(txId: dueTransfer.txid.toHexStringTxId()))
-        XCTAssertEqual(splitResult, MigrationTransferResult.success(txId: splitTransfer.txid.toHexStringTxId()))
+        XCTAssertEqual(transferResult, .success(txId: dueTransfer.txid))
+        XCTAssertEqual(splitResult, MigrationTransferResult.success(txId: splitTransfer.txid))
         let broadcastsStarted = await broadcaster.startedCount
         XCTAssertEqual(broadcastsStarted, 2, "each flow broadcasts its own transaction, strictly serialized")
         XCTAssertEqual(
@@ -915,7 +911,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         )
 
         XCTAssertEqual(instruction.id, prepTransfer.id)
-        XCTAssertEqual(result, .success(txId: prepTransfer.txid.toHexStringTxId()))
+        XCTAssertEqual(result, .success(txId: prepTransfer.txid))
         XCTAssertEqual(welding.migrationRecordTransferResultTransferIdResultForReceivedArguments?.transferId, prepTransfer.id)
     }
 
@@ -1052,7 +1048,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     }
 
     private func makePreparedTransfer(id: UInt32) -> PreparedMigrationTransfer {
-        PreparedMigrationTransfer(id: id, txid: Data(repeating: 0xAB, count: 32), pczt: Data([0x01, 0x02]))
+        PreparedMigrationTransfer(id: id, txid: TxId([UInt8](repeating: 0xAB, count: 32)), pczt: Data([0x01, 0x02]))
     }
 }
 

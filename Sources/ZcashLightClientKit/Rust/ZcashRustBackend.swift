@@ -2085,7 +2085,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         // The chunks' PREPARATION TXIDS accumulate across the whole pass, in prove order, so the
         // caller sees one handoff list for the pass rather than one per chunk.
         var totalProved = 0
-        var preparationTxids: [Data] = []
+        var preparationTxids: [TxId] = []
         while totalProved < maxProofs {
             // The last-error is cleared first so the message read on failure cannot be a
             // leftover from an earlier call on this thread.
@@ -2212,15 +2212,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
 
         switch result {
         case .success(let txId):
-            // `txId` is the display-form hex string (see `MigrationTransferResult.success`); the
-            // FFI wants the raw 32-byte internal-order id, so round-trip it through `TxId`, which
-            // both validates the length and undoes the display byte-reversal.
-            guard let parsedTxId = try? TxId(txId), parsedTxId.id.count == TxId.byteLength else {
-                throw ZcashError.migrationInvalidTxId(txId)
-            }
-
             resultTag = 0
-            txidBytes = parsedTxId.id
+            txidBytes = txId.id
         case .networkError:
             // `retryable` is a Swift-level signal for the caller's own retry policy; the rust
             // layer's behavior for a network error never depended on it (tag 1 alone drives it).
@@ -2962,7 +2955,7 @@ extension FfiMigrationTransactionStatus {
             decodedState = .proved
         case 3:
             guard has_txid else { return nil }
-            decodedState = .broadcast(txid: Data(FfiTxId(tuple: txid).array))
+            decodedState = .broadcast(txid: TxId(FfiTxId(tuple: txid).array))
         case 4:
             guard mined_height >= 0 else { return nil }
             decodedState = .mined(height: BlockHeight(mined_height))
@@ -3174,7 +3167,7 @@ extension FfiPreparedTransfer {
 
         return PreparedMigrationTransfer(
             id: id,
-            txid: Data(FfiTxId(tuple: txid).array),
+            txid: TxId(FfiTxId(tuple: txid).array),
             pczt: Data(bytes: pcztPtr, count: Int(pczt_len))
         )
     }
@@ -3187,12 +3180,12 @@ extension FfiMigrationProveOutcome {
     /// Total-only is a valid shape: a pass that proved transfers alone reports its count with no
     /// txids, because only preparations are retrievable.
     func unsafeToMigrationProveOutcome() -> MigrationProveOutcome {
-        var txids: [Data] = []
+        var txids: [TxId] = []
         txids.reserveCapacity(Int(preparation_txids_len))
 
         if let txidsPtr = preparation_txids {
             for index in 0 ..< Int(preparation_txids_len) {
-                txids.append(Data(FfiTxId(tuple: txidsPtr.advanced(by: index).pointee).array))
+                txids.append(TxId(FfiTxId(tuple: txidsPtr.advanced(by: index).pointee).array))
             }
         }
 
