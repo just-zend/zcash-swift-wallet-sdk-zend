@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 2.7.0 - 2026-08-28
+
 ## Added
 - `ZcashTransaction.Overview.zip318Kind` reports how a transaction classifies
   against ZIP 318, the Orchard to Ironwood pool migration: `nonconforming`,
