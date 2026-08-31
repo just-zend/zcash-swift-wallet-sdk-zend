@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-29
+Last reviewed: 2026-08-31
 
 ## Remote and branch invariants
 
@@ -35,7 +35,19 @@ Last reviewed: 2026-08-29
 - A directionally useful upstream change is not a safe early carry when it
   crosses a coupled migration, FFI, generated-code, artifact, or release graph
   that Zend cannot independently verify.
-- The 2026-08-29 bleeding-edge scan has no ready Zend carry. Upstream `main`
+- The 2026-08-31 bleeding-edge scan carried upstream
+  [#1998](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1998) separately
+  as Zend draft [#37](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/37).
+  It is a one-commit `Cargo.lock`-only floor from `h2` 0.4.15 to 0.4.19 for the
+  lightwalletd HTTP/2 small-DATA-frame flood mitigation. A direct cherry-pick
+  conflicted because Zend's resolver graph differs; regenerate it with
+  `cargo update -p h2 --precise 0.4.19` instead, preserving the fork's graph.
+  `git diff --check` passed. The constrained monitor's `cargo check --locked -j 2`
+  started successfully but ended before Cargo produced a completion result, so
+  leave #37 draft until the locked check is completed. This independent
+  lockfile carry does not change Zend's FFI artifact or relax #34's provenance
+  and funded-device gates.
+- Upstream `main`
   remains at `2099bf71`; PR #34 contains that exact tip. Upstream's `3.0.0`
   tag is on `maint/v3.0.x`, not `main`, and its release sequence removes and
   restructures the private Slipstream/FFI surface, so it cannot be safely
