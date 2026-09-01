@@ -42,11 +42,9 @@ Last reviewed: 2026-08-31
   lightwalletd HTTP/2 small-DATA-frame flood mitigation. A direct cherry-pick
   conflicted because Zend's resolver graph differs; regenerate it with
   `cargo update -p h2 --precise 0.4.19` instead, preserving the fork's graph.
-  `git diff --check` passed. The constrained monitor's `cargo check --locked -j 2`
-  started successfully but ended before Cargo produced a completion result, so
-  leave #37 draft until the locked check is completed. This independent
+  `git diff --check` and `cargo check --locked -j 2` passed. This independent
   lockfile carry does not change Zend's FFI artifact or relax #34's provenance
-  and funded-device gates.
+  and funded-device gates; #37 remains draft while upstream review is pending.
 - Upstream `main`
   remains at `2099bf71`; PR #34 contains that exact tip. Upstream's `3.0.0`
   tag is on `maint/v3.0.x`, not `main`, and its release sequence removes and
