@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-31
+Last reviewed: 2026-09-02
 
 ## Remote and branch invariants
 
@@ -10,13 +10,13 @@ Last reviewed: 2026-08-31
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current reconciliation boundary (2026-08-29)
+## Current reconciliation boundary (2026-09-02)
 
 - Zend `main` is `95231c39` and upstream `main` is `2099bf71` after fresh
   fetches. Draft Zend [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
-  contains the upstream tip, including #1989's typed, redacted Rust proposal
-  errors, but the source and its matching released FFI artifact are not yet
-  reconciled.
+  at `79383e64` contains the upstream tip, including #1989's typed, redacted
+  Rust proposal errors, but the source and its matching released FFI artifact
+  are not yet reconciled.
 - The #1989 merge applied without conflicts and preserves Zend release wiring,
   branding, privacy/Tor behavior, and provenance controls. `cargo fmt` and
   both merge-parent `git diff --check` checks pass. `swift build --jobs 2`
@@ -45,18 +45,19 @@ Last reviewed: 2026-08-31
   `git diff --check` and `cargo check --locked -j 2` passed. This independent
   lockfile carry does not change Zend's FFI artifact or relax #34's provenance
   and funded-device gates; #37 remains draft while upstream review is pending.
-- Upstream `main`
-  remains at `2099bf71`; PR #34 contains that exact tip. Upstream's `3.0.0`
-  tag is on `maint/v3.0.x`, not `main`, and its release sequence removes and
-  restructures the private Slipstream/FFI surface, so it cannot be safely
-  separated from Zend's artifact-provenance and migration gates. PR #1997 is
-  a blocked, review-required `release/2.7.0` release PR; its candidate range
-  is maintenance-line release/CI tooling and test retirement, not an
-  independently verified Zend SDK fix. #1988 remains maintenance-line-only;
-  #1982, #1961, #1895, and #1893 are draft and/or dirty migration, send-max,
-  or Slipstream work; #1968 and #1944 are dirty or blocked; and the active
-  ZODL vendoring, dependency, release, and maintenance branches remain
-  coupled or review-required. Do not label upstream parity with `zodl`.
+- Upstream `main` remains at `2099bf71`; PR #34 contains that exact tip.
+  Upstream's `3.0.0` tag is on `maint/v3.0.x`, not `main`, and its release
+  sequence removes and restructures the private Slipstream/FFI surface, so it
+  cannot be safely separated from Zend's artifact-provenance and migration
+  gates. PR #1997 is now clean and approved, but its `candidate/2.7.0` branch
+  is a 16-commit maintenance-release range and remains 515 commits behind
+  `upstream/main`; it rewrites release and CI tooling and retires Darkside
+  tests. It is not an independently verified Zend SDK fix, so wait for a
+  compatible mainline integration. #1998 is review-required, while #1982,
+  #1961, #1895, and #1893 are draft and/or dirty migration, send-max, or
+  Slipstream work; #1968 and #1944 are dirty or blocked; and the active ZODL
+  vendoring, dependency, release, and maintenance branches remain coupled or
+  review-required. Do not label upstream parity with `zodl`.
 
 ## Historical monitor status (2026-07-26)
 
