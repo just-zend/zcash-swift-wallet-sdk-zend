@@ -6,6 +6,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+- `ZcashTransaction.Overview.ZIP318Kind.canonicalCrossingPayment`: a canonical pool crossing that
+  pays a third party. It has the same on-chain shape as a migration transfer but is not a migration
+  this account made; a raw value of 4 previously decoded as `notClassified`. A `switch` over
+  `ZIP318Kind` with no `default` stops compiling until the case is handled.
+
 # 3.0.0 - 2026-08-18
 
 ## Changed
@@ -430,6 +436,111 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Proposal.testOnlyFakeProposal(totalFee:spendsLegacyOrchardFunds:)` gained a
   defaulted parameter for building test fixtures.
 
+# 2.7.0 - 2026-08-28
+
+## Added
+- Ironwood (NU6.3) receive, sync, and send support. Once NU6.3 activates,
+  payments to Orchard receivers are delivered through Ironwood bundles in
+  version 6 transactions. `AccountBalance.ironwoodBalance` reports the
+  Ironwood balance, `ZcashTransaction.Output.Pool.ironwood` identifies Ironwood
+  outputs, and `Proposal` reports Ironwood payments and change.
+- `Synchronizer.proposeOrchardToIronwoodMigration(accountUUID:)` and its closure
+  and Combine adapters propose moving an account's entire Orchard balance to
+  its internal Ironwood receiver after NU6.3 activation. The proposal spends
+  every Orchard note, deducts the ZIP 317 fee from the transferred value, and
+  leaves Sapling and transparent funds untouched. The method throws before
+  NU6.3 activation.
+- Server validation throws
+  `ZcashError.compactBlockProcessorServerMissingIronwoodSupport` (`ZCBPEO0024`)
+  when NU6.3 is active but the connected lightwalletd does not provide Ironwood
+  tree state. Ironwood sync requires lightwalletd v0.4.18 or newer.
+- `ZcashTransaction.Overview.zip318Kind` reports whether a transaction is
+  `nonconforming`, `preparation`, `transfer`, `canonicalCrossingPayment`, or
+  `notClassified` under ZIP 318. The value describes conformance, not
+  provenance; only `preparation` and `transfer` identify this account's own
+  migration. `notClassified` means the transaction predates the classification
+  data, has not been decrypted, or uses an encoding unknown to this SDK; rescan
+  eligible transactions before relying on the value.
+- `ZcashTransaction.Overview.spentNoteCount` reports how many of the account's
+  notes the transaction spent. `poolCrossingValue` reports the amount moved by
+  a wallet-internal shielded-pool transfer, for which `value` contains only the
+  negated fee. `isTrusted` reports whether the transaction's outputs become
+  spendable at the trusted rather than untrusted confirmation count.
+
+## Changed
+- `proposeTransfer` and `proposefulfillingPaymentURI` now propose a ZIP 318
+  canonical crossing after NU6.3 for a single canonical-denomination payment
+  (`{1, 2, 5} * 10^k` from 0.01 ZEC through 10,000 ZEC) when one Orchard note
+  can fund the payment and fee. The transaction uses one unpadded Ironwood
+  action, reducing its ZIP 317 marginal fee by one action, but its inputs may
+  require confirmations up to two ZIP 318 bucket intervals beyond the supplied
+  `ConfirmationsPolicy`. Otherwise, an ordinary transaction is proposed.
+- A canonical ZIP 318 crossing uses the oldest single Orchard note that covers
+  the payment and fee. Ordinary note selection also now uses the oldest
+  eligible notes in chain order instead of scan-discovery order.
+- ZIP 318 migrations use shorter transfer and preparation delays and limit
+  anchor age to four bucket boundaries instead of sixteen.
+- After NU6.3, fee and change calculation charges Orchard spends and outputs as
+  separate ZIP 317 actions and charges Ironwood actions against a separate
+  bundle. Proposals targeting earlier heights retain the pre-NU6.3 policy.
+- `addProofsToPCZT` now proves Ironwood bundles. PCZTs sent to external signers
+  use the full signer view and the minimum encoding version that represents
+  their content, while retaining Ironwood witness and output-metadata
+  redaction.
+- Transparent-address transaction enhancement now requires lightwalletd
+  v0.4.18 or newer. `ZcashError.serviceGetTaddressTxidsFailed` retains its
+  public shape but has updated message text.
+
+## Removed
+- The shielded voting API has been removed: `VotingRustBackend`, all public
+  `Voting*` types, `PirSnapshotResolver`, `PirSnapshotProbing`, and
+  `HTTPPirSnapshotProbe`. Calls using these symbols no longer compile and must
+  be removed.
+
+## Fixed
+- Wallet databases upgraded by affected prerelease builds no longer fail every
+  scan because of a missing ZIP 318 migration column. Production-network data
+  is repaired automatically; a migration planned on a test network with a
+  custom anchor grid reports `AnchorIntervalMismatch` and must be re-planned.
+- ZIP 318 crossings no longer fail with `ProposalError::AnchorNotFound` when an
+  anchor bucket boundary contains no note commitments. The SDK falls back to
+  an ordinary crossing when no anchor can be computed.
+- Hardware wallets can sign post-NU6.3 transactions whose zero-value Orchard
+  padding spends previously lacked ZIP 32 derivation metadata. External signers
+  that do not support compact PCZT signer views, including deployed Keystone
+  firmware, can sign these transactions again.
+- Ironwood notes received on an account's internal address are now classified
+  as change once the funding account is known. This corrects
+  `ZcashTransaction.Overview.hasChange`, note counts, and
+  `ZcashTransaction.Output.isChange`; balances were unaffected. Existing data
+  is repaired during migration without a rescan.
+- Addresses that have received only Ironwood notes are now treated as used, so
+  `getCustomUnifiedAddress(accountUUID:receivers:)` does not return them again
+  and the receiving account is reported as involved in the transaction.
+  Existing data is repaired during migration.
+- Transparent outputs funded from Ironwood are attributed to the funding
+  account and included in `getTransactionOutputs(for:)`.
+- Sent transactions that cannot be observed through shielded scanning are now
+  queried by transaction ID, including transactions funded entirely by
+  transparent inputs whose outputs belong to another wallet. Their mined and
+  expired status is updated correctly, including after a rewind.
+- `SynchronizerEvent.minedTransaction` fires exactly once for each sent
+  transaction's unmined-to-mined transition, including fully transparent
+  transactions.
+- `ZcashRustBackend.setTransactionStatus` failures are no longer ignored and
+  now throw `ZcashError.rustSetTransactionStatus` (`ZRUST0111`).
+- Tor-backed lightwalletd and exchange-rate requests now fail on timeout instead
+  of waiting indefinitely. `TorClient.httpRequest(for:retryLimit:)` also rejects
+  URL schemes other than `http` and `https`.
+- `deleteAccount(_:)` no longer fails when the account is recorded as the
+  recipient of one of its own sent outputs.
+- Payments to the wallet's own transparent addresses report the transparent
+  receiver as the output recipient instead of the account's unified address.
+- `createTransactionFromPCZT(pcztWithProofs:pcztWithSigs:)` now persists
+  Ironwood outputs, including recipient addresses and memos, and tags shielded
+  outputs with their note commitment tree. Wallet-internal Ironwood outputs are
+  therefore available from `getTransactionOutputs(for:)` before mining.
+
 # 2.8.0-rc.3 - 2026-07-29
 
 ## Changed
@@ -540,38 +651,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over the receiving address.
 
 # 2.8.0-rc.2 - 2026-07-28
-
-## Changed
-- `proposeTransfer` and `proposefulfillingPaymentURI`: once NU6.3 is active, a single payment whose
-  value is a canonical ZIP 318 denomination (a `{1, 2, 5} * 10^k` amount from 0.01 to 10,000 ZEC)
-  crossing the Orchard turnstile is proposed as a canonical crossing. Such a proposal pays one fewer
-  ZIP 317 marginal-fee action, and requires up to two anchor-bucket intervals of confirmations on its
-  inputs beyond the `ConfirmationsPolicy` you passed. No call-site change: a payment the wallet
-  cannot fund that way is proposed as an ordinary transaction, as before.
-
-## Fixed
-- An Ironwood note received on an account's internal address is reported as change.
-  `ZcashTransaction.Overview.hasChange` was `false` while the note was counted in `receivedNoteCount`
-  and `sentNoteCount`, and `ZcashTransaction.Output.isChange` presented the account's own change as a
-  recipient of the user's transaction. Balances were unaffected. Existing rows are repaired on
-  upgrade; no rescan is required.
-- An address that had received only Ironwood notes counted as unused, so
-  `getCustomUnifiedAddress(accountUUID:receivers:)` could hand it out again and the receiving account
-  was not reported as involved in the transaction that paid it. Since NU6.3 delivers every payment to
-  an Orchard receiver in the Ironwood bundle, this affected ordinary receives. Repaired on upgrade.
-- `getTransactionOutputs(for:)` omitted the transparent outputs of a transaction funded entirely from
-  the Ironwood pool, and could attribute an output funded from several pools to an account other than
-  the largest contributor.
-- A sent transaction whose shielded spends and outputs this wallet cannot observe — one funded
-  entirely by transparent inputs whose shielded outputs belong to another wallet — now has its mined
-  or expired status resolved during enhancement.
-- Calls routed over Tor time out instead of hanging indefinitely against a server that accepts a
-  connection and then never responds: `Synchronizer.refreshExchangeRateUSD()`,
-  `TorClient.getExchangeRateUSD()`, and every lightwalletd call the SDK sends over Tor.
-- `TorClient.httpRequest(for:retryLimit:)` rejects a `URLRequest` whose URL scheme is neither `http`
-  nor `https` instead of sending it as plaintext HTTP.
-
-# 2.7.0-rc.3 - 2026-07-28
 
 ## Changed
 - `proposeTransfer` and `proposefulfillingPaymentURI`: once NU6.3 is active, a single payment whose
@@ -722,102 +801,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4010000.json
 ...
 Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4090000.json
 ````
-
-# 2.7.0-rc.2 - 2026-07-26
-
-## Changed
-- The lightwalletd protobuf definitions (`compact_formats.proto`,
-  `service.proto`) are now vendored from
-  https://github.com/zcash/lightwallet-protocol as a git subtree under
-  `lightwallet-protocol/`, currently at v0.5.0, and the generated Swift
-  sources have been regenerated from it. Future updates should use
-  `Scripts/update-lightwallet-protocol.sh <ref>`, which pulls the subtree and
-  regenerates the sources (a nix dev shell providing `protoc` is available
-  via the new `flake.nix`). Protocol v0.5.0 renames `CompactTx.hash` to
-  `CompactTx.txid`, removes `CompactTx.protoVersion`, and adds transparent
-  `vin`/`vout` data, the `PoolType` enum, `BlockRange.poolTypes`, and new
-  `LightdInfo` fields; these generated types are internal to the SDK, so the
-  public API is unchanged.
-- Transparent-address transaction enhancement now uses the
-  `GetTaddressTransactions` RPC in place of the deprecated (and otherwise
-  identical) `GetTaddressTxids`. This raises the minimum server requirement:
-  the SDK now needs a lightwalletd serving lightwallet-protocol v0.3.6 or
-  newer (lightwalletd v0.4.18, 2025-05). Against an older server, enhancement
-  of transparent transactions fails rather than falling back.
-  `ZcashError.serviceGetTaddressTxidsFailed` is unchanged apart from its
-  message text.
-- Adding proofs to a PCZT now reuses a cached Orchard-family proving key
-  across the Orchard and Ironwood proofs (both use the same PostNu6_3
-  circuit after NU6.3) instead of rebuilding the key for each, and derives
-  the Ironwood circuit version from the PCZT's consensus branch id rather
-  than hardcoding it. The resulting proofs are unchanged.
-
-## Fixed
-- Hardware-wallet signing of post-NU6.3 (v6) transactions: the
-  wallet-controlled zero-value Orchard spends that pad such transactions now
-  carry ZIP 32 derivation metadata (via `zcash_client_backend 0.24.0-rc.4`),
-  so signers can identify and sign them. Previously these actions were
-  unsignable and v6 sends failed at finalization with a missing
-  spend-auth-signature error even though the device approved the
-  transaction.
-- Redacting a PCZT for an external signer now requests
-  `zcash_client_backend`'s full (non-compacted) signer view, and the PCZT
-  encoding sent to the signer is the minimal version capable of representing
-  its content (v1 for v5 transactions). The compact signer view previously
-  adopted here requires receiver capabilities (v2 PCZT encoding,
-  compact-field resolution) that deployed hardware-signer firmware does not
-  provide in its ordinary signing flow, causing Keystone sends to fail at
-  finalization with a missing-signature error. The Ironwood bundle redaction
-  is preserved: the full view clears Ironwood spend witnesses and output
-  metadata alongside the other bundles.
-
-# 2.7.0-rc.1 - 2026-07-25
-
-## Added
-- Ironwood (NU6.3) receive/sync readiness. `AccountBalance.ironwoodBalance`
-  exposes the Ironwood (Orchard note-version V3) pool balance alongside sapling
-  and orchard (masked with them while the chain tip is stale). The lightwalletd
-  protocol gains the Ironwood fields (`CompactTx.ironwoodActions`,
-  `ChainMetadata.ironwoodCommitmentTreeSize`, `TreeState.ironwoodTree`,
-  `ShieldedProtocol.ironwood`); `UpdateSubtreeRootsAction` fetches and stores
-  Ironwood subtree roots (best-effort, skipping when the server does not serve
-  them); and checkpoints can carry an `ironwoodTree` state. The path is dormant
-  until NU6.3 activates and a lightwalletd serves the fields.
-
-## Changed
-- Bumped the Rust dependency stack to the Ironwood (NU6.3) crates.io releases
-  (`orchard` 0.14→0.15, `zcash_client_backend` 0.23→0.24.0-rc.2,
-  `zcash_client_sqlite` 0.21→0.22.0-rc.2, `zcash_primitives`/`zcash_proofs`
-  0.28→0.30, `zcash_protocol` 0.9→0.10, `zcash_address` 0.12→0.13,
-  `zcash_transparent` 0.8→0.10, `pczt` 0.7→0.8, `zcash_keys` 0.14→0.16)
-  and dropped the `[patch.crates-io]` git overrides, matching the Android SDK's
-  2.5.x dependency set. `addProofsToPCZT` now also proves Ironwood bundles.
-- Once NU6.3 activates, a payment to an Orchard receiver is delivered through
-  the Ironwood bundle of a version 6 transaction rather than as an Orchard
-  output: a `Proposal` reports such payments and the change from Ironwood
-  spends as Ironwood-pool outputs, and `createProposedTransactions` and
-  `createPCZTFromProposal` build the version 6 transaction that carries them.
-- Fee and change calculation derive the Orchard bundle version from the
-  proposal's target height instead of always applying the pre-NU6.3 policy, so
-  a proposal targeting a height at or beyond NU6.3 activation is charged one
-  ZIP 317 action per Orchard spend or output rather than
-  `max(spends, outputs)`, and Ironwood spends, outputs and change are charged
-  against the separate Ironwood bundle. Proposals below the activation height
-  are unaffected.
-
-## Removed
-- The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
-  `PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe`, and the
-  `zcashlc_voting_*` FFI). `zcash_voting` cannot resolve against the Ironwood
-  `orchard` release, so voting is not shipped on the 2.5.x line, matching the
-  Android SDK.
-
-## Fixed
-- `deleteAccount(_:)` no longer fails with a rusqlite
-  `InvalidParameterName(":address")` error when the account being deleted is
-  recorded as the recipient of one of its own sent outputs, as happens after
-  an internal transfer to that account. Wallets on the 2.6 line received this
-  fix in 2.6.0-alpha.6.
 
 # 2.6.0-alpha.6 - 2026-06-26
 
