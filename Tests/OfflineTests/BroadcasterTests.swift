@@ -324,7 +324,11 @@ final class BroadcasterTests: ZcashTestCase {
             value: Zatoshi(-1_000),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
     }
 
@@ -381,6 +385,10 @@ private final class StubTransactionEncoder: TransactionEncoder {
         amount: Zatoshi,
         memoBytes: MemoBytes?
     ) async throws -> Proposal {
+        fatalError("Unused in test")
+    }
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
         fatalError("Unused in test")
     }
 
@@ -496,6 +504,10 @@ private final class RecordingCompactTxStreamerService: CompactTxStreamerProvider
         unimplementedStreaming(on: context.eventLoop)
     }
 
+    func getTaddressTransactions(request: TransparentAddressBlockFilter, context: StreamingResponseCallContext<RawTransaction>) -> EventLoopFuture<GRPCStatus> {
+        unimplementedStreaming(on: context.eventLoop)
+    }
+
     func getTaddressBalance(request: AddressList, context: StatusOnlyCallContext) -> EventLoopFuture<Balance> {
         unimplementedUnary(on: context.eventLoop)
     }
@@ -504,7 +516,7 @@ private final class RecordingCompactTxStreamerService: CompactTxStreamerProvider
         unimplementedUnary(on: context.eventLoop)
     }
 
-    func getMempoolTx(request: Exclude, context: StreamingResponseCallContext<CompactTx>) -> EventLoopFuture<GRPCStatus> {
+    func getMempoolTx(request: GetMempoolTxRequest, context: StreamingResponseCallContext<CompactTx>) -> EventLoopFuture<GRPCStatus> {
         unimplementedStreaming(on: context.eventLoop)
     }
 

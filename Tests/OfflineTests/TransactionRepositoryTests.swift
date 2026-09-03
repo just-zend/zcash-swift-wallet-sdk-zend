@@ -10,6 +10,15 @@ import XCTest
 @testable import ZcashLightClientKit
 
 class TransactionRepositoryTests: XCTestCase {
+    func testZIP318KindDecodesEveryKnownClassification() {
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 0), .notClassified)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 1), .nonconforming)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 2), .preparation)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 3), .transfer)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 4), .canonicalCrossingPayment)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 5), .notClassified)
+    }
+
     var transactionRepository: TransactionRepository!
 
     override func setUp() async throws {
@@ -126,7 +135,11 @@ class TransactionRepositoryTests: XCTestCase {
             value: Zatoshi(-1000),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)
@@ -159,7 +172,11 @@ class TransactionRepositoryTests: XCTestCase {
             value: .zero,
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)
@@ -187,7 +204,11 @@ class TransactionRepositoryTests: XCTestCase {
             value: .zero,
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)

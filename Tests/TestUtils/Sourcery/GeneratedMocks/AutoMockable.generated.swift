@@ -537,6 +537,81 @@ class BlockScannerMock: BlockScanner {
     }
 
 }
+class BroadcasterMock: Broadcaster {
+
+
+    init(
+    ) {
+    }
+
+    // MARK: - createProposedTransactions
+
+    var createProposedTransactionsProposalSpendingKeyThrowableError: Error?
+    var createProposedTransactionsProposalSpendingKeyCallsCount = 0
+    var createProposedTransactionsProposalSpendingKeyCalled: Bool {
+        return createProposedTransactionsProposalSpendingKeyCallsCount > 0
+    }
+    var createProposedTransactionsProposalSpendingKeyReceivedArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
+    var createProposedTransactionsProposalSpendingKeyReturnValue: [ZcashTransaction.Overview]!
+    var createProposedTransactionsProposalSpendingKeyClosure: ((Proposal, UnifiedSpendingKey) async throws -> [ZcashTransaction.Overview])?
+
+    func createProposedTransactions(proposal: Proposal, spendingKey: UnifiedSpendingKey) async throws -> [ZcashTransaction.Overview] {
+        if let error = createProposedTransactionsProposalSpendingKeyThrowableError {
+            throw error
+        }
+        createProposedTransactionsProposalSpendingKeyCallsCount += 1
+        createProposedTransactionsProposalSpendingKeyReceivedArguments = (proposal: proposal, spendingKey: spendingKey)
+        if let closure = createProposedTransactionsProposalSpendingKeyClosure {
+            return try await closure(proposal, spendingKey)
+        } else {
+            return createProposedTransactionsProposalSpendingKeyReturnValue
+        }
+    }
+
+    // MARK: - createTransactionFromPCZT
+
+    var createTransactionFromPCZTPcztWithProofsPcztWithSigsThrowableError: Error?
+    var createTransactionFromPCZTPcztWithProofsPcztWithSigsCallsCount = 0
+    var createTransactionFromPCZTPcztWithProofsPcztWithSigsCalled: Bool {
+        return createTransactionFromPCZTPcztWithProofsPcztWithSigsCallsCount > 0
+    }
+    var createTransactionFromPCZTPcztWithProofsPcztWithSigsReceivedArguments: (pcztWithProofs: Pczt, pcztWithSigs: Pczt)?
+    var createTransactionFromPCZTPcztWithProofsPcztWithSigsReturnValue: [ZcashTransaction.Overview]!
+    var createTransactionFromPCZTPcztWithProofsPcztWithSigsClosure: ((Pczt, Pczt) async throws -> [ZcashTransaction.Overview])?
+
+    func createTransactionFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> [ZcashTransaction.Overview] {
+        if let error = createTransactionFromPCZTPcztWithProofsPcztWithSigsThrowableError {
+            throw error
+        }
+        createTransactionFromPCZTPcztWithProofsPcztWithSigsCallsCount += 1
+        createTransactionFromPCZTPcztWithProofsPcztWithSigsReceivedArguments = (pcztWithProofs: pcztWithProofs, pcztWithSigs: pcztWithSigs)
+        if let closure = createTransactionFromPCZTPcztWithProofsPcztWithSigsClosure {
+            return try await closure(pcztWithProofs, pcztWithSigs)
+        } else {
+            return createTransactionFromPCZTPcztWithProofsPcztWithSigsReturnValue
+        }
+    }
+
+    // MARK: - submit
+
+    var submitToThrowableError: Error?
+    var submitToCallsCount = 0
+    var submitToCalled: Bool {
+        return submitToCallsCount > 0
+    }
+    var submitToReceivedArguments: (rawTransaction: Data, endpoint: LightWalletEndpoint)?
+    var submitToClosure: ((Data, LightWalletEndpoint) async throws -> Void)?
+
+    func submit(_ rawTransaction: Data, to endpoint: LightWalletEndpoint) async throws {
+        if let error = submitToThrowableError {
+            throw error
+        }
+        submitToCallsCount += 1
+        submitToReceivedArguments = (rawTransaction: rawTransaction, endpoint: endpoint)
+        try await submitToClosure!(rawTransaction, endpoint)
+    }
+
+}
 class CompactBlockRepositoryMock: CompactBlockRepository {
 
 
@@ -1036,27 +1111,27 @@ class LightWalletServiceMock: LightWalletService {
         }
     }
 
-    // MARK: - getTaddressTxids
+    // MARK: - getTaddressTransactions
 
-    var getTaddressTxidsModeThrowableError: Error?
-    var getTaddressTxidsModeCallsCount = 0
-    var getTaddressTxidsModeCalled: Bool {
-        return getTaddressTxidsModeCallsCount > 0
+    var getTaddressTransactionsModeThrowableError: Error?
+    var getTaddressTransactionsModeCallsCount = 0
+    var getTaddressTransactionsModeCalled: Bool {
+        return getTaddressTransactionsModeCallsCount > 0
     }
-    var getTaddressTxidsModeReceivedArguments: (request: TransparentAddressBlockFilter, mode: ServiceMode)?
-    var getTaddressTxidsModeReturnValue: AsyncThrowingStream<RawTransaction, Error>!
-    var getTaddressTxidsModeClosure: ((TransparentAddressBlockFilter, ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error>)?
+    var getTaddressTransactionsModeReceivedArguments: (request: TransparentAddressBlockFilter, mode: ServiceMode)?
+    var getTaddressTransactionsModeReturnValue: AsyncThrowingStream<RawTransaction, Error>!
+    var getTaddressTransactionsModeClosure: ((TransparentAddressBlockFilter, ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error>)?
 
-    func getTaddressTxids(_ request: TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error> {
-        if let error = getTaddressTxidsModeThrowableError {
+    func getTaddressTransactions(_ request: TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error> {
+        if let error = getTaddressTransactionsModeThrowableError {
             throw error
         }
-        getTaddressTxidsModeCallsCount += 1
-        getTaddressTxidsModeReceivedArguments = (request: request, mode: mode)
-        if let closure = getTaddressTxidsModeClosure {
+        getTaddressTransactionsModeCallsCount += 1
+        getTaddressTransactionsModeReceivedArguments = (request: request, mode: mode)
+        if let closure = getTaddressTransactionsModeClosure {
             return try closure(request, mode)
         } else {
-            return getTaddressTxidsModeReturnValue
+            return getTaddressTransactionsModeReturnValue
         }
     }
 
@@ -1439,75 +1514,6 @@ class SaplingParametersHandlerMock: SaplingParametersHandler {
     }
 
 }
-class BroadcasterMock: Broadcaster {
-
-
-    init(
-    ) {
-    }
-
-    // MARK: - createProposedTransactions
-
-    var createProposedTransactionsProposalSpendingKeyThrowableError: Error?
-    var createProposedTransactionsProposalSpendingKeyCallsCount = 0
-    var createProposedTransactionsProposalSpendingKeyCalled: Bool {
-        return createProposedTransactionsProposalSpendingKeyCallsCount > 0
-    }
-    var createProposedTransactionsProposalSpendingKeyReturnValue: [ZcashTransaction.Overview]!
-    var createProposedTransactionsProposalSpendingKeyClosure: ((Proposal, UnifiedSpendingKey) async throws -> [ZcashTransaction.Overview])?
-
-    func createProposedTransactions(proposal: Proposal, spendingKey: UnifiedSpendingKey) async throws -> [ZcashTransaction.Overview] {
-        if let error = createProposedTransactionsProposalSpendingKeyThrowableError {
-            throw error
-        }
-        createProposedTransactionsProposalSpendingKeyCallsCount += 1
-        if let closure = createProposedTransactionsProposalSpendingKeyClosure {
-            return try await closure(proposal, spendingKey)
-        } else {
-            return createProposedTransactionsProposalSpendingKeyReturnValue
-        }
-    }
-
-    // MARK: - createTransactionFromPCZT
-
-    var createTransactionFromPCZTPcztWithProofsPcztWithSigsThrowableError: Error?
-    var createTransactionFromPCZTPcztWithProofsPcztWithSigsCallsCount = 0
-    var createTransactionFromPCZTPcztWithProofsPcztWithSigsCalled: Bool {
-        return createTransactionFromPCZTPcztWithProofsPcztWithSigsCallsCount > 0
-    }
-    var createTransactionFromPCZTPcztWithProofsPcztWithSigsReturnValue: [ZcashTransaction.Overview]!
-    var createTransactionFromPCZTPcztWithProofsPcztWithSigsClosure: ((Pczt, Pczt) async throws -> [ZcashTransaction.Overview])?
-
-    func createTransactionFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> [ZcashTransaction.Overview] {
-        if let error = createTransactionFromPCZTPcztWithProofsPcztWithSigsThrowableError {
-            throw error
-        }
-        createTransactionFromPCZTPcztWithProofsPcztWithSigsCallsCount += 1
-        if let closure = createTransactionFromPCZTPcztWithProofsPcztWithSigsClosure {
-            return try await closure(pcztWithProofs, pcztWithSigs)
-        } else {
-            return createTransactionFromPCZTPcztWithProofsPcztWithSigsReturnValue
-        }
-    }
-
-    // MARK: - submit
-
-    var submitToThrowableError: Error?
-    var submitToCallsCount = 0
-    var submitToCalled: Bool {
-        return submitToCallsCount > 0
-    }
-    var submitToClosure: ((Data, LightWalletEndpoint) async throws -> Void)?
-
-    func submit(_ rawTransaction: Data, to endpoint: LightWalletEndpoint) async throws {
-        if let error = submitToThrowableError {
-            throw error
-        }
-        submitToCallsCount += 1
-        try await submitToClosure?(rawTransaction, endpoint)
-    }
-
-}
 class SynchronizerMock: Synchronizer {
 
 
@@ -1728,6 +1734,30 @@ class SynchronizerMock: Synchronizer {
             return try await closure(accountUUID, recipient, amount, memo)
         } else {
             return proposeTransferAccountUUIDRecipientAmountMemoReturnValue
+        }
+    }
+
+    // MARK: - proposeOrchardToIronwoodMigration
+
+    var proposeOrchardToIronwoodMigrationAccountUUIDThrowableError: Error?
+    var proposeOrchardToIronwoodMigrationAccountUUIDCallsCount = 0
+    var proposeOrchardToIronwoodMigrationAccountUUIDCalled: Bool {
+        return proposeOrchardToIronwoodMigrationAccountUUIDCallsCount > 0
+    }
+    var proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID: AccountUUID?
+    var proposeOrchardToIronwoodMigrationAccountUUIDReturnValue: Proposal!
+    var proposeOrchardToIronwoodMigrationAccountUUIDClosure: ((AccountUUID) async throws -> Proposal)?
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
+        if let error = proposeOrchardToIronwoodMigrationAccountUUIDThrowableError {
+            throw error
+        }
+        proposeOrchardToIronwoodMigrationAccountUUIDCallsCount += 1
+        proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = proposeOrchardToIronwoodMigrationAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return proposeOrchardToIronwoodMigrationAccountUUIDReturnValue
         }
     }
 
@@ -2202,6 +2232,25 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - rescanFrom
+
+    var rescanFromHeightThrowableError: Error?
+    var rescanFromHeightCallsCount = 0
+    var rescanFromHeightCalled: Bool {
+        return rescanFromHeightCallsCount > 0
+    }
+    var rescanFromHeightReceivedHeight: BlockHeight?
+    var rescanFromHeightClosure: ((BlockHeight) async throws -> Void)?
+
+    func rescanFrom(height: BlockHeight) async throws {
+        if let error = rescanFromHeightThrowableError {
+            throw error
+        }
+        rescanFromHeightCallsCount += 1
+        rescanFromHeightReceivedHeight = height
+        try await rescanFromHeightClosure!(height)
+    }
+
     // MARK: - rewind
 
     var rewindCallsCount = 0
@@ -2443,6 +2492,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - getTreeState
+
+    var getTreeStateHeightThrowableError: Error?
+    var getTreeStateHeightCallsCount = 0
+    var getTreeStateHeightCalled: Bool {
+        return getTreeStateHeightCallsCount > 0
+    }
+    var getTreeStateHeightReceivedHeight: UInt64?
+    var getTreeStateHeightReturnValue: Data!
+    var getTreeStateHeightClosure: ((UInt64) async throws -> Data)?
+
+    func getTreeState(height: UInt64) async throws -> Data {
+        if let error = getTreeStateHeightThrowableError {
+            throw error
+        }
+        getTreeStateHeightCallsCount += 1
+        getTreeStateHeightReceivedHeight = height
+        if let closure = getTreeStateHeightClosure {
+            return try await closure(height)
+        } else {
+            return getTreeStateHeightReturnValue
+        }
+    }
+
     // MARK: - getSingleUseTransparentAddress
 
     var getSingleUseTransparentAddressAccountUUIDThrowableError: Error?
@@ -2575,49 +2648,6 @@ class SynchronizerMock: Synchronizer {
         deleteAccountCallsCount += 1
         deleteAccountReceivedAccountUUID = accountUUID
         try await deleteAccountClosure!(accountUUID)
-    }
-
-    // MARK: - rescanFrom
-
-    var rescanFromHeightThrowableError: Error?
-    var rescanFromHeightCallsCount = 0
-    var rescanFromHeightCalled: Bool {
-        return rescanFromHeightCallsCount > 0
-    }
-    var rescanFromHeightReceivedHeight: BlockHeight?
-    var rescanFromHeightClosure: ((BlockHeight) async throws -> Void)?
-
-    func rescanFrom(height: BlockHeight) async throws {
-        if let error = rescanFromHeightThrowableError {
-            throw error
-        }
-        rescanFromHeightCallsCount += 1
-        rescanFromHeightReceivedHeight = height
-        try await rescanFromHeightClosure?(height)
-    }
-
-    // MARK: - getTreeState
-
-    var getTreeStateHeightThrowableError: Error?
-    var getTreeStateHeightCallsCount = 0
-    var getTreeStateHeightCalled: Bool {
-        return getTreeStateHeightCallsCount > 0
-    }
-    var getTreeStateHeightReceivedHeight: UInt64?
-    var getTreeStateHeightReturnValue: Data!
-    var getTreeStateHeightClosure: ((UInt64) async throws -> Data)?
-
-    func getTreeState(height: UInt64) async throws -> Data {
-        if let error = getTreeStateHeightThrowableError {
-            throw error
-        }
-        getTreeStateHeightCallsCount += 1
-        getTreeStateHeightReceivedHeight = height
-        if let closure = getTreeStateHeightClosure {
-            return try await closure(height)
-        } else {
-            return getTreeStateHeightReturnValue
-        }
     }
 
 }
@@ -3532,6 +3562,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         try await putOrchardSubtreeRootsStartIndexRootsClosure!(startIndex, roots)
     }
 
+    // MARK: - putIronwoodSubtreeRoots
+
+    var putIronwoodSubtreeRootsStartIndexRootsThrowableError: Error?
+    var putIronwoodSubtreeRootsStartIndexRootsCallsCount = 0
+    var putIronwoodSubtreeRootsStartIndexRootsCalled: Bool {
+        return putIronwoodSubtreeRootsStartIndexRootsCallsCount > 0
+    }
+    var putIronwoodSubtreeRootsStartIndexRootsReceivedArguments: (startIndex: UInt64, roots: [SubtreeRoot])?
+    var putIronwoodSubtreeRootsStartIndexRootsClosure: ((UInt64, [SubtreeRoot]) async throws -> Void)?
+
+    func putIronwoodSubtreeRoots(startIndex: UInt64, roots: [SubtreeRoot]) async throws {
+        if let error = putIronwoodSubtreeRootsStartIndexRootsThrowableError {
+            throw error
+        }
+        putIronwoodSubtreeRootsStartIndexRootsCallsCount += 1
+        putIronwoodSubtreeRootsStartIndexRootsReceivedArguments = (startIndex: startIndex, roots: roots)
+        try await putIronwoodSubtreeRootsStartIndexRootsClosure!(startIndex, roots)
+    }
+
     // MARK: - updateChainTip
 
     var updateChainTipHeightThrowableError: Error?
@@ -3703,6 +3752,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(accountUUID, address, value, memo)
         } else {
             return proposeTransferAccountUUIDToValueMemoReturnValue
+        }
+    }
+
+    // MARK: - proposeOrchardToIronwoodMigration
+
+    var proposeOrchardToIronwoodMigrationAccountUUIDThrowableError: Error?
+    var proposeOrchardToIronwoodMigrationAccountUUIDCallsCount = 0
+    var proposeOrchardToIronwoodMigrationAccountUUIDCalled: Bool {
+        return proposeOrchardToIronwoodMigrationAccountUUIDCallsCount > 0
+    }
+    var proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID: AccountUUID?
+    var proposeOrchardToIronwoodMigrationAccountUUIDReturnValue: FfiProposal!
+    var proposeOrchardToIronwoodMigrationAccountUUIDClosure: ((AccountUUID) async throws -> FfiProposal)?
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> FfiProposal {
+        if let error = proposeOrchardToIronwoodMigrationAccountUUIDThrowableError {
+            throw error
+        }
+        proposeOrchardToIronwoodMigrationAccountUUIDCallsCount += 1
+        proposeOrchardToIronwoodMigrationAccountUUIDReceivedAccountUUID = accountUUID
+        if let closure = proposeOrchardToIronwoodMigrationAccountUUIDClosure {
+            return try await closure(accountUUID)
+        } else {
+            return proposeOrchardToIronwoodMigrationAccountUUIDReturnValue
         }
     }
 

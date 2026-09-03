@@ -41,7 +41,7 @@ public enum ZcashErrorCode: String {
     case serviceBlockStreamFailed = "ZSRVC0000"
     /// LightWalletService.getSubtreeRoots failed.
     case serviceSubtreeRootsStreamFailed = "ZSRVC0009"
-    /// LightWalletService.getTaddressTxids failed.
+    /// LightWalletService.getTaddressTransactions failed.
     case serviceGetTaddressTxidsFailed = "ZSRVC0010"
     /// LightWalletService.getMempoolStream failed.
     case serviceGetMempoolStreamFailed = "ZSRVC0011"
@@ -197,12 +197,18 @@ public enum ZcashErrorCode: String {
     case rustPutOrchardSubtreeRootsAllocationProblem = "ZRUST0060"
     /// Error from rust layer when calling ZcashRustBackend.putOrchardSubtreeRoots
     case rustPutOrchardSubtreeRoots = "ZRUST0061"
+    /// Unable to allocate memory required to write blocks when calling ZcashRustBackend.putIronwoodSubtreeRoots
+    case rustPutIronwoodSubtreeRootsAllocationProblem = "ZRUST0109"
+    /// Error from rust layer when calling ZcashRustBackend.putIronwoodSubtreeRoots
+    case rustPutIronwoodSubtreeRoots = "ZRUST0110"
     /// Error from rust layer when calling TorClient.init
     case rustTorClientInit = "ZRUST0062"
     /// Error from rust layer when calling TorClient.get
     case rustTorClientGet = "ZRUST0063"
     /// Error from rust layer when calling ZcashRustBackend.transactionDataRequests
     case rustTransactionDataRequests = "ZRUST0064"
+    /// Error from rust layer when calling ZcashRustBackend.setTransactionStatus
+    case rustSetTransactionStatus = "ZRUST0111"
     /// Error from rust layer when calling ZcashRustBackend.deriveArbitraryWalletKey
     case rustDeriveArbitraryWalletKey = "ZRUST0065"
     /// Error from rust layer when calling ZcashRustBackend.deriveArbitraryAccountKey
@@ -419,6 +425,10 @@ public enum ZcashErrorCode: String {
     case compactBlockProcessorSupportedSyncAlgorithm = "ZCBPEO0021"
     /// Put Orchard subtree roots to the DB failed.
     case compactBlockProcessorPutOrchardSubtreeRoots = "ZCBPEO0022"
+    /// Put Ironwood subtree roots to the DB failed.
+    case compactBlockProcessorPutIronwoodSubtreeRoots = "ZCBPEO0023"
+    /// The chain is past the Ironwood (NU6.3) activation but the connected server does not serve Ironwood data, which the wallet needs in order to detect its shielded transactions by scanning.
+    case compactBlockProcessorServerMissingIronwoodSupport = "ZCBPEO0024"
     /// The synchronizer is unprepared.
     case synchronizerNotPrepared = "ZSYNCO0001"
     /// Memos can't be sent to transparent addresses.

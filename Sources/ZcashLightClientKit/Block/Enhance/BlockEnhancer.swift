@@ -66,6 +66,35 @@ struct BlockEnhancerImpl {
 }
 
 extension BlockEnhancerImpl: BlockEnhancer {
+    /// Reports a sent transaction that has just transitioned from unmined to mined through
+    /// `didEnhance` — the upstream producer of `SynchronizerEvent.minedTransaction`
+    /// (`EnhanceAction`). This callback had not been invoked since the adoption of transaction
+    /// data requests, which silently killed that event in production.
+    private func notifyNewlyMined(
+        rawID: Data,
+        wasMined: Bool,
+        enhancedTransactions: Int,
+        totalTransactions: Int,
+        range: CompactBlockRange,
+        didEnhance: @escaping (EnhancementProgress) async -> Void
+    ) async {
+        guard !wasMined else { return }
+        guard
+            let overview = try? await transactionRepository.find(rawID: rawID),
+            overview.minedHeight != nil,
+            overview.isSentTransaction
+        else { return }
+        await didEnhance(
+            EnhancementProgress(
+                totalTransactions: totalTransactions,
+                enhancedTransactions: enhancedTransactions,
+                lastFoundTransaction: overview,
+                range: range,
+                newlyMined: true
+            )
+        )
+    }
+
     // swiftlint:disable:next cyclomatic_complexity
     func enhance(at range: CompactBlockRange, didEnhance: @escaping (EnhancementProgress) async -> Void) async throws -> [ZcashTransaction.Overview]? {
         try Task.checkCancellation()
@@ -103,8 +132,21 @@ extension BlockEnhancerImpl: BlockEnhancer {
                                 try await rustBackend.setTransactionStatus(txId: txId.data, status: response.status)
                             } else if let fetchedTransaction = response.tx {
                                 try await rustBackend.setTransactionStatus(txId: fetchedTransaction.rawID, status: response.status)
+                                // A GetStatus request only exists for a transaction whose
+                                // `mined_height` is NULL, so a mined answer is by definition a
+                                // nil→mined transition.
+                                if case .mined = response.status {
+                                    await notifyNewlyMined(
+                                        rawID: fetchedTransaction.rawID,
+                                        wasMined: false,
+                                        enhancedTransactions: index + 1,
+                                        totalTransactions: transactionDataRequests.count,
+                                        range: range,
+                                        didEnhance: didEnhance
+                                    )
+                                }
                             }
-                            
+
                         case .enhancement(let txId):
                             let response = try await blockDownloaderService.fetchTransaction(
                                 txId: txId.data,
@@ -115,10 +157,24 @@ extension BlockEnhancerImpl: BlockEnhancer {
                             if response.status == .txidNotRecognized {
                                 try await rustBackend.setTransactionStatus(txId: txId.data, status: .txidNotRecognized)
                             } else if let fetchedTransaction = response.tx {
+                                // Whether the wallet already knew this transaction as mined must be
+                                // read BEFORE the store below flips it — the `.minedTransaction`
+                                // event means a transition, not a state.
+                                let wasMined = (try? await transactionRepository.find(rawID: txId.data))?.minedHeight != nil
                                 _ = try await rustBackend.decryptAndStoreTransaction(
                                     txBytes: fetchedTransaction.raw.bytes,
                                     minedHeight: fetchedTransaction.minedHeight
                                 )
+                                if fetchedTransaction.minedHeight != nil {
+                                    await notifyNewlyMined(
+                                        rawID: txId.data,
+                                        wasMined: wasMined,
+                                        enhancedTransactions: index + 1,
+                                        totalTransactions: transactionDataRequests.count,
+                                        range: range,
+                                        didEnhance: didEnhance
+                                    )
+                                }
                             }
 
                         case .transactionsInvolvingAddress(let tia):
@@ -151,7 +207,7 @@ extension BlockEnhancerImpl: BlockEnhancer {
                             }
 
                             // ServiceMode to resolve
-                            let stream = try service.getTaddressTxids(filter, mode: .direct)
+                            let stream = try service.getTaddressTransactions(filter, mode: .direct)
 
                             for try await rawTransaction in stream {
                                 let minedHeight = (rawTransaction.height == 0 || rawTransaction.height > UInt32.max)

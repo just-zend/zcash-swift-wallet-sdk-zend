@@ -22,19 +22,21 @@ public struct PoolBalance: Equatable {
 public struct AccountBalance: Equatable {
     public let saplingBalance: PoolBalance
     public let orchardBalance: PoolBalance
+    public let ironwoodBalance: PoolBalance
     public let unshielded: Zatoshi
-    
+
     /// This field is reserved for special operations.
     /// Its current use relates to the time period when the chain tip has not yet been updated, and an attempt would otherwise be made to shield transparent funds.
     /// Such a scenario would result in failure, so the funds are moved to `awaitingResolution` until the chain tip is updated.
     /// The goal is to report the total amount along with the expected value.
     public let awaitingResolution: Zatoshi
-    
-    static let zero = AccountBalance(saplingBalance: .zero, orchardBalance: .zero, unshielded: .zero, awaitingResolution: .zero)
-    
-    init(saplingBalance: PoolBalance, orchardBalance: PoolBalance, unshielded: Zatoshi, awaitingResolution: Zatoshi = .zero) {
+
+    static let zero = AccountBalance(saplingBalance: .zero, orchardBalance: .zero, ironwoodBalance: .zero, unshielded: .zero, awaitingResolution: .zero)
+
+    init(saplingBalance: PoolBalance, orchardBalance: PoolBalance, ironwoodBalance: PoolBalance = .zero, unshielded: Zatoshi, awaitingResolution: Zatoshi = .zero) {
         self.saplingBalance = saplingBalance
         self.orchardBalance = orchardBalance
+        self.ironwoodBalance = ironwoodBalance
         self.unshielded = unshielded
         self.awaitingResolution = awaitingResolution
     }
@@ -72,4 +74,5 @@ struct WalletSummary: Equatable {
     let scanProgress: ScanProgress?
     let nextSaplingSubtreeIndex: UInt32
     let nextOrchardSubtreeIndex: UInt32
+    let nextIronwoodSubtreeIndex: UInt32
 }

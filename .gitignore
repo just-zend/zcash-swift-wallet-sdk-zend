@@ -70,13 +70,17 @@ iOSInjectionProject/
 .AppleDouble
 .LSOverride
 
-#ignore Pods directory for example project 
+#ignore Pods directory for example project
 Pods
 
 # do not commit generated libraries to this repo
 lib
 *.a
 env-vars.sh
+
+# ... but Scripts/lib holds shell sources, not build output. Without this the
+# bare `lib` pattern above swallows it, and files added there vanish silently.
+!Scripts/lib/
 
 .vscode/
 
@@ -88,4 +92,11 @@ BuildSupport/products/
 
 # Claude code
 .claude/settings.local.json
+.plans/
 .remember/
+
+**/*.pyc
+
+# Design and planning notes: working artifacts, not repository history
+.plans/
+.worktrees/
