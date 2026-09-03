@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "2.7.0-rc.3"
+version = "2.7.0"
 authors = [
     "Jack Grigg <thestr4d@gmail.com>",
     "Lukas Korba <lukas@tangiblecodes.com>",
