@@ -8,6 +8,10 @@ on:
       version:
         description: 'SDK version (e.g., 2.5.0)'
         required: true
+      force:
+        description: 'Replace the assets of an existing release'
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -24,12 +28,6 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.0.app
 
-      - name: Authorize cargo against the private slipstream repository
-        uses: ./.github/actions/authorize-slipstream
-        with:
-          app-id: ${{ secrets.SLIPSTREAM_APP_ID }}
-          app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY }}
-
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -40,16 +38,9 @@ jobs:
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
-          # Swatinem/rust-cache did): that includes `~/.cargo/git`, where cargo keeps its clone of
-          # the PRIVATE zodl-inc/slipstream repo. This repository is public, and GitHub lets
-          # workflow runs from forked pull requests restore caches created on the base branch — a
-          # cached clone would hand fork PRs the private source without their ever holding the App
-          # credential. Re-cloning one small repo per run is the cost of keeping it out.
-          #
-          # `registry/` is crates.io content and safe to cache. `target/` still holds
-          # slipstream-core's compiled rlib/rmeta, which is a far smaller disclosure than the source
-          # tree and too expensive to rebuild every run; dropping it too would require solving the
-          # public-repo/private-dependency problem properly instead.
+          # Swatinem/rust-cache did): that includes `~/.cargo/git`, so a fork PR restoring a cache
+          # created on the base branch could reach whatever any future git dependency was cloned
+          # from. Every path below is crates.io content or this repository's own build output.
           path: |
             target
             ~/.cargo/bin
@@ -64,17 +55,27 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ github.event.inputs.version }}
-        run: ./Scripts/prepare-release.sh "$VERSION"
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            ./Scripts/prepare-release.sh artifacts --force-overwrite-existing-release "$VERSION"
+          else
+            ./Scripts/prepare-release.sh artifacts "$VERSION"
+          fi
 
-      - name: Output Package.swift Update
+      - name: Report the release artifacts
         run: |
           source BuildSupport/products/release.env
           echo ""
           echo "========================================"
-          echo "Update Package.swift with:"
+          echo "Draft release ${VERSION} now carries:"
           echo "========================================"
           echo ""
-          echo "url: \"${DOWNLOAD_URL}\","
-          echo "checksum: \"${CHECKSUM}\""
+          echo "url:      ${DOWNLOAD_URL}"
+          echo "checksum: ${CHECKSUM}"
           echo ""
-          echo "Then commit, tag ${VERSION}, and publish the draft release."
+          echo "From a checkout on candidate/${VERSION}, run:"
+          echo "  ./Scripts/prepare-release.sh build --artifacts ci <remote> ${VERSION}"
+          echo ""
+          echo "It will find this draft release, reuse its checksum, write"
+          echo "Package.swift, and mark the release PR ready for review."

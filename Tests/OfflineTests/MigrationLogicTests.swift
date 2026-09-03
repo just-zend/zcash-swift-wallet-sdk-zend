@@ -14,6 +14,7 @@ import XCTest
 final class MigrationLogicTests: ZcashTestCase {
     private let accountA = AccountUUID(id: [UInt8](repeating: 0x11, count: 16))
     private let referenceDate = Date(timeIntervalSince1970: 1_700_000_000)
+    private let mappedTxId = TxId([UInt8](repeating: 0xAB, count: 32))
     private static let uaString = """
     u1l9f0l4348negsncgr9pxd9d3qaxagmqv3lnexcplmufpq7muffvfaue6ksevfvd7wrz7xrvn95rc5zjtn7ugkmgh5rnxswmcj30y0pw52pn0zjvy38rn2esfgve64rj5pcmazxgpyuj
     """
@@ -768,36 +769,36 @@ final class MigrationLogicTests: ZcashTestCase {
 
     func testMapTransportErrorIsRetryableNetworkError() {
         XCTAssertEqual(
-            MigrationBroadcaster.map(outcome: .transportError, successTxId: "unused"),
+            MigrationBroadcaster.map(outcome: .transportError, successTxId: mappedTxId),
             MigrationTransferResult.networkError(retryable: true)
         )
     }
 
     func testMapGenericRejectionIsInvalidNote() {
         XCTAssertEqual(
-            MigrationBroadcaster.map(outcome: .rejected(errorCode: -25, message: "missing inputs"), successTxId: "unused"),
+            MigrationBroadcaster.map(outcome: .rejected(errorCode: -25, message: "missing inputs"), successTxId: mappedTxId),
             MigrationTransferResult.invalidNote
         )
     }
 
     func testMapExpiringSoonRejectionIsExpired() {
         XCTAssertEqual(
-            MigrationBroadcaster.map(outcome: .rejected(errorCode: -26, message: "tx-expiring-soon"), successTxId: "unused"),
+            MigrationBroadcaster.map(outcome: .rejected(errorCode: -26, message: "tx-expiring-soon"), successTxId: mappedTxId),
             MigrationTransferResult.expired
         )
     }
 
     func testMapExpiredRejectionIsCaseInsensitive() {
         XCTAssertEqual(
-            MigrationBroadcaster.map(outcome: .rejected(errorCode: -1, message: "Transaction has EXPIRED"), successTxId: "unused"),
+            MigrationBroadcaster.map(outcome: .rejected(errorCode: -1, message: "Transaction has EXPIRED"), successTxId: mappedTxId),
             MigrationTransferResult.expired
         )
     }
 
     func testMapSuccessCarriesProvidedTxId() {
         XCTAssertEqual(
-            MigrationBroadcaster.map(outcome: .submitted, successTxId: "aabbccdd"),
-            MigrationTransferResult.success(txId: "aabbccdd")
+            MigrationBroadcaster.map(outcome: .submitted, successTxId: mappedTxId),
+            MigrationTransferResult.success(txId: mappedTxId)
         )
     }
 
@@ -810,9 +811,9 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertEqual(
             MigrationBroadcaster.map(
                 outcome: .rejected(errorCode: -27, message: "transaction verification failed"),
-                successTxId: "feedface"
+                successTxId: mappedTxId
             ),
-            MigrationTransferResult.success(txId: "feedface")
+            MigrationTransferResult.success(txId: mappedTxId)
         )
     }
 
@@ -829,8 +830,8 @@ final class MigrationLogicTests: ZcashTestCase {
 
         for message in duplicateMessages {
             XCTAssertEqual(
-                MigrationBroadcaster.map(outcome: .rejected(errorCode: -26, message: message), successTxId: "aabbccdd"),
-                MigrationTransferResult.success(txId: "aabbccdd"),
+                MigrationBroadcaster.map(outcome: .rejected(errorCode: -26, message: message), successTxId: mappedTxId),
+                MigrationTransferResult.success(txId: mappedTxId),
                 "expected duplicate message \"\(message)\" to map to success"
             )
         }
@@ -840,9 +841,9 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertEqual(
             MigrationBroadcaster.map(
                 outcome: .rejected(errorCode: -26, message: "Transaction ALREADY In Block Chain"),
-                successTxId: "aabbccdd"
+                successTxId: mappedTxId
             ),
-            MigrationTransferResult.success(txId: "aabbccdd")
+            MigrationTransferResult.success(txId: mappedTxId)
         )
     }
 
@@ -852,9 +853,9 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertEqual(
             MigrationBroadcaster.map(
                 outcome: .rejected(errorCode: -27, message: "transaction has expired"),
-                successTxId: "aabbccdd"
+                successTxId: mappedTxId
             ),
-            MigrationTransferResult.success(txId: "aabbccdd")
+            MigrationTransferResult.success(txId: mappedTxId)
         )
     }
 
@@ -864,7 +865,7 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertEqual(
             MigrationBroadcaster.map(
                 outcome: .rejected(errorCode: -25, message: "input already spent"),
-                successTxId: "unused"
+                successTxId: mappedTxId
             ),
             MigrationTransferResult.invalidNote
         )
@@ -981,11 +982,11 @@ final class MigrationLogicTests: ZcashTestCase {
             receivedAccount = account
         }
         let migration = makeMigration(welding: welding, account: accountA)
-        let txid = Data(repeating: 0xCD, count: 32)
+        let txid = TxId([UInt8](repeating: 0xCD, count: 32))
 
         try await migration.recordImmediateMigration(txid: txid)
 
-        XCTAssertEqual(receivedTxid, txid)
+        XCTAssertEqual(receivedTxid, Data(txid.id))
         XCTAssertEqual(receivedAccount, accountA)
     }
 
@@ -1103,7 +1104,7 @@ final class MigrationLogicTests: ZcashTestCase {
     func testPerformBroadcastFailsClosedOnTorUnavailableWithoutRecordingOrGating() async throws {
         let prepared = PreparedMigrationTransfer(
             id: 0,
-            txid: Data(repeating: 0xAB, count: 32),
+            txid: TxId([UInt8](repeating: 0xAB, count: 32)),
             pczt: Data([0x01, 0x02])
         )
         let welding = ZcashRustBackendWeldingMock()

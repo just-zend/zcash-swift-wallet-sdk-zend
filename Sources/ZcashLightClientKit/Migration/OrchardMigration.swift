@@ -404,15 +404,14 @@ actor OrchardMigration {
     /// Unlike ``performBroadcast(_:options:)`` this does NOT broadcast, so it is not serialized
     /// against the broadcast flows and carries no privacy options of its own: what the host does
     /// with the bytes, and over what transport, is the host's ordinary submission policy.
-    /// - Parameter txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
-    ///   raw/internal byte order.
+    /// - Parameter txid: a txid ``MigrationProveOutcome/preparationTxids`` named.
     /// - Throws: ``ZcashError/migrationProvingUnavailable(_:)`` when the stored artifact cannot be
     ///   turned into servable bytes; ``ZcashError/rustMigrationTakePreparation(_:)`` for a
     ///   transfer's txid, for a txid the stored run does not carry, and for the readiness refusal
     ///   of a preparation that is not proved — which a host discharges by proving again rather
     ///   than retrying this.
-    func takePreparation(byTxid txid: Data) async throws -> PreparedMigrationTransfer {
-        try await welding.migrationTakePreparation(txid: txid, for: accountUUID)
+    func takePreparation(byTxid txid: TxId) async throws -> PreparedMigrationTransfer {
+        try await welding.migrationTakePreparation(txid: Data(txid.id), for: accountUUID)
     }
 
     /// Records the engine-side outcome of a preparation the host retrieved and submitted ITSELF —
@@ -619,8 +618,8 @@ actor OrchardMigration {
     /// the ordinary `createProposedTransactions`/`createTransactionFromPCZT` pipeline, already
     /// guarded there) -- this only records the outcome, so it is not gated by
     /// ``serializedBroadcastFlow(_:)``.
-    func recordImmediateMigration(txid: Data) async throws {
-        try await welding.migrationRecordImmediateRun(txid: txid, for: accountUUID)
+    func recordImmediateMigration(txid: TxId) async throws {
+        try await welding.migrationRecordImmediateRun(txid: Data(txid.id), for: accountUUID)
     }
 
     /// The leftover Orchard balance a migration would not cross, when large enough to be worth
@@ -900,7 +899,7 @@ actor OrchardMigration {
             throw error
         }
 
-        let result = MigrationBroadcaster.map(outcome: outcome, successTxId: prepared.txid.toHexStringTxId())
+        let result = MigrationBroadcaster.map(outcome: outcome, successTxId: prepared.txid)
         if case MigrationTransferResult.success = result {
             // The broadcast landed (or a duplicate rejection proved an earlier one did). Nothing
             // is armed here: the gate is behavior-based, so a completed broadcast leaves behind
@@ -912,7 +911,7 @@ actor OrchardMigration {
             } catch {
                 // Deliberately NOT clearing the in-flight marker: the result was never recorded,
                 // which is exactly the submit-to-record gap the marker guards; it self-expires.
-                logger.error("OrchardMigration: failed to record a successfully submitted broadcast: \(error)")
+                logger.error("OrchardMigration: failed to record a successfully submitted broadcast: \(error.localizedDescription)")
                 throw ZcashError.migrationRecordFailedAfterBroadcast(error)
             }
         } else {

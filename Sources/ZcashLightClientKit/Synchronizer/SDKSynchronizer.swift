@@ -1221,7 +1221,7 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).proveTransactions(instruction, maxProofs: maxProofs)
     }
 
-    public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
+    public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: TxId) async throws -> PreparedMigrationTransfer {
         try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
     }
 
@@ -1281,7 +1281,7 @@ public class SDKSynchronizer: Synchronizer {
         try await migrationHost.migration(for: accountUUID).proposeImmediateMigration()
     }
 
-    public func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws {
+    public func recordImmediateMigration(accountUUID: AccountUUID, txid: TxId) async throws {
         try await migrationHost.migration(for: accountUUID).recordImmediateMigration(txid: txid)
     }
 

@@ -717,9 +717,7 @@ protocol ZcashRustBackendWelding {
     func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer
 
     /// Records the platform's broadcast outcome for `transferId`, advancing the engine's state.
-    /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error;
-    ///           `migrationInvalidTxId` if `result` is `.success` and its `txId` does not decode
-    ///           to a 32-byte transaction id.
+    /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error.
     func migrationRecordTransferResult(
         transferId: UInt32,
         result: MigrationTransferResult,

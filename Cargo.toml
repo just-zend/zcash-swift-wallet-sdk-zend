@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "2.8.0-rc.2"
+version = "3.0.0"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
@@ -109,19 +109,6 @@ zeroize = "1"
 zcash_keys = { version = "0.16.0", features = ["orchard"] }
 incrementalmerkletree = { version = "0.8", default-features = false }
 
-# Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
-# drives. Consumed as a remote crate from zodl-inc/slipstream, the engine's
-# home since the personal-fork era (the old PR #6 adaptations are merged
-# there). Return to a release tag once one is cut with these aboard.
-#
-# The rev rides [patch.crates-io] below, pinned to a COMMIT HASH rather than a
-# branch: a branch pin silently follows a force-push, so a build can pick up
-# code nobody reviewed, whereas a stale hash fails loudly. The engine rides the
-# same librustzcash rev as this package, so the graph stays a single family
-# instance.
-slipstream-core = { version = "0.1", package = "zodl-slipstream" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-
 [dev-dependencies]
 hex = "0.4"
 tempfile = "3"
@@ -134,11 +121,6 @@ cc = "1.0"
 [features]
 default = []
 
-# GPU-accelerated Orchard subtree building in the engine (wgpu). OFF by
-# default — the released libzcashlc links zero wgpu. Enable for local device
-# builds via Scripts/init-local-ffi.sh --gpu / rebuild-local-ffi.sh --gpu.
-gpu = ["slipstream-core/gpu"]
-
 [lib]
 name = "zcashlc"
 path = "rust/src/lib.rs"
@@ -148,13 +130,6 @@ crate-type = ["staticlib"]
 lto = true
 
 [patch.crates-io]
-# The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
-# repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a
-# build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep it in step with
-# the librustzcash generation the versions above declare: a rev built against an older generation
-# cannot resolve against them.
-slipstream-core = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "ab89ada45f2ef893a05fcefa0ead99f87d848a4e" }
-
 # DO NOT ALTER THIS COMMENT
 #
 # This section is left in place to ensure that development against in-progress

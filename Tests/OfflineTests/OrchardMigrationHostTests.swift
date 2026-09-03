@@ -75,7 +75,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
 
         let prepared = PreparedMigrationTransfer(
             id: 0,
-            txid: Data(repeating: 0xAB, count: 32),
+            txid: TxId([UInt8](repeating: 0xAB, count: 32)),
             pczt: Data([0x01, 0x02])
         )
         // Fulfilled from account B's own actor, right before it hands off to the shared broadcaster
@@ -301,7 +301,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         welding.listAccountsReturnValue = [makeAccount(accountA)]
         welding.migrationTakeBroadcastTransactionIdForReturnValue = PreparedMigrationTransfer(
             id: 0,
-            txid: Data(repeating: 0xAB, count: 32),
+            txid: TxId([UInt8](repeating: 0xAB, count: 32)),
             pczt: Data([0x01, 0x02])
         )
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
