@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-09-02
+Last reviewed: 2026-09-03
 
 ## Remote and branch invariants
 
@@ -10,7 +10,7 @@ Last reviewed: 2026-09-02
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current reconciliation boundary (2026-09-02)
+## Current reconciliation boundary (2026-09-03)
 
 - Zend `main` is `95231c39` and upstream `main` is `2099bf71` after fresh
   fetches. Draft Zend [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
@@ -49,11 +49,14 @@ Last reviewed: 2026-09-02
   Upstream's `3.0.0` tag is on `maint/v3.0.x`, not `main`, and its release
   sequence removes and restructures the private Slipstream/FFI surface, so it
   cannot be safely separated from Zend's artifact-provenance and migration
-  gates. PR #1997 is now clean and approved, but its `candidate/2.7.0` branch
-  is a 16-commit maintenance-release range and remains 515 commits behind
-  `upstream/main`; it rewrites release and CI tooling and retires Darkside
-  tests. It is not an independently verified Zend SDK fix, so wait for a
-  compatible mainline integration. #1998 is review-required, while #1982,
+  gates. The `candidate/2.7.0` line has advanced to upstream
+  [#1999](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1999), a
+  `BLOCKED`, review-required 18-commit release range against `release/2.7.0`
+  that remains 515 commits behind `upstream/main`. Its latest two commits
+  update the `libzcashlc` and SDK release versions; the full range also changes
+  FFI release wiring, CI/release tooling, generated protocol code, and
+  Darkside-test coverage. It is not an independently verified Zend SDK fix, so
+  wait for a compatible mainline integration. #1998 is review-required, while
   #1961, #1895, and #1893 are draft and/or dirty migration, send-max, or
   Slipstream work; #1968 and #1944 are dirty or blocked; and the active ZODL
   vendoring, dependency, release, and maintenance branches remain coupled or
