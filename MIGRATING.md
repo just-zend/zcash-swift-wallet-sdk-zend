@@ -1,44 +1,5 @@
 # Migrating from previous versions to _Unreleased_
 
-## Voting rides `zcash_voting` 3.0 — `VotingPirLayout` gains `polyLen`
-
-`VotingPirLayout`'s memberwise initializer gains a required `polyLen: UInt32` — the YPIR RLWE
-polynomial degree (2048 or 4096), taken from the dynamic voting config's `pir_layout.poly_len` —
-and `precomputeDelegationPir(...)` / `buildAndProveDelegation(...)` consume it through the layout.
-`VotingPirLayout.unknown` (`polyLen` 0) fails closed before any private query. Treat a config
-without `poly_len` as a configuration error rather than defaulting: the server's dataset geometry
-is bound to the value, and 3.0 clients verify the advertised degree at connect.
-
-Helper-server payloads returned by `recoverWireJson(...)` now include `vote_round_id`
-(lowercase hex). Remove any app-side injection of that field; the payload remains verbatim wire
-JSON — do not decode, re-shape or re-encode it.
-
-## Voting wire payloads are produced by `zcash_voting`, not by the SDK
-
-`VotingSharePayload` is removed and `VotingVoteCommit.sharePayloads` is gone with it. Helper-server
-payloads are now obtained after confirmation, one per share index:
-
-```swift
-let bundle = try backend.getCommitmentBundle(
-    roundId: roundId, bundleIndex: bundleIndex, proposalId: proposalId
-)
-let payload = try VotingRustBackend.recoverWireJson(
-    commitmentBundleJson: bundle!.bundleJson,
-    proposalId: proposalId,
-    shareIndex: shareIndex,
-    voteCommitmentTreePosition: confirmation.voteCommitmentTreePosition,
-    submitAt: submitAt
-)
-```
-
-`payload` is the helper request body verbatim — do not decode, re-shape or re-encode it.
-
-`VotingDelegationSubmission` and `VotingWireEncryptedShare` are now decoded from the crate's own
-wire structs, so their byte fields are base64 `String`s rather than `[UInt8]`, `sighash` is gone
-from the delegation submission (the vote chain derives the signing digest itself), and
-`tx1Effects` is present. A host that base64-encoded these fields itself before putting them on the
-wire must stop and send the strings as they arrive.
-
 ## Proposal errors carry `RedactedRustError` instead of `String`
 
 `ZcashError.rustCreateToAddress`, `.rustProposeTransferFromURI`, and `.rustProposeSendMaxTransfer`
@@ -86,6 +47,155 @@ Three things move at the same time:
 - **`ZcashError` gains `detail: String?`**, appended to `errorDescription` in parentheses when
   present. Any snapshot test pinning the exact `localizedDescription` of one of the affected cases
   needs updating.
+
+## The shielded voting API is back, with breaking changes
+
+The shielded voting API was removed on 2.7.0 and is restored here on the
+Ironwood (NU6.3) stack. `VotingRustBackend`, the `Voting*` types and
+`PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe` are available
+again, but the API is not the one that shipped before 2.7.0: `zcash_voting`
+absorbed orchestration the SDK used to drive step by step, and made the
+intermediate steps private. Wallet developers upgrading from a pre-2.7.0
+version must make the changes below. Wallet developers coming from 2.7.0 or
+3.0.0, where voting was absent, can adopt the API as documented.
+
+### Voting hotkeys are no longer derived from the wallet seed
+
+This is the change most likely to affect a shipped wallet.
+
+A voting hotkey is now an app-owned random value. `generateHotkey` is a type
+method that takes only a network, and returns a `VotingHotkey` carrying a
+`storedSecret`, the `rawOrchardAddress` derived from it, and that address's
+`addressIndex`:
+
+```swift
+let hotkey = try VotingRustBackend.generateHotkey(networkId: networkId)
+// Persist hotkey.storedSecret. Nothing else in VotingHotkey needs storing.
+```
+
+**The application must persist `storedSecret`.** It cannot be re-derived from
+the wallet seed, so restoring a wallet from its seed phrase does not restore the
+ability to vote with a hotkey whose secret was lost, and any voting power already
+delegated to that hotkey becomes unusable. The SDK does not store it for you.
+Calling `generateHotkey` again produces an unrelated hotkey rather than
+recovering the previous one.
+
+Hotkeys derived from a wallet seed by an earlier SDK version do not carry over.
+Every API that previously took a hotkey seed now takes the stored secret instead.
+
+`VotingHotkey` no longer exposes `secretKey`, `publicKey` or `address`; upstream
+dropped the public key, and the address is now the raw Orchard address bytes.
+
+### Committing a vote is a single call
+
+`buildVoteCommitment`, `signCastVote`, `buildSharePayloads` and `encryptShares`
+are replaced by one `commitVote`, which builds the proof, signs the cast vote,
+derives the helper-share payloads and persists the recovery state. It is
+idempotent: calling it again for the same round, bundle and proposal returns the
+persisted result rather than rebuilding the proof.
+
+The encrypted shares it returns are the ciphertexts the vote proof commits to.
+There is no longer a standalone share-encryption step, because shares encrypted
+outside the commitment would not correspond to any vote.
+
+### The voting network is chosen when the database is opened
+
+`open` takes the network, and fixes it for the lifetime of the handle. The calls
+that used to take a `networkId` of their own no longer do, so a round can no
+longer be initialized — or a vote committed — against a network the handle
+disagrees with.
+
+```swift
+// Before
+try backend.open(path: dbPath)
+try backend.initRound(roundId: roundId, networkId: networkId, snapshotHeight: h, ...)
+
+// After
+try backend.open(path: dbPath, networkId: networkId)
+try backend.initRound(roundId: roundId, snapshotHeight: h, ...)
+```
+
+`initRound`, `commitVote` and `precomputeDelegationPir` drop their `networkId`
+parameter, and `VotingDelegationKeyInputs` drops its `networkId` property — omit
+it from the initializer call. `generateHotkey`, `generateDelegationInputs`,
+`extractOrchardFvk` and `generateNoteWitnesses` are unaffected: the first three
+are type methods with no handle, and the last one's `networkId` selects the
+*wallet* database's consensus parameters, not the voting identity.
+
+An unknown network id now throws from `open` rather than from each later call.
+A custom (regtest) network takes its voting identity from the registered base
+network, so a modified-mainnet chain votes with mainnet hotkeys and address
+HRPs; `open` throws if `zcashlc_set_custom_network` has not run yet.
+
+### Other API changes
+
+- `decomposeWeight` is removed. It has no replacement: share construction is now
+  entirely internal to the voting crate.
+- `buildPczt` and `buildAndProveDelegation` take the hotkey stored secret in
+  place of a raw hotkey address. `buildAndProveDelegation` additionally requires
+  the sender FVK, seed fingerprint, account index and round name, which the
+  voting crate now needs together in order to construct delegation keys.
+- `markVoteSubmitted` requires the cast-vote transaction hash. A vote is recorded
+  as submitted by persisting the transaction that carried it, so that a restarted
+  wallet resumes polling for that transaction instead of rebuilding the vote.
+- `recordShareDelegation` no longer accepts a nullifier. The voting crate derives
+  it from the vote's recovery state, so a caller can no longer record a nullifier
+  that disagrees with the share it belongs to.
+- `storeCommitmentBundle` is replaced by `recordVcPosition`.
+- `VotingBundleSetupResult` gained `droppedCount`, the number of notes the
+  canonical bundling policy discarded. A non-zero value means the wallet holds
+  voting notes that will not be voted with, which `eligibleWeight` alone does not
+  reveal.
+- `setupBundles` now rejects an empty note set instead of returning an empty
+  bundle layout.
+- Round identifiers must be 64 lowercase hexadecimal characters encoding a
+  canonical Pallas field element. Shorter or non-canonical identifiers are
+  rejected by `initRound`.
+- Types that carry key material or note secrets — `VotingHotkey`,
+  `VotingNoteInfo`, `VotingPczt` and `VotingDelegationKeyInputs` — now conform to
+  `Undescribable`, so they render as `--redacted--` rather than exposing their
+  contents through logging, string interpolation or reflection.
+
+### Voting rides `zcash_voting` 3.0 — `VotingPirLayout` carries `polyLen`
+
+`VotingPirLayout`'s memberwise initializer takes a required `polyLen: UInt32` — the YPIR RLWE
+polynomial degree (2048 or 4096), taken from the dynamic voting config's `pir_layout.poly_len` —
+and `precomputeDelegationPir(...)` / `buildAndProveDelegation(...)` consume it through the layout.
+`VotingPirLayout.unknown` (`polyLen` 0) fails closed before any private query. Treat a config
+without `poly_len` as a configuration error rather than defaulting: the server's dataset geometry
+is bound to the value, and 3.0 clients verify the advertised degree at connect.
+
+Helper-server payloads returned by `recoverWireJson(...)` include `vote_round_id`
+(lowercase hex); do not inject it app-side. The payload is verbatim wire
+JSON — do not decode, re-shape or re-encode it.
+
+### Voting wire payloads are produced by `zcash_voting`, not by the SDK
+
+There is no `VotingSharePayload` type, and `VotingVoteCommit` carries no share payloads.
+Helper-server payloads are obtained after confirmation, one per share index:
+
+```swift
+let bundle = try backend.getCommitmentBundle(
+    roundId: roundId, bundleIndex: bundleIndex, proposalId: proposalId
+)
+let payload = try VotingRustBackend.recoverWireJson(
+    commitmentBundleJson: bundle!.bundleJson,
+    proposalId: proposalId,
+    shareIndex: shareIndex,
+    voteCommitmentTreePosition: confirmation.voteCommitmentTreePosition,
+    submitAt: submitAt
+)
+```
+
+`payload` is the helper request body verbatim — do not decode, re-shape or re-encode it.
+
+`VotingDelegationSubmission` and `VotingWireEncryptedShare` are decoded from the crate's own
+wire structs, so their byte fields are base64 `String`s rather than `[UInt8]`, the delegation
+submission carries no `sighash` (the vote chain derives the signing digest itself) but does carry
+`tx1Effects`. A host that base64-encodes these fields itself before putting them on the wire must
+stop and send the strings as they arrive.
+
+# Migrating from previous versions to 3.0.0
 
 ## The SDK-side migration state machine is removed — `migrationAdvanceStep` replaces it
 
@@ -241,7 +351,9 @@ or one whose anchor the wallet cannot resolve yet) do not spend the budget.
 `proveMigrationTransactions(accountUUID:_:maxProofs:)` no longer returns a bare `Int`. It returns
 `MigrationProveOutcome` — `totalProved` plus `preparationTxids`. **Breaking, with no deprecation
 period** (nothing here has shipped in a release): a caller that used the count reads
-`outcome.totalProved`.
+`outcome.totalProved`. The transaction-id handoff is semantically typed: `preparationTxids` is
+`[TxId]`, `takeMigrationPreparation(accountUUID:byTxid:)` takes `TxId`, and the returned
+`PreparedMigrationTransfer.txid` and `MigrationTransferResult.success(txId:)` both carry `TxId`.
 
 The ruling behind the new shape, verbatim in substance:
 
@@ -584,8 +696,9 @@ the app executes through the normal transaction pipeline, with one new call to r
   no engine plan cache behind it: nothing about the returned proposal can go stale the way a
   `MigrationSchedule` preview can, and `signAndStoreMigrationSchedule` is not part of this lane (it
   remains for `proposeMigrationTransfers`'s gradual path).
-- **New: `recordImmediateMigration(accountUUID:txid:) async throws`.** Call it after a successful
-  broadcast (software or Keystone lane) so the platform migration state machine reports the sweep:
+- **New: `recordImmediateMigration(accountUUID:txid:) async throws`.** Pass the broadcast
+  transaction's `TxId` after a successful broadcast (software or Keystone lane) so the platform
+  migration state machine reports the sweep:
   `InProgress(0 of 1)` while unmined, then a quiet `NotStarted` once it mines. A MINED immediate
   sweep is CONSUMED — it is NOT surfaced as `Complete`, so there is nothing for the user to
   acknowledge and no per-run completion screen (the sweep zeroes the spendable Orchard balance, so
@@ -640,7 +753,7 @@ The `WalletInitMode` enum is gone. `prepare(with:walletBirthday:...)` no longer 
 
 - an account already exists in `data.db` → open the existing wallet;
 - no account + a (past) birthday → **restore**: `recover_until` is set to the current chain tip, so
-  the `[birthday … tip]` backfill is tracked as recovery (`SynchronizerState.isRecovering`);
+  the `[birthday … tip]` backfill is tracked as recovery by the wallet backend;
 - no account + `nil` birthday → **new wallet**: starts at a reorg-safe recent height, no recovery phase.
 
 A deliberate re-scan is an explicit action — `rewind(_:)` — not an init mode. Update call sites:
@@ -662,7 +775,7 @@ behavior (`SDKSynchronizer` does):
 - **New: `migrationTransactionStatuses(accountUUID:) async throws -> [MigrationTransactionStatus]`.**
   The live per-transaction detail view behind `migrationProgress(accountUUID:)`'s aggregate
   summary: every committed migration transaction's kind (preparation layer/index or transfer
-  crossing), lifecycle state (`broadcast`/`mined` fold the engine's txid/mined-height payload into
+  crossing), lifecycle state (`broadcast(txid:)` carries `TxId`, while `mined` folds the engine's height into
   the matching case, so illegal combinations are unrepresentable — a MINED row's txid is NOT
   carried by the engine's own state model), scheduled/expiry heights, readiness, and next
   action/blocker, keyed by a stable id. A verbatim marshal of the engine's own
@@ -767,114 +880,6 @@ information stored.
 
 Failed transactions will be treated as "Expired-Unmined" instead. The SDK won't
 track failures on its own. Wallet developers would have to account for those.
-
-## The shielded voting API is back, with breaking changes
-
-The shielded voting API was removed on 2.7.0-rc.1 and is restored here on the
-Ironwood (NU6.3) stack. `VotingRustBackend`, the `Voting*` types and
-`PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe` are available
-again, but the API is not the one that shipped before 2.7.0-rc.1: `zcash_voting`
-absorbed orchestration the SDK used to drive step by step, and made the
-intermediate steps private. Wallet developers upgrading from a pre-2.7.0-rc.1
-version must make the changes below. Wallet developers coming from 2.7.0-rc.1,
-where voting was absent, can adopt the API as documented.
-
-### Voting hotkeys are no longer derived from the wallet seed
-
-This is the change most likely to affect a shipped wallet.
-
-A voting hotkey is now an app-owned random value. `generateHotkey` is a type
-method that takes only a network, and returns a `VotingHotkey` carrying a
-`storedSecret`, the `rawOrchardAddress` derived from it, and that address's
-`addressIndex`:
-
-```swift
-let hotkey = try VotingRustBackend.generateHotkey(networkId: networkId)
-// Persist hotkey.storedSecret. Nothing else in VotingHotkey needs storing.
-```
-
-**The application must persist `storedSecret`.** It cannot be re-derived from
-the wallet seed, so restoring a wallet from its seed phrase does not restore the
-ability to vote with a hotkey whose secret was lost, and any voting power already
-delegated to that hotkey becomes unusable. The SDK does not store it for you.
-Calling `generateHotkey` again produces an unrelated hotkey rather than
-recovering the previous one.
-
-Hotkeys derived from a wallet seed by an earlier SDK version do not carry over.
-Every API that previously took a hotkey seed now takes the stored secret instead.
-
-`VotingHotkey` no longer exposes `secretKey`, `publicKey` or `address`; upstream
-dropped the public key, and the address is now the raw Orchard address bytes.
-
-### Committing a vote is a single call
-
-`buildVoteCommitment`, `signCastVote`, `buildSharePayloads` and `encryptShares`
-are replaced by one `commitVote`, which builds the proof, signs the cast vote,
-derives the helper-share payloads and persists the recovery state. It is
-idempotent: calling it again for the same round, bundle and proposal returns the
-persisted result rather than rebuilding the proof.
-
-The encrypted shares it returns are the ciphertexts the vote proof commits to.
-There is no longer a standalone share-encryption step, because shares encrypted
-outside the commitment would not correspond to any vote.
-
-### The voting network is chosen when the database is opened
-
-`open` takes the network, and fixes it for the lifetime of the handle. The calls
-that used to take a `networkId` of their own no longer do, so a round can no
-longer be initialized — or a vote committed — against a network the handle
-disagrees with.
-
-```swift
-// Before
-try backend.open(path: dbPath)
-try backend.initRound(roundId: roundId, networkId: networkId, snapshotHeight: h, ...)
-
-// After
-try backend.open(path: dbPath, networkId: networkId)
-try backend.initRound(roundId: roundId, snapshotHeight: h, ...)
-```
-
-`initRound`, `commitVote` and `precomputeDelegationPir` drop their `networkId`
-parameter, and `VotingDelegationKeyInputs` drops its `networkId` property — omit
-it from the initializer call. `generateHotkey`, `generateDelegationInputs`,
-`extractOrchardFvk` and `generateNoteWitnesses` are unaffected: the first three
-are type methods with no handle, and the last one's `networkId` selects the
-*wallet* database's consensus parameters, not the voting identity.
-
-An unknown network id now throws from `open` rather than from each later call.
-A custom (regtest) network takes its voting identity from the registered base
-network, so a modified-mainnet chain votes with mainnet hotkeys and address
-HRPs; `open` throws if `zcashlc_set_custom_network` has not run yet.
-
-### Other API changes
-
-- `decomposeWeight` is removed. It has no replacement: share construction is now
-  entirely internal to the voting crate.
-- `buildPczt` and `buildAndProveDelegation` take the hotkey stored secret in
-  place of a raw hotkey address. `buildAndProveDelegation` additionally requires
-  the sender FVK, seed fingerprint, account index and round name, which the
-  voting crate now needs together in order to construct delegation keys.
-- `markVoteSubmitted` requires the cast-vote transaction hash. A vote is recorded
-  as submitted by persisting the transaction that carried it, so that a restarted
-  wallet resumes polling for that transaction instead of rebuilding the vote.
-- `recordShareDelegation` no longer accepts a nullifier. The voting crate derives
-  it from the vote's recovery state, so a caller can no longer record a nullifier
-  that disagrees with the share it belongs to.
-- `storeCommitmentBundle` is replaced by `recordVcPosition`.
-- `VotingBundleSetupResult` gained `droppedCount`, the number of notes the
-  canonical bundling policy discarded. A non-zero value means the wallet holds
-  voting notes that will not be voted with, which `eligibleWeight` alone does not
-  reveal.
-- `setupBundles` now rejects an empty note set instead of returning an empty
-  bundle layout.
-- Round identifiers must be 64 lowercase hexadecimal characters encoding a
-  canonical Pallas field element. Shorter or non-canonical identifiers are
-  rejected by `initRound`.
-- Types that carry key material or note secrets — `VotingHotkey`,
-  `VotingNoteInfo`, `VotingPczt` and `VotingDelegationKeyInputs` — now conform to
-  `Undescribable`, so they render as `--redacted--` rather than exposing their
-  contents through logging, string interpolation or reflection.
 
 ## `AccountBalance` gained an Ironwood pool
 

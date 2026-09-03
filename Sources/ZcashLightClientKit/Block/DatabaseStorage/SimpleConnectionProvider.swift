@@ -10,13 +10,14 @@ import Foundation
 import SQLite
 
 class SimpleConnectionProvider: ConnectionProvider {
-    /// Seconds SQLite retries a locked DB before erroring. The Slipstream engine writes `data.db` (WAL
-    /// journal) from Rust while the Swift side reads it concurrently; a read that lands during the
-    /// engine's write / checkpoint — or while a cancelled write-behind task releases its lock, e.g. on a
-    /// restart mid-pass — would otherwise get `SQLITE_BUSY` immediately. SQLite.swift's `FailableIterator`
-    /// resolves a step error with `try!`, an UNCATCHABLE trap, so that `SQLITE_BUSY` crashes the app
-    /// (no `do/catch` or `try?` can intercept it). A busy timeout makes the read wait for the lock to
-    /// free and retry instead. Bounded so a genuinely stuck DB still surfaces rather than hanging forever.
+    /// Seconds SQLite retries a locked DB before erroring. Rust writes `data.db` (WAL journal) on its
+    /// own connections while the Swift side reads it concurrently — the migration store opens a second
+    /// connection onto the same file (see `migration.rs`'s `open_store_conn`), and every FFI call opens
+    /// its own. A read landing during one of those writes or its checkpoint would otherwise get
+    /// `SQLITE_BUSY` immediately. SQLite.swift's `FailableIterator` resolves a step error with `try!`,
+    /// an UNCATCHABLE trap, so that `SQLITE_BUSY` crashes the app (no `do/catch` or `try?` can
+    /// intercept it). A busy timeout makes the read wait for the lock to free and retry instead.
+    /// Bounded so a genuinely stuck DB still surfaces rather than hanging forever.
     static let busyTimeoutSeconds: Double = 5
 
     let path: String

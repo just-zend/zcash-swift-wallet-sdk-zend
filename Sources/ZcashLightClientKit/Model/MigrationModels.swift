@@ -413,9 +413,8 @@ public struct MigrationTransactionStatus: Equatable, Sendable {
         case signed
         /// Proven and ready to broadcast.
         case proved
-        /// Broadcast to the network as `txid` (the SDK's raw/internal byte order), not yet
-        /// observed mined.
-        case broadcast(txid: Data)
+        /// Broadcast to the network as `txid`, not yet observed mined.
+        case broadcast(txid: TxId)
         /// Mined at `height`.
         case mined(height: BlockHeight)
         /// Dead according to the engine's satisfiability oracle after a funding input became
@@ -838,17 +837,16 @@ public struct ImmediateMigrationProposal: Equatable {
 public struct PreparedMigrationTransfer: Equatable, Sendable {
     /// The transfer's engine-issued id.
     public let id: UInt32
-    /// The finalized transaction's id, in the SDK's raw/internal byte order (matching `TxId.id`,
-    /// not the reversed display-hex order produced by `Data.toHexStringTxId()`). Zeroed when the
+    /// The finalized transaction's id. Its bytes use the SDK's raw/internal byte order. Zeroed when the
     /// value is a STORAGE RECEIPT (`migrationStoreSignedNoteSplitPczts`) whose transaction has not
     /// been proven yet — the broadcastable value is served by the delivery lane.
-    public let txid: Data
+    public let txid: TxId
     /// The artifact: a finalized consensus transaction or a serialized PCZT per the producer, as
     /// the type doc above spells out. The property keeps its historical name.
     public let pczt: Data
 
     /// Creates a `PreparedMigrationTransfer`.
-    public init(id: UInt32, txid: Data, pczt: Data) {
+    public init(id: UInt32, txid: TxId, pczt: Data) {
         self.id = id
         self.txid = txid
         self.pczt = pczt
@@ -872,13 +870,12 @@ public struct PreparedMigrationTransfer: Equatable, Sendable {
 public struct MigrationProveOutcome: Equatable, Sendable {
     /// How many transactions this pass proved — preparations AND transfers.
     public let totalProved: Int
-    /// The proved preparations' txids, in the order they were proved, in the SDK's raw/internal
-    /// byte order (matching ``PreparedMigrationTransfer/txid``, not the reversed display-hex order
-    /// produced by `Data.toHexStringTxId()`). Empty when the pass proved no preparation.
-    public let preparationTxids: [Data]
+    /// The proved preparations' txids, in the order they were proved. Empty when the pass proved
+    /// no preparation.
+    public let preparationTxids: [TxId]
 
     /// Creates a `MigrationProveOutcome`.
-    public init(totalProved: Int, preparationTxids: [Data]) {
+    public init(totalProved: Int, preparationTxids: [TxId]) {
         self.totalProved = totalProved
         self.preparationTxids = preparationTxids
     }
@@ -889,11 +886,7 @@ public struct MigrationProveOutcome: Equatable, Sendable {
 /// `ZcashRustBackendWelding.migrationRecordTransferResult(transferId:result:for:)`.
 public enum MigrationTransferResult: Equatable, Sendable {
     /// The transfer was accepted by the network as `txId`.
-    ///
-    /// `txId` is the display-form hex-encoded transaction id: the same byte order produced by
-    /// `Data.toHexStringTxId()` and consumed by `TxId.init(_ id: String)` (reversed relative to
-    /// the transaction's raw/internal byte order), matching how the SDK renders txids elsewhere.
-    case success(txId: String)
+    case success(txId: TxId)
     /// The broadcast failed for a network-level reason; `retryable` indicates whether the
     /// platform should retry the same prepared transfer later.
     case networkError(retryable: Bool)

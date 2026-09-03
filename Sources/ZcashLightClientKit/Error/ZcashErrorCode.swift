@@ -277,16 +277,6 @@ public enum ZcashErrorCode: String {
     case rustTruncateToChainState = "ZRUST0091"
     /// Error from rust layer when calling ZcashEip681Backend.parseTransactionRequest
     case rustEip681Parse = "ZRUST0092"
-    /// Failed to open the Slipstream engine handle via zcashlc_slipstream_open.
-    case rustSlipstreamOpen = "ZRUST0093"
-    /// Slipstream engine handle is nil (open was not called or failed).
-    case rustSlipstreamNotOpen = "ZRUST0094"
-    /// Failed to start a Slipstream sync pass via zcashlc_slipstream_start.
-    case rustSlipstreamStart = "ZRUST0095"
-    /// Slipstream sync pass failed during a polling tick.
-    case rustSlipstreamSyncFailed = "ZRUST0096"
-    /// Operation is not supported by `SlipstreamSynchronizer` (wipe / switchTo).
-    case rustSlipstreamUnsupported = "ZRUST0097"
     /// Error from rust layer when calling ZcashRustBackend.migrationProgress
     case rustMigrationProgress = "ZRUST0099"
     /// Error from rust layer when calling ZcashRustBackend.migrationIsNoteSplitNeeded
@@ -325,8 +315,6 @@ public enum ZcashErrorCode: String {
     case rustMigrationStoreSignedSchedulePczts = "ZRUST0120"
     /// Tor was requested for a migration broadcast but could not be established.
     case migrationTorUnavailable = "ZRUST0121"
-    /// The `txId` hex string carried by `MigrationTransferResult.success` did not decode to a 32-byte transaction id when calling ZcashRustBackend.migrationRecordTransferResult.
-    case migrationInvalidTxId = "ZRUST0122"
     /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned. The sync gate's in-flight marker is deliberately left set on this path and self-expires.
     case migrationRecordFailedAfterBroadcast = "ZRUST0124"
     /// Synchronizer.start() was refused because the migration privacy gate is active.
