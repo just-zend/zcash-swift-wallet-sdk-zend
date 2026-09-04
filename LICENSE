@@ -19,3 +19,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Third-party component notice: ZODL Slipstream
+
+This SDK's Rust FFI dependency graph includes ZODL Slipstream, pinned in
+`Cargo.toml` to the public source revision
+[`a98d337a5bcadd7ad7160fc40446948fa33847b0`](https://github.com/zodl-inc/slipstream/tree/a98d337a5bcadd7ad7160fc40446948fa33847b0).
+The SDK source above remains available under the MIT License. ZODL Slipstream
+is separately licensed under the GNU Affero General Public License, version 3
+only (AGPL-3.0-only):
+
+Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+
+The complete AGPL-3.0-only terms for that component are available with its
+source at https://github.com/zodl-inc/slipstream/blob/a98d337a5bcadd7ad7160fc40446948fa33847b0/LICENSE.

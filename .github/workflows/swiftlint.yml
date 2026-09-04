@@ -5,34 +5,16 @@ on:
     paths:
       - '.github/workflows/swiftlint.yml'
       - '.swiftlint.yml'
-      - 'Sources/**/*.swift'
-      - 'Example/**/*.swift'
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+      - '**/*.swift'
 
 jobs:
   SwiftLint:
-    runs-on: warp-ubuntu-latest-x64-8x
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          # .swiftlint.yml includes only these trees. Sparse checkout avoids the
-          # committed XCFramework and binary fixtures that lint never reads.
-          sparse-checkout: |
-            Sources
-            Example
-      - name: SwiftLint
-        # Run the official SwiftLint 0.65.0 image after checkout. A job-level
-        # container has no Git, which makes checkout fall back to a full REST
-        # archive and defeats sparse checkout.
-        run: >-
-          docker run --rm --pull=always --network none
-          --volume "$GITHUB_WORKSPACE:/workspace:ro"
-          --workdir /workspace
-          ghcr.io/realm/swiftlint@sha256:d6dd2aefa68155198c07884b42a59fd2ca5ee70ac9a2683a6e83445235c326d6
-          lint
+      - name: GitHub Action for SwiftLint
+        uses: norio-nomura/action-swiftlint@9f4dcd7fd46b4e75d7935cf2f4df406d5cae3684 # 3.2.1

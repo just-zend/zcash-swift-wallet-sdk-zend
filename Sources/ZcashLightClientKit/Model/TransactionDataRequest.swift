@@ -88,7 +88,7 @@ enum TransactionDataRequest: Equatable {
     /// The caller evaluating this request on behalf of the wallet backend should respond to this
     /// request by detecting transactions involving the specified address within the provided block
     /// range; if using `lightwalletd` for access to chain data, this may be performed using the
-    /// `GetTaddressTxids` RPC method. It should then call `ZcashRustBackend.decryptAndStoreTransaction`
+    /// `GetTaddressTransactions` RPC method. It should then call `ZcashRustBackend.decryptAndStoreTransaction`
     /// for each transaction so detected.
     case transactionsInvolvingAddress(TransactionsInvolvingAddress)
 }

@@ -2,7 +2,7 @@
 
 This document tracks how to safely sync `just-zend/zcash-swift-wallet-sdk-zend` with `zcash/zcash-swift-wallet-sdk`.
 
-Last reviewed: 2026-08-22
+Last reviewed: 2026-08-21
 
 ## Remote and branch invariants
 
@@ -10,24 +10,467 @@ Last reviewed: 2026-08-22
 - `upstream` must point to `git@github.com:zcash/zcash-swift-wallet-sdk.git`.
 - Default branch for both repositories is `main`.
 
-## Current reconciliation boundary (2026-08-22)
+## Parity and bleeding-edge refresh (2026-08-21)
 
-- Zend `main` is `c70edbcd` and upstream `main` is `31a35c56` after fresh
-  fetches. Draft Zend [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
-  contains the upstream tip, but the source and its matching released FFI
-  artifact are not yet reconciled.
-- Keep #34 draft until the exact `librustzcash` and private-engine revisions,
-  generated headers, required XCFramework slices, release wiring, and
-  funded-device migration evidence are verified together. Its current dirty
-  merge state must be resolved against the then-current Zend `main` before
-  merge readiness is reconsidered.
-- Reuse an existing parity or tracker PR when it covers the same upstream
-  range. Do not create competing sync branches or documentation-only PRs.
-- A directionally useful upstream change is not a safe early carry when it
-  crosses a coupled migration, FFI, generated-code, artifact, or release graph
-  that Zend cannot independently verify.
+- Fresh fetches leave the default-branch relationship unchanged:
+  `origin/main=4497fe9e`, `upstream/main=31a35c56`, and divergence is `174 434`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  at `f0742dc2` still contains the exact upstream tip (`182 0` against
+  `upstream/main`). Reuse it as the sole full-parity vehicle; do not create a
+  duplicate sync branch or PR.
+- New upstream [#1989](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1989)
+  (`dw/redact-rust-errors`) would turn proposal failures into typed, redacted Rust-to-Swift
+  error reports, which is directionally compatible with Zend's rule never to log raw FFI error
+  payloads. However, it is a draft, `BLOCKED`, and review-required two-commit migration across
+  19 files: a new Rust error-reporting ABI, FFI welding, generated error cases, public error
+  behavior, Slipstream synchronization, and tests. It is not independently verifiable while
+  Zend's matching XCFramework/header provenance remains gated, so do not early-carry it; wait
+  for upstream review/merge and reconcile it through the artifact-backed parity path.
+- The 3.0 release review, migration and send-max branches, Slipstream vendoring, database stack,
+  maintenance-line fixes, and Dependabot set remain draft, dirty, blocked, review-required,
+  release-line-only, or coupled to the same private-engine/FFI artifact gate. No independently
+  ready, useful, low-risk Zend carry exists, and no labels apply to upstream parity work.
+- This is a documentation-only monitoring record. `git diff --check` is sufficient; no Zend SDK
+  source or FFI artifact changed, so `swift build` and `swift test --filter OfflineTests` are not
+  rerun.
 
-## Historical monitor status (2026-07-26)
+## Parity and bleeding-edge refresh (2026-08-20)
+
+- Fresh fetches leave the default-branch relationship unchanged:
+  `origin/main=4497fe9e`, `upstream/main=31a35c56`, and divergence is `174 434`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  at `f0742dc2` still contains the exact upstream tip (`182 0` against
+  `upstream/main`). Reuse it as the sole full-parity vehicle; do not create a
+  duplicate sync branch or PR.
+- New upstream [#1988](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1988) is a clean,
+  approved, one-file release-script option-order repair, but it targets `maint/v2.7.x` rather
+  than `main` and its branch is 11 commits beyond the current upstream default. Zend has no
+  evidence of the maintenance-line invocation failure, and a mainline parity merge would absorb
+  a successor only after upstream integration. Do not early-carry this release-line-only patch.
+- The open 3.0 release review, Ironwood migration and send-max branches, Slipstream vendoring
+  branches, database stack, and Dependabot set remain blocked, dirty, draft, review-required,
+  release-line-only, or coupled to the same private-engine/FFI artifact gate. No independently
+  ready, useful, low-risk Zend carry exists, and no labels apply to upstream parity work.
+- This is a documentation-only monitoring record. `git diff --check` is sufficient; no Zend SDK
+  source or FFI artifact changed, so `swift build` and `swift test --filter OfflineTests` are not
+  rerun.
+
+## Parity and bleeding-edge refresh (2026-08-19)
+
+- Fresh fetches leave the default-branch relationship unchanged:
+  `origin/main=4497fe9e`, `upstream/main=31a35c56`, and divergence is `174 434`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  still contains the exact upstream tip (`0 182` against `upstream/main`), so it remains the
+  sole full-parity vehicle. Do not create another sync branch or PR.
+- Upstream [#1984](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1984) is the active
+  `review/3.0.0` release review. It is `BLOCKED` with requested changes and is 10 commits ahead
+  but 40 commits behind `upstream/main`. Its latest merged review layer, upstream
+  [#1987](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1987), removes the
+  ZODL Slipstream engine, its FFI and tests, and the private-dependency CI authorization so the
+  release can be MIT-only. This broad, release-line reconciliation is neither upstream-ready nor
+  independently verifiable against Zend's existing migration/FFI artifact gate; wait for upstream
+  release completion and a separately verified Zend artifact plan.
+- The newly active `pacu/zodl-slipstream-vendoring` branch is a 17-commit, 78-file dual-artifact
+  and licensing design that explicitly vendors the ZODL Slipstream variant. Its small dependent
+  `pacu/fix-ext-slipstream-view-names` follow-up still relies on that unmerged engine surface.
+  Neither is a Zend early-carry candidate. Existing open migration, send-max, release, and
+  Dependabot work remains draft, conflicting, review-required, or artifact-coupled. No labels
+  apply and no source-independent carry is justified.
+
+## Parity and bleeding-edge refresh (2026-08-18)
+
+- Fresh fetches confirm the remote and default-branch invariants, with
+  `origin/main=4497fe9e` and `upstream/main=31a35c56`; divergence is `174 434`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  was refreshed at `f0742dc2` and contains the exact upstream tip (`181 0` against
+  `upstream/main`). It remains the sole full-parity vehicle; do not create a duplicate
+  sync branch or PR.
+- Upstream [#1983](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1983) merged the
+  approved voting 3.0 sequence from #1972 into the formerly blocked #1962 branch. The
+  16-commit parity delta updates `zcash_voting`, Rust and Swift voting bindings, the NU6.3
+  consensus-branch constant, migration documentation, and voting OfflineTests. The Zend merge
+  applied without conflicts. `cargo fmt` made only two test-assertion layout adjustments;
+  `git diff --check` passes for both merge parents.
+- `swift build` fails before tests because the released Zend XCFramework lacks both the existing
+  migration/Slipstream/readback declarations and now the voting 3.0 FFI surface. Representative
+  missing symbols include `FfiTransactionData`, `FfiMigrationProgress`,
+  `FfiSlipstreamSnapshot`, `zcashlc_slipstream_open`, and
+  `zcashlc_voting_confirm_vote_submission`; several legacy voting calls also have stale
+  signatures. Do not run OfflineTests until exact private `librustzcash`,
+  `slipstream-internal`, and `zcash_voting` provenance is frozen; all arm64 artifact slices and
+  generated headers are rebuilt and verified; release wiring is reviewed; and funded-device
+  migration and voting evidence exists.
+- No unmerged upstream candidate is independently ready, useful, and low risk. #1985 is green
+  but review-required and alters Slipstream reconciliation views; #1984 is a 3.0.0 release PR
+  with requested changes; #1982 is draft and conflicting; #1964 is the ZODL-specific AGPL
+  vendoring option; and #1968, #1961, #1895, and the Dependabot set are conflicting,
+  review-required, or migration/artifact-coupled. No Zend labels apply to upstream parity work,
+  and no source-independent early carry is justified.
+
+## Parity and bleeding-edge refresh (2026-08-17)
+
+- Fresh fetches confirm the remote and default-branch invariants, with
+  `origin/main=4497fe9e` and `upstream/main=02e04161`; divergence is `174 418`.
+  Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  was refreshed at `04602365` and contains the exact upstream tip (`181 0` against
+  `upstream/main`). It remains the sole full-parity vehicle; do not create a duplicate
+  sync branch or PR.
+- Upstream [#1979](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1979) merged the
+  Ironwood/Slipstream integration sequence containing #1978 and #1973. The Zend parity merge
+  applied with no conflicts, retaining Zend's existing private-engine provenance and fork-hosted
+  XCFramework release wiring. The delta extracts `TxResubmitter`, uses it for legacy and
+  Slipstream background resubmission, and makes `SlipstreamSynchronizer.wipe()` clear
+  submit-plan state.
+- `git diff --check` passes on the parity merge. `swift build` reaches compilation but fails
+  before tests because the released Zend XCFramework lacks the required migration, transaction
+  readback, custom-network, and Slipstream declarations, including `FfiTransactionData`,
+  `FfiMigrationProgress`, `FfiSlipstreamSnapshot`, and `zcashlc_set_custom_network`.
+  Do not run OfflineTests until the exact private `librustzcash` / `slipstream-internal`
+  provenance is frozen, the matching committed arm64 artifact and generated headers are rebuilt
+  and verified, release wiring is reviewed, and funded-device migration evidence exists.
+- No newly active unmerged branch is an early Zend carry. #1972 is a clean voting dependency
+  bump but changes `zcash_voting` and the Ironwood migration graph; #1961 (send max) and #1962
+  (voting restoration) are dirty; #1960 is only their Cargo.lock repair; #1968 is dirty and
+  stacked on a database reproduction; and #1893/#1964 remain blocked migration or ZODL
+  licensing/artifact work. Dependabot and maintenance branches remain review- or merge-blocked.
+  No Zend labels apply to upstream parity work, and no source-independent carry is justified.
+- This tracker update is documentation-only. `git diff --check` is sufficient; source builds and
+  tests are recorded on #34 instead.
+
+## Parity and bleeding-edge refresh (2026-08-16)
+
+- Fresh fetches confirm the remote and default-branch invariants, with
+  `origin/main=4497fe9e` and `upstream/main=785c7618`; divergence remains
+  `174 410`. Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  at `ee24ba3e` contains the exact upstream tip (`180 0` against `upstream/main`).
+  Reuse it as the sole full-parity vehicle; do not create a duplicate sync branch or PR.
+- New upstream [#1978](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1978)
+  (`slipstream-parity-gaps`) has green CI but remains blocked and review-required. Its three
+  commits change five files (+556/-150) to share transaction resubmission with the legacy
+  pipeline and to make `SlipstreamSynchronizer.wipe()` remove submit-plan state. Those changes
+  alter Slipstream polling, cancellation, wallet-wipe ordering, and persistent-state behavior.
+  They are coupled to the Ironwood/Slipstream source and matching XCFramework artifact gate
+  already blocking #34, so they are not an independently ready, useful, low-risk early Zend carry.
+- Upstream [#1962](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1962) is now clean and
+  approved, but still adds eight commits across 19 files (+3,248/-1,891) spanning
+  `zcash_voting`, Rust and Swift FFI, public migration constants, and new voting tests. It remains
+  coupled to the Ironwood artifact/provenance gate and has no independently verifiable Zend
+  release path, so do not carry it ahead of upstream. The post-merge `Cargo.lock` repair #1960
+  is likewise only meaningful with that integration sequence.
+- Upstream #1973/#1974 change the upstream-only `make ffi-macos` timeout from 30 to 60 minutes;
+  #1974 is stacked on the voting bump. Zend's workflow instead runs `swift test --filter
+  OfflineTests` with a 15-minute cap and has no observed timeout, so the patch neither applies
+  cleanly nor establishes a Zend-specific need. Keep CI timeout changes out of this monitor until
+  a Zend job provides evidence. The remaining readback, ZODL licensing/artifact, migration,
+  release, and dependency branches are blocked, dirty, review-required, or coupled. No Zend
+  labels apply to this upstream parity decision.
+- This is a documentation-only monitor record. No Zend SDK source or artifact changed, so
+  `swift build` and `swift test --filter OfflineTests` were intentionally not rerun.
+
+## Parity and bleeding-edge refresh (2026-08-14)
+
+- Fresh fetches confirm `origin/main=4497fe9e` and `upstream/main=785c7618`, with
+  divergence `174 410`. The upstream default advanced through merge PR
+  [#1971](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1971), which incorporates
+  the created-transaction readback and resubmission repair sequence. Existing Zend draft
+  [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34) was refreshed at
+  `ee24ba3e` and contains the exact upstream tip; it remains the sole parity vehicle.
+- The merge was clean and preserves Zend identity and release wiring. The 24-file upstream
+  delta adds the readback/rebroadcast handling and test coverage, plus the matching Rust FFI
+  surface. `cargo fmt` completed with no changes and `git diff --check HEAD^1..HEAD` passed.
+  The broader branch still carries pre-existing trailing-whitespace differences from the
+  already-open parity range; they are not introduced by this upstream refresh.
+- `swift build` fails before tests against Zend's released XCFramework because its header and
+  binary lack the required migration and Slipstream FFI surface, including
+  `FfiTransactionData`, `FfiMigrationProgress`, `FfiSlipstreamSnapshot`, and
+  `zcashlc_slipstream_open`. Do not run `swift test --filter OfflineTests` until exact
+  `librustzcash`/`slipstream-internal` provenance is reconciled, a matching arm64 artifact is
+  built and verified, release wiring is updated, and funded-device migration evidence exists.
+- No bleeding-edge carry is appropriate. Open #1962 is clean but is a large voting/FFI and
+  dependency migration; #1968 is dirty and stacked on a non-main reproduction branch; #1964
+  is blocked ZODL-specific dual MIT/AGPL artifact work; #1973 is blocked CI-timeout tuning;
+  and #1974 is only its stacked backport. The `chp-*`, readback, vendoring, and private
+  Slipstream branches remain coupled to migration, artifact, licensing, or release gates.
+  No Zend labels are applied to upstream parity work.
+
+## Parity and bleeding-edge refresh (2026-08-12)
+
+- Fresh fetches confirm `origin/main=4497fe9e` and `upstream/main=ee7b05c9`, with
+  divergence `174 398`. `upstream/main` is not an ancestor of Zend `main`, but Zend
+  draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34) at
+  `013a024d` contains the exact upstream tip (`179 0` against `upstream/main`). Reuse
+  #34 as the sole full-parity vehicle; do not open another default-branch sync PR.
+- Keep #34 draft: its Ironwood/Slipstream source surface requires a matching
+  provenance-verified arm64 `libzcashlc` XCFramework. The current released framework
+  lacks `FfiMigrationProgress`, `zcashlc_slipstream_open`, and related declarations,
+  so source parity is not a release-ready Zend artifact. The remaining gates are exact
+  `librustzcash`/`slipstream-internal` provenance, artifact rebuild and release wiring,
+  and funded-device migration evidence.
+- Newly fetched `chp-re-enable` is not a safe early carry. It is a seven-commit,
+  19-file voting/FFI migration branch (including `Cargo.lock`, `Cargo.toml`,
+  `MIGRATING.md`, Rust voting serialization, Swift voting bindings, and new Offline
+  Tests) that is still based on the Ironwood transition. Its 2,733 additions and 1,890
+  deletions require the same source/FFI/artifact and device-validation reconciliation.
+  Do not split the snapshot-validation fix from that graph. Open #1961 (send-max),
+  #1960 (post-merge `Cargo.lock` repair), #1944, #1895, #1893, and Dependabot work are
+  likewise feature, artifact-coupled, maintenance-line-only, draft/dirty, or broad
+  dependency changes; none is independently ready, useful, and low-risk for Zend.
+- This is a documentation-only monitor record. `git diff --check` passed; `swift build`
+  and `swift test --filter OfflineTests` were not rerun because no SDK source or FFI
+  artifact changed in Zend during this review.
+
+## Parity and bleeding-edge refresh (2026-08-07)
+
+- Fresh fetches leave the default-branch refs unchanged: `origin/main=4497fe9e` and
+  `upstream/main=468d1e9f`, with divergence `174 111`. `upstream/main` is not yet an ancestor of
+  `origin/main`, but Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  (`codex/zcash-upstream-sync-2026-08-01`) already contains that exact tip (`177 0` against
+  `upstream/main`). Reuse #34 as the only full-parity vehicle; do not open a duplicate sync branch.
+- Upstream [#1953](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1953) is clean and its
+  checks are green, but it is still a draft against `feature/ironwood-slipstream`. Its 21-file
+  migration/FFI change advances the private `librustzcash` pin, changes batch proving and migration
+  outlook APIs, and rewrites the wallet adapter. It is coupled to the same artifact provenance and
+  funded-device migration gates as the broader Slipstream line, so it is not a safe standalone Zend
+  carry. Draft [#1957](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1957) and blocked
+  [#1954](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1954) confirm that the stack is still
+  in integration rather than release-ready state; #1954's build is currently failing.
+- The newly merged upstream maintenance-only work remains wait-for-upstream: #1956 adds Rust test
+  gating only to `maint/v2.7.x`, and #1925 unifies release scripts on that same line. Keep Zend's
+  SHA-pinned actions, read-only permissions, and private-engine verification policy until a
+  Zend-compatible mainline or release artifact exists. The narrow XCFramework packaging fix #1944,
+  stale-sync-state fix #1900, and Tor-off submission change #1898 are respectively
+  maintenance-line-only, draft/dirty, or draft/dirty; none clears the ready, useful, low-risk gate.
+- This is a documentation-only monitoring record. No SDK source or FFI artifact changed, so local
+  `swift build` and `swift test --filter OfflineTests` were intentionally not rerun.
+
+## Parity and bleeding-edge refresh (2026-08-05)
+
+- Fresh fetches confirm that both defaults remain `main`, with
+  `origin/main=4497fe9e` and `upstream/main=468d1e9f`. The default-branch
+  divergence remains `174 111`; `upstream/main` is not yet contained in
+  `origin/main`, but Zend draft [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  at `3a7e9ee0` already contains that exact upstream tip. It is therefore the
+  single parity vehicle, rather than a reason to create a duplicate sync branch.
+- PR #34 remains draft and clean. Its GitHub `build`, `SwiftLint`, and both
+  `zizmor` checks are successful. Product/migration-owner approval and
+  funded-device migration evidence remain separate merge gates.
+- The newly active upstream stack (`#1946` through `#1951`) is draft, blocked,
+  and chained through Ironwood migration selection plus interim `librustzcash`
+  pins. It is coupled to the private-engine/artifact reconciliation surface and
+  is not a safe early Zend carry. Existing upstream release, Darkside-test,
+  Tor, dependency, and migration branches are either maintenance-line-only,
+  blocked/dirty, or lack a Zend-specific low-risk use case. The focused
+  decrypt-and-store sentinel repair remains separately tracked by Zend draft #35.
+
+## Parity and bleeding-edge refresh (2026-08-04)
+
+- Fresh fetches confirm `origin/main=4497fe9e` and `upstream/main=468d1e9f`; the
+  default-branch divergence is `174 111`. The upstream delta adds the 2.7.0-rc.3
+  and 2.8.0-rc.2 release line, including the current FFI artifact, Rust dependency,
+  build-support, and changelog graph.
+- Zend draft PR [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  remains the sole full-parity vehicle. It now merges upstream through `468d1e9f`
+  with no conflict resolution; its SDK source and release graph match `upstream/main`, while Zend
+  retains SHA-pinned, least-privilege SwiftLint workflow controls.
+  `swift build` and `swift test --filter OfflineTests` both pass against the
+  upstream release framework, resolving the prior voting Swift/FFI source mismatch.
+  Keep it draft until product owners approve replacing Zend's divergent migration
+  path and funded-device migration evidence is recorded.
+- No additional early carry is justified. Upstream [#1946](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1946)
+  is draft, blocked, and coupled to the Slipstream/private-engine stack; #1944 is
+  review-required maintenance tooling against `maint/v2.7.x`; #1942 removes the
+  Darkside test suite and is not a Zend improvement; and the remaining open
+  migration, Tor, release, FFI, and dependency PRs remain draft, blocked,
+  review-required, stale, or too broad. The focused #1896 sentinel repair remains
+  independently carried in Zend draft [#35](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/35).
+
+## Bleeding-edge refresh (2026-08-03)
+
+- Fresh fetches leave `origin/main=4497fe9e` and `upstream/main=f51ed74a`, with the same
+  `174 87` divergence. Zend draft PR [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34)
+  remains the only full-default-branch source-parity vehicle; it is still blocked on the voting
+  FFI/source mismatch, provenance review, and funded-device migration evidence.
+- Upstream [#1896](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1896) was retargeted to
+  `feature/ironwood-slipstream` and is therefore dirty and review-required there. Its three-file
+  `decrypt-and-store` FFI sentinel fix was independently verified against Zend's current ABI
+  (`1` success, `-1` failure) and carried as Zend draft
+  [#35](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/35). The carry deliberately
+  excludes the migration/release line and does not change the FFI artifact.
+- The active Slipstream branch now includes the broad migration-parity stack, so #1895 and all
+  remaining migration/FFI candidates stay wait-for-upstream. New maintenance PR #1933 is a
+  review-required, blocked Makefile-only change against `maint/v2.7.x`; do not carry it before
+  upstream integrates it into a Zend-compatible release line.
+
+## Bleeding-edge refresh (2026-08-02)
+
+- Fresh fetches leave `origin/main=4497fe9e` and `upstream/main=f51ed74a`, with
+  merge base `769809a2` and the same `174 87` divergence. Zend draft PR
+  [#34](https://github.com/just-zend/zcash-swift-wallet-sdk-zend/pull/34) now
+  contains a conflict-resolved merge through `f51ed74a`; its build, SwiftLint,
+  and workflow zizmor checks succeeded. It remains a draft pending review of the
+  19 conflict resolutions, exact FFI/provenance reconciliation, and funded-device
+  migration evidence. Do not create a competing default-branch parity vehicle.
+- Upstream PR [#1923](https://github.com/zcash/zcash-swift-wallet-sdk/pull/1923)
+  advanced to `ffda00dd`; it is clean and its build, SwiftLint, and zizmor checks
+  are green. It is nevertheless not an early Zend carry: 40 files (+8,587/-2,197)
+  replace migration-state logic and modify Rust/Swift FFI, private-engine and
+  librustzcash pins, persistence, scheduling, generated mocks, and tests atop the
+  unmerged `feature/ironwood-slipstream` line. Treat it as part of the full
+  artifact-provenance and funded-device reconciliation.
+- No other active upstream PR or branch clears the ready, useful, and low-risk
+  gate: #1914 is an approved release-line merge awaiting upstream integration;
+  #1925-#1927 are dirty, blocked, or draft; #1893 and #1900 remain draft and
+  dependency-coupled; and #1895-#1898 are not clean against their maintenance or
+  Ironwood bases. Wait for upstream integration or a scoped Zend-specific need.
+- This is a documentation-only monitor record. No SDK source or FFI artifact
+  changed, so local `swift build` and `swift test --filter OfflineTests` were not
+  rerun.
+
+## Bleeding-edge refresh (2026-08-01)
+
+- Fresh fetches leave `origin/main=4497fe9e` and `upstream/main=f51ed74a`; the
+  merge base remains `769809a2` and the parity relationship remains `174 87`.
+  Draft Zend PR `#33` at `13121500` is still the sole clean reconciliation tracker;
+  it deliberately contains only the decision record, not the upstream source range.
+- PR `#1923` advanced and its build, SwiftLint, zizmor, and proto checks are now
+  green, but it remains changes-requested. Its 17-commit, 39-file review branch is
+  still the broad RC/Ironwood migration-state-machine and FFI reconciliation line,
+  so green CI does not make an isolated Zend carry safe.
+- PR `#1914` is approved, clean, and green, but it would bring the 23-commit v2.8
+  maintenance/release line to upstream `main`, including `Cargo`, `Package.swift`,
+  and FFI release changes. Wait for upstream to land that release line and fold it
+  into the same provenance-verified reconciliation rather than carrying it early.
+- PRs `#1926` and `#1927` remain blocked/draft on the RC `Proposal` schema and
+  generated-proto line; `#1925` remains conflicting release-script work; and
+  draft PR `#1898` remains conflicting despite green checks. None clears the ready,
+  useful, and low-risk early-carry gate.
+- This is a documentation-only monitor record. No SDK source or FFI artifact changed,
+  so `swift build` and `swift test --filter OfflineTests` were intentionally not run.
+
+## Bleeding-edge refresh (2026-07-31)
+
+- Fresh fetches leave `origin/main=4497fe9e` and `upstream/main=f51ed74a`; the
+  merge base remains `769809a2` and the parity relationship remains `174 87`.
+  Draft Zend PR `#33` at `7a7936d2` is still the sole clean reconciliation tracker;
+  it deliberately contains only the decision record, not the upstream source range.
+- No newly active upstream PR or branch clears the ready, useful, and low-risk
+  early-carry gate. PR `#1923` is changes-requested with a failed build and rewrites
+  the migration state machine across the RC.5/Ironwood/FFI family. Its branch is
+  162 commits and 120 files ahead of its merge base with `upstream/main`; wait for
+  upstream stabilization and a Zend source/artifact reconciliation.
+- PR `#1926` (`Proposal.spendsLegacyOrchardFunds`) is blocked and review-required.
+  Although its endpoint is only ten files, it is stacked on the 2.7/2.8 RC dependency,
+  FFI, and `Proposal` schema line. Draft PR `#1927` likewise carries a temporary
+  librustzcash pin and generated proposal-proto changes. Neither can be isolated from
+  Zend's provenance-locked engine and XCFramework contract.
+- PR `#1925` is dirty and review-required while unifying release scripts across 36
+  files. Merged maintenance-line work `#1905` and `#1922` remains unmerged into
+  upstream `main`, so it is not a safe substitute for the release/FFI reconciliation.
+  Draft PR `#1898` remains dirty despite approval and green checks; its Tor-off
+  submission semantics should wait for its upstream release-line decision.
+- This is a documentation-only monitor record. No SDK source or FFI artifact changed,
+  so `swift build` and `swift test --filter OfflineTests` were intentionally not run.
+
+## Bleeding-edge refresh (2026-07-30)
+
+- Fresh fetches leave the default branches unchanged: `origin/main=4497fe9e` and
+  `upstream/main=f51ed74a`. The parity relationship remains `174 87` at merge base
+  `769809a2`; `upstream/main` is not an ancestor of Zend `main`. Draft Zend PR `#33`
+  remains the sole clean reconciliation tracker and deliberately does not claim to
+  carry the 87 upstream-only commits.
+- Upstream published `2.7.0-rc.4` and `2.8.0-rc.3` release/FFI branches and advanced
+  `maint/v2.7.x`, `maint/v2.8.x`, and `feature/ironwood-slipstream`. These versioned
+  lines remain part of the blocked migration/FFI reconciliation, not a compatible
+  Zend source or artifact update. Upstream PR `#1914`, which would merge the v2.8
+  maintenance line to `main`, is still blocked and review-required despite green
+  checks.
+- No early carry meets the ready, useful, and low-risk gate. Upstream PR `#1923` is a
+  32-file migration-state-machine rewrite with a failing build, atop the 154-commit
+  Ironwood/Slipstream branch. PR `#1922` is clean and green but stacked on 24 commits
+  of the `2.7.0-rc.3` and Ironwood/FFI family; its apparently small change exposes
+  `v_transactions` fields (`poolCrossingValue`, `isTrusted`, and Ironwood) that must
+  be supplied by the reconciled Rust schema and FFI artifact, so it cannot safely be
+  cherry-picked into Zend's provenance-locked baseline.
+- The related AGENTS.md/CLAUDE.md stacked PRs `#1917` through `#1919` are blocked or
+  changes-requested, while the older maintenance fixes (`#1896`, `#1897`, `#1900`, and
+  draft/dirty `#1898`) remain unsuitable in isolation. PR `#1895` is dirty on the
+  Ironwood branch and draft `#1893` remains the broad, blocked Slipstream migration
+  stack. Preserve Zend's exact engine revision and committed XCFramework until the
+  combined source/artifact reconstruction and funded-device migration proof are done.
+- This is a documentation-only decision record. No SDK source or artifact changed, so
+  `swift build` and `swift test --filter OfflineTests` were intentionally not rerun.
+
+## Current monitor status (2026-07-27)
+
+- Fresh fetches confirm both defaults are `main`; `origin/main` is `4497fe9e` and
+  `upstream/main` is `f51ed74a`. The parity count is `174 87`: Zend is 174 commits
+  ahead, while upstream is 87 commits ahead, with merge base `769809a2`. No Zend
+  parity PR currently covers this newer upstream line.
+- The upstream delta is a broad `2.5.x`/`2.7.x`/`2.8.0-rc.1` release-and-Ironwood
+  lineage. It adds the lightwallet-protocol v0.5.0 subtree, replaces major Rust
+  migration and voting surfaces, updates generated gRPC code, and includes the
+  released RC FFI workflow. It cannot be treated as a routine source-only sync
+  because Zend's default branch has a separately reviewed, provenance-locked
+  Ironwood migration engine and committed three-slice XCFramework.
+- A no-commit merge into `codex/zcash-upstream-sync-2026-07-27` was intentionally
+  aborted after it exposed 19 conflicts: `Cargo.toml`, `Cargo.lock`, `Package.swift`,
+  `rust/src/lib.rs`, `rust/src/migration.rs`, `rust/src/tor.rs`, generated gRPC
+  sources/protos, generated errors/mocks, and the Zend Ironwood checkpoint, wallet,
+  and welding surfaces. Do not resolve these by choosing upstream or Zend wholesale.
+  First produce a provenance-verified FFI artifact that reconciles the exact migration
+  engine, librustzcash graph, public API, fixtures, and funded-device migration proof;
+  then re-run this merge with an explicit compatibility design.
+- No bleeding-edge early carry is safe. Upstream PR `#1885` is a draft, dirty,
+  81-file Ironwood/protocol/proving/voting stack; `#1818` is a clean but 49-file
+  Slipstream layer atop its own evolving base; and `#1872`/`#1853` are dirty child
+  branches of that migration family. Dependabot PRs remain blocked/review-required.
+  Wait for upstream convergence and Zend artifact reconciliation rather than splitting
+  individual fixes out of these coupled stacks.
+
+## Bleeding-edge refresh (2026-07-29)
+
+- Fresh fetches leave the default branches unchanged: `origin/main=4497fe9e` and
+  `upstream/main=f51ed74a`, with `174 87` commits in `origin/main...upstream/main`
+  and merge base `769809a2`. `upstream/main` is still not an ancestor of Zend's
+  default branch. Draft Zend PR `#33` remains the single clean reconciliation tracker;
+  it does not claim to contain the 87 upstream-only commits.
+- Upstream's release and maintenance lines advanced to `2.7.0-rc.3` and
+  `2.8.0-rc.2`, including `release/ffi-2.8.0-rc.2`, while `upstream/main` did not
+  advance. These branches are part of the same versioned Ironwood/FFI release family,
+  not a substitute for a Zend-compatible source or artifact reconciliation.
+- No newly reviewed early carry meets the ready, useful, and low-risk gate. `#1905`
+  is dirty with changes requested against `maint/v2.7.x`; `#1896` and `#1897` are
+  likewise dirty and review-required. Draft `#1900` remains review-required, and
+  draft `#1898` is dirty despite approval and green checks; its Tor-off sequential
+  submission change alters multi-endpoint submission semantics on `maint/v2.8.x`.
+- The Ironwood line is still explicitly out of scope for an isolated carry: `#1895`
+  is dirty atop `feature/ironwood-slipstream`, while draft `#1893` is blocked and
+  review-required for the Orchard-to-Ironwood/Slipstream stack. Blocked Dependabot,
+  Tor/privacy, release, and older FFI branches also lack the required upstream
+  stabilization or narrow Zend-compatible surface. Preserve the provenance-locked
+  migration engine and committed XCFramework until upstream convergence, a compatible
+  artifact rebuild, and funded-device migration proof are available.
+- This update is documentation-only. It deliberately does not rerun `swift build` or
+  `swift test --filter OfflineTests`; no SDK source or FFI artifact changed.
+
+## Bleeding-edge refresh (2026-07-28)
+
+- Default-branch heads remain `origin/main=4497fe9e` and `upstream/main=f51ed74a`;
+  the `174 87` parity gap and the reconciliation gate above are unchanged. Zend draft PR
+  `#33` remains the single clean documentation vehicle for that blocker.
+- New upstream maintenance-line fixes are not early carries. `#1896` (decrypt-and-store
+  FFI error sentinel) and `#1897` (witnesses-fix version gate) are each dirty and
+  review-required against `maint/v2.7.x`; `#1904` explicitly must not merge, is blocked,
+  and its build fails while pinning a different `librustzcash` revision. `#1905` is also
+  dirty and review-required against `maint/v2.7.x`.
+- `#1898` (sequential submissions with Tor off) is clean, approved, and green, but is
+  still a draft against `maint/v2.8.x` and changes multi-endpoint submission semantics.
+  Wait for its upstream release-line decision and a compatibility review rather than
+  cherry-picking it into Zend's provenance-locked Ironwood baseline. Draft `#1900` is
+  likewise dirty despite green checks, and `#1895` is dirty atop the Slipstream/Ironwood
+  branch. None satisfies the ready, useful, and low-risk early-carry threshold.
+
+## Current monitor status (2026-07-26)
 
 - After fetching both remotes, both default branches remain `main`; `origin/main` is
   `203473ba` and `upstream/main` is `769809a2`. The parity count is `173 0`, and
@@ -57,17 +500,13 @@ Use this flow when `upstream/main` has commits not present in `origin/main`.
 
 1. `git fetch --prune origin && git fetch --prune upstream`
 2. Compute parity gap: `git log --oneline origin/main..upstream/main`
-3. Reuse an existing Zend parity branch that already contains the upstream tip;
-   otherwise create `codex/zcash-upstream-sync-YYYY-MM-DD` (add `-2`, `-3`, ... if needed).
+3. Create sync branch: `codex/zcash-upstream-sync-YYYY-MM-DD` (add `-2`, `-3`, ... if needed)
 4. Start from fork default branch: `git switch -c <branch> origin/main`
 5. Prefer `git merge --no-ff upstream/main` for low-risk parity adoption.
-6. Resolve conflicts by preserving Zend-specific branding, release integration,
-   privacy/Tor behavior, and audited artifact policy while adopting upstream
-   protocol-correctness fixes.
+6. Resolve conflicts by preserving Zend-specific behavior/branding while adopting upstream SDK fixes.
 7. Verify:
    - `swift build`
    - `swift test --filter OfflineTests`
-   - `cargo fmt` in `rust/` when Rust changes.
 8. Open a **draft PR** to `main` with:
    - upstream commit list,
    - conflict resolutions,
@@ -81,8 +520,6 @@ Treat non-merged upstream work as optional and higher risk. Carry only when all 
 - Ready: non-draft or demonstrably stable, no unresolved structural conflicts.
 - Useful: immediate Zend roadmap value.
 - Low risk: scoped changes, manageable blast radius, and testable locally.
-- Independently verifiable: it can be tested against Zend's committed FFI
-  artifact without relying on unresolved provenance or funded-device evidence.
 
 If carried early:
 
@@ -91,23 +528,7 @@ If carried early:
 3. Run `swift build` and `swift test --filter OfflineTests` when feasible.
 4. Open a **draft PR** linking the upstream PR/branch and documenting risks.
 
-If not carried, record the explicit reason (draft/WIP, dirty rebase state,
-blocked reviews, coupled dependency/artifact graph, high risk, or low Zend
-value).
-
-## Artifact and release gates
-
-The SDK source, generated headers, and committed `libzcashlc` XCFramework are
-one provenance-checked release unit. Before merging a Rust/Swift FFI or
-migration-surface change, require the exact source revisions, rebuilt and
-verified headers and framework slices, reviewed `Package.swift` release
-wiring, and funded-device migration validation. Passing a source merge or a
-local Swift build alone does not clear these gates.
-
-For documentation-only monitoring changes, `git diff --check` is sufficient;
-state that source and artifact checks were not run. For source or artifact
-changes, run `Scripts/verify-ironwood-ffi-artifact.sh`, `swift build`, and
-`swift test --filter OfflineTests`, plus `cargo fmt` for Rust changes.
+If not carried, record explicit reason (draft/WIP, dirty rebase state, blocked reviews, high risk, low Zend value).
 
 ## Zend divergence notes
 
@@ -218,14 +639,22 @@ checks together. Zend SDK release numbering remains separate from upstream and F
 When conflicts occur:
 
 - Keep upstream protocol/consensus correctness changes unless Zend has an audited override.
-- Keep Zend-facing naming/branding, artifact URLs and checksums, release
-  integration, privacy/Tor behavior, and integration points where they
-  intentionally differ.
+- Keep Zend-facing naming/branding and integration points where they intentionally differ.
 - Prefer upstream tests and safety checks unless they break known Zend constraints.
 - If uncertain, open draft PR with precise file-level blocker notes instead of forcing merge.
 
 Zend parity branch note:
 
+- On 2026-08-10, upstream `main` advanced from `468d1e9f` to `a1234039` by merging the
+  Ironwood/Slipstream stack (upstream PR `#1954`) and its migration, FFI, generated-code, and
+  CI dependencies. Zend draft PR `#34` reuses `codex/zcash-upstream-sync-2026-08-01` and merges
+  this range cleanly at `93b4a858`; do not create a competing parity branch. The source requires
+  the corresponding Ironwood/Slipstream `libzcashlc` header and XCFramework. Zend's current
+  released binary lacks the new migration and Slipstream declarations, so `swift build` fails on
+  symbols including `FfiMigrationProgress` and `zcashlc_slipstream_open`. Keep PR `#34` draft
+  until the exact `librustzcash` / `slipstream-internal` provenance is reconciled with Zend's
+  private-engine policy, all required arm64 artifacts are rebuilt and verified, and funded-device
+  migration evidence is available.
 - `codex/zcash-upstream-sync-2026-06-17` merged upstream `main` through `dd7329eb`.
 - The original June 17 merge conflict was `CHANGELOG.md`; resolve by keeping Zend's `2.6.3` release section and placing the upstream `Unreleased` diagnostics/resubmission notes above it.
 - The June 19 refresh merged `#1765` without conflicts and required no Zend-specific code adaptation.
@@ -388,3 +817,122 @@ Unmerged upstream branches (not carried):
 - `rust-build-plugin`: 2 commits ahead and 1114 behind `upstream/main`; stale draft build-plugin work covered by upstream PR `#1443`.
 - `shielded-vote-2.4.10`: 1 commit ahead and 110 behind `upstream/main`; specialized voting branch with unclear Zend product priority.
 - `testing/note_spendability_improvements`: 6 commits ahead and 223 behind `upstream/main`; draft test-only branch covered by upstream PR `#1700`.
+
+## Bleeding-edge refresh (2026-08-06)
+
+- Default branches remain `origin/main` at `4497fe9e` and `upstream/main` at `468d1e9f`.
+  The default-branch range remains `174 111`; Zend draft PR `#34`
+  (`codex/zcash-upstream-sync-2026-08-01`) already contains `upstream/main`, so it remains the
+  only full-parity vehicle. Do not open a duplicate sync branch.
+- Upstream PR `#1955` is clean and approved, but its one-file Keystone batch-signing redaction test
+  changes `rust/src/migration_keystone.rs`, which Zend's provenance-locked migration engine does
+  not carry. It is not independently applicable; wait for the coherent upstream migration stack
+  and artifact reconciliation.
+- Upstream PR `#1956` adds Rust unit-test gating in `swift.yml` and `Makefile`, but is blocked and
+  review-required on the `maint/v2.7.x` line. It needs upstream approval plus a Zend-specific CI
+  and private-engine test-cost review before any adaptation; retain Zend's SHA-pinned actions,
+  read-only permissions, and disabled persisted credentials if it is later carried.
+- Upstream PR `#1957` and active `feature/ironwood-slipstream` descendants remain a blocked,
+  review-required migration/librustzcash stack. The current PR spans Swift migration APIs, FFI
+  welding, generated mocks, Rust migration logic, and locked dependencies, so it cannot be
+  cherry-picked ahead of upstream. Upstream PR `#1942` deletes Darkside coverage and has no Zend
+  testing benefit.
+
+No newly active upstream PR or branch is simultaneously ready, useful, and low-risk for an early
+Zend carry. Continue to route the focused decrypt sentinel fix through Zend PR `#35`, and retain
+funded-device migration evidence as a prerequisite for the full-parity PR `#34`.
+
+## Bleeding-edge refresh (2026-08-08)
+
+- Default branches remain `origin/main` at `4497fe9e` and `upstream/main` at `468d1e9f` after a
+  fresh fetch. Their divergence remains `174 111`; Zend draft PR `#34`
+  (`codex/zcash-upstream-sync-2026-08-01`) contains the upstream tip (`177 0` against
+  `upstream/main`) and remains the sole parity vehicle.
+- Upstream PR `#1953` is draft, even though it is clean and approved. It repins `librustzcash` and
+  changes batch-prove/outlook and adapter behavior on top of `feature/ironwood-slipstream`; Zend's
+  provenance-locked migration engine and artifact do not make it independently applicable.
+- Upstream PR `#1954` remains blocked and review-required while proposing the full
+  `feature/ironwood-slipstream` merge to `main`. Upstream PR `#1957` is also blocked and
+  review-required, and advances the same migration lanes and dependency graph. Do not carry either
+  ahead of upstream.
+- Newly advertised `fable/f1-span-rate-estimator`, `fable/gardening-test`, and force-updated
+  `kris/advance-driven-migration` all contain the large Ironwood/Slipstream migration, FFI,
+  generated-code, and `librustzcash` graph. They are neither narrow nor independently verifiable
+  against Zend's committed private-engine artifact; wait for upstream integration, provenance
+  reconciliation, and funded-device migration evidence.
+- Upstream PR `#1956` is now approved but targets the `maint/v2.7.x` maintenance line. Its Rust
+  test-gate workflow change is not a Zend early-carry candidate; any later adaptation must retain
+  Zend's SHA-pinned actions, read-only permissions, and disabled persisted credentials.
+
+No new upstream-main commit or carry-worthy bleeding-edge work was found. Do not create another
+parity branch or run Swift validation for this documentation-only tracker update.
+
+## Bleeding-edge refresh (2026-08-11)
+
+- After a fresh fetch, both defaults remain `main`: `origin/main=4497fe9e` and
+  `upstream/main=ee7b05c9`; their divergence is `174 398`. Existing Zend draft PR `#34`
+  (`codex/zcash-upstream-sync-2026-08-01`) now contains the exact upstream tip at
+  `013a024d`. It remains the sole full-parity vehicle; do not create a duplicate.
+- The upstream `#1955`, `#1957`, `#1958`, and `#1959` integration sequence updated the
+  Ironwood/Slipstream migration and released `librustzcash` graph. The parity merge had one
+  `Cargo.toml` conflict; it takes upstream's released `13ce6c4e` pin instead of retaining
+  Zend's superseded interim pin. Zend's private-engine artifact and release gate remain intact.
+- `swift build` on `#34` still fails before tests because Zend's released XCFramework header and
+  binary lack the new migration and Slipstream FFI declarations, including
+  `FfiMigrationProgress`, `zcashlc_slipstream_open`, and `zcashlc_slipstream_snapshot`.
+  Do not run OfflineTests until a provenance-verified matching arm64 XCFramework is built,
+  release wiring is updated, and funded-device migration evidence is captured.
+- Open PRs `#1961` (send-max), `#1960` (post-merge Cargo.lock repair), `#1944`, `#1895`,
+  `#1893`, and the Dependabot set are not independent Zend carries. They are feature work,
+  maintenance-line-only, migration/artifact-coupled, draft or review-required, or broad
+  dependency updates. No candidate is ready, useful, and low-risk enough to carry early.
+
+## Bleeding-edge refresh (2026-08-13)
+
+- Fresh fetch confirms both defaults remain `main`: `origin/main=4497fe9e` and
+  `upstream/main=ee7b05c9`, with divergence `174 398`. Zend draft PR `#34`
+  (`codex/zcash-upstream-sync-2026-08-01`) remains `179 0` against `upstream/main`, and
+  ancestry confirms it contains the exact upstream tip. It is still the only full-parity
+  vehicle; do not create a duplicate.
+- New upstream PR `#1968` is `DIRTY` and is stacked on `dw/missing-entity-repro`, not `main`.
+  Its submit-plan staleness fix depends on a database-level missing-transaction reproduction;
+  wait for the upstream stack to land and for the Zend migration/artifact reconciliation.
+- New upstream PR `#1964` is clean but is an explicit ZODL Slipstream vendoring and dual
+  MIT/AGPL artifact design. It changes release tooling, CI, Rust FFI, a separate
+  `ZODLSlipstream` product, and licensing documentation. It is neither a Zend-original
+  improvement nor a safe SDK parity carry; do not import it or apply a Zend label.
+- Active `chp-re-enable` / PR `#1962` is 10 commits ahead of `main`, `BLOCKED`, and changes
+  voting, Rust/Swift FFI, dependency pins, and public migration constants. `#1961` remains
+  blocked send-max API work, while the active readback/send-error branches are descendants of
+  the non-default Ironwood stack. None is independently ready or low-risk.
+- The still-active `feature/ironwood-slipstream`, `pacu/zodl-slipstream-vendoring`, and
+  private Slipstream branches remain coupled to the same private-engine, FFI artifact,
+  licensing, and funded-device migration gates. Dependabot and maintenance-line branches stay
+  review- or merge-blocked. No early carry is appropriate, and no label changes are needed.
+
+## Bleeding-edge refresh (2026-09-04)
+
+- Fresh fetch confirms both defaults remain `main`: `origin/main=95231c39` and
+  `upstream/main=d2e036a2`; their divergence is `177 481`. Zend draft PR `#34`
+  (`codex/zcash-upstream-sync-2026-08-01`) now contains the exact upstream tip at
+  `362a0c8b` (`199 0` against `upstream/main`). It remains the sole full-parity vehicle;
+  do not create a duplicate.
+- This range consolidates upstream SDK 3.0.0 and 2.7.0 release work, removes upstream's
+  Slipstream/private-dependency source surface, retires Darkside and Slipstream tests, and
+  rewrites release tooling. Merge conflicts in CI workflows, Cargo files, the changelog, and
+  `prepare-release.sh` were resolved by retaining the current Zend changelog detail and
+  fork-safe release targeting while adopting the upstream public dependency graph, cache
+  hardening, and release-tool structure. Zend privacy/Tor behavior, branding, and independent
+  artifact provenance remain outside this upstream merge.
+- `cargo fmt` and both merge-parent `git diff --check` checks pass. `swift build --jobs 2`
+  fails before OfflineTests: the resolved 3.0.0 XCFramework header lacks newer voting and
+  redacted-error declarations used by the merged Swift code, including
+  `zcashlc_voting_confirm_vote_submission`, `zcashlc_voting_recover_wire_json`, and
+  `zcashlc_take_last_error_report`. Do not treat parity source alone as release-ready; freeze
+  matching engine/librustzcash/voting provenance, rebuild the Zend arm64 XCFramework and
+  headers, review package/release wiring, and obtain funded-device migration/voting evidence.
+- Upstream PR `#1998` (h2 0.4.19) is blocked and review-required; it is already represented by
+  Zend draft PR `#37`, so do not create a second carry. Upstream `#1982` and `#1961` are draft
+  migration/send-max API work; `#1944` and `#1895` target maintenance lines; and Dependabot,
+  Dandelion, and older FFI/release branches remain blocked, dirty, stale, or too broad. No other
+  active branch is ready, useful, and low-risk for Zend ahead of upstream; no labels changed.

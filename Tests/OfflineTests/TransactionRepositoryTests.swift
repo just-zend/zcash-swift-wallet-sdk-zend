@@ -10,6 +10,15 @@ import XCTest
 @testable import ZcashLightClientKit
 
 class TransactionRepositoryTests: XCTestCase {
+    func testZIP318KindDecodesEveryKnownClassification() {
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 0), .notClassified)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 1), .nonconforming)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 2), .preparation)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 3), .transfer)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 4), .canonicalCrossingPayment)
+        XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 5), .notClassified)
+    }
+
     var transactionRepository: TransactionRepository!
 
     override func setUp() async throws {
@@ -37,6 +46,24 @@ class TransactionRepositoryTests: XCTestCase {
         let count = try await self.transactionRepository.countUnmined()
         XCTAssertNotNil(count)
         XCTAssertEqual(count, 0)
+    }
+
+    /// Regression (2026-08-04, field): every row of a real wallet decodes through `v_transactions`
+    /// even though its stored `trust_status` is NULL — which it IS on every wallet today, because
+    /// `set_tx_trust` is an opt-in API nothing calls yet and the column ships without a default or
+    /// backfill. A strict non-optional decode threw on the FIRST row, the whole fetch failed, and
+    /// the app rendered an empty transaction list over a fully-populated wallet.
+    ///
+    /// This is also the suite's only live test that decodes an `Overview` from the real migrated
+    /// schema (the `_testFind…` family above is disabled, #1518): if a future migration adds
+    /// another nullable column to the view that the decode reads strictly, this is what fails.
+    func testFindAllDecodesRowsWhoseStoredTrustStatusIsNull() async throws {
+        let transactions = try await self.transactionRepository.find(offset: 0, limit: Int.max, kind: .all)
+
+        XCTAssertEqual(transactions.count, 21, "every fixture row must decode — one NULL must never empty the list")
+        transactions.forEach {
+            XCTAssertFalse($0.isTrusted, "an unevaluated (NULL) trust_status reads as untrusted, matching IFNULL(trust_status, 0)")
+        }
     }
 
     // TODO: [#1518] Fix the test, https://github.com/Electric-Coin-Company/zcash-swift-wallet-sdk/issues/1518
@@ -126,7 +153,11 @@ class TransactionRepositoryTests: XCTestCase {
             value: Zatoshi(-1000),
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)
@@ -159,7 +190,11 @@ class TransactionRepositoryTests: XCTestCase {
             value: .zero,
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)
@@ -187,7 +222,11 @@ class TransactionRepositoryTests: XCTestCase {
             value: .zero,
             isExpiredUmined: false,
             totalSpent: nil,
-            totalReceived: nil
+            totalReceived: nil,
+            spentNoteCount: 0,
+            poolCrossingValue: nil,
+            isTrusted: false,
+            zip318Kind: .notClassified
         )
 
         let memos = try await self.transactionRepository.findMemos(for: transaction)

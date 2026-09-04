@@ -8,6 +8,7 @@ Please read it before you start participating.
 * [Asking Questions](#asking-questions)
 * [Reporting Security Issues](#reporting-security-issues)
 * [Reporting Non Security Issues](#reporting-other-issues)
+* [Release and Maintenance Branches](#release-and-maintenance-branches)
 * [Commit Messages](#commit-messages)
 * [Developers Certificate of Origin](#developers-certificate-of-origin)
 
@@ -68,6 +69,155 @@ prioritized.
   logic are either obvious to a reasonably skilled professional, or add a
   comment that explains it.
 
+## Release and Maintenance Branches
+
+`main` is the development trunk. Released versions are maintained on long-lived
+`maint/` branches, one per minor release line, so that a fix can reach users
+already running an older version without shipping them unrelated trunk work.
+
+| Branch | Lifetime | Purpose |
+| --- | --- | --- |
+| `main` | permanent | Development trunk. New feature work lands here. |
+| `maint/vX.Y.x` | permanent | One per supported release line. Fixes to released versions land here. |
+| `release/X.Y.Z` | one release | Cut from the previous release tag. The base of the release PR, and what gets tagged. |
+| `candidate/X.Y.Z` | one release | Cut from the revision being released. Carries the release preparation commits, and is the head of the release PR. |
+
+### Basing a bug fix
+
+**The rule is: merge forward, cherry-pick back.**
+
+Branch bug fixes from the oldest currently-supported maintenance branch — at the
+time of writing that is `maint/v2.7.x`. From there the fix travels to every newer
+line by merging forward, keeping one commit identity and leaving later merges
+between those branches clean. This is the normal path and the one the diagram
+below shows; expect nearly every fix to take it.
+
+Cherry-picking back is the exception, for a fix that has already landed on a
+newer line and turns out to be needed on an older one too. Never merge backward:
+that would drag everything else on the newer line into the older release.
+
+```
+                    fix/1234
+                   ●────●
+                  /       \
+maint/v2.7.x  ───●─────────●─────────────────────────────▶   base bug fixes here
+                            \
+                             \  merge forward
+                              ▼
+maint/v2.8.x  ───●────────────●──────────────────────────▶
+                               \
+                                \  merge forward
+                                 ▼
+main          ───●───────────────●───────────────────────▶
+```
+
+### Cutting a release
+
+A release happens in two phases, with a human reading the pull request in
+between. Both are driven by `./Scripts/prepare-release.sh`; pass `--dry-run` to
+either to see what it will do without changing anything.
+
+**Phase one** — `./Scripts/prepare-release.sh start --issue <N> <remote> <version>`:
+
+1. Create `release/X.Y.Z` **from the previous release tag** and push it to
+   upstream. It starts out identical to the last release.
+2. Create `candidate/X.Y.Z` from the maintenance branch that contains all of
+   the changes to be released.
+3. Promote the CHANGELOG's `Unreleased` section to `X.Y.Z`.
+4. Open a **draft** pull request **on the public repository** from
+   `candidate/X.Y.Z` into `release/X.Y.Z`.
+
+Review that pull request. Its diff is exactly what users receive relative to
+the last release, rather than the intervening development history — which is
+the whole reason the release branch is based on the previous release tag.
+
+**Phase two** — `./Scripts/prepare-release.sh build <remote> <version>`:
+
+5. Bump the recorded version in `Cargo.toml`, `Cargo.lock` and
+   `BuildSupport/platform-Info.plist`.
+6. Build the XCFramework; verify the SDK builds and passes `OfflineTests`
+   against it; then upload it as a draft GitHub release. `--artifacts ci` does
+   all of that on a runner instead of locally; `--skip-verify` skips the
+   build-and-test check.
+7. Rewrite `Package.swift`'s binary target to point at that release.
+8. Extend `candidate/X.Y.Z` with both commits, comment on the pull request, and
+   mark it ready for review.
+
+Each step of phase two checks whether it has already run, so re-running it
+after a failure resumes rather than starting over.
+
+9. Merge the pull request, then run `./Scripts/release.sh <remote> X.Y.Z` from
+   `release/X.Y.Z`. It requires that branch to be identical to its counterpart
+   on `<remote>` — only what merged there may be tagged, and a pushed tag
+   cannot be recalled — then verifies the checksum in `Package.swift` against
+   the uploaded asset, signs the tag `X.Y.Z`, pushes it, and publishes the
+   release. The tag is the only thing pushed.
+
+A version carrying a pre-release suffix, such as `2.8.0-rc.1`, is marked as a
+pre-release on GitHub, both on the draft created in step 6 and on the published
+release in step 9. That bit is what keeps a release candidate from being served
+as `latest` to everyone who asks the API for the newest release.
+
+The artifact build alone is available as
+`./Scripts/prepare-release.sh artifacts <version>`. It touches no git or
+pull-request state, which is what lets `.github/workflows/build-ffi.yml` run it
+with only `contents: write`. Its
+`--force-overwrite-existing-release` replaces the assets of a *draft* release
+only: `Package.swift` pins the checksum of whatever a published release
+carries, and SwiftPM checks it on every fetch, so replacing that asset breaks
+the build of every consumer that has already resolved the version.
+
+```
+tag X.Y.W  (previous release)
+      │
+      └──▶  release/X.Y.Z  ●──────────────────────────────●  tag X.Y.Z
+                                                          ▲
+                                                          │  PR: candidate ──▶ release
+                                                          │
+     candidate/X.Y.Z   ●────●────●────────────────────────┘
+                       ▲     CHANGELOG, version bump, XCFramework
+                       │
+                       │  branch from maint
+maint/vX.Y.x ──●────●──┴────────────────────────▶
+               └─ changes to be released ─┘
+```
+
+### After the release
+
+Three merges, in order:
+
+1. Merge `release/X.Y.Z` back into `maint/vX.Y.x`, so the maintenance branch
+   carries the tagged release and its preparation commits.
+2. Merge each maintenance branch forward into the next newer one. With
+   `maint/v2.7.x` and `maint/v2.8.x` both active, a release on the 2.7 line goes
+   `maint/v2.7.x` → `maint/v2.8.x`. Repeat along the chain for every newer line.
+3. Merge the newest maintenance branch into `main`.
+
+```
+release/X.Y.Z   ●  tag X.Y.Z
+                 \
+                  \  1. merge back
+                   ▼
+maint/vX.Y.x  ──────●────────────────────────────────────▶
+                     \
+                      \  2. merge forward
+                       ▼
+maint/vX.Y+1.x  ────────●────────────────────────────────▶
+                         \
+                          \  3. merge back to trunk
+                           ▼
+main          ──────────────●────────────────────────────▶
+```
+
+Do not treat step 3 as release-time-only work: merge `maint/` branches back to
+`main` regularly. Trunk then never drifts far from what is shipping, and each
+merge stays small enough to resolve confidently.
+
+Skipping a forward merge is how a fix silently regresses — a user upgrading from
+2.7.1 to 2.8.0 would lose it. If a forward merge conflicts, resolve it in favour
+of keeping both changes rather than dropping either, and verify the result builds
+before pushing.
+
 ## Commit Messages
 
 Commit history is an important part of the project's documentation.
@@ -92,9 +242,10 @@ issue following the criteria described in the preceding sections.
 Every contribution must reference an existing Issue. This issue is important
 since it will be directly referenced in the title of your commit.
 
-Although we prefer small PR's. We encourage our contributors to use Squash
-commits extensively. Maintainers prefer avoiding _merge commits_ when possible.
-It is very much likely that _if accepted_, your contribution will be _squash merged_.
+We prefer small PR's, and PRs are always landed with a _merge commit_ —
+never squash-merged or rebased — so the branch's commits enter history
+exactly as reviewed. Because of this, we encourage contributors to squash
+their own work into a tidy series of self-contained commits before review.
 
 When squashing commits, use your best judgement. In some situations, a refactoring may
 be done before actual behavior changes are implemented. It is reasonable to keep such

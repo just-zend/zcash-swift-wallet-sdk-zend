@@ -33,7 +33,7 @@ extension Connection {
     }
 }
 
-class TransactionSQLDAO: TransactionRepository, RawTransactionLookup {
+class TransactionSQLDAO: TransactionRepository {
     enum NotesTableStructure {
         static let transactionID = SQLite.Expression<Int>("tx")
         static let memo = SQLite.Expression<Blob>("memo")
@@ -98,7 +98,8 @@ class TransactionSQLDAO: TransactionRepository, RawTransactionLookup {
         return transactionsCopy
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): SELECT over v_transactions JOIN v_tx_outputs — filter/join
+    // query via connection().prepare only.
     func fetchTxidsWithMemoContaining(searchTerm: String) async throws -> [Data] {
         let query = transactionsView
             .join(txOutputsView, on: transactionsView[UserMetadata.txid] == txOutputsView[UserMetadata.txid])
@@ -115,12 +116,13 @@ class TransactionSQLDAO: TransactionRepository, RawTransactionLookup {
         return txids
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): blocks table via BlockSQLDAO.block(at:) — filter+limit
+    // SELECT.
     func blockForHeight(_ height: BlockHeight) async throws -> Block? {
         try blockDao.block(at: height)
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): scalar COUNT over v_transactions.
     func countAll() async throws -> Int {
         do {
             return try connection().scalar(transactionsView.count)
@@ -129,7 +131,7 @@ class TransactionSQLDAO: TransactionRepository, RawTransactionLookup {
         }
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): scalar COUNT over v_transactions filtered unmined.
     func countUnmined() async throws -> Int {
         do {
             return try connection().scalar(transactionsView.filter(ZcashTransaction.Overview.Column.minedHeight == nil).count)
@@ -141,14 +143,6 @@ class TransactionSQLDAO: TransactionRepository, RawTransactionLookup {
     func find(rawID: Data) async throws -> ZcashTransaction.Overview {
         let query = transactionsView
             .filter(ZcashTransaction.Overview.Column.rawID == Blob(bytes: rawID.bytes))
-            .limit(1)
-
-        return try await execute(query) { try ZcashTransaction.Overview(row: $0) }
-    }
-
-    func find(rawTransaction: Data) async throws -> ZcashTransaction.Overview {
-        let query = transactionsView
-            .filter(ZcashTransaction.Overview.Column.raw == Blob(bytes: rawTransaction.bytes))
             .limit(1)
 
         return try await execute(query) { try ZcashTransaction.Overview(row: $0) }
@@ -272,7 +266,8 @@ class TransactionSQLDAO: TransactionRepository, RawTransactionLookup {
         return entity
     }
 
-    @DBActor
+    // DB-READ (audited 2026-08-03): connection().prepare(query).map — every caller passes a
+    // view-based SELECT.
     private func execute<Entity>(_ query: View, createEntity: (Row) throws -> Entity) async throws -> [Entity] {
         do {
             let entities = try connection()

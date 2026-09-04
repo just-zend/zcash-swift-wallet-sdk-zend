@@ -21,6 +21,8 @@ public enum ZcashErrorCode: String {
     case initializerGeneralStorageCantCreate = "ZINIT0004"
     /// Can't set `isExcludedFromBackup` flag to `generalStorageURL`.
     case initializerCantSetNoBackupFlagToGeneralStorageURL = "ZINIT0005"
+    /// The seed passed to `prepare` does not match the seed-derived account(s) already stored in `data.db`; restoring a different wallet requires wiping first.
+    case initializerSeedMismatch = "ZINIT0006"
     /// Unknown GRPC Service error
     case serviceUnknownError = "ZSRVC0001"
     /// LightWalletService.getInfo failed.
@@ -41,7 +43,7 @@ public enum ZcashErrorCode: String {
     case serviceBlockStreamFailed = "ZSRVC0000"
     /// LightWalletService.getSubtreeRoots failed.
     case serviceSubtreeRootsStreamFailed = "ZSRVC0009"
-    /// LightWalletService.getTaddressTxids failed.
+    /// LightWalletService.getTaddressTransactions failed.
     case serviceGetTaddressTxidsFailed = "ZSRVC0010"
     /// LightWalletService.getMempoolStream failed.
     case serviceGetMempoolStreamFailed = "ZSRVC0011"
@@ -187,7 +189,7 @@ public enum ZcashErrorCode: String {
     case rustScanProgressOutOfRange = "ZRUST0055"
     /// Error from rust layer when calling ZcashRustBackend.getWalletSummary
     case rustGetWalletSummary = "ZRUST0056"
-    /// Error from rust layer when calling ZcashRustBackend.
+    /// Error from rust layer when calling ZcashRustBackend.proposeTransferFromURI
     case rustProposeTransferFromURI = "ZRUST0057"
     /// Error from rust layer when calling ZcashRustBackend.
     case rustListAccounts = "ZRUST0058"
@@ -201,12 +203,24 @@ public enum ZcashErrorCode: String {
     case rustPutIronwoodSubtreeRootsAllocationProblem = "ZRUST0109"
     /// Error from rust layer when calling ZcashRustBackend.putIronwoodSubtreeRoots
     case rustPutIronwoodSubtreeRoots = "ZRUST0110"
+    /// Error from rust layer when calling ZcashRustBackend.getTransaction
+    case rustGetTransaction = "ZRUST0150"
+    /// Error from rust layer when calling ZcashRustBackend.proposeTransfer
+    case rustProposeTransfer = "ZRUST0151"
+    /// Error from rust layer when calling ZcashRustBackend.proposeOrchardToIronwoodMigration
+    case rustProposeOrchardToIronwoodMigration = "ZRUST0152"
+    /// The wallet must finish scanning the blockchain before this payment can be prepared.
+    case rustProposalScanRequired = "ZRUST0153"
+    /// The spendable balance does not cover this payment and its fee.
+    case rustProposalInsufficientFunds = "ZRUST0154"
     /// Error from rust layer when calling TorClient.init
     case rustTorClientInit = "ZRUST0062"
     /// Error from rust layer when calling TorClient.get
     case rustTorClientGet = "ZRUST0063"
     /// Error from rust layer when calling ZcashRustBackend.transactionDataRequests
     case rustTransactionDataRequests = "ZRUST0064"
+    /// Error from rust layer when calling ZcashRustBackend.setTransactionStatus
+    case rustSetTransactionStatus = "ZRUST0107"
     /// Error from rust layer when calling ZcashRustBackend.deriveArbitraryWalletKey
     case rustDeriveArbitraryWalletKey = "ZRUST0065"
     /// Error from rust layer when calling ZcashRustBackend.deriveArbitraryAccountKey
@@ -263,70 +277,90 @@ public enum ZcashErrorCode: String {
     case rustTruncateToChainState = "ZRUST0091"
     /// Error from rust layer when calling ZcashEip681Backend.parseTransactionRequest
     case rustEip681Parse = "ZRUST0092"
-    /// Error from rust layer when calling ZcashRustBackend.migrationState
-    case rustMigrationState = "ZRUST0093"
     /// Error from rust layer when calling ZcashRustBackend.migrationProgress
-    case rustMigrationProgress = "ZRUST0094"
+    case rustMigrationProgress = "ZRUST0099"
     /// Error from rust layer when calling ZcashRustBackend.migrationIsNoteSplitNeeded
-    case rustMigrationIsNoteSplitNeeded = "ZRUST0095"
-    /// Error from rust layer when calling ZcashRustBackend.migrationPrepareNoteSplit
-    case rustMigrationPrepareNoteSplit = "ZRUST0096"
-    /// Error from rust layer when calling ZcashRustBackend.migrationSignNoteSplit
-    case rustMigrationSignNoteSplit = "ZRUST0097"
-    /// Error from rust layer when calling ZcashRustBackend.migrationProposeTransfers
-    case rustMigrationProposeTransfers = "ZRUST0098"
-    /// Error from rust layer when calling ZcashRustBackend.migrationSignAndStore
-    case rustMigrationSignAndStore = "ZRUST0099"
-    /// Error from rust layer when calling ZcashRustBackend.migrationIsSyncRequired
-    case rustMigrationIsSyncRequired = "ZRUST0100"
-    /// Error from rust layer when calling ZcashRustBackend.migrationNextDueTransfer
-    case rustMigrationNextDueTransfer = "ZRUST0101"
-    /// Error from rust layer when calling ZcashRustBackend.migrationRecordTransferResult
-    case rustMigrationRecordTransferResult = "ZRUST0102"
+    case rustMigrationIsNoteSplitNeeded = "ZRUST0100"
     /// Error from rust layer when calling ZcashRustBackend.migrationHasOverdueTransfers
-    case rustMigrationHasOverdueTransfers = "ZRUST0103"
+    case rustMigrationHasOverdueTransfers = "ZRUST0101"
     /// Error from rust layer when calling ZcashRustBackend.migrationHasInvalidTransfers
-    case rustMigrationHasInvalidTransfers = "ZRUST0104"
+    case rustMigrationHasInvalidTransfers = "ZRUST0102"
+    /// Error from rust layer when calling ZcashRustBackend.migrationPrepareNoteSplit
+    case rustMigrationPrepareNoteSplit = "ZRUST0103"
+    /// Error from rust layer when calling ZcashRustBackend.migrationSignNoteSplit
+    case rustMigrationSignNoteSplit = "ZRUST0104"
+    /// Error from rust layer when calling ZcashRustBackend.migrationResidualAfterMigration
+    case rustMigrationResidualAfterMigration = "ZRUST0105"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProposeTransfers
+    case rustMigrationProposeTransfers = "ZRUST0106"
+    /// Error from rust layer when calling ZcashRustBackend.migrationSignAndStoreSchedule
+    case rustMigrationSignAndStoreSchedule = "ZRUST0108"
+    /// Error from rust layer when calling ZcashRustBackend.migrationTakeBroadcastTransaction
+    case rustMigrationTakeBroadcastTransaction = "ZRUST0111"
+    /// Error from rust layer when calling ZcashRustBackend.migrationTakePreparation
+    case rustMigrationTakePreparation = "ZRUST0149"
+    /// Error from rust layer when calling ZcashRustBackend.migrationRecordTransferResult
+    case rustMigrationRecordTransferResult = "ZRUST0113"
     /// Error from rust layer when calling ZcashRustBackend.migrationRestartStep
-    case rustMigrationRestartStep = "ZRUST0105"
-    /// Error from rust layer when calling ZcashRustBackend.migrationInitializePostUpgrade
-    case rustMigrationInitializePostUpgrade = "ZRUST0106"
-    /// Error from rust layer when calling ZcashRustBackend.migrationExtractBroadcastTx
-    case rustMigrationExtractBroadcastTx = "ZRUST0107"
+    case rustMigrationRestartStep = "ZRUST0115"
     /// Error from rust layer when calling ZcashRustBackend.migrationRefreshStaleTransfers
-    case rustMigrationRefreshStaleTransfers = "ZRUST0108"
-    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedNoteSplitPCZT
-    case rustMigrationCreateUnsignedNoteSplitPCZT = "ZRUST0111"
-    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedTransferPCZTs
-    case rustMigrationCreateUnsignedTransferPCZTs = "ZRUST0112"
-    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedNoteSplitPCZT
-    case rustMigrationStoreSignedNoteSplitPCZT = "ZRUST0113"
-    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePCZTs
-    case rustMigrationStoreSignedSchedulePCZTs = "ZRUST0114"
-    /// Ordinary wallet spending is blocked by the active Ironwood migration.
-    case migrationOrdinarySpendsBlocked = "ZRUST0115"
-    /// Error from rust layer when reading the authoritative migration snapshot.
-    case rustMigrationSnapshot = "ZRUST0116"
-    /// Error from rust layer when proposing a private anchorless intent schedule.
-    case rustMigrationProposePrivateIntents = "ZRUST0117"
-    /// Error from rust layer when proposing an immediate anchorless intent.
-    case rustMigrationProposeImmediateIntent = "ZRUST0118"
-    /// Error from rust layer when committing an approved intent schedule.
-    case rustMigrationCommitIntents = "ZRUST0119"
-    /// Error from rust layer when claiming a persisted due migration transaction.
-    case rustMigrationClaimNextDueTransfer = "ZRUST0120"
-    /// Error from rust layer when materializing and claiming a software-signed intent.
-    case rustMigrationMaterializeAndClaimNextDue = "ZRUST0121"
-    /// Error from rust layer when staging a due intent for an external signer.
-    case rustMigrationStageNextDueExternalPCZT = "ZRUST0122"
-    /// Error from rust layer when resuming an engine-owned signed submission.
-    case rustMigrationResumeStagedSubmission = "ZRUST0123"
-    /// Error from rust layer when storing a device-signed due intent.
-    case rustMigrationStoreSignedDueIntent = "ZRUST0124"
-    /// Error from rust layer when recording a tokenized migration submission result.
-    case rustMigrationRecordClaimedTransferResult = "ZRUST0125"
-    /// Error from rust layer when ingesting and claiming a persisted denomination-split transaction.
-    case rustMigrationClaimNoteSplitSubmission = "ZRUST0126"
+    case rustMigrationRefreshStaleTransfers = "ZRUST0116"
+    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedNoteSplitPczt
+    case rustMigrationCreateUnsignedNoteSplitPczt = "ZRUST0117"
+    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedNoteSplitPczt
+    case rustMigrationStoreSignedNoteSplitPczt = "ZRUST0118"
+    /// Error from rust layer when calling ZcashRustBackend.migrationCreateUnsignedTransferPczts
+    case rustMigrationCreateUnsignedTransferPczts = "ZRUST0119"
+    /// Error from rust layer when calling ZcashRustBackend.migrationStoreSignedSchedulePczts
+    case rustMigrationStoreSignedSchedulePczts = "ZRUST0120"
+    /// Tor was requested for a migration broadcast but could not be established.
+    case migrationTorUnavailable = "ZRUST0121"
+    /// The migration engine failed to record a successfully submitted broadcast. The broadcast DID land; the engine reconciles the transfer on a later execution attempt (a duplicate re-submission records as success) or when the mined transaction is scanned. The sync gate's in-flight marker is deliberately left set on this path and self-expires.
+    case migrationRecordFailedAfterBroadcast = "ZRUST0124"
+    /// Synchronizer.start() was refused because the migration privacy gate is active.
+    case migrationSyncBlocked = "ZRUST0125"
+    /// A broadcast-performing migration method was called while the synchronizer is actively syncing.
+    case migrationBroadcastDuringSync = "ZRUST0126"
+    /// Proving a migration transaction failed.
+    case migrationProvingUnavailable = "ZRUST0127"
+    /// A migration commit was requested without a matching previewed plan.
+    case migrationPlanStale = "ZRUST0128"
+    /// Error from rust layer when calling ZcashRustBackend.proposeSendMaxTransfer
+    case rustProposeSendMaxTransfer = "ZRUST0129"
+    /// `migrationRecordImmediateRun` was called with a `txid` that is not exactly 32 bytes.
+    case migrationRecordImmediateRunInvalidTxId = "ZRUST0130"
+    /// Error from rust layer when calling ZcashRustBackend.migrationRecordImmediateRun
+    case rustMigrationRecordImmediateRun = "ZRUST0131"
+    /// Error from rust layer when calling ZcashRustBackend.lockMigrationResidual
+    case rustMigrationLockResidual = "ZRUST0132"
+    /// Error from rust layer when calling ZcashRustBackend.unlockMigrationResidual
+    case rustMigrationUnlockResidual = "ZRUST0133"
+    /// Error from rust layer when calling ZcashRustBackend.estimateMigrationRuns
+    case rustMigrationEstimateRuns = "ZRUST0134"
+    /// Error from rust layer when calling ZcashRustBackend.migrationTransactionStatuses
+    case rustMigrationTransactionStatuses = "ZRUST0135"
+    /// Error from rust layer when calling ZcashRustBackend.migrationKeystoneBuildSignBatchQrParts
+    case rustMigrationKeystoneBuildSignBatchQrParts = "ZRUST0136"
+    /// Error from rust layer when calling ZcashRustBackend.migrationKeystoneDecodeSignBatchPart
+    case rustMigrationKeystoneDecodeSignBatchPart = "ZRUST0137"
+    /// Error from rust layer when calling ZcashRustBackend.migrationKeystoneApplyBatchSignatures
+    case rustMigrationKeystoneApplyBatchSignatures = "ZRUST0138"
+    /// Error from rust layer when calling ZcashRustBackend.migrationProveTransactions
+    case rustMigrationProveTransactions = "ZRUST0140"
+    /// A stored migration transfer admits NO valid sync/proving wake-up height.
+    case migrationWakeupInfeasible = "ZRUST0141"
+    /// Error from rust layer when calling ZcashRustBackend.migrationAdvanceStep
+    case rustMigrationAdvanceStep = "ZRUST0142"
+    /// Error from rust layer when calling ZcashRustBackend.migrationSyncWakeups
+    case rustMigrationSyncWakeups = "ZRUST0143"
+    /// Error from rust layer when calling ZcashRustBackend.migrationBlockRateSamples
+    case rustMigrationBlockRateSamples = "ZRUST0144"
+    /// Error from rust layer when calling ZcashRustBackend.migrationReconcileUnrecordedBroadcasts
+    case rustMigrationReconcileUnrecordedBroadcasts = "ZRUST0145"
+    /// Error from rust layer when calling ZcashRustBackend.migrationBatchPcztsByActions
+    case rustMigrationBatchPcztsByActions = "ZRUST0146"
+    /// No chain tip is available to estimate from: the wallet has never scanned a block.
+    case migrationChainTipUnavailable = "ZRUST0147"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.
@@ -489,8 +523,8 @@ public enum ZcashErrorCode: String {
     case compactBlockProcessorPutOrchardSubtreeRoots = "ZCBPEO0022"
     /// Put Ironwood subtree roots to the DB failed.
     case compactBlockProcessorPutIronwoodSubtreeRoots = "ZCBPEO0023"
-    /// Every sampled server tip was below durable local wallet state. Retrying may select a healthy load-balanced replica.
-    case compactBlockProcessorServerTipBehind = "ZCBPEO0024"
+    /// The chain is past the Ironwood (NU6.3) activation but the connected server does not serve Ironwood data, which the wallet needs in order to detect its shielded transactions by scanning.
+    case compactBlockProcessorServerMissingIronwoodSupport = "ZCBPEO0024"
     /// The synchronizer is unprepared.
     case synchronizerNotPrepared = "ZSYNCO0001"
     /// Memos can't be sent to transparent addresses.

@@ -319,6 +319,13 @@ pub struct Balance {
     /// confirmations to be spendable, or for which witnesses cannot yet be constructed without
     /// additional scanning.
     value_pending_spendability: i64,
+
+    /// The value in the account that is currently locked by an explicit output lock (e.g. the
+    /// migration residual locked via `zcashlc_migration_lock_residual`) and therefore excluded
+    /// from `spendable_value`. Locked value still belongs to the account: it is part of the
+    /// account's total (the sum of this struct's fields), it just cannot be selected for spending
+    /// until it is unlocked.
+    locked_value: i64,
 }
 
 impl Balance {
@@ -329,6 +336,7 @@ impl Balance {
                 .into(),
             value_pending_spendability: ZatBalance::from(balance.value_pending_spendability())
                 .into(),
+            locked_value: ZatBalance::from(balance.locked_value()).into(),
         }
     }
 }
@@ -704,6 +712,54 @@ impl SymmetricKeys {
 }
 
 pub type TxIds = SymmetricKeys;
+
+/// Transaction data stored by the wallet, with the bytes required for broadcast.
+///
+/// A null `raw` pointer represents an unknown transaction or one whose raw bytes are unavailable.
+/// `expiry_height` is the consensus value; zero means that transaction expiry is disabled.
+#[repr(C)]
+pub struct TransactionData {
+    pub txid: [u8; 32],
+    pub raw: *mut u8,
+    pub raw_len: usize,
+    pub expiry_height: u32,
+}
+
+impl TransactionData {
+    pub(crate) fn from_parts(txid: [u8; 32], raw_bytes: Vec<u8>, expiry_height: u32) -> *mut Self {
+        let (raw, raw_len) = ptr_from_vec(raw_bytes);
+        Box::into_raw(Box::new(Self {
+            txid,
+            raw,
+            raw_len,
+            expiry_height,
+        }))
+    }
+
+    pub(crate) fn unavailable(txid: [u8; 32]) -> *mut Self {
+        Box::into_raw(Box::new(Self {
+            txid,
+            raw: ptr::null_mut(),
+            raw_len: 0,
+            expiry_height: 0,
+        }))
+    }
+}
+
+/// Frees a [`TransactionData`] and its serialized transaction bytes.
+///
+/// # Safety
+///
+/// - `ptr` must either be null or point to a value returned by
+///   [`crate::zcashlc_get_transaction`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_transaction_data(ptr: *mut TransactionData) {
+    if !ptr.is_null() {
+        let transaction_data = unsafe { Box::from_raw(ptr) };
+        free_ptr_from_vec(transaction_data.raw, transaction_data.raw_len);
+        drop(transaction_data);
+    }
+}
 
 /// Frees an array of `[u8; 32]` values.
 ///

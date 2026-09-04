@@ -33,8 +33,7 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
 
     public func prepare(
         with seed: [UInt8]?,
-        walletBirthday: BlockHeight,
-        for walletMode: WalletInitMode,
+        walletBirthday: BlockHeight?,
         name: String,
         keySource: String?
     ) -> SinglePublisher<Initializer.InitializationResult, Error> {
@@ -42,7 +41,6 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
             return try await self.synchronizer.prepare(
                 with: seed,
                 walletBirthday: walletBirthday,
-                for: walletMode,
                 name: name,
                 keySource: keySource
             )
@@ -91,6 +89,12 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
     ) -> SinglePublisher<Proposal, Error> {
         AsyncToCombineGateway.executeThrowingAction() {
             try await self.synchronizer.proposeTransfer(accountUUID: accountUUID, recipient: recipient, amount: amount, memo: memo)
+        }
+    }
+
+    public func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) -> SinglePublisher<Proposal, Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
         }
     }
 

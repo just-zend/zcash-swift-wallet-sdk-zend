@@ -9,31 +9,39 @@ import SQLite3
 
 // Shared fixtures for tests that round-trip persisted voting recovery state
 // through the Rust voting database.
+
+/// Builds a round identifier that satisfies the Rust round-parameter validation,
+/// which requires 64 lowercase hex characters encoding a canonical Pallas field
+/// element. `tag` occupies the low byte so each caller gets a distinct round
+/// while staying canonical.
+private func hexRoundId(_ tag: UInt8) -> String {
+    String(format: "%02x", tag) + String(repeating: "00", count: 31)
+}
+
 private let roundTripWalletId = "test-wallet"
-private let roundTripRoundId = "round"
+private let roundTripRoundId = hexRoundId(0x01)
+/// A well-formed round identifier that is never initialized, for tests that
+/// exercise lookups against a round the database does not know about.
+private let missingRoundId = hexRoundId(0xfe)
+private let roundTripNetworkId: UInt32 = 1
 private let roundTripBundleIndex: UInt32 = 0
 private let roundTripProposalId: UInt32 = 1
-private let roundTripShareIndex0: UInt32 = 0
-private let roundTripShareIndex1: UInt32 = 1
+private let roundTripShareIndex: UInt32 = 0
 private let roundTripSnapshotHeight: UInt64 = 1
 private let roundTripVoteCommitmentTreePosition: UInt64 = 42
 private let roundTripDelegationTxHash = "delegation-tx-hash"
 private let roundTripVoteTxHash = "vote-tx-hash"
-private let roundTripCommitmentBundleJson = #"{"vote_commitment":[1,2,3],"proposal_id":1}"#
-private let roundTripHelperAURL = "https://helper-a.example"
-private let roundTripHelperBURL = "https://helper-b.example"
-private let roundTripFirstSubmitAt: UInt64 = 1000
-private let roundTripSecondSubmitAt: UInt64 = 2000
+private let roundTripHelperURL = "https://helper-a.example"
+private let roundTripSubmitAt: UInt64 = 1000
 private let roundTripCreatedAt: Int64 = 1_000
 private let roundTripDiversifierByteCount = 11
 private let roundTripEligibleNoteValue: UInt64 = 13_000_000
 private let roundTripSQLiteSuccessCode = SQLITE_OK
 private let roundTripSQLiteDoneCode = SQLITE_DONE
 private let roundTripRoundParameter = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
-private let roundTripKeystoneSignature = [UInt8](repeating: 0x01, count: votingKeystoneSignatureByteCount)
+private let roundTripSpendAuthSignature = [UInt8](repeating: 0x01, count: votingSpendAuthSignatureByteCount)
 private let roundTripPcztSighash = [UInt8](repeating: 0x02, count: votingPcztSighashByteCount)
 private let roundTripRandomizedKey = [UInt8](repeating: 0x03, count: votingRandomizedKeyByteCount)
-private let roundTripShareNullifier = String(repeating: "dd", count: votingShareNullifierByteCount)
 private let roundTripVoteCommitment = [UInt8](repeating: 0xAA, count: votingFieldElementByteCount)
 
 final class VotingRustBackendTests: XCTestCase {
@@ -68,6 +76,7 @@ final class VotingRustBackendTests: XCTestCase {
             nullifier,
             "058ffd2e1ba7acaf97b167accfb4ec141b91c0ee2a0f552631851ac97ca1e61d"
         )
+        XCTAssertEqual(nullifier.count, votingShareNullifierHexCharacterCount)
     }
 
     func test_computeShareNullifier_throwsInvalidData_whenInputsAreNot32Bytes() {
@@ -90,7 +99,7 @@ final class VotingRustBackendTests: XCTestCase {
                 label
             ) { error in
                 guard case VotingRustBackendError.invalidData = error else {
-                    XCTFail("\(label): expected .invalidData, got \(error)")
+                    XCTFail("\(label): expected .invalidData, got \(error.localizedDescription)")
                     return
                 }
             }
@@ -103,7 +112,7 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         let path = makeTempDbPath()
 
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
         backend.close()
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: path))
@@ -113,12 +122,25 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         let path = makeTempDbPath()
 
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
         defer { backend.close() }
 
-        XCTAssertThrowsError(try backend.open(path: path)) { error in
+        XCTAssertThrowsError(try backend.open(path: path, networkId: roundTripNetworkId)) { error in
             guard case VotingRustBackendError.databaseAlreadyOpen = error else {
-                XCTFail("expected .databaseAlreadyOpen, got \(error)")
+                XCTFail("expected .databaseAlreadyOpen, got \(error.localizedDescription)")
+                return
+            }
+        }
+    }
+
+    func test_open_rejectsUnknownNetworkId() throws {
+        // The network is fixed when the handle is opened, so an unknown id is
+        // rejected once, here, rather than by each database-bound call.
+        let backend = VotingRustBackend()
+
+        XCTAssertThrowsError(try backend.open(path: makeTempDbPath(), networkId: 99)) { error in
+            guard case VotingRustBackendError.rustError = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
                 return
             }
         }
@@ -128,19 +150,19 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         let path = makeTempDbPath()
 
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
         backend.close()
         backend.close() // second close must not crash
 
         // Re-opening after close must succeed.
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
         backend.close()
     }
 
     func test_close_waitsForInFlightDatabaseOperationBeforeFreeingHandle() throws {
         let backend = VotingRustBackend()
         let path = makeTempDbPath()
-        try backend.open(path: path)
+        try backend.open(path: path, networkId: roundTripNetworkId)
 
         let operationStarted = XCTestExpectation(description: "operation started")
         let operationFinished = XCTestExpectation(description: "operation finished")
@@ -155,7 +177,7 @@ final class VotingRustBackendTests: XCTestCase {
                 }
                 operationFinished.fulfill()
             } catch {
-                XCTFail("unexpected error: \(error)")
+                XCTFail("unexpected error: \(error.localizedDescription)")
             }
         }
 
@@ -178,7 +200,7 @@ final class VotingRustBackendTests: XCTestCase {
 
         XCTAssertThrowsError(try backend.setWalletId("wallet-after-close")) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -190,7 +212,7 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         XCTAssertThrowsError(try backend.setWalletId("wallet")) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -200,7 +222,7 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         XCTAssertThrowsError(try backend.resetTreeClient()) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -209,82 +231,131 @@ final class VotingRustBackendTests: XCTestCase {
     func test_generateVanWitness_beforeOpen_throwsDatabaseNotOpen() {
         let backend = VotingRustBackend()
         XCTAssertThrowsError(
-            try backend.generateVanWitness(roundId: "round1", bundleIndex: 0, anchorHeight: 0)
+            try backend.generateVanWitness(roundId: hexRoundId(0x11), bundleIndex: 0, anchorHeight: 0)
         ) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
     }
 
+    // MARK: - Hotkey generation
+
+    func test_generateHotkey_producesIndependentSecretsAndDerivedAddress() throws {
+        let first = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+        let second = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+
+        XCTAssertFalse(first.storedSecret.isEmpty)
+        XCTAssertFalse(first.rawOrchardAddress.isEmpty)
+        XCTAssertNotEqual(
+            first.storedSecret,
+            second.storedSecret,
+            "hotkeys must be independently random"
+        )
+        XCTAssertEqual(first.addressIndex, second.addressIndex)
+    }
+
+    func test_generateHotkey_rejectsUnknownNetworkId() {
+        XCTAssertThrowsError(try VotingRustBackend.generateHotkey(networkId: 99)) { error in
+            guard case VotingRustBackendError.rustError = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
+                return
+            }
+        }
+    }
+
+    func test_generateHotkey_redactsSecretFromDescription() throws {
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+
+        XCTAssertEqual("\(hotkey)", "--redacted--")
+        XCTAssertEqual(String(describing: hotkey), "--redacted--")
+    }
+
     // MARK: - Foundation helpers
 
-    func test_decomposeWeight_returnsFixedWidthBinaryDecomposition() throws {
-        XCTAssertEqual(try VotingRustBackend.decomposeWeight(0).filter { $0 != 0 }, [])
-        XCTAssertEqual(try VotingRustBackend.decomposeWeight(1).filter { $0 != 0 }, [1])
-        XCTAssertEqual(try VotingRustBackend.decomposeWeight(8).filter { $0 != 0 }, [8])
-        XCTAssertEqual(
-            try VotingRustBackend.decomposeWeight(11).filter { $0 != 0 }.sorted(),
-            [1, 2, 8]
-        )
-    }
+    // The former `test_decomposeWeight_returnsFixedWidthBinaryDecomposition` is
+    // gone: `zcashlc_voting_decompose_weight` was removed with no replacement,
+    // because weight decomposition is now internal to `zcash_voting`'s bundling.
 
     func test_warmProvingCaches_doesNotThrow() throws {
         XCTAssertNoThrow(try VotingRustBackend.warmProvingCaches())
         XCTAssertNoThrow(try VotingRustBackend.warmProvingCaches())
     }
 
-    func test_generateDelegationInputs_rejectsShortSeeds() {
+    func test_generateDelegationInputs_rejectsShortSenderSeed() throws {
         let short = [UInt8](repeating: 0x01, count: votingMinSeedByteCount - 1)
-        let valid = [UInt8](repeating: 0x02, count: votingMinSeedByteCount)
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         XCTAssertThrowsError(
             try VotingRustBackend.generateDelegationInputs(
                 senderSeed: short,
-                hotkeySeed: valid,
-                networkId: 1,
+                hotkeyStoredSecret: hotkey.storedSecret,
+                networkId: roundTripNetworkId,
                 accountIndex: 0
             )
         ) { error in
             guard case VotingRustBackendError.invalidData = error else {
-                XCTFail("expected .invalidData, got \(error)")
+                XCTFail("expected .invalidData, got \(error.localizedDescription)")
                 return
             }
         }
     }
 
-    func test_generateDelegationInputs_withFvk_rejectsBadLengths() {
+    func test_generateDelegationInputs_rejectsMalformedStoredSecret() {
+        // The stored-secret length is `zcash_voting`'s invariant, so a malformed
+        // secret must surface as a Rust error rather than a Swift-side check.
+        XCTAssertThrowsError(
+            try VotingRustBackend.generateDelegationInputs(
+                senderSeed: [UInt8](repeating: 0x02, count: votingMinSeedByteCount),
+                hotkeyStoredSecret: [UInt8](repeating: 0x03, count: votingMinSeedByteCount),
+                networkId: roundTripNetworkId,
+                accountIndex: 0
+            )
+        ) { error in
+            guard case VotingRustBackendError.rustError = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
+                return
+            }
+        }
+    }
+
+    func test_generateDelegationInputs_withFvk_rejectsBadLengths() throws {
         struct Case {
             let fvk: [UInt8]
-            let hotkey: [UInt8]
             let fingerprint: [UInt8]
             let label: String
         }
 
-        let validHotkey = [UInt8](repeating: 0x02, count: votingMinSeedByteCount)
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let validFvk = [UInt8](repeating: 0x03, count: votingOrchardFvkByteCount)
         let validFp = [UInt8](repeating: 0x04, count: votingSeedFingerprintByteCount)
         let cases: [Case] = [
-            .init(fvk: [UInt8](repeating: 0, count: votingOrchardFvkByteCount - 1), hotkey: validHotkey, fingerprint: validFp, label: "fvk too short"),
-            .init(fvk: validFvk, hotkey: [UInt8](repeating: 0, count: votingMinSeedByteCount - 1), fingerprint: validFp, label: "hotkey too short"),
-            .init(fvk: validFvk, hotkey: validHotkey, fingerprint: [UInt8](repeating: 0, count: votingSeedFingerprintByteCount - 1), label: "fingerprint too short")
+            .init(
+                fvk: [UInt8](repeating: 0, count: votingOrchardFvkByteCount - 1),
+                fingerprint: validFp,
+                label: "fvk too short"
+            ),
+            .init(
+                fvk: validFvk,
+                fingerprint: [UInt8](repeating: 0, count: votingSeedFingerprintByteCount - 1),
+                label: "fingerprint too short"
+            )
         ]
         for testCase in cases {
             let fvk = testCase.fvk
-            let hotkey = testCase.hotkey
-            let fp = testCase.fingerprint
+            let fingerprint = testCase.fingerprint
             let label = testCase.label
             XCTAssertThrowsError(
                 try VotingRustBackend.generateDelegationInputs(
                     senderFvk: fvk,
-                    hotkeySeed: hotkey,
-                    networkId: 1,
-                    seedFingerprint: fp
+                    hotkeyStoredSecret: hotkey.storedSecret,
+                    networkId: roundTripNetworkId,
+                    seedFingerprint: fingerprint
                 ),
                 label
             ) { error in
                 guard case VotingRustBackendError.invalidData = error else {
-                    XCTFail("\(label): expected .invalidData, got \(error)")
+                    XCTFail("\(label): expected .invalidData, got \(error.localizedDescription)")
                     return
                 }
             }
@@ -293,10 +364,10 @@ final class VotingRustBackendTests: XCTestCase {
 
     func test_extractOrchardFvk_invalidUfvk_throwsRustError() {
         XCTAssertThrowsError(
-            try VotingRustBackend.extractOrchardFvk(ufvk: "not-a-ufvk", networkId: 1)
+            try VotingRustBackend.extractOrchardFvk(ufvk: "not-a-ufvk", networkId: roundTripNetworkId)
         ) { error in
             guard case VotingRustBackendError.rustError = error else {
-                XCTFail("expected .rustError, got \(error)")
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
                 return
             }
         }
@@ -307,7 +378,7 @@ final class VotingRustBackendTests: XCTestCase {
             try VotingRustBackend.extractPcztSighash(pczt: [])
         ) { error in
             guard case VotingRustBackendError.rustError = error else {
-                XCTFail("expected .rustError, got \(error)")
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
                 return
             }
         }
@@ -390,7 +461,7 @@ final class VotingRustBackendTests: XCTestCase {
                 testCase.label
             ) { error in
                 guard case VotingRustBackendError.invalidData = error else {
-                    XCTFail("\(testCase.label): expected .invalidData, got \(error)")
+                    XCTFail("\(testCase.label): expected .invalidData, got \(error.localizedDescription)")
                     return
                 }
             }
@@ -405,15 +476,15 @@ final class VotingRustBackendTests: XCTestCase {
 
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
-            roundId: "round-1",
+            roundId: hexRoundId(0x21),
             snapshotHeight: 1234,
             eaPublicKey: valid,
             ncRoot: valid,
             nullifierImtRoot: valid
         )
 
-        let state = try backend.getRoundState(roundId: "round-1")
-        XCTAssertEqual(state.roundId, "round-1")
+        let state = try backend.getRoundState(roundId: hexRoundId(0x21))
+        XCTAssertEqual(state.roundId, hexRoundId(0x21))
         XCTAssertEqual(state.snapshotHeight, 1234)
         XCTAssertEqual(state.phase, .initialized)
         XCTAssertNil(state.hotkeyAddress)
@@ -430,7 +501,7 @@ final class VotingRustBackendTests: XCTestCase {
 
         XCTAssertThrowsError(
             try backend.initRound(
-                roundId: "bad",
+                roundId: hexRoundId(0x41),
                 snapshotHeight: 1,
                 eaPublicKey: short,
                 ncRoot: valid,
@@ -438,7 +509,7 @@ final class VotingRustBackendTests: XCTestCase {
             )
         ) { error in
             guard case VotingRustBackendError.rustError = error else {
-                XCTFail("expected .rustError, got \(error)")
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
                 return
             }
         }
@@ -458,14 +529,14 @@ final class VotingRustBackendTests: XCTestCase {
 
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
-            roundId: "round-1",
+            roundId: hexRoundId(0x21),
             snapshotHeight: 42,
             eaPublicKey: valid,
             ncRoot: valid,
             nullifierImtRoot: valid
         )
         try backend.initRound(
-            roundId: "round-2",
+            roundId: hexRoundId(0x22),
             snapshotHeight: 43,
             eaPublicKey: valid,
             ncRoot: valid,
@@ -474,7 +545,7 @@ final class VotingRustBackendTests: XCTestCase {
 
         let rounds = try backend.listRounds()
         XCTAssertEqual(rounds.count, 2)
-        XCTAssertEqual(Set(rounds.map(\.roundId)), ["round-1", "round-2"])
+        XCTAssertEqual(Set(rounds.map(\.roundId)), [hexRoundId(0x21), hexRoundId(0x22)])
     }
 
     func test_getVotes_returnsEmpty_forFreshRound() throws {
@@ -483,14 +554,14 @@ final class VotingRustBackendTests: XCTestCase {
 
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
-            roundId: "round",
+            roundId: roundTripRoundId,
             snapshotHeight: 1,
             eaPublicKey: valid,
             ncRoot: valid,
             nullifierImtRoot: valid
         )
 
-        XCTAssertTrue(try backend.getVotes(roundId: "round").isEmpty)
+        XCTAssertTrue(try backend.getVotes(roundId: roundTripRoundId).isEmpty)
     }
 
     // MARK: - Recovery state
@@ -528,10 +599,10 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
 
         XCTAssertThrowsError(
-            try backend.storeDelegationTxHash(roundId: "missing", bundleIndex: 0, txHash: "abc")
+            try backend.storeDelegationTxHash(roundId: missingRoundId, bundleIndex: 0, txHash: "abc")
         ) { error in
             guard case VotingRustBackendError.rustError = error else {
-                XCTFail("expected .rustError, got \(error)")
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
                 return
             }
         }
@@ -574,7 +645,12 @@ final class VotingRustBackendTests: XCTestCase {
         )
     }
 
-    func test_commitmentBundle_roundTrips() throws {
+    // The former `test_commitmentBundle_roundTrips` is gone: the recovery bundle
+    // JSON is no longer supplied by the caller. `zcash_voting` writes it inside
+    // `vote::commit`, whose proof is too expensive for a unit test, so the only
+    // remaining caller-supplied half is the tree position covered below.
+
+    func test_recordVcPosition_succeedsForExistingVote() throws {
         let backend = try makeReadyBackend(walletId: roundTripWalletId)
         defer { backend.close() }
 
@@ -586,6 +662,17 @@ final class VotingRustBackendTests: XCTestCase {
             proposalId: roundTripProposalId
         )
 
+        XCTAssertNoThrow(
+            try backend.recordVcPosition(
+                roundId: roundTripRoundId,
+                bundleIndex: roundTripBundleIndex,
+                proposalId: roundTripProposalId,
+                voteCommitmentTreePosition: roundTripVoteCommitmentTreePosition
+            )
+        )
+
+        // The bundle JSON is only written by `vote::commit`, so a vote that has
+        // a position but no committed bundle still reads back as absent.
         XCTAssertNil(
             try backend.getCommitmentBundle(
                 roundId: roundTripRoundId,
@@ -593,24 +680,45 @@ final class VotingRustBackendTests: XCTestCase {
                 proposalId: roundTripProposalId
             )
         )
+    }
 
-        try backend.storeCommitmentBundle(
-            roundId: roundTripRoundId,
-            bundleIndex: roundTripBundleIndex,
-            proposalId: roundTripProposalId,
-            bundleJson: roundTripCommitmentBundleJson,
-            voteCommitmentTreePosition: roundTripVoteCommitmentTreePosition
-        )
+    func test_recordVcPosition_throwsRustError_whenVoteMissing() throws {
+        let backend = try makeReadyBackend()
+        defer { backend.close() }
 
-        let stored = try XCTUnwrap(
-            backend.getCommitmentBundle(
+        try createRoundWithBundle(backend, roundId: roundTripRoundId)
+
+        XCTAssertThrowsError(
+            try backend.recordVcPosition(
                 roundId: roundTripRoundId,
                 bundleIndex: roundTripBundleIndex,
-                proposalId: roundTripProposalId
+                proposalId: roundTripProposalId,
+                voteCommitmentTreePosition: roundTripVoteCommitmentTreePosition
             )
-        )
-        XCTAssertEqual(stored.bundleJson, roundTripCommitmentBundleJson)
-        XCTAssertEqual(stored.voteCommitmentTreePosition, roundTripVoteCommitmentTreePosition)
+        ) { error in
+            guard case VotingRustBackendError.rustError(let message) = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
+                return
+            }
+            XCTAssertTrue(message.contains("record_vc_position failed"), "unexpected message: \(message)")
+        }
+    }
+
+    func test_recordVcPosition_beforeOpen_throwsDatabaseNotOpen() {
+        let backend = VotingRustBackend()
+        XCTAssertThrowsError(
+            try backend.recordVcPosition(
+                roundId: hexRoundId(0x31),
+                bundleIndex: 0,
+                proposalId: 0,
+                voteCommitmentTreePosition: 0
+            )
+        ) { error in
+            guard case VotingRustBackendError.databaseNotOpen = error else {
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
+                return
+            }
+        }
     }
 
     func test_keystoneSignature_roundTrips() throws {
@@ -622,7 +730,7 @@ final class VotingRustBackendTests: XCTestCase {
         try backend.storeKeystoneSignature(
             roundId: roundTripRoundId,
             bundleIndex: roundTripBundleIndex,
-            sig: roundTripKeystoneSignature,
+            sig: roundTripSpendAuthSignature,
             sighash: roundTripPcztSighash,
             randomizedKey: roundTripRandomizedKey
         )
@@ -632,7 +740,7 @@ final class VotingRustBackendTests: XCTestCase {
             [
                 VotingKeystoneSignatureRecord(
                     bundleIndex: roundTripBundleIndex,
-                    sig: roundTripKeystoneSignature,
+                    sig: roundTripSpendAuthSignature,
                     sighash: roundTripPcztSighash,
                     randomizedKey: roundTripRandomizedKey
                 )
@@ -646,7 +754,7 @@ final class VotingRustBackendTests: XCTestCase {
 
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
-            roundId: "round",
+            roundId: roundTripRoundId,
             snapshotHeight: 1,
             eaPublicKey: valid,
             ncRoot: valid,
@@ -660,19 +768,34 @@ final class VotingRustBackendTests: XCTestCase {
             let label: String
         }
 
-        let validSig = [UInt8](repeating: 0x01, count: votingKeystoneSignatureByteCount)
+        let validSig = [UInt8](repeating: 0x01, count: votingSpendAuthSignatureByteCount)
         let validSighash = [UInt8](repeating: 0x02, count: votingPcztSighashByteCount)
         let validRk = [UInt8](repeating: 0x03, count: votingRandomizedKeyByteCount)
 
         let cases: [Case] = [
-            .init(sig: [UInt8](repeating: 0, count: votingKeystoneSignatureByteCount - 1), sighash: validSighash, randomizedKey: validRk, label: "sig too short"),
-            .init(sig: validSig, sighash: [UInt8](repeating: 0, count: votingPcztSighashByteCount - 1), randomizedKey: validRk, label: "sighash too short"),
-            .init(sig: validSig, sighash: validSighash, randomizedKey: [UInt8](repeating: 0, count: votingRandomizedKeyByteCount - 1), label: "rk too short")
+            .init(
+                sig: [UInt8](repeating: 0, count: votingSpendAuthSignatureByteCount - 1),
+                sighash: validSighash,
+                randomizedKey: validRk,
+                label: "sig too short"
+            ),
+            .init(
+                sig: validSig,
+                sighash: [UInt8](repeating: 0, count: votingPcztSighashByteCount - 1),
+                randomizedKey: validRk,
+                label: "sighash too short"
+            ),
+            .init(
+                sig: validSig,
+                sighash: validSighash,
+                randomizedKey: [UInt8](repeating: 0, count: votingRandomizedKeyByteCount - 1),
+                label: "rk too short"
+            )
         ]
         for testCase in cases {
             XCTAssertThrowsError(
                 try backend.storeKeystoneSignature(
-                    roundId: "round",
+                    roundId: roundTripRoundId,
                     bundleIndex: 0,
                     sig: testCase.sig,
                     sighash: testCase.sighash,
@@ -681,7 +804,7 @@ final class VotingRustBackendTests: XCTestCase {
                 testCase.label
             ) { error in
                 guard case VotingRustBackendError.invalidData = error else {
-                    XCTFail("\(testCase.label): expected .invalidData, got \(error)")
+                    XCTFail("\(testCase.label): expected .invalidData, got \(error.localizedDescription)")
                     return
                 }
             }
@@ -692,93 +815,63 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
-        XCTAssertTrue(try backend.getKeystoneSignatures(roundId: "missing").isEmpty)
+        XCTAssertTrue(try backend.getKeystoneSignatures(roundId: missingRoundId).isEmpty)
     }
 
     func test_clearRecoveryState_isNoop_onMissingRound() throws {
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
-        XCTAssertNoThrow(try backend.clearRecoveryState(roundId: "missing"))
+        XCTAssertNoThrow(try backend.clearRecoveryState(roundId: missingRoundId))
     }
 
     // MARK: - Share delegation tracking
 
-    func test_shareDelegationLifecycle_roundTripsHexNullifier() throws {
+    // The former `test_shareDelegationLifecycle_roundTripsHexNullifier` and
+    // `test_recordShareDelegation_rejectsInvalidNullifierLength` are gone: the
+    // share nullifier is no longer a caller-supplied argument. `zcash_voting`
+    // derives it from the committed vote's recovery bundle, so recording a share
+    // now requires a real `vote::commit` and its proof — too expensive for a unit
+    // test. Only the missing-vote rejection below remains observable offline.
+
+    func test_recordShareDelegation_throwsRustError_whenVoteNotCommitted() throws {
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
         try createRoundWithBundle(backend, roundId: roundTripRoundId)
 
-        try backend.recordShareDelegation(
-            roundId: roundTripRoundId,
-            bundleIndex: roundTripBundleIndex,
-            proposalId: roundTripProposalId,
-            shareIndex: roundTripShareIndex0,
-            sentToURLs: [roundTripHelperAURL],
-            nullifier: roundTripShareNullifier,
-            submitAt: roundTripFirstSubmitAt
-        )
-        try backend.recordShareDelegation(
-            roundId: roundTripRoundId,
-            bundleIndex: roundTripBundleIndex,
-            proposalId: roundTripProposalId,
-            shareIndex: roundTripShareIndex1,
-            sentToURLs: [roundTripHelperBURL],
-            nullifier: roundTripShareNullifier,
-            submitAt: roundTripSecondSubmitAt
-        )
-
-        let all = try backend.getShareDelegations(roundId: roundTripRoundId)
-        XCTAssertEqual(all.count, 2)
-
-        let share0 = try XCTUnwrap(all.first { $0.shareIndex == roundTripShareIndex0 })
-        XCTAssertEqual(share0.roundId, roundTripRoundId)
-        XCTAssertEqual(share0.bundleIndex, roundTripBundleIndex)
-        XCTAssertEqual(share0.proposalId, roundTripProposalId)
-        XCTAssertEqual(share0.sentToURLs, [roundTripHelperAURL])
-        XCTAssertEqual(share0.nullifier, roundTripShareNullifier)
-        XCTAssertFalse(share0.confirmed)
-        XCTAssertEqual(share0.submitAt, roundTripFirstSubmitAt)
-
-        XCTAssertEqual(try backend.getUnconfirmedDelegations(roundId: roundTripRoundId).count, 2)
-
-        try backend.markShareConfirmed(
-            roundId: roundTripRoundId,
-            bundleIndex: roundTripBundleIndex,
-            proposalId: roundTripProposalId,
-            shareIndex: roundTripShareIndex0
-        )
-
-        let confirmedShare = try XCTUnwrap(
-            backend.getShareDelegations(roundId: roundTripRoundId)
-                .first { $0.shareIndex == roundTripShareIndex0 }
-        )
-        XCTAssertTrue(confirmedShare.confirmed)
-
-        let unconfirmed = try backend.getUnconfirmedDelegations(roundId: roundTripRoundId)
-        XCTAssertEqual(unconfirmed.count, 1)
-        XCTAssertEqual(unconfirmed[0].shareIndex, roundTripShareIndex1)
-    }
-
-    func test_recordShareDelegation_rejectsInvalidNullifierLength() throws {
-        let backend = try makeReadyBackend()
-        defer { backend.close() }
-
-        let bad = String(repeating: "aa", count: votingShareNullifierByteCount - 1)
         XCTAssertThrowsError(
             try backend.recordShareDelegation(
-                roundId: "round",
+                roundId: roundTripRoundId,
+                bundleIndex: roundTripBundleIndex,
+                proposalId: roundTripProposalId,
+                shareIndex: roundTripShareIndex,
+                sentToURLs: [roundTripHelperURL],
+                submitAt: roundTripSubmitAt
+            )
+        ) { error in
+            guard case VotingRustBackendError.rustError(let message) = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
+                return
+            }
+            XCTAssertTrue(message.contains("share::record failed"), "unexpected message: \(message)")
+        }
+    }
+
+    func test_recordShareDelegation_beforeOpen_throwsDatabaseNotOpen() {
+        let backend = VotingRustBackend()
+        XCTAssertThrowsError(
+            try backend.recordShareDelegation(
+                roundId: hexRoundId(0x31),
                 bundleIndex: 0,
                 proposalId: 0,
                 shareIndex: 0,
-                sentToURLs: ["https://helper.example"],
-                nullifier: bad,
+                sentToURLs: [roundTripHelperURL],
                 submitAt: 0
             )
         ) { error in
-            guard case VotingRustBackendError.invalidData = error else {
-                XCTFail("expected .invalidData, got \(error)")
+            guard case VotingRustBackendError.databaseNotOpen = error else {
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -788,83 +881,91 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
-        XCTAssertTrue(try backend.getShareDelegations(roundId: "missing").isEmpty)
-        XCTAssertTrue(try backend.getUnconfirmedDelegations(roundId: "missing").isEmpty)
+        XCTAssertTrue(try backend.getShareDelegations(roundId: missingRoundId).isEmpty)
+        XCTAssertTrue(try backend.getUnconfirmedDelegations(roundId: missingRoundId).isEmpty)
     }
 
     // MARK: - Delegation workflow
 
-    func test_setupBundles_returnsZero_forEmptyNotes() throws {
+    /// An empty note set used to produce an empty bundle layout. The canonical
+    /// bundling policy now rejects it instead, so a caller with nothing to vote
+    /// with learns that directly rather than receiving a zero-weight layout that
+    /// only fails later in the delegation flow.
+    func test_setupBundles_rejectsEmptyNotes() throws {
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
         let valid = [UInt8](repeating: 0x07, count: votingFieldElementByteCount)
         try backend.initRound(
-            roundId: "round",
+            roundId: roundTripRoundId,
             snapshotHeight: 1,
             eaPublicKey: valid,
             ncRoot: valid,
             nullifierImtRoot: valid
         )
 
-        let result = try backend.setupBundles(roundId: "round", notes: [])
-        XCTAssertEqual(result.bundleCount, 0)
-        XCTAssertEqual(result.eligibleWeight, 0)
-        XCTAssertEqual(try backend.getBundleCount(roundId: "round"), 0)
+        XCTAssertThrowsError(try backend.setupBundles(roundId: roundTripRoundId, notes: [])) { error in
+            guard case VotingRustBackendError.rustError = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
+                return
+            }
+        }
+        XCTAssertEqual(try backend.getBundleCount(roundId: roundTripRoundId), 0)
     }
 
     func test_buildPczt_rejectsInvalidSeedFingerprintLength() throws {
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let params = VotingBuildPcztParams(
-            roundId: "round",
+            roundId: roundTripRoundId,
             bundleIndex: 0,
             notes: [],
-            fvk: [UInt8](repeating: 0, count: votingOrchardFvkByteCount),
-            hotkeyRawAddress: [UInt8](repeating: 0, count: votingHotkeyRawAddressByteCount),
-            consensusBranchId: 0,
-            coinType: 0,
-            seedFingerprint: [UInt8](repeating: 0, count: votingSeedFingerprintByteCount - 1),
-            accountIndex: 0,
-            roundName: "Round",
-            addressIndex: 0
+            keys: VotingDelegationKeyInputs(
+                fvk: [UInt8](repeating: 0, count: votingOrchardFvkByteCount),
+                hotkeyStoredSecret: hotkey.storedSecret,
+                seedFingerprint: [UInt8](repeating: 0, count: votingSeedFingerprintByteCount - 1),
+                accountIndex: 0,
+                roundName: "Round"
+            ),
+            consensusBranchId: 0
         )
         XCTAssertThrowsError(try backend.buildPczt(params)) { error in
             guard case VotingRustBackendError.invalidData = error else {
-                XCTFail("expected .invalidData, got \(error)")
+                XCTFail("expected .invalidData, got \(error.localizedDescription)")
                 return
             }
         }
     }
 
-    func test_getDelegationSubmissionWithKeystoneSig_rejectsBadLengths() throws {
+    func test_getDelegationSubmission_rejectsBadLengths() throws {
         let backend = try makeReadyBackend()
         defer { backend.close() }
 
         XCTAssertThrowsError(
             try backend.getDelegationSubmission(
-                roundId: "round",
+                roundId: roundTripRoundId,
                 bundleIndex: 0,
-                keystoneSig: [UInt8](repeating: 0, count: votingKeystoneSignatureByteCount - 1),
+                signature: [UInt8](repeating: 0, count: votingSpendAuthSignatureByteCount - 1),
                 sighash: [UInt8](repeating: 0, count: votingPcztSighashByteCount)
             )
         ) { error in
             guard case VotingRustBackendError.invalidData = error else {
-                XCTFail("expected .invalidData, got \(error)")
+                XCTFail("expected .invalidData, got \(error.localizedDescription)")
                 return
             }
         }
         XCTAssertThrowsError(
             try backend.getDelegationSubmission(
-                roundId: "round",
+                roundId: roundTripRoundId,
                 bundleIndex: 0,
-                keystoneSig: [UInt8](repeating: 0, count: votingKeystoneSignatureByteCount),
+                signature: [UInt8](repeating: 0, count: votingSpendAuthSignatureByteCount),
                 sighash: [UInt8](repeating: 0, count: votingPcztSighashByteCount - 1)
             )
         ) { error in
             guard case VotingRustBackendError.invalidData = error else {
-                XCTFail("expected .invalidData, got \(error)")
+                XCTFail("expected .invalidData, got \(error.localizedDescription)")
                 return
             }
         }
@@ -877,7 +978,7 @@ final class VotingRustBackendTests: XCTestCase {
         let valid = [UInt8](repeating: 0, count: votingFieldElementByteCount)
         XCTAssertThrowsError(
             try backend.initRound(
-                roundId: "r",
+                roundId: hexRoundId(0x31),
                 snapshotHeight: 0,
                 eaPublicKey: valid,
                 ncRoot: valid,
@@ -885,7 +986,7 @@ final class VotingRustBackendTests: XCTestCase {
             )
         ) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -894,10 +995,10 @@ final class VotingRustBackendTests: XCTestCase {
     func test_syncVoteTree_beforeOpen_throwsDatabaseNotOpen() {
         let backend = VotingRustBackend()
         XCTAssertThrowsError(
-            try backend.syncVoteTree(roundId: "round1", nodeUrl: "http://localhost")
+            try backend.syncVoteTree(roundId: hexRoundId(0x11), nodeUrl: "http://localhost")
         ) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -907,7 +1008,7 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         XCTAssertThrowsError(try backend.listRounds()) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -915,9 +1016,9 @@ final class VotingRustBackendTests: XCTestCase {
 
     func test_getRoundState_beforeOpen_throwsDatabaseNotOpen() {
         let backend = VotingRustBackend()
-        XCTAssertThrowsError(try backend.getRoundState(roundId: "r")) { error in
+        XCTAssertThrowsError(try backend.getRoundState(roundId: hexRoundId(0x31))) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -925,9 +1026,9 @@ final class VotingRustBackendTests: XCTestCase {
 
     func test_setupBundles_beforeOpen_throwsDatabaseNotOpen() {
         let backend = VotingRustBackend()
-        XCTAssertThrowsError(try backend.setupBundles(roundId: "r", notes: [])) { error in
+        XCTAssertThrowsError(try backend.setupBundles(roundId: hexRoundId(0x31), notes: [])) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -936,10 +1037,10 @@ final class VotingRustBackendTests: XCTestCase {
     func test_storeVanPosition_beforeOpen_throwsDatabaseNotOpen() {
         let backend = VotingRustBackend()
         XCTAssertThrowsError(
-            try backend.storeVanPosition(roundId: "r", bundleIndex: 0, position: 0)
+            try backend.storeVanPosition(roundId: hexRoundId(0x31), bundleIndex: 0, position: 0)
         ) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -949,22 +1050,21 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         do {
             _ = try await backend.precomputeDelegationPir(
-                roundId: "round1",
+                roundId: hexRoundId(0x11),
                 bundleIndex: 0,
                 notes: [],
                 pirEndpoints: ["https://stub"],
                 expectedSnapshotHeight: 0,
-                networkId: 1,
                 pirResolver: PirSnapshotResolver(probe: FailingProbe())
             )
             XCTFail("expected .databaseNotOpen")
         } catch let error as VotingRustBackendError {
             guard case .databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         } catch {
-            XCTFail("unexpected error: \(error)")
+            XCTFail("unexpected error: \(error.localizedDescription)")
         }
     }
 
@@ -972,15 +1072,15 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         XCTAssertThrowsError(
             try backend.storeKeystoneSignature(
-                roundId: "r",
+                roundId: hexRoundId(0x31),
                 bundleIndex: 0,
-                sig: [UInt8](repeating: 0, count: votingKeystoneSignatureByteCount),
+                sig: [UInt8](repeating: 0, count: votingSpendAuthSignatureByteCount),
                 sighash: [UInt8](repeating: 0, count: votingPcztSighashByteCount),
                 randomizedKey: [UInt8](repeating: 0, count: votingRandomizedKeyByteCount)
             )
         ) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -990,41 +1090,63 @@ final class VotingRustBackendTests: XCTestCase {
         let backend = VotingRustBackend()
         XCTAssertThrowsError(
             try backend.generateNoteWitnesses(
-                roundId: "round1",
+                roundId: hexRoundId(0x11),
                 bundleIndex: 0,
                 walletDbPath: "/tmp/wallet.sqlite",
                 notes: [],
-                networkId: 1
+                networkId: roundTripNetworkId
             )
         ) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
     }
 
-    func test_buildAndProveDelegation_beforeOpen_throwsDatabaseNotOpen() async {
+    func test_buildAndProveDelegation_beforeOpen_throwsDatabaseNotOpen() async throws {
         let backend = VotingRustBackend()
+        let params = try makeDelegationProofParams()
         do {
             _ = try await backend.buildAndProveDelegation(
-                roundId: "r",
-                bundleIndex: 0,
-                notes: [],
-                hotkeyRawAddress: [UInt8](repeating: 0, count: votingHotkeyRawAddressByteCount),
+                params,
                 pirEndpoints: ["https://stub"],
                 expectedSnapshotHeight: 0,
-                networkId: 1,
                 pirResolver: PirSnapshotResolver(probe: FailingProbe())
             )
             XCTFail("expected .databaseNotOpen")
         } catch let error as VotingRustBackendError {
             guard case .databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         } catch {
-            XCTFail("unexpected error: \(error)")
+            XCTFail("unexpected error: \(error.localizedDescription)")
+        }
+    }
+
+    func test_buildAndProveDelegation_rejectsInvalidSeedFingerprintLength() async throws {
+        let backend = try makeOpenBackend()
+        defer { backend.close() }
+
+        let params = try makeDelegationProofParams(
+            seedFingerprint: [UInt8](repeating: 0, count: votingSeedFingerprintByteCount - 1)
+        )
+        do {
+            _ = try await backend.buildAndProveDelegation(
+                params,
+                pirEndpoints: ["https://stub"],
+                expectedSnapshotHeight: 0,
+                pirResolver: PirSnapshotResolver(probe: FailingProbe())
+            )
+            XCTFail("expected .invalidData")
+        } catch let error as VotingRustBackendError {
+            guard case .invalidData = error else {
+                XCTFail("expected .invalidData, got \(error.localizedDescription)")
+                return
+            }
+        } catch {
+            XCTFail("unexpected error: \(error.localizedDescription)")
         }
     }
 
@@ -1034,7 +1156,7 @@ final class VotingRustBackendTests: XCTestCase {
 
         XCTAssertThrowsError(
             try backend.generateNoteWitnesses(
-                roundId: "round1",
+                roundId: hexRoundId(0x11),
                 bundleIndex: 0,
                 walletDbPath: "/tmp/nonexistent-wallet.sqlite",
                 notes: [],
@@ -1042,187 +1164,94 @@ final class VotingRustBackendTests: XCTestCase {
             )
         ) { error in
             guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
                 return
             }
             XCTAssertTrue(message.contains("Invalid network type"), "unexpected message: \(message)")
         }
     }
 
-    func test_encryptShares_beforeOpen_throwsDatabaseNotOpen() {
+    // MARK: - commitVote
+
+    func test_commitVote_beforeOpen_throwsDatabaseNotOpen() async throws {
         let backend = VotingRustBackend()
-        XCTAssertThrowsError(try backend.encryptShares(roundId: "round1", shares: [1])) { error in
-            guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
-                return
-            }
-        }
-    }
-
-    func test_encryptShares_afterOpen_propagatesRustError() throws {
-        let backend = try makeOpenBackend()
-        defer { backend.close() }
-
-        XCTAssertThrowsError(try backend.encryptShares(roundId: "missing-round", shares: [1, 2])) { error in
-            guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-            XCTAssertTrue(message.contains("encrypt_shares failed"), "unexpected message: \(message)")
-        }
-    }
-
-    func test_buildVoteCommitment_beforeOpen_throwsDatabaseNotOpen() async {
-        let backend = VotingRustBackend()
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
 
         do {
-            _ = try await backend.buildVoteCommitment(
-                roundId: "round1",
+            _ = try await backend.commitVote(
+                roundId: hexRoundId(0x11),
                 bundleIndex: 0,
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-                networkId: 1,
+                hotkeyStoredSecret: hotkey.storedSecret,
                 proposalId: 0,
                 choice: 0,
                 numOptions: 2,
-                vanWitness: VotingVanWitness(
-                    authPath: [[UInt8](repeating: 1, count: votingFieldElementByteCount)],
-                    position: 0,
-                    anchorHeight: 0
-                ),
+                voteCommitmentTreePosition: 0,
+                vanWitness: makeVanWitness(),
                 singleShare: false
             )
             XCTFail("expected .databaseNotOpen")
         } catch let error as VotingRustBackendError {
             guard case .databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         } catch {
-            XCTFail("unexpected error: \(error)")
+            XCTFail("unexpected error: \(error.localizedDescription)")
         }
     }
 
-    func test_buildVoteCommitment_afterOpen_rejectsShortSeedAndDoesNotReportProgress() async throws {
+    func test_commitVote_afterOpen_rejectsMalformedStoredSecretBeforeReportingProgress() async throws {
         let backend = try makeOpenBackend()
         defer { backend.close() }
-        let progressReported = expectation(description: "progress must not be reported before seed validation")
+        let progressReported = expectation(
+            description: "progress must not be reported before the hotkey is reconstructed"
+        )
         progressReported.isInverted = true
 
         do {
-            _ = try await backend.buildVoteCommitment(
-                roundId: "round1",
+            _ = try await backend.commitVote(
+                roundId: hexRoundId(0x11),
                 bundleIndex: 0,
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount - 1),
-                networkId: 1,
+                hotkeyStoredSecret: [UInt8](repeating: 1, count: votingFieldElementByteCount),
                 proposalId: 0,
                 choice: 0,
                 numOptions: 2,
-                vanWitness: VotingVanWitness(
-                    authPath: [],
-                    position: 0,
-                    anchorHeight: 0
-                ),
+                voteCommitmentTreePosition: 0,
+                vanWitness: makeVanWitness(),
                 singleShare: false,
                 progress: { _ in progressReported.fulfill() }
             )
             XCTFail("expected .rustError")
         } catch let error as VotingRustBackendError {
             guard case .rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
                 return
             }
-            XCTAssertTrue(message.contains("hotkey_seed must be at least"), "unexpected message: \(message)")
+            XCTAssertTrue(
+                message.contains("failed to reconstruct voting hotkey"),
+                "unexpected message: \(message)"
+            )
         } catch {
-            XCTFail("unexpected error: \(error)")
+            XCTFail("unexpected error: \(error.localizedDescription)")
         }
 
         await fulfillment(of: [progressReported], timeout: 0.1)
     }
 
-    func test_buildSharePayloads_beforeOpen_throwsDatabaseNotOpen() {
-        let backend = VotingRustBackend()
-        XCTAssertThrowsError(
-            try backend.buildSharePayloads(
-                commitment: makeVoteCommitmentBundle(),
-                voteDecision: 0,
-                numOptions: 2,
-                voteCommitmentTreePosition: 0,
-                singleShare: false
-            )
-        ) { error in
-            guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
-                return
-            }
-        }
-    }
-
-    func test_buildSharePayloads_afterOpen_rejectsCommitmentWithoutEncryptedShares() throws {
-        let backend = try makeOpenBackend()
-        defer { backend.close() }
-
-        XCTAssertThrowsError(
-            try backend.buildSharePayloads(
-                commitment: makeVoteCommitmentBundle(encShares: []),
-                voteDecision: 0,
-                numOptions: 2,
-                voteCommitmentTreePosition: 0,
-                singleShare: false
-            )
-        ) { error in
-            guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-            XCTAssertTrue(message.contains("enc_shares must not be empty"), "unexpected message: \(message)")
-        }
-    }
-
-    func test_voteSubmissionHelpers_afterOpen_buildPayloadsAndSignWithSyntheticCommitment() throws {
-        let backend = try makeOpenBackend()
-        defer { backend.close() }
-        let commitment = makeVoteCommitmentBundle(proposalId: 7)
-
-        let payloads = try backend.buildSharePayloads(
-            commitment: commitment,
-            voteDecision: 1,
-            numOptions: 2,
-            voteCommitmentTreePosition: 42,
-            singleShare: false
-        )
-
-        XCTAssertEqual(payloads.count, commitment.encShares.count)
-        XCTAssertEqual(payloads[0].sharesHash, commitment.sharesHash)
-        XCTAssertEqual(payloads[0].proposalId, commitment.proposalId)
-        XCTAssertEqual(payloads[0].voteDecision, 1)
-        XCTAssertEqual(payloads[0].treePosition, 42)
-        XCTAssertEqual(payloads[0].encShare.shareIndex, commitment.encShares[0].shareIndex)
-        XCTAssertEqual(payloads[0].allEncShares.count, commitment.encShares.count)
-        XCTAssertEqual(payloads[0].shareComms, commitment.shareComms)
-        XCTAssertEqual(payloads[0].primaryBlind, commitment.shareBlinds[0])
-
-        let nullifier = try VotingRustBackend.computeShareNullifier(
-            voteCommitment: commitment.voteCommitment,
-            shareIndex: payloads[0].encShare.shareIndex,
-            primaryBlind: payloads[0].primaryBlind
-        )
-        XCTAssertEqual(nullifier.count, votingShareNullifierHexCharacterCount)
-
-        let signature = try VotingRustBackend.signCastVote(
-            hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-            networkId: 1,
-            commitment: commitment
-        )
-        XCTAssertFalse(signature.voteAuthSig.isEmpty)
-    }
+    // MARK: - markVoteSubmitted
 
     func test_markVoteSubmitted_beforeOpen_throwsDatabaseNotOpen() {
         let backend = VotingRustBackend()
         XCTAssertThrowsError(
-            try backend.markVoteSubmitted(roundId: "round1", bundleIndex: 0, proposalId: 0)
+            try backend.markVoteSubmitted(
+                roundId: hexRoundId(0x11),
+                bundleIndex: 0,
+                proposalId: 0,
+                txHash: roundTripVoteTxHash
+            )
         ) { error in
             guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error)")
+                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
                 return
             }
         }
@@ -1233,110 +1262,29 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
 
         XCTAssertThrowsError(
-            try backend.markVoteSubmitted(roundId: "missing-round", bundleIndex: 0, proposalId: 0)
-        ) { error in
-            assertNoVoteFound(error)
-        }
-    }
-
-    func test_signCastVote_invalidCommitment_throwsRustError() {
-        XCTAssertThrowsError(
-            try VotingRustBackend.signCastVote(
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-                networkId: 1,
-                commitment: makeVoteCommitmentBundle(voteRoundId: "too-short")
-            )
-        ) { error in
-            guard case VotingRustBackendError.rustError = error else {
-                XCTFail("expected .rustError, got \(error)")
-                return
-            }
-        }
-    }
-
-    func test_signCastVote_rejectsShortSeed() {
-        XCTAssertThrowsError(
-            try VotingRustBackend.signCastVote(
-                hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount - 1),
-                networkId: 1,
-                commitment: makeVoteCommitmentBundle()
+            try backend.markVoteSubmitted(
+                roundId: missingRoundId,
+                bundleIndex: 0,
+                proposalId: 0,
+                txHash: roundTripVoteTxHash
             )
         ) { error in
             guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error)")
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
                 return
             }
-            XCTAssertTrue(message.contains("hotkey_seed must be at least"), "unexpected message: \(message)")
-        }
-    }
-
-    func test_signCastVote_rejectsWrongSizedCanonicalFields() {
-        let short = [UInt8](repeating: 1, count: votingFieldElementByteCount - 1)
-
-        let cases: [(String, VotingVoteCommitmentBundle, String)] = [
-            (
-                "rVpkBytes",
-                makeVoteCommitmentBundle(rVpkBytes: short),
-                "r_vpk_bytes must be 32 bytes"
-            ),
-            (
-                "vanNullifier",
-                makeVoteCommitmentBundle(vanNullifier: short),
-                "van_nullifier must be 32 bytes"
-            ),
-            (
-                "voteAuthorityNoteNew",
-                makeVoteCommitmentBundle(voteAuthorityNoteNew: short),
-                "vote_authority_note_new must be 32 bytes"
-            ),
-            (
-                "voteCommitment",
-                makeVoteCommitmentBundle(voteCommitment: short),
-                "vote_commitment must be 32 bytes"
-            ),
-            (
-                "alphaV",
-                makeVoteCommitmentBundle(alphaV: short),
-                "alpha_v must be 32 bytes"
+            XCTAssertTrue(
+                message.contains("record_submission failed"),
+                "unexpected message: \(message)"
             )
-        ]
-
-        for (label, commitment, expectedMessage) in cases {
-            XCTAssertThrowsError(
-                try VotingRustBackend.signCastVote(
-                    hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-                    networkId: 1,
-                    commitment: commitment
-                ),
-                label
-            ) { error in
-                guard case VotingRustBackendError.rustError(let message) = error else {
-                    XCTFail("\(label): expected .rustError, got \(error)")
-                    return
-                }
-                XCTAssertTrue(
-                    message.contains(expectedMessage),
-                    "\(label): unexpected message: \(message)"
-                )
-            }
         }
-    }
-
-    func test_signCastVote_validFixture_returnsSignature() throws {
-        let signature = try VotingRustBackend.signCastVote(
-            hotkeySeed: [UInt8](repeating: 1, count: votingMinSeedByteCount),
-            networkId: 1,
-            commitment: makeVoteCommitmentBundle()
-        )
-
-        XCTAssertFalse(signature.voteAuthSig.isEmpty)
     }
 
     // MARK: - setWalletId
 
     func test_setWalletId_succeedsAfterOpen() throws {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         defer { backend.close() }
 
         XCTAssertNoThrow(try backend.setWalletId("wallet-id-1"))
@@ -1348,7 +1296,7 @@ final class VotingRustBackendTests: XCTestCase {
 
     func test_resetTreeClient_succeedsAfterOpen_withEmptyRoundId() throws {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         defer { backend.close() }
 
         // Empty round ID resets all in-memory tree clients; safe to call on a
@@ -1360,23 +1308,59 @@ final class VotingRustBackendTests: XCTestCase {
 
     func test_precomputeDelegationPir_emptyEndpoints_throwsResolverError() async throws {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         defer { backend.close() }
 
         do {
             _ = try await backend.precomputeDelegationPir(
-                roundId: "round1",
+                roundId: hexRoundId(0x11),
                 bundleIndex: 0,
                 notes: [],
                 pirEndpoints: [],
-                expectedSnapshotHeight: 0,
-                networkId: 1
+                expectedSnapshotHeight: 0
             )
             XCTFail("expected PirSnapshotResolverError.noEndpointsConfigured")
         } catch PirSnapshotResolverError.noEndpointsConfigured {
             // expected
         } catch {
-            XCTFail("unexpected error: \(error)")
+            XCTFail("unexpected error: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - precomputeDelegationPir layout gating
+
+    /// Pins that the `.unknown` sentinel layout (`polyLen` 0) fails closed
+    /// inside `zcash_voting` at the FFI boundary: the crate rejects the layout
+    /// locally, before issuing any network request. The probe stub satisfies
+    /// snapshot resolution offline, so the failure can only be the layout
+    /// rejection, not a resolver or transport error.
+    func test_precomputeDelegationPir_unknownLayout_failsClosedThroughFFI() async throws {
+        let backend = VotingRustBackend()
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
+        defer { backend.close() }
+
+        do {
+            _ = try await backend.precomputeDelegationPir(
+                roundId: hexRoundId(0x11),
+                bundleIndex: 0,
+                notes: [],
+                pirEndpoints: ["https://stub"],
+                expectedSnapshotHeight: 0,
+                pirLayout: .unknown,
+                pirResolver: PirSnapshotResolver(probe: MatchingProbe())
+            )
+            XCTFail("expected .rustError for the unknown PIR layout")
+        } catch let error as VotingRustBackendError {
+            guard case .rustError(let message) = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
+                return
+            }
+            XCTAssertTrue(
+                message.contains("pir_layout is unknown"),
+                "expected the crate's unknown-layout rejection, got: \(message)"
+            )
+        } catch {
+            XCTFail("unexpected error: \(error.localizedDescription)")
         }
     }
 
@@ -1391,9 +1375,35 @@ final class VotingRustBackendTests: XCTestCase {
 
     private func makeReadyBackend(walletId: String = roundTripWalletId) throws -> VotingRustBackend {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         try backend.setWalletId(walletId)
         return backend
+    }
+
+    private func makeVanWitness() -> VotingVanWitness {
+        VotingVanWitness(
+            authPath: [[UInt8](repeating: 1, count: votingFieldElementByteCount)],
+            position: 0,
+            anchorHeight: 0
+        )
+    }
+
+    private func makeDelegationProofParams(
+        seedFingerprint: [UInt8] = [UInt8](repeating: 0x04, count: votingSeedFingerprintByteCount)
+    ) throws -> VotingDelegationProofParams {
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+        return VotingDelegationProofParams(
+            roundId: roundTripRoundId,
+            bundleIndex: roundTripBundleIndex,
+            notes: [],
+            keys: VotingDelegationKeyInputs(
+                fvk: [UInt8](repeating: 0x03, count: votingOrchardFvkByteCount),
+                hotkeyStoredSecret: hotkey.storedSecret,
+                seedFingerprint: seedFingerprint,
+                accountIndex: 0,
+                roundName: "Round"
+            )
+        )
     }
 
     private func createRoundWithBundle(
@@ -1429,8 +1439,8 @@ final class VotingRustBackendTests: XCTestCase {
         )
     }
 
-    // TODO: Consider replacing this raw SQLite insertion with a proper Rust-side test helper
-    // so we don't reach into the Rust-managed votes table directly.
+    // TODO: [#1855] Consider replacing this raw SQLite insertion with a proper Rust-side test
+    // helper so we don't reach into the Rust-managed votes table directly.
     // https://github.com/zcash/zcash-swift-wallet-sdk/pull/1724#discussion_r3222196789
     private func insertVoteRow(
         roundId: String,
@@ -1537,71 +1547,26 @@ final class VotingRustBackendTests: XCTestCase {
 
     private func makeOpenBackend() throws -> VotingRustBackend {
         let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath())
+        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
         try backend.setWalletId("wallet")
         return backend
-    }
-
-    private func assertNoVoteFound(
-        _ error: Error,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        guard case VotingRustBackendError.rustError(let message) = error else {
-            XCTFail("expected .rustError, got \(error)", file: file, line: line)
-            return
-        }
-        XCTAssertTrue(message.contains("no vote found"), "unexpected message: \(message)", file: file, line: line)
-    }
-
-    private func makeVoteCommitmentBundle(
-        voteRoundId: String = String(repeating: "a", count: votingVoteRoundIdHexCharacterCount),
-        vanNullifier: [UInt8] = [UInt8](repeating: 1, count: votingFieldElementByteCount),
-        voteAuthorityNoteNew: [UInt8] = [UInt8](repeating: 2, count: votingFieldElementByteCount),
-        voteCommitment: [UInt8] = [UInt8](repeating: 3, count: votingFieldElementByteCount),
-        proposalId: UInt32 = 0,
-        encShares: [VotingWireEncryptedShare] = [
-            VotingWireEncryptedShare(
-                ciphertext1: [UInt8](repeating: 5, count: votingFieldElementByteCount),
-                ciphertext2: [UInt8](repeating: 6, count: votingFieldElementByteCount),
-                shareIndex: 0
-            )
-        ],
-        rVpkBytes: [UInt8] = [UInt8](repeating: 10, count: votingFieldElementByteCount),
-        alphaV: [UInt8] = [UInt8](repeating: 11, count: votingFieldElementByteCount)
-    ) -> VotingVoteCommitmentBundle {
-        VotingVoteCommitmentBundle(
-            vanNullifier: vanNullifier,
-            voteAuthorityNoteNew: voteAuthorityNoteNew,
-            voteCommitment: voteCommitment,
-            proposalId: proposalId,
-            proof: [4],
-            encShares: encShares,
-            anchorHeight: 1,
-            voteRoundId: voteRoundId,
-            sharesHash: [7],
-            shareBlinds: [[UInt8](repeating: 8, count: votingFieldElementByteCount)],
-            shareComms: [[UInt8](repeating: 9, count: votingFieldElementByteCount)],
-            rVpkBytes: rVpkBytes,
-            alphaV: alphaV
-        )
     }
 }
 
 // MARK: - Test doubles
-
-/// Probe stub that reports every endpoint as matching, so we can drive the
-/// resolver into the FFI call without contacting a real server.
-private struct AlwaysMatchingProbe: PirSnapshotProbing {
-    func probe(url: String, expectedSnapshotHeight: BlockHeight) async -> PirSnapshotProbeOutcome {
-        PirSnapshotProbeOutcome(url: url, status: .matching(height: expectedSnapshotHeight))
-    }
-}
 
 /// Probe stub used where endpoint probing must not happen.
 private struct FailingProbe: PirSnapshotProbing {
     func probe(url: String, expectedSnapshotHeight: BlockHeight) async -> PirSnapshotProbeOutcome {
         XCTFail("closed voting backend should fail before probing PIR endpoints")
         return PirSnapshotProbeOutcome(url: url, status: .matching(height: expectedSnapshotHeight))
+    }
+}
+
+/// Probe stub that reports every endpoint as serving the expected snapshot,
+/// letting resolution succeed offline so a test can reach the FFI itself.
+private struct MatchingProbe: PirSnapshotProbing {
+    func probe(url: String, expectedSnapshotHeight: BlockHeight) async -> PirSnapshotProbeOutcome {
+        PirSnapshotProbeOutcome(url: url, status: .matching(height: expectedSnapshotHeight))
     }
 }

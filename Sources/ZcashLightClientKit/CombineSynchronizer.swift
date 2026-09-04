@@ -24,8 +24,7 @@ public protocol CombineSynchronizer {
 
     func prepare(
         with seed: [UInt8]?,
-        walletBirthday: BlockHeight,
-        for walletMode: WalletInitMode,
+        walletBirthday: BlockHeight?,
         name: String,
         keySource: String?
     ) -> SinglePublisher<Initializer.InitializationResult, Error>
@@ -53,6 +52,10 @@ public protocol CombineSynchronizer {
         amount: Zatoshi,
         memo: Memo?
     ) -> SinglePublisher<Proposal, Error>
+
+    /// Creates a proposal that migrates the account's entire Orchard balance into the Ironwood pool.
+    /// Fails unless NU6.3 is active at the chain tip.
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) -> SinglePublisher<Proposal, Error>
 
     /// Creates a proposal for shielding any transparent funds received by the given account.
     ///

@@ -1,22 +1,23 @@
-name: Package Verified FFI XCFramework
+name: Build FFI XCFramework
 
 on:
-  # The private migration engine is intentionally unavailable to public GitHub Actions. This
-  # workflow verifies and packages the frozen three-slice artifact already committed on the
-  # selected branch; authenticated source rebuilds use Scripts/build-ironwood-ffi-artifact.sh.
+  # Manual trigger for preparing releases.
+  # The branch selected in the GitHub UI determines which commit is checked out and built.
   workflow_dispatch:
     inputs:
       version:
         description: 'SDK version (e.g., 2.5.0)'
         required: true
+      force:
+        description: 'Replace the assets of an existing release'
+        type: boolean
+        default: false
 
 permissions: {}
 
 jobs:
-  package-xcframework:
-    runs-on: warp-macos-15-arm64-12x
-    # The live sdk-release environment must be protected before this workflow is dispatched.
-    environment: sdk-release
+  build-xcframework:
+    runs-on: macos-15
     permissions:
       contents: write # Required for creating draft releases
     steps:
@@ -24,53 +25,57 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Select Xcode version
-        run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.0.app
 
-      - name: Verify frozen committed artifact
-        run: |
-          ./Scripts/verify-ironwood-ffi-artifact.sh
-          expected=(ios-arm64 ios-arm64-simulator macos-arm64)
-          for slice in "${expected[@]}"; do
-            test -f "LocalPackages/libzcashlc.xcframework/${slice}/libzcashlc.framework/libzcashlc"
-          done
-          count=$(find LocalPackages/libzcashlc.xcframework -type f -path '*/libzcashlc.framework/libzcashlc' | wc -l | tr -d ' ')
-          test "$count" = "3"
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: aarch64-apple-ios, x86_64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-darwin, aarch64-apple-darwin
 
-      - name: Package and upload draft release
+      - name: Cache Cargo
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
+          # Swatinem/rust-cache did): that includes `~/.cargo/git`, so a fork PR restoring a cache
+          # created on the base branch could reach whatever any future git dependency was cloned
+          # from. Every path below is crates.io content or this repository's own build output.
+          path: |
+            target
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v1-
+
+      - name: Build and upload draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ github.event.inputs.version }}
+          FORCE: ${{ github.event.inputs.force }}
         run: |
-          set -euo pipefail
-          products=BuildSupport/products
-          archive=libzcashlc.xcframework.zip
-          mkdir -p "$products"
-          rm -f "$products/$archive"
-          (cd LocalPackages && /usr/bin/zip -qry "../$products/$archive" libzcashlc.xcframework)
-          checksum=$(shasum -a 256 "$products/$archive" | awk '{print $1}')
-          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/${archive}"
-          printf 'CHECKSUM=%s\nDOWNLOAD_URL=%s\nVERSION=%s\n' \
-            "$checksum" "$download_url" "$VERSION" > "$products/release.env"
-          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $VERSION already exists; refusing to overwrite a frozen artifact." >&2
-            exit 1
+          if [ "$FORCE" = "true" ]; then
+            ./Scripts/prepare-release.sh artifacts --force-overwrite-existing-release "$VERSION"
+          else
+            ./Scripts/prepare-release.sh artifacts "$VERSION"
           fi
-          prerelease=()
-          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
-          gh release create "$VERSION" "$products/$archive" \
-            --repo "$GITHUB_REPOSITORY" --title "$VERSION" \
-            --notes "Zcash Light Client SDK $VERSION verified frozen FFI" --draft "${prerelease[@]}"
 
-      - name: Output Package.swift Update
+      - name: Report the release artifacts
         run: |
           source BuildSupport/products/release.env
           echo ""
           echo "========================================"
-          echo "Update Package.swift with:"
+          echo "Draft release ${VERSION} now carries:"
           echo "========================================"
           echo ""
-          echo "url: \"${DOWNLOAD_URL}\","
-          echo "checksum: \"${CHECKSUM}\""
+          echo "url:      ${DOWNLOAD_URL}"
+          echo "checksum: ${CHECKSUM}"
           echo ""
-          echo "Then commit, tag ${VERSION}, and publish the draft release."
+          echo "From a checkout on candidate/${VERSION}, run:"
+          echo "  ./Scripts/prepare-release.sh build --artifacts ci <remote> ${VERSION}"
+          echo ""
+          echo "It will find this draft release, reuse its checksum, write"
+          echo "Package.swift, and mark the release PR ready for review."

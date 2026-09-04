@@ -406,6 +406,8 @@ extension CompactBlockProcessor {
         } catch { }
     }
 
+    // DB-AUDIT (2026-08-03): WRITE — decryptAndStoreTransaction persists the decrypted tx;
+    // the trailing find only reads back the own write. Stays serialized.
     @DBActor
     func resolveMempools(rawTransaction: RawTransaction) async throws -> [ZcashTransaction.Overview] {
         let minedHeight = (rawTransaction.height == 0 || rawTransaction.height > UInt32.max)
@@ -657,8 +659,7 @@ extension CompactBlockProcessor {
                     ZcashError.serviceSubtreeRootsStreamFailed,
                     ZcashError.rustTorConnectToLightwalletd, ZcashError.rustTorLwdGetInfo,
                     ZcashError.rustTorLwdSubmit, ZcashError.rustTorLwdFetchTransaction,
-                    ZcashError.rustTorLwdLatestBlockHeight, ZcashError.rustTorLwdGetTreeState,
-                    ZcashError.compactBlockProcessorServerTipBehind: serviceError = true
+                    ZcashError.rustTorLwdLatestBlockHeight, ZcashError.rustTorLwdGetTreeState: serviceError = true
                 default:
                     // Non-ZcashError exceptions are raw gRPC/transport failures that escaped without
                     // proper wrapping — treat them as service errors so the retry logic kicks in

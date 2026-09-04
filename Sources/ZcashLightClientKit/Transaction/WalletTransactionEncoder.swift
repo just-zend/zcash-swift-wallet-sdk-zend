@@ -77,6 +77,12 @@ class WalletTransactionEncoder: TransactionEncoder {
         return Proposal(inner: proposal)
     }
 
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
+        let proposal = try await rustBackend.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
+
+        return Proposal(inner: proposal)
+    }
+
     func proposeShielding(
         accountUUID: AccountUUID,
         shieldingThreshold: Zatoshi,
@@ -107,7 +113,7 @@ class WalletTransactionEncoder: TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey
-    ) async throws -> [ZcashTransaction.Overview] {
+    ) async throws -> [CreatedTransaction] {
         guard ensureParams(spend: self.spendParamsURL, output: self.outputParamsURL) else {
             throw ZcashError.walletTransEncoderCreateTransactionMissingSaplingParams
         }
@@ -117,7 +123,22 @@ class WalletTransactionEncoder: TransactionEncoder {
             usk: spendingKey
         )
 
-        return try await fetchTransactionsForTxIds(txIds)
+        return try await createdTransactions(forTxIds: txIds)
+    }
+
+    func createdTransactions(forTxIds txIds: [Data]) async throws -> [CreatedTransaction] {
+        var createdTransactions: [CreatedTransaction] = []
+        for txId in txIds {
+            guard let transactionData = try await rustBackend.getTransaction(txId: txId) else {
+                let completedTxIds = createdTransactions.map { $0.txId.toHexStringTxId() }.joined(separator: ", ")
+                throw ZcashError.rustGetTransaction(
+                    "Transaction \(txId.toHexStringTxId()) is unavailable in the wallet store; already read transaction ids: [\(completedTxIds)]"
+                )
+            }
+            createdTransactions.append(CreatedTransaction(transactionData: transactionData))
+        }
+
+        return createdTransactions
     }
 
     func fetchTransactionsForTxIds(_ txIds: [Data]) async throws -> [ZcashTransaction.Overview] {

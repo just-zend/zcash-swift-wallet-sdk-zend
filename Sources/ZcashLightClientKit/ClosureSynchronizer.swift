@@ -25,8 +25,7 @@ public protocol ClosureSynchronizer {
     // swiftlint:disable:next function_parameter_count
     func prepare(
         with seed: [UInt8]?,
-        walletBirthday: BlockHeight,
-        for walletMode: WalletInitMode,
+        walletBirthday: BlockHeight?,
         name: String,
         keySource: String?,
         completion: @escaping (Result<Initializer.InitializationResult, Error>) -> Void
@@ -54,6 +53,13 @@ public protocol ClosureSynchronizer {
         recipient: Recipient,
         amount: Zatoshi,
         memo: Memo?,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    )
+
+    /// Creates a proposal that migrates the account's entire Orchard balance into the Ironwood pool.
+    /// Fails unless NU6.3 is active at the chain tip.
+    func proposeOrchardToIronwoodMigration(
+        accountUUID: AccountUUID,
         completion: @escaping (Result<Proposal, Error>) -> Void
     )
 

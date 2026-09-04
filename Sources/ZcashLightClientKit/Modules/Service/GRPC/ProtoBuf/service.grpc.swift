@@ -59,6 +59,12 @@ internal protocol CompactTxStreamerClientProtocol: GRPCClient {
     handler: @escaping (RawTransaction) -> Void
   ) -> ServerStreamingCall<TransparentAddressBlockFilter, RawTransaction>
 
+  func getTaddressTransactions(
+    _ request: TransparentAddressBlockFilter,
+    callOptions: CallOptions?,
+    handler: @escaping (RawTransaction) -> Void
+  ) -> ServerStreamingCall<TransparentAddressBlockFilter, RawTransaction>
+
   func getTaddressBalance(
     _ request: AddressList,
     callOptions: CallOptions?
@@ -69,10 +75,10 @@ internal protocol CompactTxStreamerClientProtocol: GRPCClient {
   ) -> ClientStreamingCall<Address, Balance>
 
   func getMempoolTx(
-    _ request: Exclude,
+    _ request: GetMempoolTxRequest,
     callOptions: CallOptions?,
     handler: @escaping (CompactTx) -> Void
-  ) -> ServerStreamingCall<Exclude, CompactTx>
+  ) -> ServerStreamingCall<GetMempoolTxRequest, CompactTx>
 
   func getMempoolStream(
     _ request: Empty,
@@ -123,7 +129,7 @@ extension CompactTxStreamerClientProtocol {
     return "cash.z.wallet.sdk.rpc.CompactTxStreamer"
   }
 
-  /// Return the height of the tip of the best chain
+  /// Return the BlockID of the block at the tip of the best chain
   ///
   /// - Parameters:
   ///   - request: Request to send to GetLatestBlock.
@@ -141,7 +147,18 @@ extension CompactTxStreamerClientProtocol {
     )
   }
 
-  /// Return the compact block corresponding to the given block identifier
+  /// Return the compact block corresponding to the given block identifier.
+  ///
+  /// The returned `CompactBlock` includes transaction data for all value
+  /// pools, including transparent inputs (`vin`) and outputs (`vout`). This
+  /// differs from `GetBlockRange`, which supports filtering by pool type and
+  /// defaults to returning only shielded (Sapling, Orchard, and Ironwood)
+  /// data. Clients that require only data for specific pools should use
+  /// `GetBlockRange` with the appropriate `poolTypes` set.
+  ///
+  /// Note: the single null-outpoint input for coinbase transactions is
+  /// omitted from the `vin` field of the corresponding `CompactTx`. See the
+  /// documentation of the `CompactTx` message for details.
   ///
   /// - Parameters:
   ///   - request: Request to send to GetBlock.
@@ -159,7 +176,14 @@ extension CompactTxStreamerClientProtocol {
     )
   }
 
-  /// Same as GetBlock except actions contain only nullifiers
+  /// Return a compact block containing only nullifier information for the
+  /// shielded pools (Sapling spend nullifiers, Orchard action nullifiers, and
+  /// Ironwood action nullifiers). Transparent transaction data, Sapling
+  /// outputs, full Orchard/Ironwood action data, and commitment tree sizes are
+  /// not included.
+  ///
+  /// Note: this method is deprecated; use `GetBlockRange` with the
+  /// appropriate `poolTypes` instead.
   ///
   /// - Parameters:
   ///   - request: Request to send to GetBlockNullifiers.
@@ -177,7 +201,11 @@ extension CompactTxStreamerClientProtocol {
     )
   }
 
-  /// Return a list of consecutive compact blocks
+  /// Return a list of consecutive compact blocks in the specified range,
+  /// which is inclusive of `range.end`.
+  ///
+  /// If range.start <= range.end, blocks are returned increasing height order;
+  /// otherwise blocks are returned in decreasing height order.
   ///
   /// - Parameters:
   ///   - request: Request to send to GetBlockRange.
@@ -198,7 +226,16 @@ extension CompactTxStreamerClientProtocol {
     )
   }
 
-  /// Same as GetBlockRange except actions contain only nullifiers
+  /// Return a stream of compact blocks for the specified range, where each
+  /// block contains only nullifier information for the shielded pools
+  /// (Sapling spend nullifiers, Orchard action nullifiers, and Ironwood action
+  /// nullifiers). Transparent transaction data, Sapling outputs, full
+  /// Orchard/Ironwood action data, and commitment tree sizes are not included.
+  /// Implementations MUST ignore any
+  /// `PoolType::TRANSPARENT` member of the `poolTypes` field of the request.
+  ///
+  /// Note: this method is deprecated; use `GetBlockRange` with the
+  /// appropriate `poolTypes` instead.
   ///
   /// - Parameters:
   ///   - request: Request to send to GetBlockRangeNullifiers.
@@ -255,8 +292,10 @@ extension CompactTxStreamerClientProtocol {
     )
   }
 
-  /// Return the transactions corresponding to the given t-address within the given block range
-  /// NB - this method is misnamed, it returns transactions, not transaction IDs.
+  /// Return RawTransactions that match the given transparent address filter.
+  ///
+  /// Note: This function is misnamed, it returns complete `RawTransaction` values, not TxIds.
+  /// NOTE: this method is deprecated, please use GetTaddressTransactions instead.
   ///
   /// - Parameters:
   ///   - request: Request to send to GetTaddressTxids.
@@ -273,6 +312,28 @@ extension CompactTxStreamerClientProtocol {
       request: request,
       callOptions: callOptions ?? self.defaultCallOptions,
       interceptors: self.interceptors?.makeGetTaddressTxidsInterceptors() ?? [],
+      handler: handler
+    )
+  }
+
+  /// Return the transactions corresponding to the given t-address within the given block range.
+  /// Mempool transactions are not included in the results.
+  ///
+  /// - Parameters:
+  ///   - request: Request to send to GetTaddressTransactions.
+  ///   - callOptions: Call options.
+  ///   - handler: A closure called when each response is received from the server.
+  /// - Returns: A `ServerStreamingCall` with futures for the metadata and status.
+  internal func getTaddressTransactions(
+    _ request: TransparentAddressBlockFilter,
+    callOptions: CallOptions? = nil,
+    handler: @escaping (RawTransaction) -> Void
+  ) -> ServerStreamingCall<TransparentAddressBlockFilter, RawTransaction> {
+    return self.makeServerStreamingCall(
+      path: CompactTxStreamerClientMetadata.Methods.getTaddressTransactions.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeGetTaddressTransactionsInterceptors() ?? [],
       handler: handler
     )
   }
@@ -313,15 +374,18 @@ extension CompactTxStreamerClientProtocol {
     )
   }
 
-  /// Return the compact transactions currently in the mempool; the results
-  /// can be a few seconds out of date. If the Exclude list is empty, return
-  /// all transactions; otherwise return all *except* those in the Exclude list
-  /// (if any); this allows the client to avoid receiving transactions that it
-  /// already has (from an earlier call to this rpc). The transaction IDs in the
-  /// Exclude list can be shortened to any number of bytes to make the request
-  /// more bandwidth-efficient; if two or more transactions in the mempool
-  /// match a shortened txid, they are all sent (none is excluded). Transactions
-  /// in the exclude list that don't exist in the mempool are ignored.
+  /// Returns a stream of the compact transaction representation for transactions
+  /// currently in the mempool. The results of this operation may be a few
+  /// seconds out of date. If the `exclude_txid_suffixes` list is empty,
+  /// return all transactions; otherwise return all *except* those in the
+  /// `exclude_txid_suffixes` list (if any); this allows the client to avoid
+  /// receiving transactions that it already has (from an earlier call to this
+  /// RPC). The transaction IDs in the `exclude_txid_suffixes` list can be
+  /// shortened to any number of bytes to make the request more
+  /// bandwidth-efficient; if two or more transactions in the mempool match a
+  /// txid suffix, none of the matching transactions are excluded. Txid
+  /// suffixes in the exclude list that don't match any transactions in the
+  /// mempool are ignored.
   ///
   /// - Parameters:
   ///   - request: Request to send to GetMempoolTx.
@@ -329,10 +393,10 @@ extension CompactTxStreamerClientProtocol {
   ///   - handler: A closure called when each response is received from the server.
   /// - Returns: A `ServerStreamingCall` with futures for the metadata and status.
   internal func getMempoolTx(
-    _ request: Exclude,
+    _ request: GetMempoolTxRequest,
     callOptions: CallOptions? = nil,
     handler: @escaping (CompactTx) -> Void
-  ) -> ServerStreamingCall<Exclude, CompactTx> {
+  ) -> ServerStreamingCall<GetMempoolTxRequest, CompactTx> {
     return self.makeServerStreamingCall(
       path: CompactTxStreamerClientMetadata.Methods.getMempoolTx.path,
       request: request,
@@ -404,7 +468,7 @@ extension CompactTxStreamerClientProtocol {
   }
 
   /// Returns a stream of information about roots of subtrees of the note commitment tree
-  /// for the specified shielded protocol (Sapling or Orchard).
+  /// for the specified shielded protocol (Sapling, Orchard, or Ironwood).
   ///
   /// - Parameters:
   ///   - request: Request to send to GetSubtreeRoots.
@@ -603,6 +667,11 @@ internal protocol CompactTxStreamerAsyncClientProtocol: GRPCClient {
     callOptions: CallOptions?
   ) -> GRPCAsyncServerStreamingCall<TransparentAddressBlockFilter, RawTransaction>
 
+  func makeGetTaddressTransactionsCall(
+    _ request: TransparentAddressBlockFilter,
+    callOptions: CallOptions?
+  ) -> GRPCAsyncServerStreamingCall<TransparentAddressBlockFilter, RawTransaction>
+
   func makeGetTaddressBalanceCall(
     _ request: AddressList,
     callOptions: CallOptions?
@@ -613,9 +682,9 @@ internal protocol CompactTxStreamerAsyncClientProtocol: GRPCClient {
   ) -> GRPCAsyncClientStreamingCall<Address, Balance>
 
   func makeGetMempoolTxCall(
-    _ request: Exclude,
+    _ request: GetMempoolTxRequest,
     callOptions: CallOptions?
-  ) -> GRPCAsyncServerStreamingCall<Exclude, CompactTx>
+  ) -> GRPCAsyncServerStreamingCall<GetMempoolTxRequest, CompactTx>
 
   func makeGetMempoolStreamCall(
     _ request: Empty,
@@ -764,6 +833,18 @@ extension CompactTxStreamerAsyncClientProtocol {
     )
   }
 
+  internal func makeGetTaddressTransactionsCall(
+    _ request: TransparentAddressBlockFilter,
+    callOptions: CallOptions? = nil
+  ) -> GRPCAsyncServerStreamingCall<TransparentAddressBlockFilter, RawTransaction> {
+    return self.makeAsyncServerStreamingCall(
+      path: CompactTxStreamerClientMetadata.Methods.getTaddressTransactions.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeGetTaddressTransactionsInterceptors() ?? []
+    )
+  }
+
   internal func makeGetTaddressBalanceCall(
     _ request: AddressList,
     callOptions: CallOptions? = nil
@@ -787,9 +868,9 @@ extension CompactTxStreamerAsyncClientProtocol {
   }
 
   internal func makeGetMempoolTxCall(
-    _ request: Exclude,
+    _ request: GetMempoolTxRequest,
     callOptions: CallOptions? = nil
-  ) -> GRPCAsyncServerStreamingCall<Exclude, CompactTx> {
+  ) -> GRPCAsyncServerStreamingCall<GetMempoolTxRequest, CompactTx> {
     return self.makeAsyncServerStreamingCall(
       path: CompactTxStreamerClientMetadata.Methods.getMempoolTx.path,
       request: request,
@@ -993,6 +1074,18 @@ extension CompactTxStreamerAsyncClientProtocol {
     )
   }
 
+  internal func getTaddressTransactions(
+    _ request: TransparentAddressBlockFilter,
+    callOptions: CallOptions? = nil
+  ) -> GRPCAsyncResponseStream<RawTransaction> {
+    return self.performAsyncServerStreamingCall(
+      path: CompactTxStreamerClientMetadata.Methods.getTaddressTransactions.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeGetTaddressTransactionsInterceptors() ?? []
+    )
+  }
+
   internal func getTaddressBalance(
     _ request: AddressList,
     callOptions: CallOptions? = nil
@@ -1030,7 +1123,7 @@ extension CompactTxStreamerAsyncClientProtocol {
   }
 
   internal func getMempoolTx(
-    _ request: Exclude,
+    _ request: GetMempoolTxRequest,
     callOptions: CallOptions? = nil
   ) -> GRPCAsyncResponseStream<CompactTx> {
     return self.performAsyncServerStreamingCall(
@@ -1181,6 +1274,9 @@ internal protocol CompactTxStreamerClientInterceptorFactoryProtocol: Sendable {
   /// - Returns: Interceptors to use when invoking 'getTaddressTxids'.
   func makeGetTaddressTxidsInterceptors() -> [ClientInterceptor<TransparentAddressBlockFilter, RawTransaction>]
 
+  /// - Returns: Interceptors to use when invoking 'getTaddressTransactions'.
+  func makeGetTaddressTransactionsInterceptors() -> [ClientInterceptor<TransparentAddressBlockFilter, RawTransaction>]
+
   /// - Returns: Interceptors to use when invoking 'getTaddressBalance'.
   func makeGetTaddressBalanceInterceptors() -> [ClientInterceptor<AddressList, Balance>]
 
@@ -1188,7 +1284,7 @@ internal protocol CompactTxStreamerClientInterceptorFactoryProtocol: Sendable {
   func makeGetTaddressBalanceStreamInterceptors() -> [ClientInterceptor<Address, Balance>]
 
   /// - Returns: Interceptors to use when invoking 'getMempoolTx'.
-  func makeGetMempoolTxInterceptors() -> [ClientInterceptor<Exclude, CompactTx>]
+  func makeGetMempoolTxInterceptors() -> [ClientInterceptor<GetMempoolTxRequest, CompactTx>]
 
   /// - Returns: Interceptors to use when invoking 'getMempoolStream'.
   func makeGetMempoolStreamInterceptors() -> [ClientInterceptor<Empty, RawTransaction>]
@@ -1228,6 +1324,7 @@ internal enum CompactTxStreamerClientMetadata {
       CompactTxStreamerClientMetadata.Methods.getTransaction,
       CompactTxStreamerClientMetadata.Methods.sendTransaction,
       CompactTxStreamerClientMetadata.Methods.getTaddressTxids,
+      CompactTxStreamerClientMetadata.Methods.getTaddressTransactions,
       CompactTxStreamerClientMetadata.Methods.getTaddressBalance,
       CompactTxStreamerClientMetadata.Methods.getTaddressBalanceStream,
       CompactTxStreamerClientMetadata.Methods.getMempoolTx,
@@ -1288,6 +1385,12 @@ internal enum CompactTxStreamerClientMetadata {
     internal static let getTaddressTxids = GRPCMethodDescriptor(
       name: "GetTaddressTxids",
       path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids",
+      type: GRPCCallType.serverStreaming
+    )
+
+    internal static let getTaddressTransactions = GRPCMethodDescriptor(
+      name: "GetTaddressTransactions",
+      path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTransactions",
       type: GRPCCallType.serverStreaming
     )
 
@@ -1363,19 +1466,50 @@ internal enum CompactTxStreamerClientMetadata {
 internal protocol CompactTxStreamerProvider: CallHandlerProvider {
   var interceptors: CompactTxStreamerServerInterceptorFactoryProtocol? { get }
 
-  /// Return the height of the tip of the best chain
+  /// Return the BlockID of the block at the tip of the best chain
   func getLatestBlock(request: ChainSpec, context: StatusOnlyCallContext) -> EventLoopFuture<BlockID>
 
-  /// Return the compact block corresponding to the given block identifier
+  /// Return the compact block corresponding to the given block identifier.
+  ///
+  /// The returned `CompactBlock` includes transaction data for all value
+  /// pools, including transparent inputs (`vin`) and outputs (`vout`). This
+  /// differs from `GetBlockRange`, which supports filtering by pool type and
+  /// defaults to returning only shielded (Sapling, Orchard, and Ironwood)
+  /// data. Clients that require only data for specific pools should use
+  /// `GetBlockRange` with the appropriate `poolTypes` set.
+  ///
+  /// Note: the single null-outpoint input for coinbase transactions is
+  /// omitted from the `vin` field of the corresponding `CompactTx`. See the
+  /// documentation of the `CompactTx` message for details.
   func getBlock(request: BlockID, context: StatusOnlyCallContext) -> EventLoopFuture<CompactBlock>
 
-  /// Same as GetBlock except actions contain only nullifiers
+  /// Return a compact block containing only nullifier information for the
+  /// shielded pools (Sapling spend nullifiers, Orchard action nullifiers, and
+  /// Ironwood action nullifiers). Transparent transaction data, Sapling
+  /// outputs, full Orchard/Ironwood action data, and commitment tree sizes are
+  /// not included.
+  ///
+  /// Note: this method is deprecated; use `GetBlockRange` with the
+  /// appropriate `poolTypes` instead.
   func getBlockNullifiers(request: BlockID, context: StatusOnlyCallContext) -> EventLoopFuture<CompactBlock>
 
-  /// Return a list of consecutive compact blocks
+  /// Return a list of consecutive compact blocks in the specified range,
+  /// which is inclusive of `range.end`.
+  ///
+  /// If range.start <= range.end, blocks are returned increasing height order;
+  /// otherwise blocks are returned in decreasing height order.
   func getBlockRange(request: BlockRange, context: StreamingResponseCallContext<CompactBlock>) -> EventLoopFuture<GRPCStatus>
 
-  /// Same as GetBlockRange except actions contain only nullifiers
+  /// Return a stream of compact blocks for the specified range, where each
+  /// block contains only nullifier information for the shielded pools
+  /// (Sapling spend nullifiers, Orchard action nullifiers, and Ironwood action
+  /// nullifiers). Transparent transaction data, Sapling outputs, full
+  /// Orchard/Ironwood action data, and commitment tree sizes are not included.
+  /// Implementations MUST ignore any
+  /// `PoolType::TRANSPARENT` member of the `poolTypes` field of the request.
+  ///
+  /// Note: this method is deprecated; use `GetBlockRange` with the
+  /// appropriate `poolTypes` instead.
   func getBlockRangeNullifiers(request: BlockRange, context: StreamingResponseCallContext<CompactBlock>) -> EventLoopFuture<GRPCStatus>
 
   /// Return the requested full (not compact) transaction (as from zcashd)
@@ -1384,24 +1518,33 @@ internal protocol CompactTxStreamerProvider: CallHandlerProvider {
   /// Submit the given transaction to the Zcash network
   func sendTransaction(request: RawTransaction, context: StatusOnlyCallContext) -> EventLoopFuture<SendResponse>
 
-  /// Return the transactions corresponding to the given t-address within the given block range
-  /// NB - this method is misnamed, it returns transactions, not transaction IDs.
+  /// Return RawTransactions that match the given transparent address filter.
+  ///
+  /// Note: This function is misnamed, it returns complete `RawTransaction` values, not TxIds.
+  /// NOTE: this method is deprecated, please use GetTaddressTransactions instead.
   func getTaddressTxids(request: TransparentAddressBlockFilter, context: StreamingResponseCallContext<RawTransaction>) -> EventLoopFuture<GRPCStatus>
+
+  /// Return the transactions corresponding to the given t-address within the given block range.
+  /// Mempool transactions are not included in the results.
+  func getTaddressTransactions(request: TransparentAddressBlockFilter, context: StreamingResponseCallContext<RawTransaction>) -> EventLoopFuture<GRPCStatus>
 
   func getTaddressBalance(request: AddressList, context: StatusOnlyCallContext) -> EventLoopFuture<Balance>
 
   func getTaddressBalanceStream(context: UnaryResponseCallContext<Balance>) -> EventLoopFuture<(StreamEvent<Address>) -> Void>
 
-  /// Return the compact transactions currently in the mempool; the results
-  /// can be a few seconds out of date. If the Exclude list is empty, return
-  /// all transactions; otherwise return all *except* those in the Exclude list
-  /// (if any); this allows the client to avoid receiving transactions that it
-  /// already has (from an earlier call to this rpc). The transaction IDs in the
-  /// Exclude list can be shortened to any number of bytes to make the request
-  /// more bandwidth-efficient; if two or more transactions in the mempool
-  /// match a shortened txid, they are all sent (none is excluded). Transactions
-  /// in the exclude list that don't exist in the mempool are ignored.
-  func getMempoolTx(request: Exclude, context: StreamingResponseCallContext<CompactTx>) -> EventLoopFuture<GRPCStatus>
+  /// Returns a stream of the compact transaction representation for transactions
+  /// currently in the mempool. The results of this operation may be a few
+  /// seconds out of date. If the `exclude_txid_suffixes` list is empty,
+  /// return all transactions; otherwise return all *except* those in the
+  /// `exclude_txid_suffixes` list (if any); this allows the client to avoid
+  /// receiving transactions that it already has (from an earlier call to this
+  /// RPC). The transaction IDs in the `exclude_txid_suffixes` list can be
+  /// shortened to any number of bytes to make the request more
+  /// bandwidth-efficient; if two or more transactions in the mempool match a
+  /// txid suffix, none of the matching transactions are excluded. Txid
+  /// suffixes in the exclude list that don't match any transactions in the
+  /// mempool are ignored.
+  func getMempoolTx(request: GetMempoolTxRequest, context: StreamingResponseCallContext<CompactTx>) -> EventLoopFuture<GRPCStatus>
 
   /// Return a stream of current Mempool transactions. This will keep the output stream open while
   /// there are mempool transactions. It will close the returned stream when a new block is mined.
@@ -1416,7 +1559,7 @@ internal protocol CompactTxStreamerProvider: CallHandlerProvider {
   func getLatestTreeState(request: Empty, context: StatusOnlyCallContext) -> EventLoopFuture<TreeState>
 
   /// Returns a stream of information about roots of subtrees of the note commitment tree
-  /// for the specified shielded protocol (Sapling or Orchard).
+  /// for the specified shielded protocol (Sapling, Orchard, or Ironwood).
   func getSubtreeRoots(request: GetSubtreeRootsArg, context: StreamingResponseCallContext<SubtreeRoot>) -> EventLoopFuture<GRPCStatus>
 
   func getAddressUtxos(request: GetAddressUtxosArg, context: StatusOnlyCallContext) -> EventLoopFuture<GetAddressUtxosReplyList>
@@ -1514,6 +1657,15 @@ extension CompactTxStreamerProvider {
         userFunction: self.getTaddressTxids(request:context:)
       )
 
+    case "GetTaddressTransactions":
+      return ServerStreamingServerHandler(
+        context: context,
+        requestDeserializer: ProtobufDeserializer<TransparentAddressBlockFilter>(),
+        responseSerializer: ProtobufSerializer<RawTransaction>(),
+        interceptors: self.interceptors?.makeGetTaddressTransactionsInterceptors() ?? [],
+        userFunction: self.getTaddressTransactions(request:context:)
+      )
+
     case "GetTaddressBalance":
       return UnaryServerHandler(
         context: context,
@@ -1535,7 +1687,7 @@ extension CompactTxStreamerProvider {
     case "GetMempoolTx":
       return ServerStreamingServerHandler(
         context: context,
-        requestDeserializer: ProtobufDeserializer<Exclude>(),
+        requestDeserializer: ProtobufDeserializer<GetMempoolTxRequest>(),
         responseSerializer: ProtobufSerializer<CompactTx>(),
         interceptors: self.interceptors?.makeGetMempoolTxInterceptors() ?? [],
         userFunction: self.getMempoolTx(request:context:)
@@ -1625,32 +1777,63 @@ internal protocol CompactTxStreamerAsyncProvider: CallHandlerProvider, Sendable 
   static var serviceDescriptor: GRPCServiceDescriptor { get }
   var interceptors: CompactTxStreamerServerInterceptorFactoryProtocol? { get }
 
-  /// Return the height of the tip of the best chain
+  /// Return the BlockID of the block at the tip of the best chain
   func getLatestBlock(
     request: ChainSpec,
     context: GRPCAsyncServerCallContext
   ) async throws -> BlockID
 
-  /// Return the compact block corresponding to the given block identifier
+  /// Return the compact block corresponding to the given block identifier.
+  ///
+  /// The returned `CompactBlock` includes transaction data for all value
+  /// pools, including transparent inputs (`vin`) and outputs (`vout`). This
+  /// differs from `GetBlockRange`, which supports filtering by pool type and
+  /// defaults to returning only shielded (Sapling, Orchard, and Ironwood)
+  /// data. Clients that require only data for specific pools should use
+  /// `GetBlockRange` with the appropriate `poolTypes` set.
+  ///
+  /// Note: the single null-outpoint input for coinbase transactions is
+  /// omitted from the `vin` field of the corresponding `CompactTx`. See the
+  /// documentation of the `CompactTx` message for details.
   func getBlock(
     request: BlockID,
     context: GRPCAsyncServerCallContext
   ) async throws -> CompactBlock
 
-  /// Same as GetBlock except actions contain only nullifiers
+  /// Return a compact block containing only nullifier information for the
+  /// shielded pools (Sapling spend nullifiers, Orchard action nullifiers, and
+  /// Ironwood action nullifiers). Transparent transaction data, Sapling
+  /// outputs, full Orchard/Ironwood action data, and commitment tree sizes are
+  /// not included.
+  ///
+  /// Note: this method is deprecated; use `GetBlockRange` with the
+  /// appropriate `poolTypes` instead.
   func getBlockNullifiers(
     request: BlockID,
     context: GRPCAsyncServerCallContext
   ) async throws -> CompactBlock
 
-  /// Return a list of consecutive compact blocks
+  /// Return a list of consecutive compact blocks in the specified range,
+  /// which is inclusive of `range.end`.
+  ///
+  /// If range.start <= range.end, blocks are returned increasing height order;
+  /// otherwise blocks are returned in decreasing height order.
   func getBlockRange(
     request: BlockRange,
     responseStream: GRPCAsyncResponseStreamWriter<CompactBlock>,
     context: GRPCAsyncServerCallContext
   ) async throws
 
-  /// Same as GetBlockRange except actions contain only nullifiers
+  /// Return a stream of compact blocks for the specified range, where each
+  /// block contains only nullifier information for the shielded pools
+  /// (Sapling spend nullifiers, Orchard action nullifiers, and Ironwood action
+  /// nullifiers). Transparent transaction data, Sapling outputs, full
+  /// Orchard/Ironwood action data, and commitment tree sizes are not included.
+  /// Implementations MUST ignore any
+  /// `PoolType::TRANSPARENT` member of the `poolTypes` field of the request.
+  ///
+  /// Note: this method is deprecated; use `GetBlockRange` with the
+  /// appropriate `poolTypes` instead.
   func getBlockRangeNullifiers(
     request: BlockRange,
     responseStream: GRPCAsyncResponseStreamWriter<CompactBlock>,
@@ -1669,9 +1852,19 @@ internal protocol CompactTxStreamerAsyncProvider: CallHandlerProvider, Sendable 
     context: GRPCAsyncServerCallContext
   ) async throws -> SendResponse
 
-  /// Return the transactions corresponding to the given t-address within the given block range
-  /// NB - this method is misnamed, it returns transactions, not transaction IDs.
+  /// Return RawTransactions that match the given transparent address filter.
+  ///
+  /// Note: This function is misnamed, it returns complete `RawTransaction` values, not TxIds.
+  /// NOTE: this method is deprecated, please use GetTaddressTransactions instead.
   func getTaddressTxids(
+    request: TransparentAddressBlockFilter,
+    responseStream: GRPCAsyncResponseStreamWriter<RawTransaction>,
+    context: GRPCAsyncServerCallContext
+  ) async throws
+
+  /// Return the transactions corresponding to the given t-address within the given block range.
+  /// Mempool transactions are not included in the results.
+  func getTaddressTransactions(
     request: TransparentAddressBlockFilter,
     responseStream: GRPCAsyncResponseStreamWriter<RawTransaction>,
     context: GRPCAsyncServerCallContext
@@ -1687,17 +1880,20 @@ internal protocol CompactTxStreamerAsyncProvider: CallHandlerProvider, Sendable 
     context: GRPCAsyncServerCallContext
   ) async throws -> Balance
 
-  /// Return the compact transactions currently in the mempool; the results
-  /// can be a few seconds out of date. If the Exclude list is empty, return
-  /// all transactions; otherwise return all *except* those in the Exclude list
-  /// (if any); this allows the client to avoid receiving transactions that it
-  /// already has (from an earlier call to this rpc). The transaction IDs in the
-  /// Exclude list can be shortened to any number of bytes to make the request
-  /// more bandwidth-efficient; if two or more transactions in the mempool
-  /// match a shortened txid, they are all sent (none is excluded). Transactions
-  /// in the exclude list that don't exist in the mempool are ignored.
+  /// Returns a stream of the compact transaction representation for transactions
+  /// currently in the mempool. The results of this operation may be a few
+  /// seconds out of date. If the `exclude_txid_suffixes` list is empty,
+  /// return all transactions; otherwise return all *except* those in the
+  /// `exclude_txid_suffixes` list (if any); this allows the client to avoid
+  /// receiving transactions that it already has (from an earlier call to this
+  /// RPC). The transaction IDs in the `exclude_txid_suffixes` list can be
+  /// shortened to any number of bytes to make the request more
+  /// bandwidth-efficient; if two or more transactions in the mempool match a
+  /// txid suffix, none of the matching transactions are excluded. Txid
+  /// suffixes in the exclude list that don't match any transactions in the
+  /// mempool are ignored.
   func getMempoolTx(
-    request: Exclude,
+    request: GetMempoolTxRequest,
     responseStream: GRPCAsyncResponseStreamWriter<CompactTx>,
     context: GRPCAsyncServerCallContext
   ) async throws
@@ -1725,7 +1921,7 @@ internal protocol CompactTxStreamerAsyncProvider: CallHandlerProvider, Sendable 
   ) async throws -> TreeState
 
   /// Returns a stream of information about roots of subtrees of the note commitment tree
-  /// for the specified shielded protocol (Sapling or Orchard).
+  /// for the specified shielded protocol (Sapling, Orchard, or Ironwood).
   func getSubtreeRoots(
     request: GetSubtreeRootsArg,
     responseStream: GRPCAsyncResponseStreamWriter<SubtreeRoot>,
@@ -1847,6 +2043,15 @@ extension CompactTxStreamerAsyncProvider {
         wrapping: { try await self.getTaddressTxids(request: $0, responseStream: $1, context: $2) }
       )
 
+    case "GetTaddressTransactions":
+      return GRPCAsyncServerHandler(
+        context: context,
+        requestDeserializer: ProtobufDeserializer<TransparentAddressBlockFilter>(),
+        responseSerializer: ProtobufSerializer<RawTransaction>(),
+        interceptors: self.interceptors?.makeGetTaddressTransactionsInterceptors() ?? [],
+        wrapping: { try await self.getTaddressTransactions(request: $0, responseStream: $1, context: $2) }
+      )
+
     case "GetTaddressBalance":
       return GRPCAsyncServerHandler(
         context: context,
@@ -1868,7 +2073,7 @@ extension CompactTxStreamerAsyncProvider {
     case "GetMempoolTx":
       return GRPCAsyncServerHandler(
         context: context,
-        requestDeserializer: ProtobufDeserializer<Exclude>(),
+        requestDeserializer: ProtobufDeserializer<GetMempoolTxRequest>(),
         responseSerializer: ProtobufSerializer<CompactTx>(),
         interceptors: self.interceptors?.makeGetMempoolTxInterceptors() ?? [],
         wrapping: { try await self.getMempoolTx(request: $0, responseStream: $1, context: $2) }
@@ -1986,6 +2191,10 @@ internal protocol CompactTxStreamerServerInterceptorFactoryProtocol: Sendable {
   ///   Defaults to calling `self.makeInterceptors()`.
   func makeGetTaddressTxidsInterceptors() -> [ServerInterceptor<TransparentAddressBlockFilter, RawTransaction>]
 
+  /// - Returns: Interceptors to use when handling 'getTaddressTransactions'.
+  ///   Defaults to calling `self.makeInterceptors()`.
+  func makeGetTaddressTransactionsInterceptors() -> [ServerInterceptor<TransparentAddressBlockFilter, RawTransaction>]
+
   /// - Returns: Interceptors to use when handling 'getTaddressBalance'.
   ///   Defaults to calling `self.makeInterceptors()`.
   func makeGetTaddressBalanceInterceptors() -> [ServerInterceptor<AddressList, Balance>]
@@ -1996,7 +2205,7 @@ internal protocol CompactTxStreamerServerInterceptorFactoryProtocol: Sendable {
 
   /// - Returns: Interceptors to use when handling 'getMempoolTx'.
   ///   Defaults to calling `self.makeInterceptors()`.
-  func makeGetMempoolTxInterceptors() -> [ServerInterceptor<Exclude, CompactTx>]
+  func makeGetMempoolTxInterceptors() -> [ServerInterceptor<GetMempoolTxRequest, CompactTx>]
 
   /// - Returns: Interceptors to use when handling 'getMempoolStream'.
   ///   Defaults to calling `self.makeInterceptors()`.
@@ -2044,6 +2253,7 @@ internal enum CompactTxStreamerServerMetadata {
       CompactTxStreamerServerMetadata.Methods.getTransaction,
       CompactTxStreamerServerMetadata.Methods.sendTransaction,
       CompactTxStreamerServerMetadata.Methods.getTaddressTxids,
+      CompactTxStreamerServerMetadata.Methods.getTaddressTransactions,
       CompactTxStreamerServerMetadata.Methods.getTaddressBalance,
       CompactTxStreamerServerMetadata.Methods.getTaddressBalanceStream,
       CompactTxStreamerServerMetadata.Methods.getMempoolTx,
@@ -2104,6 +2314,12 @@ internal enum CompactTxStreamerServerMetadata {
     internal static let getTaddressTxids = GRPCMethodDescriptor(
       name: "GetTaddressTxids",
       path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids",
+      type: GRPCCallType.serverStreaming
+    )
+
+    internal static let getTaddressTransactions = GRPCMethodDescriptor(
+      name: "GetTaddressTransactions",
+      path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTransactions",
       type: GRPCCallType.serverStreaming
     )
 

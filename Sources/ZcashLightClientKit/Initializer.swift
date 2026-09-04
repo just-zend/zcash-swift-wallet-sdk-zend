@@ -46,7 +46,10 @@ public struct LightWalletEndpoint {
     }
 }
 
-extension LightWalletEndpoint: Equatable {}
+// Sendable: a pure value type (String/Int/Bool fields). Alternate-endpoint lists cross
+// actor boundaries, which makes hosts building under strict concurrency need this
+// conformance spelled out.
+extension LightWalletEndpoint: Equatable, Sendable {}
 
 /// This contains URLs from which can the SDK fetch files that contain sapling parameters.
 /// Use `SaplingParamsSourceURL.default` when initilizing the SDK.
@@ -332,23 +335,23 @@ public class Initializer {
 
         // It's not possible to fail from constructor. Technically it's possible but it can be pain for the client apps to handle errors thrown
         // from constructor. So `parsingError` is just stored in initializer and `SDKSynchronizer.prepare()` throw this error if it exists.
-        let (updatedURLs, urlParsingError) = Self.tryToUpdateURLs(with: alias, urls: urls)
-        var parsingError = urlParsingError
+        let (updatedURLs, parsingError) = Self.tryToUpdateURLs(with: alias, urls: urls)
 
         // A custom network carries a base identity + custom NU activation heights; register them with
         // the Rust core before any FFI call resolves the custom (regtest-slot) network id.
         // Process-global (see MIGRATING.md).
         if let activationHeights = network.customActivationHeights {
-            let configured = ZcashRustBackend.setCustomNetwork(
+            let cleanRegistration = ZcashRustBackend.setCustomNetwork(
                 base: network.customNetworkBase ?? network.networkType,
-                chainName: network.chainName,
                 activationHeights
             )
-            if !configured, parsingError == nil {
-                parsingError = .unknown(
-                    ConsensusParametersError.unavailable(
-                        "Custom consensus parameters are invalid or conflict with an existing process-wide configuration"
-                    )
+            if !cleanRegistration {
+                // A different custom network was already registered in this process. The new values
+                // are applied (last writer wins), but per-instance state of any earlier Initializer
+                // (e.g. its checkpoint source) no longer matches the process-global parameters —
+                // a host configuration bug worth failing fast on during development.
+                assertionFailure(
+                    "Conflicting custom-network registration: a different custom network was already registered in this process."
                 )
             }
         }
@@ -458,8 +461,7 @@ public class Initializer {
     /// `InitializerError.accountInitFailed` if the account table can't be initialized.
     func initialize(
         with seed: [UInt8]?,
-        walletBirthday: BlockHeight,
-        for walletMode: WalletInitMode,
+        walletBirthday: BlockHeight?,
         name: String,
         keySource: String? = nil
     ) async throws -> InitializationResult {
@@ -476,26 +478,50 @@ public class Initializer {
 
         let checkpointSource = container.resolve(CheckpointSource.self)
 
-        let checkpoint = checkpointSource.birthday(for: walletBirthday)
+        // A restore honors the caller's (past) birthday; a new wallet (nil birthday) starts from the
+        // latest checkpoint, refined below to a reorg-safe server tree state.
+        let checkpoint = checkpointSource.birthday(for: walletBirthday ?? BlockHeight.max)
 
         self.walletBirthday = checkpoint.height
 
-        // If there are no accounts it must be created, the default amount of accounts is 1
-        if let seed, try await rustBackend.listAccounts().isEmpty {
+        // If there are no accounts it must be created (the default amount of accounts is 1). The init
+        // "mode" is DERIVED here — clients no longer pass `WalletInitMode`:
+        //   • an account already exists  → existing wallet → we never enter this block, just open it.
+        //   • no account + a birthday    → RESTORE: recover_until = current tip, so the
+        //     [birthday … tip] backfill is tracked as recovery by the wallet backend.
+        //   • no account + nil birthday  → NEW: start at a reorg-safe recent height, no recovery phase
+        //     (recover_until = nil).
+        // (A deliberate re-scan/resync is a separate, explicit action — `rewind(_:)` — not an init mode.)
+        let existingAccounts = try await rustBackend.listAccounts()
+        try await validateSeedAgainstExistingAccounts(seed, existingAccounts: existingAccounts)
+        if let seed, existingAccounts.isEmpty {
             var chainTip: UInt32?
             var accountTreeState = checkpoint.treeState()
 
             let sdkFlags = container.resolve(SDKFlags.self)
 
-            switch walletMode {
-            case .restoreWallet:
+            if walletBirthday != nil {
+                // RESTORE — recover_until = current chain tip.
                 if let latestBlockHeight = try? await lightWalletService.latestBlockHeight(mode: await sdkFlags.ifTor(.uniqueTor)) {
                     chainTip = UInt32(latestBlockHeight)
+                } else {
+                    // [#1755] Server unreachable at restore time: recover_until MUST still be a valid recent
+                    // height. A NULL recover_until makes the restore look like a NEW wallet — recovery_progress
+                    // reads complete ⇒ NO "Restoring" UI, the recovery gate never engages, and the raw
+                    // (transiently over-counted) balance is shown (syncLogsMac9: recover_until=unknown,
+                    // wallet showed 0 then a fluttering 8/5 with no banner). Fall back to the latest bundled
+                    // checkpoint — the best offline estimate of "now"; the [checkpoint..tip] gap is caught up as a
+                    // normal scan once the server is reachable, and recovery [birthday..checkpoint] keeps the
+                    // restore identity. max(.., birthday+1) guarantees a non-empty recovery even for a wallet
+                    // whose birthday is newer than the bundled checkpoints.
+                    let latestCheckpointHeight = checkpointSource.birthday(for: BlockHeight.max).height
+                    chainTip = UInt32(max(latestCheckpointHeight, self.walletBirthday + 1))
                 }
-            case .newWallet:
+            } else {
+                // NEW — no prior history. Fetch a recent tree state below the reorg horizon so funds
+                // intended for the wallet can't be missed if the current chain tip is reorganized; leave
+                // recover_until nil (no recovery phase).
                 if let latestBlockHeight = try? await lightWalletService.latestBlockHeight(mode: await sdkFlags.ifTor(.uniqueTor)) {
-                    // Fetch a recent tree state below the reorg horizon so funds intended for the
-                    // wallet can't be missed if the current chain tip is reorganized.
                     let birthdayTreeStateHeight = max(
                         latestBlockHeight - ZcashSDK.maxReorgSize,
                         network.saplingActivationHeight
@@ -509,9 +535,19 @@ public class Initializer {
                         self.walletBirthday = BlockHeight(serverTreeState.height)
                     }
                 }
-            case .existingWallet:
-                break
             }
+
+            // [#1755] Surface the DERIVED init flow (clients no longer pass it) so a device log shows
+            // exactly which path each launch took — the first thing to check when validating a restore.
+            let recoverUntil = chainTip.map { "tip \($0)" } ?? "unknown"
+            logger.info(
+                walletBirthday != nil
+                    ? "init flow: RESTORE — birthday \(self.walletBirthday), recover_until=\(recoverUntil)"
+                    : "init flow: NEW — start height \(self.walletBirthday), recover_until=nil",
+                file: #file,
+                function: #function,
+                line: #line
+            )
 
             _ = try await rustBackend.createAccount(
                 seed: seed,
@@ -520,9 +556,36 @@ public class Initializer {
                 name: name,
                 keySource: keySource
             )
+        } else {
+            logger.info(
+                existingAccounts.isEmpty
+                    ? "init flow: OPEN — no seed supplied, not creating an account"
+                    : "init flow: EXISTING — \(existingAccounts.count) account(s) present, opening (no create)",
+                file: #file,
+                function: #function,
+                line: #line
+            )
         }
 
         return .success
+    }
+
+    /// Seed↔account integrity guard: `initialize` is idempotent for an existing wallet, so
+    /// restoring a DIFFERENT seed over existing accounts previously no-op'd silently — the
+    /// keychain held seed B while data.db kept seed A's account, the app showed A's balance AND
+    /// receive address (funds receivable but unspendable), and sends failed ZRUST0002. Validate
+    /// the caller's seed against the stored derived account(s) before opening.
+    ///
+    /// The relevance check is delegated to the Rust core, which reports the seed relevant when it
+    /// derives an existing account, when there are no accounts, or when there is no seed-derived
+    /// account to validate against — so imported-only wallets (hardware-wallet UFVKs) are exempt.
+    /// Only a genuine mismatch against existing seed-derived accounts throws. This must not use a
+    /// Swift-side heuristic on `seedFingerprint`/`hdAccountIndex`, since those are also populated
+    /// for imported-spending accounts and would falsely brick hardware-wallet-only wallets.
+    private func validateSeedAgainstExistingAccounts(_ seed: [UInt8]?, existingAccounts: [Account]) async throws {
+        guard let seed, !existingAccounts.isEmpty else { return }
+        let seedIsRelevant = try await rustBackend.isSeedRelevantToAnyDerivedAccount(seed: seed)
+        guard seedIsRelevant else { throw ZcashError.initializerSeedMismatch }
     }
 
     /**
@@ -537,5 +600,62 @@ public class Initializer {
     */
     public func isValidTransparentAddress(_ address: String) -> Bool {
         DerivationTool(networkType: network.networkType).isValidTransparentAddress(address)
+    }
+}
+
+extension Initializer.LoggingPolicy {
+    /// Builds the `Logger` this policy specifies.
+    ///
+    /// Extracted from what were two independently maintained copies of this exact mapping
+    /// (`Synchronizer/Dependencies.swift`'s DI registration, `OrchardMigration`'s standalone
+    /// backend setup) so there is one implementation to keep in sync with `LoggingPolicy`'s cases.
+    ///
+    /// - Parameters:
+    ///   - category: the OSLog category for the `.default` case's `OSLogger`. Defaults to
+    ///     `OSLogger`'s own default (`"sdkLogs"`).
+    ///   - alias: the synchronizer alias folded into the `.default` case's `OSLogger` category
+    ///     suffix, mirroring the DI-registered per-synchronizer-instance logger. Pass `nil` when the
+    ///     logger is not scoped to a synchronizer instance (e.g. `OrchardMigration`, which predates
+    ///     any `Synchronizer`).
+    func makeLogger(category: String = "sdkLogs", alias: ZcashSynchronizerAlias? = nil) -> Logger {
+        switch self {
+        case let .default(logLevel):
+            return OSLogger(logLevel: logLevel, category: category, alias: alias)
+        case let .custom(customLogger):
+            return customLogger
+        case .noLogging:
+            return NullLogger()
+        }
+    }
+
+    /// Maps this policy to the Rust FFI's log-level enum: `.default` translates its `OSLogger.LogLevel`
+    /// directly, `.custom` reads the supplied logger's own `maxLogLevel()` (`nil` -> `.off`), and
+    /// `.noLogging` is always `.off`. Extracted alongside `makeLogger(category:alias:)` -- see its
+    /// doc for the two call sites this used to be duplicated across.
+    func makeRustLogging() -> RustLogging {
+        switch self {
+        case .default(let logLevel):
+            return Self.rustLogging(for: logLevel)
+        case .custom(let customLogger):
+            guard let logLevel = customLogger.maxLogLevel() else {
+                return RustLogging.off
+            }
+            return Self.rustLogging(for: logLevel)
+        case .noLogging:
+            return RustLogging.off
+        }
+    }
+
+    private static func rustLogging(for logLevel: OSLogger.LogLevel) -> RustLogging {
+        switch logLevel {
+        case .debug:
+            return RustLogging.debug
+        case .info, .event:
+            return RustLogging.info
+        case .warning:
+            return RustLogging.warn
+        case .error:
+            return RustLogging.error
+        }
     }
 }

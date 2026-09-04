@@ -50,6 +50,48 @@ public enum ZcashTransaction {
             }
         }
 
+        /// How a transaction classifies against ZIP 318, the Orchard to Ironwood
+        /// pool migration. This is a conformance class and never a provenance: it
+        /// cannot establish that a transaction came from this wallet's own
+        /// migration run. The encoding is stable and append-only.
+        public enum ZIP318Kind: Equatable {
+            /// Not classified. Either the transaction predates this column or the
+            /// wallet has not decrypted it yet; deciding requires rescanning the
+            /// transaction. This is the absence of a decision, not the decision
+            /// that the transaction is not a ZIP 318 one, so present no label for
+            /// it. An unrecognized encoding decodes here as well, because an SDK
+            /// that does not know a code has learned nothing about the
+            /// transaction.
+            case notClassified
+            /// Classified, and not a ZIP 318 transaction.
+            case nonconforming
+            /// A note-preparation self-send that a migration run makes before it
+            /// crosses.
+            case preparation
+            /// A pool crossing paying the account's own internal address, so a
+            /// migration transfer.
+            case transfer
+            /// A canonical pool crossing that pays a third party. It has the
+            /// same on-chain shape as a migration transfer but is not a
+            /// migration this account made.
+            case canonicalCrossingPayment
+
+            init(rawValue: Int) {
+                switch rawValue {
+                case 1:
+                    self = .nonconforming
+                case 2:
+                    self = .preparation
+                case 3:
+                    self = .transfer
+                case 4:
+                    self = .canonicalCrossingPayment
+                default:
+                    self = .notClassified
+                }
+            }
+        }
+
         public var id: Data { rawID }
 
         public let accountUUID: AccountUUID
@@ -70,6 +112,23 @@ public enum ZcashTransaction {
         public let isExpiredUmined: Bool?
         public let totalSpent: Zatoshi?
         public let totalReceived: Zatoshi?
+        /// Number of the account's own notes this transaction spent.
+        public let spentNoteCount: Int
+        /// The value that crossed shielded pools when this transaction is a
+        /// wallet-internal transfer between them, such as an Orchard to
+        /// Ironwood migration; `nil` when it is not such a transfer.
+        ///
+        /// For such a transaction `value` is just the negated fee, so this is
+        /// the amount to present to a user rather than the balance delta.
+        public let poolCrossingValue: Zatoshi?
+        /// Whether this transaction is considered trusted, meaning its outputs
+        /// are spendable after the trusted confirmation count rather than the
+        /// untrusted one.
+        public let isTrusted: Bool
+        /// How this transaction classifies against ZIP 318, the Orchard to
+        /// Ironwood pool migration. Only `preparation` and `transfer` are a
+        /// migration this account made.
+        public let zip318Kind: ZIP318Kind
         public var state: State?
     }
 
@@ -78,6 +137,10 @@ public enum ZcashTransaction {
             case transaparent
             case sapling
             case orchard
+            /// The Ironwood (NU6.3) shielded pool. Every shielded output a wallet receives after
+            /// NU6.3 activation lands here, so this is the common case post-activation — before
+            /// it existed, such outputs decoded as `.other(4)`.
+            case ironwood
             case other(Int)
             init(rawValue: Int) {
                 switch rawValue {
@@ -87,6 +150,8 @@ public enum ZcashTransaction {
                     self = .sapling
                 case 3:
                     self = .orchard
+                case 4:
+                    self = .ironwood
                 default:
                     self = .other(rawValue)
                 }
@@ -141,7 +206,8 @@ extension ZcashTransaction.Output {
 
             if
                 let outputRecipient = try row.get(Column.toAddress),
-                let metadata = DerivationTool.getAddressMetadata(outputRecipient) {
+                let metadata = DerivationTool.getAddressMetadata(outputRecipient)
+            {
                 recipient = TransactionRecipient.address(try Recipient(outputRecipient, network: metadata.networkType))
             } else if let toAccount = try row.get(Column.toAccount) {
                 recipient = .internalAccount(AccountUUID(id: [UInt8](Data(blob: toAccount))))
@@ -179,6 +245,15 @@ extension ZcashTransaction.Overview {
         static let expiredUnmined = SQLite.Expression<Bool?>("expired_unmined")
         static let totalSpent = SQLite.Expression<Int64?>("total_spent")
         static let totalReceived = SQLite.Expression<Int64?>("total_received")
+        static let spentNoteCount = SQLite.Expression<Int>("spent_note_count")
+        static let poolCrossingValue = SQLite.Expression<Int64?>("pool_crossing_value")
+        // Optional by contract: `trust_status` is an opt-in marker (`set_tx_trust`) with no
+        // default, no backfill, and — today — no caller anywhere, so it is NULL on every row of
+        // every real wallet. librustzcash's own readers consume it as IFNULL(trust_status, 0);
+        // decoding it strictly threw on the first row and emptied the entire transaction list
+        // (field, 2026-08-04). NULL decodes as "never evaluated" → untrusted.
+        static let trustStatus = SQLite.Expression<Bool?>("trust_status")
+        static let zip318Kind = SQLite.Expression<Int>("zip318_kind")
     }
 
     init(row: Row) throws {
@@ -195,7 +270,15 @@ extension ZcashTransaction.Overview {
             self.sentNoteCount = try row.get(Column.sentNoteCount)
             self.value = Zatoshi(try row.get(Column.value))
             self.isExpiredUmined = try row.get(Column.expiredUnmined)
+            self.spentNoteCount = try row.get(Column.spentNoteCount)
+            self.isTrusted = (try row.get(Column.trustStatus)) ?? false
+            self.zip318Kind = .init(rawValue: try row.get(Column.zip318Kind))
 
+            if let poolCrossingValue = try row.get(Column.poolCrossingValue) {
+                self.poolCrossingValue = Zatoshi(poolCrossingValue)
+            } else {
+                self.poolCrossingValue = nil
+            }
             if let blockTime = try row.get(Column.blockTime) {
                 self.blockTime = TimeInterval(blockTime)
             } else {

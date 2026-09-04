@@ -1,5 +1,5 @@
 //
-//  Updatesubtreerootsaction.swift
+//  UpdateSubtreeRootsAction.swift
 //
 //
 //  Created by Lukas Korba on 01.08.2023.
@@ -99,6 +99,14 @@ extension UpdateSubtreeRootsAction: Action {
                 for try await subtreeRoot in ironwoodStream {
                     ironwoodRoots.append(subtreeRoot)
                 }
+            } catch ZcashError.serviceSubtreeRootsStreamFailed(LightWalletServiceError.timeOut) {
+                // A stream timeout is a transport problem, not an "Ironwood not
+                // supported" signal: rethrow it into the retry machinery like the
+                // Sapling/Orchard streams do, so a server that black-holes this
+                // stream doesn't silently add the full streaming deadline to
+                // every sync pass. Genuine "unsupported protocol" errors still
+                // fall through to the best-effort skip below.
+                throw ZcashError.serviceSubtreeRootsStreamFailed(LightWalletServiceError.timeOut)
             } catch {
                 logger.debug("Ironwood subtree roots unavailable (\(error.localizedDescription)); skipping")
                 ironwoodRoots = []

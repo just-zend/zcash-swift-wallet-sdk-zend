@@ -113,7 +113,7 @@ class TestCoordinator {
     }
 
     func prepare(seed: [UInt8]) async throws -> Initializer.InitializationResult {
-        return try await synchronizer.prepare(with: seed, walletBirthday: self.birthday, for: .newWallet, name: "", keySource: nil)
+        return try await synchronizer.prepare(with: seed, walletBirthday: self.birthday, name: "", keySource: nil)
     }
 
     func stop() async throws {
@@ -247,38 +247,23 @@ extension TestCoordinator {
     }
 }
 
-final class TemporaryTestDatabases {
-    let rootURL: URL
+struct TemporaryTestDatabases {
     var fsCacheDbRoot: URL
     let generalStorageURL: URL
     var torDir: URL
     var dataDB: URL
-
-    init(rootURL: URL, fsCacheDbRoot: URL, generalStorageURL: URL, torDir: URL, dataDB: URL) {
-        self.rootURL = rootURL
-        self.fsCacheDbRoot = fsCacheDbRoot
-        self.generalStorageURL = generalStorageURL
-        self.torDir = torDir
-        self.dataDB = dataDB
-    }
-
-    deinit {
-        try? FileManager.default.removeItem(at: rootURL)
-    }
 }
 
 enum TemporaryDbBuilder {
     static func build() -> TemporaryTestDatabases {
-        let rootURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("zcash-swift-wallet-sdk-tests-\(UUID().uuidString)", isDirectory: true)
-        try! FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let tempUrl = try! __documentsDirectory()
+        let timestamp = String(Int(Date().timeIntervalSince1970))
 
         return TemporaryTestDatabases(
-            rootURL: rootURL,
-            fsCacheDbRoot: rootURL.appendingPathComponent("fs_cache"),
-            generalStorageURL: rootURL.appendingPathComponent("general_storage"),
-            torDir: rootURL.appendingPathComponent("tor"),
-            dataDB: rootURL.appendingPathComponent("data.db")
+            fsCacheDbRoot: tempUrl.appendingPathComponent("fs_cache_\(timestamp)"),
+            generalStorageURL: tempUrl.appendingPathComponent("general_storage_\(timestamp)"),
+            torDir: tempUrl.appendingPathComponent("tor_\(timestamp)"),
+            dataDB: tempUrl.appendingPathComponent("data_db_\(timestamp).db")
         )
     }
 }

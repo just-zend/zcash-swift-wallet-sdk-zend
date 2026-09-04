@@ -54,47 +54,6 @@ enum TestDbBuilder {
         Bundle.module.url(forResource: "darkside_caches", withExtension: "db")
     }
 
-    static func zend260Alpha6OrchardDataDbURL() -> URL? {
-        Bundle.module.url(forResource: "zend_2_6_0_alpha_6_orchard", withExtension: "sqlite")
-    }
-
-    static func zend260Alpha6OrchardMainnetDataDbURL() -> URL? {
-        Bundle.module.url(forResource: "zend_2_6_0_alpha_6_orchard_mainnet", withExtension: "sqlite")
-    }
-
-    static func zend260Alpha6OrchardCompactBlocks() throws -> [ZcashCompactBlock] {
-        try compactBlocks(resource: "zend_2_6_0_alpha_6_orchard")
-    }
-
-    static func zend260Alpha6OrchardMainnetCompactBlocks() throws -> [ZcashCompactBlock] {
-        try compactBlocks(resource: "zend_2_6_0_alpha_6_orchard_mainnet")
-    }
-
-    private static func compactBlocks(resource: String) throws -> [ZcashCompactBlock] {
-        guard let url = Bundle.module.url(forResource: resource, withExtension: "compactblocks") else {
-            throw TestBuilderError.generalError
-        }
-
-        return try String(contentsOf: url, encoding: .utf8)
-            .split(whereSeparator: \.isNewline)
-            .map { line in
-                let fields = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-                guard
-                    fields.count == 2,
-                    let expectedHeight = BlockHeight(fields[0]),
-                    let data = Data(hexEncoded: String(fields[1]))
-                else {
-                    throw TestBuilderError.generalError
-                }
-
-                let compactBlock = try CompactBlock(serializedBytes: data)
-                guard BlockHeight(compactBlock.height) == expectedHeight else {
-                    throw TestBuilderError.generalError
-                }
-                return ZcashCompactBlock(compactBlock: compactBlock)
-            }
-    }
-
     static func prepopulatedDataDbProvider(rustBackend: ZcashRustBackend) async throws -> ConnectionProvider? {
         let provider = SimpleConnectionProvider(path: (rustBackend.dbData).0, readonly: true)
 

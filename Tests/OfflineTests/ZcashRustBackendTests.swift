@@ -66,27 +66,6 @@ class ZcashRustBackendTests: XCTestCase {
         } catch { }
     }
 
-    func testCorruptDatabaseInitializationThrowsTypedSanitizedCause() async throws {
-        let root = Environment.uniqueTestTempDirectory
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let corruptURL = root.appendingPathComponent("corrupt-wallet.sqlite")
-        try Data("not a sqlite wallet or a private path".utf8).write(to: corruptURL)
-        let backend = ZcashRustBackend.makeForTests(
-            dbData: corruptURL,
-            fsBlockDbRoot: root.appendingPathComponent("blocks"),
-            networkType: .testnet
-        )
-
-        do {
-            _ = try await backend.initDataDb(seed: nil)
-            XCTFail("Expected typed database corruption")
-        } catch let error as WalletDatabaseInitializationError {
-            XCTAssertEqual(error.cause, .databaseCorrupt)
-            XCTAssertFalse(error.localizedDescription.contains(corruptURL.path))
-        }
-    }
-
     func testDecryptAndStoreTransactionThrowsOnMalformedTransaction() async throws {
         let dbInit = try await rustBackend.initDataDb(seed: nil)
 
@@ -104,7 +83,7 @@ class ZcashRustBackendTests: XCTestCase {
             XCTFail("decryptAndStoreTransaction must throw when the FFI reports an error, got txid: \(Array(txid))")
         } catch let error as ZcashError {
             guard case .rustDecryptAndStoreTransaction = error else {
-                XCTFail("Expected ZcashError.rustDecryptAndStoreTransaction")
+                XCTFail("Expected ZcashError.rustDecryptAndStoreTransaction, got: \(error)")
                 return
             }
         }

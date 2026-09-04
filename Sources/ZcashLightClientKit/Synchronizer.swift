@@ -131,12 +131,13 @@ public protocol Synchronizer: AnyObject {
     ///
     /// - Parameters:
     ///   - seed: ZIP-32 Seed bytes for the wallet that will be initialized
-    ///   - walletBirthday: Birthday of wallet.
-    ///   - for: [walletMode] Set `.newWallet` when preparing synchronizer for a brand new generated wallet,
-    ///   `.restoreWallet` when wallet is about to be restored from a seed
-    ///   and  `.existingWallet` for all other scenarios.
+    ///   - walletBirthday: Birthday of the wallet to RESTORE from, or `nil` for a brand-new wallet (the
+    ///   SDK then picks a reorg-safe recent height). Ignored when an account already exists.
     ///   - name: name of the account.
     ///   - keySource: custom optional string for clients, used for example to help identify the type of the account.
+    /// - Note: The init flow (new / restore / existing) is DERIVED by the SDK — an existing account is
+    ///   opened, a `nil` birthday creates a new wallet, a past birthday restores from it. A deliberate
+    ///   re-scan/resync is the separate `rewind(_:)` action, not an init mode.
     /// - Throws:
     ///     - `aliasAlreadyInUse` if the Alias used to create this instance is already used by other instance.
     ///     - `cantUpdateURLWithAlias` if the updating of paths in `Initilizer` according to alias fails. When this happens it means that
@@ -145,8 +146,7 @@ public protocol Synchronizer: AnyObject {
     ///     - Some other `ZcashError` thrown by lower layer of the SDK.
     func prepare(
         with seed: [UInt8]?,
-        walletBirthday: BlockHeight,
-        for walletMode: WalletInitMode,
+        walletBirthday: BlockHeight?,
         name: String,
         keySource: String?
     ) async throws -> Initializer.InitializationResult
@@ -155,6 +155,11 @@ public protocol Synchronizer: AnyObject {
     ///
     /// Implementations should leverage structured concurrency and
     /// cancel all jobs when this scope completes.
+    ///
+    /// - Throws: ``ZcashError/migrationSyncBlocked`` when a migration submission is in flight for
+    ///   any account in the wallet — a seconds-long hold, and the only one the migration gate
+    ///   imposes. Wait until ``isMigrationSyncBlocked()`` is false, or observe
+    ///   ``migrationSyncBlockedStream``, then retry.
     func start(retry: Bool) async throws
 
     /// Stop this synchronizer. Implementations should ensure that calling this method cancels all jobs that were created by this instance.
@@ -198,6 +203,17 @@ public protocol Synchronizer: AnyObject {
         amount: Zatoshi,
         memo: Memo?
     ) async throws -> Proposal
+
+    /// Creates a proposal that migrates the account's entire Orchard balance into the Ironwood pool.
+    ///
+    /// NU6.3 introduces the Orchard turnstile: value may leave the Orchard pool but never re-enter
+    /// it, so Orchard funds must be moved across once and in full. This spends every Orchard note and
+    /// sends the maximum to the account's own internal receiver, with the fee computed so no change
+    /// returns to Orchard. Sapling and transparent funds are untouched. Fails unless NU6.3 is active
+    /// at the chain tip.
+    ///
+    /// - Parameter accountUUID: the account whose Orchard balance is migrated.
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal
 
     /// Creates a proposal for shielding any transparent funds received by the given account.
     ///
@@ -334,6 +350,9 @@ public protocol Synchronizer: AnyObject {
     // sourcery: mockedName="getTransactionOutputsForTransaction"
     func getTransactionOutputs(for transaction: ZcashTransaction.Overview) async -> [ZcashTransaction.Output]
 
+    /// Returns all transactions, most recent first.
+    func allTransactions() async throws -> [ZcashTransaction.Overview]
+
     /// Returns a list of confirmed transactions that preceed the given transaction with a limit count.
     /// - Parameters:
     ///     - from: the confirmed transaction from which the query should start from or nil to retrieve from the most recent transaction
@@ -343,19 +362,6 @@ public protocol Synchronizer: AnyObject {
 
     /// Returns the latest block height from the provided Lightwallet endpoint
     func latestHeight() async throws -> BlockHeight
-
-    /// Returns an upgrade's activation height from the exact librustzcash consensus parameters
-    /// linked into this SDK, or `nil` when it is explicitly not configured for this network.
-    func networkUpgradeActivationHeight(_ upgrade: NetworkUpgrade) throws -> BlockHeight?
-
-    /// Convenience query for the Ironwood / NU6.3 activation height.
-    func nu6_3ActivationHeight() throws -> BlockHeight?
-
-    /// Canonical chain name bound into the Rust consensus configuration.
-    func consensusChainName() throws -> String
-
-    /// Stable fingerprint of the Rust consensus base, chain name, and activation schedule.
-    func consensusParametersFingerprint() throws -> String
 
     /// Returns the latests UTXOs for the given address from the specified height on
     ///
@@ -580,199 +586,714 @@ public protocol Synchronizer: AnyObject {
     /// to multiple lightwalletd servers in parallel.
     var broadcaster: Broadcaster { get }
 
-    // MARK: - Ironwood migration
+    // MARK: - Migration (Orchard -> Ironwood)
+    //
+    // Exposes the host's per-account `OrchardMigration` machinery and its wallet-scope sync gate
+    // to the app: note-split preparation and submission, transfer scheduling, the advance drive
+    // and its instruction executors, on-launch reconciliation/recovery, and external (PCZT)
+    // signing. None of these methods require `prepare()` to have been called — a host may
+    // broadcast a migration transfer from a background session without ever starting sync.
+    //
+    // The action surface is exactly three things: the conduit (`migrationAdvanceStep(accountUUID:)`),
+    // the instruction executors (`proveMigrationTransactions`, `performMigrationBroadcast`,
+    // `refreshStaleMigrationTransfers`), and reads. The app has no semantic goal except to advance
+    // the migration and perform the advancement's dictates, and no member decides for itself what
+    // the migration needs: `MigrationBroadcastInstruction` and `MigrationProveTarget` have no
+    // public initializers, so the advance marshaling is their only producer and un-instructed
+    // proving or broadcasting does not compile. This is a Swift-surface property, not a security
+    // boundary — the Rust executors' per-row state gating remains the safety backstop.
+    //
+    // The ceremony/consent lane is deliberately untouched by this: `prepareNoteSplit` /
+    // `submitNoteSplit` and the propose/sign/store family are pre-drive consent flows — a user
+    // approving a plan that does not exist yet — so there is no instruction for them to carry.
 
-    /// The current Orchard -> Ironwood migration state for `account`.
-    func migrationState(for account: AccountUUID) async throws -> MigrationState
+    /// The migration engine's next step to advance `accountUUID`'s stored run, paired with its
+    /// advisory outlook — a verbatim conduit of the engine's own `advance_migration`: the
+    /// attention step, the broadcast-first ordering, and the prove batch's per-entry kinds are
+    /// all the engine's own answer, marshaled field-for-field. Call it on launch and after every
+    /// migration operation.
+    ///
+    /// `nil` means no run is stored — nothing to advance, nothing to poll. A non-`nil` answer is
+    /// a ``MigrationAdvance``: `.step` is the step to perform now, judged with the engine's
+    /// attend > broadcast > prove > rebuild priority under its dueness rule — the wall-clock
+    /// chain-tip estimate, which this member always projects and passes, may only ACCELERATE
+    /// scheduled-height due-ness, while expiry, boundary settledness, and every destructive
+    /// determination evaluate on the SCANNED tip, and an estimator failure degrades to
+    /// scanned-tip behavior rather than failing the call. The answer is memoryless about
+    /// sessions: session policy (one broadcast per session, no sync in a broadcast session)
+    /// stays with the caller and the sync gate. `.next` is the advisory outlook
+    /// (``MigrationNextWork``) — what session to plan for once `.step` is executed, or `nil`
+    /// when nothing is height-schedulable.
+    ///
+    /// This is the conduit: crank it, then switch over `.step` and perform that step's dictate.
+    /// Every actionable arm hands the step's own payload straight to an executor:
+    ///
+    /// ```swift
+    /// switch try await synchronizer.migrationAdvanceStep(accountUUID: account)?.step {
+    /// case .prove(let instruction):
+    ///     _ = try await synchronizer.proveMigrationTransactions(accountUUID: account, instruction, maxProofs: budget)
+    /// case .broadcast(let instruction):
+    ///     _ = try await synchronizer.performMigrationBroadcast(accountUUID: account, instruction, options: options)
+    /// case .rebuild:
+    ///     _ = try await synchronizer.refreshStaleMigrationTransfers(accountUUID: account, usk: usk)
+    /// case .replan, .reevaluate, .waiting, .complete, nil:
+    ///     break // nothing to perform; see the per-step notes below
+    /// }
+    /// ```
+    ///
+    /// Discharging each step (see ``MigrationAdvanceStep`` for the full contract):
+    /// - `.reevaluate` — surfaced first, before any actionable step, while a broadcast-rejection
+    ///   report is open → sync and call this again so the engine can adjudicate against the newly
+    ///   scanned data; it keeps answering this until the scan reaches the rejecting node's tip.
+    /// - `.replan` — the run's plan was undercut past the committed threshold and the verdict is
+    ///   already persisted (no sync changes it) → surface the re-plan UX over the
+    ///   ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
+    ///   ``restartCurrentMigrationStep(accountUUID:)``. Invalid rows are excluded from delivery
+    ///   and from the sync gate.
+    /// - `.broadcast` → ``performMigrationBroadcast(accountUUID:_:options:)`` with the step's own
+    ///   ``MigrationBroadcastInstruction`` — submit and end the session (no sync).
+    /// - `.prove` → ``proveMigrationTransactions(accountUUID:_:maxProofs:)`` at a sync wake-up.
+    ///   Proving can unblock rows the batch did not name, so a host draining the run cranks again
+    ///   afterwards and discharges the next instruction. Each entry's `kind` decides what follows
+    ///   for that transaction: a `.preparation` entry may be proved and broadcast at the same
+    ///   wake-up, while a `.transfer` entry's broadcast follows in its own later session.
+    /// - `.rebuild` → ``refreshStaleMigrationTransfers(accountUUID:usk:)`` (needs spend
+    ///   authority).
+    /// - `.waiting` → register OS wake-ups from ``migrationSyncWakeups(accountUUID:)`` plus each
+    ///   ``migrationTransactionStatuses(accountUUID:)`` row's `scheduledHeight`; the outlook's
+    ///   `.next`, when present, sharpens which wake-up to arm first (a `.broadcast` outlook needs
+    ///   no sync, a `.prove` one is sync-bound), but the wake-up schedule remains the authority —
+    ///   the outlook is one call's lookahead, superseded by the next.
+    /// - `.complete` is terminal for the stored run — including a cancelled one — and means
+    ///   "stop polling" (its outlook is always `nil`). It is per-run, never "nothing left to
+    ///   migrate": whether a migratable balance remains is answered by
+    ///   ``proposeMigrationTransfers(accountUUID:)`` (an empty schedule means no).
+    /// - Parameter accountUUID: the account whose next step is of interest.
+    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance?
 
-    /// One authoritative, revisioned read of the migration state machine. UI and background
-    /// workers should use this instead of combining the legacy state/progress getters.
-    func migrationSnapshot(for account: AccountUUID) async throws -> MigrationSnapshot
+    /// Live migration progress for `accountUUID`, or `nil` when no snapshot is reportable:
+    /// present only while an engine run is ACTIVE (not terminal) or a recorded immediate sweep is
+    /// pending (unmined and unexpired); a terminal — complete or cancelled — run reports `nil`.
+    /// - Parameter accountUUID: the account whose migration progress is of interest.
+    func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress?
 
-    /// Starts (or idempotently resumes) a private run, validates its exact network submission
-    /// policy, and binds that policy before any transaction is proved, signed, or staged.
-    func beginPrivateMigration(
-        externalSigner: Bool,
-        options: NetworkPrivacyOptions,
-        for account: AccountUUID
-    ) async throws -> MigrationSnapshot
+    /// The prove executor: proves up to `maxProofs` of the transactions `instruction` names,
+    /// persisting each proof, and returns a ``MigrationProveOutcome`` — how many were proved (`0`
+    /// is the ordinary "nothing in this batch is provable right now" answer) and the txids of the
+    /// PREPARATIONS it proved.
+    ///
+    /// The txids are the handoff: a proved preparation is a complete transaction, ZIP 318-exempt
+    /// and meant to be broadcast as soon as it is proved, so its submission is the app's ordinary
+    /// path — for each returned txid call ``takeMigrationPreparation(accountUUID:byTxid:)``,
+    /// submit the bytes it hands back through the app's ordinary raw-transaction machinery, and
+    /// record the outcome the standard way. A transfer's txid is never returned — transfers are
+    /// served by the drive's broadcast instruction alone.
+    ///
+    /// The instruction is a batch a ``migrationAdvanceStep(accountUUID:)`` crank handed out — the
+    /// only way to hold one, since ``MigrationProveTarget`` has no public initializer. There is
+    /// no loop here: proving can unblock rows the batch did not name, so a host draining the run
+    /// cranks the conduit again and discharges the next instruction; a pass that proves `0` means
+    /// the batch's remainder is transiently unprovable and a later wake-up will retry it.
+    ///
+    /// Run this at the sync wake-ups ``migrationSyncWakeups(accountUUID:)`` schedules — after the
+    /// wake-up's sync has caught the wallet up — and never in a broadcast session. A transaction
+    /// that cannot be proved yet (anchor not scanned/retained) is skipped and retried by a later
+    /// call, as is one no longer awaiting its proof — so acting on a stale instruction is safe,
+    /// and neither skip spends the budget.
+    /// - Parameters:
+    ///   - accountUUID: the account whose proofs should be produced.
+    ///   - instruction: the prove batch the crank returned.
+    ///   - maxProofs: this session's proof budget (at least `1`) — each proof is seconds of CPU,
+    ///     so a background session bounds what it takes on and cranks again next time.
+    /// - Throws: ``ZcashError/rustMigrationProveTransactions(_:)`` when `maxProofs` is below `1`
+    ///   (a caller bug); ``ZcashError/migrationProvingUnavailable(_:)`` when proving fails for a
+    ///   non-transient reason.
+    func proveMigrationTransactions(
+        accountUUID: AccountUUID,
+        _ instruction: [MigrationProveTarget],
+        maxProofs: Int
+    ) async throws -> MigrationProveOutcome
 
-    /// Revalidates and binds the selected testnet transport policy for an existing run. This is
-    /// the explicit repair path after a durable endpoint/policy validation failure; it never
-    /// creates a run or transaction artifact.
-    func bindMigrationSubmissionPolicy(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        options: NetworkPrivacyOptions,
-        for account: AccountUUID
-    ) async throws -> MigrationSnapshot
+    /// Serves the proved preparation with `txid` for submission — the retrieval half of the
+    /// handoff ``proveMigrationTransactions(accountUUID:_:maxProofs:)`` opens by returning the
+    /// preparations' txids.
+    ///
+    /// The accessor is the seam, not a byte read of a stored artifact: `txid -> row -> the
+    /// store's atomic broadcast seam`, in one database transaction. The wallet's own record of
+    /// the transaction binds at retrieval, so an app can never hold submittable bytes the wallet
+    /// knows nothing about, and it is idempotent — a consumer that crashed between retrieving and
+    /// submitting re-retrieves exactly the same bytes over the same record.
+    ///
+    /// Submit ``PreparedMigrationTransfer/pczt`` — a finalized consensus transaction, submittable
+    /// as-is — through the app's ordinary raw-transaction machinery, then record the outcome the
+    /// standard way: the returned ``PreparedMigrationTransfer/id`` is the engine transfer id that
+    /// path keys on. Retrieved-but-never-submitted is a bounded state, not a leak: the
+    /// preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces through the
+    /// ordinary attention path once it expires.
+    ///
+    /// Preparation-gated: a txid naming a transfer is refused. Transfers cross on the drive's own
+    /// ZIP 318 schedule and are served by ``performMigrationBroadcast(accountUUID:_:options:)``
+    /// alone. This call does not broadcast, so it carries no privacy options and is not guarded
+    /// against sync.
+    /// - Parameters:
+    ///   - accountUUID: the account whose preparation is being retrieved.
+    ///   - txid: a txid ``MigrationProveOutcome/preparationTxids`` named.
+    /// - Throws: ``ZcashError/migrationProvingUnavailable(_:)`` when the stored artifact cannot be
+    ///   turned into servable bytes; ``ZcashError/rustMigrationTakePreparation(_:)`` for a
+    ///   transfer's txid, for a txid the stored run does not carry, and for the readiness refusal
+    ///   of a preparation that is not proved — which an app discharges by proving again rather
+    ///   than retrying this.
+    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: TxId) async throws -> PreparedMigrationTransfer
 
-    /// Pauses future migration actions without discarding signed or staged bytes.
-    func pauseMigration(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        for account: AccountUUID
-    ) async throws -> MigrationSnapshot
+    /// Closes the seam: records the engine-side outcome of a preparation the app retrieved with
+    /// ``takeMigrationPreparation(accountUUID:byTxid:)`` and submitted itself — the same per-row
+    /// mark (`Proved -> Broadcast`) ``performMigrationBroadcast(accountUUID:_:options:)`` makes
+    /// on its own success arm, made here by the app in place of the ceremony it deliberately
+    /// skipped. It is the ordinary close of the loop, not a repair.
+    ///
+    /// Keyed on the retrieval result: it takes the ``PreparedMigrationTransfer`` the accessor
+    /// returned, whose ``PreparedMigrationTransfer/id`` is already the engine transfer id the
+    /// record path keys on. Preparation-gated in the same register as the accessor: an id naming
+    /// a transfer is refused — the drive's own broadcast records transfer outcomes itself — as is
+    /// an id the stored run does not carry.
+    ///
+    /// Report the submission's real outcome. An acceptance makes the mark; a permanent server
+    /// rejection (`.invalidNote` / `.expired`) should be reported too — the engine dates the
+    /// verdict against the observed tip and the next crank re-adjudicates, so a doomed row can
+    /// raise attention instead of being re-served until expiry. A network-level non-acceptance
+    /// needs no call — the engine's network-error outcome records nothing by design, so reporting
+    /// one and reporting nothing leave the row equally re-servable. An app that crashed between
+    /// submitting and marking still converges: the engine promotes any in-flight transaction its
+    /// scan sees mine, and a later re-serve of the same bytes draws a duplicate rejection the SDK
+    /// records as success.
+    /// - Parameters:
+    ///   - accountUUID: the account the preparation belongs to.
+    ///   - prepared: the value ``takeMigrationPreparation(accountUUID:byTxid:)`` returned for this
+    ///     submission.
+    ///   - result: the submission's outcome, in the engine's own vocabulary.
+    /// - Throws: ``ZcashError/rustMigrationRecordTransferResult(_:)`` when `prepared` names a
+    ///   transfer or a transaction the stored run does not carry, and for rust-layer failures of
+    ///   the record itself.
+    func recordMigrationPreparationBroadcast(
+        accountUUID: AccountUUID,
+        _ prepared: PreparedMigrationTransfer,
+        result: MigrationTransferResult
+    ) async throws
 
-    /// Retries only an engine-owned `.retryAutomatically` failure at the supplied CAS revision.
-    /// Reapproval, proof rebuild, paused, abandoning, and terminal states are deliberately not
-    /// reset by this API.
-    func retryAutomaticMigrationRecovery(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        for account: AccountUUID
-    ) async throws -> MigrationSnapshot
+    /// The stored run's minimal sync/proving wake-up schedule for `accountUUID`, as of the
+    /// SCANNED chain tip: each row is a height at which to wake, sync, crank
+    /// ``migrationAdvanceStep(accountUUID:)`` and discharge the prove instruction it returns, plus
+    /// the transfer ids it covers.
+    /// Register OS wake-ups from these heights (converted to wall clock via
+    /// ``estimatedMigrationSecondsPerBlock()``) plus each status row's
+    /// `scheduledHeight` for the broadcast windows. Jitter is re-drawn on every call — recompute
+    /// (and re-register) after any state change rather than caching. Empty when there is nothing
+    /// left to prove (including no stored or a terminal run).
+    /// - Parameter accountUUID: the account whose wake-ups should be scheduled.
+    /// - Throws: ``ZcashError/migrationWakeupInfeasible(_:)`` when a stored transfer admits no
+    ///   valid wake-up height (an inconsistent stored schedule; rebuild or restart the run).
+    func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup]
 
-    /// Resumes a paused migration and returns the reconciled authoritative snapshot.
-    func resumeMigration(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        for account: AccountUUID
-    ) async throws -> MigrationSnapshot
+    /// The drive's retained OUTLOOK for `accountUUID`: the most recent
+    /// ``migrationAdvanceStep(accountUUID:)`` crank's advisory ``MigrationAdvance/next``, from ANY
+    /// caller (the app's driver, or any other call for this account) — so a host can ask
+    /// "when is the next migration wake, per the drive's own plan" without re-cranking the engine.
+    ///
+    /// Advisory and a floor: the height is the earliest the outlook's work becomes serviceable,
+    /// never an appointment, and it holds only as of the crank that produced it — the very next
+    /// crank's outlook (even to `nil`) supersedes it unconditionally. It complements, never
+    /// replaces, ``migrationSyncWakeups(accountUUID:)``: this is one height, the schedule is
+    /// many — a host arming OS wake-ups should min-fold this outlook's height in alongside the
+    /// schedule's own heights, never treat it as a replacement source.
+    ///
+    /// `nil` means no crank has run this session, or the last step's own outcome (a chain
+    /// condition or user/spend-authority action, not a height) decides what follows.
+    /// - Parameter accountUUID: the account whose retained outlook is of interest.
+    func nextMigrationWake(accountUUID: AccountUUID) async -> MigrationNextWork?
 
-    /// Requests safe abandonment. Signed/possibly submitted work remains guarded until consensus
-    /// confirms it mined or expired; planned unsigned work is cancelled immediately.
-    func requestMigrationAbandonment(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        for account: AccountUUID
-    ) async throws -> MigrationSnapshot
+    /// The wall-clock ESTIMATED chain tip, projected from the most recently scanned blocks'
+    /// header times (the measured-block-rate estimator behind `useEstimatedTip`). Falls back to
+    /// the wallet's max SCANNED height when no samples exist. WALLET-scoped, like the batching
+    /// group: the projection reads the shared blocks table, so it takes no account — one answer
+    /// serves every account.
+    /// - Throws: ``ZcashError/migrationChainTipUnavailable`` when the wallet has never scanned a
+    ///   block, so no tip exists to estimate from.
+    func estimatedMigrationChainTip() async throws -> BlockHeight
 
-    /// Live migration progress for the progress UI, or `nil` when no migration is in progress.
-    func migrationProgress(for account: AccountUUID) async throws -> MigrationProgress?
+    /// The measured seconds-per-block over the most recently scanned blocks: the mean of the last
+    /// up-to-100 consecutive header-time deltas, clamped to [5, 150] s, falling back to 75 s (the
+    /// target spacing) when fewer than two samples exist. Use it to convert
+    /// ``migrationSyncWakeups(accountUUID:)`` heights into wall-clock OS timers. WALLET-scoped
+    /// like ``estimatedMigrationChainTip()`` — the measurement reads the shared blocks table, so
+    /// it takes no account.
+    func estimatedMigrationSecondsPerBlock() async throws -> Double
 
-    /// Whether the account's Orchard notes must be split before migration can proceed.
-    func isNoteSplitNeeded(for account: AccountUUID) async throws -> Bool
+    /// The LIVE status of every committed migration transaction for `accountUUID`, keyed by its
+    /// stable id — the per-transaction detail view behind ``migrationProgress(accountUUID:)``'s
+    /// aggregate summary: what a wallet renders progress from and decides what to sign/prove/
+    /// broadcast next.
+    ///
+    /// A verbatim marshal of the engine's own `MigrationState::transaction_statuses`: nothing
+    /// here is derived independently of the engine's view. Each row's `id` is STABLE across reads
+    /// and across a stale-transfer rebuild (a rebuilt transfer keeps its id; only its state and
+    /// heights change), so a wallet may use it as a durable row key. Reconciles mined transactions
+    /// first (the same read-path convention as ``migrationAdvanceStep(accountUUID:)``), so a transaction
+    /// the wallet's own scan has since observed mined is reported `.mined` here even if the stored
+    /// run still marks it broadcast. No stored run, or a stored run with no transactions, returns
+    /// an EMPTY array — not an error.
+    /// - Parameter accountUUID: the account whose migration transactions are of interest.
+    func migrationTransactionStatuses(accountUUID: AccountUUID) async throws -> [MigrationTransactionStatus]
 
-    /// The proposed note split (per-note output values and the prep-transaction fee).
-    func prepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
+    /// Whether `accountUUID`'s Orchard notes must be split before migration.
+    /// - Parameter accountUUID: the account to check.
+    /// - Note: Requires at least one completed sync. On a wallet that has never completed a sync (no
+    ///   chain tip known) this throws rather than returning `false`.
+    func isNoteSplitNeeded(accountUUID: AccountUUID) async throws -> Bool
 
-    /// Signs the note-split transaction for `proposal` and broadcasts it. After this returns
-    /// `.success`, the migration state advances to `.splitPendingConfirmation`; the app should poll
-    /// ``migrationState(for:)`` for confirmation.
-    /// - Parameter options: authoritative per-call network-privacy preferences.
+    /// The optimal note split for `accountUUID`'s spendable Orchard balance.
+    ///
+    /// Any subsequent propose/prepare call for the same account supersedes previously returned
+    /// proposal handles — commit calls carrying an older handle throw `ZcashError.migrationPlanStale`.
+    /// - Parameter accountUUID: the account to prepare a note split for.
+    func prepareNoteSplit(accountUUID: AccountUUID) async throws -> NoteSplitProposal
+
+    /// Signs, extracts, broadcasts, and records `accountUUID`'s note-split transaction, returning the
+    /// broadcast outcome.
+    ///
+    /// - Parameters:
+    ///   - accountUUID: the account whose note split is being submitted.
+    ///   - proposal: the note-split proposal to sign and broadcast, from ``prepareNoteSplit(accountUUID:)``.
+    ///   - usk: the account's unified spending key.
+    ///   - options: network-privacy options (Tor, submission endpoint) for this broadcast.
+    /// - Throws: ``ZcashError/migrationBroadcastDuringSync`` if the synchronizer is actively syncing —
+    ///   sync and migration broadcasts must never share a session; this is enforced by the SDK on
+    ///   this call, so stop sync first. Otherwise, a pre-broadcast failure throws untouched (nothing
+    ///   was broadcast); a failure to record a broadcast that did land throws
+    ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast is real and a
+    ///   later attempt self-heals.
+    /// - Note: A completed submission leaves no timed hold behind — the migration gate blocks
+    ///   ``isMigrationSyncBlocked()``/``start(retry:)`` only while this submission is in flight.
+    ///   There is exactly one submission
+    ///   endpoint per attempt, and no txid polling — confirmation comes from scanning. Calls for
+    ///   different accounts are unserialized and safe to run concurrently; calls for the *same*
+    ///   account are single-flight (a concurrent call waits for the in-flight one rather than
+    ///   re-broadcasting). The sync-state check above is advisory, point-in-time enforcement, not a
+    ///   hard mutual-exclusion lock: a sync started concurrently with an in-flight broadcast is not
+    ///   torn down, so hosts should still sequence sync and migration-broadcast sessions themselves.
     func submitNoteSplit(
-        expectedRunId: String,
-        expectedRevision: UInt64,
+        accountUUID: AccountUUID,
         proposal: NoteSplitProposal,
-        spendingKey: UnifiedSpendingKey,
-        options: NetworkPrivacyOptions,
-        for account: AccountUUID
-    ) async throws -> TransferResult
+        usk: UnifiedSpendingKey,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferResult
 
-    /// The note-split transaction as an unsigned PCZT for an external signer (hardware wallet) —
-    /// the counterpart of ``submitNoteSplit(proposal:spendingKey:options:for:)`` for accounts whose
-    /// spending key lives on a device. Plans the split for the current spendable Orchard balance and
-    /// keeps the proven original staged internally; the app routes the returned PCZT to the device
-    /// (via ``redactPCZTForSigner(pczt:)`` and the QR channel, exactly like a regular
-    /// hardware-wallet send) and hands the claim intact with the signed PCZT to
-    /// ``submitSignedNoteSplitPCZT(_:for:options:account:)``.
-    func proposeNoteSplitPCZT(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        proposal: NoteSplitProposal,
-        options: NetworkPrivacyOptions,
-        for account: AccountUUID
-    ) async throws -> ClaimedNoteSplitPCZT
+    /// The full migration schedule preview for `accountUUID`'s live spendable Orchard balance, in
+    /// chronological broadcast order. Plans fresh (drawing new ZIP 318 schedule randomness) and
+    /// caches the preview — a later commit signs exactly this plan, so always confirm the schedule
+    /// the user actually saw. Any subsequent propose/prepare call for the same account supersedes
+    /// previously returned proposal handles — commit calls carrying an older handle throw
+    /// `ZcashError.migrationPlanStale`. An EMPTY schedule means there is nothing to migrate; after a
+    /// completed run this is the "does anything remain" answer of the sequential-runs contract.
+    /// - Parameter accountUUID: the account to propose a migration schedule for.
+    func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule
 
-    /// Stores the externally signed note-split PCZT (merging it into the staged original, verifying
-    /// and finalizing it) and broadcasts the result — the external-signer completion of
-    /// ``proposeNoteSplitPCZT(for:)``. After this returns `.success`, the migration state advances
-    /// to `.splitPendingConfirmation`, mirroring
-    /// ``submitNoteSplit(proposal:spendingKey:options:for:)``.
-    /// - Parameter options: authoritative per-call network-privacy preferences.
-    func submitSignedNoteSplitPCZT(
-        _ pczt: Pczt,
-        for claim: ClaimedNoteSplitPCZT,
-        expectedRevision: UInt64,
-        options: NetworkPrivacyOptions,
-        account: AccountUUID
-    ) async throws -> TransferResult
+    /// Proposes the immediate (single-transaction) migration: an ordinary send-max that spends ALL
+    /// spendable Orchard notes of `accountUUID` and pays everything minus the ZIP-317 fee to the
+    /// account's own unified address -- post-NU6.3 the payment lands in the Ironwood pool (the UA's
+    /// Orchard receiver doubles as the Ironwood receiver). Deterministic for unchanged wallet state.
+    ///
+    /// Unlike ``proposeMigrationTransfers(accountUUID:)``, this is an ORDINARY
+    /// proposal: it is not held by the migration engine, so there is no plan-cache staleness to
+    /// invalidate it between this call and ``createProposedTransactions(proposal:spendingKey:)`` /
+    /// ``createPCZTFromProposal(accountUUID:proposal:)``. Executing it is the caller's job exactly
+    /// like any other transfer; call ``recordImmediateMigration(accountUUID:txid:)`` after a
+    /// successful broadcast so the platform migration state machine reports it.
+    /// - Parameter accountUUID: the account to propose the immediate migration for.
+    /// - Throws: the rust layer's `InsufficientFunds` (mapped) when the fee would consume the whole
+    ///   balance.
+    func proposeImmediateMigration(accountUUID: AccountUUID) async throws -> ImmediateMigrationProposal
 
-    /// Retrieves the exact already-staged note-split signer envelope after process death or UI
-    /// route loss. This never proves replacement bytes; positive consensus expiry returns `nil`
-    /// and lets the engine require a fresh round.
-    func resumeNoteSplitExternalSigning(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        options: NetworkPrivacyOptions,
-        for account: AccountUUID
-    ) async throws -> ClaimedNoteSplitPCZT?
+    /// Records a broadcast immediate-migration sweep in the SDK migration store so the platform
+    /// migration state machine reports it: `InProgress` (0 of 1) while unmined, `Complete` once
+    /// mined, or a re-offer (`NotStarted`) if it expires unmined. One row per account: a new record
+    /// supersedes any previous one.
+    ///
+    /// Not broadcast-sensitive itself: the broadcast rides the already-guarded
+    /// ``createProposedTransactions(proposal:spendingKey:)`` / ``createPCZTFromProposal(accountUUID:proposal:)``
+    /// pipeline, so this call carries no ``ZcashError/migrationBroadcastDuringSync`` guard of its own.
+    /// - Parameters:
+    ///   - accountUUID: the account the immediate migration belongs to.
+    ///   - txid: the broadcast transaction's id.
+    func recordImmediateMigration(accountUUID: AccountUUID, txid: TxId) async throws
 
-    /// Proposes the private, anchorless migration intents shown for one-time confirmation.
-    func proposePrivateMigrationIntents(for account: AccountUUID) async throws -> MigrationIntentSchedule
+    /// The leftover Orchard balance a migration of `accountUUID` would not cross, when large enough
+    /// to be worth offering the user a choice about; `nil` when there is no such residual.
+    /// - Parameter accountUUID: the account to check.
+    /// - Note: Requires at least one completed sync. On a wallet that has never completed a sync (no
+    ///   chain tip known) this throws rather than returning `nil`.
+    func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi?
 
-    /// Proposes a single immediate, anchorless migration intent.
-    func proposeImmediateMigrationIntent(for account: AccountUUID) async throws -> MigrationIntentSchedule
+    /// Locks every currently-spendable, not-already-locked legacy-Orchard note of `accountUUID`
+    /// until explicit unlock and returns the total value locked — the "Lock balance" choice at
+    /// migration `Complete`: the sub-threshold residual a migration would not cross stays in
+    /// Orchard, out of spending, until ``unlockMigrationResidual(accountUUID:)`` releases it (the
+    /// lock never expires on its own). Locked value leaves `PoolBalance.spendableValue` but stays
+    /// in `PoolBalance.lockedValue`, and therefore in the account's total balance — locked funds
+    /// never vanish from app-visible sums.
+    /// - Parameter accountUUID: the account whose residual should be locked.
+    /// - Note: `Zatoshi(0)` is a legitimate result (nothing was spendable, or everything spendable
+    ///   was already locked). Idempotent-additive: already-locked notes are excluded from
+    ///   selection, so repeating the call locks (and reports) only notes that became spendable
+    ///   since.
+    /// - Throws: ``ZcashError/rustMigrationLockResidual(_:)`` if the engine reports an error —
+    ///   including a concurrent-lock race, which the caller may retry.
+    func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi
 
-    /// Returns exact immediate-migration economics without creating a draft, run, reservation,
-    /// signature, or transaction. ``initializePostUpgrade(for:)`` must have completed first.
-    func previewImmediateMigration(for account: AccountUUID) async throws -> ImmediateMigrationPreview
+    /// Clears ALL of `accountUUID`'s output locks — the release half of
+    /// ``lockMigrationResidual(accountUUID:)`` — and returns the number of outputs unlocked (`0`
+    /// when nothing was locked; the blanket clear is safe because the SDK never creates
+    /// proposal-scoped output locks). "Migrate anyway" over a locked residual composes as this
+    /// call followed by ``proposeImmediateMigration(accountUUID:)``: locked notes are excluded
+    /// from note selection, so the unlock must come first.
+    /// - Parameter accountUUID: the account whose output locks should be cleared.
+    func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int
 
-    /// Commits the exact approved intent schedule using its run id and revision compare-and-set
-    /// token. `externalSigner` permanently selects the run's signer path.
-    func commitMigrationIntents(
-        _ schedule: MigrationIntentSchedule,
-        externalSigner: Bool,
-        options: NetworkPrivacyOptions,
-        for account: AccountUUID
-    ) async throws -> MigrationSnapshot
+    /// Estimates how `accountUUID` migrates its whole spendable Orchard balance — the rounds
+    /// preview for the multi-round migration UI, answered before anything is planned or
+    /// committed: the number of migration RUNS ("rounds") it takes, per run both what it migrates
+    /// (the pool crossings) and what preparing it costs (the note-preparation layers,
+    /// transactions, and signer ACTIONS), and the final residual that never migrates. External-
+    /// signer effort is precomputed on the result in actions, not transaction counts:
+    /// ``MigrationRunEstimate/totalActions`` is the signing workload and
+    /// ``MigrationRunEstimate/totalKeystoneSigningSessions`` the signer-interaction count under
+    /// the 96-action Keystone budget (see ``MigrationRunEstimate`` for why count-based session
+    /// math undercounts).
+    /// - Parameter accountUUID: the account to estimate for.
+    /// - Note: The zero-run estimate (`runCount == 0`, a zero or fully sub-quantum balance) is a
+    ///   legitimate answer, not an error.
+    func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate
 
-    /// Executes at most one engine-authorized software/background action from a fresh snapshot.
-    /// A spending key is required only when a due anchorless intent must be materialized; signed
-    /// crash-recovery claims can be resumed without one. Returns `nil` for every wait, user-choice,
-    /// external-signing, or otherwise non-executable state.
-    func executeNextMigrationAction(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        spendingKey: UnifiedSpendingKey?,
-        options: NetworkPrivacyOptions,
-        for account: AccountUUID
-    ) async throws -> MigrationExecutionResult
+    /// Pre-signs and persists every transfer in `schedule` in the migration engine for `accountUUID`
+    /// (a no-op when a matching non-terminal run is already stored for the account — the normal
+    /// case, since the note-split submission commits the run). Any subsequent propose/prepare call
+    /// for the same account supersedes previously returned proposal handles — commit calls
+    /// carrying an older handle throw `ZcashError.migrationPlanStale`.
+    ///
+    /// The SDK does not retain the proposal list: hosts that need to render the committed schedule
+    /// later must persist it themselves at confirmation time.
+    /// - Parameters:
+    ///   - accountUUID: the account the schedule belongs to.
+    ///   - schedule: the schedule to sign and store, from
+    ///     ``proposeMigrationTransfers(accountUUID:)``. Only its `proposalHandle` crosses to the
+    ///     native side -- the display fields (transfers, estimated duration) are never echoed back.
+    ///     A fresh commit signs exactly the cached plan the handle identifies, so a stale or
+    ///     tampered display can never sign different values than the ones the user approved; the
+    ///     resume/no-op case above does not consult the handle at all. Not used by the immediate
+    ///     lane: ``proposeImmediateMigration(accountUUID:)`` returns an ordinary
+    ///     ``ImmediateMigrationProposal``, executed via ``createProposedTransactions(proposal:spendingKey:)``
+    ///     / ``createPCZTFromProposal(accountUUID:proposal:)`` like any other transfer.
+    ///   - usk: the account's unified spending key.
+    /// - Throws: `ZcashError.migrationPlanStale` when nothing is committed and the identified plan
+    ///   is missing (process restart between propose and confirm) or superseded by a later
+    ///   propose/prepare call — re-propose and re-display; rust-layer errors otherwise.
+    func signAndStoreMigrationSchedule(accountUUID: AccountUUID, _ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws
 
-    /// Stages exactly one due proven-but-unsigned intent for an external signer. The returned
-    /// object carries the engine claim token and must be passed intact to
-    /// ``submitSignedDueMigrationPCZT(_:for:options:)``.
-    func stageNextDueMigrationPCZT(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        options: NetworkPrivacyOptions,
-        for account: AccountUUID
-    ) async throws -> ClaimedTransferPCZT?
+    /// The broadcast executor: submits the already-proven migration transaction `instruction`
+    /// names for `accountUUID`, records the outcome, and returns it.
+    ///
+    /// The instruction is the payload of a ``MigrationAdvanceStep/broadcast(_:)`` step that a
+    /// ``migrationAdvanceStep(accountUUID:)`` crank handed out — and the only way to hold one,
+    /// since ``MigrationBroadcastInstruction`` has no public initializer. This executor never
+    /// advances the drive and never chooses a transaction: the ZIP 318 re-spread, the
+    /// satisfiability verification, and the dueness judgement all happened in the crank that
+    /// issued it, so there is no "nothing due" and no "awaiting proof" outcome to report. It
+    /// never proves, either: a due row still awaiting its proof is never named by a `.broadcast`
+    /// step; the crank reports it inside the `.prove` batch.
+    ///
+    /// It wraps exactly what an app cannot do for itself: serving the transaction's finalized
+    /// bytes through the store's atomic broadcast seam, submitting them under the given privacy
+    /// options — always over the dedicated migration Tor runtime when `options.useTor` is set,
+    /// independent of the global `tor(enabled:)` toggle and fail-closed — bracketing the submit
+    /// in the sync gate's in-flight marker, and recording the result.
+    ///
+    /// - Parameters:
+    ///   - accountUUID: the account the instruction belongs to.
+    ///   - instruction: the broadcast instruction the crank returned.
+    ///   - options: network-privacy options (Tor, submission endpoint) for this broadcast.
+    /// - Throws: ``ZcashError/migrationBroadcastDuringSync`` if the synchronizer is actively syncing —
+    ///   sync and migration broadcasts must never share a session; this is enforced by the SDK on
+    ///   this call, so stop sync first. Otherwise, a pre-broadcast failure throws untouched (nothing
+    ///   was broadcast) — including
+    ///   ``ZcashError/rustMigrationTakeBroadcastTransaction(_:)`` when the instruction has gone
+    ///   STALE (its row is no longer proved-and-servable, typically because it was already
+    ///   broadcast). Discharge a staleness throw by cranking
+    ///   ``migrationAdvanceStep(accountUUID:)`` again, not by retrying the executor. A failure to
+    ///   record a broadcast that did land throws
+    ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast is real and a
+    ///   later attempt self-heals.
+    /// - Note: A completed broadcast leaves NO timed hold behind: the gate is behavior-based, so
+    ///   ``isMigrationSyncBlocked()``/``start(retry:)`` block only for the seconds this submission
+    ///   is in flight, and a caller is free to sync the instant it is recorded. There is exactly
+    ///   one submission
+    ///   endpoint per attempt, and no txid polling — confirmation comes from scanning. Calls for
+    ///   different accounts are unserialized and safe to run concurrently; calls for the *same*
+    ///   account are single-flight (a concurrent call waits for the in-flight one rather than
+    ///   re-broadcasting, and then meets the staleness refusal above). The sync-state check is
+    ///   advisory, point-in-time enforcement, not a
+    ///   hard mutual-exclusion lock: a sync started concurrently with an in-flight broadcast is not
+    ///   torn down, so hosts should still sequence sync and migration-broadcast sessions themselves.
+    func performMigrationBroadcast(
+        accountUUID: AccountUUID,
+        _ instruction: MigrationBroadcastInstruction,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferResult
 
-    /// Retrieves the exact already-staged due signer envelope and renews its wall-clock lease
-    /// without materializing a new intent.
-    func resumeDueMigrationExternalSigning(
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        options: NetworkPrivacyOptions,
-        for account: AccountUUID
-    ) async throws -> ClaimedTransferPCZT?
+    /// Whether ordinary wallet sync should currently be paused because a migration submission is
+    /// in flight for any account in the wallet — including an account with no live activity this
+    /// session (a gate file a crashed launch left a marker in still counts).
+    ///
+    /// The gate is behavior-based: the single present-tense condition is that a migration submit
+    /// is between reaching the network and having its outcome recorded, which lasts seconds.
+    /// Nothing else holds sync: there is no elapsed-time condition (a fixed post-broadcast delay
+    /// is itself an identifiable pattern — a correlation signature rather than a defense against
+    /// one; instead, a wake serves the drive's instruction without auto-appending a sync, so sync
+    /// sessions start for a reason), no hold on user intent (a manual refresh or an attempt to
+    /// create a transaction is never made to wait beyond an in-flight submit), and no
+    /// work-pending query (a due row that still needs its proof needs MORE syncing, so
+    /// ``hasOverdueMigrationTransfers(accountUUID:useEstimatedTip:)`` deliberately does not gate
+    /// sync either).
+    ///
+    /// Non-throwing: degrades open (returns `false`, i.e. sync allowed) if the check itself fails
+    /// rather than blocking sync on an internal error. ``start(retry:)`` consults this and throws
+    /// ``ZcashError/migrationSyncBlocked`` while it is `true`.
+    func isMigrationSyncBlocked() async -> Bool
 
-    /// Stores one externally signed due intent, submits the exact Rust-extracted bytes, and records
-    /// the result with the same engine claim token. Returns `nil` if reconciliation finds the
-    /// transaction already mined or safely expired before submission.
-    func submitSignedDueMigrationPCZT(
-        _ signedPCZT: Pczt,
-        for claim: ClaimedTransferPCZT,
-        expectedRunId: String,
-        expectedRevision: UInt64,
-        options: NetworkPrivacyOptions,
-        account: AccountUUID
-    ) async throws -> MigrationExecutionResult
+    /// A stream of ``isMigrationSyncBlocked()`` at wallet scope: emits the current value on subscribe
+    /// and re-evaluates reactively thereafter. The predicate is ``isMigrationSyncBlocked()``'s —
+    /// an in-flight submission, and nothing else.
+    ///
+    /// - Important: The value delivered synchronously on subscribe is a conservative `false` seed; it
+    ///   is corrected by the first asynchronous re-evaluation. A subscriber that must be correct from
+    ///   its very first value should pair this stream with an initial ``isMigrationSyncBlocked()``
+    ///   call.
+    var migrationSyncBlockedStream: AnyPublisher<Bool, Never> { get }
 
-    /// Whether the wallet must sync before the next transfer can be broadcast (a previous transfer
-    /// produced change back to Orchard that must be observed first).
-    func isSyncRequiredBeforeNextTransfer(for account: AccountUUID) async throws -> Bool
+    /// Whether `accountUUID` has any scheduled transfer that is past its send height but not yet
+    /// broadcast — the "is there actionable work" query, counting an already-proved due
+    /// transaction AND a due, dependency-satisfied `Signed` one that still needs its proof.
+    /// Informational (re-arm background execution, launch
+    /// reconciliation): it is deliberately NOT the sync-gate predicate — a due-but-unproved row
+    /// needs MORE syncing and must never block sync, so ``isMigrationSyncBlocked()`` holds only
+    /// while a submission is in flight. It is a READ,
+    /// never a substitute for ``migrationAdvanceStep(accountUUID:)``: it says whether cranking is
+    /// worth a wake-up, never what to do.
+    /// - Parameters:
+    ///   - accountUUID: the account to check.
+    ///   - useEstimatedTip: opts the check into the wall-clock chain-tip estimate, which may only
+    ///     ACCELERATE due-ness (expiry stays scanned-tip; estimator failure degrades to the
+    ///     scanned-tip behavior) — the same rule ``migrationAdvanceStep(accountUUID:)`` always
+    ///     applies. The protocol-extension overload without this parameter defaults it to `false`.
+    func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool
 
-    /// Whether any scheduled transfer is past the height at which it should have been broadcast.
-    func hasOverdueTransfers(for account: AccountUUID) async throws -> Bool
+    /// Whether `accountUUID`'s migration is in an invalid state (spendable Orchard remains but no
+    /// scheduled transfer covers it).
+    /// - Parameter accountUUID: the account to check.
+    func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool
 
-    /// Whether the migration is in an invalid state (spendable Orchard remains but nothing covers it).
-    func hasInvalidTransfers(for account: AccountUUID) async throws -> Bool
+    /// Re-evaluates `accountUUID`'s remaining spendable Orchard balance and returns a fresh schedule.
+    ///
+    /// The old plan is no longer valid: the engine discards it and derives a new one, which a
+    /// follow-up ``signAndStoreMigrationSchedule(accountUUID:_:usk:)`` (or PCZT store) then signs and
+    /// persists.
+    /// - Parameter accountUUID: the account to restart.
+    func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule
 
-    /// One-time initialization to run after the wallet upgrades to an Ironwood-capable build.
-    func initializePostUpgrade(for account: AccountUUID) async throws
+    /// Rebuilds every EXPIRED transfer of `accountUUID`'s stored migration run in place through the
+    /// engine and returns the run's FULL transfer schedule as stored AFTER the refresh.
+    ///
+    /// Each rebuilt transfer re-spends the SAME funding note (recovered from the expired transfer by
+    /// nullifier identity, never an equal-value substitute) on a fresh schedule — a fresh
+    /// memoryless delay from the current tip, a fresh canonical expiry, and a freshly drawn
+    /// boundary anchor. The transfer ids are unchanged, but their schedule, expiry, and anchors are
+    /// all fresh, and those fresh values exist nowhere but in the returned schedule: it is the
+    /// atomically-persisted post-refresh truth, and the host MUST re-display it to the user. Once a
+    /// run is stored (as it must be, to have anything to refresh), every subsequent commit-shaped
+    /// call (``signAndStoreMigrationSchedule(accountUUID:_:usk:)``,
+    /// ``createUnsignedNoteSplitPCZTs(accountUUID:for:)``,
+    /// ``createUnsignedMigrationTransferPCZTs(accountUUID:for:)``) resumes it handle-free — the
+    /// `schedule` argument identifies nothing at that point, so it is the stored run itself
+    /// (already refreshed) that the external-signer ceremony converges on, not a comparison against
+    /// whatever copy the host happens to pass. With nothing expired the current stored schedule
+    /// comes back unchanged; with no stored run, or a terminal (completed or cancelled) one, the
+    /// schedule is empty.
+    /// - Parameters:
+    ///   - accountUUID: the account to refresh.
+    ///   - usk: the account's unified spending key, or `nil` for the external-signer (Keystone)
+    ///     lane. Passing a key signs each rebuilt transfer anew in-process; passing `nil` (an
+    ///     account whose spend authority never exists on this device) leaves the rebuilt transfers
+    ///     awaiting their signature, so the existing
+    ///     ``createUnsignedMigrationTransferPCZTs(accountUUID:for:)`` /
+    ///     ``storeSignedMigrationSchedulePCZTs(accountUUID:_:)`` ceremony re-serves and completes
+    ///     them.
+    /// - Throws: notably, a `FundingNoteUnavailable`-class failure when an expired transfer's exact
+    ///   funding note was spent outside the migration — the underlying message names
+    ///   ``restartCurrentMigrationStep(accountUUID:)`` (cancel and re-plan the remaining balance) as
+    ///   the remedy. Rebuilds are persisted ALL-OR-NOTHING: a mid-refresh throw (including this one)
+    ///   persists NONE of the batch's rebuilds, so a non-throwing return's schedule is exactly what
+    ///   was atomically persisted, never a partial batch.
+    func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule
+
+    /// Builds `accountUUID`'s whole previewed migration UNSIGNED — the run is created by this
+    /// call, with every transaction persisted awaiting its signature — and returns the preparation
+    /// (note-split) subset of the PCZTs for the signing ceremony. The transfer subset of the same
+    /// build is served by `createUnsignedMigrationTransferPCZTs(accountUUID:for:)`, so one
+    /// ceremony signs everything (the final engine builds N preparation transactions, not one
+    /// split transaction). Resumes a stored non-terminal run handle-free; replaces a terminal one.
+    /// - Parameters:
+    ///   - accountUUID: the account to build the PCZTs for.
+    ///   - schedule: the schedule to build the run from, from
+    ///     ``proposeMigrationTransfers(accountUUID:)``. Only its `proposalHandle` crosses to the
+    ///     native side, and only when this call is the one creating the run (no stored run, or a
+    ///     terminal one) — the display fields are never echoed back, and the ordinary resume case
+    ///     does not consult the handle at all.
+    /// - Throws: `ZcashError.migrationPlanStale` when this call is creating the run and the
+    ///   identified plan is missing (process restart between propose and confirm) or superseded by
+    ///   a later propose/prepare call — re-propose and re-display before retrying.
+    func createUnsignedNoteSplitPCZTs(accountUUID: AccountUUID, for schedule: MigrationSchedule) async throws -> [MigrationUnsignedTransferPczt]
+
+    /// Applies the ceremony's signatures to `accountUUID`'s preparation (note-split) transactions,
+    /// all-or-nothing: every element must match a stored transaction awaiting its signature or
+    /// nothing is persisted. Returns a STORAGE RECEIPT for the first preparation transaction (its
+    /// `txid` is zeroed — the broadcastable, proven value is served by the delivery lane).
+    /// - Parameters:
+    ///   - accountUUID: the account the PCZTs belong to.
+    ///   - signed: the externally signed preparation PCZTs, each paired with its engine id.
+    func storeSignedNoteSplitPCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws -> PreparedMigrationTransfer
+
+    /// Builds one unsigned, proven PCZT per transfer of `schedule` for `accountUUID`, for an external
+    /// signer. Serves the TRANSFER subset of the same unsigned build
+    /// ``createUnsignedNoteSplitPCZTs(accountUUID:for:)`` serves the preparation subset of — the
+    /// run and every unsigned transaction it needs normally already exist by the time this is
+    /// called, so the usual path here is the handle-free resume of the stored run.
+    /// - Parameters:
+    ///   - accountUUID: the account the schedule belongs to.
+    ///   - schedule: the schedule to build PCZTs for, from ``proposeMigrationTransfers(accountUUID:)``.
+    ///     Only its `proposalHandle` crosses to the native side, and it only gates the fresh-build
+    ///     case where this call is the one creating the run (no stored run, or a terminal one) —
+    ///     the display fields are never echoed back, and the ordinary resume case does not consult
+    ///     the handle at all.
+    /// - Throws: `ZcashError.migrationPlanStale` when this call is creating the run and the
+    ///   identified plan is missing (process restart) or superseded by a later propose/prepare
+    ///   call — re-propose and re-display; rust-layer errors otherwise.
+    func createUnsignedMigrationTransferPCZTs(accountUUID: AccountUUID, for schedule: MigrationSchedule) async throws -> [MigrationUnsignedTransferPczt]
+
+    /// Accepts the full set of `accountUUID`'s externally signed transfer PCZTs (all-or-nothing),
+    /// persisting them in the migration engine.
+    ///
+    /// The SDK does not retain the proposal list: hosts that need to render the committed schedule
+    /// later must persist it themselves at confirmation time.
+    /// - Parameters:
+    ///   - accountUUID: the account the PCZTs belong to.
+    ///   - signed: the full set of externally signed transfer PCZTs.
+    func storeSignedMigrationSchedulePCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws
+
+    // MARK: - Migration Keystone batch-signing (external signer ceremony)
+    //
+    // A DB-free, account-free bridge for driving a Keystone hardware signer through the migration
+    // ceremony's PCZTs over an animated multi-part QR UR: none of these calls take an
+    // `accountUUID`, since they operate purely on caller-held PCZT bytes (from
+    // `createUnsignedNoteSplitPCZTs(accountUUID:for:)` / `createUnsignedMigrationTransferPCZTs(accountUUID:for:)`)
+    // and a scanned device response, never touching the wallet database or the migration engine.
+
+    /// Splits an ORDERED unsigned-PCZT batch into signer sessions bounded by
+    /// `maxActionsPerSession` actions, preserving order: each returned sub-array is one signing
+    /// session, and their concatenation is exactly `pczts`. Run each session through the QR
+    /// ceremony (``buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)`` ...) on its
+    /// own.
+    ///
+    /// Action-weighted, not count-based: the split packs by each row's
+    /// ``MigrationUnsignedTransferPczt/actions`` weight (16 preparation / 3 transfer) with an
+    /// order-preserving greedy strategy — the CREATE/RE-SERVE order carries the ceremony's
+    /// preparation-then-transfer contract, so reordering is not an option here (unlike the
+    /// estimate's ``MigrationRunEstimate/Run/keystoneSigningSessions``, which packs optimally
+    /// because nothing is dispatched yet). Account-free like the rest of this group: it weighs
+    /// caller-held rows, never the wallet database.
+    /// - Parameters:
+    ///   - pczts: the unsigned PCZTs to split, in ceremony order (preparations first, then
+    ///     transfers) — rows from the CREATE/RE-SERVE calls, whose `actions` weights are
+    ///     populated.
+    ///   - maxActionsPerSession: the signer's per-session action budget — e.g.
+    ///     ``MigrationSigningBudget/keystone`` (96) — at least 16 (a single preparation
+    ///     transaction, the minimum any signer must support).
+    /// - Throws: `ZcashError.rustMigrationBatchPcztsByActions` when any row's weight is not
+    ///   exactly 16 or 3 (e.g. rows returned by
+    ///   ``applyKeystoneBatchSignatures(pczts:batchSignResponse:)``, which carry `0`), or when
+    ///   `maxActionsPerSession` is below 16 — caller bugs, not signer conditions.
+    func batchMigrationPcztsForSigning(
+        _ pczts: [MigrationUnsignedTransferPczt],
+        maxActionsPerSession: Int
+    ) async throws -> [[MigrationUnsignedTransferPczt]]
+
+    /// Builds the animated multi-part QR frames for a Keystone batch-signing request covering
+    /// every PCZT in `pczts`, in the given order.
+    ///
+    /// `pczts` MUST be preparation (note-split) PCZTs first, then transfer PCZTs, in schedule
+    /// order -- and the caller MUST pass this SAME array, in this SAME order, to
+    /// ``applyKeystoneBatchSignatures(pczts:batchSignResponse:)`` once the device responds; the
+    /// response's signatures are aligned by position, not by any id embedded in the wire format.
+    ///
+    /// Every PCZT is redacted for the batch-Signer role INSIDE this call before it reaches the
+    /// wire (the signing firmware rejects a batch request carrying a pre-existing spend
+    /// authorization signature). Callers must NOT pre-redact, and must retain their own
+    /// unredacted `pczts` -- those unredacted bytes are what
+    /// ``applyKeystoneBatchSignatures(pczts:batchSignResponse:)`` applies the device's signatures
+    /// onto.
+    /// - Parameters:
+    ///   - requestId: an opaque correlation token (e.g. a UUID's bytes), round-tripped by the
+    ///     device and checked in ``decodeKeystoneSignBatchPart(_:expectedRequestId:)`` to reject a
+    ///     scan of an unrelated/stale response.
+    ///   - pczts: the unsigned PCZTs to include, preparation-then-transfer, schedule order.
+    ///   - maxFragmentLen: the maximum byte length of each animated QR frame's payload.
+    /// - Returns: the QR frame strings, in wire fragment order -- display/scan them in that order.
+    func buildKeystoneSignBatchQRParts(requestId: Data, pczts: [MigrationUnsignedTransferPczt], maxFragmentLen: Int) async throws -> [String]
+
+    /// Discards any in-flight multi-part Keystone sign-batch-response scan session.
+    ///
+    /// Only one decode session exists at a time. Call this on scan-screen entry, on retry, and on
+    /// exit, so a new attempt always starts from a clean slate regardless of how a previous
+    /// attempt ended (cancel, back button, mid-stream error). Non-throwing and infallible.
+    func resetKeystoneSignBatchDecoder() async
+
+    /// Feeds one scanned QR frame into the active (or a freshly started) Keystone
+    /// sign-batch-response decode session.
+    ///
+    /// `expectedRequestId` must match the decoded response's own request id once complete, or
+    /// this throws (a scan of an unrelated/stale response) instead of silently accepting it.
+    /// - Parameters:
+    ///   - part: the scanned QR frame's raw string payload.
+    ///   - expectedRequestId: the request id passed to
+    ///     ``buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)`` for this ceremony.
+    /// - Returns: a ``KeystoneBatchDecodeResult`` -- `complete == false` while more frames are
+    ///   needed (`progress` reports 0-100 so far, `data`/`firmwareVersion` are `nil`);
+    ///   `complete == true` once the full response has been decoded, with `data` holding the
+    ///   batch-signature response and, when the device's response envelope carried it,
+    ///   `firmwareVersion` set. The response is signatures-only -- no PCZT is echoed back by the
+    ///   device -- and `firmwareVersion` is the ONLY way to learn the signing device's firmware
+    ///   version in this batch flow.
+    func decodeKeystoneSignBatchPart(_ part: String, expectedRequestId: Data) async throws -> KeystoneBatchDecodeResult
+
+    /// Applies the ceremony's Keystone batch signatures to `pczts`, positionally.
+    ///
+    /// `pczts` MUST be the SAME array, in the SAME order, passed to
+    /// ``buildKeystoneSignBatchQRParts(requestId:pczts:maxFragmentLen:)`` -- including the SAME
+    /// unredacted bytes retained from that call, never the redacted wire copy.
+    /// `batchSignResponse` is the `KeystoneBatchDecodeResult.data` a completed
+    /// ``decodeKeystoneSignBatchPart(_:expectedRequestId:)`` returned.
+    /// - Returns: one signed PCZT per element of `pczts`, in the same order, ready for the
+    ///   existing note-split / schedule storage calls
+    ///   (``storeSignedNoteSplitPCZTs(accountUUID:_:)`` /
+    ///   ``storeSignedMigrationSchedulePCZTs(accountUUID:_:)``).
+    func applyKeystoneBatchSignatures(pczts: [MigrationUnsignedTransferPczt], batchSignResponse: Data) async throws -> [MigrationSignedTransferPczt]
 }
 
 /// Error thrown by the default `Synchronizer.getTreeState(height:)` implementation
@@ -795,6 +1316,27 @@ private struct BroadcasterUnimplemented: LocalizedError {
         """
         Synchronizer.broadcaster has no default implementation. \
         Override this property in your Synchronizer conformer to provide broadcast support.
+        """
+    }
+}
+
+/// Error thrown by the default implementations of the throwing members of the migration group (see
+/// `public extension Synchronizer` below) when a conformer doesn't override them. One shared,
+/// member-parameterized type rather than one hoisted struct per member (as
+/// ``GetTreeStateUnimplemented``/``BroadcasterUnimplemented`` do): the migration group has over
+/// thirty throwing requirements, and duplicating that two-struct precedent once per member would
+/// be pure boilerplate for the same LocalizedError-conforming, "override this in your conformer"
+/// pattern. Hoisted to file scope for the same reason as those two — protocol-extension methods
+/// carry an implicit `Self` and so count as generic, and Swift forbids nesting concrete types with
+/// synthesized members inside a generic function.
+private struct MigrationUnimplemented: LocalizedError {
+    /// The unimplemented member's signature, supplied by each default via `#function`.
+    let member: String
+
+    var errorDescription: String? {
+        """
+        Synchronizer.\(member) has no default implementation. \
+        Override this member in your Synchronizer conformer to provide migration support.
         """
     }
 }
@@ -855,6 +1397,195 @@ public extension Synchronizer {
     /// through to this default and report the feature as unavailable.
     var broadcaster: Broadcaster {
         UnimplementedBroadcaster()
+    }
+
+    // MARK: - Migration (Orchard -> Ironwood) defaults
+    //
+    // Default implementations so adding the migration group to the protocol is not a
+    // source-breaking change for downstream/stacked conformers. Conformers with
+    // migration support (`SDKSynchronizer`) override every one of these; conformers that don't fall
+    // through here. The throwing members all throw `MigrationUnimplemented`; the four non-throwing
+    // members get inert defaults instead, documented below — conformers must override them to offer
+    // real migration behavior.
+
+    func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress? {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func proveMigrationTransactions(
+        accountUUID: AccountUUID,
+        _ instruction: [MigrationProveTarget],
+        maxProofs: Int
+    ) async throws -> MigrationProveOutcome {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: TxId) async throws -> PreparedMigrationTransfer {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func recordMigrationPreparationBroadcast(
+        accountUUID: AccountUUID,
+        _ prepared: PreparedMigrationTransfer,
+        result: MigrationTransferResult
+    ) async throws {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    /// Inert default: conformers must override to provide the retained-outlook accessor. `nil` is
+    /// the correct "no crank has run" answer either way, so this default needs no throwing variant.
+    func nextMigrationWake(accountUUID: AccountUUID) async -> MigrationNextWork? {
+        nil
+    }
+
+    func estimatedMigrationChainTip() async throws -> BlockHeight {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func estimatedMigrationSecondsPerBlock() async throws -> Double {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func migrationTransactionStatuses(accountUUID: AccountUUID) async throws -> [MigrationTransactionStatus] {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func isNoteSplitNeeded(accountUUID: AccountUUID) async throws -> Bool {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func prepareNoteSplit(accountUUID: AccountUUID) async throws -> NoteSplitProposal {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func submitNoteSplit(
+        accountUUID: AccountUUID,
+        proposal: NoteSplitProposal,
+        usk: UnifiedSpendingKey,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferResult {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func proposeImmediateMigration(accountUUID: AccountUUID) async throws -> ImmediateMigrationProposal {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func recordImmediateMigration(accountUUID: AccountUUID, txid: TxId) async throws {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi? {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func signAndStoreMigrationSchedule(accountUUID: AccountUUID, _ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func performMigrationBroadcast(
+        accountUUID: AccountUUID,
+        _ instruction: MigrationBroadcastInstruction,
+        options: MigrationNetworkPrivacyOptions
+    ) async throws -> MigrationTransferResult {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    /// Inert default: conformers must override to provide the wallet-scope migration privacy gate.
+    func isMigrationSyncBlocked() async -> Bool {
+        false
+    }
+
+    /// Inert default: conformers must override to provide the wallet-scope migration privacy gate.
+    var migrationSyncBlockedStream: AnyPublisher<Bool, Never> {
+        Just(false).eraseToAnyPublisher()
+    }
+
+    func hasOverdueMigrationTransfers(accountUUID: AccountUUID, useEstimatedTip: Bool) async throws -> Bool {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    /// Convenience overload of the protocol requirement, defaulting `useEstimatedTip` to `false`
+    /// (scanned-tip due-ness only) so one-argument call sites keep reading naturally.
+    func hasOverdueMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
+        try await hasOverdueMigrationTransfers(accountUUID: accountUUID, useEstimatedTip: false)
+    }
+
+    func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func createUnsignedNoteSplitPCZTs(accountUUID: AccountUUID, for schedule: MigrationSchedule) async throws -> [MigrationUnsignedTransferPczt] {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func storeSignedNoteSplitPCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws -> PreparedMigrationTransfer {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func createUnsignedMigrationTransferPCZTs(accountUUID: AccountUUID, for schedule: MigrationSchedule) async throws -> [MigrationUnsignedTransferPczt] {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func storeSignedMigrationSchedulePCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func batchMigrationPcztsForSigning(
+        _ pczts: [MigrationUnsignedTransferPczt],
+        maxActionsPerSession: Int
+    ) async throws -> [[MigrationUnsignedTransferPczt]] {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func buildKeystoneSignBatchQRParts(requestId: Data, pczts: [MigrationUnsignedTransferPczt], maxFragmentLen: Int) async throws -> [String] {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    /// Inert default: conformers must override to provide real Keystone batch-signing decode
+    /// session support. Mirrors `isMigrationSyncBlocked()`'s non-throwing inert-default
+    /// treatment: this member is infallible by contract (see the protocol doc), so it cannot
+    /// throw `MigrationUnimplemented` the way its throwing siblings do.
+    func resetKeystoneSignBatchDecoder() async { }
+
+    func decodeKeystoneSignBatchPart(_ part: String, expectedRequestId: Data) async throws -> KeystoneBatchDecodeResult {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func applyKeystoneBatchSignatures(pczts: [MigrationUnsignedTransferPczt], batchSignResponse: Data) async throws -> [MigrationSignedTransferPczt] {
+        throw MigrationUnimplemented(member: #function)
     }
 }
 
@@ -997,16 +1728,6 @@ enum InternalSyncStatus: Equatable {
         case .error: return "error"
         }
     }
-}
-
-/// Mode of the Synchronizer's initialization for the wallet.
-public enum WalletInitMode: Equatable {
-    /// For brand new wallet - typically when users creates a new wallet.
-    case newWallet
-    /// For a wallet that is about to be restored. Typically when a user wants to restore a wallet from a seed.
-    case restoreWallet
-    /// All other cases - typically when clients just start the process e.g. every regular app start for mobile apps.
-    case existingWallet
 }
 
 /// Kind of transactions handled by a Synchronizer

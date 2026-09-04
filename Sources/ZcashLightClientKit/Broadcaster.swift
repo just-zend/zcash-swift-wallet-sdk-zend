@@ -117,6 +117,14 @@ public struct CreatedTransaction: Equatable {
 }
 
 extension CreatedTransaction {
+    init(transactionData: TransactionData) {
+        self.init(
+            txId: transactionData.txId,
+            raw: transactionData.raw,
+            expiryHeight: transactionData.expiryHeight
+        )
+    }
+
     /// Builds a submittable transaction from a wallet overview, e.g. to re-submit
     /// a transaction created in a previous app session. The overview must carry
     /// raw bytes; overviews returned by transaction-listing APIs do.
