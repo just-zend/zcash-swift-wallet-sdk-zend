@@ -8,13 +8,16 @@ on:
       version:
         description: 'SDK version (e.g., 2.5.0)'
         required: true
+      force:
+        description: 'Replace the assets of an existing release'
+        type: boolean
+        default: false
 
 permissions: {}
 
 jobs:
   build-xcframework:
     runs-on: macos-15
-    environment: sdk-release
     permissions:
       contents: write # Required for creating draft releases
     steps:
@@ -34,8 +37,10 @@ jobs:
       - name: Cache Cargo
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
-          # Keep cargo's Git checkouts uncached. The public Slipstream revision is immutable in
-          # Cargo.lock, and fetching it afresh makes the CI provenance straightforward to audit.
+          # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
+          # Swatinem/rust-cache did): that includes `~/.cargo/git`, so a fork PR restoring a cache
+          # created on the base branch could reach whatever any future git dependency was cloned
+          # from. Every path below is crates.io content or this repository's own build output.
           path: |
             target
             ~/.cargo/bin
@@ -50,17 +55,27 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ github.event.inputs.version }}
-        run: ./Scripts/prepare-release.sh "$VERSION"
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            ./Scripts/prepare-release.sh artifacts --force-overwrite-existing-release "$VERSION"
+          else
+            ./Scripts/prepare-release.sh artifacts "$VERSION"
+          fi
 
-      - name: Output Package.swift Update
+      - name: Report the release artifacts
         run: |
           source BuildSupport/products/release.env
           echo ""
           echo "========================================"
-          echo "Update Package.swift with:"
+          echo "Draft release ${VERSION} now carries:"
           echo "========================================"
           echo ""
-          echo "url: \"${DOWNLOAD_URL}\","
-          echo "checksum: \"${CHECKSUM}\""
+          echo "url:      ${DOWNLOAD_URL}"
+          echo "checksum: ${CHECKSUM}"
           echo ""
-          echo "Then commit, tag ${VERSION}, and publish the draft release."
+          echo "From a checkout on candidate/${VERSION}, run:"
+          echo "  ./Scripts/prepare-release.sh build --artifacts ci <remote> ${VERSION}"
+          echo ""
+          echo "It will find this draft release, reuse its checksum, write"
+          echo "Package.swift, and mark the release PR ready for review."

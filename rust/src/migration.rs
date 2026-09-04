@@ -240,8 +240,8 @@ struct CallCtx {
 /// Open the migration store connection: a second, independent connection into the same wallet
 /// database file as the wallet handle (`crate::wallet_db`), which the account-keyed migration
 /// tables live inside. Set to the same [`crate::WALLET_DB_BUSY_TIMEOUT`] the wallet handle uses --
-/// the slipstream engine's writer (write-behind commits, `deleteAccount`/`importAccount` mid-pass)
-/// can hold the file lock for seconds, and a migration call racing it must wait as long as the
+/// this connection and the wallet handle write the same file, so either can hold the file lock
+/// while the other wants it, and a migration call racing a wallet write must wait as long as the
 /// wallet handle would rather than failing fast on rusqlite's 5 s default.
 fn open_store_conn(db_path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(db_path)
@@ -6682,12 +6682,12 @@ mod tests {
     }
 
     /// Regression pin: the migration store connection (a second, independent connection into the
-    /// same wallet database file the slipstream engine writes from) must wait for a held sqlite
+    /// same wallet database file the wallet handle writes) must wait for a held sqlite
     /// lock exactly as long as the wallet handle does -- `crate::wallet_db` (lib.rs) sets
-    /// `crate::WALLET_DB_BUSY_TIMEOUT` (15 s, currently) because the engine's write-behind commits
-    /// can hold the file lock for seconds; upstream sets none. Before the fix, [`open`]'s store
+    /// `crate::WALLET_DB_BUSY_TIMEOUT` (15 s, currently) because a write can hold the file lock
+    /// for seconds; upstream sets none. Before the fix, [`open`]'s store
     /// connection was a bare `Connection::open` with no explicit timeout, silently falling back to
-    /// rusqlite's 5 s default -- a migration call racing a long engine write could hit
+    /// rusqlite's 5 s default -- a migration call racing a long write could hit
     /// `database is locked` a full 10 s earlier than the wallet handle would have given up.
     #[test]
     fn store_conn_matches_wallet_db_busy_timeout() {

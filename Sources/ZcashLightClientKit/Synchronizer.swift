@@ -50,14 +50,6 @@ public struct SynchronizerState: Equatable {
     /// snapshot — must gate on this, not on `latestBlockHeight`.
     public var fullyScannedHeight: BlockHeight
 
-    /// True while the wallet is in a deep recovery (a restore, or a new-account backfill) where the
-    /// balance and transaction history are still provisional: during recent-first sync a note can
-    /// appear unspent before the block that spends it has been scanned, transiently inflating both
-    /// the balance and the Activity list. Clients should treat balance/Activity as not-yet-final
-    /// (e.g. hold `0` and hold the Activity) until this is `false`. Derived from the wallet
-    /// backend's `recovery_progress`; `false` for light catch-ups and once fully synced.
-    public var isRecovering: Bool
-
     /// Represents a synchronizer that has made zero progress hasn't done a sync attempt
     public static var zero: SynchronizerState {
         SynchronizerState(
@@ -74,15 +66,13 @@ public struct SynchronizerState: Equatable {
         accountsBalances: [AccountUUID: AccountBalance],
         internalSyncStatus: InternalSyncStatus,
         latestBlockHeight: BlockHeight,
-        fullyScannedHeight: BlockHeight = .zero,
-        isRecovering: Bool = false
+        fullyScannedHeight: BlockHeight = .zero
     ) {
         self.syncSessionID = syncSessionID
         self.accountsBalances = accountsBalances
         self.internalSyncStatus = internalSyncStatus
         self.latestBlockHeight = latestBlockHeight
         self.fullyScannedHeight = fullyScannedHeight
-        self.isRecovering = isRecovering
         self.syncStatus = internalSyncStatus.mapToSyncStatus()
     }
 }
@@ -747,14 +737,13 @@ public protocol Synchronizer: AnyObject {
     /// against sync.
     /// - Parameters:
     ///   - accountUUID: the account whose preparation is being retrieved.
-    ///   - txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
-    ///     raw/internal byte order.
+    ///   - txid: a txid ``MigrationProveOutcome/preparationTxids`` named.
     /// - Throws: ``ZcashError/migrationProvingUnavailable(_:)`` when the stored artifact cannot be
     ///   turned into servable bytes; ``ZcashError/rustMigrationTakePreparation(_:)`` for a
     ///   transfer's txid, for a txid the stored run does not carry, and for the readiness refusal
     ///   of a preparation that is not proved — which an app discharges by proving again rather
     ///   than retrying this.
-    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer
+    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: TxId) async throws -> PreparedMigrationTransfer
 
     /// Closes the seam: records the engine-side outcome of a preparation the app retrieved with
     /// ``takeMigrationPreparation(accountUUID:byTxid:)`` and submitted itself — the same per-row
@@ -934,9 +923,8 @@ public protocol Synchronizer: AnyObject {
     /// pipeline, so this call carries no ``ZcashError/migrationBroadcastDuringSync`` guard of its own.
     /// - Parameters:
     ///   - accountUUID: the account the immediate migration belongs to.
-    ///   - txid: the broadcast transaction's id, in the SDK's raw/internal byte order (32 bytes;
-    ///     matches `TxId.id`, not the reversed display-hex order produced by `Data.toHexStringTxId()`).
-    func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws
+    ///   - txid: the broadcast transaction's id.
+    func recordImmediateMigration(accountUUID: AccountUUID, txid: TxId) async throws
 
     /// The leftover Orchard balance a migration of `accountUUID` would not cross, when large enough
     /// to be worth offering the user a choice about; `nil` when there is no such residual.
@@ -1414,8 +1402,7 @@ public extension Synchronizer {
     // MARK: - Migration (Orchard -> Ironwood) defaults
     //
     // Default implementations so adding the migration group to the protocol is not a
-    // source-breaking change for downstream/stacked conformers (in particular the
-    // `SlipstreamSynchronizer` stack, until it carries its own implementations). Conformers with
+    // source-breaking change for downstream/stacked conformers. Conformers with
     // migration support (`SDKSynchronizer`) override every one of these; conformers that don't fall
     // through here. The throwing members all throw `MigrationUnimplemented`; the four non-throwing
     // members get inert defaults instead, documented below — conformers must override them to offer
@@ -1437,7 +1424,7 @@ public extension Synchronizer {
         throw MigrationUnimplemented(member: #function)
     }
 
-    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
+    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: TxId) async throws -> PreparedMigrationTransfer {
         throw MigrationUnimplemented(member: #function)
     }
 
@@ -1496,7 +1483,7 @@ public extension Synchronizer {
         throw MigrationUnimplemented(member: #function)
     }
 
-    func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws {
+    func recordImmediateMigration(accountUUID: AccountUUID, txid: TxId) async throws {
         throw MigrationUnimplemented(member: #function)
     }
 

@@ -101,7 +101,10 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
 
     func testRecordImmediateMigrationDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented {
-            try await self.synchronizer.recordImmediateMigration(accountUUID: self.accountUUID, txid: Data(repeating: 0x01, count: 32))
+            try await self.synchronizer.recordImmediateMigration(
+                accountUUID: self.accountUUID,
+                txid: TxId([UInt8](repeating: 0x01, count: 32))
+            )
         }
     }
 

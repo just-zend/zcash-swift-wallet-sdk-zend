@@ -2776,11 +2776,11 @@ class SynchronizerMock: Synchronizer {
     var takeMigrationPreparationAccountUUIDByTxidCalled: Bool {
         return takeMigrationPreparationAccountUUIDByTxidCallsCount > 0
     }
-    var takeMigrationPreparationAccountUUIDByTxidReceivedArguments: (accountUUID: AccountUUID, txid: Data)?
+    var takeMigrationPreparationAccountUUIDByTxidReceivedArguments: (accountUUID: AccountUUID, txid: TxId)?
     var takeMigrationPreparationAccountUUIDByTxidReturnValue: PreparedMigrationTransfer!
-    var takeMigrationPreparationAccountUUIDByTxidClosure: ((AccountUUID, Data) async throws -> PreparedMigrationTransfer)?
+    var takeMigrationPreparationAccountUUIDByTxidClosure: ((AccountUUID, TxId) async throws -> PreparedMigrationTransfer)?
 
-    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
+    func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: TxId) async throws -> PreparedMigrationTransfer {
         if let error = takeMigrationPreparationAccountUUIDByTxidThrowableError {
             throw error
         }
@@ -3051,10 +3051,10 @@ class SynchronizerMock: Synchronizer {
     var recordImmediateMigrationAccountUUIDTxidCalled: Bool {
         return recordImmediateMigrationAccountUUIDTxidCallsCount > 0
     }
-    var recordImmediateMigrationAccountUUIDTxidReceivedArguments: (accountUUID: AccountUUID, txid: Data)?
-    var recordImmediateMigrationAccountUUIDTxidClosure: ((AccountUUID, Data) async throws -> Void)?
+    var recordImmediateMigrationAccountUUIDTxidReceivedArguments: (accountUUID: AccountUUID, txid: TxId)?
+    var recordImmediateMigrationAccountUUIDTxidClosure: ((AccountUUID, TxId) async throws -> Void)?
 
-    func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws {
+    func recordImmediateMigration(accountUUID: AccountUUID, txid: TxId) async throws {
         if let error = recordImmediateMigrationAccountUUIDTxidThrowableError {
             throw error
         }
@@ -3932,28 +3932,6 @@ class TransactionRepositoryMock: TransactionRepository {
             return closure(sql)
         } else {
             return debugDatabaseSqlReturnValue
-        }
-    }
-
-    // MARK: - unreconciledTxids
-
-    var unreconciledTxidsThrowableError: Error?
-    var unreconciledTxidsCallsCount = 0
-    var unreconciledTxidsCalled: Bool {
-        return unreconciledTxidsCallsCount > 0
-    }
-    var unreconciledTxidsReturnValue: Set<Data>!
-    var unreconciledTxidsClosure: (() async throws -> Set<Data>)?
-
-    func unreconciledTxids() async throws -> Set<Data> {
-        if let error = unreconciledTxidsThrowableError {
-            throw error
-        }
-        unreconciledTxidsCallsCount += 1
-        if let closure = unreconciledTxidsClosure {
-            return try await closure()
-        } else {
-            return unreconciledTxidsReturnValue
         }
     }
 

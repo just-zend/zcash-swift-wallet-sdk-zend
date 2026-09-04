@@ -180,7 +180,7 @@ final class MigrationSyncGate: @unchecked Sendable {
         do {
             try BackupExcludedStorage.provision(directory: directory)
         } catch {
-            logger.warn("MigrationSyncGate: failed to provision the storage directory (backup exclusion may be missing): \(error)")
+            logger.warn("MigrationSyncGate: storage provisioning failed; backup exclusion may be missing: \(error.localizedDescription)")
         }
 
         // Load the in-memory `inFlightUntil` cache from the file exactly once, here -- every
@@ -518,7 +518,7 @@ final class MigrationSyncGate: @unchecked Sendable {
             let data = try JSONEncoder().encode(state)
             try data.write(to: fileURL, options: .atomic)
         } catch {
-            logger.warn("MigrationSyncGate: failed to persist sync-gate state: \(error)")
+            logger.warn("MigrationSyncGate: failed to persist sync-gate state: \(error.localizedDescription)")
         }
     }
 
@@ -536,7 +536,7 @@ final class MigrationSyncGate: @unchecked Sendable {
             }
             return state.inFlightUntilEpochSeconds.map { Date(timeIntervalSince1970: $0) }
         } catch {
-            logger.warn("MigrationSyncGate: ignoring corrupt sync-gate file: \(error)")
+            logger.warn("MigrationSyncGate: ignoring corrupt sync-gate file: \(error.localizedDescription)")
             return nil
         }
     }

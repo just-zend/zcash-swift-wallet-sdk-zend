@@ -7,7 +7,7 @@
 
 import Foundation
 
-public struct TxId: Equatable, Hashable, Identifiable {
+public struct TxId: Equatable, Hashable, Identifiable, Sendable {
     static let byteLength = 32
 
     public var id: [UInt8]

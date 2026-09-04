@@ -138,7 +138,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     /// 3. Anything else maps to ``MigrationTransferResult/invalidNote``. This InvalidNote/Expired
     ///    split is best-effort (the lightwalletd rejection reasons do not cleanly distinguish the
     ///    two); it mirrors the Android SDK's known ambiguity and is kept for parity.
-    static func map(outcome: MigrationBroadcastOutcome, successTxId: String) -> MigrationTransferResult {
+    static func map(outcome: MigrationBroadcastOutcome, successTxId: TxId) -> MigrationTransferResult {
         switch outcome {
         case .submitted:
             return MigrationTransferResult.success(txId: successTxId)
@@ -233,7 +233,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         do {
             runtime = try await dedicatedTorClient()
         } catch {
-            logger.error("MigrationBroadcaster: dedicated Tor runtime unavailable: \(error)")
+            logger.error("MigrationBroadcaster: dedicated Tor runtime unavailable: \(error.localizedDescription)")
             throw ZcashError.migrationTorUnavailable
         }
 
@@ -242,7 +242,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
             let isolated = try await runtime.isolatedClient()
             connection = try await isolated.connectToLightwalletd(endpoint: endpoint.urlString)
         } catch {
-            logger.error("MigrationBroadcaster: could not open isolated Tor connection to \(endpoint.host):\(endpoint.port): \(error)")
+            logger.error("MigrationBroadcaster: Tor connection to \(endpoint.host):\(endpoint.port) failed: \(error.localizedDescription)")
             throw ZcashError.migrationTorUnavailable
         }
 
@@ -255,7 +255,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
             let response = try connection.submit(spendTransaction: rawTransaction)
             return outcome(from: response)
         } catch {
-            logger.error("MigrationBroadcaster: Tor submit transport failure: \(error)")
+            logger.error("MigrationBroadcaster: Tor submit transport failure: \(error.localizedDescription)")
             return MigrationBroadcastOutcome.transportError
         }
     }
@@ -277,7 +277,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
             return outcome(from: response)
         } catch {
             await service.closeConnections()
-            logger.error("MigrationBroadcaster: direct submit transport failure: \(error)")
+            logger.error("MigrationBroadcaster: direct submit transport failure: \(error.localizedDescription)")
             return MigrationBroadcastOutcome.transportError
         }
     }

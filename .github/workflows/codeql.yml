@@ -133,8 +133,10 @@ jobs:
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
-        # Keep cargo's Git checkouts uncached. The public Slipstream revision is immutable in
-        # Cargo.lock, and fetching it afresh makes the CI provenance straightforward to audit.
+        # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
+        # Swatinem/rust-cache did): that includes `~/.cargo/git`, so a fork PR restoring a cache
+        # created on the base branch could reach whatever any future git dependency was cloned
+        # from. Every path below is crates.io content or this repository's own build output.
         path: |
           target
           ~/.cargo/bin
