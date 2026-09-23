@@ -27,7 +27,7 @@
 #   - gh CLI installed and authenticated (https://cli.github.com/)
 #   - Rust toolchain with all Apple targets
 
-set -e
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Ensure cargo/rustup are on PATH (needed when invoked from CI or Xcode)
@@ -48,9 +48,10 @@ if [[ -z "$1" ]]; then
 fi
 
 VERSION="$1"
-REPO="zcash/zcash-swift-wallet-sdk"
+REPO="just-zend/zcash-swift-wallet-sdk-zend"
 PRODUCTS_DIR="BuildSupport/products"
 ZIP_FILE="libzcashlc.xcframework.zip"
+RELEASE_NOTES_FILE=".github/release-notes/${VERSION}.md"
 
 # SemVer: a hyphen in the version (e.g. 2.6.0-alpha.1) marks a pre-release
 PRERELEASE_FLAG=()
@@ -64,6 +65,13 @@ if [[ ${#PRERELEASE_FLAG[@]} -gt 0 ]]; then
 fi
 echo ""
 
+./Scripts/audit-zend-release.sh "$VERSION"
+
+if [[ ! -f "$RELEASE_NOTES_FILE" ]]; then
+    echo "Error: release notes not found at ${RELEASE_NOTES_FILE}." >&2
+    exit 1
+fi
+
 # Check for uncommitted changes (skip in non-interactive mode, e.g. CI)
 if [[ -t 0 ]] && [[ -n $(git status --porcelain) ]]; then
     echo "Warning: You have uncommitted changes."
@@ -74,14 +82,14 @@ if [[ -t 0 ]] && [[ -n $(git status --porcelain) ]]; then
     fi
 fi
 
-git checkout -b "release/ffi-${VERSION}"
-
 # Build full xcframework
 echo "=== Building xcframework (this takes a while) ==="
 cd BuildSupport
 make clean
 make xcframework
 cd ..
+
+./Scripts/audit-zend-release.sh "$VERSION" "$PRODUCTS_DIR/libzcashlc.xcframework"
 
 # Create release archive
 echo ""
@@ -121,14 +129,17 @@ if gh release view "$VERSION" --repo "$REPO" &>/dev/null; then
     # needs an explicit edit to gain the pre-release bit.
     if [[ ${#PRERELEASE_FLAG[@]} -gt 0 ]]; then
         echo "Marking existing release ${VERSION} as a pre-release."
-        gh release edit "$VERSION" --repo "$REPO" "${PRERELEASE_FLAG[@]}"
+        gh release edit "$VERSION" \
+            --repo "$REPO" \
+            --notes-file "$RELEASE_NOTES_FILE" \
+            "${PRERELEASE_FLAG[@]}"
     fi
 else
     gh release create "$VERSION" \
         "$PRODUCTS_DIR/$ZIP_FILE" \
         --repo "$REPO" \
         --title "$VERSION" \
-        --notes "Zcash Light Client SDK ${VERSION}" \
+        --notes-file "$RELEASE_NOTES_FILE" \
         --draft \
         "${PRERELEASE_FLAG[@]}"
 fi
@@ -155,9 +166,9 @@ echo "   git add Package.swift"
 echo "   git commit -m \"Prepare ffi release for sdk version ${VERSION}\""
 echo ""
 echo "3. Push:"
-echo "   git push -u upstream release/ffi-${VERSION}"
+echo "   git push"
 echo ""
-echo "4. Once release/ffi-${VERSION} has merged to the SDK release branch, create the signed tag:"
+echo "4. Once this release branch has passed review, create the signed tag:"
 echo "   git tag -s ${VERSION} -m \"Release ${VERSION}\""
 echo ""
 echo "5. Publish the draft release:"

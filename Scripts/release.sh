@@ -13,8 +13,8 @@
 #   8. Publishes the GitHub release
 #
 # Arguments:
-#   <remote>   The git remote pointing to zcash/zcash-swift-wallet-sdk
-#              (e.g., 'origin' or 'upstream')
+#   <remote>   The git remote pointing to just-zend/zcash-swift-wallet-sdk-zend
+#              (normally 'origin')
 #   <version>  The version to release (e.g., '2.5.0')
 #
 # Versions with a SemVer pre-release suffix (e.g. 2.6.0-alpha.1, 2.7.0-rc.2)
@@ -40,7 +40,7 @@ cd "$(dirname "$0")/.."
 
 if [[ -z "$1" ]] || [[ -z "$2" ]]; then
     echo "Usage: $0 <remote> <version>"
-    echo "Example: $0 upstream 2.5.0"
+    echo "Example: $0 origin 2.8.0-rc.2-zend.1"
     echo ""
     echo "Available remotes:"
     git remote -v
@@ -58,7 +58,7 @@ if ! git remote get-url "$UPSTREAM_REMOTE" &>/dev/null; then
     git remote -v
     exit 1
 fi
-REPO="zcash/zcash-swift-wallet-sdk"
+REPO="just-zend/zcash-swift-wallet-sdk-zend"
 PRODUCTS_DIR="BuildSupport/products"
 
 # SemVer: a hyphen in the version (e.g. 2.6.0-alpha.1) marks a pre-release
@@ -117,13 +117,13 @@ echo "=== Step 2/6: Updating Package.swift ==="
 
 # Update the binaryTarget URL and checksum in Package.swift
 sed -i.bak -E \
-    -e "s|(url: \"https://github.com/${REPO}/releases/download/)[^\"]+(/libzcashlc.xcframework.zip\")|\1${VERSION}\2|" \
+    -e "s|(url: \"https://github.com/)[^/]+/[^/]+(/releases/download/)[^\"]+(/libzcashlc.xcframework.zip\")|\1${REPO}\2${VERSION}\3|" \
     -e "s|(checksum: \")[^\"]+(\")|\1${CHECKSUM}\2|" \
     Package.swift
 rm -f Package.swift.bak
 
 # Verify the update worked
-if ! grep -q "download/${VERSION}/libzcashlc.xcframework.zip" Package.swift; then
+if ! grep -q "https://github.com/${REPO}/releases/download/${VERSION}/libzcashlc.xcframework.zip" Package.swift; then
     echo "Error: Failed to update Package.swift URL"
     git checkout Package.swift
     exit 1

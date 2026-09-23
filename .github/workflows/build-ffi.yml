@@ -6,8 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'SDK version (e.g., 2.5.0)'
+        description: 'SDK version'
         required: true
+        default: '2.8.0-rc.2-zend.1'
 
 permissions: {}
 
@@ -19,6 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Select Xcode
@@ -32,6 +34,11 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+
+      - name: Verify Zend release boundary
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: ./Scripts/audit-zend-release.sh "$VERSION"
 
       - name: Build and upload draft release
         env:

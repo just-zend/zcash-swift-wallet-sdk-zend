@@ -21,7 +21,7 @@
 # Usage:
 #   ./Scripts/start-release.sh [options] <remote> <version> [<revision>]
 #
-#   <remote>    git remote for zcash/zcash-swift-wallet-sdk, e.g. upstream
+#   <remote>    git remote for just-zend/zcash-swift-wallet-sdk-zend, normally origin
 #   <version>   version being released, e.g. 2.7.1
 #   <revision>  commit or branch holding the changes to release
 #               (default: current HEAD, which should be a maint/ branch)
@@ -199,9 +199,9 @@ Next:
 EOF
 $PUSH_REVIEW || echo "  git push -u ${REMOTE} ${REVIEW_BRANCH}"
 cat <<EOF
-  gh pr create --repo zcash/zcash-swift-wallet-sdk \\
+  gh pr create --repo just-zend/zcash-swift-wallet-sdk-zend \\
       --base ${RELEASE_BRANCH} --head ${REVIEW_BRANCH} \\
-      --title "Release zcash-swift-wallet-sdk ${VERSION}"
+      --title "Release Zend SDK ${VERSION}"
 
 Review the PR diff: it is exactly what users get over ${PREV_TAG}. Then merge
 it and run

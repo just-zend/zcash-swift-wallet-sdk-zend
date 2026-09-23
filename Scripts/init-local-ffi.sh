@@ -174,12 +174,12 @@ if [[ "$BUILD_MODE" == "arm" ]]; then
     build_arm_xcframework "${ARM_TARGETS[@]}"
 elif [[ "$BUILD_MODE" == "cached" ]]; then
     echo "Downloading pre-built xcframework..."
-    REPO="zcash/zcash-swift-wallet-sdk"
-
-    # Extract the version from the download URL in Package.swift
-    SDK_VERSION=$(grep -oE 'releases/download/[0-9]+\.[0-9]+\.[0-9]+' Package.swift | head -1 | sed 's|releases/download/||')
-    if [[ -z "$SDK_VERSION" ]]; then
-        echo "Error: Could not determine SDK version from Package.swift"
+    # Extract the repository and complete version (including pre-release
+    # suffixes) from the download URL in Package.swift.
+    REPO=$(sed -nE 's|.*url: "https://github.com/([^/]+/[^/]+)/releases/download/.*|\1|p' Package.swift | head -1)
+    SDK_VERSION=$(sed -nE 's|.*releases/download/([^/]+)/libzcashlc[.]xcframework[.]zip.*|\1|p' Package.swift | head -1)
+    if [[ -z "$REPO" || -z "$SDK_VERSION" ]]; then
+        echo "Error: Could not determine SDK repository and version from Package.swift"
         exit 1
     fi
 

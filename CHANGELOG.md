@@ -6,6 +6,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 2.8.0-rc.2-zend.1 - 2026-09-22
+
+## Changed
+- Repackage the exact MIT-licensed SDK and Rust source from upstream
+  `2.8.0-rc.2` (`1f4e12ba9a58d90e1416d4e3b145d3e63d10cf27`) under the Zend
+  release namespace. This changes release plumbing only and adds no SDK or FFI
+  behavior.
+
 # 2.8.0-rc.2 - 2026-07-28
 
 ## Changed
