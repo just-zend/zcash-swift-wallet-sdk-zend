@@ -55,7 +55,7 @@ if ! grep -Eq '^license = "MIT"$' Cargo.toml; then
     exit 1
 fi
 
-if git grep -nEI \
+if git grep -nEiI \
     'slipstream|AGPL-3([.]0)?|GNU Affero General Public License|zodl[_-]qa' \
     HEAD -- Cargo.lock Cargo.toml Package.swift Sources rust BuildSupport; then
     echo "Error: prohibited release content was found." >&2
@@ -100,7 +100,7 @@ for slice in "${REQUIRED_SLICES[@]:1}"; do
     fi
 done
 
-if grep -aEIq 'slipstream|AGPL-3([.]0)?|GNU Affero General Public License' "$REFERENCE_HEADER"; then
+if grep -aEiIq 'slipstream|AGPL-3([.]0)?|GNU Affero General Public License' "$REFERENCE_HEADER"; then
     echo "Error: prohibited API or license text found in generated header." >&2
     exit 1
 fi
